@@ -1,4 +1,4 @@
-<p align="center"><img src="../logo.svg" width="72" height="72" alt="mqlite"></p>
+<p align="center"><img src="logo.svg" width="72" height="72" alt="mqlite"></p>
 
 # mqlite
 
@@ -9,10 +9,6 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > **Embed it like goqite, or serve it like a broker — the same engine.**
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
-
-This is the reference implementation of the design in
-[`../mqlite-design.md`](../mqlite-design.md) (and the interactive
-[`../mqlite-design.html`](../mqlite-design.html)).
 
 ## Why mqlite
 
