@@ -124,6 +124,10 @@ type ReceiveOptions struct {
 	MaxMessages int
 	WaitMs      int64 // long-poll up to 20000
 	Mode        ReceiveMode
+	// AttemptID, when set, makes Receive idempotent under client retries: a retry
+	// with the same id replays the same batch (same lock tokens) instead of
+	// claiming new messages / burning delivery_count (SQS ReceiveRequestAttemptId).
+	AttemptID string
 }
 
 // PeekOptions controls a Peek call.

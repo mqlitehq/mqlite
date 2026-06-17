@@ -59,6 +59,7 @@ func (s *Server) routes() {
 	h(wire.PathCreateSubscription, s.handleCreateSubscription)
 	h(wire.PathListQueues, s.handleListQueues)
 	h(wire.PathRedrive, s.handleRedrive)
+	h(wire.PathPurgeDeadLetter, s.handlePurgeDeadLetter)
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -183,6 +184,7 @@ func (s *Server) handleReceive(w http.ResponseWriter, r *http.Request) {
 		MaxMessages: req.MaxMessages,
 		WaitMs:      req.WaitTimeMs,
 		Mode:        engine.ReceiveMode(req.ReceiveMode),
+		AttemptID:   req.AttemptID,
 	})
 	if err != nil {
 		s.fail(w, err)
@@ -213,14 +215,17 @@ func (s *Server) handleReceiveDeferred(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
-// settleOK runs a settle action and returns {ok:false} on LockLost (not an error).
+// settleOK runs a settle action. A lost/expired lock is a distinct, typed error
+// (HTTP 409 "lock_lost") — not a 200 with {ok:false}, which a status-only client
+// would mistake for success. Idempotent replays of an already-settled token
+// return success (the engine consults the settlement-receipt table).
 func (s *Server) settleOK(w http.ResponseWriter, err error) {
 	if err == nil {
 		writeJSON(w, wire.SettleResponse{Ok: true})
 		return
 	}
 	if errors.Is(err, engine.ErrLockLost) {
-		writeJSON(w, wire.SettleResponse{Ok: false})
+		writeErr(w, http.StatusConflict, "lock_lost", err.Error())
 		return
 	}
 	s.fail(w, err)
@@ -381,4 +386,20 @@ func (s *Server) handleRedrive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, wire.RedriveResponse{Moved: moved})
+}
+
+func (s *Server) handlePurgeDeadLetter(w http.ResponseWriter, r *http.Request) {
+	var req wire.PurgeDeadLetterRequest
+	if err := decode(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		return
+	}
+	purged, err := s.eng.PurgeDeadLetter(r.Context(), req.Queue, engine.RedriveOptions{
+		Max: req.Max, OlderThanMs: req.OlderThanMs,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, wire.PurgeDeadLetterResponse{Purged: purged})
 }

@@ -65,7 +65,7 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 	deadline := e.now() + wait
 
 	for {
-		msgs, err := e.claimUpTo(ctx, q, max, opts.Mode)
+		msgs, err := e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
 		if err != nil {
 			return nil, err
 		}
@@ -74,7 +74,7 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		}
 		// register a waiter, then re-check to avoid a lost wakeup.
 		ch := e.note.wait(queue)
-		msgs, err = e.claimUpTo(ctx, q, max, opts.Mode)
+		msgs, err = e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
 		if err != nil {
 			return nil, err
 		}

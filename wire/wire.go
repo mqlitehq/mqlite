@@ -28,6 +28,7 @@ const (
 	PathCreateSubscription = "/mqlite.v1.AdminService/CreateSubscription"
 	PathListQueues         = "/mqlite.v1.AdminService/ListQueues"
 	PathRedrive            = "/mqlite.v1.AdminService/Redrive"
+	PathPurgeDeadLetter    = "/mqlite.v1.AdminService/PurgeDeadLetter"
 )
 
 // Message is the wire form of a message (both send input and receive output).
@@ -65,7 +66,8 @@ type ReceiveRequest struct {
 	Queue       string `json:"queue"`
 	MaxMessages int    `json:"max_messages,omitempty"`
 	WaitTimeMs  int64  `json:"wait_time_ms,omitempty"`
-	ReceiveMode int    `json:"receive_mode,omitempty"` // 0=peek-lock, 1=receive-and-delete
+	ReceiveMode int    `json:"receive_mode,omitempty"`        // 0=peek-lock, 1=receive-and-delete
+	AttemptID   string `json:"receive_attempt_id,omitempty"`  // idempotency key for retried receives
 }
 type ReceiveResponse struct {
 	Messages []Message `json:"messages"`
@@ -155,6 +157,15 @@ type RedriveRequest struct {
 }
 type RedriveResponse struct {
 	Moved int `json:"moved"`
+}
+
+type PurgeDeadLetterRequest struct {
+	Queue       string `json:"queue"`
+	Max         int    `json:"max,omitempty"`
+	OlderThanMs int64  `json:"older_than_ms,omitempty"`
+}
+type PurgeDeadLetterResponse struct {
+	Purged int `json:"purged"`
 }
 
 type Empty struct{}

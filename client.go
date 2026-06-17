@@ -94,6 +94,8 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
 	case "message_too_large":
 		return fmt.Errorf("%w: %s", ErrMessageTooLarge, eb.Message)
+	case "lock_lost":
+		return fmt.Errorf("%w: %s", ErrLockLost, eb.Message)
 	case "unauthenticated":
 		return fmt.Errorf("mqlite: unauthenticated: %s", eb.Message)
 	default:
@@ -202,7 +204,18 @@ func (c *Client) CancelScheduled(ctx context.Context, queue string, seq int64) e
 // Receive claims up to N messages (Peek-Lock by default), with optional long-poll.
 func (c *Client) Receive(ctx context.Context, queue string, opts ...ReceiveOption) ([]*Message, error) {
 	cfg := buildReceive(opts)
-	return c.receiveOne(ctx, queue, cfg.MaxMessages, cfg.WaitMs, cfg.Mode)
+	var resp wire.ReceiveResponse
+	if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+		Queue: queue, MaxMessages: cfg.MaxMessages, WaitTimeMs: cfg.WaitMs,
+		ReceiveMode: int(cfg.Mode), AttemptID: cfg.AttemptID, // idempotent receive
+	}, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]*Message, len(resp.Messages))
+	for i, wm := range resp.Messages {
+		out[i] = c.wireToMessage(queue, wm)
+	}
+	return out, nil
 }
 
 func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode) ([]*Message, error) {

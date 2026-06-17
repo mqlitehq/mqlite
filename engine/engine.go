@@ -237,6 +237,9 @@ func (e *Engine) Send(ctx context.Context, queue string, m OutMessage) (int64, e
 	if err != nil {
 		return 0, err
 	}
+	if seqs[0] == 0 { // skipped as a dedup conflict (batch path swallows it)
+		return 0, ErrDedupConflict
+	}
 	return seqs[0], nil
 }
 
@@ -253,6 +256,9 @@ func (e *Engine) Schedule(ctx context.Context, queue string, m OutMessage, atMs 
 	seqs, err := e.send(ctx, queue, []OutMessage{m}, atMs, StateScheduled)
 	if err != nil {
 		return 0, err
+	}
+	if seqs[0] == 0 { // skipped as a dedup conflict (batch path swallows it)
+		return 0, ErrDedupConflict
 	}
 	return seqs[0], nil
 }
@@ -303,6 +309,13 @@ func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs in
 					return err
 				}
 				seq, deduped, err := e.insertOne(ctx, tx, q, m, atMs, forced, now)
+				if errors.Is(err, ErrDedupConflict) {
+					// Batch-safe: a dedup conflict (same id, different body) skips
+					// only the offending message — the rest of the batch still
+					// commits. The conflicting slot stays seq=0; single Send /
+					// Schedule re-surface it as ErrDedupConflict.
+					continue
+				}
 				if err != nil {
 					return err
 				}

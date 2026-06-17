@@ -16,6 +16,7 @@ func (e *Engine) startBackground(ctx context.Context) {
 	e.spawn(ctx, 1*time.Second, e.activateScheduled) // scheduled -> active
 	e.spawn(ctx, 10*time.Second, e.expireTTL)        // active TTL -> DLQ/discard
 	e.spawn(ctx, 60*time.Second, e.cleanupDedup)     // drop out-of-window dedup rows
+	e.spawn(ctx, 60*time.Second, e.cleanupExpiredAux) // drop expired settle/receive receipts
 }
 
 func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(context.Context)) {
@@ -111,6 +112,15 @@ func (e *Engine) cleanupDedup(ctx context.Context) {
 	_, _ = e.db.exec(ctx, `DELETE FROM dedup WHERE seen_at < ?`, e.now()-maxWindow.Int64)
 }
 
+// cleanupExpiredAux drops expired settlement receipts and receive-attempt records.
+// cx ships these idempotency tables without a sweeper (unbounded growth); mqlite
+// retires them on a low-frequency pass so the feature comes with retention.
+func (e *Engine) cleanupExpiredAux(ctx context.Context) {
+	now := e.now()
+	_, _ = e.db.exec(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?`, now)
+	_, _ = e.db.exec(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?`, now)
+}
+
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
 // DisableBackground use this to drive time-based transitions deterministically.
 func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
@@ -118,4 +128,5 @@ func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
 	e.activateScheduled(ctx)
 	e.expireTTL(ctx)
 	e.cleanupDedup(ctx)
+	e.cleanupExpiredAux(ctx)
 }

@@ -93,9 +93,10 @@ type QueueInfo = engine.QueueInfo
 // ── receive options ─────────────────────────────────────────────────────────
 
 type receiveConfig struct {
-	max  int
-	wait time.Duration
-	mode engine.ReceiveMode
+	max       int
+	wait      time.Duration
+	mode      engine.ReceiveMode
+	attemptID string
 }
 
 // ReceiveOption configures a Receive call.
@@ -112,12 +113,18 @@ func WithReceiveAndDelete() ReceiveOption {
 	return func(c *receiveConfig) { c.mode = engine.ReceiveAndDelete }
 }
 
+// WithReceiveAttemptID makes the Receive idempotent under client retries: a retry
+// carrying the same id replays the same batch instead of claiming new messages.
+func WithReceiveAttemptID(id string) ReceiveOption {
+	return func(c *receiveConfig) { c.attemptID = id }
+}
+
 func buildReceive(opts []ReceiveOption) engine.ReceiveOptions {
 	c := receiveConfig{max: 1}
 	for _, o := range opts {
 		o(&c)
 	}
-	return engine.ReceiveOptions{MaxMessages: c.max, WaitMs: c.wait.Milliseconds(), Mode: c.mode}
+	return engine.ReceiveOptions{MaxMessages: c.max, WaitMs: c.wait.Milliseconds(), Mode: c.mode, AttemptID: c.attemptID}
 }
 
 // ── peek options ────────────────────────────────────────────────────────────

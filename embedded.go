@@ -123,8 +123,15 @@ func (e *Embedded) Tx(ctx context.Context, fn func(*engine.EngineTx) error) erro
 // ── receive ─────────────────────────────────────────────────────────────────
 
 func (e *Embedded) Receive(ctx context.Context, queue string, opts ...ReceiveOption) ([]*Message, error) {
-	cfg := buildReceive(opts)
-	return e.receiveOne(ctx, queue, cfg.MaxMessages, cfg.WaitMs, cfg.Mode)
+	ms, err := e.eng.Receive(ctx, queue, buildReceive(opts)) // carries AttemptID for idempotent receive
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Message, len(ms))
+	for i, m := range ms {
+		out[i] = e.engineToMessage(queue, m)
+	}
+	return out, nil
 }
 
 func (e *Embedded) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode) ([]*Message, error) {
@@ -188,6 +195,12 @@ func (e *Embedded) QueueMetrics(ctx context.Context, queue string) (Metrics, err
 
 func (e *Embedded) Redrive(ctx context.Context, dlqQueue string, opts ...RedriveOption) (int, error) {
 	return e.eng.Redrive(ctx, dlqQueue, buildRedrive(opts))
+}
+
+// PurgeDeadLetter permanently deletes dead-lettered messages (RedriveMax /
+// RedriveOlderThan scope it; no args purges the whole DLQ). Returns count deleted.
+func (e *Embedded) PurgeDeadLetter(ctx context.Context, queue string, opts ...RedriveOption) (int, error) {
+	return e.eng.PurgeDeadLetter(ctx, queue, buildRedrive(opts))
 }
 
 // Receiver returns a stateful receive loop bound to the embedded engine.

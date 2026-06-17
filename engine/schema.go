@@ -1,7 +1,7 @@
 package engine
 
 // schemaVersion is bumped when the DDL below changes incompatibly.
-const schemaVersion = "1"
+const schemaVersion = "2"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc
@@ -81,6 +81,31 @@ var schemaStmts = []string{
 	    PRIMARY KEY (queue, message_id)
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_dedup_seen ON dedup(seen_at)`,
+
+	// settlement receipts make settle (Complete/Abandon/DeadLetter/Defer) idempotent
+	// under client RPC retries: a dropped settle response that the client retries
+	// finds the receipt and returns success instead of a spurious LockLost. Keyed
+	// by lock_token (unique per claim); expires_at bounds growth (janitor sweeps it).
+	`CREATE TABLE IF NOT EXISTS settlement_receipts (
+	    lock_token  TEXT PRIMARY KEY,
+	    operation   TEXT NOT NULL,
+	    created_at  INTEGER NOT NULL,
+	    expires_at  INTEGER NOT NULL
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS idx_settlement_expire ON settlement_receipts(expires_at)`,
+
+	// receive attempts make Receive idempotent under client RPC retries: a dropped
+	// Receive response replays the same batch (same lock tokens) instead of burning
+	// delivery_count / leaving in-flight black holes. Opt-in via a client attempt id.
+	`CREATE TABLE IF NOT EXISTS receive_attempts (
+	    queue       TEXT NOT NULL,
+	    attempt_id  TEXT NOT NULL,
+	    response    TEXT NOT NULL,
+	    created_at  INTEGER NOT NULL,
+	    expires_at  INTEGER NOT NULL,
+	    PRIMARY KEY (queue, attempt_id)
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS idx_recv_attempt_expire ON receive_attempts(expires_at)`,
 
 	`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`,
 }
