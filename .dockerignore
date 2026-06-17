@@ -1,0 +1,10 @@
+.git
+bin/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+*.token
+*.test

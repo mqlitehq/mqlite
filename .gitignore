@@ -1,0 +1,24 @@
+# secrets — never commit the Turso/libSQL connection string or token
+.env.local
+.env
+*.token
+
+# local databases & WAL sidecars
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# build output
+/mqlite
+/mqlite-bench
+/dist/
+/bin/
+
+# generated stress-test data + monitor logs (reproducible via `make bench`)
+/bench/out/
+
+# go
+*.test
+*.out

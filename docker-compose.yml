@@ -1,0 +1,26 @@
+# Local broker on :8080, backed by a persistent named volume.
+# For remote Turso instead of a local file, set in your shell or an .env file:
+#   MQLITE_DB=libsql://<db>.turso.io
+#   MQLITE_DB_AUTH_TOKEN=<jwt>
+# (never commit the token — see .env.example)
+services:
+  mqlite:
+    build:
+      context: .
+    image: mqlite:0.1.0
+    ports:
+      - "8080:8080"
+    environment:
+      MQLITE_DB: ${MQLITE_DB:-file:/data/mq.db}
+      MQLITE_DB_AUTH_TOKEN: ${MQLITE_DB_AUTH_TOKEN:-}
+      MQLITE_TOKENS: ${MQLITE_TOKENS:-mqk_dev_local}
+    volumes:
+      - mqlite-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  mqlite-data:
