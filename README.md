@@ -36,26 +36,60 @@ ordering, topics — in a single pure-Go binary (no CGO).
 
 ## Quickstart
 
-### 1. Embedded (in-process, like goqite)
+### 1. Embedded (in-process — no broker, no HTTP, no second process)
+
+mqlite's primary form is a **library you embed directly in your Go process**, exactly
+like `goqite` or using `database/sql` against SQLite. `OpenEmbedded` gives you the
+full queue — Send/Receive/Peek-Lock/DLQ/scheduling/topics — calling the storage
+engine **in-process**. There is **no broker to run, no network hop, no JSON
+serialization, no extra daemon**: your app and the queue are one binary backed by
+one SQLite (or Turso) database. You only start an HTTP server if you *choose* to
+(see §2) — the embedded path never opens a socket.
 
 ```go
 ctx := context.Background()
-eng, _ := mqlite.OpenEmbedded(ctx, "file:./mq.db")
+
+// The whole MQ, in your process. file: local SQLite, or libsql://… for Turso.
+eng, err := mqlite.OpenEmbedded(ctx, "file:./mq.db")
+if err != nil { log.Fatal(err) }
 defer eng.Close()
+
 eng.CreateQueue(ctx, "orders", mqlite.QueueConfig{})
 
+// produce
 eng.Send(ctx, "orders", mqlite.OutMessage{Body: []byte("hello"), SessionID: "order-42"})
 
+// consume (Peek-Lock): handle, then settle. at-least-once → handler must be idempotent.
 msgs, _ := eng.Receive(ctx, "orders", mqlite.WithWait(5*time.Second))
-for _, m := range msgs { _ = m.Complete(ctx) }
+for _, m := range msgs {
+    if err := handle(m.Body); err != nil {
+        _ = m.Abandon(ctx)   // release the lock → redelivered (or DLQ past max)
+        continue
+    }
+    _ = m.Complete(ctx)      // remove it (idempotent under retries)
+}
 
-// ⭐ same-DB transactional enqueue (business write + enqueue commit together):
+// or hands-off: a Receiver auto-settles (nil→Complete, err→Abandon) — still in-process.
+eng.Receiver("orders", mqlite.WithConcurrency(4)).
+    Run(ctx, func(ctx context.Context, m *mqlite.Message) error { return handle(m.Body) })
+```
+
+**⭐ Transactional outbox — the embedded superpower.** Because the queue lives in
+the *same* SQLite database as your application tables, you can enqueue a message in
+the **same transaction** as your business write. No dual-write, no outbox poller,
+no lost events: either both commit or neither does.
+
+```go
 eng.Tx(ctx, func(tx *engine.EngineTx) error {
     tx.SQL().ExecContext(ctx, `INSERT INTO orders_tbl(id) VALUES (1)`)
-    _, err := tx.Send("orders", engine.OutMessage{Body: []byte("evt")})
+    _, err := tx.Send("orders", engine.OutMessage{Body: []byte("order-created")})
     return err // commit both, or roll back both
 })
 ```
+
+> Outgrow a single process? The *same* engine upgrades to a network broker with one
+> call — `eng.Serve(ctx, ":8080")` — and remote clients speak the same semantics
+> over HTTP (§2–§4). Embedded and broker are not two products; they are one engine.
 
 ### 2. Serve a broker
 
