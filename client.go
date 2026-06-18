@@ -92,6 +92,8 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, eb.Message)
 	case "already_exists":
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
+	case "name_conflict":
+		return fmt.Errorf("%w: %s", ErrNameConflict, eb.Message)
 	case "message_too_large":
 		return fmt.Errorf("%w: %s", ErrMessageTooLarge, eb.Message)
 	case "lock_lost":
@@ -110,7 +112,7 @@ func outToWire(m OutMessage) wire.Message {
 	return wire.Message{
 		Body:          m.Body,
 		MessageID:     m.MessageID,
-		SessionID:     m.SessionID,
+		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
@@ -123,7 +125,7 @@ func (c *Client) wireToMessage(queue string, wm wire.Message) *Message {
 		SequenceNumber: wm.SeqNumber,
 		Body:           wm.Body,
 		MessageID:      wm.MessageID,
-		SessionID:      wm.SessionID,
+		GroupID:        wm.GroupID,
 		CorrelationID:  wm.CorrelationID,
 		Subject:        wm.Subject,
 		ContentType:    wm.ContentType,
@@ -144,28 +146,37 @@ func msToTime(ms int64) time.Time {
 	return time.UnixMilli(ms)
 }
 
-// ── send / schedule ─────────────────────────────────────────────────────────
+// ── send ────────────────────────────────────────────────────────────────────
 
-// Send enqueues one message and returns its seq (0 if deduped away).
-func (c *Client) Send(ctx context.Context, queue string, m OutMessage) (int64, error) {
+// SendOne enqueues one message and returns its seq. A dedup conflict (same id,
+// different body) surfaces as ErrDedupConflict. SendOpts.At schedules delayed delivery.
+func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts ...SendOpts) (int64, error) {
+	o := firstOpt(opts)
+	path := wire.PathSend
+	req := wire.SendRequest{Queue: queue, Messages: []wire.Message{outToWire(m)}, TTLMs: m.TTL.Milliseconds()}
+	if !o.At.IsZero() {
+		path = wire.PathSchedule
+		req.ScheduledEnqueueTimeMs = o.At.UnixMilli()
+	}
 	var resp wire.SendResponse
-	err := c.post(ctx, wire.PathSend, wire.SendRequest{
-		Queue: queue, Messages: []wire.Message{outToWire(m)}, TTLMs: m.TTL.Milliseconds(),
-	}, &resp)
-	if err != nil {
+	if err := c.post(ctx, path, req, &resp); err != nil {
 		return 0, err
 	}
-	if len(resp.SeqNumbers) == 0 {
-		return 0, nil
+	if len(resp.SeqNumbers) == 0 || resp.SeqNumbers[0] == 0 {
+		return 0, ErrDedupConflict
 	}
 	return resp.SeqNumbers[0], nil
 }
 
-// SendBatch enqueues many messages in one request/transaction.
-func (c *Client) SendBatch(ctx context.Context, queue string, ms []OutMessage) ([]int64, error) {
-	wm := make([]wire.Message, len(ms))
+// Send enqueues one or many messages in one request/transaction (use SendOne
+// for a single seq return or At() scheduling).
+func (c *Client) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]int64, error) {
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	wm := make([]wire.Message, len(msgs))
 	var ttl int64
-	for i, m := range ms {
+	for i, m := range msgs {
 		wm[i] = outToWire(m)
 		if ttl == 0 {
 			ttl = m.TTL.Milliseconds()
@@ -178,38 +189,30 @@ func (c *Client) SendBatch(ctx context.Context, queue string, ms []OutMessage) (
 	return resp.SeqNumbers, nil
 }
 
-// Schedule enqueues a message that becomes visible at `at`.
-func (c *Client) Schedule(ctx context.Context, queue string, m OutMessage, at time.Time) (int64, error) {
-	var resp wire.SendResponse
-	err := c.post(ctx, wire.PathSchedule, wire.SendRequest{
-		Queue: queue, Messages: []wire.Message{outToWire(m)},
-		ScheduledEnqueueTimeMs: at.UnixMilli(), TTLMs: m.TTL.Milliseconds(),
-	}, &resp)
-	if err != nil {
-		return 0, err
-	}
-	if len(resp.SeqNumbers) == 0 {
-		return 0, nil
-	}
-	return resp.SeqNumbers[0], nil
-}
-
-// CancelScheduled deletes a not-yet-activated scheduled message.
-func (c *Client) CancelScheduled(ctx context.Context, queue string, seq int64) error {
-	return c.post(ctx, wire.PathCancelScheduled, wire.CancelScheduledRequest{Queue: queue, SeqNumber: seq}, &wire.SettleResponse{})
+// Cancel deletes a not-yet-activated scheduled message.
+func (c *Client) Cancel(ctx context.Context, queue string, seq int64) error {
+	return c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: seq}, &wire.SettleResponse{})
 }
 
 // ── receive ─────────────────────────────────────────────────────────────────
 
 // Receive claims up to N messages (Peek-Lock by default), with optional long-poll.
-func (c *Client) Receive(ctx context.Context, queue string, opts ...ReceiveOption) ([]*Message, error) {
-	cfg := buildReceive(opts)
+// RecvOpts.Pick fetches previously-deferred messages by seq instead of claiming.
+func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([]*Message, error) {
+	o := firstOpt(opts)
 	var resp wire.ReceiveResponse
-	if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
-		Queue: queue, MaxMessages: cfg.MaxMessages, WaitTimeMs: cfg.WaitMs,
-		ReceiveMode: int(cfg.Mode), AttemptID: cfg.AttemptID, // idempotent receive
-	}, &resp); err != nil {
-		return nil, err
+	if len(o.Pick) > 0 {
+		if err := c.post(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, SeqNumbers: o.Pick}, &resp); err != nil {
+			return nil, err
+		}
+	} else {
+		eo := o.toEngine()
+		if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+			Queue: queue, MaxMessages: eo.MaxMessages, WaitTimeMs: eo.WaitMs,
+			ReceiveMode: int(eo.Mode), AttemptID: eo.AttemptID, // idempotent receive
+		}, &resp); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
@@ -232,22 +235,9 @@ func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs i
 	return out, nil
 }
 
-// ReceiveDeferred locks previously-deferred messages by seq.
-func (c *Client) ReceiveDeferred(ctx context.Context, queue string, seqs ...int64) ([]*Message, error) {
-	var resp wire.ReceiveResponse
-	if err := c.post(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, SeqNumbers: seqs}, &resp); err != nil {
-		return nil, err
-	}
-	out := make([]*Message, len(resp.Messages))
-	for i, wm := range resp.Messages {
-		out[i] = c.wireToMessage(queue, wm)
-	}
-	return out, nil
-}
-
 // Peek browses without locking.
-func (c *Client) Peek(ctx context.Context, queue string, opts ...PeekOption) ([]*PeekedMessage, error) {
-	p := buildPeek(opts)
+func (c *Client) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]*PeekedMessage, error) {
+	p := firstOpt(opts).toEngine()
 	var resp wire.PeekResponse
 	if err := c.post(ctx, wire.PathPeek, wire.PeekRequest{
 		Queue: queue, FromSeq: p.FromSeq, State: string(p.State), Max: p.Max,
@@ -274,9 +264,9 @@ func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	}, &wire.Empty{})
 }
 
-// CreateSubscription registers a subscription under a topic with an optional filter.
-func (c *Client) CreateSubscription(ctx context.Context, topic, name string, f *Filter) error {
-	return c.post(ctx, wire.PathCreateSubscription, wire.CreateSubscriptionRequest{Topic: topic, Name: name, Filter: f}, &wire.Empty{})
+// Subscribe registers a subscription under a topic with an optional filter.
+func (c *Client) Subscribe(ctx context.Context, topic, name string, f *Filter) error {
+	return c.post(ctx, wire.PathSubscribe, wire.SubscribeRequest{Topic: topic, Name: name, Filter: f}, &wire.Empty{})
 }
 
 // ListQueues lists queues/subscriptions.
@@ -293,10 +283,10 @@ func (c *Client) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	return out, nil
 }
 
-// QueueMetrics returns counters for a queue.
-func (c *Client) QueueMetrics(ctx context.Context, queue string) (Metrics, error) {
+// Stats returns counters for a queue.
+func (c *Client) Stats(ctx context.Context, queue string) (Metrics, error) {
 	var resp wire.MetricsResponse
-	if err := c.post(ctx, wire.PathMetrics, wire.MetricsRequest{Queue: queue}, &resp); err != nil {
+	if err := c.post(ctx, wire.PathStats, wire.MetricsRequest{Queue: queue}, &resp); err != nil {
 		return Metrics{}, err
 	}
 	return Metrics{Queue: resp.Queue, Active: resp.Active, Locked: resp.Locked, Deferred: resp.Deferred,
@@ -305,8 +295,8 @@ func (c *Client) QueueMetrics(ctx context.Context, queue string) (Metrics, error
 }
 
 // Redrive moves dead-lettered messages back to active.
-func (c *Client) Redrive(ctx context.Context, dlqQueue string, opts ...RedriveOption) (int, error) {
-	r := buildRedrive(opts)
+func (c *Client) Redrive(ctx context.Context, dlqQueue string, opts ...RedriveOpts) (int, error) {
+	r := firstOpt(opts).toEngine()
 	var resp wire.RedriveResponse
 	if err := c.post(ctx, wire.PathRedrive, wire.RedriveRequest{
 		Queue: dlqQueue, Target: r.Target, Max: r.Max, OlderThanMs: r.OlderThanMs, RatePerSec: r.RatePerSec,
@@ -314,6 +304,19 @@ func (c *Client) Redrive(ctx context.Context, dlqQueue string, opts ...RedriveOp
 		return 0, err
 	}
 	return resp.Moved, nil
+}
+
+// Purge permanently deletes dead-lettered messages (PurgeOpts scopes it; no opts
+// purges the whole DLQ). Returns count deleted.
+func (c *Client) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (int, error) {
+	p := firstOpt(opts).toEngine()
+	var resp wire.PurgeResponse
+	if err := c.post(ctx, wire.PathPurge, wire.PurgeRequest{
+		Queue: queue, Max: p.Max, OlderThanMs: p.OlderThanMs,
+	}, &resp); err != nil {
+		return 0, err
+	}
+	return resp.Purged, nil
 }
 
 // Receiver returns a stateful receive loop bound to this client.
@@ -340,14 +343,14 @@ func (c *Client) complete(ctx context.Context, q string, seq int64, tok string) 
 func (c *Client) abandon(ctx context.Context, q string, seq int64, tok string, delayMs int64) error {
 	return c.settle(ctx, wire.PathAbandon, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok, DelayMs: delayMs})
 }
-func (c *Client) deadLetter(ctx context.Context, q string, seq int64, tok, reason, desc string) error {
-	return c.settle(ctx, wire.PathDeadLetter, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok, DeadLetterReason: reason, DeadLetterDescription: desc})
+func (c *Client) reject(ctx context.Context, q string, seq int64, tok, reason, desc string) error {
+	return c.settle(ctx, wire.PathReject, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok, DeadLetterReason: reason, DeadLetterDescription: desc})
 }
 func (c *Client) deferMsg(ctx context.Context, q string, seq int64, tok string) error {
 	return c.settle(ctx, wire.PathDefer, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok})
 }
-func (c *Client) renewLock(ctx context.Context, q string, seq int64, tok string) error {
-	return c.settle(ctx, wire.PathRenewLock, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok})
+func (c *Client) renew(ctx context.Context, q string, seq int64, tok string) error {
+	return c.settle(ctx, wire.PathRenew, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok})
 }
 
 // PeekedMessage is a read-only browse result.
@@ -356,7 +359,7 @@ type PeekedMessage struct {
 	State          State
 	Body           []byte
 	MessageID      string
-	SessionID      string
+	GroupID        string
 	CorrelationID  string
 	Subject        string
 	ContentType    string
@@ -373,7 +376,7 @@ func wireToPeeked(wm wire.Message) *PeekedMessage {
 		State:          State(wm.State),
 		Body:           wm.Body,
 		MessageID:      wm.MessageID,
-		SessionID:      wm.SessionID,
+		GroupID:        wm.GroupID,
 		CorrelationID:  wm.CorrelationID,
 		Subject:        wm.Subject,
 		ContentType:    wm.ContentType,

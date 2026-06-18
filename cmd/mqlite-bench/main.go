@@ -312,7 +312,7 @@ func produce(ctx context.Context, eng *engine.Engine, q string, d time.Duration,
 			var local int64
 			for time.Now().Before(deadline) {
 				t := time.Now()
-				if _, err := eng.Send(ctx, q, engine.OutMessage{Body: b}); err == nil {
+				if _, err := eng.SendOne(ctx, q, engine.OutMessage{Body: b}); err == nil {
 					h.add(time.Since(t))
 					local++
 				}
@@ -342,7 +342,7 @@ func batchProduce(ctx context.Context, eng *engine.Engine, q string, d time.Dura
 			var local int64
 			for time.Now().Before(deadline) {
 				t := time.Now()
-				if _, err := eng.SendBatch(ctx, q, ms); err == nil {
+				if _, err := eng.Send(ctx, q, ms...); err == nil {
 					h.add(time.Since(t)) // per-batch latency
 					local += int64(batch)
 				}
@@ -366,8 +366,8 @@ func sessionsRun(ctx context.Context, eng *engine.Engine, q string, d time.Durat
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(int64(seed) + 1))
 			for time.Now().Before(deadline) {
-				sid := "g" + strconv.Itoa(rng.Intn(groups))
-				if _, err := eng.Send(ctx, q, engine.OutMessage{Body: b, SessionID: sid}); err == nil {
+				gid := "g" + strconv.Itoa(rng.Intn(groups))
+				if _, err := eng.SendOne(ctx, q, engine.OutMessage{Body: b, GroupID: gid}); err == nil {
 					atomic.AddInt64(&prod, 1)
 				}
 			}
@@ -390,7 +390,7 @@ func e2eRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, 
 		go func() {
 			defer wg.Done()
 			for time.Now().Before(deadline) {
-				eng.Send(ctx, q, engine.OutMessage{Body: b})
+				eng.SendOne(ctx, q, engine.OutMessage{Body: b})
 			}
 		}()
 	}
@@ -400,9 +400,9 @@ func e2eRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, 
 	return cons()
 }
 
-// consumeUntil starts C consumers that Receive(16)+Complete until stop closes.
+// consumeUntil starts C consumers that Receive(16)+Ack until stop closes.
 // Returns a func that (after stop) blocks until all consumers finish, then
-// returns the consumed count and the merged per-message Complete-latency histogram.
+// returns the consumed count and the merged per-message Ack-latency histogram.
 func consumeUntil(ctx context.Context, eng *engine.Engine, q string, C int, stop <-chan struct{}) func() (int64, *hist) {
 	hs := make([]*hist, C)
 	var total int64
@@ -488,7 +488,7 @@ func prefill(ctx context.Context, eng *engine.Engine, q string, n, batch, msg in
 		ms[i] = engine.OutMessage{Body: b}
 	}
 	for i := 0; i < n; i += batch {
-		eng.SendBatch(ctx, q, ms)
+		eng.Send(ctx, q, ms...)
 	}
 }
 

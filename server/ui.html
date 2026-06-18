@@ -99,7 +99,7 @@
       $('qcount').textContent='('+queues.length+')';
       if(!queues.length){ $('queues').innerHTML='<div class="empty">没有队列</div>'; return; }
       // fetch metrics per queue (concurrently)
-      const metrics=await Promise.all(queues.map(q=>api('/mqlite.v1.QueueService/GetQueueMetrics',{queue:q.name}).catch(()=>({}))));
+      const metrics=await Promise.all(queues.map(q=>api('/mqlite.v1.QueueService/Stats',{queue:q.name}).catch(()=>({}))));
       let html='<table><tr><th>名称</th><th>类型</th><th class="num">active</th><th class="num">locked</th><th class="num">defer</th><th class="num">sched</th><th class="num">DLQ</th><th class="num">total</th></tr>';
       queues.forEach((q,i)=>{const m=metrics[i];
         html+=`<tr class="q" data-q="${q.name}" onclick="selectQ('${q.name}',this)">`+

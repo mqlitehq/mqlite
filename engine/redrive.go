@@ -9,9 +9,9 @@ import (
 
 // dlqRec is a dead-lettered row carried across a cross-queue move.
 type dlqRec struct {
-	id                                                         int64
-	body                                                       []byte
-	messageID, correlationID, sessionID, ctype, subject, props sql.NullString
+	id                                                       int64
+	body                                                     []byte
+	messageID, correlationID, groupID, ctype, subject, props sql.NullString
 }
 
 // Redrive moves dead-lettered messages back to active for reprocessing (§11.2).
@@ -48,7 +48,7 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 	}
 
 	// Select the candidate set up front (single writer → the set is stable).
-	selQuery := "SELECT id,body,message_id,correlation_id,session_id,content_type,subject,properties" +
+	selQuery := "SELECT id,body,message_id,correlation_id,group_id,content_type,subject,properties" +
 		" FROM messages WHERE " + where + " ORDER BY id" + limit
 	rows, err := e.db.query(ctx, selQuery, args...)
 	if err != nil {
@@ -57,7 +57,7 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 	var recs []dlqRec
 	for rows.Next() {
 		var r dlqRec
-		if err := rows.Scan(&r.id, &r.body, &r.messageID, &r.correlationID, &r.sessionID,
+		if err := rows.Scan(&r.id, &r.body, &r.messageID, &r.correlationID, &r.groupID,
 			&r.ctype, &r.subject, &r.props); err != nil {
 			rows.Close()
 			return 0, err
@@ -122,9 +122,9 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO messages
 				  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
-				   message_id,correlation_id,session_id,content_type,subject,properties,body)
+				   message_id,correlation_id,group_id,content_type,subject,properties,body)
 				VALUES (?, 'active', 0, 0, NULL, 0, ?, 0, ?,?,?,?,?,?,?)`,
-				target, now, r.messageID, r.correlationID, r.sessionID, r.ctype, r.subject, r.props, r.body); err != nil {
+				target, now, r.messageID, r.correlationID, r.groupID, r.ctype, r.subject, r.props, r.body); err != nil {
 				return err
 			}
 		}
@@ -133,11 +133,11 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 	})
 }
 
-// PurgeDeadLetter permanently deletes dead-lettered messages from a queue's DLQ
-// (§7.3 PurgeDeadLetter). Use after a redrive, or to discard poison messages that
-// will never be reprocessed. opts.Max / opts.OlderThanMs scope the purge; both
-// zero purges the whole DLQ. Returns the number of rows deleted.
-func (e *Engine) PurgeDeadLetter(ctx context.Context, queue string, opts RedriveOptions) (int, error) {
+// Purge permanently deletes dead-lettered messages from a queue's DLQ (§7.3).
+// Use after a redrive, or to discard poison messages that will never be
+// reprocessed. opts.Max / opts.OlderThanMs scope the purge; both zero purges the
+// whole DLQ. Returns the number of rows deleted.
+func (e *Engine) Purge(ctx context.Context, queue string, opts RedriveOptions) (int, error) {
 	if _, err := e.loadQueue(ctx, queue); err != nil {
 		return 0, err
 	}

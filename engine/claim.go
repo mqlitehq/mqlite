@@ -20,7 +20,7 @@ func randToken() string {
 // idx_msg_active(queue,id) index (O(log n) even with a deep backlog). Expired
 // locks are returned to 'active' by the reaper (§8.8), so visibility-timeout
 // redelivery happens within the reaper interval rather than on the claim path.
-// session_id IS NULL  -> the message is its own group (never group-blocked);
+// group_id IS NULL  -> the message is its own group (never group-blocked);
 // otherwise the group head is released only when no earlier same-group message
 // is still locked/deferred/scheduled (in-order, FIFO-per-group).
 const claimSQL = `
@@ -30,15 +30,15 @@ UPDATE messages
    SELECT m.id FROM messages m
     WHERE m.queue=? AND m.state='active'
       AND m.visible_at<=? AND (m.expires_at=0 OR m.expires_at>?)
-      AND ( m.session_id IS NULL
+      AND ( m.group_id IS NULL
          OR NOT EXISTS (
               SELECT 1 FROM messages b
-               WHERE b.queue=m.queue AND b.session_id IS m.session_id
+               WHERE b.queue=m.queue AND b.group_id IS m.group_id
                  AND b.id < m.id
                  AND ( (b.state='locked' AND b.locked_until>?)
                     OR  b.state IN ('deferred','scheduled') ) ) )
     ORDER BY m.id ASC LIMIT 1)
-RETURNING id, body, delivery_count, session_id, message_id, correlation_id,
+RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
           subject, content_type, properties, enqueued_at, locked_until`
 
 // Receive claims up to opts.MaxMessages messages (Peek-Lock by default), with
@@ -124,12 +124,12 @@ func (e *Engine) claimOne(ctx context.Context, q queueRow, now int64) (*Message,
 	token := randToken()
 	lockUntil := now + q.lockDurationMs
 	var (
-		m                                                   Message
-		sessionID, messageID, correlationID, subject, ctype sql.NullString
-		props                                               sql.NullString
+		m                                                 Message
+		groupID, messageID, correlationID, subject, ctype sql.NullString
+		props                                             sql.NullString
 	)
 	err := e.db.queryRowScan(ctx,
-		[]any{&m.SeqNumber, &m.Body, &m.DeliveryCount, &sessionID, &messageID,
+		[]any{&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
 			&correlationID, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs},
 		claimSQL, lockUntil, token, q.name, now, now, now)
 	if err != nil {
@@ -139,7 +139,7 @@ func (e *Engine) claimOne(ctx context.Context, q queueRow, now int64) (*Message,
 		return nil, err
 	}
 	m.LockToken = token
-	m.SessionID = sessionID.String
+	m.GroupID = groupID.String
 	m.MessageID = messageID.String
 	m.CorrelationID = correlationID.String
 	m.Subject = subject.String
@@ -160,17 +160,17 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 		token := randToken()
 		lockUntil := now + q.lockDurationMs
 		var (
-			m                                                   Message
-			sessionID, messageID, correlationID, subject, ctype sql.NullString
-			props                                               sql.NullString
+			m                                                 Message
+			groupID, messageID, correlationID, subject, ctype sql.NullString
+			props                                             sql.NullString
 		)
 		err := e.db.queryRowScan(ctx,
-			[]any{&m.SeqNumber, &m.Body, &m.DeliveryCount, &sessionID, &messageID,
+			[]any{&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
 				&correlationID, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs}, `
 			UPDATE messages
 			   SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
 			 WHERE id=? AND queue=? AND state='deferred'
-			RETURNING id, body, delivery_count, session_id, message_id, correlation_id,
+			RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
 			          subject, content_type, properties, enqueued_at, locked_until`,
 			lockUntil, token, seq, queue)
 		if err != nil {
@@ -180,7 +180,7 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 			return out, err
 		}
 		m.LockToken = token
-		m.SessionID = sessionID.String
+		m.GroupID = groupID.String
 		m.MessageID = messageID.String
 		m.CorrelationID = correlationID.String
 		m.Subject = subject.String

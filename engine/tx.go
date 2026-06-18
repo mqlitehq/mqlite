@@ -23,8 +23,8 @@ type EngineTx struct {
 // in the same transaction as the enqueue.
 func (t *EngineTx) SQL() *sql.Tx { return t.tx }
 
-// Send enqueues a message inside the open transaction.
-func (t *EngineTx) Send(queue string, m OutMessage) (int64, error) {
+// SendOne enqueues a message inside the open transaction.
+func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 	if int64(len(m.Body)) > t.e.maxMsgBytes {
 		return 0, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(m.Body), t.e.maxMsgBytes)
 	}

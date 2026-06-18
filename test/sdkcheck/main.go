@@ -82,7 +82,7 @@ func main() {
 }
 
 func recv1(ctx context.Context, cli *mqlite.Client, q string, wait time.Duration) *mqlite.Message {
-	ms, err := cli.Receive(ctx, q, mqlite.WithWait(wait))
+	ms, err := cli.Receive(ctx, q, mqlite.RecvOpts{Wait: wait})
 	if err != nil || len(ms) == 0 {
 		return nil
 	}
@@ -90,27 +90,27 @@ func recv1(ctx context.Context, cli *mqlite.Client, q string, wait time.Duration
 }
 
 func remoteLifecycle(ctx context.Context, cli *mqlite.Client) {
-	section("client: lifecycle (send → receive → complete)")
+	section("client: lifecycle (send → receive → ack)")
 	q := rid + "_sdk_basic"
 	check(cli.CreateQueue(ctx, q, mqlite.QueueConfig{}) == nil, "create queue")
-	seq, err := cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("hi"), MessageID: "m1", Subject: "x"})
+	seq, err := cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("hi"), MessageID: "m1", Subject: "x"})
 	check(err == nil && seq >= 1, "send returns seq")
 	m := recv1(ctx, cli, q, 3*time.Second)
 	check(m != nil && string(m.Body) == "hi" && m.MessageID == "m1", "receive round-trips body+id")
-	check(m != nil && m.Complete(ctx) == nil, "complete")
-	mt, _ := cli.QueueMetrics(ctx, q)
+	check(m != nil && m.Complete(ctx) == nil, "ack")
+	mt, _ := cli.Stats(ctx, q)
 	check(mt.Total == 0, "queue drained")
 }
 
 func remoteRedelivery(ctx context.Context, cli *mqlite.Client) {
-	section("client: abandon → redelivery (delivery_count grows)")
+	section("client: nack → redelivery (delivery_count grows)")
 	q := rid + "_sdk_redeliver"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{MaxDeliveryCount: 10})
-	cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("x")})
+	cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("x")})
 	m := recv1(ctx, cli, q, 2*time.Second)
 	check(m != nil && m.DeliveryCount == 1, "first delivery count 1")
 	if m != nil {
-		check(m.Abandon(ctx) == nil, "abandon")
+		check(m.Abandon(ctx) == nil, "nack")
 	}
 	m2 := recv1(ctx, cli, q, 2*time.Second)
 	check(m2 != nil && m2.DeliveryCount == 2, "redelivered with count 2")
@@ -123,13 +123,13 @@ func remoteDLQRedrive(ctx context.Context, cli *mqlite.Client) {
 	section("client: dead-letter + redrive")
 	q := rid + "_sdk_dlq"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{MaxDeliveryCount: 2})
-	cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("poison")})
+	cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("poison")})
 	for i := 0; i < 2; i++ {
 		if m := recv1(ctx, cli, q, 2*time.Second); m != nil {
 			m.Abandon(ctx)
 		}
 	}
-	pk, _ := cli.Peek(ctx, q, mqlite.PeekState(mqlite.DeadLettered))
+	pk, _ := cli.Peek(ctx, q, mqlite.PeekOpts{State: mqlite.DeadLettered})
 	check(len(pk) == 1, "message in DLQ after max deliveries")
 	moved, err := cli.Redrive(ctx, q)
 	check(err == nil && moved >= 1, "redrive moved >= 1")
@@ -140,8 +140,8 @@ func remoteSessions(ctx context.Context, cli *mqlite.Client) {
 	section("client: MessageGroupId ordering")
 	q := rid + "_sdk_sess"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{})
-	cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("s1"), SessionID: "A"})
-	cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("s2"), SessionID: "A"})
+	cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("s1"), GroupID: "A"})
+	cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("s2"), GroupID: "A"})
 	m1 := recv1(ctx, cli, q, 2*time.Second)
 	check(m1 != nil && string(m1.Body) == "s1", "group head delivered first")
 	check(recv1(ctx, cli, q, 300*time.Millisecond) == nil, "rest of group blocked while head in-flight")
@@ -149,18 +149,18 @@ func remoteSessions(ctx context.Context, cli *mqlite.Client) {
 		m1.Complete(ctx)
 	}
 	m2 := recv1(ctx, cli, q, 2*time.Second)
-	check(m2 != nil && string(m2.Body) == "s2", "next in group after completion")
+	check(m2 != nil && string(m2.Body) == "s2", "next in group after ack")
 }
 
 func remoteTopic(ctx context.Context, cli *mqlite.Client) {
 	section("client: topic fan-out + filter")
 	topic := rid + "_sdk_topic"
-	cli.CreateSubscription(ctx, topic, topic+"_all", nil)
-	cli.CreateSubscription(ctx, topic, topic+"_paid", &mqlite.Filter{SubjectPrefix: "payment."})
-	cli.Send(ctx, topic, mqlite.OutMessage{Body: []byte("o"), Subject: "order.created"})
-	cli.Send(ctx, topic, mqlite.OutMessage{Body: []byte("p"), Subject: "payment.captured"})
-	all, _ := cli.QueueMetrics(ctx, topic+"_all")
-	paid, _ := cli.QueueMetrics(ctx, topic+"_paid")
+	cli.Subscribe(ctx, topic, topic+"_all", nil)
+	cli.Subscribe(ctx, topic, topic+"_paid", &mqlite.Filter{SubjectPrefix: "payment."})
+	cli.SendOne(ctx, topic, mqlite.OutMessage{Body: []byte("o"), Subject: "order.created"})
+	cli.SendOne(ctx, topic, mqlite.OutMessage{Body: []byte("p"), Subject: "payment.captured"})
+	all, _ := cli.Stats(ctx, topic+"_all")
+	paid, _ := cli.Stats(ctx, topic+"_paid")
 	check(all.Active == 2, "subscription 'all' received both")
 	check(paid.Active == 1, "subscription 'paid' filtered to payment.*")
 }
@@ -169,10 +169,10 @@ func remoteDedup(ctx context.Context, cli *mqlite.Client) {
 	section("client: dedup window + conflict")
 	q := rid + "_sdk_dedup"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{DedupWindow: 10 * time.Minute})
-	s1, _ := cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("p"), MessageID: "d1"})
-	s2, _ := cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("p"), MessageID: "d1"})
+	s1, _ := cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("p"), MessageID: "d1"})
+	s2, _ := cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("p"), MessageID: "d1"})
 	check(s1 == s2, "duplicate returns original seq")
-	_, err := cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("DIFFERENT"), MessageID: "d1"})
+	_, err := cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("DIFFERENT"), MessageID: "d1"})
 	check(errors.Is(err, mqlite.ErrDedupConflict), "same id / different body -> conflict")
 }
 
@@ -180,12 +180,12 @@ func remoteDefer(ctx context.Context, cli *mqlite.Client) {
 	section("client: defer / receive-deferred")
 	q := rid + "_sdk_defer"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{})
-	seq, _ := cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("later")})
+	seq, _ := cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("later")})
 	m := recv1(ctx, cli, q, 2*time.Second)
 	check(m != nil && m.Defer(ctx) == nil, "defer")
 	check(recv1(ctx, cli, q, 300*time.Millisecond) == nil, "hidden from normal receive")
-	dm, _ := cli.ReceiveDeferred(ctx, q, seq)
-	check(len(dm) == 1, "receive-deferred fetches by seq")
+	dm, _ := cli.Receive(ctx, q, mqlite.RecvOpts{Pick: []int64{seq}})
+	check(len(dm) == 1, "Pick fetches deferred by seq")
 }
 
 func remoteSchedule(ctx context.Context, cli *mqlite.Client) {
@@ -194,7 +194,7 @@ func remoteSchedule(ctx context.Context, cli *mqlite.Client) {
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{})
 	// generous delay so the "before" check finishes before activation even on a
 	// remote backend with hundreds-of-ms round-trips.
-	cli.Schedule(ctx, q, mqlite.OutMessage{Body: []byte("s")}, time.Now().Add(2*time.Second))
+	cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("s")}, mqlite.SendOpts{At: time.Now().Add(2 * time.Second)})
 	check(recv1(ctx, cli, q, 0) == nil, "not visible before time") // immediate, no long-poll
 	time.Sleep(4 * time.Second)
 	check(recv1(ctx, cli, q, 3*time.Second) != nil, "visible after time")
@@ -204,10 +204,10 @@ func remoteReceiveAndDelete(ctx context.Context, cli *mqlite.Client) {
 	section("client: receive-and-delete")
 	q := rid + "_sdk_rad"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{})
-	cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("t")})
-	ms, _ := cli.Receive(ctx, q, mqlite.WithWait(2*time.Second), mqlite.WithReceiveAndDelete())
+	cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("t")})
+	ms, _ := cli.Receive(ctx, q, mqlite.RecvOpts{Wait: 2 * time.Second, AtMostOnce: true})
 	check(len(ms) == 1, "received one")
-	mt, _ := cli.QueueMetrics(ctx, q)
+	mt, _ := cli.Stats(ctx, q)
 	check(mt.Total == 0, "removed immediately")
 }
 
@@ -217,21 +217,21 @@ func remoteReceiverRun(ctx context.Context, cli *mqlite.Client) {
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{})
 	const n = 4
 	for i := 0; i < n; i++ {
-		cli.Send(ctx, q, mqlite.OutMessage{Body: []byte("job")})
+		cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("job")})
 	}
 	var done int64
 	runCtx, stop := context.WithTimeout(ctx, 10*time.Second)
 	defer stop()
 	go cli.Receiver(q, mqlite.WithConcurrency(2)).Run(runCtx, func(c context.Context, m *mqlite.Message) error {
 		atomic.AddInt64(&done, 1)
-		return nil // -> auto Complete
+		return nil // -> auto Ack
 	})
 	deadline := time.Now().Add(8 * time.Second)
 	for atomic.LoadInt64(&done) < n && time.Now().Before(deadline) {
 		time.Sleep(30 * time.Millisecond)
 	}
 	check(atomic.LoadInt64(&done) >= n, "Receiver processed all jobs")
-	mt, _ := cli.QueueMetrics(ctx, q)
+	mt, _ := cli.Stats(ctx, q)
 	check(mt.Total == 0, "queue drained by Receiver")
 }
 
@@ -240,16 +240,16 @@ func remoteAllFields(ctx context.Context, cli *mqlite.Client) {
 	q := rid + "_sdk_fields"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{})
 	in := mqlite.OutMessage{
-		Body: []byte("body \x00\xff"), MessageID: "M1", SessionID: "S1", CorrelationID: "C1",
+		Body: []byte("body \x00\xff"), MessageID: "M1", GroupID: "S1", CorrelationID: "C1",
 		Subject: "sub.x", ContentType: "application/json",
 		Properties: map[string]string{"tenant": "acme", "k": "中文🚀"},
 	}
-	cli.Send(ctx, q, in)
+	cli.SendOne(ctx, q, in)
 	m := recv1(ctx, cli, q, 2*time.Second)
-	ok := m != nil && string(m.Body) == string(in.Body) && m.MessageID == "M1" && m.SessionID == "S1" &&
+	ok := m != nil && string(m.Body) == string(in.Body) && m.MessageID == "M1" && m.GroupID == "S1" &&
 		m.CorrelationID == "C1" && m.Subject == "sub.x" && m.ContentType == "application/json" &&
 		m.Properties["k"] == "中文🚀"
-	check(ok, "all fields (id/session/correlation/subject/content_type/properties/body) preserved")
+	check(ok, "all fields (id/group/correlation/subject/content_type/properties/body) preserved")
 }
 
 func remoteMaxSize(ctx context.Context, cli *mqlite.Client) {
@@ -262,12 +262,12 @@ func remoteMaxSize(ctx context.Context, cli *mqlite.Client) {
 			cap = n
 		}
 	}
-	if _, err := cli.Send(ctx, q, mqlite.OutMessage{Body: make([]byte, cap)}); err != nil {
+	if _, err := cli.SendOne(ctx, q, mqlite.OutMessage{Body: make([]byte, cap)}); err != nil {
 		check(false, "body == cap accepted: "+err.Error())
 	} else {
 		check(true, "body == cap accepted")
 	}
-	_, err := cli.Send(ctx, q, mqlite.OutMessage{Body: make([]byte, cap+1)})
+	_, err := cli.SendOne(ctx, q, mqlite.OutMessage{Body: make([]byte, cap+1)})
 	check(errors.Is(err, mqlite.ErrMessageTooLarge), "body == cap+1 -> ErrMessageTooLarge")
 }
 
@@ -275,11 +275,11 @@ func remoteCancelScheduled(ctx context.Context, cli *mqlite.Client) {
 	section("client: cancel scheduled")
 	q := rid + "_sdk_cancel"
 	cli.CreateQueue(ctx, q, mqlite.QueueConfig{})
-	seq, _ := cli.Schedule(ctx, q, mqlite.OutMessage{Body: []byte("later")}, time.Now().Add(time.Minute))
-	pk, _ := cli.Peek(ctx, q, mqlite.PeekState(mqlite.Scheduled))
+	seq, _ := cli.SendOne(ctx, q, mqlite.OutMessage{Body: []byte("later")}, mqlite.SendOpts{At: time.Now().Add(time.Minute)})
+	pk, _ := cli.Peek(ctx, q, mqlite.PeekOpts{State: mqlite.Scheduled})
 	check(len(pk) == 1, "scheduled present before cancel")
-	check(cli.CancelScheduled(ctx, q, seq) == nil, "cancel ok")
-	pk, _ = cli.Peek(ctx, q, mqlite.PeekState(mqlite.Scheduled))
+	check(cli.Cancel(ctx, q, seq) == nil, "cancel ok")
+	pk, _ = cli.Peek(ctx, q, mqlite.PeekOpts{State: mqlite.Scheduled})
 	check(len(pk) == 0, "scheduled gone after cancel")
 }
 
@@ -303,11 +303,11 @@ func embeddedTx(ctx context.Context) {
 		if _, e := tx.SQL().ExecContext(ctx, `INSERT INTO biz(id) VALUES (1)`); e != nil {
 			return e
 		}
-		_, e := tx.Send("q", engine.OutMessage{Body: []byte("evt")})
+		_, e := tx.SendOne("q", engine.OutMessage{Body: []byte("evt")})
 		return e
 	})
 	check(err == nil, "tx commit succeeds")
-	ms, _ := emb.Receive(ctx, "q", mqlite.WithWait(time.Second))
+	ms, _ := emb.Receive(ctx, "q", mqlite.RecvOpts{Wait: time.Second})
 	check(len(ms) == 1, "committed tx enqueued the message")
 	for _, m := range ms {
 		m.Complete(ctx)
@@ -316,10 +316,10 @@ func embeddedTx(ctx context.Context) {
 	// rollback: returning an error enqueues nothing
 	boom := errors.New("boom")
 	err = emb.Tx(ctx, func(tx *engine.EngineTx) error {
-		tx.Send("q", engine.OutMessage{Body: []byte("ghost")})
+		tx.SendOne("q", engine.OutMessage{Body: []byte("ghost")})
 		return boom
 	})
 	check(errors.Is(err, boom), "tx rollback returns the error")
-	ms, _ = emb.Receive(ctx, "q", mqlite.WithWait(200*time.Millisecond))
+	ms, _ = emb.Receive(ctx, "q", mqlite.RecvOpts{Wait: 200 * time.Millisecond})
 	check(len(ms) == 0, "rolled-back tx enqueued nothing")
 }

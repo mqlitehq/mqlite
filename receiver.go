@@ -122,7 +122,7 @@ func (r *Receiver) renewLoop(ctx context.Context, m *Message) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := m.RenewLock(ctx); err != nil {
+			if err := m.Renew(ctx); err != nil {
 				return
 			}
 		}

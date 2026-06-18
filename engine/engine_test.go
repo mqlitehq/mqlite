@@ -56,7 +56,7 @@ func TestSendReceiveComplete(t *testing.T) {
 	e, _ := testEngine(t)
 	mustQueue(t, e, "orders", QueueConfig{})
 
-	seq, err := e.Send(ctx, "orders", OutMessage{Body: []byte("hello")})
+	seq, err := e.SendOne(ctx, "orders", OutMessage{Body: []byte("hello")})
 	if err != nil || seq != 1 {
 		t.Fatalf("send seq=%d err=%v (want 1, nil)", seq, err)
 	}
@@ -71,7 +71,7 @@ func TestSendReceiveComplete(t *testing.T) {
 	if err := e.Complete(ctx, "orders", m.SeqNumber, m.LockToken); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	mt, _ := e.GetQueueMetrics(ctx, "orders")
+	mt, _ := e.Stats(ctx, "orders")
 	if mt.Total != 0 {
 		t.Fatalf("expected empty queue after complete, got %+v", mt)
 	}
@@ -82,7 +82,7 @@ func TestFencingTokenSafety(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{})
-	e.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 
 	m := recvOne(t, e, "q")
 	if err := e.Complete(ctx, "q", m.SeqNumber, "wrong-token"); !errors.Is(err, ErrLockLost) {
@@ -98,7 +98,7 @@ func TestAbandonAndDeadLetter(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{MaxDeliveryCount: 2})
-	e.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 
 	m := recvOne(t, e, "q") // delivery 1
 	if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 0); err != nil {
@@ -115,7 +115,7 @@ func TestAbandonAndDeadLetter(t *testing.T) {
 	if got := recvOne(t, e, "q"); got != nil {
 		t.Fatalf("expected DLQ, but received seq=%d", got.SeqNumber)
 	}
-	mt, _ := e.GetQueueMetrics(ctx, "q")
+	mt, _ := e.Stats(ctx, "q")
 	if mt.DeadLettered != 1 {
 		t.Fatalf("expected 1 dead-lettered, got %+v", mt)
 	}
@@ -126,7 +126,7 @@ func TestVisibilityTimeoutReaper(t *testing.T) {
 	ctx := context.Background()
 	e, ms := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1000, MaxDeliveryCount: 10})
-	e.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 
 	m := recvOne(t, e, "q")
 	if got := recvOne(t, e, "q"); got != nil {
@@ -146,7 +146,7 @@ func TestExpiredLockReclaimedByReaper(t *testing.T) {
 	ctx := context.Background()
 	e, ms := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1000, MaxDeliveryCount: 10})
-	e.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 
 	m := recvOne(t, e, "q")
 	advance(ms, 2*time.Second) // lock expires
@@ -166,7 +166,7 @@ func TestExpiredLockAtMaxNotReclaimed(t *testing.T) {
 	ctx := context.Background()
 	e, ms := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1000, MaxDeliveryCount: 1})
-	e.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 
 	_ = recvOne(t, e, "q") // delivery_count now 1 == max
 	advance(ms, 2*time.Second)
@@ -174,7 +174,7 @@ func TestExpiredLockAtMaxNotReclaimed(t *testing.T) {
 		t.Fatalf("at-max expired lock must not be reclaimed by claim, got seq=%d", got.SeqNumber)
 	}
 	e.RunMaintenanceOnce(ctx) // reaper dead-letters it
-	mt, _ := e.GetQueueMetrics(ctx, "q")
+	mt, _ := e.Stats(ctx, "q")
 	if mt.DeadLettered != 1 {
 		t.Fatalf("reaper should have dead-lettered, got %+v", mt)
 	}
@@ -205,16 +205,16 @@ func TestDedup(t *testing.T) {
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{DedupWindowMs: (10 * time.Minute).Milliseconds()})
 
-	s1, _ := e.Send(ctx, "q", OutMessage{Body: []byte("a"), MessageID: "id1"})
-	s2, _ := e.Send(ctx, "q", OutMessage{Body: []byte("a"), MessageID: "id1"})
+	s1, _ := e.SendOne(ctx, "q", OutMessage{Body: []byte("a"), MessageID: "id1"})
+	s2, _ := e.SendOne(ctx, "q", OutMessage{Body: []byte("a"), MessageID: "id1"})
 	if s1 != s2 {
 		t.Fatalf("duplicate should return original seq: %d vs %d", s1, s2)
 	}
-	mt, _ := e.GetQueueMetrics(ctx, "q")
+	mt, _ := e.Stats(ctx, "q")
 	if mt.Active != 1 {
 		t.Fatalf("dedup should keep depth at 1, got %d", mt.Active)
 	}
-	_, err := e.Send(ctx, "q", OutMessage{Body: []byte("DIFFERENT"), MessageID: "id1"})
+	_, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("DIFFERENT"), MessageID: "id1"})
 	if !errors.Is(err, ErrDedupConflict) {
 		t.Fatalf("expected DedupConflict for same id different body, got %v", err)
 	}
@@ -225,8 +225,8 @@ func TestSessionOrdering(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{})
-	e.Send(ctx, "q", OutMessage{Body: []byte("1"), SessionID: "order-7"})
-	e.Send(ctx, "q", OutMessage{Body: []byte("2"), SessionID: "order-7"})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("1"), GroupID: "order-7"})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("2"), GroupID: "order-7"})
 
 	m1 := recvOne(t, e, "q")
 	if m1 == nil || string(m1.Body) != "1" {
@@ -250,12 +250,12 @@ func TestSessionParallelGroups(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{})
-	e.Send(ctx, "q", OutMessage{Body: []byte("a1"), SessionID: "A"})
-	e.Send(ctx, "q", OutMessage{Body: []byte("b1"), SessionID: "B"})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("a1"), GroupID: "A"})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("b1"), GroupID: "B"})
 
 	m1 := recvOne(t, e, "q") // locks head of group A
 	m2 := recvOne(t, e, "q") // group B head still available
-	if m1 == nil || m2 == nil || m1.SessionID == m2.SessionID {
+	if m1 == nil || m2 == nil || m1.GroupID == m2.GroupID {
 		t.Fatalf("expected one from each group, got %v / %v", m1, m2)
 	}
 }
@@ -264,18 +264,18 @@ func TestSessionParallelGroups(t *testing.T) {
 func TestTopicFanoutAndFilter(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
-	if err := e.CreateSubscription(ctx, "events", "all", nil); err != nil {
+	if err := e.Subscribe(ctx, "events", "all", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.CreateSubscription(ctx, "events", "paid", &Filter{SubjectPrefix: "payment."}); err != nil {
+	if err := e.Subscribe(ctx, "events", "paid", &Filter{SubjectPrefix: "payment."}); err != nil {
 		t.Fatal(err)
 	}
-	e.Send(ctx, "events", OutMessage{Body: []byte("o"), Subject: "order.created"})
-	e.Send(ctx, "events", OutMessage{Body: []byte("p"), Subject: "payment.captured"})
+	e.SendOne(ctx, "events", OutMessage{Body: []byte("o"), Subject: "order.created"})
+	e.SendOne(ctx, "events", OutMessage{Body: []byte("p"), Subject: "payment.captured"})
 
 	// "all" gets both; "paid" only the payment.* one.
-	all, _ := e.GetQueueMetrics(ctx, "all")
-	paid, _ := e.GetQueueMetrics(ctx, "paid")
+	all, _ := e.Stats(ctx, "all")
+	paid, _ := e.Stats(ctx, "paid")
 	if all.Active != 2 {
 		t.Fatalf("subscription all should have 2, got %d", all.Active)
 	}
@@ -289,7 +289,7 @@ func TestDeferAndReceiveDeferred(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{})
-	e.Send(ctx, "q", OutMessage{Body: []byte("d")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("d")})
 	m := recvOne(t, e, "q")
 	if err := e.Defer(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
 		t.Fatal(err)
@@ -308,9 +308,9 @@ func TestRedrive(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{MaxDeliveryCount: 1})
-	e.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 	m := recvOne(t, e, "q")
-	e.DeadLetter(ctx, "q", m.SeqNumber, m.LockToken, "AppRequested", "bad")
+	e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "AppRequested", "bad")
 
 	moved, err := e.Redrive(ctx, "q", RedriveOptions{})
 	if err != nil || moved != 1 {
@@ -328,7 +328,7 @@ func TestCrashRecovery(t *testing.T) {
 	path := filepath.Join(dir, "mq.db")
 	e1, _ := testEngineAt(t, path)
 	mustQueue(t, e1, "q", QueueConfig{})
-	e1.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e1.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 	m := recvOne(t, e1, "q") // locked
 	if m == nil {
 		t.Fatal("expected a message")
@@ -357,7 +357,7 @@ func TestTxAtomicEnqueue(t *testing.T) {
 		if _, err := tx.SQL().ExecContext(ctx, `INSERT INTO biz(id) VALUES (1)`); err != nil {
 			return err
 		}
-		_, err := tx.Send("q", OutMessage{Body: []byte("evt")})
+		_, err := tx.SendOne("q", OutMessage{Body: []byte("evt")})
 		return err
 	})
 	if err != nil {
@@ -370,7 +370,7 @@ func TestTxAtomicEnqueue(t *testing.T) {
 	// rollback path: returning an error must enqueue nothing.
 	wantErr := errors.New("boom")
 	err = e.Tx(ctx, func(tx *EngineTx) error {
-		if _, err := tx.Send("q", OutMessage{Body: []byte("ghost")}); err != nil {
+		if _, err := tx.SendOne("q", OutMessage{Body: []byte("ghost")}); err != nil {
 			return err
 		}
 		return wantErr
@@ -388,12 +388,12 @@ func TestReceiveAndDelete(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{})
-	e.Send(ctx, "q", OutMessage{Body: []byte("x")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
 	ms, err := e.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveAndDelete})
 	if err != nil || len(ms) != 1 {
 		t.Fatalf("receive-and-delete: %v %d", err, len(ms))
 	}
-	mt, _ := e.GetQueueMetrics(ctx, "q")
+	mt, _ := e.Stats(ctx, "q")
 	if mt.Total != 0 {
 		t.Fatalf("message should be gone, got %+v", mt)
 	}

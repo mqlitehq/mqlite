@@ -11,7 +11,7 @@ type Message struct {
 	SequenceNumber int64
 	Body           []byte
 	MessageID      string
-	SessionID      string
+	GroupID        string
 	CorrelationID  string
 	Subject        string
 	ContentType    string
@@ -31,17 +31,15 @@ func (m *Message) Complete(ctx context.Context) error {
 }
 
 // Abandon releases the lock for immediate redelivery (optionally after a delay).
-func (m *Message) Abandon(ctx context.Context, opts ...AbandonOption) error {
-	c := abandonConfig{}
-	for _, o := range opts {
-		o(&c)
-	}
-	return m.s.abandon(ctx, m.queue, m.SequenceNumber, m.lockToken, c.delay.Milliseconds())
+func (m *Message) Abandon(ctx context.Context, opts ...AbandonOpts) error {
+	o := firstOpt(opts)
+	return m.s.abandon(ctx, m.queue, m.SequenceNumber, m.lockToken, o.Delay.Milliseconds())
 }
 
-// DeadLetter moves the message to the dead-letter state with a reason.
-func (m *Message) DeadLetter(ctx context.Context, reason, desc string) error {
-	return m.s.deadLetter(ctx, m.queue, m.SequenceNumber, m.lockToken, reason, desc)
+// Reject moves the message to the dead-letter state (optionally with a reason).
+func (m *Message) Reject(ctx context.Context, opts ...RejectOpts) error {
+	o := firstOpt(opts)
+	return m.s.reject(ctx, m.queue, m.SequenceNumber, m.lockToken, o.Reason, o.Detail)
 }
 
 // Defer sets the message aside, to be retrieved later by SequenceNumber.
@@ -49,18 +47,7 @@ func (m *Message) Defer(ctx context.Context) error {
 	return m.s.deferMsg(ctx, m.queue, m.SequenceNumber, m.lockToken)
 }
 
-// RenewLock extends the lock lease (for long-running handlers).
-func (m *Message) RenewLock(ctx context.Context) error {
-	return m.s.renewLock(ctx, m.queue, m.SequenceNumber, m.lockToken)
+// Renew extends the lock lease (for long-running handlers).
+func (m *Message) Renew(ctx context.Context) error {
+	return m.s.renew(ctx, m.queue, m.SequenceNumber, m.lockToken)
 }
-
-// LockToken exposes the fencing token (rarely needed; settlement is preferred).
-func (m *Message) LockToken() string { return m.lockToken }
-
-type abandonConfig struct{ delay time.Duration }
-
-// AbandonOption configures Abandon.
-type AbandonOption func(*abandonConfig)
-
-// WithDelay re-hides an abandoned message for d before redelivery (backoff).
-func WithDelay(d time.Duration) AbandonOption { return func(c *abandonConfig) { c.delay = d } }

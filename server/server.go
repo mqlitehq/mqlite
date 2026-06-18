@@ -47,19 +47,19 @@ func (s *Server) routes() {
 	h(wire.PathReceive, s.handleReceive)
 	h(wire.PathComplete, s.handleComplete)
 	h(wire.PathAbandon, s.handleAbandon)
-	h(wire.PathDeadLetter, s.handleDeadLetter)
+	h(wire.PathReject, s.handleReject)
 	h(wire.PathDefer, s.handleDefer)
 	h(wire.PathReceiveDeferred, s.handleReceiveDeferred)
-	h(wire.PathRenewLock, s.handleRenewLock)
+	h(wire.PathRenew, s.handleRenew)
 	h(wire.PathSchedule, s.handleSchedule)
-	h(wire.PathCancelScheduled, s.handleCancelScheduled)
+	h(wire.PathCancel, s.handleCancel)
 	h(wire.PathPeek, s.handlePeek)
-	h(wire.PathMetrics, s.handleMetrics)
+	h(wire.PathStats, s.handleStats)
 	h(wire.PathCreateQueue, s.handleCreateQueue)
-	h(wire.PathCreateSubscription, s.handleCreateSubscription)
+	h(wire.PathSubscribe, s.handleSubscribe)
 	h(wire.PathListQueues, s.handleListQueues)
 	h(wire.PathRedrive, s.handleRedrive)
-	h(wire.PathPurgeDeadLetter, s.handlePurgeDeadLetter)
+	h(wire.PathPurge, s.handlePurge)
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -125,6 +125,8 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, engine.ErrDedupConflict):
 		writeErr(w, http.StatusConflict, "already_exists", err.Error())
+	case errors.Is(err, engine.ErrNameConflict):
+		writeErr(w, http.StatusConflict, "name_conflict", err.Error())
 	case errors.Is(err, engine.ErrMessageTooLarge):
 		writeErr(w, http.StatusRequestEntityTooLarge, "message_too_large", err.Error())
 	case errors.Is(err, context.Canceled):
@@ -163,7 +165,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		seqs, err = s.eng.SendBatch(ctx, req.Queue, outs)
+		seqs, err = s.eng.Send(ctx, req.Queue, outs...)
 		if err != nil {
 			s.fail(w, err)
 			return
@@ -249,13 +251,13 @@ func (s *Server) handleAbandon(w http.ResponseWriter, r *http.Request) {
 	s.settleOK(w, s.eng.Abandon(r.Context(), req.Queue, req.SeqNumber, req.LockToken, req.DelayMs))
 }
 
-func (s *Server) handleDeadLetter(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 	var req wire.SettleRequest
 	if err := decode(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
-	s.settleOK(w, s.eng.DeadLetter(r.Context(), req.Queue, req.SeqNumber, req.LockToken,
+	s.settleOK(w, s.eng.Reject(r.Context(), req.Queue, req.SeqNumber, req.LockToken,
 		req.DeadLetterReason, req.DeadLetterDescription))
 }
 
@@ -268,22 +270,22 @@ func (s *Server) handleDefer(w http.ResponseWriter, r *http.Request) {
 	s.settleOK(w, s.eng.Defer(r.Context(), req.Queue, req.SeqNumber, req.LockToken))
 }
 
-func (s *Server) handleRenewLock(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	var req wire.SettleRequest
 	if err := decode(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
-	s.settleOK(w, s.eng.RenewLock(r.Context(), req.Queue, req.SeqNumber, req.LockToken))
+	s.settleOK(w, s.eng.Renew(r.Context(), req.Queue, req.SeqNumber, req.LockToken))
 }
 
-func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
-	var req wire.CancelScheduledRequest
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	var req wire.CancelRequest
 	if err := decode(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
-	if err := s.eng.CancelScheduled(r.Context(), req.Queue, req.SeqNumber); err != nil {
+	if err := s.eng.Cancel(r.Context(), req.Queue, req.SeqNumber); err != nil {
 		s.fail(w, err)
 		return
 	}
@@ -310,13 +312,13 @@ func (s *Server) handlePeek(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	var req wire.MetricsRequest
 	if err := decode(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
-	m, err := s.eng.GetQueueMetrics(r.Context(), req.Queue)
+	m, err := s.eng.Stats(r.Context(), req.Queue)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -343,13 +345,13 @@ func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, wire.Empty{})
 }
 
-func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request) {
-	var req wire.CreateSubscriptionRequest
+func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	var req wire.SubscribeRequest
 	if err := decode(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
-	if err := s.eng.CreateSubscription(r.Context(), req.Topic, req.Name, req.Filter); err != nil {
+	if err := s.eng.Subscribe(r.Context(), req.Topic, req.Name, req.Filter); err != nil {
 		s.fail(w, err)
 		return
 	}
@@ -388,18 +390,18 @@ func (s *Server) handleRedrive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, wire.RedriveResponse{Moved: moved})
 }
 
-func (s *Server) handlePurgeDeadLetter(w http.ResponseWriter, r *http.Request) {
-	var req wire.PurgeDeadLetterRequest
+func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
+	var req wire.PurgeRequest
 	if err := decode(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
-	purged, err := s.eng.PurgeDeadLetter(r.Context(), req.Queue, engine.RedriveOptions{
+	purged, err := s.eng.Purge(r.Context(), req.Queue, engine.RedriveOptions{
 		Max: req.Max, OlderThanMs: req.OlderThanMs,
 	})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, wire.PurgeDeadLetterResponse{Purged: purged})
+	writeJSON(w, wire.PurgeResponse{Purged: purged})
 }

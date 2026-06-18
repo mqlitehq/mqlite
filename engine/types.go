@@ -29,6 +29,7 @@ var (
 	ErrNotFound        = errors.New("mqlite: not found")
 	ErrClosed          = errors.New("mqlite: engine closed")
 	ErrMessageTooLarge = errors.New("mqlite: message body exceeds max size")
+	ErrNameConflict    = errors.New("mqlite: name already in use by another queue or topic")
 )
 
 // QueueConfig configures a queue or subscription (entity-level defaults).
@@ -46,7 +47,7 @@ type QueueConfig struct {
 type OutMessage struct {
 	Body          []byte
 	MessageID     string // dedup / idempotency key; empty -> body SHA-256 used when dedup on
-	SessionID     string // = MessageGroupId; empty -> message is its own group (max parallelism)
+	GroupID       string // = MessageGroupId; empty -> message is its own group (max parallelism)
 	CorrelationID string
 	Subject       string // = ASB Label
 	ContentType   string
@@ -67,7 +68,7 @@ type Message struct {
 	SeqNumber     int64
 	Body          []byte
 	MessageID     string
-	SessionID     string
+	GroupID       string
 	CorrelationID string
 	Subject       string
 	ContentType   string
@@ -84,7 +85,7 @@ type PeekedMessage struct {
 	State                 State
 	Body                  []byte
 	MessageID             string
-	SessionID             string
+	GroupID               string
 	CorrelationID         string
 	Subject               string
 	ContentType           string
@@ -97,7 +98,7 @@ type PeekedMessage struct {
 	DeadLetterDescription string
 }
 
-// Metrics mirrors pgmq-style queue counters (§7.3 GetQueueMetrics).
+// Metrics mirrors pgmq-style queue counters (§7.3 Stats).
 type Metrics struct {
 	Queue              string
 	Active             int64

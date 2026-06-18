@@ -44,7 +44,7 @@ func TestRemoteRoundTrip(t *testing.T) {
 	if err := cli.CreateQueue(ctx, "orders", mqlite.QueueConfig{}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}
-	seq, err := cli.Send(ctx, "orders", mqlite.OutMessage{
+	seq, err := cli.SendOne(ctx, "orders", mqlite.OutMessage{
 		Body: []byte("hello"), MessageID: "m1", Subject: "order.created",
 		Properties: map[string]string{"tenant": "acme"},
 	})
@@ -52,7 +52,7 @@ func TestRemoteRoundTrip(t *testing.T) {
 		t.Fatalf("send: seq=%d err=%v", seq, err)
 	}
 
-	msgs, err := cli.Receive(ctx, "orders", mqlite.WithWait(2*time.Second))
+	msgs, err := cli.Receive(ctx, "orders", mqlite.RecvOpts{Wait: 2 * time.Second})
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("receive: %v n=%d", err, len(msgs))
 	}
@@ -63,7 +63,7 @@ func TestRemoteRoundTrip(t *testing.T) {
 	if err := m.Complete(ctx); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	mt, _ := cli.QueueMetrics(ctx, "orders")
+	mt, _ := cli.Stats(ctx, "orders")
 	if mt.Total != 0 {
 		t.Fatalf("queue should be empty, got %+v", mt)
 	}
@@ -99,7 +99,7 @@ func TestReceiverRun(t *testing.T) {
 	}
 	const n = 5
 	for i := 0; i < n; i++ {
-		if _, err := cli.Send(ctx, "jobs", mqlite.OutMessage{Body: []byte("job")}); err != nil {
+		if _, err := cli.SendOne(ctx, "jobs", mqlite.OutMessage{Body: []byte("job")}); err != nil {
 			t.Fatal(err)
 		}
 	}
