@@ -75,14 +75,19 @@ var schemaStmts = []string{
 	// (queue,group_id,state[,locked_until]) prefix (MQLITE-22).
 	`CREATE INDEX IF NOT EXISTS idx_msg_group_inflight ON messages(queue, group_id, state, locked_until)
 	  WHERE group_id IS NOT NULL`,
-	// head-of-line probe for a SCHEDULED blocker (MQLITE-22): mirrors idx_msg_deferred
-	// so claim's per-state "earlier scheduled in this queue?" EXISTS seeks (queue,id<?)
-	// instead of a backward rowid scan. (deferred -> idx_msg_deferred, locked ->
-	// idx_msg_locked / idx_msg_group_inflight already cover those branches.) A single
-	// (queue,state,id) partial over all in-flight states does NOT work: SQLite won't
-	// match a `state IN(...)` partial predicate to a single-state `state='scheduled'`
-	// probe, so it falls back to the rowid scan. Scheduled rows are sparse -> cheap.
-	`CREATE INDEX IF NOT EXISTS idx_msg_sched_head ON messages(queue, id) WHERE state='scheduled'`,
+	// Per-state head-of-line probes for the ordered-claim paths (MQLITE-22): each
+	// in-flight state gets a (queue,id) partial index so claim's per-state EXISTS
+	// seeks (queue, id<?) instead of a backward rowid scan. deferred already has
+	// idx_msg_deferred above; scheduled and locked get matching indexes here.
+	// group_fifo uses the covering idx_msg_group_inflight instead; strict_fifo has
+	// no group column and needs these. A single (queue,state,id) partial over all
+	// in-flight states does NOT work — SQLite won't match a `state IN(...)` partial
+	// predicate to a single state= probe. And older SQLite (modernc v1.36.1, the
+	// embed-compat floor) won't reuse idx_msg_locked(state,locked_until) for the
+	// locked branch — hence a dedicated idx_msg_locked_head. In-flight rows are
+	// sparse, so these stay tiny.
+	`CREATE INDEX IF NOT EXISTS idx_msg_sched_head  ON messages(queue, id) WHERE state='scheduled'`,
+	`CREATE INDEX IF NOT EXISTS idx_msg_locked_head ON messages(queue, id) WHERE state='locked'`,
 
 	// optional dedup table (message_id + sliding window). active only when dedup_window_ms>0.
 	`CREATE TABLE IF NOT EXISTS dedup (
