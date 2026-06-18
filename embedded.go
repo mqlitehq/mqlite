@@ -79,8 +79,9 @@ func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
 		SequenceNumber: m.SeqNumber,
 		Body:           m.Body,
 		MessageID:      m.MessageID,
-		SessionID:      m.SessionID,
+		GroupID:        m.GroupID,
 		CorrelationID:  m.CorrelationID,
+		ReplyTo:        m.ReplyTo,
 		Subject:        m.Subject,
 		ContentType:    m.ContentType,
 		Properties:     m.Properties,
@@ -93,26 +94,30 @@ func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
 	}
 }
 
-// ── send / schedule ─────────────────────────────────────────────────────────
+// ── send ──────────────────────────────────────────────────────────────────
 
-func (e *Embedded) Send(ctx context.Context, queue string, m OutMessage) (int64, error) {
-	return e.eng.Send(ctx, queue, m.toEngine())
+// SendOne enqueues one message. A dedup conflict surfaces as ErrDedupConflict.
+// SendOpts.At schedules delayed delivery.
+func (e *Embedded) SendOne(ctx context.Context, queue string, m OutMessage, opts ...SendOpts) (int64, error) {
+	o := firstOpt(opts)
+	if !o.At.IsZero() {
+		return e.eng.Schedule(ctx, queue, m.toEngine(), o.At.UnixMilli())
+	}
+	return e.eng.SendOne(ctx, queue, m.toEngine())
 }
 
-func (e *Embedded) SendBatch(ctx context.Context, queue string, ms []OutMessage) ([]int64, error) {
-	outs := make([]engine.OutMessage, len(ms))
-	for i, m := range ms {
+// Send enqueues one or many messages in one transaction.
+func (e *Embedded) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]int64, error) {
+	outs := make([]engine.OutMessage, len(msgs))
+	for i, m := range msgs {
 		outs[i] = m.toEngine()
 	}
-	return e.eng.SendBatch(ctx, queue, outs)
+	return e.eng.Send(ctx, queue, outs...)
 }
 
-func (e *Embedded) Schedule(ctx context.Context, queue string, m OutMessage, at time.Time) (int64, error) {
-	return e.eng.Schedule(ctx, queue, m.toEngine(), at.UnixMilli())
-}
-
-func (e *Embedded) CancelScheduled(ctx context.Context, queue string, seq int64) error {
-	return e.eng.CancelScheduled(ctx, queue, seq)
+// Cancel deletes a not-yet-activated scheduled message.
+func (e *Embedded) Cancel(ctx context.Context, queue string, seq int64) error {
+	return e.eng.Cancel(ctx, queue, seq)
 }
 
 // Tx runs business writes and enqueues in one transaction (§4.5, embedded-only).
@@ -122,8 +127,15 @@ func (e *Embedded) Tx(ctx context.Context, fn func(*engine.EngineTx) error) erro
 
 // ── receive ─────────────────────────────────────────────────────────────────
 
-func (e *Embedded) Receive(ctx context.Context, queue string, opts ...ReceiveOption) ([]*Message, error) {
-	ms, err := e.eng.Receive(ctx, queue, buildReceive(opts)) // carries AttemptID for idempotent receive
+func (e *Embedded) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([]*Message, error) {
+	o := firstOpt(opts)
+	var ms []*engine.Message
+	var err error
+	if len(o.Pick) > 0 {
+		ms, err = e.eng.ReceiveDeferred(ctx, queue, o.Pick...)
+	} else {
+		ms, err = e.eng.Receive(ctx, queue, o.toEngine()) // carries AttemptID for idempotent receive
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -146,20 +158,8 @@ func (e *Embedded) receiveOne(ctx context.Context, queue string, max int, waitMs
 	return out, nil
 }
 
-func (e *Embedded) ReceiveDeferred(ctx context.Context, queue string, seqs ...int64) ([]*Message, error) {
-	ms, err := e.eng.ReceiveDeferred(ctx, queue, seqs...)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*Message, len(ms))
-	for i, m := range ms {
-		out[i] = e.engineToMessage(queue, m)
-	}
-	return out, nil
-}
-
-func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOption) ([]*PeekedMessage, error) {
-	ms, err := e.eng.Peek(ctx, queue, buildPeek(opts))
+func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]*PeekedMessage, error) {
+	ms, err := e.eng.Peek(ctx, queue, firstOpt(opts).toEngine())
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +167,7 @@ func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOption) (
 	for i, p := range ms {
 		out[i] = &PeekedMessage{
 			SequenceNumber: p.SeqNumber, State: p.State, Body: p.Body, MessageID: p.MessageID,
-			SessionID: p.SessionID, CorrelationID: p.CorrelationID, Subject: p.Subject, ContentType: p.ContentType,
+			GroupID: p.GroupID, CorrelationID: p.CorrelationID, ReplyTo: p.ReplyTo, Subject: p.Subject, ContentType: p.ContentType,
 			Properties: p.Properties, DeliveryCount: p.DeliveryCount,
 			EnqueuedAt: msToTime(p.EnqueuedAtMs), VisibleAt: msToTime(p.VisibleAtMs), LockedUntil: msToTime(p.LockedUntilMs),
 		}
@@ -181,26 +181,26 @@ func (e *Embedded) CreateQueue(ctx context.Context, name string, cfg QueueConfig
 	return e.eng.CreateQueue(ctx, name, cfg.toEngine())
 }
 
-func (e *Embedded) CreateSubscription(ctx context.Context, topic, name string, f *Filter) error {
-	return e.eng.CreateSubscription(ctx, topic, name, f)
+func (e *Embedded) Subscribe(ctx context.Context, topic, name string, f *Filter) error {
+	return e.eng.Subscribe(ctx, topic, name, f)
 }
 
 func (e *Embedded) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	return e.eng.ListQueues(ctx)
 }
 
-func (e *Embedded) QueueMetrics(ctx context.Context, queue string) (Metrics, error) {
-	return e.eng.GetQueueMetrics(ctx, queue)
+func (e *Embedded) Stats(ctx context.Context, queue string) (Metrics, error) {
+	return e.eng.Stats(ctx, queue)
 }
 
-func (e *Embedded) Redrive(ctx context.Context, dlqQueue string, opts ...RedriveOption) (int, error) {
-	return e.eng.Redrive(ctx, dlqQueue, buildRedrive(opts))
+func (e *Embedded) Redrive(ctx context.Context, dlqQueue string, opts ...RedriveOpts) (int, error) {
+	return e.eng.Redrive(ctx, dlqQueue, firstOpt(opts).toEngine())
 }
 
-// PurgeDeadLetter permanently deletes dead-lettered messages (RedriveMax /
-// RedriveOlderThan scope it; no args purges the whole DLQ). Returns count deleted.
-func (e *Embedded) PurgeDeadLetter(ctx context.Context, queue string, opts ...RedriveOption) (int, error) {
-	return e.eng.PurgeDeadLetter(ctx, queue, buildRedrive(opts))
+// Purge permanently deletes dead-lettered messages (PurgeOpts scopes it; no opts
+// purges the whole DLQ). Returns count deleted.
+func (e *Embedded) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (int, error) {
+	return e.eng.Purge(ctx, queue, firstOpt(opts).toEngine())
 }
 
 // Receiver returns a stateful receive loop bound to the embedded engine.
@@ -263,12 +263,12 @@ func (e *Embedded) complete(ctx context.Context, q string, seq int64, tok string
 func (e *Embedded) abandon(ctx context.Context, q string, seq int64, tok string, delayMs int64) error {
 	return e.eng.Abandon(ctx, q, seq, tok, delayMs)
 }
-func (e *Embedded) deadLetter(ctx context.Context, q string, seq int64, tok, reason, desc string) error {
-	return e.eng.DeadLetter(ctx, q, seq, tok, reason, desc)
+func (e *Embedded) reject(ctx context.Context, q string, seq int64, tok, reason, desc string) error {
+	return e.eng.Reject(ctx, q, seq, tok, reason, desc)
 }
 func (e *Embedded) deferMsg(ctx context.Context, q string, seq int64, tok string) error {
 	return e.eng.Defer(ctx, q, seq, tok)
 }
-func (e *Embedded) renewLock(ctx context.Context, q string, seq int64, tok string) error {
-	return e.eng.RenewLock(ctx, q, seq, tok)
+func (e *Embedded) renew(ctx context.Context, q string, seq int64, tok string) error {
+	return e.eng.Renew(ctx, q, seq, tok)
 }

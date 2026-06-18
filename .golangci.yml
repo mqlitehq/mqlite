@@ -1,0 +1,28 @@
+# golangci-lint v2 config.
+#
+# The shipped library + CLI are linted with the full standard set (errcheck,
+# govet, ineffassign, staticcheck, unused). Idiomatic ignored errors
+# (defer x.Close(), fmt.Print*, os.Remove…) are excluded via the
+# std-error-handling preset. Tests and the bench/SDK harness are fire-and-forget
+# code, so errcheck is excluded there — the library surface stays strict.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  exclusions:
+    generated: lax
+    presets:
+      - std-error-handling
+    rules:
+      - path: '_test\.go'
+        linters:
+          - errcheck
+      - path: 'cmd/mqlite-bench/'
+        linters:
+          - errcheck
+      - path: 'test/sdkcheck/'
+        linters:
+          - errcheck

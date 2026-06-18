@@ -1,7 +1,7 @@
 package engine
 
 // schemaVersion is bumped when the DDL below changes incompatibly.
-const schemaVersion = "2"
+const schemaVersion = "4"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc
@@ -17,6 +17,8 @@ var schemaStmts = []string{
 	    default_ttl_ms        INTEGER NOT NULL DEFAULT 0,
 	    dead_letter_on_expire INTEGER NOT NULL DEFAULT 1,
 	    dedup_window_ms       INTEGER NOT NULL DEFAULT 0,
+	    ordering_mode         TEXT NOT NULL DEFAULT 'standard'
+	                              CHECK (ordering_mode IN ('standard','group_fifo','strict_fifo')),
 	    created_at            INTEGER NOT NULL,
 	    updated_at            INTEGER NOT NULL
 	) STRICT`,
@@ -47,7 +49,8 @@ var schemaStmts = []string{
 	    expires_at     INTEGER NOT NULL DEFAULT 0,
 	    message_id     TEXT,
 	    correlation_id TEXT,
-	    session_id     TEXT,
+	    reply_to       TEXT,
+	    group_id       TEXT,
 	    content_type   TEXT,
 	    subject        TEXT,
 	    properties     TEXT,
@@ -67,9 +70,9 @@ var schemaStmts = []string{
 	`CREATE INDEX IF NOT EXISTS idx_msg_deferred  ON messages(queue, id)            WHERE state='deferred'`,
 	`CREATE INDEX IF NOT EXISTS idx_msg_expire    ON messages(expires_at)           WHERE expires_at>0`,
 	`CREATE INDEX IF NOT EXISTS idx_msg_dlq       ON messages(queue, id)            WHERE state='dead_lettered'`,
-	// partial index for session/group-ordered claim — only session queues pay for it (§11.1).
-	`CREATE INDEX IF NOT EXISTS idx_msg_group_inflight ON messages(queue, session_id, state, locked_until)
-	  WHERE session_id IS NOT NULL`,
+	// partial index for group-ordered claim — only grouped messages pay for it (§11.1).
+	`CREATE INDEX IF NOT EXISTS idx_msg_group_inflight ON messages(queue, group_id, state, locked_until)
+	  WHERE group_id IS NOT NULL`,
 
 	// optional dedup table (message_id + sliding window). active only when dedup_window_ms>0.
 	`CREATE TABLE IF NOT EXISTS dedup (

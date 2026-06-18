@@ -23,7 +23,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	}
 	args = append(args, max)
 	rows, err := e.db.query(ctx, `
-		SELECT id,state,body,message_id,session_id,correlation_id,subject,content_type,
+		SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
 		       properties,delivery_count,enqueued_at,visible_at,locked_until,
 		       dead_letter_reason,dead_letter_description
 		FROM messages WHERE queue=? AND id>=?`+stateClause+`
@@ -36,16 +36,17 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	for rows.Next() {
 		var p PeekedMessage
 		var st string
-		var messageID, sessionID, correlationID, subject, ctype, props, dlr, dld sql.NullString
-		if err := rows.Scan(&p.SeqNumber, &st, &p.Body, &messageID, &sessionID, &correlationID,
-			&subject, &ctype, &props, &p.DeliveryCount, &p.EnqueuedAtMs, &p.VisibleAtMs, &p.LockedUntilMs,
+		var messageID, groupID, correlationID, replyTo, subject, ctype, props, dlr, dld sql.NullString
+		if err := rows.Scan(&p.SeqNumber, &st, &p.Body, &messageID, &groupID, &correlationID,
+			&replyTo, &subject, &ctype, &props, &p.DeliveryCount, &p.EnqueuedAtMs, &p.VisibleAtMs, &p.LockedUntilMs,
 			&dlr, &dld); err != nil {
 			return nil, err
 		}
 		p.State = State(st)
 		p.MessageID = messageID.String
-		p.SessionID = sessionID.String
+		p.GroupID = groupID.String
 		p.CorrelationID = correlationID.String
+		p.ReplyTo = replyTo.String
 		p.Subject = subject.String
 		p.ContentType = ctype.String
 		p.Properties = parseProps(props)
@@ -56,8 +57,8 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	return out, rows.Err()
 }
 
-// GetQueueMetrics returns pgmq-style counters for a queue (§7.3).
-func (e *Engine) GetQueueMetrics(ctx context.Context, queue string) (Metrics, error) {
+// Stats returns pgmq-style counters for a queue (§7.3).
+func (e *Engine) Stats(ctx context.Context, queue string) (Metrics, error) {
 	if _, err := e.loadQueue(ctx, queue); err != nil {
 		return Metrics{}, err
 	}

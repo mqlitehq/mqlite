@@ -22,15 +22,15 @@ func affected(res sql.Result) error {
 	return nil
 }
 
-// settleOp runs a terminal settle (Complete/Abandon/DeadLetter/Defer) idempotently
+// settleOp runs a terminal settle (Complete/Abandon/Reject/Defer) idempotently
 // under one transaction: it performs the fenced write (do), and
 //   - rows affected > 0 → records a receipt keyed by lock_token, returns nil;
 //   - rows affected = 0 but a live receipt exists → the client is retrying a
 //     settle whose response was lost; returns nil (idempotent success);
 //   - rows affected = 0 and no receipt → ErrLockLost (genuine fencing failure).
 //
-// This is the difference between "I already Completed this, the ack just got
-// lost" (success) and "my lock expired and someone else has the message" (lost).
+// This is the difference between "I already Completed this, the completion just
+// got lost" (success) and "my lock expired and someone else has the message" (lost).
 func (e *Engine) settleOp(ctx context.Context, token, op string, do func(tx *sql.Tx) (int64, error)) error {
 	if token == "" {
 		return ErrLockLost
@@ -102,8 +102,8 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 	return nil
 }
 
-// DeadLetter moves a locked message to the dead-letter state with a reason.
-func (e *Engine) DeadLetter(ctx context.Context, queue string, seq int64, token, reason, desc string) error {
+// Reject moves a locked message to the dead-letter state with a reason.
+func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, reason, desc string) error {
 	if reason == "" {
 		reason = ReasonAppRequested
 	}
@@ -133,8 +133,8 @@ func (e *Engine) Defer(ctx context.Context, queue string, seq int64, token strin
 	})
 }
 
-// RenewLock extends the lock lease by the queue's lock duration (§11.3).
-func (e *Engine) RenewLock(ctx context.Context, queue string, seq int64, token string) error {
+// Renew extends the lock lease by the queue's lock duration (§11.3).
+func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token string) error {
 	q, err := e.loadQueue(ctx, queue)
 	if err != nil {
 		return err

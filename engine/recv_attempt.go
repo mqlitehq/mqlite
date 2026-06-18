@@ -108,13 +108,13 @@ func (e *Engine) claimOneTx(ctx context.Context, tx *sql.Tx, q queueRow, now int
 	token := randToken()
 	lockUntil := now + q.lockDurationMs
 	var (
-		m                                                   Message
-		sessionID, messageID, correlationID, subject, ctype sql.NullString
-		props                                               sql.NullString
+		m                                                          Message
+		groupID, messageID, correlationID, replyTo, subject, ctype sql.NullString
+		props                                                      sql.NullString
 	)
-	err := tx.QueryRowContext(ctx, claimSQL, lockUntil, token, q.name, now, now, now).Scan(
-		&m.SeqNumber, &m.Body, &m.DeliveryCount, &sessionID, &messageID,
-		&correlationID, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs)
+	err := tx.QueryRowContext(ctx, claimSQLFor(q.ordering), lockUntil, token, q.name, now, now, now).Scan(
+		&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
+		&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -122,9 +122,10 @@ func (e *Engine) claimOneTx(ctx context.Context, tx *sql.Tx, q queueRow, now int
 		return nil, err
 	}
 	m.LockToken = token
-	m.SessionID = sessionID.String
+	m.GroupID = groupID.String
 	m.MessageID = messageID.String
 	m.CorrelationID = correlationID.String
+	m.ReplyTo = replyTo.String
 	m.Subject = subject.String
 	m.ContentType = ctype.String
 	m.Properties = parseProps(props)

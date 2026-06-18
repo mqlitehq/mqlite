@@ -12,10 +12,10 @@ func (e *Engine) startBackground(ctx context.Context) {
 	// reaper at 1s bounds visibility-timeout redelivery to lock_duration + ≤1s
 	// (expired locks are reclaimed here, not on the claim hot path, so claims stay
 	// O(log n) on a deep backlog — see claim.go / the stress report).
-	e.spawn(ctx, 1*time.Second, e.reapLocks)         // lock-expiry reaper
-	e.spawn(ctx, 1*time.Second, e.activateScheduled) // scheduled -> active
-	e.spawn(ctx, 10*time.Second, e.expireTTL)        // active TTL -> DLQ/discard
-	e.spawn(ctx, 60*time.Second, e.cleanupDedup)     // drop out-of-window dedup rows
+	e.spawn(ctx, 1*time.Second, e.reapLocks)          // lock-expiry reaper
+	e.spawn(ctx, 1*time.Second, e.activateScheduled)  // scheduled -> active
+	e.spawn(ctx, 10*time.Second, e.expireTTL)         // active TTL -> DLQ/discard
+	e.spawn(ctx, 60*time.Second, e.cleanupDedup)      // drop out-of-window dedup rows
 	e.spawn(ctx, 60*time.Second, e.cleanupExpiredAux) // drop expired settle/receive receipts
 }
 

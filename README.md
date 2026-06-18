@@ -3,7 +3,7 @@
 # mqlite
 
 A small, SQLite/Turso-backed online message queue with **Azure Service Bus–style
-semantics** — Peek-Lock, retries, DLQ, scheduling, dedup, MessageGroupId
+semantics** — Peek-Lock, retries, DLQ, scheduling, dedup, GroupID
 ordering, topics — in a single pure-Go binary (no CGO).
 
 > **Embed it like goqite, or serve it like a broker — the same engine.**
@@ -16,11 +16,15 @@ ordering, topics — in a single pure-Go binary (no CGO).
   remote **Turso/libSQL** — the *same* SQL and semantics, selected by a
   connection string.
 - **Service Bus semantics, honestly at-least-once.** Peek-Lock + four-way settle
-  (`Complete`/`Abandon`/`DeadLetter`/`Defer`), visibility timeout with fencing
-  tokens, `delivery_count` → DLQ, `RenewLock`, scheduled/deferred messages.
+  (`Complete`/`Abandon`/`Reject`/`Defer`), visibility timeout with fencing
+  tokens, `delivery_count` → DLQ, `Renew`, scheduled/deferred messages.
 - **Approximate order by default, strict order opt-in.** Plain queues are
-  competing-consumer; set a `SessionID` (= SQS MessageGroupId) for strict
-  per-group ordering with cross-group parallelism.
+  competing-consumer. Pick a queue-level ordering mode at create time:
+  `standard` (default — per-`GroupID` FIFO with cross-group parallelism),
+  `group_fifo` (same, but a `GroupID` is required on every message), or
+  `strict_fifo` (single global head-of-line FIFO across the whole queue).
+  `GroupID` is an **ordering key** (= SQS MessageGroupId / ASB SessionId) — *not*
+  a consumer group; competing consumers just `Receive` the same queue.
 - **curl-able contract.** Every RPC is a plain HTTP `POST` to
   `/mqlite.v1.<Service>/<Method>` with a JSON body; the Go SDK is sugar on top.
 
@@ -57,10 +61,10 @@ defer eng.Close()
 eng.CreateQueue(ctx, "orders", mqlite.QueueConfig{})
 
 // produce
-eng.Send(ctx, "orders", mqlite.OutMessage{Body: []byte("hello"), SessionID: "order-42"})
+eng.SendOne(ctx, "orders", mqlite.OutMessage{Body: []byte("hello"), GroupID: "order-42"})
 
 // consume (Peek-Lock): handle, then settle. at-least-once → handler must be idempotent.
-msgs, _ := eng.Receive(ctx, "orders", mqlite.WithWait(5*time.Second))
+msgs, _ := eng.Receive(ctx, "orders", mqlite.RecvOpts{Wait: 5 * time.Second})
 for _, m := range msgs {
     if err := handle(m.Body); err != nil {
         _ = m.Abandon(ctx)   // release the lock → redelivered (or DLQ past max)
@@ -82,7 +86,7 @@ no lost events: either both commit or neither does.
 ```go
 eng.Tx(ctx, func(tx *engine.EngineTx) error {
     tx.SQL().ExecContext(ctx, `INSERT INTO orders_tbl(id) VALUES (1)`)
-    _, err := tx.Send("orders", engine.OutMessage{Body: []byte("order-created")})
+    _, err := tx.SendOne("orders", engine.OutMessage{Body: []byte("order-created")})
     return err // commit both, or roll back both
 })
 ```
@@ -125,7 +129,7 @@ The page loads without auth; its data calls use the Bearer token you paste in.
 
 ```go
 cli, _ := mqlite.Open(ctx, "http://127.0.0.1:8080", mqlite.WithToken("mqk_dev"))
-seq, _ := cli.Send(ctx, "orders", mqlite.OutMessage{Body: []byte("hi")})
+seq, _ := cli.SendOne(ctx, "orders", mqlite.OutMessage{Body: []byte("hi")})
 
 // hands-off consumer: nil -> Complete, error -> Abandon, auto lock renewal
 cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
@@ -137,8 +141,8 @@ cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
 ### 5. CLI
 
 ```bash
-mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m
-mqlite send orders "hello" --message-id m1 --session order-42
+mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering strict_fifo
+mqlite send orders "hello" --message-id m1 --group order-42 --reply-to replies
 mqlite receive orders --wait 5s
 mqlite peek orders --state dead_lettered
 mqlite metrics orders

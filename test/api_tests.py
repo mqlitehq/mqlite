@@ -67,12 +67,12 @@ def create_sub(topic, name, flt=None):
     body = {"topic": topic, "name": name}
     if flt:
         body["filter"] = flt
-    return call("/mqlite.v1.AdminService/CreateSubscription", body)
+    return call("/mqlite.v1.AdminService/Subscribe", body)
 
 
 def send(queue, body, **kw):
     msg = {"body": b64(body)}
-    for k in ("message_id", "session_id", "subject", "correlation_id"):
+    for k in ("message_id", "group_id", "subject", "correlation_id"):
         if k in kw:
             msg[k] = kw[k]
     req = {"queue": queue, "messages": [msg]}
@@ -92,7 +92,7 @@ def schedule(queue, body, at_ms):
 
 
 def cancel_scheduled(queue, seq):
-    return call("/mqlite.v1.QueueService/CancelScheduled", {"queue": queue, "seq_number": seq})
+    return call("/mqlite.v1.QueueService/Cancel", {"queue": queue, "seq_number": seq})
 
 
 def receive(queue, max_messages=1, wait_ms=0, mode=0):
@@ -115,7 +115,7 @@ def abandon(q, s, t, delay_ms=0):
 
 
 def deadletter(q, s, t, reason="", desc=""):
-    return settle("/mqlite.v1.QueueService/DeadLetter", q, s, t,
+    return settle("/mqlite.v1.QueueService/Reject", q, s, t,
                   dead_letter_reason=reason, dead_letter_description=desc)
 
 
@@ -132,7 +132,7 @@ def peek(queue, state="", mx=20):
 
 
 def metrics(queue):
-    return call("/mqlite.v1.QueueService/GetQueueMetrics", {"queue": queue})
+    return call("/mqlite.v1.QueueService/Stats", {"queue": queue})
 
 
 def redrive(queue, **kw):
@@ -267,8 +267,8 @@ def t_sessions():
     section("MessageGroupId: in-order per group, parallel across groups")
     q = f"{RUNID}_py_sess"
     create_queue(q)
-    send(q, "s1", session_id="orderA")
-    send(q, "s2", session_id="orderA")
+    send(q, "s1", group_id="orderA")
+    send(q, "s2", group_id="orderA")
     _, r = receive(q, wait_ms=2000)
     m1 = r["messages"][0]
     check(base64.b64decode(m1["body"]).decode() == "s1", "first of group A delivered")
@@ -280,10 +280,10 @@ def t_sessions():
 
     q2 = f"{RUNID}_py_sess2"
     create_queue(q2)
-    send(q2, "a", session_id="A")
-    send(q2, "b", session_id="B")
+    send(q2, "a", group_id="A")
+    send(q2, "b", group_id="B")
     _, r = receive(q2, max_messages=2, wait_ms=2000)
-    sess = {m["session_id"] for m in r["messages"]}
+    sess = {m["group_id"] for m in r["messages"]}
     check(len(r["messages"]) == 2 and sess == {"A", "B"}, "different groups deliver in parallel")
 
 
@@ -316,13 +316,13 @@ def t_all_fields():
     q = f"{RUNID}_py_fields"
     create_queue(q)
     call("/mqlite.v1.QueueService/Send", {"queue": q, "messages": [{
-        "body": b64("payload \x00\xff"), "message_id": "M1", "session_id": "S1",
+        "body": b64("payload \x00\xff"), "message_id": "M1", "group_id": "S1",
         "correlation_id": "C1", "subject": "sub.x", "content_type": "application/json",
         "properties": {"tenant": "acme", "k": "中文🚀"},
     }]})
     _, r = receive(q, wait_ms=2000)
     m = r["messages"][0]
-    ok = (m.get("message_id") == "M1" and m.get("session_id") == "S1" and
+    ok = (m.get("message_id") == "M1" and m.get("group_id") == "S1" and
           m.get("correlation_id") == "C1" and m.get("subject") == "sub.x" and
           m.get("content_type") == "application/json" and
           m.get("properties", {}).get("k") == "中文🚀")

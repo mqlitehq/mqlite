@@ -7,20 +7,20 @@ import (
 	"time"
 )
 
-// A dedup conflict inside a SendBatch must skip only the offending message, not
+// A dedup conflict inside a batch Send must skip only the offending message, not
 // roll back the whole batch (§11 / Bug-4).
 func TestSendBatchDedupConflictSkipsOne(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{DedupWindowMs: 60_000})
 
-	seqs, err := e.SendBatch(ctx, "q", []OutMessage{
-		{MessageID: "A", Body: []byte("one")},
-		{MessageID: "A", Body: []byte("TWO-different-body")}, // conflict: same id, diff body
-		{MessageID: "B", Body: []byte("three")},
-	})
+	seqs, err := e.Send(ctx, "q",
+		OutMessage{MessageID: "A", Body: []byte("one")},
+		OutMessage{MessageID: "A", Body: []byte("TWO-different-body")}, // conflict: same id, diff body
+		OutMessage{MessageID: "B", Body: []byte("three")},
+	)
 	if err != nil {
-		t.Fatalf("SendBatch must not fail the whole batch on one conflict: %v", err)
+		t.Fatalf("Send must not fail the whole batch on one conflict: %v", err)
 	}
 	if len(seqs) != 3 || seqs[0] == 0 || seqs[2] == 0 {
 		t.Fatalf("good messages must commit, got seqs=%v", seqs)
@@ -28,13 +28,13 @@ func TestSendBatchDedupConflictSkipsOne(t *testing.T) {
 	if seqs[1] != 0 {
 		t.Fatalf("conflicting message must be skipped (seq 0), got %d", seqs[1])
 	}
-	mm, _ := e.GetQueueMetrics(ctx, "q")
+	mm, _ := e.Stats(ctx, "q")
 	if mm.Active != 2 {
 		t.Fatalf("want 2 enqueued (A,B), got active=%d", mm.Active)
 	}
 
 	// single Send still surfaces the conflict as an error.
-	if _, err := e.Send(ctx, "q", OutMessage{MessageID: "A", Body: []byte("yet-another")}); !errors.Is(err, ErrDedupConflict) {
+	if _, err := e.SendOne(ctx, "q", OutMessage{MessageID: "A", Body: []byte("yet-another")}); !errors.Is(err, ErrDedupConflict) {
 		t.Fatalf("single Send conflict must return ErrDedupConflict, got %v", err)
 	}
 }
@@ -46,8 +46,8 @@ func TestIdempotentReceive(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{})
-	e.Send(ctx, "q", OutMessage{Body: []byte("first")})
-	e.Send(ctx, "q", OutMessage{Body: []byte("second")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("first")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("second")})
 
 	first, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, AttemptID: "A1"})
 	if err != nil || len(first) != 1 {
@@ -88,14 +88,14 @@ func deadLetterN(t *testing.T, e *Engine, q string, n int) {
 	t.Helper()
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
-		e.Send(ctx, q, OutMessage{Body: []byte("x")})
+		e.SendOne(ctx, q, OutMessage{Body: []byte("x")})
 	}
 	for i := 0; i < n; i++ {
 		m := recvOne(t, e, q)
 		if m == nil {
 			t.Fatalf("expected a message to dead-letter")
 		}
-		if err := e.DeadLetter(ctx, q, m.SeqNumber, m.LockToken, "test", ""); err != nil {
+		if err := e.Reject(ctx, q, m.SeqNumber, m.LockToken, "test", ""); err != nil {
 			t.Fatalf("deadletter: %v", err)
 		}
 	}
@@ -114,8 +114,8 @@ func TestCrossQueueRedrive(t *testing.T) {
 	if err != nil || moved != 5 {
 		t.Fatalf("cross-queue redrive moved=%d err=%v (want 5, nil)", moved, err)
 	}
-	src, _ := e.GetQueueMetrics(ctx, "src")
-	dst, _ := e.GetQueueMetrics(ctx, "dst")
+	src, _ := e.Stats(ctx, "src")
+	dst, _ := e.Stats(ctx, "dst")
 	if src.DeadLettered != 0 || dst.Active != 5 {
 		t.Fatalf("after move: src.dlq=%d dst.active=%d (want 0, 5)", src.DeadLettered, dst.Active)
 	}
@@ -133,28 +133,28 @@ func TestRedriveRatePerSec(t *testing.T) {
 	if err != nil || moved != 3 {
 		t.Fatalf("rate-limited redrive moved=%d err=%v (want 3, nil)", moved, err)
 	}
-	dst, _ := e.GetQueueMetrics(ctx, "dst")
+	dst, _ := e.Stats(ctx, "dst")
 	if dst.Active != 3 {
 		t.Fatalf("dst.active=%d (want 3)", dst.Active)
 	}
 }
 
-// PurgeDeadLetter permanently deletes DLQ messages.
+// Purge permanently deletes DLQ messages.
 func TestPurgeDeadLetter(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 	mustQueue(t, e, "q", QueueConfig{})
 	deadLetterN(t, e, "q", 4)
 
-	purged, err := e.PurgeDeadLetter(ctx, "q", RedriveOptions{Max: 3})
+	purged, err := e.Purge(ctx, "q", RedriveOptions{Max: 3})
 	if err != nil || purged != 3 {
 		t.Fatalf("purge max=3 got=%d err=%v", purged, err)
 	}
-	purged, err = e.PurgeDeadLetter(ctx, "q", RedriveOptions{}) // purge the rest
+	purged, err = e.Purge(ctx, "q", RedriveOptions{}) // purge the rest
 	if err != nil || purged != 1 {
 		t.Fatalf("purge rest got=%d err=%v", purged, err)
 	}
-	mm, _ := e.GetQueueMetrics(ctx, "q")
+	mm, _ := e.Stats(ctx, "q")
 	if mm.DeadLettered != 0 || mm.Total != 0 {
 		t.Fatalf("after purge dlq=%d total=%d (want 0,0)", mm.DeadLettered, mm.Total)
 	}
@@ -169,7 +169,7 @@ func TestSettleIdempotentVsLockLost(t *testing.T) {
 	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1000, MaxDeliveryCount: 50})
 
 	// --- idempotent replay: double Complete with the SAME token succeeds twice.
-	e.Send(ctx, "q", OutMessage{Body: []byte("a")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("a")})
 	m := recvOne(t, e, "q")
 	if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
 		t.Fatalf("first complete: %v", err)
@@ -180,7 +180,7 @@ func TestSettleIdempotentVsLockLost(t *testing.T) {
 
 	// --- genuine lock-loss: lock expires, message reclaimed (new token), the
 	// stale token's Complete must be ErrLockLost (no receipt for it).
-	e.Send(ctx, "q", OutMessage{Body: []byte("b")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("b")})
 	m1 := recvOne(t, e, "q")
 	advance(ms, 2*time.Second) // past the 1s lock
 	e.RunMaintenanceOnce(ctx)  // reaper returns it to active

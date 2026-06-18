@@ -219,7 +219,7 @@ func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		}
 		err = fn(tx)
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			if e.db.retryable(err) {
 				continue
 			}

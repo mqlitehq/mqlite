@@ -22,3 +22,6 @@
 # go
 *.test
 *.out
+coverage.html
+cover.txt
+/sdkcheck

@@ -15,20 +15,20 @@ const (
 	PathReceive         = "/mqlite.v1.QueueService/Receive"
 	PathComplete        = "/mqlite.v1.QueueService/Complete"
 	PathAbandon         = "/mqlite.v1.QueueService/Abandon"
-	PathDeadLetter      = "/mqlite.v1.QueueService/DeadLetter"
+	PathReject          = "/mqlite.v1.QueueService/Reject"
 	PathDefer           = "/mqlite.v1.QueueService/Defer"
 	PathReceiveDeferred = "/mqlite.v1.QueueService/ReceiveDeferred"
-	PathRenewLock       = "/mqlite.v1.QueueService/RenewLock"
+	PathRenew           = "/mqlite.v1.QueueService/Renew"
 	PathSchedule        = "/mqlite.v1.QueueService/Schedule"
-	PathCancelScheduled = "/mqlite.v1.QueueService/CancelScheduled"
+	PathCancel          = "/mqlite.v1.QueueService/Cancel"
 	PathPeek            = "/mqlite.v1.QueueService/Peek"
-	PathMetrics         = "/mqlite.v1.QueueService/GetQueueMetrics"
+	PathStats           = "/mqlite.v1.QueueService/Stats"
 
-	PathCreateQueue        = "/mqlite.v1.AdminService/CreateQueue"
-	PathCreateSubscription = "/mqlite.v1.AdminService/CreateSubscription"
-	PathListQueues         = "/mqlite.v1.AdminService/ListQueues"
-	PathRedrive            = "/mqlite.v1.AdminService/Redrive"
-	PathPurgeDeadLetter    = "/mqlite.v1.AdminService/PurgeDeadLetter"
+	PathCreateQueue = "/mqlite.v1.AdminService/CreateQueue"
+	PathSubscribe   = "/mqlite.v1.AdminService/Subscribe"
+	PathListQueues  = "/mqlite.v1.AdminService/ListQueues"
+	PathRedrive     = "/mqlite.v1.AdminService/Redrive"
+	PathPurge       = "/mqlite.v1.AdminService/Purge"
 )
 
 // Message is the wire form of a message (both send input and receive output).
@@ -45,7 +45,8 @@ type Message struct {
 	DeadLetterDescription string            `json:"dead_letter_description,omitempty"`
 	MessageID             string            `json:"message_id,omitempty"`
 	CorrelationID         string            `json:"correlation_id,omitempty"`
-	SessionID             string            `json:"session_id,omitempty"`
+	ReplyTo               string            `json:"reply_to,omitempty"`
+	GroupID               string            `json:"group_id,omitempty"`
 	ContentType           string            `json:"content_type,omitempty"`
 	Subject               string            `json:"subject,omitempty"`
 	Properties            map[string]string `json:"properties,omitempty"`
@@ -66,8 +67,8 @@ type ReceiveRequest struct {
 	Queue       string `json:"queue"`
 	MaxMessages int    `json:"max_messages,omitempty"`
 	WaitTimeMs  int64  `json:"wait_time_ms,omitempty"`
-	ReceiveMode int    `json:"receive_mode,omitempty"`        // 0=peek-lock, 1=receive-and-delete
-	AttemptID   string `json:"receive_attempt_id,omitempty"`  // idempotency key for retried receives
+	ReceiveMode int    `json:"receive_mode,omitempty"`       // 0=peek-lock, 1=receive-and-delete
+	AttemptID   string `json:"receive_attempt_id,omitempty"` // idempotency key for retried receives
 }
 type ReceiveResponse struct {
 	Messages []Message `json:"messages"`
@@ -90,7 +91,7 @@ type SettleResponse struct {
 	Ok bool `json:"ok"`
 }
 
-type CancelScheduledRequest struct {
+type CancelRequest struct {
 	Queue     string `json:"queue"`
 	SeqNumber int64  `json:"seq_number"`
 }
@@ -126,12 +127,13 @@ type QueueConfigJSON struct {
 	DefaultTTLMs       int64  `json:"default_ttl_ms,omitempty"`
 	DeadLetterOnExpire *bool  `json:"dead_letter_on_expire,omitempty"`
 	DedupWindowMs      int64  `json:"dedup_window_ms,omitempty"`
+	OrderingMode       string `json:"ordering_mode,omitempty"`
 }
 type CreateQueueRequest struct {
 	Name   string          `json:"name"`
 	Config QueueConfigJSON `json:"config"`
 }
-type CreateSubscriptionRequest struct {
+type SubscribeRequest struct {
 	Topic  string         `json:"topic"`
 	Name   string         `json:"name"`
 	Filter *engine.Filter `json:"filter,omitempty"`
@@ -159,12 +161,12 @@ type RedriveResponse struct {
 	Moved int `json:"moved"`
 }
 
-type PurgeDeadLetterRequest struct {
+type PurgeRequest struct {
 	Queue       string `json:"queue"`
 	Max         int    `json:"max,omitempty"`
 	OlderThanMs int64  `json:"older_than_ms,omitempty"`
 }
-type PurgeDeadLetterResponse struct {
+type PurgeResponse struct {
 	Purged int `json:"purged"`
 }
 
@@ -182,8 +184,9 @@ func (m Message) ToOut() engine.OutMessage {
 	return engine.OutMessage{
 		Body:          m.Body,
 		MessageID:     m.MessageID,
-		SessionID:     m.SessionID,
+		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
+		ReplyTo:       m.ReplyTo,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
 		Properties:    m.Properties,
@@ -195,8 +198,9 @@ func FromEngineMessage(m *engine.Message) Message {
 		SeqNumber:     m.SeqNumber,
 		Body:          m.Body,
 		MessageID:     m.MessageID,
-		SessionID:     m.SessionID,
+		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
+		ReplyTo:       m.ReplyTo,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
 		Properties:    m.Properties,
@@ -213,8 +217,9 @@ func FromPeeked(p *engine.PeekedMessage) Message {
 		State:                 string(p.State),
 		Body:                  p.Body,
 		MessageID:             p.MessageID,
-		SessionID:             p.SessionID,
+		GroupID:               p.GroupID,
 		CorrelationID:         p.CorrelationID,
+		ReplyTo:               p.ReplyTo,
 		Subject:               p.Subject,
 		ContentType:           p.ContentType,
 		Properties:            p.Properties,
@@ -235,5 +240,6 @@ func (c QueueConfigJSON) ToConfig() engine.QueueConfig {
 		DefaultTTLMs:       c.DefaultTTLMs,
 		DeadLetterOnExpire: c.DeadLetterOnExpire,
 		DedupWindowMs:      c.DedupWindowMs,
+		Ordering:           engine.OrderingMode(c.OrderingMode),
 	}
 }

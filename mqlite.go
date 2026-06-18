@@ -24,6 +24,17 @@ var (
 	ErrQueueNotFound   = engine.ErrQueueNotFound
 	ErrDedupConflict   = engine.ErrDedupConflict
 	ErrMessageTooLarge = engine.ErrMessageTooLarge
+	ErrNameConflict    = engine.ErrNameConflict
+	ErrGroupRequired   = engine.ErrGroupRequired
+)
+
+// OrderingMode mirrors engine.OrderingMode for queue-level delivery ordering.
+type OrderingMode = engine.OrderingMode
+
+const (
+	OrderStandard   = engine.OrderStandard
+	OrderGroupFIFO  = engine.OrderGroupFIFO
+	OrderStrictFIFO = engine.OrderStrictFIFO
 )
 
 // State mirrors engine.State for Peek filtering.
@@ -42,10 +53,15 @@ type Filter = engine.Filter
 
 // OutMessage is a message to send. Body is opaque; broker never parses it.
 type OutMessage struct {
-	Body          []byte
-	MessageID     string // dedup/idempotency key; empty -> body SHA-256 when dedup on
-	SessionID     string // = MessageGroupId; empty -> own group (max parallelism)
+	Body      []byte
+	MessageID string // dedup/idempotency key; empty -> body SHA-256 when dedup on
+	// GroupID is an ordering/partition key (= SQS MessageGroupId, ASB SessionId):
+	// same GroupID = strict in-order (FIFO per group); empty = own group (max
+	// parallelism). NOT a consumer group — competing consumers just Receive the
+	// same queue; peek-lock gives each message to exactly one.
+	GroupID       string
 	CorrelationID string
+	ReplyTo       string // = ASB ReplyTo; opaque address the consumer should reply to
 	Subject       string // = ASB Label
 	ContentType   string
 	Properties    map[string]string // custom KV (headers)
@@ -56,8 +72,9 @@ func (m OutMessage) toEngine() engine.OutMessage {
 	return engine.OutMessage{
 		Body:          m.Body,
 		MessageID:     m.MessageID,
-		SessionID:     m.SessionID,
+		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
+		ReplyTo:       m.ReplyTo,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
 		Properties:    m.Properties,
@@ -72,6 +89,7 @@ type QueueConfig struct {
 	DefaultTTL         time.Duration
 	DeadLetterOnExpire *bool
 	DedupWindow        time.Duration
+	Ordering           OrderingMode // "" -> standard
 }
 
 func (c QueueConfig) toEngine() engine.QueueConfig {
@@ -81,6 +99,7 @@ func (c QueueConfig) toEngine() engine.QueueConfig {
 		DefaultTTLMs:       c.DefaultTTL.Milliseconds(),
 		DeadLetterOnExpire: c.DeadLetterOnExpire,
 		DedupWindowMs:      c.DedupWindow.Milliseconds(),
+		Ordering:           c.Ordering,
 	}
 }
 
@@ -90,103 +109,94 @@ type Metrics = engine.Metrics
 // QueueInfo mirrors engine.QueueInfo.
 type QueueInfo = engine.QueueInfo
 
-// ── receive options ─────────────────────────────────────────────────────────
+// ── data-plane options ───────────────────────────────────────────────────────
+//
+// These are plain option structs passed as a trailing variadic argument: callers
+// pass nothing for defaults, or a single literal to set fields. Construction and
+// receiver/loop config (Open/OpenEmbedded/Receiver) keep their functional With…
+// options — those configure the transport, not a single call.
 
-type receiveConfig struct {
-	max       int
-	wait      time.Duration
-	mode      engine.ReceiveMode
-	attemptID string
+// RecvOpts configures a Receive call.
+type RecvOpts struct {
+	Max        int           // most messages to claim (0 -> 1)
+	Wait       time.Duration // long-poll wait (0 -> don't wait); capped at 20s
+	AtMostOnce bool          // receive-and-delete (no lock, no settle)
+	Attempt    string        // idempotent-receive key; a retry replays the same batch
+	Pick       []int64       // fetch these deferred seqs by seq instead of claiming
 }
 
-// ReceiveOption configures a Receive call.
-type ReceiveOption func(*receiveConfig)
-
-// WithMaxMessages caps how many messages a single Receive returns.
-func WithMaxMessages(n int) ReceiveOption { return func(c *receiveConfig) { c.max = n } }
-
-// WithWait enables long-polling up to d (capped at 20s).
-func WithWait(d time.Duration) ReceiveOption { return func(c *receiveConfig) { c.wait = d } }
-
-// WithReceiveAndDelete switches to at-most-once fast-path delivery.
-func WithReceiveAndDelete() ReceiveOption {
-	return func(c *receiveConfig) { c.mode = engine.ReceiveAndDelete }
-}
-
-// WithReceiveAttemptID makes the Receive idempotent under client retries: a retry
-// carrying the same id replays the same batch instead of claiming new messages.
-func WithReceiveAttemptID(id string) ReceiveOption {
-	return func(c *receiveConfig) { c.attemptID = id }
-}
-
-func buildReceive(opts []ReceiveOption) engine.ReceiveOptions {
-	c := receiveConfig{max: 1}
-	for _, o := range opts {
-		o(&c)
+func (o RecvOpts) mode() engine.ReceiveMode {
+	if o.AtMostOnce {
+		return engine.ReceiveAndDelete
 	}
-	return engine.ReceiveOptions{MaxMessages: c.max, WaitMs: c.wait.Milliseconds(), Mode: c.mode, AttemptID: c.attemptID}
+	return engine.PeekLock
 }
 
-// ── peek options ────────────────────────────────────────────────────────────
-
-type peekConfig struct {
-	from  int64
-	state State
-	max   int
-}
-
-// PeekOption configures a Peek call.
-type PeekOption func(*peekConfig)
-
-// PeekFrom starts browsing at seq.
-func PeekFrom(seq int64) PeekOption { return func(c *peekConfig) { c.from = seq } }
-
-// PeekState filters by state.
-func PeekState(s State) PeekOption { return func(c *peekConfig) { c.state = s } }
-
-// PeekMax caps results.
-func PeekMax(n int) PeekOption { return func(c *peekConfig) { c.max = n } }
-
-func buildPeek(opts []PeekOption) engine.PeekOptions {
-	c := peekConfig{}
-	for _, o := range opts {
-		o(&c)
+func (o RecvOpts) toEngine() engine.ReceiveOptions {
+	max := o.Max
+	if max <= 0 {
+		max = 1
 	}
-	return engine.PeekOptions{FromSeq: c.from, State: c.state, Max: c.max}
+	return engine.ReceiveOptions{MaxMessages: max, WaitMs: o.Wait.Milliseconds(), Mode: o.mode(), AttemptID: o.Attempt}
 }
 
-// ── redrive options ─────────────────────────────────────────────────────────
-
-type redriveConfig struct {
-	target    string
-	max       int
-	olderThan time.Duration
-	rate      int
+// SendOpts configures a SendOne call.
+type SendOpts struct {
+	At time.Time // schedule delivery for t (zero -> immediate)
 }
 
-// RedriveOption configures a Redrive call.
-type RedriveOption func(*redriveConfig)
-
-// RedriveTo redrives cross-queue (engine re-INSERTs with a new rowid).
-func RedriveTo(target string) RedriveOption { return func(c *redriveConfig) { c.target = target } }
-
-// RedriveMax caps how many messages are moved.
-func RedriveMax(n int) RedriveOption { return func(c *redriveConfig) { c.max = n } }
-
-// RedriveOlderThan only redrives messages older than d.
-func RedriveOlderThan(d time.Duration) RedriveOption {
-	return func(c *redriveConfig) { c.olderThan = d }
+// AbandonOpts configures a Message.Abandon call.
+type AbandonOpts struct {
+	Delay time.Duration // re-hide for this long before redelivery (backoff)
 }
 
-// RedriveRate limits redrive throughput (per second).
-func RedriveRate(perSec int) RedriveOption { return func(c *redriveConfig) { c.rate = perSec } }
+// RejectOpts configures a Message.Reject call.
+type RejectOpts struct {
+	Reason string // dead-letter reason
+	Detail string // dead-letter description
+}
 
-func buildRedrive(opts []RedriveOption) engine.RedriveOptions {
-	c := redriveConfig{}
-	for _, o := range opts {
-		o(&c)
+// PeekOpts configures a Peek call.
+type PeekOpts struct {
+	From  int64 // start browsing at this seq
+	State State // filter by state
+	Max   int   // cap results
+}
+
+func (o PeekOpts) toEngine() engine.PeekOptions {
+	return engine.PeekOptions{FromSeq: o.From, State: o.State, Max: o.Max}
+}
+
+// RedriveOpts configures a Redrive call.
+type RedriveOpts struct {
+	To        string        // target queue (empty -> back to source)
+	Max       int           // cap how many messages move
+	OlderThan time.Duration // only move messages older than this
+	Rate      int           // throughput limit per second
+}
+
+func (o RedriveOpts) toEngine() engine.RedriveOptions {
+	return engine.RedriveOptions{Target: o.To, Max: o.Max, OlderThanMs: o.OlderThan.Milliseconds(), RatePerSec: o.Rate}
+}
+
+// PurgeOpts configures a Purge call.
+type PurgeOpts struct {
+	Max       int           // cap how many messages are deleted
+	OlderThan time.Duration // only delete messages older than this
+}
+
+func (o PurgeOpts) toEngine() engine.RedriveOptions {
+	return engine.RedriveOptions{Max: o.Max, OlderThanMs: o.OlderThan.Milliseconds()}
+}
+
+// firstOpt returns opts[0] or the zero value, the shared "trailing variadic"
+// idiom for the option structs above.
+func firstOpt[T any](opts []T) T {
+	if len(opts) > 0 {
+		return opts[0]
 	}
-	return engine.RedriveOptions{Target: c.target, Max: c.max, OlderThanMs: c.olderThan.Milliseconds(), RatePerSec: c.rate}
+	var zero T
+	return zero
 }
 
 // settler is implemented by both the remote Client and the Embedded engine, so
@@ -194,9 +204,9 @@ func buildRedrive(opts []RedriveOption) engine.RedriveOptions {
 type settler interface {
 	complete(ctx context.Context, queue string, seq int64, token string) error
 	abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error
-	deadLetter(ctx context.Context, queue string, seq int64, token, reason, desc string) error
+	reject(ctx context.Context, queue string, seq int64, token, reason, desc string) error
 	deferMsg(ctx context.Context, queue string, seq int64, token string) error
-	renewLock(ctx context.Context, queue string, seq int64, token string) error
+	renew(ctx context.Context, queue string, seq int64, token string) error
 }
 
 // receiveSource is implemented by Client and Embedded so Receiver works on both.

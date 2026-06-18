@@ -92,14 +92,14 @@ connection via env: MQLITE_ENDPOINT+MQLITE_TOKEN (client) or MQLITE_DB[+token] (
 
 // api is the subset shared by *mqlite.Client and *mqlite.Embedded.
 type api interface {
-	Send(ctx context.Context, queue string, m mqlite.OutMessage) (int64, error)
-	Receive(ctx context.Context, queue string, opts ...mqlite.ReceiveOption) ([]*mqlite.Message, error)
-	Peek(ctx context.Context, queue string, opts ...mqlite.PeekOption) ([]*mqlite.PeekedMessage, error)
+	SendOne(ctx context.Context, queue string, m mqlite.OutMessage, opts ...mqlite.SendOpts) (int64, error)
+	Receive(ctx context.Context, queue string, opts ...mqlite.RecvOpts) ([]*mqlite.Message, error)
+	Peek(ctx context.Context, queue string, opts ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error)
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
-	CreateSubscription(ctx context.Context, topic, name string, f *mqlite.Filter) error
+	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
 	ListQueues(ctx context.Context) ([]mqlite.QueueInfo, error)
-	QueueMetrics(ctx context.Context, queue string) (mqlite.Metrics, error)
-	Redrive(ctx context.Context, dlq string, opts ...mqlite.RedriveOption) (int, error)
+	Stats(ctx context.Context, queue string) (mqlite.Metrics, error)
+	Redrive(ctx context.Context, dlq string, opts ...mqlite.RedriveOpts) (int, error)
 	Close() error
 }
 
@@ -185,12 +185,13 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	maxdc := fs.Int("max-delivery", 0, "max delivery count before DLQ")
 	ttl := fs.Duration("ttl", 0, "default message TTL")
 	dedup := fs.Duration("dedup", 0, "dedup window (0=off)")
+	ordering := fs.String("ordering", "", "ordering mode: standard|group_fifo|strict_fifo (default standard)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m]")
+		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m --ordering standard]")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -199,6 +200,7 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	defer c.Close()
 	if err := c.CreateQueue(ctx, pos[0], mqlite.QueueConfig{
 		LockDuration: *lock, MaxDeliveryCount: *maxdc, DefaultTTL: *ttl, DedupWindow: *dedup,
+		Ordering: mqlite.OrderingMode(*ordering),
 	}); err != nil {
 		return err
 	}
@@ -225,7 +227,7 @@ func cmdCreateSubscription(ctx context.Context, args []string) error {
 	if *prefix != "" {
 		f = &mqlite.Filter{SubjectPrefix: *prefix}
 	}
-	if err := c.CreateSubscription(ctx, pos[0], pos[1], f); err != nil {
+	if err := c.Subscribe(ctx, pos[0], pos[1], f); err != nil {
 		return err
 	}
 	fmt.Printf("ok: subscription %s under topic %s\n", pos[1], pos[0])
@@ -236,15 +238,16 @@ func cmdSend(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	file := fs.String("file", "", "read body from file")
 	msgID := fs.String("message-id", "", "message id (dedup/idempotency key)")
-	session := fs.String("session", "", "session id (MessageGroupId)")
+	group := fs.String("group", "", "group id (MessageGroupId)")
 	subject := fs.String("subject", "", "subject (label)")
+	replyTo := fs.String("reply-to", "", "reply-to address")
 	ttl := fs.Duration("ttl", 0, "message TTL")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: send <queue> <body|-> [--file f --message-id id --session s --subject sub --ttl 1h]")
+		return fmt.Errorf("usage: send <queue> <body|-> [--file f --message-id id --group g --subject sub --reply-to addr --ttl 1h]")
 	}
 	queue := pos[0]
 	body, err := readBody(*file, pos[1:])
@@ -256,8 +259,8 @@ func cmdSend(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	seq, err := c.Send(ctx, queue, mqlite.OutMessage{
-		Body: body, MessageID: *msgID, SessionID: *session, Subject: *subject, TTL: *ttl,
+	seq, err := c.SendOne(ctx, queue, mqlite.OutMessage{
+		Body: body, MessageID: *msgID, GroupID: *group, Subject: *subject, ReplyTo: *replyTo, TTL: *ttl,
 	})
 	if err != nil {
 		return err
@@ -285,11 +288,7 @@ func cmdReceive(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	opts := []mqlite.ReceiveOption{mqlite.WithMaxMessages(*max), mqlite.WithWait(*wait)}
-	if *del {
-		opts = append(opts, mqlite.WithReceiveAndDelete())
-	}
-	msgs, err := c.Receive(ctx, queue, opts...)
+	msgs, err := c.Receive(ctx, queue, mqlite.RecvOpts{Max: *max, Wait: *wait, AtMostOnce: *del})
 	if err != nil {
 		return err
 	}
@@ -325,11 +324,11 @@ func cmdPeek(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	opts := []mqlite.PeekOption{mqlite.PeekFrom(*from), mqlite.PeekMax(*max)}
+	po := mqlite.PeekOpts{From: *from, Max: *max}
 	if *state != "" {
-		opts = append(opts, mqlite.PeekState(mqlite.State(*state)))
+		po.State = mqlite.State(*state)
 	}
-	ms, err := c.Peek(ctx, pos[0], opts...)
+	ms, err := c.Peek(ctx, pos[0], po)
 	if err != nil {
 		return err
 	}
@@ -352,7 +351,7 @@ func cmdMetrics(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	m, err := c.QueueMetrics(ctx, args[0])
+	m, err := c.Stats(ctx, args[0])
 	if err != nil {
 		return err
 	}
@@ -399,11 +398,7 @@ func cmdRedrive(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	opts := []mqlite.RedriveOption{mqlite.RedriveMax(*max), mqlite.RedriveOlderThan(*older)}
-	if *to != "" {
-		opts = append(opts, mqlite.RedriveTo(*to))
-	}
-	moved, err := c.Redrive(ctx, pos[0], opts...)
+	moved, err := c.Redrive(ctx, pos[0], mqlite.RedriveOpts{To: *to, Max: *max, OlderThan: *older})
 	if err != nil {
 		return err
 	}
@@ -431,8 +426,11 @@ func printMsg(m *mqlite.Message) {
 	if m.MessageID != "" {
 		fmt.Printf(" message-id=%s", m.MessageID)
 	}
-	if m.SessionID != "" {
-		fmt.Printf(" session=%s", m.SessionID)
+	if m.GroupID != "" {
+		fmt.Printf(" group=%s", m.GroupID)
+	}
+	if m.ReplyTo != "" {
+		fmt.Printf(" reply-to=%s", m.ReplyTo)
 	}
 	fmt.Printf(" body=%q\n", string(m.Body))
 }

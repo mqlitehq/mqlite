@@ -50,6 +50,7 @@ type queueRow struct {
 	defaultTTLMs     int64
 	deadLetterOnExp  bool
 	dedupWindowMs    int64
+	ordering         OrderingMode
 }
 
 // Open opens (and migrates) the store, performs single-broker crash recovery,
@@ -60,7 +61,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		return nil, err
 	}
 	if err := d.migrate(ctx); err != nil {
-		d.close()
+		_ = d.close()
 		return nil, err
 	}
 	nowFn := opts.Now
@@ -85,7 +86,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	// already incremented at claim time, so this counts as one redelivery).
 	if _, err := e.db.exec(ctx,
 		`UPDATE messages SET state='active', locked_until=0, lock_token=NULL WHERE state='locked'`); err != nil {
-		d.close()
+		_ = d.close()
 		return nil, fmt.Errorf("crash recovery: %w", err)
 	}
 
@@ -136,19 +137,24 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	if cfg.DeadLetterOnExpire != nil && !*cfg.DeadLetterOnExpire {
 		dle = 0
 	}
+	ordering := cfg.Ordering
+	if ordering == "" {
+		ordering = OrderStandard
+	}
 	now := e.now()
 	_, err := e.db.exec(ctx, `
 		INSERT INTO queues (name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		                    dead_letter_on_expire,dedup_window_ms,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		                    dead_letter_on_expire,dedup_window_ms,ordering_mode,created_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(name) DO UPDATE SET
 		    lock_duration_ms=excluded.lock_duration_ms,
 		    max_delivery_count=excluded.max_delivery_count,
 		    default_ttl_ms=excluded.default_ttl_ms,
 		    dead_letter_on_expire=excluded.dead_letter_on_expire,
 		    dedup_window_ms=excluded.dedup_window_ms,
+		    ordering_mode=excluded.ordering_mode,
 		    updated_at=excluded.updated_at`,
-		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, now, now)
+		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, string(ordering), now, now)
 	if err != nil {
 		return err
 	}
@@ -158,11 +164,39 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	return nil
 }
 
-// CreateSubscription registers subscription `name` under `topic`, creating the
+// Subscribe registers subscription `name` under `topic`, creating the
 // subscription's backing queue and the fan-out mapping (§10.1).
-func (e *Engine) CreateSubscription(ctx context.Context, topic, name string, filter *Filter) error {
+func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filter) error {
 	if topic == "" || name == "" {
 		return errors.New("mqlite: topic and subscription name required")
+	}
+	// A subscription's backing queue is addressed by the bare subscription name
+	// (messages fan out into queue `name`, and Receive/Metrics/Redrive target it
+	// by that name). Reusing a name that already belongs to a plain queue, or to a
+	// *different* topic's subscription, would silently merge two delivery targets
+	// into one backing queue and leak messages across topics (pub/sub isolation
+	// breach, eval report r2 §architecture/P0-3). Fail loud instead of corrupting
+	// data. Per-topic-scoped naming (so the same name may be reused across topics)
+	// is a public addressing/API change tracked separately (#13).
+	var existingKind sql.NullString
+	if err := e.db.queryRowScan(ctx, []any{&existingKind},
+		`SELECT kind FROM queues WHERE name=?`, name); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if existingKind.Valid {
+		if existingKind.String != "subscription" {
+			return fmt.Errorf("%w: %q is already a queue", ErrNameConflict, name)
+		}
+		var otherTopic sql.NullString
+		if err := e.db.queryRowScan(ctx, []any{&otherTopic},
+			`SELECT topic FROM subscriptions WHERE subscription=? AND topic<>? LIMIT 1`,
+			name, topic); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if otherTopic.Valid {
+			return fmt.Errorf("%w: subscription %q already exists under topic %q",
+				ErrNameConflict, name, otherTopic.String)
+		}
 	}
 	cfg := QueueConfig{Kind: "subscription"}
 	if err := e.CreateQueue(ctx, name, cfg); err != nil {
@@ -192,16 +226,18 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 		return q, nil
 	}
 	var dle int
+	var ordering string
 	if err := e.db.queryRowScan(ctx,
-		[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs}, `
+		[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering}, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms FROM queues WHERE name=?`, name); err != nil {
+		       dead_letter_on_expire,dedup_window_ms,ordering_mode FROM queues WHERE name=?`, name); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return queueRow{}, ErrQueueNotFound
 		}
 		return queueRow{}, err
 	}
 	q.deadLetterOnExp = dle != 0
+	q.ordering = OrderingMode(ordering)
 	e.qmu.Lock()
 	e.qcache[name] = q
 	e.qmu.Unlock()
@@ -231,8 +267,9 @@ func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 
 // ── send / schedule ─────────────────────────────────────────────────────────
 
-// Send enqueues one message, returning its seq_number (0 if deduped away).
-func (e *Engine) Send(ctx context.Context, queue string, m OutMessage) (int64, error) {
+// SendOne enqueues one message, returning its seq_number. A dedup conflict
+// (same id, different body) surfaces as ErrDedupConflict.
+func (e *Engine) SendOne(ctx context.Context, queue string, m OutMessage) (int64, error) {
 	seqs, err := e.send(ctx, queue, []OutMessage{m}, 0, StateActive)
 	if err != nil {
 		return 0, err
@@ -243,8 +280,8 @@ func (e *Engine) Send(ctx context.Context, queue string, m OutMessage) (int64, e
 	return seqs[0], nil
 }
 
-// SendBatch enqueues many messages in one transaction (§11.3 Batch).
-func (e *Engine) SendBatch(ctx context.Context, queue string, ms []OutMessage) ([]int64, error) {
+// Send enqueues one or many messages in one transaction (§11.3 Batch).
+func (e *Engine) Send(ctx context.Context, queue string, ms ...OutMessage) ([]int64, error) {
 	if len(ms) == 0 {
 		return nil, nil
 	}
@@ -263,8 +300,8 @@ func (e *Engine) Schedule(ctx context.Context, queue string, m OutMessage, atMs 
 	return seqs[0], nil
 }
 
-// CancelScheduled deletes a not-yet-activated scheduled message by seq.
-func (e *Engine) CancelScheduled(ctx context.Context, queue string, seq int64) error {
+// Cancel deletes a not-yet-activated scheduled message by seq.
+func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
 	res, err := e.db.exec(ctx,
 		`DELETE FROM messages WHERE id=? AND queue=? AND state='scheduled'`, seq, queue)
 	if err != nil {
@@ -307,6 +344,9 @@ func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs in
 				q, err := e.loadQueueTx(ctx, tx, t.name)
 				if err != nil {
 					return err
+				}
+				if q.ordering == OrderGroupFIFO && m.GroupID == "" {
+					return ErrGroupRequired
 				}
 				seq, deduped, err := e.insertOne(ctx, tx, q, m, atMs, forced, now)
 				if errors.Is(err, ErrDedupConflict) {
@@ -389,16 +429,18 @@ func (e *Engine) loadQueueTx(ctx context.Context, tx *sql.Tx, name string) (queu
 	}
 	row := tx.QueryRowContext(ctx, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms FROM queues WHERE name=?`, name)
+		       dead_letter_on_expire,dedup_window_ms,ordering_mode FROM queues WHERE name=?`, name)
 	var dle int
+	var ordering string
 	if err := row.Scan(&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount,
-		&q.defaultTTLMs, &dle, &q.dedupWindowMs); err != nil {
+		&q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return queueRow{}, ErrQueueNotFound
 		}
 		return queueRow{}, err
 	}
 	q.deadLetterOnExp = dle != 0
+	q.ordering = OrderingMode(ordering)
 	return q, nil
 }
 
