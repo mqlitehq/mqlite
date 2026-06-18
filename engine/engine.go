@@ -61,7 +61,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		return nil, err
 	}
 	if err := d.migrate(ctx); err != nil {
-		d.close()
+		_ = d.close()
 		return nil, err
 	}
 	nowFn := opts.Now
@@ -86,7 +86,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	// already incremented at claim time, so this counts as one redelivery).
 	if _, err := e.db.exec(ctx,
 		`UPDATE messages SET state='active', locked_until=0, lock_token=NULL WHERE state='locked'`); err != nil {
-		d.close()
+		_ = d.close()
 		return nil, fmt.Errorf("crash recovery: %w", err)
 	}
 

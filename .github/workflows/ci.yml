@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} · go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.25.x', 'stable'] # floor (go.mod directive) + latest stable
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then echo "needs gofmt:"; echo "$out"; exit 1; fi
+      - name: go.mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: test (race + coverage)
+        run: go test -race -coverprofile=coverage.out -count=1 ./...
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+      # Turso integration is gated by env (MQLITE_TEST_DB) and runs in the
+      # nightly workflow, not here — keeps PRs hermetic and off the remote quota.
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.11.4
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable # latest patch -> stdlib CVEs already fixed
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  docker:
+    name: docker build + healthz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build --platform linux/amd64 -t mqlite:ci .
+      - name: run + /healthz smoke
+        run: |
+          docker run -d --name mq -p 8080:8080 mqlite:ci
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then echo "healthz never came up"; docker logs mq; exit 1; fi
+          echo "healthz OK"
+          docker rm -f mq

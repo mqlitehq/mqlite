@@ -294,7 +294,9 @@ func run(s scen) Result {
 
 func body(n int) []byte {
 	b := make([]byte, n)
-	rand.Read(b)
+	for i := range b { // opaque payload; content is irrelevant to the benchmark
+		b[i] = byte(i)
+	}
 	return b
 }
 

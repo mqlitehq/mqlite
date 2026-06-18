@@ -1,0 +1,32 @@
+name: Turso nightly
+
+# Real-remote integration against a Turso/libSQL DB. Gated by repo secrets so it
+# never runs on forks or PRs (avoids burning the remote quota); nightly + manual.
+on:
+  schedule:
+    - cron: '0 8 * * *' # 08:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  turso:
+    name: real Turso integration
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'mqlitehq/mqlite' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: TestTurso* (skips if secrets absent)
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+        run: |
+          if [ -z "$MQLITE_TEST_DB" ]; then
+            echo "MQLITE_TEST_DB secret not set — skipping remote integration."
+            exit 0
+          fi
+          go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
