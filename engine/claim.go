@@ -82,7 +82,8 @@ UPDATE messages
                  -- equality each) so each seeks an index instead of a backward
                  -- rowid scan: deferred -> idx_msg_deferred(queue,id),
                  -- scheduled -> idx_msg_sched_head(queue,id), locked ->
-                 -- idx_msg_locked. Same reasoning as claimSQL; do NOT collapse back.
+                 -- idx_msg_locked_head(queue,id). Same reasoning as claimSQL; do
+                 -- NOT collapse back.
               EXISTS ( SELECT 1 FROM messages b
                         WHERE b.queue=m.queue
                           AND b.state='deferred' AND b.id < m.id )

@@ -56,6 +56,13 @@ func TestClaimPlanPinning(t *testing.T) {
 // TestClaimDeepBacklogBounded is the plan-agnostic guard: a claim against a deep
 // backlog stuck behind a locked head must stay fast (~20-30s @ 20k before the fix).
 func TestClaimDeepBacklogBounded(t *testing.T) {
+	if raceEnabled {
+		// Under -race the pure-Go SQLite engine is instrumented, so seeding 20k rows
+		// takes ~40s and a wall-clock budget is meaningless. TestClaimPlanPinning
+		// guards the O(n^2) regression deterministically (and fast) under -race; this
+		// timing check runs in the non-race coverage job.
+		t.Skip("wall-clock timing is meaningless under -race (instrumented pure-Go SQLite); plan-pin test covers it")
+	}
 	const n, budget = 20_000, 3 * time.Second
 	for _, mode := range []OrderingMode{OrderGroupFIFO, OrderStrictFIFO} {
 		t.Run(string(mode), func(t *testing.T) {
