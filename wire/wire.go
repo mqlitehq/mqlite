@@ -45,6 +45,7 @@ type Message struct {
 	DeadLetterDescription string            `json:"dead_letter_description,omitempty"`
 	MessageID             string            `json:"message_id,omitempty"`
 	CorrelationID         string            `json:"correlation_id,omitempty"`
+	ReplyTo               string            `json:"reply_to,omitempty"`
 	GroupID               string            `json:"group_id,omitempty"`
 	ContentType           string            `json:"content_type,omitempty"`
 	Subject               string            `json:"subject,omitempty"`
@@ -126,6 +127,7 @@ type QueueConfigJSON struct {
 	DefaultTTLMs       int64  `json:"default_ttl_ms,omitempty"`
 	DeadLetterOnExpire *bool  `json:"dead_letter_on_expire,omitempty"`
 	DedupWindowMs      int64  `json:"dedup_window_ms,omitempty"`
+	OrderingMode       string `json:"ordering_mode,omitempty"`
 }
 type CreateQueueRequest struct {
 	Name   string          `json:"name"`
@@ -184,6 +186,7 @@ func (m Message) ToOut() engine.OutMessage {
 		MessageID:     m.MessageID,
 		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
+		ReplyTo:       m.ReplyTo,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
 		Properties:    m.Properties,
@@ -197,6 +200,7 @@ func FromEngineMessage(m *engine.Message) Message {
 		MessageID:     m.MessageID,
 		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
+		ReplyTo:       m.ReplyTo,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
 		Properties:    m.Properties,
@@ -215,6 +219,7 @@ func FromPeeked(p *engine.PeekedMessage) Message {
 		MessageID:             p.MessageID,
 		GroupID:               p.GroupID,
 		CorrelationID:         p.CorrelationID,
+		ReplyTo:               p.ReplyTo,
 		Subject:               p.Subject,
 		ContentType:           p.ContentType,
 		Properties:            p.Properties,
@@ -235,5 +240,6 @@ func (c QueueConfigJSON) ToConfig() engine.QueueConfig {
 		DefaultTTLMs:       c.DefaultTTLMs,
 		DeadLetterOnExpire: c.DeadLetterOnExpire,
 		DedupWindowMs:      c.DedupWindowMs,
+		Ordering:           engine.OrderingMode(c.OrderingMode),
 	}
 }

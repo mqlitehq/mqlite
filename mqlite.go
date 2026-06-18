@@ -25,6 +25,16 @@ var (
 	ErrDedupConflict   = engine.ErrDedupConflict
 	ErrMessageTooLarge = engine.ErrMessageTooLarge
 	ErrNameConflict    = engine.ErrNameConflict
+	ErrGroupRequired   = engine.ErrGroupRequired
+)
+
+// OrderingMode mirrors engine.OrderingMode for queue-level delivery ordering.
+type OrderingMode = engine.OrderingMode
+
+const (
+	OrderStandard   = engine.OrderStandard
+	OrderGroupFIFO  = engine.OrderGroupFIFO
+	OrderStrictFIFO = engine.OrderStrictFIFO
 )
 
 // State mirrors engine.State for Peek filtering.
@@ -43,10 +53,15 @@ type Filter = engine.Filter
 
 // OutMessage is a message to send. Body is opaque; broker never parses it.
 type OutMessage struct {
-	Body          []byte
-	MessageID     string // dedup/idempotency key; empty -> body SHA-256 when dedup on
-	GroupID       string // = MessageGroupId; empty -> own group (max parallelism)
+	Body      []byte
+	MessageID string // dedup/idempotency key; empty -> body SHA-256 when dedup on
+	// GroupID is an ordering/partition key (= SQS MessageGroupId, ASB SessionId):
+	// same GroupID = strict in-order (FIFO per group); empty = own group (max
+	// parallelism). NOT a consumer group — competing consumers just Receive the
+	// same queue; peek-lock gives each message to exactly one.
+	GroupID       string
 	CorrelationID string
+	ReplyTo       string // = ASB ReplyTo; opaque address the consumer should reply to
 	Subject       string // = ASB Label
 	ContentType   string
 	Properties    map[string]string // custom KV (headers)
@@ -59,6 +74,7 @@ func (m OutMessage) toEngine() engine.OutMessage {
 		MessageID:     m.MessageID,
 		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
+		ReplyTo:       m.ReplyTo,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
 		Properties:    m.Properties,
@@ -73,6 +89,7 @@ type QueueConfig struct {
 	DefaultTTL         time.Duration
 	DeadLetterOnExpire *bool
 	DedupWindow        time.Duration
+	Ordering           OrderingMode // "" -> standard
 }
 
 func (c QueueConfig) toEngine() engine.QueueConfig {
@@ -82,6 +99,7 @@ func (c QueueConfig) toEngine() engine.QueueConfig {
 		DefaultTTLMs:       c.DefaultTTL.Milliseconds(),
 		DeadLetterOnExpire: c.DeadLetterOnExpire,
 		DedupWindowMs:      c.DedupWindow.Milliseconds(),
+		Ordering:           c.Ordering,
 	}
 }
 

@@ -13,6 +13,7 @@ type Message struct {
 	MessageID      string
 	GroupID        string
 	CorrelationID  string
+	ReplyTo        string
 	Subject        string
 	ContentType    string
 	Properties     map[string]string

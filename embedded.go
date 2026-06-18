@@ -81,6 +81,7 @@ func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
 		MessageID:      m.MessageID,
 		GroupID:        m.GroupID,
 		CorrelationID:  m.CorrelationID,
+		ReplyTo:        m.ReplyTo,
 		Subject:        m.Subject,
 		ContentType:    m.ContentType,
 		Properties:     m.Properties,
@@ -166,7 +167,7 @@ func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]
 	for i, p := range ms {
 		out[i] = &PeekedMessage{
 			SequenceNumber: p.SeqNumber, State: p.State, Body: p.Body, MessageID: p.MessageID,
-			GroupID: p.GroupID, CorrelationID: p.CorrelationID, Subject: p.Subject, ContentType: p.ContentType,
+			GroupID: p.GroupID, CorrelationID: p.CorrelationID, ReplyTo: p.ReplyTo, Subject: p.Subject, ContentType: p.ContentType,
 			Properties: p.Properties, DeliveryCount: p.DeliveryCount,
 			EnqueuedAt: msToTime(p.EnqueuedAtMs), VisibleAt: msToTime(p.VisibleAtMs), LockedUntil: msToTime(p.LockedUntilMs),
 		}

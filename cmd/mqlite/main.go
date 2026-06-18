@@ -185,12 +185,13 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	maxdc := fs.Int("max-delivery", 0, "max delivery count before DLQ")
 	ttl := fs.Duration("ttl", 0, "default message TTL")
 	dedup := fs.Duration("dedup", 0, "dedup window (0=off)")
+	ordering := fs.String("ordering", "", "ordering mode: standard|group_fifo|strict_fifo (default standard)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m]")
+		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m --ordering standard]")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -199,6 +200,7 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	defer c.Close()
 	if err := c.CreateQueue(ctx, pos[0], mqlite.QueueConfig{
 		LockDuration: *lock, MaxDeliveryCount: *maxdc, DefaultTTL: *ttl, DedupWindow: *dedup,
+		Ordering: mqlite.OrderingMode(*ordering),
 	}); err != nil {
 		return err
 	}
@@ -238,13 +240,14 @@ func cmdSend(ctx context.Context, args []string) error {
 	msgID := fs.String("message-id", "", "message id (dedup/idempotency key)")
 	group := fs.String("group", "", "group id (MessageGroupId)")
 	subject := fs.String("subject", "", "subject (label)")
+	replyTo := fs.String("reply-to", "", "reply-to address")
 	ttl := fs.Duration("ttl", 0, "message TTL")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: send <queue> <body|-> [--file f --message-id id --group g --subject sub --ttl 1h]")
+		return fmt.Errorf("usage: send <queue> <body|-> [--file f --message-id id --group g --subject sub --reply-to addr --ttl 1h]")
 	}
 	queue := pos[0]
 	body, err := readBody(*file, pos[1:])
@@ -257,7 +260,7 @@ func cmdSend(ctx context.Context, args []string) error {
 	}
 	defer c.Close()
 	seq, err := c.SendOne(ctx, queue, mqlite.OutMessage{
-		Body: body, MessageID: *msgID, GroupID: *group, Subject: *subject, TTL: *ttl,
+		Body: body, MessageID: *msgID, GroupID: *group, Subject: *subject, ReplyTo: *replyTo, TTL: *ttl,
 	})
 	if err != nil {
 		return err
@@ -425,6 +428,9 @@ func printMsg(m *mqlite.Message) {
 	}
 	if m.GroupID != "" {
 		fmt.Printf(" group=%s", m.GroupID)
+	}
+	if m.ReplyTo != "" {
+		fmt.Printf(" reply-to=%s", m.ReplyTo)
 	}
 	fmt.Printf(" body=%q\n", string(m.Body))
 }

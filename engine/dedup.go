@@ -91,11 +91,11 @@ func (e *Engine) rawInsert(ctx context.Context, tx *sql.Tx, queue string, m OutM
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO messages
 		  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
-		   message_id,correlation_id,group_id,content_type,subject,properties,body)
-		VALUES (?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?)
+		   message_id,correlation_id,reply_to,group_id,content_type,subject,properties,body)
+		VALUES (?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)
 		RETURNING id`,
 		queue, string(forced), visibleAt, now, expiresAt,
-		nz(m.MessageID), nz(m.CorrelationID), nz(m.GroupID),
+		nz(m.MessageID), nz(m.CorrelationID), nz(m.ReplyTo), nz(m.GroupID),
 		nz(m.ContentType), nz(m.Subject), props, body,
 	).Scan(&seq)
 	return seq, err

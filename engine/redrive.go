@@ -9,9 +9,9 @@ import (
 
 // dlqRec is a dead-lettered row carried across a cross-queue move.
 type dlqRec struct {
-	id                                                       int64
-	body                                                     []byte
-	messageID, correlationID, groupID, ctype, subject, props sql.NullString
+	id                                                                int64
+	body                                                              []byte
+	messageID, correlationID, replyTo, groupID, ctype, subject, props sql.NullString
 }
 
 // Redrive moves dead-lettered messages back to active for reprocessing (§11.2).
@@ -48,7 +48,7 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 	}
 
 	// Select the candidate set up front (single writer → the set is stable).
-	selQuery := "SELECT id,body,message_id,correlation_id,group_id,content_type,subject,properties" +
+	selQuery := "SELECT id,body,message_id,correlation_id,reply_to,group_id,content_type,subject,properties" +
 		" FROM messages WHERE " + where + " ORDER BY id" + limit
 	rows, err := e.db.query(ctx, selQuery, args...)
 	if err != nil {
@@ -57,7 +57,7 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 	var recs []dlqRec
 	for rows.Next() {
 		var r dlqRec
-		if err := rows.Scan(&r.id, &r.body, &r.messageID, &r.correlationID, &r.groupID,
+		if err := rows.Scan(&r.id, &r.body, &r.messageID, &r.correlationID, &r.replyTo, &r.groupID,
 			&r.ctype, &r.subject, &r.props); err != nil {
 			rows.Close()
 			return 0, err
@@ -122,9 +122,9 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO messages
 				  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
-				   message_id,correlation_id,group_id,content_type,subject,properties,body)
-				VALUES (?, 'active', 0, 0, NULL, 0, ?, 0, ?,?,?,?,?,?,?)`,
-				target, now, r.messageID, r.correlationID, r.groupID, r.ctype, r.subject, r.props, r.body); err != nil {
+				   message_id,correlation_id,reply_to,group_id,content_type,subject,properties,body)
+				VALUES (?, 'active', 0, 0, NULL, 0, ?, 0, ?,?,?,?,?,?,?,?)`,
+				target, now, r.messageID, r.correlationID, r.replyTo, r.groupID, r.ctype, r.subject, r.props, r.body); err != nil {
 				return err
 			}
 		}

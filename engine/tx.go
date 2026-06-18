@@ -41,6 +41,9 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
+		if q.ordering == OrderGroupFIFO && m.GroupID == "" {
+			return 0, ErrGroupRequired
+		}
 		seq, deduped, err := t.e.insertOne(t.ctx, t.tx, q, m, 0, StateActive, t.now)
 		if err != nil {
 			return 0, err

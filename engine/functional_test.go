@@ -23,6 +23,7 @@ func TestAllFieldsRoundTrip(t *testing.T) {
 		MessageID:     "msg-123",
 		GroupID:       "sess-A",
 		CorrelationID: "corr-9",
+		ReplyTo:       "reply.queue.A",
 		Subject:       "orders.created",
 		ContentType:   "application/json",
 		Properties:    map[string]string{"tenant": "acme", "trace": "abc-中文", "x": ""},
@@ -39,6 +40,9 @@ func TestAllFieldsRoundTrip(t *testing.T) {
 	}
 	if m.MessageID != in.MessageID || m.GroupID != in.GroupID || m.CorrelationID != in.CorrelationID {
 		t.Errorf("id/session/correlation mismatch: %+v", m)
+	}
+	if m.ReplyTo != in.ReplyTo {
+		t.Errorf("reply_to mismatch: %q != %q", m.ReplyTo, in.ReplyTo)
 	}
 	if m.Subject != in.Subject || m.ContentType != in.ContentType {
 		t.Errorf("subject/content_type mismatch: %+v", m)
@@ -432,3 +436,68 @@ func TestConcurrentSessionClaimIsolation(t *testing.T) {
 
 // atomicNow reads the test clock pointer.
 func atomicNow(ms *int64) int64 { return atomic.LoadInt64(ms) }
+
+// strict_fifo: the queue delivers strictly one message at a time in id order,
+// regardless of grouping. A second message is not claimable while the head is
+// still in flight; completing the head releases the next id in order.
+func TestStrictFIFOOrdering(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{Ordering: OrderStrictFIFO})
+
+	// Three ungrouped messages (no GroupID). Under strict_fifo they must still
+	// be delivered strictly head-of-line.
+	for _, b := range []string{"m1", "m2", "m3"} {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte(b)}); err != nil {
+			t.Fatalf("send %s: %v", b, err)
+		}
+	}
+
+	// First claim returns m1 only.
+	first := recvOne(t, e, "q")
+	if first == nil || string(first.Body) != "m1" {
+		t.Fatalf("expected m1 first, got %+v", first)
+	}
+	// While m1 is locked (unsettled), nothing else is claimable.
+	if blocked := recvOne(t, e, "q"); blocked != nil {
+		t.Fatalf("expected head-of-line block, but got %q", blocked.Body)
+	}
+	// Complete m1 -> m2 becomes claimable, in id order.
+	if err := e.Complete(ctx, "q", first.SeqNumber, first.LockToken); err != nil {
+		t.Fatalf("complete m1: %v", err)
+	}
+	second := recvOne(t, e, "q")
+	if second == nil || string(second.Body) != "m2" {
+		t.Fatalf("expected m2 second, got %+v", second)
+	}
+	// m3 still blocked behind the in-flight m2.
+	if blocked := recvOne(t, e, "q"); blocked != nil {
+		t.Fatalf("expected m3 blocked behind m2, got %q", blocked.Body)
+	}
+	if err := e.Complete(ctx, "q", second.SeqNumber, second.LockToken); err != nil {
+		t.Fatalf("complete m2: %v", err)
+	}
+	third := recvOne(t, e, "q")
+	if third == nil || string(third.Body) != "m3" {
+		t.Fatalf("expected m3 third, got %+v", third)
+	}
+}
+
+// group_fifo: every message must carry a GroupID; sending one without surfaces
+// ErrGroupRequired. A message with a GroupID enqueues normally.
+func TestGroupFIFORequiresGroupID(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{Ordering: OrderGroupFIFO})
+
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("no-group")}); !errors.Is(err, ErrGroupRequired) {
+		t.Fatalf("expected ErrGroupRequired for missing GroupID, got %v", err)
+	}
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("grouped"), GroupID: "g1"}); err != nil {
+		t.Fatalf("grouped send should succeed: %v", err)
+	}
+	m := recvOne(t, e, "q")
+	if m == nil || string(m.Body) != "grouped" || m.GroupID != "g1" {
+		t.Fatalf("expected grouped message, got %+v", m)
+	}
+}

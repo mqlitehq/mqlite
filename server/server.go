@@ -127,6 +127,8 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, "already_exists", err.Error())
 	case errors.Is(err, engine.ErrNameConflict):
 		writeErr(w, http.StatusConflict, "name_conflict", err.Error())
+	case errors.Is(err, engine.ErrGroupRequired):
+		writeErr(w, http.StatusBadRequest, "group_required", err.Error())
 	case errors.Is(err, engine.ErrMessageTooLarge):
 		writeErr(w, http.StatusRequestEntityTooLarge, "message_too_large", err.Error())
 	case errors.Is(err, context.Canceled):

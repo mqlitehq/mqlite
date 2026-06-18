@@ -19,8 +19,12 @@ ordering, topics — in a single pure-Go binary (no CGO).
   (`Complete`/`Abandon`/`Reject`/`Defer`), visibility timeout with fencing
   tokens, `delivery_count` → DLQ, `Renew`, scheduled/deferred messages.
 - **Approximate order by default, strict order opt-in.** Plain queues are
-  competing-consumer; set a `GroupID` (= SQS MessageGroupId) for strict
-  per-group ordering with cross-group parallelism.
+  competing-consumer. Pick a queue-level ordering mode at create time:
+  `standard` (default — per-`GroupID` FIFO with cross-group parallelism),
+  `group_fifo` (same, but a `GroupID` is required on every message), or
+  `strict_fifo` (single global head-of-line FIFO across the whole queue).
+  `GroupID` is an **ordering key** (= SQS MessageGroupId / ASB SessionId) — *not*
+  a consumer group; competing consumers just `Receive` the same queue.
 - **curl-able contract.** Every RPC is a plain HTTP `POST` to
   `/mqlite.v1.<Service>/<Method>` with a JSON body; the Go SDK is sugar on top.
 
@@ -137,8 +141,8 @@ cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
 ### 5. CLI
 
 ```bash
-mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m
-mqlite send orders "hello" --message-id m1 --group order-42
+mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering strict_fifo
+mqlite send orders "hello" --message-id m1 --group order-42 --reply-to replies
 mqlite receive orders --wait 5s
 mqlite peek orders --state dead_lettered
 mqlite metrics orders

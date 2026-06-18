@@ -94,6 +94,8 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
 	case "name_conflict":
 		return fmt.Errorf("%w: %s", ErrNameConflict, eb.Message)
+	case "group_required":
+		return fmt.Errorf("%w: %s", ErrGroupRequired, eb.Message)
 	case "message_too_large":
 		return fmt.Errorf("%w: %s", ErrMessageTooLarge, eb.Message)
 	case "lock_lost":
@@ -114,6 +116,7 @@ func outToWire(m OutMessage) wire.Message {
 		MessageID:     m.MessageID,
 		GroupID:       m.GroupID,
 		CorrelationID: m.CorrelationID,
+		ReplyTo:       m.ReplyTo,
 		Subject:       m.Subject,
 		ContentType:   m.ContentType,
 		Properties:    m.Properties,
@@ -127,6 +130,7 @@ func (c *Client) wireToMessage(queue string, wm wire.Message) *Message {
 		MessageID:      wm.MessageID,
 		GroupID:        wm.GroupID,
 		CorrelationID:  wm.CorrelationID,
+		ReplyTo:        wm.ReplyTo,
 		Subject:        wm.Subject,
 		ContentType:    wm.ContentType,
 		Properties:     wm.Properties,
@@ -260,6 +264,7 @@ func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 		Name: name, Config: wire.QueueConfigJSON{
 			LockDurationMs: ec.LockDurationMs, MaxDeliveryCount: ec.MaxDeliveryCount,
 			DefaultTTLMs: ec.DefaultTTLMs, DeadLetterOnExpire: ec.DeadLetterOnExpire, DedupWindowMs: ec.DedupWindowMs,
+			OrderingMode: string(ec.Ordering),
 		},
 	}, &wire.Empty{})
 }
@@ -361,6 +366,7 @@ type PeekedMessage struct {
 	MessageID      string
 	GroupID        string
 	CorrelationID  string
+	ReplyTo        string
 	Subject        string
 	ContentType    string
 	Properties     map[string]string
@@ -378,6 +384,7 @@ func wireToPeeked(wm wire.Message) *PeekedMessage {
 		MessageID:      wm.MessageID,
 		GroupID:        wm.GroupID,
 		CorrelationID:  wm.CorrelationID,
+		ReplyTo:        wm.ReplyTo,
 		Subject:        wm.Subject,
 		ContentType:    wm.ContentType,
 		Properties:     wm.Properties,

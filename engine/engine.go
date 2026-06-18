@@ -50,6 +50,7 @@ type queueRow struct {
 	defaultTTLMs     int64
 	deadLetterOnExp  bool
 	dedupWindowMs    int64
+	ordering         OrderingMode
 }
 
 // Open opens (and migrates) the store, performs single-broker crash recovery,
@@ -136,19 +137,24 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	if cfg.DeadLetterOnExpire != nil && !*cfg.DeadLetterOnExpire {
 		dle = 0
 	}
+	ordering := cfg.Ordering
+	if ordering == "" {
+		ordering = OrderStandard
+	}
 	now := e.now()
 	_, err := e.db.exec(ctx, `
 		INSERT INTO queues (name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		                    dead_letter_on_expire,dedup_window_ms,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		                    dead_letter_on_expire,dedup_window_ms,ordering_mode,created_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(name) DO UPDATE SET
 		    lock_duration_ms=excluded.lock_duration_ms,
 		    max_delivery_count=excluded.max_delivery_count,
 		    default_ttl_ms=excluded.default_ttl_ms,
 		    dead_letter_on_expire=excluded.dead_letter_on_expire,
 		    dedup_window_ms=excluded.dedup_window_ms,
+		    ordering_mode=excluded.ordering_mode,
 		    updated_at=excluded.updated_at`,
-		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, now, now)
+		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, string(ordering), now, now)
 	if err != nil {
 		return err
 	}
@@ -220,16 +226,18 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 		return q, nil
 	}
 	var dle int
+	var ordering string
 	if err := e.db.queryRowScan(ctx,
-		[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs}, `
+		[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering}, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms FROM queues WHERE name=?`, name); err != nil {
+		       dead_letter_on_expire,dedup_window_ms,ordering_mode FROM queues WHERE name=?`, name); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return queueRow{}, ErrQueueNotFound
 		}
 		return queueRow{}, err
 	}
 	q.deadLetterOnExp = dle != 0
+	q.ordering = OrderingMode(ordering)
 	e.qmu.Lock()
 	e.qcache[name] = q
 	e.qmu.Unlock()
@@ -337,6 +345,9 @@ func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs in
 				if err != nil {
 					return err
 				}
+				if q.ordering == OrderGroupFIFO && m.GroupID == "" {
+					return ErrGroupRequired
+				}
 				seq, deduped, err := e.insertOne(ctx, tx, q, m, atMs, forced, now)
 				if errors.Is(err, ErrDedupConflict) {
 					// Batch-safe: a dedup conflict (same id, different body) skips
@@ -418,16 +429,18 @@ func (e *Engine) loadQueueTx(ctx context.Context, tx *sql.Tx, name string) (queu
 	}
 	row := tx.QueryRowContext(ctx, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms FROM queues WHERE name=?`, name)
+		       dead_letter_on_expire,dedup_window_ms,ordering_mode FROM queues WHERE name=?`, name)
 	var dle int
+	var ordering string
 	if err := row.Scan(&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount,
-		&q.defaultTTLMs, &dle, &q.dedupWindowMs); err != nil {
+		&q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return queueRow{}, ErrQueueNotFound
 		}
 		return queueRow{}, err
 	}
 	q.deadLetterOnExp = dle != 0
+	q.ordering = OrderingMode(ordering)
 	return q, nil
 }
 

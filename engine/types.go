@@ -14,6 +14,22 @@ const (
 	StateDeadLettered State = "dead_lettered"
 )
 
+// OrderingMode is a queue-level delivery-ordering policy.
+//
+//	OrderStandard   — best-effort FIFO per group; ungrouped messages are each
+//	                  their own group (max parallelism). The default.
+//	OrderGroupFIFO  — strict in-order delivery within a group; GroupID is
+//	                  required on every message (claim behaves like standard).
+//	OrderStrictFIFO — strict single-flight global FIFO: the queue head blocks
+//	                  the whole queue until it is settled (no grouping).
+type OrderingMode string
+
+const (
+	OrderStandard   OrderingMode = "standard"
+	OrderGroupFIFO  OrderingMode = "group_fifo"
+	OrderStrictFIFO OrderingMode = "strict_fifo"
+)
+
 // Dead-letter reasons.
 const (
 	ReasonMaxDeliveryCount = "MaxDeliveryCountExceeded"
@@ -30,25 +46,33 @@ var (
 	ErrClosed          = errors.New("mqlite: engine closed")
 	ErrMessageTooLarge = errors.New("mqlite: message body exceeds max size")
 	ErrNameConflict    = errors.New("mqlite: name already in use by another queue or topic")
+	ErrGroupRequired   = errors.New("mqlite: group id required for group_fifo queue")
 )
 
 // QueueConfig configures a queue or subscription (entity-level defaults).
 // Zero values mean "use the documented default".
 type QueueConfig struct {
-	Kind               string // "queue" (default) or "subscription"
-	LockDurationMs     int64  // Peek-Lock default lock duration; 0 -> 30000
-	MaxDeliveryCount   int    // 0 -> 10
-	DefaultTTLMs       int64  // 0 -> unlimited
-	DeadLetterOnExpire *bool  // nil -> true
-	DedupWindowMs      int64  // 0 -> dedup disabled
+	Kind               string       // "queue" (default) or "subscription"
+	LockDurationMs     int64        // Peek-Lock default lock duration; 0 -> 30000
+	MaxDeliveryCount   int          // 0 -> 10
+	DefaultTTLMs       int64        // 0 -> unlimited
+	DeadLetterOnExpire *bool        // nil -> true
+	DedupWindowMs      int64        // 0 -> dedup disabled
+	Ordering           OrderingMode // "" -> standard
 }
 
 // OutMessage is a message to enqueue. Body is opaque; the broker never parses it.
 type OutMessage struct {
-	Body          []byte
-	MessageID     string // dedup / idempotency key; empty -> body SHA-256 used when dedup on
-	GroupID       string // = MessageGroupId; empty -> message is its own group (max parallelism)
+	Body      []byte
+	MessageID string // dedup / idempotency key; empty -> body SHA-256 used when dedup on
+	// GroupID is an ordering / partition key (= SQS MessageGroupId, ASB SessionId):
+	// messages sharing a GroupID are delivered strictly in-order (FIFO per group);
+	// empty -> the message is its own group (max parallelism). It is NOT a consumer
+	// group — competing consumers just Receive the same queue and peek-lock hands
+	// each message to exactly one of them.
+	GroupID       string
 	CorrelationID string
+	ReplyTo       string // = ASB ReplyTo; opaque address the consumer should reply to
 	Subject       string // = ASB Label
 	ContentType   string
 	Properties    map[string]string // custom KV (headers), JSON-encoded; broker does not interpret
@@ -70,6 +94,7 @@ type Message struct {
 	MessageID     string
 	GroupID       string
 	CorrelationID string
+	ReplyTo       string
 	Subject       string
 	ContentType   string
 	Properties    map[string]string
@@ -87,6 +112,7 @@ type PeekedMessage struct {
 	MessageID             string
 	GroupID               string
 	CorrelationID         string
+	ReplyTo               string
 	Subject               string
 	ContentType           string
 	Properties            map[string]string
