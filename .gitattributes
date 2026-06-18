@@ -1,0 +1,7 @@
+# Normalize Go sources to LF in the working tree on every platform. Windows CI
+# runners check out with core.autocrlf=true by default, which would turn *.go
+# into CRLF and make the `gofmt -l` CI step report every file as unformatted.
+*.go  text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.sh  text eol=lf
