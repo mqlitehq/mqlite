@@ -39,12 +39,43 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
-      - name: test (race + coverage)
-        run: go test -race -coverprofile=coverage.out -count=1 ./...
-      - name: coverage summary
-        run: go tool cover -func=coverage.out | tail -1
+      - name: test (race)
+        run: go test -race -count=1 ./...
       # Turso integration is gated by env (MQLITE_TEST_DB) and runs in the
       # nightly workflow, not here — keeps PRs hermetic and off the remote quota.
+      # Coverage is measured once in the dedicated `coverage` job below.
+
+  coverage:
+    name: coverage (gate engine ≥70%, report all)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: test with coverage
+        run: go test -covermode=atomic -coverprofile=coverage.out -count=1 ./... | tee cover.txt
+      - name: report + gate
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            grep -E 'coverage:|no test files' cover.txt | sed 's#github.com/mqlitehq/mqlite/##; s/  */ /g'
+            echo "total: $(go tool cover -func=coverage.out | awk '/^total:/{print $3}')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          eng=$(grep -E '/engine[[:space:]]' cover.txt | sed -n 's/.*coverage: \([0-9.]*\)%.*/\1/p')
+          echo "engine coverage = ${eng:-0}% (floor 70%)"
+          awk -v e="${eng:-0}" 'BEGIN { if (e + 0 < 70) { exit 1 } }' \
+            || { echo "::error::engine coverage ${eng:-0}% is below the 70% floor"; exit 1; }
+      - name: html report
+        run: go tool cover -html=coverage.out -o coverage.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.html
 
   lint:
     name: golangci-lint
