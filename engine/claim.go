@@ -42,12 +42,24 @@ UPDATE messages
     WHERE m.queue=? AND m.state='active'
       AND m.visible_at<=? AND (m.expires_at=0 OR m.expires_at>?)
       AND ( m.group_id IS NULL
-         OR NOT EXISTS (
-              SELECT 1 FROM messages b
-               WHERE b.queue=m.queue AND b.group_id IS m.group_id
-                 AND b.id < m.id
-                 AND ( (b.state='locked' AND b.locked_until>?)
-                    OR  b.state IN ('deferred','scheduled') ) ) )
+         OR NOT (  -- MQLITE-22: one EXISTS per in-flight state, each a single
+                   -- state= equality so SQLite seeks the covering index
+                   -- idx_msg_group_inflight(queue,group_id,state,locked_until) by
+                   -- its (queue,group_id,state) prefix instead of a backward rowid
+                   -- scan. (group_id IS NULL short-circuits first, so these run
+                   -- only for grouped messages.) Do NOT merge back into one
+                   -- NOT EXISTS with state IN(...) / an OR of states: that plans as
+                   -- a rowid scan, O(n) per candidate, O(n^2) to drain a deep
+                   -- blocked backlog — the r1 incident, on the ordered path.
+              EXISTS ( SELECT 1 FROM messages b
+                        WHERE b.queue=m.queue AND b.group_id=m.group_id
+                          AND b.state='deferred' AND b.id < m.id )
+           OR EXISTS ( SELECT 1 FROM messages b
+                        WHERE b.queue=m.queue AND b.group_id=m.group_id
+                          AND b.state='scheduled' AND b.id < m.id )
+           OR EXISTS ( SELECT 1 FROM messages b
+                        WHERE b.queue=m.queue AND b.group_id=m.group_id
+                          AND b.state='locked' AND b.locked_until>? AND b.id < m.id ) ) )
     ORDER BY m.id ASC LIMIT 1)
 RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
           reply_to, subject, content_type, properties, enqueued_at, locked_until`
@@ -66,12 +78,20 @@ UPDATE messages
    SELECT m.id FROM messages m
     WHERE m.queue=? AND m.state='active'
       AND m.visible_at<=? AND (m.expires_at=0 OR m.expires_at>?)
-      AND NOT EXISTS (
-              SELECT 1 FROM messages b
-               WHERE b.queue=m.queue
-                 AND b.id < m.id
-                 AND ( (b.state='locked' AND b.locked_until>?)
-                    OR  b.state IN ('deferred','scheduled') ) )
+      AND NOT (  -- MQLITE-22: one EXISTS per in-flight state (single state=
+                 -- equality each) so each seeks an index instead of a backward
+                 -- rowid scan: deferred -> idx_msg_deferred(queue,id),
+                 -- scheduled -> idx_msg_sched_head(queue,id), locked ->
+                 -- idx_msg_locked. Same reasoning as claimSQL; do NOT collapse back.
+              EXISTS ( SELECT 1 FROM messages b
+                        WHERE b.queue=m.queue
+                          AND b.state='deferred' AND b.id < m.id )
+           OR EXISTS ( SELECT 1 FROM messages b
+                        WHERE b.queue=m.queue
+                          AND b.state='scheduled' AND b.id < m.id )
+           OR EXISTS ( SELECT 1 FROM messages b
+                        WHERE b.queue=m.queue
+                          AND b.state='locked' AND b.locked_until>? AND b.id < m.id ) )
     ORDER BY m.id ASC LIMIT 1)
 RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
           reply_to, subject, content_type, properties, enqueued_at, locked_until`
