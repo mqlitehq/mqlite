@@ -69,7 +69,7 @@ jobs:
           awk -v e="${eng:-0}" 'BEGIN { if (e + 0 < 70) { exit 1 } }' \
             || { echo "::error::engine coverage ${eng:-0}% is below the 70% floor"; exit 1; }
       - name: upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
