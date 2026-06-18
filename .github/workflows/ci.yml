@@ -77,7 +77,7 @@ jobs:
           fail_ci_if_error: false # don't fail the build on a Codecov upload hiccup
       - name: html report
         run: go tool cover -html=coverage.out -o coverage.html
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: |
