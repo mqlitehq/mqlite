@@ -186,6 +186,7 @@ MQLITE_TEST_DB=libsql://<db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
 
 ## Status
 
-v0.1 — the core is complete and tested (local SQLite + live Turso). See
-[`BUILD-LOG.md`](BUILD-LOG.md) for what's implemented, what's deferred, and the
-build/verification record.
+v0.1 — the core is complete and tested (local SQLite + live Turso): hermetic
+unit + invariant (TCK-style) tests run in CI on every push, and live
+Turso/libSQL round-trips run in the nightly workflow. Not yet tagged for
+release.
