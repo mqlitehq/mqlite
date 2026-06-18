@@ -47,6 +47,7 @@ var (
 	ErrMessageTooLarge = errors.New("mqlite: message body exceeds max size")
 	ErrNameConflict    = errors.New("mqlite: name already in use by another queue or topic")
 	ErrGroupRequired   = errors.New("mqlite: group id required for group_fifo queue")
+	ErrDBLocked        = errors.New("mqlite: database file is already open by another process")
 )
 
 // QueueConfig configures a queue or subscription (entity-level defaults).

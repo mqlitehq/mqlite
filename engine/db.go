@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 type db struct {
 	sql    *sql.DB
 	remote bool
+	lock   io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
 }
 
 // resolveDSN turns the user-facing DB string + optional auth token into a
@@ -61,10 +63,40 @@ func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 	return "sqlite", "file:" + path + "?" + pragmas, false
 }
 
+// localFilePath returns the on-disk path of a local file DSN, or ok=false for an
+// in-memory DB (which needs no single-writer lock — each :memory: is its own DB).
+func localFilePath(dsn string) (string, bool) {
+	low := strings.ToLower(strings.TrimSpace(dsn))
+	if low == "" || strings.Contains(low, ":memory:") {
+		return "", false
+	}
+	return strings.TrimPrefix(dsn, "file:"), true
+}
+
 func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 	driver, conn, remote := resolveDSN(dsn, token, sync)
+
+	// Single-writer guard (MQLITE-6): a local file DB may be opened by only one
+	// process at a time — two writers would race on crash recovery and claims.
+	// Exempt :memory: (private per handle) and remote Turso (serialized server-side).
+	// Lock the sidecar, not the DB file, so SQLite's own locking is untouched; the
+	// OS releases it on process exit, so a crash never leaves a stale lock.
+	var lock io.Closer
+	if !remote {
+		if path, ok := localFilePath(dsn); ok {
+			l, err := acquireFileLock(path + ".lock")
+			if err != nil {
+				return nil, err
+			}
+			lock = l
+		}
+	}
+
 	sdb, err := sql.Open(driver, conn)
 	if err != nil {
+		if lock != nil {
+			_ = lock.Close()
+		}
 		return nil, fmt.Errorf("open %s: %w", driver, err)
 	}
 	if remote {
@@ -89,9 +121,12 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 	defer cancel()
 	if err := sdb.PingContext(pingCtx); err != nil {
 		sdb.Close()
+		if lock != nil {
+			_ = lock.Close()
+		}
 		return nil, fmt.Errorf("ping %s: %w", driver, err)
 	}
-	return &db{sql: sdb, remote: remote}, nil
+	return &db{sql: sdb, remote: remote, lock: lock}, nil
 }
 
 // migrate creates tables/indexes idempotently and records the schema version.
@@ -108,7 +143,15 @@ func (d *db) migrate(ctx context.Context) error {
 	return nil
 }
 
-func (d *db) close() error { return d.sql.Close() }
+func (d *db) close() error {
+	err := d.sql.Close()
+	if d.lock != nil {
+		if e := d.lock.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
 
 // ── connection-error resilience (remote only) ───────────────────────────────
 //
