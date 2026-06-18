@@ -225,10 +225,10 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 	return out, nil
 }
 
-func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode) ([]*Message, error) {
+func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
 	var resp wire.ReceiveResponse
 	if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
-		Queue: queue, MaxMessages: max, WaitTimeMs: waitMs, ReceiveMode: int(mode),
+		Queue: queue, MaxMessages: max, WaitTimeMs: waitMs, ReceiveMode: int(mode), AttemptID: attemptID,
 	}, &resp); err != nil {
 		return nil, err
 	}

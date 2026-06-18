@@ -146,8 +146,8 @@ func (e *Embedded) Receive(ctx context.Context, queue string, opts ...RecvOpts) 
 	return out, nil
 }
 
-func (e *Embedded) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode) ([]*Message, error) {
-	ms, err := e.eng.Receive(ctx, queue, engine.ReceiveOptions{MaxMessages: max, WaitMs: waitMs, Mode: mode})
+func (e *Embedded) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
+	ms, err := e.eng.Receive(ctx, queue, engine.ReceiveOptions{MaxMessages: max, WaitMs: waitMs, Mode: mode, AttemptID: attemptID})
 	if err != nil {
 		return nil, err
 	}

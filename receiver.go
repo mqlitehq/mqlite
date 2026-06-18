@@ -2,11 +2,20 @@ package mqlite
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"sync"
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
 )
+
+// newAttemptID returns a random idempotency key for one receive round (§17.1).
+func newAttemptID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
 
 type receiverConfig struct {
 	autoRenew   bool
@@ -58,7 +67,17 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			wg.Wait()
 			return ctx.Err()
 		}
-		msgs, err := r.src.receiveOne(ctx, r.queue, batch, 20000, engine.PeekLock) // 20s long-poll
+		// Fresh attempt id per round drives idempotent receive: on a transient error
+		// we retry ONCE with the SAME id, so if the broker already claimed+recorded
+		// this batch (only the response was lost) the retry replays it instead of
+		// claiming new messages — no double-delivery / burned delivery_count. Retrying
+		// on any error is safe: the attempt id makes it a no-op replay when the first
+		// claim already landed, and a fresh claim when it never did.
+		attemptID := newAttemptID()
+		msgs, err := r.src.receiveOne(ctx, r.queue, batch, 20000, engine.PeekLock, attemptID) // 20s long-poll
+		if err != nil && ctx.Err() == nil {
+			msgs, err = r.src.receiveOne(ctx, r.queue, batch, 20000, engine.PeekLock, attemptID)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				wg.Wait()
