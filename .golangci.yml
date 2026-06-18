@@ -12,6 +12,13 @@ run:
 
 linters:
   default: standard
+  enable:
+    - bodyclose # HTTP response bodies are closed
+    - copyloopvar # no aliasing of loop variables
+    - errorlint # correct error wrapping / errors.Is/As
+    - misspell # spelling in comments/strings
+    - nilerr # don't return nil on a non-nil error
+    - unconvert # no redundant type conversions
   exclusions:
     generated: lax
     presets:

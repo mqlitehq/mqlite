@@ -68,6 +68,13 @@ jobs:
           echo "engine coverage = ${eng:-0}% (floor 70%)"
           awk -v e="${eng:-0}" 'BEGIN { if (e + 0 < 70) { exit 1 } }' \
             || { echo "::error::engine coverage ${eng:-0}% is below the 70% floor"; exit 1; }
+      - name: upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          slug: mqlitehq/mqlite
+          fail_ci_if_error: false # don't fail the build on a Codecov upload hiccup
       - name: html report
         run: go tool cover -html=coverage.out -o coverage.html
       - uses: actions/upload-artifact@v4
