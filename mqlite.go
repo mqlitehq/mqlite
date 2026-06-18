@@ -212,5 +212,5 @@ type settler interface {
 // receiveSource is implemented by Client and Embedded so Receiver works on both.
 type receiveSource interface {
 	settler
-	receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode) ([]*Message, error)
+	receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error)
 }

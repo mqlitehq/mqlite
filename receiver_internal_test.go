@@ -1,0 +1,108 @@
+package mqlite
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/mqlitehq/mqlite/engine"
+)
+
+// fakeSource is a receiveSource that records the attempt id of every receiveOne
+// call and can fail the first failN calls, to exercise the Receiver's same-id retry.
+type fakeSource struct {
+	mu       sync.Mutex
+	attempts []string
+	calls    int
+	failN    int
+	batch    []*Message
+}
+
+func (f *fakeSource) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
+	f.mu.Lock()
+	f.calls++
+	n := f.calls
+	f.attempts = append(f.attempts, attemptID)
+	f.mu.Unlock()
+	switch {
+	case n <= f.failN:
+		return nil, errors.New("simulated transient receive error")
+	case n == f.failN+1:
+		return f.batch, nil
+	default:
+		<-ctx.Done() // quiesce after the batch is delivered; no busy-spin
+		return nil, ctx.Err()
+	}
+}
+
+func (f *fakeSource) complete(ctx context.Context, queue string, seq int64, token string) error {
+	return nil
+}
+func (f *fakeSource) abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
+	return nil
+}
+func (f *fakeSource) reject(ctx context.Context, queue string, seq int64, token, reason, desc string) error {
+	return nil
+}
+func (f *fakeSource) deferMsg(ctx context.Context, queue string, seq int64, token string) error {
+	return nil
+}
+func (f *fakeSource) renew(ctx context.Context, queue string, seq int64, token string) error {
+	return nil
+}
+
+// MQLITE-8: a transient receive error must be retried ONCE with the SAME attempt
+// id, so the broker's idempotent-receive machinery replays the lost batch instead
+// of claiming new messages (no double-delivery).
+func TestReceiverRetriesWithSameAttemptID(t *testing.T) {
+	f := &fakeSource{failN: 1}
+	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var once sync.Once
+	got := make(chan struct{})
+	go func() {
+		_ = newReceiver(f, "q", nil).Run(ctx, func(context.Context, *Message) error {
+			once.Do(func() { close(got); cancel() })
+			return nil
+		})
+	}()
+
+	select {
+	case <-got:
+	case <-ctx.Done():
+		t.Fatal("handler never received the replayed batch")
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.attempts) < 2 {
+		t.Fatalf("a failed receive must be retried; got %d call(s)", len(f.attempts))
+	}
+	if f.attempts[0] == "" {
+		t.Fatal("receive attempt id must be non-empty")
+	}
+	if f.attempts[0] != f.attempts[1] {
+		t.Fatalf("retry must reuse the same attempt id: %q != %q", f.attempts[0], f.attempts[1])
+	}
+}
+
+// Each receive round must use a fresh, unique attempt id so distinct batches are
+// not collapsed by idempotent-receive dedup.
+func TestNewAttemptIDUnique(t *testing.T) {
+	seen := make(map[string]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		id := newAttemptID()
+		if id == "" {
+			t.Fatal("attempt id must be non-empty")
+		}
+		if seen[id] {
+			t.Fatalf("attempt id collided: %s", id)
+		}
+		seen[id] = true
+	}
+}
