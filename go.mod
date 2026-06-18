@@ -1,10 +1,10 @@
 module github.com/mqlitehq/mqlite
 
-go 1.21
+go 1.25.0
 
 require (
 	github.com/tursodatabase/libsql-client-go v0.0.0-20251219100830-236aa1ff8acc
-	golang.org/x/sys v0.30.0
+	golang.org/x/sys v0.46.0
 	modernc.org/sqlite v1.36.1
 )
 
