@@ -7,7 +7,7 @@
 #   BENCH_DUR=10s BENCH_MSG=1024 ./bench/run-bench.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(cd "$HERE/.." && pwd)
+ROOT=$(cd "$HERE/../.." && pwd)
 OUT="$HERE/out"
 DUR="${BENCH_DUR:-5s}"
 MSG="${BENCH_MSG:-256}"
