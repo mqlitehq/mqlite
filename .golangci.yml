@@ -27,7 +27,7 @@ linters:
       - path: '_test\.go'
         linters:
           - errcheck
-      - path: 'cmd/mqlite-bench/'
+      - path: 'test/bench/'
         linters:
           - errcheck
       - path: 'test/sdkcheck/'

@@ -1,4 +1,4 @@
-<p align="center"><img src="logo.svg" width="72" height="72" alt="mqlite"></p>
+<p align="center"><img src="docs/logo.svg" width="72" height="72" alt="mqlite"></p>
 
 # mqlite
 

@@ -17,7 +17,7 @@
 /bin/
 
 # generated stress-test data + monitor logs (reproducible via `make bench`)
-/bench/out/
+/test/bench/out/
 
 # go
 *.test

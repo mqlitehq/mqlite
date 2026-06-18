@@ -15,7 +15,7 @@ help: ## show this help
 build: ## build mqlite + mqlite-bench into bin/
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/mqlite ./cmd/mqlite
-	go build -o $(BIN)/mqlite-bench ./cmd/mqlite-bench
+	go build -o $(BIN)/mqlite-bench ./test/bench
 	@echo "built $(BIN)/mqlite, $(BIN)/mqlite-bench"
 
 test: ## run unit + invariant tests (uses auto-cleaned temp dirs)
@@ -24,8 +24,8 @@ test: ## run unit + invariant tests (uses auto-cleaned temp dirs)
 e2e: ## run end-to-end suites against an ephemeral local broker
 	./test/run.sh
 
-bench: ## run the Docker stress matrix (regenerates bench/out/)
-	./bench/run-bench.sh
+bench: ## run the Docker stress matrix (regenerates test/bench/out/)
+	./test/bench/run-bench.sh
 
 ## ── clean ───────────────────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ clean: ## remove ALL generated/temp data (DBs, bench/out, binaries, smoke dirs)
 	@echo "› generated SQLite files"
 	@find . -type f \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \) -print -delete
 	@echo "› bench output"
-	@rm -rf bench/out
+	@rm -rf test/bench/out
 	@echo "› built binaries"
 	@rm -rf $(BIN) ./mqlite ./mqlite-bench
 	@echo "› local smoke dirs"
