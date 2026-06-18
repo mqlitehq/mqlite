@@ -2,6 +2,9 @@
 
 # mqlite
 
+[![CI](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
+
 A small, SQLite/Turso-backed online message queue with **Azure Service Bus–style
 semantics** — Peek-Lock, retries, DLQ, scheduling, dedup, GroupID
 ordering, topics — in a single pure-Go binary (no CGO).
