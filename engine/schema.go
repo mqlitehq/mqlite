@@ -71,8 +71,18 @@ var schemaStmts = []string{
 	`CREATE INDEX IF NOT EXISTS idx_msg_expire    ON messages(expires_at)           WHERE expires_at>0`,
 	`CREATE INDEX IF NOT EXISTS idx_msg_dlq       ON messages(queue, id)            WHERE state='dead_lettered'`,
 	// partial index for group-ordered claim — only grouped messages pay for it (§11.1).
+	// The split per-state head-of-line probe in claimSQL seeks this by its
+	// (queue,group_id,state[,locked_until]) prefix (MQLITE-22).
 	`CREATE INDEX IF NOT EXISTS idx_msg_group_inflight ON messages(queue, group_id, state, locked_until)
 	  WHERE group_id IS NOT NULL`,
+	// head-of-line probe for a SCHEDULED blocker (MQLITE-22): mirrors idx_msg_deferred
+	// so claim's per-state "earlier scheduled in this queue?" EXISTS seeks (queue,id<?)
+	// instead of a backward rowid scan. (deferred -> idx_msg_deferred, locked ->
+	// idx_msg_locked / idx_msg_group_inflight already cover those branches.) A single
+	// (queue,state,id) partial over all in-flight states does NOT work: SQLite won't
+	// match a `state IN(...)` partial predicate to a single-state `state='scheduled'`
+	// probe, so it falls back to the rowid scan. Scheduled rows are sparse -> cheap.
+	`CREATE INDEX IF NOT EXISTS idx_msg_sched_head ON messages(queue, id) WHERE state='scheduled'`,
 
 	// optional dedup table (message_id + sliding window). active only when dedup_window_ms>0.
 	`CREATE TABLE IF NOT EXISTS dedup (
