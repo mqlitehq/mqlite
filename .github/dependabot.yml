@@ -8,6 +8,15 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
+    # The go.mod floor is pinned at go 1.21 for embedding compatibility (MQLITE-1).
+    # Every release past these versions requires go >= 1.23, so Dependabot would
+    # only ever open PRs that fail the go 1.21.x CI matrix. Ignore them until the
+    # floor is intentionally raised. See docs/dependencies.md.
+    ignore:
+      - dependency-name: "modernc.org/sqlite"
+        versions: [">=1.36.2"]
+      - dependency-name: "golang.org/x/sys"
+        versions: [">=0.31.0"]
   # GitHub Actions versions (would have caught golangci-lint-action v6 -> v7).
   - package-ecosystem: github-actions
     directory: "/"
