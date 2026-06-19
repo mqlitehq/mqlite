@@ -53,6 +53,15 @@ serialization, no extra daemon**: your app and the queue are one binary backed b
 one SQLite (or Turso) database. You only start an HTTP server if you *choose* to
 (see §2) — the embedded path never opens a socket.
 
+> **Single process, single writer.** Embedded mode is one process owning one
+> database. `OpenEmbedded` takes an exclusive lock on the DB file, so a second
+> process — or a second `OpenEmbedded` on the same file — fails fast with
+> `ErrDBLocked` instead of racing it (two writers would corrupt crash recovery and
+> claim ordering). Sharing one file DB across processes is **not supported**: when
+> you need multiple processes or hosts, run the broker (§2) and connect over HTTP —
+> that single broker is the one writer. (`:memory:` is private per handle, and a
+> remote Turso DB is serialized server-side, so neither takes the lock.)
+
 ```go
 ctx := context.Background()
 
