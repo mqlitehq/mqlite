@@ -14,6 +14,7 @@ func TestCmdPurgeDLQ(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("MQLITE_ENDPOINT", "") // force the embedded path in dial()
 	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	t.Setenv("MQLITE_SYNC", "FULL") // exercise the durability knob through embeddedOpts (MQLITE-7)
 
 	// Arrange: one dead-lettered message. Close releases the file lock (MQLITE-6)
 	// before the command opens the same DB.

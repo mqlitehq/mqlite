@@ -199,6 +199,30 @@ Connection is read from the environment:
 > The DB connection string is **only ever read from the environment** — it is
 > never compiled into the binary. Copy `.env.example` → `.env.local` (gitignored).
 
+## Durability
+
+mqlite stores everything in SQLite/libSQL with **WAL** journaling. State is durable
+across a normal process crash: on restart, in-flight (`locked`) messages are
+reclaimed and redelivered (at-least-once), and settled work stays settled.
+
+The one knob is SQLite's `synchronous` level (database-wide — SQLite has no
+per-queue setting):
+
+| Level | Guarantee | Cost |
+|---|---|---|
+| `NORMAL` *(default)* | Durable across an app/process crash. A sudden **OS or power loss** can drop the last few commits not yet checkpointed to the main DB file. | Fast — fsync per WAL checkpoint, not per commit. |
+| `FULL` | Every commit is fsync'd before it returns — survives OS/power loss. | Slower under high enqueue throughput. |
+
+Set it with the embedded option `mqlite.WithSynchronous("FULL")`, or `MQLITE_SYNC=FULL`
+for the `serve`/CLI path. Remote **Turso** DSNs ignore this — durability there is the
+server's responsibility.
+
+> **What "no message loss" means here:** mqlite is honestly **at-least-once**, not
+> exactly-once. Under `NORMAL`, a power cut can lose a handful of just-enqueued
+> messages that hadn't reached disk yet; choose `FULL` if that window is
+> unacceptable. Once a message is durably written it is delivered at least once and
+> never silently dropped.
+
 ## Docker
 
 ```bash
