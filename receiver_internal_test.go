@@ -78,7 +78,16 @@ func TestReceiverRetriesWithSameAttemptID(t *testing.T) {
 	select {
 	case <-got:
 	case <-ctx.Done():
-		t.Fatal("handler never received the replayed batch")
+		// The handler cancels ctx the instant it fires, so ctx.Done() can become
+		// ready in the same scheduling tick as got closing — select then picks a
+		// ready case at random and occasionally reads a real delivery as a timeout
+		// (the actual flake, which a wider deadline alone can't fix). got is only
+		// ever closed by the handler, so re-check it before declaring failure.
+		select {
+		case <-got:
+		default:
+			t.Fatal("handler never received the replayed batch")
+		}
 	}
 
 	f.mu.Lock()
