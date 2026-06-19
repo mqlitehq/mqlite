@@ -3,6 +3,7 @@ package mqlite_test
 import (
 	"context"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -16,7 +17,17 @@ import (
 func newBroker(t *testing.T, token string) (*mqlite.Client, *mqlite.Embedded) {
 	t.Helper()
 	ctx := context.Background()
-	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	// Not t.TempDir(): on Windows a pure-Go SQLite (modernc) file handle can linger
+	// briefly after Close, and t.TempDir()'s auto-RemoveAll fails the test when it
+	// can't delete the still-open file. Use a manual dir with a best-effort cleanup
+	// (the CI runner reaps temp dirs anyway) so this teardown race can't flake.
+	dir, err := os.MkdirTemp("", "mqlite-test-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(dir, "mq.db"))
 	if err != nil {
 		t.Fatalf("open embedded: %v", err)
 	}
@@ -106,7 +117,9 @@ func TestReceiverRun(t *testing.T) {
 
 	var processed int64
 	runCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		_ = cli.Receiver("jobs", mqlite.WithConcurrency(3)).Run(runCtx, func(c context.Context, m *mqlite.Message) error {
 			if atomic.AddInt64(&processed, 1) >= n {
 				stop()
@@ -124,4 +137,6 @@ func TestReceiverRun(t *testing.T) {
 		}
 	}
 	stop()
+	<-done // wait for Run (and its in-flight settles) to fully stop before cleanup
+	//        closes the engine — else Windows can't delete the still-open DB file.
 }

@@ -55,6 +55,8 @@ func main() {
 		err = cmdList(ctx, args)
 	case "redrive":
 		err = cmdRedrive(ctx, args)
+	case "purge-dlq":
+		err = cmdPurgeDLQ(ctx, args)
 	case "version", "-v", "--version":
 		fmt.Println("mqlite", version)
 	case "help", "-h", "--help":
@@ -84,6 +86,7 @@ usage: mqlite <command> [flags]
   metrics <queue>        show queue counters
   list                   list queues/subscriptions
   redrive <queue>        move dead-lettered messages back to active
+  purge-dlq <queue>      permanently delete dead-lettered messages
   version | help
 
 connection via env: MQLITE_ENDPOINT+MQLITE_TOKEN (client) or MQLITE_DB[+token] (embedded)
@@ -100,6 +103,7 @@ type api interface {
 	ListQueues(ctx context.Context) ([]mqlite.QueueInfo, error)
 	Stats(ctx context.Context, queue string) (mqlite.Metrics, error)
 	Redrive(ctx context.Context, dlq string, opts ...mqlite.RedriveOpts) (int, error)
+	Purge(ctx context.Context, queue string, opts ...mqlite.PurgeOpts) (int, error)
 	Close() error
 }
 
@@ -403,6 +407,30 @@ func cmdRedrive(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("ok: moved %d message(s)\n", moved)
+	return nil
+}
+
+func cmdPurgeDLQ(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("purge-dlq", flag.ExitOnError)
+	max := fs.Int("max", 0, "max messages (0=all)")
+	older := fs.Duration("older-than", 0, "only messages older than this")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 1 {
+		return fmt.Errorf("usage: purge-dlq <queue> [--max n --older-than 1h]")
+	}
+	c, err := dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	purged, err := c.Purge(ctx, pos[0], mqlite.PurgeOpts{Max: *max, OlderThan: *older})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ok: purged %d dead-lettered message(s)\n", purged)
 	return nil
 }
 
