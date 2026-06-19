@@ -25,6 +25,7 @@ type embeddedConfig struct {
 	now               func() int64
 	maxMessageBytes   int64
 	logger            *slog.Logger
+	synchronous       string
 }
 
 // EmbeddedOption configures OpenEmbedded.
@@ -56,6 +57,15 @@ func WithLogger(lg *slog.Logger) EmbeddedOption {
 	return func(c *embeddedConfig) { c.logger = lg }
 }
 
+// WithSynchronous sets the local SQLite PRAGMA synchronous level — the durability
+// vs throughput knob (MQLITE-7). "NORMAL" (default) is fast and durable across a
+// process crash, but a sudden OS/power loss can drop the last few not-yet-
+// checkpointed commits; "FULL" fsyncs every commit (safer, slower). Database-wide
+// (SQLite has no per-queue sync); ignored for remote Turso DSNs.
+func WithSynchronous(mode string) EmbeddedOption {
+	return func(c *embeddedConfig) { c.synchronous = mode }
+}
+
 // OpenEmbedded opens the engine on a DB DSN: file:./mq.db | :memory: | libsql://host
 func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*Embedded, error) {
 	var cfg embeddedConfig
@@ -69,6 +79,7 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 		DisableBackground: cfg.disableBackground,
 		MaxMessageBytes:   cfg.maxMessageBytes,
 		Logger:            cfg.logger,
+		Synchronous:       cfg.synchronous,
 	})
 	if err != nil {
 		return nil, err

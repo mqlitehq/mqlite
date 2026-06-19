@@ -132,6 +132,9 @@ func embeddedOpts() []mqlite.EmbeddedOption {
 			opts = append(opts, mqlite.WithMaxMessageBytes(n))
 		}
 	}
+	if v := os.Getenv("MQLITE_SYNC"); v != "" { // NORMAL (default) | FULL | OFF — durability knob (MQLITE-7)
+		opts = append(opts, mqlite.WithSynchronous(v))
+	}
 	return opts
 }
 
