@@ -49,7 +49,7 @@ jobs:
       # Coverage is measured once in the dedicated `coverage` job below.
 
   coverage:
-    name: coverage (gate engine ≥70%, report all)
+    name: coverage (per-package gate, cross-package)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -57,20 +57,44 @@ jobs:
         with:
           go-version: stable
       - name: test with coverage
-        run: go test -covermode=atomic -coverprofile=coverage.out -count=1 ./... | tee cover.txt
+        # -coverpkg over the product packages (not the test/ helper programs) so
+        # cross-package execution is credited: e.g. the SDK broker round-trip test
+        # exercises — and counts toward — the server handlers it calls (MQLITE-26).
+        run: |
+          pkgs=$(go list ./... | grep -v '/test/' | paste -sd, -)
+          go test -covermode=atomic -coverpkg="$pkgs" -coverprofile=coverage.out -count=1 ./... | tee cover.txt
       - name: report + gate
         run: |
+          # Per-package statement coverage from the merged -coverpkg profile: dedup
+          # blocks by id (a block repeats per test binary), covered if any binary hit it.
+          awk 'NR>1{ key=$1; stmt[key]=$2; if($3>0) cov[key]=1 }
+          END{
+            for(k in stmt){ f=k; sub(/:[0-9].*/,"",f);
+              n=split(f,p,"/"); pkg=""; for(i=4;i<n;i++) pkg=pkg (pkg==""?"":"/") p[i];
+              if(pkg=="")pkg="root"; if(pkg ~ /^test\//) continue;
+              tot[pkg]+=stmt[k]; if(cov[k]) c[pkg]+=stmt[k]; gt+=stmt[k]; if(cov[k]) gc+=stmt[k]; }
+            for(pp in tot) printf "%-12s %5.1f %d/%d\n", pp, 100*c[pp]/tot[pp], c[pp], tot[pp];
+            printf "%-12s %5.1f %d/%d\n", "TOTAL", 100*gc/gt, gc, gt;
+          }' coverage.out | sort > pkgcov.txt
           {
-            echo '### Coverage'
+            echo '### Coverage (cross-package, product code)'
             echo '```'
-            grep -E 'coverage:|no test files' cover.txt | sed 's#github.com/mqlitehq/mqlite/##; s/  */ /g'
-            echo "total: $(go tool cover -func=coverage.out | awk '/^total:/{print $3}')"
+            awk '{printf "%-12s %5s%% (%s)\n",$1,$2,$3}' pkgcov.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          eng=$(grep -E '/engine[[:space:]]' cover.txt | sed -n 's/.*coverage: \([0-9.]*\)%.*/\1/p')
-          echo "engine coverage = ${eng:-0}% (floor 70%)"
-          awk -v e="${eng:-0}" 'BEGIN { if (e + 0 < 70) { exit 1 } }' \
-            || { echo "::error::engine coverage ${eng:-0}% is below the 70% floor"; exit 1; }
+          cat pkgcov.txt
+          # Floors sit a few points below current coverage to absorb drift; raise as
+          # coverage grows. A drop below any floor fails the build (MQLITE-26).
+          awk '
+            BEGIN{ floor["TOTAL"]=65; floor["engine"]=72; floor["server"]=62;
+                   floor["cmd/mqlite"]=52; floor["root"]=55; floor["wire"]=90 }
+            { got[$1]=$2+0 }
+            END{ bad=0;
+              for(p in floor){
+                if(!(p in got)){ printf "::error::no coverage for %s\n",p; bad=1; continue }
+                if(got[p] < floor[p]){ printf "::error::%s %.1f%% below %d%% floor\n",p,got[p],floor[p]; bad=1 }
+                else printf "ok  %-12s %.1f%% >= %d%%\n",p,got[p],floor[p] }
+              exit bad }' pkgcov.txt
       - name: upload to Codecov
         uses: codecov/codecov-action@v7
         with:
