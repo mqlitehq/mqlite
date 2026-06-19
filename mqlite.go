@@ -26,6 +26,9 @@ var (
 	ErrMessageTooLarge = engine.ErrMessageTooLarge
 	ErrNameConflict    = engine.ErrNameConflict
 	ErrGroupRequired   = engine.ErrGroupRequired
+	// ErrDBLocked is returned by OpenEmbedded when the local file DB is already open
+	// in another process: embedded mode is single-process, single-writer (MQLITE-6).
+	ErrDBLocked = engine.ErrDBLocked
 )
 
 // OrderingMode mirrors engine.OrderingMode for queue-level delivery ordering.
