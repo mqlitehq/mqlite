@@ -13,6 +13,31 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
 
+## Goal
+
+mqlite aims to be the **smallest reliable queue you can drop into a system** — and
+to stay friendly to both humans and AI agents:
+
+- **Lightweight & flexible.** One pure-Go binary over a single SQLite file (or a
+  remote Turso database) — no broker cluster, no ZooKeeper, no sidecar required.
+  Embed it in your process or run it as a broker; move the storage from a
+  `:memory:` test to a replicated Turso DB without changing a line of app code.
+- **Reliable under concurrency.** At-least-once delivery with fencing tokens,
+  single-broker crash recovery, idempotent send/receive/settle, and O(log n) claims
+  on a deep backlog — built to take high enqueue/dequeue throughput without losing
+  or double-delivering messages.
+- **Simple, unambiguous interface.** Every operation is one plain HTTP `POST` with
+  a JSON body — curl-able, trivially scriptable, and easy for an LLM or agent to
+  drive — with exactly one settlement verb per outcome and no aliased calls.
+- **Service Bus flavor, not a clone.** Peek-Lock, `GroupID` sessions, DLQ,
+  scheduling and dedup will feel familiar if you know Azure Service Bus — but the
+  API is its own, shaped to be idiomatic Go and unambiguous rather than
+  bug-for-bug compatible.
+
+It targets most everyday queueing needs — background jobs, transactional
+outbox/event delivery, topic fan-out to subscriptions, and rate-limited pipelines —
+rather than competing with Kafka-scale streaming.
+
 ## Why mqlite
 
 - **One file, one binary.** Local SQLite (`modernc.org/sqlite`, pure Go) or
