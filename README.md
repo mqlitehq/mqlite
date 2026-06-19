@@ -150,6 +150,7 @@ mqlite receive orders --wait 5s
 mqlite peek orders --state dead_lettered
 mqlite metrics orders
 mqlite redrive orders --max 100        # DLQ → active
+mqlite purge-dlq orders --older-than 24h # delete dead-lettered messages
 ```
 
 Connection is read from the environment:
