@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -17,6 +18,7 @@ type Engine struct {
 	db   *db
 	note *notifier
 	now  func() int64 // epoch ms; injectable for tests
+	log  *slog.Logger // structured logging for background-loop failures (MQLITE-5)
 
 	bgWG      sync.WaitGroup
 	bgCancel  context.CancelFunc
@@ -37,6 +39,7 @@ type Options struct {
 	DisableBackground bool         // skip reaper/scheduler loops (tests)
 	Synchronous       string       // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
 	MaxMessageBytes   int64        // reject bodies larger than this; 0 -> 1 MiB (§11.4)
+	Logger            *slog.Logger // background-loop failures log here; nil -> slog.Default()
 }
 
 // DefaultMaxMessageBytes is the default body-size cap (1 MiB, design §14-Q7).
@@ -72,10 +75,15 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if maxMsg <= 0 {
 		maxMsg = DefaultMaxMessageBytes
 	}
+	lg := opts.Logger
+	if lg == nil {
+		lg = slog.Default()
+	}
 	e := &Engine{
 		db:          d,
 		note:        newNotifier(),
 		now:         nowFn,
+		log:         lg,
 		closed:      make(chan struct{}),
 		qcache:      map[string]queueRow{},
 		maxMsgBytes: maxMsg,

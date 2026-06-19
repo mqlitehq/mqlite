@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -64,6 +65,9 @@ func (s *Server) routes() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Prometheus metrics: per-queue gauges. Behind auth like the RPCs (a scraper
+	// passes the Bearer token); only /healthz stays open for liveness.
+	s.mux.HandleFunc("/metrics", s.handleMetrics)
 	// read-only ops dashboard (static page; data still goes through the authed API).
 	s.mux.HandleFunc("/ui", s.handleUI)
 	s.mux.HandleFunc("/ui/", s.handleUI)
@@ -72,6 +76,55 @@ func (s *Server) routes() {
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(uiHTML)
+}
+
+// handleMetrics exposes per-queue counters in Prometheus text format (MQLITE-5).
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	queues, err := s.eng.ListQueues(r.Context())
+	if err != nil {
+		http.Error(w, "metrics: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type qm struct {
+		name string
+		m    engine.Metrics
+	}
+	stats := make([]qm, 0, len(queues))
+	for _, q := range queues {
+		m, err := s.eng.Stats(r.Context(), q.Name)
+		if err != nil {
+			http.Error(w, "metrics: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		stats = append(stats, qm{q.Name, m})
+	}
+
+	var b strings.Builder
+	b.WriteString("# HELP mqlite_queue_messages Messages in a queue by state.\n")
+	b.WriteString("# TYPE mqlite_queue_messages gauge\n")
+	for _, st := range stats {
+		for _, sv := range []struct {
+			state string
+			n     int64
+		}{
+			{"active", st.m.Active}, {"locked", st.m.Locked}, {"deferred", st.m.Deferred},
+			{"scheduled", st.m.Scheduled}, {"dead_lettered", st.m.DeadLettered},
+		} {
+			fmt.Fprintf(&b, "mqlite_queue_messages{queue=%q,state=%q} %d\n", st.name, sv.state, sv.n)
+		}
+	}
+	b.WriteString("# HELP mqlite_queue_total Total messages in a queue.\n")
+	b.WriteString("# TYPE mqlite_queue_total gauge\n")
+	for _, st := range stats {
+		fmt.Fprintf(&b, "mqlite_queue_total{queue=%q} %d\n", st.name, st.m.Total)
+	}
+	b.WriteString("# HELP mqlite_queue_oldest_message_age_ms Age of the oldest message in a queue, in milliseconds.\n")
+	b.WriteString("# TYPE mqlite_queue_oldest_message_age_ms gauge\n")
+	for _, st := range stats {
+		fmt.Fprintf(&b, "mqlite_queue_oldest_message_age_ms{queue=%q} %d\n", st.name, st.m.OldestMessageAgeMs)
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = w.Write([]byte(b.String()))
 }
 
 func postOnly(fn http.HandlerFunc) http.HandlerFunc {

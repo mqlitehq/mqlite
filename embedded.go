@@ -3,6 +3,7 @@ package mqlite
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ type embeddedConfig struct {
 	disableBackground bool
 	now               func() int64
 	maxMessageBytes   int64
+	logger            *slog.Logger
 }
 
 // EmbeddedOption configures OpenEmbedded.
@@ -49,6 +51,11 @@ func WithMaxMessageBytes(n int64) EmbeddedOption {
 	return func(c *embeddedConfig) { c.maxMessageBytes = n }
 }
 
+// WithLogger routes background-loop failures to lg (nil -> slog.Default()).
+func WithLogger(lg *slog.Logger) EmbeddedOption {
+	return func(c *embeddedConfig) { c.logger = lg }
+}
+
 // OpenEmbedded opens the engine on a DB DSN: file:./mq.db | :memory: | libsql://host
 func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*Embedded, error) {
 	var cfg embeddedConfig
@@ -61,6 +68,7 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 		Now:               cfg.now,
 		DisableBackground: cfg.disableBackground,
 		MaxMessageBytes:   cfg.maxMessageBytes,
+		Logger:            cfg.logger,
 	})
 	if err != nil {
 		return nil, err

@@ -41,7 +41,7 @@ func TestSendBatchDedupConflictSkipsOne(t *testing.T) {
 
 // Idempotent receive: retrying Receive with the same attempt id replays the same
 // batch (same lock token, no delivery_count increment) — a dropped Receive
-// response must not burn a delivery or hand out a different message (§11 cx-port).
+// response must not burn a delivery or hand out a different message (§11).
 func TestIdempotentReceive(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
