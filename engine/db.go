@@ -182,15 +182,22 @@ func (d *db) close() error {
 	return err
 }
 
-// ── connection-error resilience (remote only) ───────────────────────────────
+// ── remote write resilience (Turso/libSQL only) ─────────────────────────────
 //
-// Turso closes idle Hrana streams; libsql-client-go then returns a *wrapped*
-// driver.ErrBadConn ("stream is closed: driver: bad connection"). Because it is
-// wrapped, database/sql will not transparently retry it. A closed stream means
-// the statement never reached the server, so retrying on a fresh pooled
-// connection is safe (no double-execution). Local SQLite never retries.
+// Two transient remote failures are retried (a local SQLite single writer never
+// retries):
+//   - a closed idle Hrana stream surfaces as a wrapped driver.ErrBadConn ("stream
+//     is closed") — the statement never reached the server, so a retry on a fresh
+//     pooled connection can't double-execute; and
+//   - a contended write surfaces as "database is locked" (SQLITE_BUSY) — the lock
+//     was never acquired so nothing ran, and a retry after a short backoff is
+//     equally safe.
+//
+// The remote pool is small (4) but the Turso primary serializes writes, so a burst
+// of concurrent enqueues races for the write lock; bounded retry + backoff lets
+// them through instead of erroring (the MQLITE-4 pool-vs-single-writer tension).
 
-const maxConnAttempts = 3
+const maxConnAttempts = 6
 
 func isConnErr(err error) bool {
 	if err == nil {
@@ -208,6 +215,32 @@ func isConnErr(err error) bool {
 	return false
 }
 
+// isBusyErr reports a contended-write error from the remote primary. The lock was
+// not acquired, so the statement did not run and a retry is safe (no double-apply).
+func isBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, sub := range []string{"database is locked", "database table is locked", "SQLITE_BUSY"} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// backoff pauses before a retry so a contended remote write doesn't immediately
+// re-collide; it escalates a little per attempt and honors ctx cancellation.
+func (d *db) backoff(ctx context.Context, attempt int) {
+	t := time.NewTimer(time.Duration(attempt) * 40 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
 func (d *db) attempts() int {
 	if d.remote {
 		return maxConnAttempts
@@ -215,12 +248,17 @@ func (d *db) attempts() int {
 	return 1
 }
 
-func (d *db) retryable(err error) bool { return d.remote && isConnErr(err) }
+func (d *db) retryable(err error) bool {
+	return d.remote && (isConnErr(err) || isBusyErr(err))
+}
 
 func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	var res sql.Result
 	var err error
 	for i := 0; i < d.attempts(); i++ {
+		if i > 0 {
+			d.backoff(ctx, i)
+		}
 		res, err = d.sql.ExecContext(ctx, query, args...)
 		if err == nil || !d.retryable(err) {
 			return res, err
@@ -233,6 +271,9 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 	var rows *sql.Rows
 	var err error
 	for i := 0; i < d.attempts(); i++ {
+		if i > 0 {
+			d.backoff(ctx, i)
+		}
 		rows, err = d.sql.QueryContext(ctx, query, args...)
 		if err == nil || !d.retryable(err) {
 			return rows, err
@@ -246,6 +287,9 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ...any) error {
 	var err error
 	for i := 0; i < d.attempts(); i++ {
+		if i > 0 {
+			d.backoff(ctx, i)
+		}
 		var rows *sql.Rows
 		rows, err = d.sql.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -281,6 +325,9 @@ func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ..
 func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	var err error
 	for i := 0; i < e.db.attempts(); i++ {
+		if i > 0 {
+			e.db.backoff(ctx, i)
+		}
 		var tx *sql.Tx
 		tx, err = e.db.sql.BeginTx(ctx, nil)
 		if err != nil {
