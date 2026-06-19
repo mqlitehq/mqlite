@@ -1,7 +1,11 @@
 package engine
 
-// schemaVersion is bumped when the DDL below changes incompatibly.
-const schemaVersion = "4"
+// schemaVersion identifies the on-disk schema. It is "1" for the public release:
+// the internal v2→v4 ladder collapsed into this single clean init schema (MQLITE-25)
+// — no external database ever ran an intermediate version, so there is no history to
+// migrate. Bump it only on an incompatible DDL change; Open then refuses an older
+// database instead of silently running new DDL against it (MQLITE-24, see db.go).
+const schemaVersion = "1"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc

@@ -39,15 +39,16 @@ const (
 
 // Sentinel errors. The server maps these onto Connect/HTTP error codes.
 var (
-	ErrQueueNotFound   = errors.New("mqlite: queue not found")
-	ErrLockLost        = errors.New("mqlite: lock lost or already settled")
-	ErrDedupConflict   = errors.New("mqlite: dedup conflict (same id, different body)")
-	ErrNotFound        = errors.New("mqlite: not found")
-	ErrClosed          = errors.New("mqlite: engine closed")
-	ErrMessageTooLarge = errors.New("mqlite: message body exceeds max size")
-	ErrNameConflict    = errors.New("mqlite: name already in use by another queue or topic")
-	ErrGroupRequired   = errors.New("mqlite: group id required for group_fifo queue")
-	ErrDBLocked        = errors.New("mqlite: database file is already open by another process")
+	ErrQueueNotFound         = errors.New("mqlite: queue not found")
+	ErrLockLost              = errors.New("mqlite: lock lost or already settled")
+	ErrDedupConflict         = errors.New("mqlite: dedup conflict (same id, different body)")
+	ErrNotFound              = errors.New("mqlite: not found")
+	ErrClosed                = errors.New("mqlite: engine closed")
+	ErrMessageTooLarge       = errors.New("mqlite: message body exceeds max size")
+	ErrNameConflict          = errors.New("mqlite: name already in use by another queue or topic")
+	ErrGroupRequired         = errors.New("mqlite: group id required for group_fifo queue")
+	ErrDBLocked              = errors.New("mqlite: database file is already open by another process")
+	ErrSchemaVersionMismatch = errors.New("mqlite: database schema version is incompatible with this build")
 )
 
 // QueueConfig configures a queue or subscription (entity-level defaults).
