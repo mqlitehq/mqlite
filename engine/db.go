@@ -130,7 +130,18 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 }
 
 // migrate creates tables/indexes idempotently and records the schema version.
+// Because it only does CREATE IF NOT EXISTS, a bumped schemaVersion would NOT
+// alter an already-initialized database — so if the recorded version differs it
+// refuses to open rather than silently running new DDL against an old layout
+// (MQLITE-24). The fix is to recreate the database or migrate it explicitly.
 func (d *db) migrate(ctx context.Context) error {
+	if v, ok, err := d.recordedSchemaVersion(ctx); err != nil {
+		return err
+	} else if ok && v != schemaVersion {
+		return fmt.Errorf("%w: database is schema version %q but this build expects %q; "+
+			"recreate the database (delete the file / drop the tables) or migrate it before upgrading",
+			ErrSchemaVersionMismatch, v, schemaVersion)
+	}
 	for _, stmt := range schemaStmts {
 		if _, err := d.exec(ctx, stmt); err != nil {
 			return fmt.Errorf("schema: %w\n%s", err, firstLine(stmt))
@@ -141,6 +152,24 @@ func (d *db) migrate(ctx context.Context) error {
 		return fmt.Errorf("schema version: %w", err)
 	}
 	return nil
+}
+
+// recordedSchemaVersion returns the schema_version stored in meta, or ok=false for
+// a fresh database (the meta table or its row does not exist yet).
+func (d *db) recordedSchemaVersion(ctx context.Context) (string, bool, error) {
+	var v string
+	err := d.queryRowScan(ctx, []any{&v}, `SELECT value FROM meta WHERE key='schema_version'`)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isNoSuchTable(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return v, true, nil
+}
+
+func isNoSuchTable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such table")
 }
 
 func (d *db) close() error {
