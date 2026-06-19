@@ -39,6 +39,7 @@ func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(cont
 func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) []string {
 	rows, err := e.db.query(ctx, `SELECT DISTINCT queue FROM messages WHERE `+where, args...)
 	if err != nil {
+		e.log.Error("background: list affected queues failed", "err", err)
 		return nil
 	}
 	defer rows.Close()
@@ -65,6 +66,7 @@ func (e *Engine) reapLocks(ctx context.Context) {
 		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
 		 WHERE state='locked' AND locked_until<=?`, now)
 	if err != nil {
+		e.log.Error("reaper: reclaim expired locks failed", "err", err)
 		return
 	}
 	for _, q := range qs {
@@ -78,6 +80,7 @@ func (e *Engine) activateScheduled(ctx context.Context) {
 	qs := e.distinctQueues(ctx, `state='scheduled' AND visible_at<=?`, now)
 	if _, err := e.db.exec(ctx,
 		`UPDATE messages SET state='active' WHERE state='scheduled' AND visible_at<=?`, now); err != nil {
+		e.log.Error("scheduler: activate scheduled messages failed", "err", err)
 		return
 	}
 	for _, q := range qs {
@@ -89,36 +92,47 @@ func (e *Engine) activateScheduled(ctx context.Context) {
 // (queues with dead_letter_on_expire=1) or are discarded.
 func (e *Engine) expireTTL(ctx context.Context) {
 	now := e.now()
-	_, _ = e.db.exec(ctx, `
+	if _, err := e.db.exec(ctx, `
 		UPDATE messages SET state='dead_lettered', dead_letter_reason='TTLExpired',
 		    locked_until=0, lock_token=NULL
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred')
-		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1)`, now)
-	_, _ = e.db.exec(ctx, `
+		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1)`, now); err != nil {
+		e.log.Error("ttl: dead-letter expired messages failed", "err", err)
+	}
+	if _, err := e.db.exec(ctx, `
 		DELETE FROM messages
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
-		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=0)`, now)
+		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=0)`, now); err != nil {
+		e.log.Error("ttl: discard expired messages failed", "err", err)
+	}
 }
 
 // cleanupDedup drops dedup rows older than the widest configured window.
 func (e *Engine) cleanupDedup(ctx context.Context) {
 	var maxWindow sql.NullInt64
 	if err := e.db.queryRowScan(ctx, []any{&maxWindow}, `SELECT MAX(dedup_window_ms) FROM queues`); err != nil {
+		e.log.Error("janitor: read max dedup window failed", "err", err)
 		return
 	}
 	if !maxWindow.Valid || maxWindow.Int64 <= 0 {
 		return
 	}
-	_, _ = e.db.exec(ctx, `DELETE FROM dedup WHERE seen_at < ?`, e.now()-maxWindow.Int64)
+	if _, err := e.db.exec(ctx, `DELETE FROM dedup WHERE seen_at < ?`, e.now()-maxWindow.Int64); err != nil {
+		e.log.Error("janitor: prune dedup rows failed", "err", err)
+	}
 }
 
 // cleanupExpiredAux drops expired settlement receipts and receive-attempt records.
-// cx ships these idempotency tables without a sweeper (unbounded growth); mqlite
-// retires them on a low-frequency pass so the feature comes with retention.
+// These idempotency tables would otherwise grow unbounded; mqlite retires them on a
+// low-frequency pass so the feature ships with its own retention.
 func (e *Engine) cleanupExpiredAux(ctx context.Context) {
 	now := e.now()
-	_, _ = e.db.exec(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?`, now)
-	_, _ = e.db.exec(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?`, now)
+	if _, err := e.db.exec(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?`, now); err != nil {
+		e.log.Error("janitor: prune settlement receipts failed", "err", err)
+	}
+	if _, err := e.db.exec(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?`, now); err != nil {
+		e.log.Error("janitor: prune receive attempts failed", "err", err)
+	}
 }
 
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
