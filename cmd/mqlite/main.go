@@ -7,6 +7,14 @@
 //	MQLITE_DB_AUTH_TOKEN=<jwt>                                    (remote Turso/libSQL)
 //	MQLITE_ENDPOINT=http://host:port + MQLITE_TOKEN=<bearer>      (client mode; wins if set)
 //	MQLITE_TOKENS=mqk_a,mqk_b                                     (tokens `serve` accepts)
+//	MQLITE_MAX_MESSAGE_BYTES=<n>                                  (reject larger bodies)
+//	MQLITE_SYNC=NORMAL|FULL|OFF                                   (durability; embedded/serve)
+//
+// CLI design (MQLITE-14): subcommands use the standard library `flag` package plus a
+// small parseInterspersed helper (so flags may appear before or after positionals),
+// with one FlagSet per command and a consistent usage/error/"ok:" style. We
+// deliberately do NOT take a cobra/pflag dependency — for ~a dozen simple commands
+// the stdlib is sufficient, and staying a dependency-light single binary is a goal.
 package main
 
 import (
