@@ -68,32 +68,76 @@ delete rows. Note SQLite keeps the file at its high-water mark (free pages are
 reused, not returned to the OS) unless you `VACUUM`; size the volume for peak
 backlog, not average.
 
-### Throughput & latency (in-process engine, indicative)
+### Throughput & latency (macOS in-process — latency detail)
 
 ```
 scenario           sync     ops/s    p50      p99
 produce (1 prod)   NORMAL   17.4k    50 µs    165 µs
 produce (4 prod)   NORMAL   17.4k    201 µs   765 µs
-produce (4 prod)   FULL     12.3k    285 µs   919 µs   ← fsync-per-commit cost ≈ -30%
+produce (4 prod)   FULL     12.3k    285 µs   919 µs   ← macOS only; on Linux FULL is ~18× (below)
 ```
 
-Per-message CPU is tiny; a single shared vCPU serves thousands of msg/s — far above
-typical lightweight-queue load. `MQLITE_SYNC` (NORMAL ↔ FULL) is the durability
-↔ throughput/IOPS lever; batch sends (`messages: [...]`) amortise the commit.
+A single writer serves tens of thousands of msg/s. `MQLITE_SYNC` (NORMAL ↔ FULL) is
+the durability ↔ throughput lever and batch sends (`messages: [...]`) amortise the
+commit — both quantified on real hardware in **Disk I/O & CPU (Linux)** below. (The
+macOS FULL penalty above looks mild only because APFS fsync is buffered.)
 
-## Caveats — what still needs a Linux run
+## Disk I/O & CPU (Linux)
 
-CPU-seconds-per-op and disk **IOPS/bytes-per-op** are read from `/proc/self`, which
-exists only on Linux — on the macOS host used here those fields read 0. The absolute
-numbers above for memory, disk footprint, throughput and latency are valid
-cross-platform; **per-op CPU and IOPS should be confirmed on Linux/Fly**.
+Measured on Linux with real `/proc/self` IO+CPU (`test/bench/run-bench.sh`; 256 B
+messages, 3 s/scenario, NORMAL + WAL unless noted). The host is a Docker linuxkit VM
+(arm64, fast local SSD) — **not** Fly's shared-cpu-1x — so read the *relative* costs,
+not the absolute ops/s; a Fly smoke test would pin the absolutes.
 
-The bench harness is ready for exactly that (Docker, native-arch, real `/proc`):
+```
+scenario             ops/s   cpu%   write-bytes/msg   note
+produce 1 producer   19.5k    92%      9.7 KB         one commit = whole-page WAL write
+produce 4 producers  18.6k    91%      9.7 KB         one writer; more producers don't add throughput
+batch 16 / commit    33.7k    99%      2.0 KB         amortised fsync
+batch 64 / commit    36.2k   100%      1.1 KB         9× less write amplification than 1-by-1
+send+receive+complete 3.6k    84%       58 KB         three commits per message
+produce, FULL sync   1.05k    11%     13.7 KB         fsync per commit — see finding 3
+```
+
+Three findings that matter:
+
+1. **One writer ≈ one core.** Produce saturates ~0.9 of a single core at ~18–19k
+   msg/s, and adding producers does *not* raise throughput — the single writer is
+   the ceiling, by design. Under NORMAL sync the write path is **CPU-bound**, not
+   I/O-bound (pure-Go SQLite). On Fly's 1 shared vCPU expect proportionally less but
+   still thousands/s, well above typical load.
+2. **Write amplification is real; batching is the cure.** A 256 B message costs
+   ~**9.7 KB** of writes sent one-at-a-time (each commit flushes whole 4 KB WAL
+   pages); batching 64 per commit drops that to ~**1.1 KB/msg (9×)** and nearly
+   doubles throughput. *Send arrays, not singletons.*
+3. **FULL sync is ~18× slower on real hardware.** Single-send throughput falls
+   18.6k → **1.05k** msg/s under `synchronous=FULL`, CPU dropping to 11% — the broker
+   is now waiting on real `fsync` disk barriers, not computing. (macOS made this look
+   like ~30 % because APFS fsync is cheap/buffered; Linux is the honest figure.) If
+   you need FULL durability, **batch** to amortise the fsync.
+
+## Tuning knobs
+
+MQLite ships sensible defaults; most deployments change nothing. In rough order of
+impact:
+
+| knob | default | when to change |
+|---|---|---|
+| **batch size** (`messages:[…]`) | — | the biggest lever — 9× less write amplification, ~2× throughput. Batch whenever you can. |
+| **`MQLITE_SYNC`** | `NORMAL` | `FULL` only if a power cut losing the last few commits is unacceptable; it costs ~18× on single sends, so pair it with batching. |
+| `wal_autocheckpoint` | 1000 pages (~4 MB) | matches the observed WAL plateau; raise for fewer checkpoints at the cost of a larger WAL + slower crash recovery. |
+| `cache_size` | ~2 MB | the working set (queue heads + indexes) is small; raise only after profiling shows cache pressure under deep backlogs — it costs RAM on a 256 MB machine. |
+| `mmap_size` | off | `modernc.org/sqlite` is a pure-Go reimplementation; don't assume C-SQLite mmap gains — measure before relying on it. |
+| connection pool | local 1 / remote 4 | **don't change** — local=1 *is* the single writer (atomic claims); remote=4 is tuned for Turso's Hrana streams. |
+
+`busy_timeout=5000` and `temp_store=MEMORY` are already set by MQLite.
+
+Reproduce the Linux numbers (Docker, native arch, real `/proc`):
 
 ```sh
 ./test/bench/run-bench.sh                 # 5 s/scenario, 256 B
 BENCH_DUR=10s BENCH_MSG=1024 ./test/bench/run-bench.sh
-# → test/bench/out/results.json  (ops/s, p50..p999, cpu%, write_bytes_per_op, db/wal MB)
+# → test/bench/out/results.json  (ops/s, cpu%, write_bytes_per_op, db/wal MB, p50..p999)
 ```
 
 ## How these numbers were taken
@@ -102,4 +146,7 @@ BENCH_DUR=10s BENCH_MSG=1024 ./test/bench/run-bench.sh
   after 50k messages pushed over HTTP.
 - **Disk / heap / throughput**: `go run ./test/bench -only produce -dur 3s`, reading
   `db_size_mb + wal_size_mb` and `heap_mb` from the JSON output.
+- **Disk I/O & CPU (Linux)**: `BENCH_DUR=3s ./test/bench/run-bench.sh` in Docker —
+  the bench's `/proc/self` probe reports `cpu_pct` and `write_bytes_per_op` only on
+  Linux, so this runs in a container, not on the macOS host.
 - **Binary**: `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' ./cmd/mqlite`.
