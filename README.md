@@ -145,6 +145,11 @@ mqlite serve --addr :8080
 
 ```bash
 TOKEN=mqk_dev
+# create the queue first — sending to a queue that doesn't exist is a 404
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"name":"orders","config":{}}' \
+  http://127.0.0.1:8080/mqlite.v1.AdminService/CreateQueue
+
 # send (body is base64)
 curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data "{\"queue\":\"orders\",\"messages\":[{\"body\":\"$(printf hello | base64)\"}]}" \
