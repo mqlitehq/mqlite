@@ -234,6 +234,10 @@ docker run --platform linux/amd64 -p 8080:8080 \
   -e MQLITE_TOKENS=mqk_dev mqlite:0.1.0
 ```
 
+**Footprint:** ~11 MB static (CGO-free) binary, ~19 MB idle RSS, ~0.4 KB per message
+on disk — fits Fly's smallest 256 MB machine with room to spare. Measured numbers and
+Fly.io machine/volume sizing: [docs/resource-profile.md](docs/resource-profile.md).
+
 ## Tests
 
 ```bash
