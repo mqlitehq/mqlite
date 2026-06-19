@@ -200,3 +200,7 @@ v0.1 — the core is complete and tested (local SQLite + live Turso): hermetic
 unit + invariant (TCK-style) tests run in CI on every push, and live
 Turso/libSQL round-trips run in the nightly workflow. Not yet tagged for
 release.
+
+## License
+
+[MIT](LICENSE) © mqlitehq
