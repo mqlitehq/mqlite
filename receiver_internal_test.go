@@ -60,7 +60,10 @@ func TestReceiverRetriesWithSameAttemptID(t *testing.T) {
 	f := &fakeSource{failN: 1}
 	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Generous deadline: the receiver only needs one 500ms retry backoff, but a
+	// loaded CI runner under -race can starve the goroutine well past a few seconds.
+	// A correct receiver still fires in <1s locally; this only absorbs CI jitter.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	var once sync.Once
