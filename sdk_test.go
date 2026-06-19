@@ -106,7 +106,9 @@ func TestReceiverRun(t *testing.T) {
 
 	var processed int64
 	runCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		_ = cli.Receiver("jobs", mqlite.WithConcurrency(3)).Run(runCtx, func(c context.Context, m *mqlite.Message) error {
 			if atomic.AddInt64(&processed, 1) >= n {
 				stop()
@@ -124,4 +126,6 @@ func TestReceiverRun(t *testing.T) {
 		}
 	}
 	stop()
+	<-done // wait for Run (and its in-flight settles) to fully stop before cleanup
+	//        closes the engine — else Windows can't delete the still-open DB file.
 }
