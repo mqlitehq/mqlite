@@ -225,6 +225,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, err)
 			return
 		}
+		// A single Send that hit a dedup conflict (same id, different body) comes
+		// back as seq 0 — the batch path skips the offending slot to keep the rest
+		// of the batch. Surface it as 409, like engine.SendOne, so an HTTP client
+		// isn't handed 200 with a bogus seq 0 for a message that was never enqueued.
+		if len(req.Messages) == 1 && len(seqs) == 1 && seqs[0] == 0 {
+			s.fail(w, engine.ErrDedupConflict)
+			return
+		}
 	}
 	writeJSON(w, wire.SendResponse{SeqNumbers: seqs})
 }
