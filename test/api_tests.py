@@ -305,10 +305,12 @@ def t_fencing():
     send(q, "x")
     _, r = receive(q, wait_ms=2000)
     m = r["messages"][0]
-    _, r = complete(q, m["seq_number"], "deadbeef")
-    check(r.get("ok") is False, "complete with wrong token -> ok:false")
-    _, r = complete(q, m["seq_number"], m["lock_token"])
-    check(r.get("ok") is True, "complete with right token -> ok:true")
+    # fencing: a wrong / never-issued token is rejected as 409 lock_lost (the server
+    # never returns 200 {ok:false}, which a status-only client would read as success).
+    st, r = complete(q, m["seq_number"], "deadbeef")
+    check(st == 409, "complete with wrong token -> 409 lock_lost")
+    st, r = complete(q, m["seq_number"], m["lock_token"])
+    check(st == 200 and r.get("ok") is True, "complete with right token -> ok:true")
 
 
 def t_all_fields():

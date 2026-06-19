@@ -152,3 +152,18 @@ jobs:
           if [ -z "$ok" ]; then echo "healthz never came up"; docker logs mq; exit 1; fi
           echo "healthz OK"
           docker rm -f mq
+
+  e2e:
+    # Black-box end-to-end: builds mqlite, boots an ephemeral broker, and runs the
+    # curl / Python / Go-SDK suites against the real HTTP API. This is what catches
+    # API drift the in-process Go tests can't — e.g. the dedup-conflict status code
+    # (MQLITE-33). ubuntu-latest already ships go, python3, curl and jq.
+    name: e2e (curl + python + SDK blackbox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: blackbox suites (test/run.sh)
+        run: ./test/run.sh

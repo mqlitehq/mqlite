@@ -37,9 +37,12 @@ assert_eq "$(b64 hello)" "$B0" "body round-trips as base64"
 
 api "$P_COMP" "{\"queue\":\"$Q\",\"seq_number\":$SS0,\"lock_token\":\"$T0\"}"
 assert_eq true "$(jqr "$API_BODY" '.ok')" "Complete with valid token -> ok:true"
-# fencing: completing again with the stale token must fail safely.
+# idempotent settle (MQLITE-8): replaying the same (seq, token) is a no-op success.
 api "$P_COMP" "{\"queue\":\"$Q\",\"seq_number\":$SS0,\"lock_token\":\"$T0\"}"
-assert_eq false "$(jqr "$API_BODY" '.ok')" "Complete with stale token -> ok:false (LockLost)"
+assert_eq true "$(jqr "$API_BODY" '.ok')" "Complete replay (same token) -> ok:true (idempotent)"
+# fencing: a wrong / never-issued token is rejected as 409 lock_lost, never silent ok.
+api "$P_COMP" "{\"queue\":\"$Q\",\"seq_number\":$SS0,\"lock_token\":\"deadbeef\"}"
+assert_eq 409 "$API_STATUS" "Complete with wrong token -> 409 lock_lost"
 
 # ── error codes ──────────────────────────────────────────────────────────────
 section "error handling"
