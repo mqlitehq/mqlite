@@ -9,6 +9,8 @@
 //	MQLITE_TOKENS=mqk_a,mqk_b                                     (tokens `serve` accepts)
 //	MQLITE_MAX_MESSAGE_BYTES=<n>                                  (reject larger bodies)
 //	MQLITE_SYNC=NORMAL|FULL|OFF                                   (durability; embedded/serve)
+//	MQLITE_DLQ_MAX_AGE=14d-ish (e.g. 336h) · MQLITE_DLQ_MAX_COUNT=1000000 · MQLITE_DLQ_RETENTION=off
+//	                                                             (broker DLQ retention; serve)
 //
 // CLI design (MQLITE-14): subcommands use the standard library `flag` package plus a
 // small parseInterspersed helper (so flags may appear before or after positionals),
@@ -28,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mqlitehq/mqlite"
 )
@@ -142,6 +145,25 @@ func embeddedOpts() []mqlite.EmbeddedOption {
 	}
 	if v := os.Getenv("MQLITE_SYNC"); v != "" { // NORMAL (default) | FULL | OFF — durability knob (MQLITE-7)
 		opts = append(opts, mqlite.WithSynchronous(v))
+	}
+	// DLQ retention (MQLITE-21): bound the dead-letter queue by default so the broker
+	// can run online long-term without the one unbounded sink filling the disk. Drop
+	// oldest-first past 14 days or 1,000,000 dead letters per queue; override with
+	// MQLITE_DLQ_MAX_AGE / MQLITE_DLQ_MAX_COUNT, or disable with MQLITE_DLQ_RETENTION=off.
+	if !strings.EqualFold(os.Getenv("MQLITE_DLQ_RETENTION"), "off") {
+		age := 14 * 24 * time.Hour
+		count := 1_000_000
+		if v := os.Getenv("MQLITE_DLQ_MAX_AGE"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				age = d
+			}
+		}
+		if v := os.Getenv("MQLITE_DLQ_MAX_COUNT"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				count = n
+			}
+		}
+		opts = append(opts, mqlite.WithDLQRetention(age, count))
 	}
 	return opts
 }

@@ -147,20 +147,34 @@ The existing primitives already compose into archival; document, don't build:
 
 ## Recommendation — tiered, minimal
 
-### Tier 1 (v0.1, no schema change): broker-level DLQ age retention
+### Tier 1 (SHIPPED, no schema change): broker-default DLQ retention by age + count
 
-One broker-wide knob, off by default:
+A `reapDLQ` background loop (alongside the existing janitors) bounds the DLQ by
+**age and per-queue count**, drop-oldest, **batched + rate-limited**, touching
+**only `state='dead_lettered'`** (undelivered / in-flight / scheduled work is never
+deleted). No new column, no migration, fully backward-compatible.
+
+**On by default for the broker** so it is safe to run online long-term out of the
+box (the maintainer's call — the one unbounded sink should not silently fill the
+disk). The engine itself defaults to *off* (zero bounds), so the embedded library
+never auto-deletes a caller's dead letters unless asked:
 
 ```
-MQLITE_DLQ_TTL=168h        # 0 / unset  → keep forever (today's behaviour)
+# mqlite serve (broker) — defaults applied unless overridden:
+MQLITE_DLQ_MAX_AGE=336h        # default 14d; dead letters older (by enqueued_at) are dropped
+MQLITE_DLQ_MAX_COUNT=1000000   # default 1,000,000 dead letters per queue (drop oldest)
+MQLITE_DLQ_RETENTION=off       # disable entirely
+
+# embedded library — off unless you opt in:
+mqlite.WithDLQRetention(14*24*time.Hour, 1_000_000)
 ```
 
-A new `reapDLQ` background loop (alongside the existing janitors) runs, per queue,
-the equivalent of `Purge(OlderThanMs = DLQ_TTL)` — **batched and rate-limited** per
-the rules above. No new column, no migration, fully backward-compatible. This is
-the 80 % solution and the only piece that must ship for v0.1.
+Implemented in `engine/background.go` (`reapDLQ`), `engine.Options.{DLQMaxAgeMs,
+DLQMaxCount}`, the `WithDLQRetention` embedded option, and the broker defaults in
+`cmd/mqlite` (`embeddedOpts`). Tested in `engine/retention_dlq_test.go` (drop-oldest,
+age boundary, non-DLQ-untouched, off-by-default).
 
-### Tier 2 (next schema bump): per-queue overrides + count/bytes triggers
+### Tier 2 (next schema bump): per-queue overrides + bytes trigger
 
 When the schema is next bumped for another reason, add the per-queue policy:
 
@@ -187,16 +201,16 @@ dead-letter-relative TTL if ever needed.
 Tracked in Plane as children of MQLITE-21:
 
 ```
-MQLITE-28  Tier 1: reapDLQ background loop + MQLITE_DLQ_TTL (off by default),     v0.1?
-           batched + rate-limited; reuses Purge(OlderThanMs); no schema change.
-MQLITE-29  Tier 2: per-queue dead_letter_ttl_ms + count/bytes caps               next schema
+MQLITE-28  Tier 1: reapDLQ loop + MQLITE_DLQ_MAX_AGE/MAX_COUNT, default ON for     SHIPPED
+           the broker; batched + rate-limited; only state='dead_lettered'; no schema.
+MQLITE-29  Tier 2: per-queue overrides (dead_letter_ttl_ms) + bytes cap            next schema
            (+ optional dead_lettered_at); bundled with the next schema bump.
 MQLITE-30  Document the operator archival pattern (Peek/Redrive/Purge) in README. docs
 MQLITE-31  Opt-in incremental_vacuum maintenance step (CLI) for disk give-back.   later
 ```
 
-Recommendation: **MQLITE-28** is the only piece worth considering for v0.1 (and
-even then, manual `purge-dlq` plus the documented operator pattern already make the
-DLQ manageable — so v0.1 need not block on it). Hold **MQLITE-29** for the next
-schema change; **MQLITE-30** is a short README addition; **MQLITE-31** only when a
-deployment actually needs to return disk to the OS after a large DLQ flush.
+Status: **MQLITE-28 is shipped** — the broker bounds its DLQ by age + count, on by
+default, so it runs online long-term without the unbounded sink filling the disk.
+**MQLITE-29** (per-queue overrides + a precise *bytes* cap) waits for the next schema
+change; **MQLITE-30** is a short README addition; **MQLITE-31** only when a deployment
+actually needs to return disk to the OS after a large DLQ flush.
