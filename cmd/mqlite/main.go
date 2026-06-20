@@ -213,7 +213,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return eng.Serve(sctx, *addr, mqlite.WithTokenCSV(tokens))
+	return eng.Serve(sctx, *addr, mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version))
 }
 
 func cmdCreateQueue(ctx context.Context, args []string) error {

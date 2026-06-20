@@ -248,10 +248,19 @@ func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 
 // ── serve: upgrade in-process engine to a network broker ─────────────────────
 
-type serveConfig struct{ tokens []string }
+type serveConfig struct {
+	tokens  []string
+	version string
+}
 
 // ServeOption configures Serve.
 type ServeOption func(*serveConfig)
+
+// WithVersion sets the version string the broker reports on its open "/" discovery
+// endpoint (typically the CLI/build version).
+func WithVersion(v string) ServeOption {
+	return func(c *serveConfig) { c.version = v }
+}
 
 // WithTokens sets the accepted Bearer tokens for the broker.
 func WithTokens(tokens ...string) ServeOption {
@@ -276,6 +285,7 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 		o(&sc)
 	}
 	srv := server.New(e.eng, sc.tokens)
+	srv.Version = sc.version
 	hs := &http.Server{Addr: addr, Handler: srv.Handler()}
 	errCh := make(chan error, 1)
 	go func() { errCh <- hs.ListenAndServe() }()
