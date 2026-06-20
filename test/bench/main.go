@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,7 +170,16 @@ type Result struct {
 	HeapMB          float64 `json:"heap_mb"`
 	DBSizeMB        float64 `json:"db_size_mb"`
 	WALSizeMB       float64 `json:"wal_size_mb"`
-	Note            string  `json:"note,omitempty"`
+	// resource time-series (sampler): peak vs after-idle, to show reclamation
+	RSSPeakMB       float64  `json:"rss_peak_mb"`
+	RSSFinalMB      float64  `json:"rss_final_mb"`
+	HeapInusePeakMB float64  `json:"heap_inuse_peak_mb"`
+	HeapReleasedMB  float64  `json:"heap_released_mb"`
+	DBPeakMB        float64  `json:"db_peak_mb"`  // db+wal peak (during load)
+	DBFinalMB       float64  `json:"db_final_mb"` // db+wal after drain+idle
+	FileBytesPerMsg float64  `json:"file_bytes_per_msg"`
+	Series          []sample `json:"series,omitempty"`
+	Note            string   `json:"note,omitempty"`
 }
 
 var dir = flag.String("dir", "/data", "data directory for bench DBs")
@@ -189,9 +199,23 @@ func main() {
 		{Name: "batch_16_p4", Kind: "batch", P: 4, Batch: 16, Msg: *msg},
 		{Name: "batch_64_p4", Kind: "batch", P: 4, Batch: 64, Msg: *msg},
 		{Name: "e2e_4x4", Kind: "e2e", P: 4, C: 4, Msg: *msg},
-		{Name: "drain_4c", Kind: "drain", C: 4, Prefill: 200_000, Batch: 64, Msg: *msg},
 		{Name: "sessions_64g", Kind: "sessions", P: 4, C: 4, Groups: 64, Msg: *msg},
 		{Name: "produce_p4_FULL", Kind: "produce", P: 4, Msg: *msg, Sync: "FULL"},
+		// ── enriched messages: realistic KV properties + ASB metadata ──
+		{Name: "props_p4", Kind: "props", P: 4, Msg: *msg},
+		{Name: "props_batch64", Kind: "props", P: 4, Batch: 64, Msg: *msg},
+		// ── body-size sweep: write amplification vs payload size ──
+		{Name: "size_64B", Kind: "produce", P: 4, Msg: 64},
+		{Name: "size_1KB", Kind: "produce", P: 4, Msg: 1024},
+		{Name: "size_4KB", Kind: "produce", P: 4, Msg: 4096},
+		{Name: "size_16KB", Kind: "produce", P: 4, Msg: 16384},
+		// ── DB file bloat + reclamation: fill then drain, does the file shrink? ──
+		{Name: "bloat_50k", Kind: "bloat", Prefill: 50_000, Batch: 64, Msg: *msg},
+		// ── 上下线: load up then down; memory/file reclamation after idle ──
+		{Name: "rampdown_4x4", Kind: "rampdown", P: 4, C: 4, Msg: *msg},
+		{Name: "churn_consumers", Kind: "churn", P: 4, C: 4, Msg: *msg},
+		// heaviest (200k prefill) LAST so a constrained box still gets all the rest
+		{Name: "drain_4c", Kind: "drain", C: 4, Prefill: 200_000, Batch: 64, Msg: *msg},
 	}
 
 	fmt.Printf("mqlite-bench · GOMAXPROCS=%d · dur=%s · msgsize=%dB · linux=%v\n",
@@ -202,10 +226,17 @@ func main() {
 		if *only != "" && !strings.Contains(s.Name, *only) {
 			continue
 		}
-		results = append(results, run(s))
+		r := run(s)
+		results = append(results, r)
+		// incremental line so a later OOM (e.g. on a 256MB cloud box) does not lose
+		// the scenarios that already finished
+		fmt.Printf("[done] %-16s ops/s=%-7s p99us=%-7d wB/op=%-6.0f rssPeak=%4.0fM rssEnd=%4.0fM dbPeak=%5.1fM dbEnd=%5.1fM\n",
+			r.Name, hnum(r.OpsPerSec), r.P99us, r.WriteBytesPerOp,
+			r.RSSPeakMB, r.RSSFinalMB, r.DBPeakMB, r.DBFinalMB)
 	}
 
 	printTable(results)
+	printResourceTable(results)
 	if b, err := json.MarshalIndent(map[string]any{
 		"meta": map[string]any{
 			"gomaxprocs": runtime.GOMAXPROCS(0), "duration_s": dur.Seconds(),
@@ -245,6 +276,8 @@ func run(s scen) Result {
 	var m0, m1 runtime.MemStats
 	runtime.ReadMemStats(&m0)
 	p0 := readProc()
+	samp := newSampler(dbPath, 200*time.Millisecond)
+	samp.start()
 	t0 := time.Now()
 
 	var ops int64
@@ -260,11 +293,30 @@ func run(s scen) Result {
 		ops, h = e2eRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
 	case "drain":
 		ops, h = drain(ctx, eng, q, s.C)
+	case "props":
+		ops, h = propsRun(ctx, eng, q, *dur, s.P, s.Batch, s.Msg)
+	case "bloat":
+		ops, h = bloatRun(ctx, eng, q, s.Prefill, s.Batch, s.Msg)
+	case "rampdown":
+		ops, h = rampDownRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+	case "churn":
+		ops, h = churnRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
 	}
 
 	elapsed := time.Since(t0)
 	p1 := readProc()
 	runtime.ReadMemStats(&m1)
+
+	// ── reclamation phase: idle so background settles, force GC + return memory
+	// to the OS, re-measure. RSS-final vs RSS-peak shows whether memory is freed;
+	// DB-final vs DB-peak shows whether the file shrinks once the queue empties. ──
+	time.Sleep(1500 * time.Millisecond)
+	runtime.GC()
+	debug.FreeOSMemory()
+	time.Sleep(400 * time.Millisecond)
+	samp.stop()
+	fin := samp.snap()
+	rssPeak, heapPeak, dbPeak := samp.peaks()
 
 	res.DurationS = elapsed.Seconds()
 	res.Ops = ops
@@ -287,6 +339,23 @@ func run(s scen) Result {
 	res.HeapMB = float64(m1.HeapAlloc) / (1 << 20)
 	res.DBSizeMB = fileMB(dbPath)
 	res.WALSizeMB = fileMB(dbPath + "-wal")
+	res.RSSPeakMB = float64(rssPeak) / (1 << 20)
+	res.RSSFinalMB = float64(fin.RSS) / (1 << 20)
+	res.HeapInusePeakMB = float64(heapPeak) / (1 << 20)
+	res.HeapReleasedMB = float64(fin.HeapReleased) / (1 << 20)
+	res.DBPeakMB = float64(dbPeak) / (1 << 20)
+	res.DBFinalMB = float64(fin.DB+fin.WAL) / (1 << 20)
+	res.Series = samp.downsample(24)
+	switch s.Kind { // file bytes per resident message — only where messages stay resident
+	case "produce", "batch", "props":
+		if ops > 0 {
+			res.FileBytesPerMsg = float64(dbPeak) / float64(ops)
+		}
+	case "bloat":
+		if s.Prefill > 0 {
+			res.FileBytesPerMsg = float64(dbPeak) / float64(s.Prefill)
+		}
+	}
 	return res
 }
 
@@ -529,6 +598,19 @@ func printTable(rs []Result) {
 			r.Name, r.Sync, hnum(r.OpsPerSec), r.P50us, r.P99us,
 			float64(r.MaxUs)/1000, r.WriteBytesPerOp,
 			float64(r.DiskWriteBytes)/(1<<20), r.CPUPct, r.GCCount)
+	}
+}
+
+// printResourceTable shows the memory + disk story the throughput table omits:
+// peak vs after-idle RSS/heap (reclamation) and DB-file peak vs final (bloat).
+func printResourceTable(rs []Result) {
+	fmt.Printf("\n%-16s %8s %8s %9s %8s %8s %8s %10s\n",
+		"scenario", "rssPeak", "rssEnd", "heapPeak", "heapRel", "dbPeak", "dbEnd", "fileB/msg")
+	fmt.Println(strings.Repeat("-", 92))
+	for _, r := range rs {
+		fmt.Printf("%-16s %7.1fM %7.1fM %8.1fM %7.1fM %7.1fM %7.1fM %10.0f\n",
+			r.Name, r.RSSPeakMB, r.RSSFinalMB, r.HeapInusePeakMB, r.HeapReleasedMB,
+			r.DBPeakMB, r.DBFinalMB, r.FileBytesPerMsg)
 	}
 }
 
