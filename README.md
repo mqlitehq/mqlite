@@ -211,7 +211,7 @@ Connection is read from the environment:
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
 | `MQLITE_TOKENS` | comma-separated Bearer tokens that `serve` accepts |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; `MQLITE_DLQ_RETENTION=off` disables) |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
 > The DB connection string is **only ever read from the environment** — it is
 > never compiled into the binary. Copy `.env.example` → `.env.local` (gitignored).
@@ -246,8 +246,9 @@ Completed messages are deleted on settle and TTL'd messages expire, so a healthy
 queue's size tracks its in-flight backlog. The one sink that can grow without bound
 is the **dead-letter queue** — so `serve` bounds it by default: a background pass
 drops dead letters oldest-first once they are older than **14 days** or beyond
-**1,000,000 per queue** (`MQLITE_DLQ_MAX_AGE` / `MQLITE_DLQ_MAX_COUNT`, or
-`MQLITE_DLQ_RETENTION=off`). Only the DLQ is ever touched — undelivered and in-flight
+**1,000,000 per queue** (`MQLITE_DLQ_MAX_AGE` / `MQLITE_DLQ_MAX_COUNT`; an optional
+per-queue byte cap `MQLITE_DLQ_MAX_BYTES` is off by default; `MQLITE_DLQ_RETENTION=off`
+disables all). Only the DLQ is ever touched — undelivered and in-flight
 work is never auto-deleted. The embedded library leaves this off unless you opt in
 with `mqlite.WithDLQRetention(...)`. Freed pages are reused (the file plateaus at
 peak backlog rather than shrinking; `VACUUM` is manual). See

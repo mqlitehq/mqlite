@@ -10,7 +10,7 @@ import (
 
 // openWithDLQ opens a deterministic (clock-injected, no background) engine with
 // the DLQ retention bounds set, for the reapDLQ tests.
-func openWithDLQ(t *testing.T, ageMs int64, count int) (*Engine, *int64) {
+func openWithDLQ(t *testing.T, ageMs int64, count int, maxBytes int64) (*Engine, *int64) {
 	t.Helper()
 	var ms int64 = 1_700_000_000_000
 	e, err := Open(context.Background(), Options{
@@ -19,6 +19,7 @@ func openWithDLQ(t *testing.T, ageMs int64, count int) (*Engine, *int64) {
 		DisableBackground: true,
 		DLQMaxAgeMs:       ageMs,
 		DLQMaxCount:       count,
+		DLQMaxBytes:       maxBytes,
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -55,7 +56,7 @@ func dlqBodies(t *testing.T, e *Engine, q string) []byte {
 // touches messages in any other state or queue.
 func TestDLQRetentionCountDropsOldest(t *testing.T) {
 	ctx := context.Background()
-	e, ms := openWithDLQ(t, 0, 2) // keep at most 2 dead letters per queue
+	e, ms := openWithDLQ(t, 0, 2, 0) // keep at most 2 dead letters per queue
 	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
 	mustQueue(t, e, "live", QueueConfig{}) // no TTL -> stays active, must be untouched
 
@@ -77,10 +78,33 @@ func TestDLQRetentionCountDropsOldest(t *testing.T) {
 	}
 }
 
+// A per-queue byte cap keeps the newest dead letters whose bodies fit, dropping the
+// oldest until total body bytes are under the cap.
+func TestDLQRetentionBytesDropsOldest(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 0, 250) // keep newest dead letters whose bodies sum <= 250B
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+	for i := 0; i < 5; i++ { // 100-byte bodies, first byte = index
+		b := make([]byte, 100)
+		b[0] = byte(i)
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: b}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // 5 dead-lettered; byte cap keeps newest 2 (200B <= 250)
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 2 {
+		t.Fatalf("byte cap: want 2 (2*100B <= 250B), got %d", mt.DeadLettered)
+	}
+	if got := dlqBodies(t, e, "q"); len(got) != 2 || got[0] != 3 || got[1] != 4 {
+		t.Fatalf("want survivors {3,4} (newest), got %v", got)
+	}
+}
+
 // An age cap drops dead letters older than the bound while keeping fresh ones.
 func TestDLQRetentionAgeDropsOld(t *testing.T) {
 	ctx := context.Background()
-	e, ms := openWithDLQ(t, time.Hour.Milliseconds(), 0) // drop dead letters older than 1h
+	e, ms := openWithDLQ(t, time.Hour.Milliseconds(), 0, 0) // drop dead letters older than 1h
 	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
 
 	sendBodies(t, e, "q", 3) // enqueued at T0
@@ -103,7 +127,7 @@ func TestDLQRetentionAgeDropsOld(t *testing.T) {
 // With no bounds set (engine default), reapDLQ is a no-op — the DLQ is unbounded.
 func TestDLQRetentionDisabledByDefault(t *testing.T) {
 	ctx := context.Background()
-	e, ms := openWithDLQ(t, 0, 0) // both bounds off
+	e, ms := openWithDLQ(t, 0, 0, 0) // all bounds off
 	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
 	sendBodies(t, e, "q", 5)
 	advance(ms, 2*time.Second)

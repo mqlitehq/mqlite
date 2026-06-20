@@ -148,11 +148,13 @@ func embeddedOpts() []mqlite.EmbeddedOption {
 	}
 	// DLQ retention (MQLITE-21): bound the dead-letter queue by default so the broker
 	// can run online long-term without the one unbounded sink filling the disk. Drop
-	// oldest-first past 14 days or 1,000,000 dead letters per queue; override with
+	// oldest-first past 14 days or 1,000,000 dead letters per queue; an optional byte
+	// cap (MQLITE_DLQ_MAX_BYTES, deployment-specific) is off by default. Override
 	// MQLITE_DLQ_MAX_AGE / MQLITE_DLQ_MAX_COUNT, or disable with MQLITE_DLQ_RETENTION=off.
 	if !strings.EqualFold(os.Getenv("MQLITE_DLQ_RETENTION"), "off") {
 		age := 14 * 24 * time.Hour
 		count := 1_000_000
+		var maxBytes int64 // 0 = off; age+count already bound growth without knowing disk size
 		if v := os.Getenv("MQLITE_DLQ_MAX_AGE"); v != "" {
 			if d, err := time.ParseDuration(v); err == nil {
 				age = d
@@ -163,7 +165,12 @@ func embeddedOpts() []mqlite.EmbeddedOption {
 				count = n
 			}
 		}
-		opts = append(opts, mqlite.WithDLQRetention(age, count))
+		if v := os.Getenv("MQLITE_DLQ_MAX_BYTES"); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				maxBytes = n
+			}
+		}
+		opts = append(opts, mqlite.WithDLQRetention(age, count, maxBytes))
 	}
 	return opts
 }

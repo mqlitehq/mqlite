@@ -29,6 +29,7 @@ type Engine struct {
 
 	dlqMaxAgeMs int64 // DLQ retention: drop dead letters older than this (0 = off)
 	dlqMaxCount int   // DLQ retention: keep at most N dead letters per queue (0 = off)
+	dlqMaxBytes int64 // DLQ retention: cap dead-letter body bytes per queue (0 = off)
 
 	qmu    sync.RWMutex
 	qcache map[string]queueRow
@@ -47,6 +48,7 @@ type Options struct {
 	// dimension unbounded. Defaults are applied by the broker, not the engine.
 	DLQMaxAgeMs int64        // dead letters older than this (by enqueued_at) are dropped
 	DLQMaxCount int          // keep at most this many dead letters per queue (drop oldest)
+	DLQMaxBytes int64        // cap total dead-letter body bytes per queue (drop oldest)
 	Logger      *slog.Logger // background-loop failures log here; nil -> slog.Default()
 }
 
@@ -97,6 +99,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		maxMsgBytes: maxMsg,
 		dlqMaxAgeMs: opts.DLQMaxAgeMs,
 		dlqMaxCount: opts.DLQMaxCount,
+		dlqMaxBytes: opts.DLQMaxBytes,
 	}
 
 	// Single-broker crash recovery (§4.4): any 'locked' row is an orphan from a
