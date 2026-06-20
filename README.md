@@ -161,6 +161,11 @@ curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   http://127.0.0.1:8080/mqlite.v1.QueueService/Receive
 ```
 
+> **`Send` response.** `/Send` returns `{"seq_numbers":[…]}` — one per message, in
+> order. A *single* message that hits a dedup conflict (same `message_id`, different
+> body) is rejected with **409**; in a *multi-message batch* the conflicting slot
+> comes back as `0` (skipped, not enqueued) while the rest still commit.
+
 ### 3b. Web UI (read-only ops panel)
 
 The broker serves a read-only dashboard at **`http://<host>/ui`** — list queues with
@@ -231,7 +236,9 @@ server's responsibility.
 ## Docker
 
 ```bash
-docker build --platform linux/amd64 -t mqlite:0.1.0 .
+# --pull forces the latest golang:1.25 base (newest Go stdlib security patches) —
+# use it for release builds so a cached old base layer can't ship known CVEs.
+docker build --platform linux/amd64 --pull -t mqlite:0.1.0 .
 docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.1.0
 # remote Turso instead of the local volume:
 docker run --platform linux/amd64 -p 8080:8080 \
