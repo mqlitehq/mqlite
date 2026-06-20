@@ -21,9 +21,10 @@ var uiHTML []byte
 
 // Server adapts an Engine to HTTP with static Bearer-token auth.
 type Server struct {
-	eng    *engine.Engine
-	tokens map[string]bool // empty -> auth disabled (dev/LAN only)
-	mux    *http.ServeMux
+	eng     *engine.Engine
+	tokens  map[string]bool // empty -> auth disabled (dev/LAN only)
+	mux     *http.ServeMux
+	Version string // reported by the open "/" discovery endpoint; "" -> "dev"
 }
 
 // New builds a Server. tokens is the set of accepted Bearer tokens; pass nil/empty
@@ -65,6 +66,9 @@ func (s *Server) routes() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Open discovery/index at "/" — hit the broker with no path/params/auth and get a
+	// plain JSON telling you what this is, the version, and a basic status.
+	s.mux.HandleFunc("/", s.handleIndex)
 	// Prometheus metrics: per-queue gauges. Behind auth like the RPCs (a scraper
 	// passes the Bearer token); only /healthz stays open for liveness.
 	s.mux.HandleFunc("/metrics", s.handleMetrics)
@@ -76,6 +80,34 @@ func (s *Server) routes() {
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(uiHTML)
+}
+
+// handleIndex is the open discovery endpoint at "/": no params, no auth, just a JSON
+// card identifying the system, its version, and a basic status. "/" is also the mux
+// catch-all, so anything else unmatched gets a JSON 404 here.
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		writeErr(w, http.StatusNotFound, "not_found", "no such path: "+r.URL.Path)
+		return
+	}
+	version := s.Version
+	if version == "" {
+		version = "dev"
+	}
+	writeJSON(w, map[string]any{
+		"name":        "mqlite",
+		"description": "Lightweight SQLite-backed message queue with Azure Service Bus-style semantics.",
+		"version":     version,
+		"status":      "ok",
+		"auth":        len(s.tokens) > 0, // true -> RPCs need a Bearer token
+		"docs":        "https://github.com/mqlitehq/mqlite",
+		"endpoints": map[string]string{
+			"health":  "GET /healthz",
+			"metrics": "GET /metrics (Bearer)",
+			"ui":      "GET /ui",
+			"rpc":     "POST /mqlite.v1.{Service}/{Method} (Bearer)",
+		},
+	})
 }
 
 // handleMetrics exposes per-queue counters in Prometheus text format (MQLITE-5).
@@ -140,7 +172,7 @@ func postOnly(fn http.HandlerFunc) http.HandlerFunc {
 // auth enforces Bearer tokens (skips /healthz and when no tokens configured).
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.tokens) == 0 || r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/ui") {
+		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/ui") {
 			next.ServeHTTP(w, r)
 			return
 		}
