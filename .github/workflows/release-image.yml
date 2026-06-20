@@ -1,0 +1,47 @@
+name: release image
+
+# Build the broker image and push it to this repo's GitHub Container Registry
+# (ghcr.io/mqlitehq/mqlite) on every v* tag. Manual runs are allowed too — to
+# backfill an existing tag, dispatch this workflow with that tag as the ref.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  ghcr:
+    name: build + push multi-arch image (GHCR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
+      # Pure-Go cross-compile (Dockerfile uses BUILDPLATFORM + GOARCH=$TARGETARCH),
+      # so amd64 + arm64 build natively without QEMU emulation.
+      - name: build + push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
