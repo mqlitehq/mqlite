@@ -273,7 +273,8 @@ Fly.io machine/volume sizing: [docs/resource-profile.md](docs/resource-profile.m
 
 Full copy-runnable recipes — Docker/GHCR, **Fly.io** (minimal-cost, scale-to-zero),
 **systemd**, and **Turso** — with auth and verification:
-[docs/deployment.md](docs/deployment.md).
+[docs/deployment.md](docs/deployment.md). Wiring `/metrics` into Prometheus + Grafana
+(scrape config, PromQL, alerts): [docs/observability.md](docs/observability.md).
 
 ## Tests
 
