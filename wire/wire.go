@@ -59,6 +59,13 @@ type SendRequest struct {
 	ScheduledEnqueueTimeMs int64     `json:"scheduled_enqueue_time_ms,omitempty"`
 	TTLMs                  int64     `json:"ttl_ms,omitempty"`
 }
+
+// SendResponse returns one sequence number per input message, positionally.
+// In a multi-message batch a slot is 0 when that message hit a dedup conflict
+// (same message_id, different body): the offending message is skipped so the rest
+// of the batch still commits, and seq 0 marks the slot that was NOT enqueued. A
+// single-message Send instead surfaces that conflict as a 409 (already_exists)
+// rather than a 200 with a 0, so a non-batch client never has to special-case it.
 type SendResponse struct {
 	SeqNumbers []int64 `json:"seq_numbers"`
 }

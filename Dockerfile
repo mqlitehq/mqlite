@@ -2,6 +2,10 @@
 # Build:  docker build --platform linux/amd64 -t mqlite:0.1.0 .
 # Run:    docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.1.0
 
+# golang:1.25-alpine is a rolling tag — each pull is the latest 1.25.x patch, so the
+# release binary always carries the current Go stdlib security fixes. Do NOT pin to a
+# specific old patch (e.g. 1.25.9), which would ship known stdlib CVEs. CI's
+# govulncheck job (go-version: stable) gates the same.
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
