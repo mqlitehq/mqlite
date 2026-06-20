@@ -271,6 +271,10 @@ docker run --platform linux/amd64 -p 8080:8080 \
 on disk — fits Fly's smallest 256 MB machine with room to spare. Measured numbers and
 Fly.io machine/volume sizing: [docs/resource-profile.md](docs/resource-profile.md).
 
+Full copy-runnable recipes — Docker/GHCR, **Fly.io** (minimal-cost, scale-to-zero),
+**systemd**, and **Turso** — with auth and verification:
+[docs/deployment.md](docs/deployment.md).
+
 ## Tests
 
 ```bash
