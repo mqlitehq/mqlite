@@ -26,6 +26,8 @@ type embeddedConfig struct {
 	maxMessageBytes   int64
 	logger            *slog.Logger
 	synchronous       string
+	dlqMaxAgeMs       int64
+	dlqMaxCount       int
 }
 
 // EmbeddedOption configures OpenEmbedded.
@@ -66,6 +68,21 @@ func WithSynchronous(mode string) EmbeddedOption {
 	return func(c *embeddedConfig) { c.synchronous = mode }
 }
 
+// WithDLQRetention bounds the dead-letter queue so a long-running broker can't grow
+// without limit (MQLITE-21). A background pass drops dead letters oldest-first when
+// they are older than maxAge or beyond maxCount per queue; pass 0 to leave a
+// dimension unbounded. ONLY the DLQ is affected — undelivered and in-flight messages
+// are never deleted. Off by default for the embedded library; the `mqlite serve`
+// broker enables a sane default (see cmd/mqlite).
+func WithDLQRetention(maxAge time.Duration, maxCount int) EmbeddedOption {
+	return func(c *embeddedConfig) {
+		if maxAge > 0 {
+			c.dlqMaxAgeMs = maxAge.Milliseconds()
+		}
+		c.dlqMaxCount = maxCount
+	}
+}
+
 // OpenEmbedded opens the engine on a DB DSN: file:./mq.db | :memory: | libsql://host
 func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*Embedded, error) {
 	var cfg embeddedConfig
@@ -80,6 +97,8 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 		MaxMessageBytes:   cfg.maxMessageBytes,
 		Logger:            cfg.logger,
 		Synchronous:       cfg.synchronous,
+		DLQMaxAgeMs:       cfg.dlqMaxAgeMs,
+		DLQMaxCount:       cfg.dlqMaxCount,
 	})
 	if err != nil {
 		return nil, err

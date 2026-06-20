@@ -17,6 +17,9 @@ func (e *Engine) startBackground(ctx context.Context) {
 	e.spawn(ctx, 10*time.Second, e.expireTTL)         // active TTL -> DLQ/discard
 	e.spawn(ctx, 60*time.Second, e.cleanupDedup)      // drop out-of-window dedup rows
 	e.spawn(ctx, 60*time.Second, e.cleanupExpiredAux) // drop expired settle/receive receipts
+	if e.dlqMaxAgeMs > 0 || e.dlqMaxCount > 0 {
+		e.spawn(ctx, 60*time.Second, e.reapDLQ) // DLQ retention: drop-oldest past age/count
+	}
 }
 
 func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(context.Context)) {
@@ -135,6 +138,61 @@ func (e *Engine) cleanupExpiredAux(ctx context.Context) {
 	}
 }
 
+// reapDLQ enforces the DLQ retention bounds (MQLITE-21): drop-oldest dead letters
+// past the configured max age and/or per-queue max count, in bounded batches so the
+// single writer never stalls. ONLY state='dead_lettered' rows are ever deleted —
+// undelivered / in-flight / scheduled work is never touched. No-op if both bounds
+// are 0 (the engine default; the broker sets sane defaults).
+func (e *Engine) reapDLQ(ctx context.Context) {
+	const batch = 1000
+	const maxBatches = 100 // bound work per pass; the 60s cadence rate-limits the rest
+
+	if e.dlqMaxAgeMs > 0 {
+		cutoff := e.now() - e.dlqMaxAgeMs
+		for i := 0; i < maxBatches; i++ {
+			res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
+				SELECT id FROM messages WHERE state='dead_lettered' AND enqueued_at < ?
+				ORDER BY id LIMIT ?)`, cutoff, batch)
+			if err != nil {
+				e.log.Error("dlq-retention: age purge failed", "err", err)
+				break
+			}
+			if n, _ := res.RowsAffected(); n < batch {
+				break
+			}
+		}
+	}
+
+	if e.dlqMaxCount > 0 {
+		for _, q := range e.distinctQueues(ctx, `state='dead_lettered'`) {
+			// The (maxCount+1)-th newest dead letter, by id: it and everything older
+			// are surplus. NULL -> the queue is at or under the cap, nothing to drop.
+			var cutoffID sql.NullInt64
+			if err := e.db.queryRowScan(ctx, []any{&cutoffID},
+				`SELECT id FROM messages WHERE queue=? AND state='dead_lettered'
+				 ORDER BY id DESC LIMIT 1 OFFSET ?`, q, e.dlqMaxCount); err != nil {
+				e.log.Error("dlq-retention: count cutoff failed", "queue", q, "err", err)
+				continue
+			}
+			if !cutoffID.Valid {
+				continue
+			}
+			for i := 0; i < maxBatches; i++ {
+				res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
+					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
+					ORDER BY id LIMIT ?)`, q, cutoffID.Int64, batch)
+				if err != nil {
+					e.log.Error("dlq-retention: count purge failed", "queue", q, "err", err)
+					break
+				}
+				if n, _ := res.RowsAffected(); n < batch {
+					break
+				}
+			}
+		}
+	}
+}
+
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
 // DisableBackground use this to drive time-based transitions deterministically.
 func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
@@ -143,4 +201,5 @@ func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
 	e.expireTTL(ctx)
 	e.cleanupDedup(ctx)
 	e.cleanupExpiredAux(ctx)
+	e.reapDLQ(ctx)
 }
