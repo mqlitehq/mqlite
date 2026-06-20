@@ -68,6 +68,9 @@ rather than competing with Kafka-scale streaming.
 
 ## Quickstart
 
+Full copy-runnable programs (embedded, transactional outbox, remote consumer, curl):
+[docs/examples.md](docs/examples.md).
+
 ### 1. Embedded (in-process — no broker, no HTTP, no second process)
 
 mqlite's primary form is a **library you embed directly in your Go process**, exactly
