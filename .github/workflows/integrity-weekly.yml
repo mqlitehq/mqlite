@@ -1,0 +1,36 @@
+name: Integrity weekly
+
+# Large-scale message-integrity sweep (no message loss + no content corruption).
+# The daily per-PR CI runs TestMessageIntegrity at a small N under the race detector
+# (fast); this runs it at scale (default 500k) WITHOUT -race — at half a million
+# messages the race detector is infeasible, and the point here is scale, not data
+# races. Weekly + on demand, so the heavy run never slows the PR loop.
+on:
+  schedule:
+    - cron: '0 6 * * 1' # 06:00 UTC Mondays
+  workflow_dispatch:
+    inputs:
+      n:
+        description: messages for the integrity sweep
+        default: '500000'
+
+permissions:
+  contents: read
+
+jobs:
+  large-integrity:
+    name: large integrity sweep + embedded benchmarks
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'mqlitehq/mqlite' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: large integrity sweep (no -race; scale, not race detection)
+        env:
+          MQLITE_INTEGRITY_N: ${{ github.event.inputs.n || '500000' }}
+        run: go test ./engine -run TestMessageIntegrity -count=1 -v -timeout 15m
+      - name: embedded benchmarks (weekly perf snapshot)
+        run: go test ./engine -run '^$' -bench=. -benchmem -benchtime=3s
