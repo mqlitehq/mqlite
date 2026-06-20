@@ -147,12 +147,14 @@ The existing primitives already compose into archival; document, don't build:
 
 ## Recommendation — tiered, minimal
 
-### Tier 1 (SHIPPED, no schema change): broker-default DLQ retention by age + count
+### Tier 1 (SHIPPED, no schema change): broker-default DLQ retention by age + count + bytes
 
 A `reapDLQ` background loop (alongside the existing janitors) bounds the DLQ by
-**age and per-queue count**, drop-oldest, **batched + rate-limited**, touching
-**only `state='dead_lettered'`** (undelivered / in-flight / scheduled work is never
-deleted). No new column, no migration, fully backward-compatible.
+**age, per-queue count, and per-queue body bytes** — drop-oldest, **batched +
+rate-limited**, touching **only `state='dead_lettered'`** (undelivered / in-flight /
+scheduled work is never deleted). All three are broker-wide settings enforced over
+existing columns (`enqueued_at`, `length(body)`), so there's no new column, no
+migration, fully backward-compatible.
 
 **On by default for the broker** so it is safe to run online long-term out of the
 box (the maintainer's call — the one unbounded sink should not silently fill the
@@ -163,29 +165,31 @@ never auto-deletes a caller's dead letters unless asked:
 # mqlite serve (broker) — defaults applied unless overridden:
 MQLITE_DLQ_MAX_AGE=336h        # default 14d; dead letters older (by enqueued_at) are dropped
 MQLITE_DLQ_MAX_COUNT=1000000   # default 1,000,000 dead letters per queue (drop oldest)
+MQLITE_DLQ_MAX_BYTES=0         # optional per-queue body-byte cap; 0 = off (deployment-specific)
 MQLITE_DLQ_RETENTION=off       # disable entirely
 
 # embedded library — off unless you opt in:
-mqlite.WithDLQRetention(14*24*time.Hour, 1_000_000)
+mqlite.WithDLQRetention(14*24*time.Hour, 1_000_000, 0)
 ```
 
 Implemented in `engine/background.go` (`reapDLQ`), `engine.Options.{DLQMaxAgeMs,
-DLQMaxCount}`, the `WithDLQRetention` embedded option, and the broker defaults in
-`cmd/mqlite` (`embeddedOpts`). Tested in `engine/retention_dlq_test.go` (drop-oldest,
-age boundary, non-DLQ-untouched, off-by-default).
+DLQMaxCount,DLQMaxBytes}`, the `WithDLQRetention` embedded option, and the broker
+defaults in `cmd/mqlite` (`embeddedOpts`). Tested in `engine/retention_dlq_test.go`
+(drop-oldest by each dimension, age boundary, non-DLQ-untouched, off-by-default).
 
-### Tier 2 (next schema bump): per-queue overrides + bytes trigger
+### Tier 2 (next schema bump): per-queue overrides
 
-When the schema is next bumped for another reason, add the per-queue policy:
+When the schema is next bumped for another reason, add per-queue policy columns so a
+high-volume queue can keep dead letters an hour while an audit queue keeps them a
+month (the Tier-1 bounds above are broker-wide):
 
 ```
 ALTER TABLE queues ADD COLUMN dead_letter_ttl_ms INTEGER NOT NULL DEFAULT 0;
 -- optional: dead_letter_max_count, dead_letter_max_bytes, dead_lettered_at
 ```
 
-so a high-volume queue keeps dead letters an hour while an audit queue keeps them a
-month, and count/bytes caps join age. **Do not bump the schema solely for this** —
-bundle it with the next schema change (respects MQLITE-25).
+**Do not bump the schema solely for this** — bundle it with the next schema change
+(respects MQLITE-25).
 
 ## Caveat: age is measured from `enqueued_at`
 
@@ -201,9 +205,9 @@ dead-letter-relative TTL if ever needed.
 Tracked in Plane as children of MQLITE-21:
 
 ```
-MQLITE-28  Tier 1: reapDLQ loop + MQLITE_DLQ_MAX_AGE/MAX_COUNT, default ON for     SHIPPED
-           the broker; batched + rate-limited; only state='dead_lettered'; no schema.
-MQLITE-29  Tier 2: per-queue overrides (dead_letter_ttl_ms) + bytes cap            next schema
+MQLITE-28  Tier 1: reapDLQ loop + MQLITE_DLQ_MAX_AGE/MAX_COUNT/MAX_BYTES, default   SHIPPED
+           ON for the broker; batched + rate-limited; only state='dead_lettered'; no schema.
+MQLITE-29  Tier 2: per-queue overrides (dead_letter_ttl_ms / max_count / max_bytes) next schema
            (+ optional dead_lettered_at); bundled with the next schema bump.
 MQLITE-30  Document the operator archival pattern (Peek/Redrive/Purge) in README. docs
 MQLITE-31  Opt-in incremental_vacuum maintenance step (CLI) for disk give-back.   later

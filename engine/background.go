@@ -17,8 +17,8 @@ func (e *Engine) startBackground(ctx context.Context) {
 	e.spawn(ctx, 10*time.Second, e.expireTTL)         // active TTL -> DLQ/discard
 	e.spawn(ctx, 60*time.Second, e.cleanupDedup)      // drop out-of-window dedup rows
 	e.spawn(ctx, 60*time.Second, e.cleanupExpiredAux) // drop expired settle/receive receipts
-	if e.dlqMaxAgeMs > 0 || e.dlqMaxCount > 0 {
-		e.spawn(ctx, 60*time.Second, e.reapDLQ) // DLQ retention: drop-oldest past age/count
+	if e.dlqMaxAgeMs > 0 || e.dlqMaxCount > 0 || e.dlqMaxBytes > 0 {
+		e.spawn(ctx, 60*time.Second, e.reapDLQ) // DLQ retention: drop-oldest past age/count/bytes
 	}
 }
 
@@ -183,6 +183,37 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 					ORDER BY id LIMIT ?)`, q, cutoffID.Int64, batch)
 				if err != nil {
 					e.log.Error("dlq-retention: count purge failed", "queue", q, "err", err)
+					break
+				}
+				if n, _ := res.RowsAffected(); n < batch {
+					break
+				}
+			}
+		}
+	}
+
+	if e.dlqMaxBytes > 0 {
+		for _, q := range e.distinctQueues(ctx, `state='dead_lettered'`) {
+			// Scanning newest->oldest, the first dead letter whose cumulative body
+			// bytes exceed the cap (and everything older) is surplus. NULL -> under cap.
+			var cutoffID sql.NullInt64
+			if err := e.db.queryRowScan(ctx, []any{&cutoffID},
+				`SELECT id FROM (
+				     SELECT id, SUM(length(body)) OVER (ORDER BY id DESC) AS cum
+				     FROM messages WHERE queue=? AND state='dead_lettered'
+				 ) WHERE cum > ? ORDER BY id DESC LIMIT 1`, q, e.dlqMaxBytes); err != nil {
+				e.log.Error("dlq-retention: bytes cutoff failed", "queue", q, "err", err)
+				continue
+			}
+			if !cutoffID.Valid {
+				continue
+			}
+			for i := 0; i < maxBatches; i++ {
+				res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
+					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
+					ORDER BY id LIMIT ?)`, q, cutoffID.Int64, batch)
+				if err != nil {
+					e.log.Error("dlq-retention: bytes purge failed", "queue", q, "err", err)
 					break
 				}
 				if n, _ := res.RowsAffected(); n < batch {
