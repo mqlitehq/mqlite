@@ -169,6 +169,8 @@ curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 > body) is rejected with **409**; in a *multi-message batch* the conflicting slot
 > comes back as `0` (skipped, not enqueued) while the rest still commit.
 
+Full endpoint, request/response, and error reference: [docs/api-reference.md](docs/api-reference.md).
+
 ### 3b. Web UI (read-only ops panel)
 
 The broker serves a read-only dashboard at **`http://<host>/ui`** — list queues with
