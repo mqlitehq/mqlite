@@ -165,7 +165,7 @@ func compileFilter(source string) (*vm.Program, error) {
 	}
 	prog, err := expr.Compile(source, filterOptions()...)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidFilter, err)
+		return nil, fmt.Errorf("%w: %s", ErrInvalidFilter, err.Error())
 	}
 	return prog, nil
 }
@@ -287,7 +287,7 @@ func parseDuration(s string) (time.Duration, error) {
 		}
 		f, err := strconv.ParseFloat(m[1], 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid duration %q: %s", orig, err)
+			return 0, fmt.Errorf("invalid duration %q: %w", orig, err)
 		}
 		total += time.Duration(f * float64(unitDur[m[2]]))
 		s = s[len(m[0]):]
