@@ -49,6 +49,7 @@ var (
 	ErrGroupRequired         = errors.New("mqlite: group id required for group_fifo queue")
 	ErrDBLocked              = errors.New("mqlite: database file is already open by another process")
 	ErrSchemaVersionMismatch = errors.New("mqlite: database schema version is incompatible with this build")
+	ErrInvalidFilter         = errors.New("mqlite: invalid subscription filter expression")
 )
 
 // QueueConfig configures a queue or subscription (entity-level defaults).

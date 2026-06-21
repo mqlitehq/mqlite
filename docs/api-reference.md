@@ -160,8 +160,9 @@ Create or update a queue (idempotent on name).
 
 Register subscription `name` under `topic` (creates its backing queue).
 
-- **Request** `SubscribeRequest`: `topic`, `name`, `filter` (optional — equality-AND +
-  subject prefix). **Response** `{}`.
+- **Request** `SubscribeRequest`: `topic`, `name`, `filter` (optional —
+  `{"expr": "<predicate>"}`, an [expr boolean over the message](filters.md); empty/omitted
+  matches all). A malformed expr is rejected with `400 invalid_argument`. **Response** `{}`.
 
 ### ListQueues
 

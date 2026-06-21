@@ -170,9 +170,11 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   Single-process only — exactly mqlite's target.
 - **Transactional outbox** (`engine/tx.go`, `Embedded.Tx`): embedded-only. Business
   writes + enqueue commit in one `*sql.Tx` ("business success ⇔ message enqueued").
-- **Topics/subscriptions** (`engine/topic.go`): a topic fans a Send out to each
-  subscription's backing queue (addressed by the bare subscription name); subscription
-  filters are equality-AND + subject prefix. Receive/Redrive/Stats target the
+- **Topics/subscriptions** (`engine/topic.go`, `engine/filter.go`): a topic fans a Send
+  out to each subscription's backing queue (addressed by the bare subscription name).
+  A subscription filter is one `expr-lang` boolean predicate over the message
+  (`Filter{Expr}`), compiled+type-checked at Subscribe (cached per subscription) and
+  run fail-closed at publish — see `docs/filters.md`. Receive/Redrive/Stats target the
   subscription by name.
 
 ### Conventions specific to this repo

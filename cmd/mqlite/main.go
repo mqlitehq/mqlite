@@ -90,7 +90,7 @@ usage: mqlite <command> [flags]
 
   serve                  run the HTTP broker (embedded engine + Serve)
   create-queue <name>    create/update a queue
-  subscribe <topic> <n>  create a subscription <n> under <topic>
+  subscribe <topic> <n>  create a subscription <n> under <topic> (--expr 'predicate')
   send <queue> <body>    send a message (body "-" reads stdin; --file reads a file)
   receive <queue>        receive (Peek-Lock, auto-Complete unless --no-ack)
   peek <queue>           browse without locking
@@ -254,13 +254,13 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 
 func cmdCreateSubscription(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("subscribe", flag.ExitOnError)
-	prefix := fs.String("subject-prefix", "", "subject prefix filter")
+	exprStr := fs.String("expr", "", `filter expression (expr-lang), e.g. 'subject_parts[0]=="orders"'; empty = match all`)
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 2 {
-		return fmt.Errorf("usage: subscribe <topic> <subscription> [--subject-prefix p]")
+		return fmt.Errorf("usage: subscribe <topic> <subscription> [--expr 'predicate']")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -268,8 +268,8 @@ func cmdCreateSubscription(ctx context.Context, args []string) error {
 	}
 	defer c.Close()
 	var f *mqlite.Filter
-	if *prefix != "" {
-		f = &mqlite.Filter{SubjectPrefix: *prefix}
+	if *exprStr != "" {
+		f = &mqlite.Filter{Expr: *exprStr}
 	}
 	if err := c.Subscribe(ctx, pos[0], pos[1], f); err != nil {
 		return err

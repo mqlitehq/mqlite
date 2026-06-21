@@ -156,7 +156,7 @@ func remoteTopic(ctx context.Context, cli *mqlite.Client) {
 	section("client: topic fan-out + filter")
 	topic := rid + "_sdk_topic"
 	cli.Subscribe(ctx, topic, topic+"_all", nil)
-	cli.Subscribe(ctx, topic, topic+"_paid", &mqlite.Filter{SubjectPrefix: "payment."})
+	cli.Subscribe(ctx, topic, topic+"_paid", &mqlite.Filter{Expr: `subject startsWith "payment."`})
 	cli.SendOne(ctx, topic, mqlite.OutMessage{Body: []byte("o"), Subject: "order.created"})
 	cli.SendOne(ctx, topic, mqlite.OutMessage{Body: []byte("p"), Subject: "payment.captured"})
 	all, _ := cli.Stats(ctx, topic+"_all")

@@ -267,7 +267,7 @@ func TestTopicFanoutAndFilter(t *testing.T) {
 	if err := e.Subscribe(ctx, "events", "all", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Subscribe(ctx, "events", "paid", &Filter{SubjectPrefix: "payment."}); err != nil {
+	if err := e.Subscribe(ctx, "events", "paid", &Filter{Expr: `subject startsWith "payment."`}); err != nil {
 		t.Fatal(err)
 	}
 	e.SendOne(ctx, "events", OutMessage{Body: []byte("o"), Subject: "order.created"})

@@ -33,6 +33,9 @@ type Engine struct {
 
 	qmu    sync.RWMutex
 	qcache map[string]queueRow
+
+	filterMu    sync.Mutex              // guards filterCache
+	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
 }
 
 // Options configures Open.
@@ -96,6 +99,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		log:         lg,
 		closed:      make(chan struct{}),
 		qcache:      map[string]queueRow{},
+		filterCache: map[string]*filterEntry{},
 		maxMsgBytes: maxMsg,
 		dlqMaxAgeMs: opts.DLQMaxAgeMs,
 		dlqMaxCount: opts.DLQMaxCount,
@@ -219,6 +223,13 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 				ErrNameConflict, name, otherTopic.String)
 		}
 	}
+	// Validate the filter expression up front: a bad one is rejected here
+	// (ErrInvalidFilter -> 400) with the precise compiler error and never stored.
+	if filter != nil {
+		if _, err := compileFilter(filter.Expr); err != nil {
+			return err
+		}
+	}
 	cfg := QueueConfig{Kind: "subscription"}
 	if err := e.CreateQueue(ctx, name, cfg); err != nil {
 		return err
@@ -231,12 +242,17 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 		}
 		fj = sql.NullString{String: string(b), Valid: true}
 	}
-	_, err := e.db.exec(ctx, `
+	if _, err := e.db.exec(ctx, `
 		INSERT INTO subscriptions (topic,subscription,filter_json,created_at)
 		VALUES (?,?,?,?)
 		ON CONFLICT(topic,subscription) DO UPDATE SET filter_json=excluded.filter_json`,
-		topic, name, fj, e.now())
-	return err
+		topic, name, fj, e.now()); err != nil {
+		return err
+	}
+	// A re-subscribe may have changed the filter — drop any cached program so the
+	// next publish recompiles from the freshly stored expression.
+	e.invalidateFilter(name)
+	return nil
 }
 
 func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
@@ -289,13 +305,14 @@ func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 // ── send / schedule ─────────────────────────────────────────────────────────
 
 // SendOne enqueues one message, returning its seq_number. A dedup conflict
-// (same id, different body) surfaces as ErrDedupConflict.
+// (same id, different body) surfaces as ErrDedupConflict. Publishing to a topic
+// that no subscription filter accepts is a valid no-op: it returns (0, nil).
 func (e *Engine) SendOne(ctx context.Context, queue string, m OutMessage) (int64, error) {
-	seqs, err := e.send(ctx, queue, []OutMessage{m}, 0, StateActive)
+	seqs, conflicts, err := e.sendTracked(ctx, queue, []OutMessage{m}, 0, StateActive)
 	if err != nil {
 		return 0, err
 	}
-	if seqs[0] == 0 { // skipped as a dedup conflict (batch path swallows it)
+	if seqs[0] == 0 && conflicts[0] { // 0 because of a dedup conflict, not a no-match
 		return 0, ErrDedupConflict
 	}
 	return seqs[0], nil
@@ -310,12 +327,14 @@ func (e *Engine) Send(ctx context.Context, queue string, ms ...OutMessage) ([]in
 }
 
 // Schedule enqueues a message that becomes visible at `atMs` (epoch ms) (§8.7).
+// As with SendOne, a dedup conflict surfaces as ErrDedupConflict while a publish that
+// no subscription accepts is a no-op returning (0, nil).
 func (e *Engine) Schedule(ctx context.Context, queue string, m OutMessage, atMs int64) (int64, error) {
-	seqs, err := e.send(ctx, queue, []OutMessage{m}, atMs, StateScheduled)
+	seqs, conflicts, err := e.sendTracked(ctx, queue, []OutMessage{m}, atMs, StateScheduled)
 	if err != nil {
 		return 0, err
 	}
-	if seqs[0] == 0 { // skipped as a dedup conflict (batch path swallows it)
+	if seqs[0] == 0 && conflicts[0] {
 		return 0, ErrDedupConflict
 	}
 	return seqs[0], nil
@@ -336,30 +355,47 @@ func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
 
 // send is the shared enqueue path. forced state is 'active' or 'scheduled'.
 func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs int64, forced State) ([]int64, error) {
+	seqs, _, err := e.sendTracked(ctx, name, ms, atMs, forced)
+	return seqs, err
+}
+
+// sendTracked is send with per-message dedup-conflict tracking. conflicts[i] is true
+// only when message i was rejected by a dedup conflict (same id, different body) —
+// distinct from a 0 seq because the message matched no subscription filter, which is
+// a valid no-op. The single-message wrappers use this to avoid reporting a spurious
+// ErrDedupConflict for a publish that simply had no interested subscriber.
+func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, atMs int64, forced State) ([]int64, []bool, error) {
 	for i := range ms {
 		if int64(len(ms[i].Body)) > e.maxMsgBytes {
-			return nil, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(ms[i].Body), e.maxMsgBytes)
+			return nil, nil, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(ms[i].Body), e.maxMsgBytes)
 		}
 	}
 	targets, err := e.resolveTargets(ctx, name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	now := e.now()
+	// visible_at for the filter env: the scheduled time for a delayed send, else now.
+	visibleAt := now
+	if atMs > 0 {
+		visibleAt = atMs
+	}
 	seqs := make([]int64, len(ms))
+	conflicts := make([]bool, len(ms))
 	woke := map[string]bool{}
 
 	err = e.inTx(ctx, func(tx *sql.Tx) error {
 		// reset per-attempt accumulators (inTx may retry the whole closure).
 		for i := range seqs {
 			seqs[i] = 0
+			conflicts[i] = false
 		}
 		woke = map[string]bool{}
 		for i, m := range ms {
 			// fan-out: identical body to each subscription target (topic) or the one queue.
 			var lastSeq int64
 			for _, t := range targets {
-				if !t.filter.match(m) { // subscription filter; nil filter matches all
+				if !e.filterAccepts(t, m, now, visibleAt) { // empty/nil filter matches all
 					continue
 				}
 				q, err := e.loadQueueTx(ctx, tx, t.name)
@@ -374,7 +410,9 @@ func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs in
 					// Batch-safe: a dedup conflict (same id, different body) skips
 					// only the offending message — the rest of the batch still
 					// commits. The conflicting slot stays seq=0; single Send /
-					// Schedule re-surface it as ErrDedupConflict.
+					// Schedule re-surface it as ErrDedupConflict (vs a 0 that just
+					// means no subscription filter accepted the message).
+					conflicts[i] = true
 					continue
 				}
 				if err != nil {
@@ -390,18 +428,32 @@ func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs in
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for q := range woke {
 		e.note.notify(q)
 	}
-	return seqs, nil
+	return seqs, conflicts, nil
 }
 
-// target is a concrete deliverable queue name plus an optional subscription filter.
+// target is a concrete deliverable queue name plus an optional compiled filter.
+// entry is nil for a plain queue or an empty filter (match all).
 type target struct {
-	name   string
-	filter *Filter
+	name  string
+	entry *filterEntry
+}
+
+// targetFor builds a fan-out target from a subscription row, compiling and caching
+// its filter expression (empty or absent → entry nil → match all).
+func (e *Engine) targetFor(sub string, fj sql.NullString) target {
+	t := target{name: sub}
+	if fj.Valid && fj.String != "" {
+		var f Filter
+		if json.Unmarshal([]byte(fj.String), &f) == nil && f.Expr != "" {
+			t.entry = e.compiledFilter(sub, f.Expr)
+		}
+	}
+	return t
 }
 
 // resolveTargets expands a topic to its subscriptions, else validates the queue.
@@ -419,14 +471,7 @@ func (e *Engine) resolveTargets(ctx context.Context, name string) ([]target, err
 		if err := rows.Scan(&s, &fj); err != nil {
 			return nil, err
 		}
-		t := target{name: s}
-		if fj.Valid && fj.String != "" {
-			var f Filter
-			if json.Unmarshal([]byte(fj.String), &f) == nil {
-				t.filter = &f
-			}
-		}
-		subs = append(subs, t)
+		subs = append(subs, e.targetFor(s, fj))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

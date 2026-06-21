@@ -51,11 +51,11 @@ mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering st
 
 ### `subscribe <topic> <name>` — create a subscription
 ```bash
-mqlite subscribe orders eu-orders --subject-prefix eu.
+mqlite subscribe orders eu-orders --expr 'subject_parts[0]=="orders" && properties["region"]=="eu"'
 ```
 | Flag | | |
 |---|---|---|
-| `--subject-prefix` | "" | only fan-out messages whose subject has this prefix |
+| `--expr` | "" | subscription filter — an [expr](filters.md) boolean predicate; empty = match all |
 
 ### `send <queue> <body>` — enqueue a message
 `body` of `-` reads stdin; or use `--file`.
