@@ -92,6 +92,16 @@ an expired or wrong `lock_token` → `409 lock_lost`.
 
 `SettleRequest`: `queue`, `seq_number`, `lock_token` (+ the extras above).
 
+### CompleteBatch
+
+Complete many messages in **one round-trip** — settle a whole received batch without
+a Complete-per-message N+1 (the cheap path for draining).
+
+- **Request** `CompleteBatchRequest`: `queue`, `messages` ([{`seq_number`, `lock_token`}]).
+- **Response** `CompleteBatchResponse`: `results` ([{`seq_number`, `ok`}]) — `ok=false`
+  for a stale/expired lock on that item (not fatal to the batch). Each item is fenced +
+  idempotent exactly like `Complete`.
+
 ### ReceiveDeferred
 
 Lock previously-`Defer`'d messages by sequence number.

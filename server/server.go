@@ -48,6 +48,7 @@ func (s *Server) routes() {
 	h(wire.PathSend, s.handleSend)
 	h(wire.PathReceive, s.handleReceive)
 	h(wire.PathComplete, s.handleComplete)
+	h(wire.PathCompleteBatch, s.handleCompleteBatch)
 	h(wire.PathAbandon, s.handleAbandon)
 	h(wire.PathReject, s.handleReject)
 	h(wire.PathDefer, s.handleDefer)
@@ -335,6 +336,28 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.settleOK(w, s.eng.Complete(r.Context(), req.Queue, req.SeqNumber, req.LockToken))
+}
+
+func (s *Server) handleCompleteBatch(w http.ResponseWriter, r *http.Request) {
+	var req wire.CompleteBatchRequest
+	if err := decode(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		return
+	}
+	items := make([]engine.SettleItem, len(req.Messages))
+	for i, m := range req.Messages {
+		items[i] = engine.SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+	}
+	results, err := s.eng.CompleteBatch(r.Context(), req.Queue, items)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]wire.SettleItemResult, len(results))
+	for i, res := range results {
+		out[i] = wire.SettleItemResult{SeqNumber: res.SeqNumber, Ok: res.Ok}
+	}
+	writeJSON(w, wire.CompleteBatchResponse{Results: out})
 }
 
 func (s *Server) handleAbandon(w http.ResponseWriter, r *http.Request) {

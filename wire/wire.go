@@ -14,6 +14,7 @@ const (
 	PathSend            = "/mqlite.v1.QueueService/Send"
 	PathReceive         = "/mqlite.v1.QueueService/Receive"
 	PathComplete        = "/mqlite.v1.QueueService/Complete"
+	PathCompleteBatch   = "/mqlite.v1.QueueService/CompleteBatch"
 	PathAbandon         = "/mqlite.v1.QueueService/Abandon"
 	PathReject          = "/mqlite.v1.QueueService/Reject"
 	PathDefer           = "/mqlite.v1.QueueService/Defer"
@@ -96,6 +97,23 @@ type SettleRequest struct {
 }
 type SettleResponse struct {
 	Ok bool `json:"ok"`
+}
+
+// CompleteBatch settles many messages in one round-trip (fixes the drain N+1).
+type SettleItem struct {
+	SeqNumber int64  `json:"seq_number"`
+	LockToken string `json:"lock_token"`
+}
+type CompleteBatchRequest struct {
+	Queue    string       `json:"queue"`
+	Messages []SettleItem `json:"messages"`
+}
+type SettleItemResult struct {
+	SeqNumber int64 `json:"seq_number"`
+	Ok        bool  `json:"ok"`
+}
+type CompleteBatchResponse struct {
+	Results []SettleItemResult `json:"results"`
 }
 
 type CancelRequest struct {

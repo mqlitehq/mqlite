@@ -198,6 +198,36 @@ func (c *Client) Cancel(ctx context.Context, queue string, seq int64) error {
 	return c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: seq}, &wire.SettleResponse{})
 }
 
+// SettleResult is the per-message outcome of CompleteBatch (Ok=false = the lock was
+// lost/expired for that message — not a fatal error for the batch).
+type SettleResult struct {
+	SequenceNumber int64
+	Ok             bool
+}
+
+func toSettleResults(rs []wire.SettleItemResult) []SettleResult {
+	out := make([]SettleResult, len(rs))
+	for i, r := range rs {
+		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok}
+	}
+	return out
+}
+
+// CompleteBatch completes many received messages in one round-trip — the fix for the
+// drain N+1 (settling a received batch one HTTP call at a time). Messages should
+// share one queue; a stale lock comes back as Ok=false rather than failing the batch.
+func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
+	items := make([]wire.SettleItem, len(msgs))
+	for i, m := range msgs {
+		items[i] = wire.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	}
+	var resp wire.CompleteBatchResponse
+	if err := c.post(ctx, wire.PathCompleteBatch, wire.CompleteBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
+		return nil, err
+	}
+	return toSettleResults(resp.Results), nil
+}
+
 // ── receive ─────────────────────────────────────────────────────────────────
 
 // Receive claims up to N messages (Peek-Lock by default), with optional long-poll.
