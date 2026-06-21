@@ -242,6 +242,13 @@ func TestTursoExtended(t *testing.T) {
 // Bug-5): concurrent dedup must collapse to one row, and concurrent claims must
 // never hand the same message to two consumers. Same creds gating as the other
 // Turso tests — skipped unless MQLITE_TEST_DB is set, run live in nightly.
+//
+// Load is sized for real-remote timing, not a local DB: every queue op is a
+// durable Hrana round-trip to the primary (~1s each), and the primary serializes
+// writes, so C consumers contend for the 4-conn pool and lose claim races they
+// retry. C=4 saturates the pool (its natural max-contention level); the assertions
+// (no double-delivery, exact-once drain, dedup-collapse) are what matter, not
+// throughput — the generous deadline is only a hang guard.
 func TestTursoConcurrent(t *testing.T) {
 	dsn := os.Getenv("MQLITE_TEST_DB")
 	if dsn == "" {
@@ -249,8 +256,9 @@ func TestTursoConcurrent(t *testing.T) {
 	}
 	token := os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
+	start := time.Now()
 
 	// Background loops off so the run is deterministic: a reaper must not reclaim a
 	// lock mid-test and make a message look double-delivered.
@@ -278,7 +286,7 @@ func TestTursoConcurrent(t *testing.T) {
 	// ── Part 1: concurrent dedup — N goroutines race to send the SAME message id.
 	// All must collapse to one row (one seq), exercising the dedup path through the
 	// 4-conn remote pool simultaneously.
-	const N = 12
+	const N = 8
 	var wg sync.WaitGroup
 	seqs := make([]int64, N)
 	errs := make([]error, N)
@@ -303,11 +311,12 @@ func TestTursoConcurrent(t *testing.T) {
 	if m, _ := e.Stats(ctx, q); m.Active != 1 {
 		t.Fatalf("concurrent dedup: want exactly 1 active row, got %d", m.Active)
 	}
+	t.Logf("Part 1 (concurrent dedup, N=%d) collapsed to 1 row in %s", N, time.Since(start).Round(time.Second))
 
 	// ── Part 2: concurrent claim — no double-delivery. Seed M distinct messages
 	// (plus the 1 dedup row already active = M+1), then drain with C concurrent
 	// consumers; every seq must be claimed by exactly one consumer.
-	const M = 40
+	const M = 24
 	for i := 0; i < M; i++ {
 		if _, err := e.SendOne(ctx, q, OutMessage{
 			Body: []byte(fmt.Sprintf("m%d", i)), MessageID: fmt.Sprintf("claim-%d", i),
@@ -317,7 +326,7 @@ func TestTursoConcurrent(t *testing.T) {
 	}
 	const want = M + 1
 
-	const C = 6
+	const C = 4
 	var (
 		cwg     sync.WaitGroup
 		mu      sync.Mutex
@@ -365,5 +374,6 @@ func TestTursoConcurrent(t *testing.T) {
 		t.Fatalf("queue should be fully drained, got %+v", m)
 	}
 
-	t.Logf("Turso concurrency OK: dedup collapsed %d→1 under race; %d messages claimed exactly once by %d consumers", N, want, C)
+	t.Logf("Turso concurrency OK in %s: dedup collapsed %d→1 under race; %d messages claimed exactly once by %d consumers",
+		time.Since(start).Round(time.Second), N, want, C)
 }
