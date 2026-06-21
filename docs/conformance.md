@@ -1,0 +1,122 @@
+# Conformance — correct mqlite behavior (TCK)
+
+This is the normative spec of how mqlite **must** behave — the invariants that define
+"correct," independent of any one implementation detail. Each is enforced by a
+hermetic test (cross-referenced); together these are mqlite's TCK. If a change would
+break a **MUST** here, it is a behavior change, not a refactor.
+
+mqlite is honestly **at-least-once**: a durably-written message is delivered at least
+once and never silently dropped; handlers must be idempotent. (§3)
+
+## 1 · Peek-Lock lifecycle
+
+- **1.1** `Receive` claims an `active` message, moving it to `locked` for the queue's
+  lock duration, and returns a `lock_token`. *(engine/functional_test.go)*
+- **1.2** A `locked` message MUST be invisible to other `Receive` calls until it is
+  settled or its lock expires — no message is delivered to two consumers at once.
+  *(engine/functional_test.go `TestCompetingConsumersNoDouble`)*
+- **1.3** Each claim increments `delivery_count`. *(engine/engine_test.go)*
+- **1.4** When a lock expires, the reaper returns the message to `active` (redelivery)
+  — or to `dead_lettered` once `delivery_count >= max_delivery_count`. *(engine/engine_test.go)*
+- **1.5** Claims are O(log n) on a deep backlog (a partial index on `active` rows; the
+  reaper, not the claim path, reclaims expired locks). *(engine/claim_plan_test.go)*
+
+## 2 · Settlement (fenced on `lock_token`)
+
+Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
+
+- **2.1 Complete** removes the message. *(engine/functional_test.go)*
+- **2.2 Abandon** returns it to `active` for redelivery (or `dead_lettered` if over
+  max); `delay_ms` re-hides it for backoff. *(engine/engine_test.go)*
+- **2.3 Reject** moves it to `dead_lettered` with a reason. *(engine/functional_test.go)*
+- **2.4 Defer** sets it aside; it is retrieved later by seq via `ReceiveDeferred`.
+  *(engine/functional_test.go)*
+- **2.5 Renew** extends the lock by the queue's lock duration. *(engine/ga_fixes_test.go)*
+- **2.6** Settling with a wrong/expired token MUST fail with `ErrLockLost` (HTTP 409)
+  — **except** an idempotent replay (a live settlement receipt for that token) returns
+  success. *(engine/ga_fixes_test.go)*
+- **2.7 CompleteBatch** settles many messages in one transaction with the same per-item
+  fencing + idempotency; a stale token yields `ok=false`, never failing the batch.
+  *(engine/complete_batch_test.go)*
+
+## 3 · Idempotency & at-least-once
+
+- **3.1** On `Open`, every orphaned `locked` row (a crash leftover) MUST reset to
+  `active` (single-broker recovery). *(engine/engine_test.go)*
+- **3.2** A settle whose response was lost MUST replay as success, not `ErrLockLost`
+  (`settlement_receipts`, fenced on `lock_token`). *(engine/ga_fixes_test.go)*
+- **3.3** A `Receive` retried with the same `AttemptID` MUST replay the same batch /
+  same lock tokens, not double-deliver. *(engine/ga_fixes_test.go)*
+- **3.4** No message loss + no content corruption: a contiguous `1..N` sequence with
+  random bodies (hashed into a property), consumed concurrently with redelivery, is
+  delivered completely (every value once) and intact (each body matches its hash).
+  *(engine/integrity_test.go `TestMessageIntegrity`)*
+
+## 4 · Deduplication
+
+- **4.1** Within a queue's `dedup_window`, a repeat `message_id` (empty → body SHA-256)
+  MUST collapse to a single enqueue. *(engine/functional_test.go, engine/turso_concurrent_test.go)*
+- **4.2** A *single* `Send` whose `message_id` conflicts with a different body MUST
+  return `ErrDedupConflict` (HTTP 409). *(server/send_dedup_test.go)*
+- **4.3** In a *multi-message* `Send`, a conflicting slot comes back as seq `0`
+  (skipped) while the rest of the batch commits. *(wire `SendResponse`; server/send_dedup_test.go)*
+
+## 5 · Ordering modes
+
+- **5.1 `standard`** — no ordering constraint; maximum parallelism. *(engine/functional_test.go)*
+- **5.2 `group_fifo`** — strict FIFO per `GroupID` (head-of-line per group); a send
+  without a `GroupID` MUST be rejected with `ErrGroupRequired`. *(engine/functional_test.go)*
+- **5.3 `strict_fifo`** — global FIFO: at most one message in flight for the queue at a
+  time. *(engine/functional_test.go, engine/claim_plan_test.go)*
+
+## 6 · Dead-letter queue
+
+- **6.1** A message reaching `max_delivery_count` MUST be dead-lettered with reason
+  `MaxDeliveryCountExceeded`. *(engine/engine_test.go)*
+- **6.2** `Redrive` moves dead letters back to `active` (or to a target queue); `Purge`
+  permanently deletes them (scoped by `Max`/`OlderThanMs`). *(engine/redrive — functional tests)*
+
+## 7 · Scheduling, deferral & TTL
+
+- **7.1 Schedule** keeps a message hidden (`scheduled`, `visible_at` in the future)
+  until its time, then the scheduler activates it; `Cancel` deletes a not-yet-active
+  scheduled message. *(engine/functional_test.go)*
+- **7.2 TTL** — an expired message (`expires_at`) MUST move to the DLQ when the queue
+  has `dead_letter_on_expire`, else be discarded. *(engine/functional_test.go)*
+
+## 8 · DLQ retention
+
+- **8.1** With a bound set, `reapDLQ` MUST drop **oldest-first** dead letters past the
+  max age, per-queue count, or per-queue body bytes — and MUST touch **only**
+  `state='dead_lettered'` (never undelivered/in-flight/scheduled work).
+  *(engine/retention_dlq_test.go)*
+- **8.2** With no bound (the engine default), the DLQ is unbounded — no auto-deletion.
+  *(engine/retention_dlq_test.go `TestDLQRetentionDisabledByDefault`)*
+
+## 9 · Auth & errors (broker)
+
+- **9.1** When `MQLITE_TOKENS` is set, every endpoint MUST require a valid
+  `Authorization: Bearer` token **except** the open `/` (discovery), `/healthz`, and
+  `/ui`; a missing/invalid token → 401 `unauthenticated`. *(server/errors_test.go, server/index_test.go)*
+- **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status:
+  400 `invalid_argument`/`group_required` · 401 `unauthenticated` · 404 `not_found` ·
+  409 `already_exists`/`lock_lost`/`name_conflict` · 413 `message_too_large` · 500
+  `internal`. *(server/errors_test.go; see [api-reference.md](api-reference.md))*
+
+## 10 · Storage & schema invariants
+
+- **10.1** Local file / `:memory:` use a single writer (`SetMaxOpenConns(1)`); a second
+  process / second `OpenEmbedded` on the same file MUST fail fast with `ErrDBLocked`.
+  *(engine/lock_test.go)*
+- **10.2** `Open` MUST refuse a DB whose recorded `schemaVersion` differs from the
+  binary's (`ErrSchemaVersionMismatch`) rather than silently mis-migrating.
+  *(engine/schema_version_test.go)*
+- **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
+  tests. The remote (Turso) path retries transient errors with backoff; the local
+  path never retries. *(engine/db_retry_test.go, engine/turso_concurrent_test.go)*
+
+---
+
+*This spec is the contract a non-SQLite storage backend (see the Store-interface
+research) would have to satisfy to be a conformant mqlite. CI runs every referenced
+test with `-race`; the large no-loss sweep also runs weekly.*

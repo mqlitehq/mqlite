@@ -244,6 +244,7 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 [Turso](docs/turso.md)
 
 **Understand it:**
+[Conformance / TCK](docs/conformance.md) ·
 [Resource profile](docs/resource-profile.md) ·
 [Benchmarks](docs/benchmark.md) ·
 [Dependencies](docs/dependencies.md)
