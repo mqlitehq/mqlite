@@ -226,6 +226,28 @@ tools (create_queue, send, receive, complete, …) — a thin, dependency-free s
 forwarder, in keeping with mqlite's "friendly to AI agents" goal. Point it at a
 broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 
+## Documentation
+
+**Use it** — pick your interface:
+
+| | |
+|---|---|
+| [CLI reference](docs/cli.md) | every command + flags; works embedded or against a broker |
+| [HTTP API reference](docs/api-reference.md) | endpoints, request/response, error codes |
+| [MCP server](docs/mcp.md) | drive mqlite from an AI agent |
+| [Examples](docs/examples.md) | copy-runnable Go (embedded · outbox · remote) + curl |
+
+**Operate it:**
+[Deployment](docs/deployment.md) (Docker/Fly/systemd/Turso) ·
+[Observability](docs/observability.md) (Prometheus/Grafana) ·
+[Retention](docs/retention.md) ·
+[Turso](docs/turso.md)
+
+**Understand it:**
+[Resource profile](docs/resource-profile.md) ·
+[Benchmarks](docs/benchmark.md) ·
+[Dependencies](docs/dependencies.md)
+
 ## Durability
 
 mqlite stores everything in SQLite/libSQL with **WAL** journaling. State is durable
