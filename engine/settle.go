@@ -147,3 +147,64 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	}
 	return affected(res)
 }
+
+// SettleItem identifies one message to settle in a batch (fenced on LockToken).
+type SettleItem struct {
+	SeqNumber int64
+	LockToken string
+}
+
+// SettleResult is the per-item outcome of a batch settle.
+type SettleResult struct {
+	SeqNumber int64
+	Ok        bool // true = settled (or an idempotent replay of an already-settled token)
+}
+
+// CompleteBatch completes many messages in one transaction / one round-trip — the
+// broker-side fix for the drain N+1 (Receive returns a batch, but settling it
+// one-by-one is one HTTP call per message). Each item is fenced on its own
+// lock_token and recorded idempotently, exactly like Complete; a per-item failure
+// (expired/wrong token) returns Ok=false rather than failing the whole batch.
+func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []SettleItem) ([]SettleResult, error) {
+	out := make([]SettleResult, len(items))
+	now := e.now()
+	err := e.inTx(ctx, func(tx *sql.Tx) error {
+		for i, it := range items {
+			out[i].SeqNumber = it.SeqNumber
+			if it.LockToken == "" {
+				continue // Ok stays false
+			}
+			res, err := tx.ExecContext(ctx,
+				`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=?`, it.SeqNumber, queue, it.LockToken)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			if n > 0 {
+				if _, err := tx.ExecContext(ctx,
+					`INSERT OR REPLACE INTO settlement_receipts(lock_token,operation,created_at,expires_at)
+					 VALUES (?,?,?,?)`, it.LockToken, "completed", now, now+settlementTTLMs); err != nil {
+					return err
+				}
+				out[i].Ok = true
+				continue
+			}
+			// rows=0: idempotent replay if a live receipt exists, else the lock is lost.
+			var one int
+			switch err := tx.QueryRowContext(ctx,
+				`SELECT 1 FROM settlement_receipts WHERE lock_token=? AND expires_at>?`, it.LockToken, now).Scan(&one); {
+			case err == nil:
+				out[i].Ok = true // already completed (lost-response replay)
+			case errors.Is(err, sql.ErrNoRows):
+				// Ok stays false (lock lost)
+			default:
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}

@@ -161,6 +161,25 @@ func (e *Embedded) Cancel(ctx context.Context, queue string, seq int64) error {
 	return e.eng.Cancel(ctx, queue, seq)
 }
 
+// CompleteBatch completes many received messages in one transaction (mirrors the
+// remote Client method; for the in-process engine there is no round-trip to save,
+// but it keeps the API symmetric and settles atomically).
+func (e *Embedded) CompleteBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
+	items := make([]engine.SettleItem, len(msgs))
+	for i, m := range msgs {
+		items[i] = engine.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	}
+	res, err := e.eng.CompleteBatch(ctx, queue, items)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SettleResult, len(res))
+	for i, r := range res {
+		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok}
+	}
+	return out, nil
+}
+
 // Tx runs business writes and enqueues in one transaction (§4.5, embedded-only).
 func (e *Embedded) Tx(ctx context.Context, fn func(*engine.EngineTx) error) error {
 	return e.eng.Tx(ctx, fn)

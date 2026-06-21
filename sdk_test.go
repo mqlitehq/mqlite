@@ -48,6 +48,39 @@ func newBroker(t *testing.T, token string) (*mqlite.Client, *mqlite.Embedded) {
 	return cli, eng
 }
 
+// CompleteBatch over HTTP: receive a batch, then settle it in one round-trip.
+func TestRemoteCompleteBatch(t *testing.T) {
+	ctx := context.Background()
+	cli, _ := newBroker(t, "mqk_test")
+	if err := cli.CreateQueue(ctx, "orders", mqlite.QueueConfig{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := cli.SendOne(ctx, "orders", mqlite.OutMessage{Body: []byte("x")}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	msgs, err := cli.Receive(ctx, "orders", mqlite.RecvOpts{Max: 3})
+	if err != nil || len(msgs) != 3 {
+		t.Fatalf("receive: got %d (err %v)", len(msgs), err)
+	}
+	res, err := cli.CompleteBatch(ctx, "orders", msgs...)
+	if err != nil {
+		t.Fatalf("CompleteBatch: %v", err)
+	}
+	if len(res) != 3 {
+		t.Fatalf("want 3 results, got %d", len(res))
+	}
+	for _, r := range res {
+		if !r.Ok {
+			t.Fatalf("want all Ok=true, got %+v", res)
+		}
+	}
+	if m, _ := cli.Stats(ctx, "orders"); m.Total != 0 {
+		t.Fatalf("queue should be empty after batch complete, total=%d", m.Total)
+	}
+}
+
 func TestRemoteRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	cli, _ := newBroker(t, "mqk_test")
