@@ -74,8 +74,9 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
   code is the gate); reference the Backlog id (`MQLITE-N`) in the commit/PR.
 - **The `go 1.21` floor is deliberate** — it is the embedding-compatibility floor,
   so `modernc.org/sqlite` and `golang.org/x/sys` are frozen at the last versions
-  that build on 1.21 (newer ones require go ≥ 1.23). Enforced by `go_floor_test.go`
-  + Dependabot ignore rules and explained in `docs/dependencies.md`; `govulncheck`
+  that build on 1.21 (newer ones require go ≥ 1.23). Enforced by
+  `TestGoModFloorStaysAt121` (in `sdk_test.go`) + Dependabot ignore rules and
+  explained in `docs/dependencies.md`; `govulncheck`
   stays green at the pins. Release **binaries are built with the latest patched Go**
   (Docker `golang:1.25`, CI `stable`) so the shipped artifact carries current stdlib
   security fixes — the low floor governs who can *import* the SDK, not what compiles
@@ -207,3 +208,27 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 
 `make clean` removes every generated artifact (DBs, binaries, bench output, smoke
 dirs); the regenerate targets recreate them. Source is never touched by clean.
+
+### Test file organization (keep it tidy)
+
+Test files are grouped **by theme, not one file per micro-feature** — a new test
+joins the existing file for its subject (separated by a `// ─── section ───`
+banner) instead of spawning `feature_x_test.go`. The current shape, and the rules
+that keep it from sprawling again:
+
+- **One thematic file per concern.** `engine/storage_test.go` holds the storage
+  layer (durability pragma · schema-version guard · single-writer lock · remote
+  retry classification); `engine/turso_test.go` holds every live-remote test;
+  `engine/functional_test.go` / `engine/engine_test.go` hold queue semantics. At the
+  root, `sdk_test.go` is the blackbox SDK suite (harness · remote/HTTP · embedded
+  example · build guards). Add to these; don't fork a new file for each test.
+- **Split a file out ONLY for a real structural reason**, not by topic:
+  - a different package — white-box `package mqlite` (`receiver_internal_test.go`)
+    can't live with blackbox `package mqlite_test`;
+  - a build constraint — `engine/race_{enabled,disabled}_test.go` (`//go:build race`);
+  - the `TestMain` harness — `engine/main_test.go`.
+- **One-off / external tooling is not a package test.** Stress harnesses, curl/python
+  blackbox drivers, and SDK smoke checks live under `test/` (`test/bench/`,
+  `test/sdkcheck/`, `test/*.sh`/`*.py`), never as a `*_test.go` in a source package.
+- When a test moves, **update its cross-references** — `docs/conformance.md` cites
+  tests by `path:TestName`, and `docs/{dependencies,turso}.md` name files too.

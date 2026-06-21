@@ -34,7 +34,7 @@ that forces the decision below — security wins over the embedding floor.
    `golang.org/x/sys >=0.31.0`, so Dependabot stops opening PRs that can't merge.
 2. **`go 1.21.x` CI matrix** — a dependency (or a `go.mod` edit) that needs a newer
    toolchain fails to build there.
-3. **`TestGoModFloorStaysAt121`** (`go_floor_test.go`) asserts the floor is exactly
+3. **`TestGoModFloorStaysAt121`** (`sdk_test.go`) asserts the floor is exactly
    `go 1.21`, failing with a clear message if it's bumped — so unfreezing the
    dependencies is always a conscious edit, never a side effect.
 
