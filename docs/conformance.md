@@ -55,7 +55,7 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 ## 4 · Deduplication
 
 - **4.1** Within a queue's `dedup_window`, a repeat `message_id` (empty → body SHA-256)
-  MUST collapse to a single enqueue. *(engine/functional_test.go, engine/turso_concurrent_test.go)*
+  MUST collapse to a single enqueue. *(engine/functional_test.go, engine/turso_test.go)*
 - **4.2** A *single* `Send` whose `message_id` conflicts with a different body MUST
   return `ErrDedupConflict` (HTTP 409). *(server/send_dedup_test.go)*
 - **4.3** In a *multi-message* `Send`, a conflicting slot comes back as seq `0`
@@ -107,13 +107,13 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 
 - **10.1** Local file / `:memory:` use a single writer (`SetMaxOpenConns(1)`); a second
   process / second `OpenEmbedded` on the same file MUST fail fast with `ErrDBLocked`.
-  *(engine/lock_test.go)*
+  *(engine/storage_test.go)*
 - **10.2** `Open` MUST refuse a DB whose recorded `schemaVersion` differs from the
   binary's (`ErrSchemaVersionMismatch`) rather than silently mis-migrating.
-  *(engine/schema_version_test.go)*
+  *(engine/storage_test.go)*
 - **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
   tests. The remote (Turso) path retries transient errors with backoff; the local
-  path never retries. *(engine/db_retry_test.go, engine/turso_concurrent_test.go)*
+  path never retries. *(engine/storage_test.go, engine/turso_test.go)*
 
 ---
 

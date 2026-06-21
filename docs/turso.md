@@ -46,7 +46,7 @@ wrapped, `database/sql` will not transparently retry it, so MQLite does:
   rather than surfacing it as an error.
 
 The classifier that decides all this is unit-tested hermetically — see
-`TestIsConnErr` / `TestRetryableAndAttempts` in `engine/db_retry_test.go` — so the
+`TestIsConnErr` / `TestRetryableAndAttempts` in `engine/storage_test.go` — so the
 retry contract can't silently drift without creds.
 
 ## Embedded replicas — evaluated, not adopted
@@ -76,7 +76,7 @@ synchronous read-your-writes mode.
 ## Validation status
 
 ```
-hermetic (always, in CI)   engine/db_retry_test.go   conn-error retry classifier
+hermetic (always, in CI)   engine/storage_test.go    conn-error retry classifier
 live  (creds-gated, nightly) engine/turso_test.go     full lifecycle vs real Turso
 ```
 
