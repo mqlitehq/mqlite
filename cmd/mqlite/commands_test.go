@@ -24,7 +24,7 @@ func TestCommandsEndToEnd(t *testing.T) {
 	}
 
 	ok("create-queue", cmdCreateQueue(ctx, []string{"orders", "--max-delivery", "5", "--lock", "30s", "--ordering", "group_fifo"}))
-	ok("subscribe", cmdCreateSubscription(ctx, []string{"events", "subA", "--subject-prefix", "ord."}))
+	ok("subscribe", cmdCreateSubscription(ctx, []string{"events", "subA", "--expr", `subject startsWith "ord."`}))
 	ok("send", cmdSend(ctx, []string{"orders", "hello", "--group", "g1", "--subject", "ord.created"}))
 	ok("send-id", cmdSend(ctx, []string{"orders", "world", "--group", "g1", "--message-id", "id-1"}))
 	ok("list", cmdList(ctx, nil))

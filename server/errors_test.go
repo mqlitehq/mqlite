@@ -73,4 +73,13 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("healthz open", http.MethodGet, "/healthz", "", nil, http.StatusOK, "")
 	// A valid token passes through to a successful send.
 	check("authed send", http.MethodPost, wire.PathSend, "secret", send("q"), http.StatusOK, "")
+
+	// Subscription filter contract: a malformed expr is rejected at Subscribe with
+	// 400 invalid_argument (never stored); a valid one succeeds.
+	sub := func(name, expr string) []byte {
+		return jsonOf(wire.SubscribeRequest{Topic: "ev", Name: name, Filter: &engine.Filter{Expr: expr}})
+	}
+	check("bad filter expr", http.MethodPost, wire.PathSubscribe, "secret", sub("bad", "subject =="), http.StatusBadRequest, "invalid_argument")
+	check("unknown filter field", http.MethodPost, wire.PathSubscribe, "secret", sub("bad2", `nope == "x"`), http.StatusBadRequest, "invalid_argument")
+	check("valid filter", http.MethodPost, wire.PathSubscribe, "secret", sub("ok", `subject_parts[0] == "a"`), http.StatusOK, "")
 }

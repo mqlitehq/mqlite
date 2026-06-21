@@ -3,6 +3,7 @@ module github.com/mqlitehq/mqlite
 go 1.21
 
 require (
+	github.com/expr-lang/expr v1.17.8
 	github.com/tursodatabase/libsql-client-go v0.0.0-20251219100830-236aa1ff8acc
 	golang.org/x/sys v0.30.0
 	modernc.org/sqlite v1.36.1

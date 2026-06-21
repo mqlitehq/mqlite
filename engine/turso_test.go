@@ -213,7 +213,7 @@ func TestTursoExtended(t *testing.T) {
 	if err := e.Subscribe(ctx, topic, subAll, nil); err != nil {
 		t.Fatalf("create sub all: %v", err)
 	}
-	if err := e.Subscribe(ctx, topic, subPaid, &Filter{SubjectPrefix: "payment."}); err != nil {
+	if err := e.Subscribe(ctx, topic, subPaid, &Filter{Expr: `subject startsWith "payment."`}); err != nil {
 		t.Fatalf("create sub paid: %v", err)
 	}
 	if err := e.Subscribe(ctx, topic+"_b", subAll, nil); !errors.Is(err, ErrNameConflict) {

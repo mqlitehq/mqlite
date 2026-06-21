@@ -61,10 +61,10 @@ api "$P_LISTQ" '{}'
 assert_contains "$Q" "$API_BODY" "ListQueues contains our queue"
 
 # ── topic fan-out + filter ───────────────────────────────────────────────────
-section "topic: fan-out + subject-prefix filter"
+section "topic: fan-out + expr filter"
 T="${RUNID}_events"
 api "$P_CSUB" "{\"topic\":\"$T\",\"name\":\"${T}_all\"}";  assert_eq 200 "$API_STATUS" "CreateSubscription all"
-api "$P_CSUB" "{\"topic\":\"$T\",\"name\":\"${T}_paid\",\"filter\":{\"subject_prefix\":\"payment.\"}}"; assert_eq 200 "$API_STATUS" "CreateSubscription paid(filter)"
+api "$P_CSUB" "{\"topic\":\"$T\",\"name\":\"${T}_paid\",\"filter\":{\"expr\":\"subject startsWith \\\"payment.\\\"\"}}"; assert_eq 200 "$API_STATUS" "CreateSubscription paid(filter)"
 api "$P_SEND" "{\"queue\":\"$T\",\"messages\":[{\"body\":\"$(b64 o)\",\"subject\":\"order.created\"}]}"
 api "$P_SEND" "{\"queue\":\"$T\",\"messages\":[{\"body\":\"$(b64 p)\",\"subject\":\"payment.captured\"}]}"
 api "$P_METRICS" "{\"queue\":\"${T}_all\"}";  assert_eq 2 "$(jqr "$API_BODY" '.active')" "sub 'all' received both"

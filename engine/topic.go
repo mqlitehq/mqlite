@@ -1,25 +1,13 @@
 package engine
 
-import "strings"
-
-// Filter is a subscription filter: equality-AND over properties plus an optional
-// subject prefix (Correlation-style, §10.2). Evaluated in Go at publish time.
+// Filter is a subscription filter: a single expr-lang boolean predicate over a
+// message. An empty Expr matches every message. The expression is type-checked and
+// compiled once at Subscribe (a bad one is rejected with ErrInvalidFilter) and run
+// per message at publish (fan-out). The language surface — the variables a filter
+// sees, the helpers, and the fail-closed evaluator — lives in filter.go.
+//
+// This replaces the earlier equality-AND + subject-prefix form: a filter is now just
+// `subject_parts[0] == "orders" && properties["tier"] == "gold"` (MQLITE-17).
 type Filter struct {
-	Equals        map[string]string `json:"equals,omitempty"`
-	SubjectPrefix string            `json:"subject_prefix,omitempty"`
-}
-
-func (f *Filter) match(m OutMessage) bool {
-	if f == nil {
-		return true
-	}
-	if f.SubjectPrefix != "" && !strings.HasPrefix(m.Subject, f.SubjectPrefix) {
-		return false
-	}
-	for k, v := range f.Equals {
-		if m.Properties[k] != v {
-			return false
-		}
-	}
-	return true
+	Expr string `json:"expr,omitempty"`
 }

@@ -115,6 +115,27 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   tests. The remote (Turso) path retries transient errors with backoff; the local
   path never retries. *(engine/storage_test.go, engine/turso_test.go)*
 
+## 11 · Subscription filters
+
+- **11.1** A subscription filter is one `expr` boolean predicate over the message; an
+  empty filter matches every message. It is compiled + type-checked at `Subscribe`,
+  and a malformed / unknown-field / non-boolean expression MUST be rejected with
+  `ErrInvalidFilter` (HTTP 400 `invalid_argument`) and **not** stored — no backing
+  queue is created. *(engine/filter_test.go, server/errors_test.go)*
+- **11.2** The filter is evaluated at **publish** against the message env (core fields,
+  `enqueued_at`/`visible_at`, and the derived `subject_parts`/`body_size`/
+  `property_keys`); a message is routed to a subscription iff its filter returns true.
+  `enqueued_at` is the publish time and `visible_at` is the delivery time (equal for an
+  immediate send, the scheduled time for a delayed one), so a delay is
+  `visible_at - enqueued_at`. *(engine/filter_test.go `TestFilterFanoutConditions`,
+  `TestFilterScheduledMessageDelay`)*
+- **11.3** Evaluation is **fail-closed**: a filter that errors or panics at runtime MUST
+  leave the message unrouted to that subscription (logged) — never crashing the broker
+  and never matching by default. *(engine/filter_test.go `TestEvalFilterFailClosed`)*
+- **11.4** Publishing to a topic that **no** subscription filter accepts is a valid
+  no-op (`SendOne`/`Schedule` return `0, nil`), not an `ErrDedupConflict`.
+  *(engine/filter_test.go `TestFilterReSubscribeRecompiles`)*
+
 ---
 
 *This spec is the contract a non-SQLite storage backend (see the Store-interface

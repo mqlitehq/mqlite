@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 )
 
@@ -34,7 +33,7 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 	}
 	var last int64
 	for _, tg := range targets {
-		if !tg.filter.match(m) {
+		if !t.e.filterAccepts(tg, m, t.now, t.now) { // immediate send: visible_at == enqueued_at
 			continue
 		}
 		q, err := t.e.loadQueueTx(t.ctx, t.tx, tg.name)
@@ -94,14 +93,7 @@ func (e *Engine) resolveTargetsTx(ctx context.Context, tx *sql.Tx, name string) 
 		if err := rows.Scan(&s, &fj); err != nil {
 			return nil, err
 		}
-		tg := target{name: s}
-		if fj.Valid && fj.String != "" {
-			var f Filter
-			if json.Unmarshal([]byte(fj.String), &f) == nil {
-				tg.filter = &f
-			}
-		}
-		subs = append(subs, tg)
+		subs = append(subs, e.targetFor(s, fj))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
