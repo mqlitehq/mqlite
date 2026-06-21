@@ -12,11 +12,12 @@ help: ## show this help
 
 ## ── regenerate ──────────────────────────────────────────────────────────────
 
-build: ## build mqlite + mqlite-bench into bin/
+build: ## build mqlite + mqlite-mcp + mqlite-bench into bin/
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/mqlite ./cmd/mqlite
+	go build -o $(BIN)/mqlite-mcp ./cmd/mqlite-mcp
 	go build -o $(BIN)/mqlite-bench ./test/bench
-	@echo "built $(BIN)/mqlite, $(BIN)/mqlite-bench"
+	@echo "built $(BIN)/mqlite, $(BIN)/mqlite-mcp, $(BIN)/mqlite-bench"
 
 test: ## run unit + invariant tests (uses auto-cleaned temp dirs)
 	go test ./...

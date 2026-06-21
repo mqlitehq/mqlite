@@ -219,6 +219,13 @@ Connection is read from the environment:
 > The DB connection string is **only ever read from the environment** — it is
 > never compiled into the binary. Copy `.env.example` → `.env.local` (gitignored).
 
+### 6. MCP (drive it from an AI agent)
+
+`mqlite-mcp` is a Model Context Protocol server that exposes the broker as agent
+tools (create_queue, send, receive, complete, …) — a thin, dependency-free stdio
+forwarder, in keeping with mqlite's "friendly to AI agents" goal. Point it at a
+broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
+
 ## Durability
 
 mqlite stores everything in SQLite/libSQL with **WAL** journaling. State is durable
