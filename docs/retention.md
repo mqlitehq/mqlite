@@ -177,11 +177,11 @@ DLQMaxCount,DLQMaxBytes}`, the `WithDLQRetention` embedded option, and the broke
 defaults in `cmd/mqlite` (`embeddedOpts`). Tested in `engine/retention_dlq_test.go`
 (drop-oldest by each dimension, age boundary, non-DLQ-untouched, off-by-default).
 
-### Tier 2 (SHIPPED, schema v2): per-queue overrides
+### Tier 2 (SHIPPED): per-queue overrides
 
-Schema **v2** (MQLITE-29) adds three per-queue columns so a high-volume queue can keep
-dead letters an hour while an audit queue keeps them a month (the Tier-1 bounds are
-broker-wide):
+Per-queue overrides (MQLITE-29) add three columns to the `queues` table so a
+high-volume queue can keep dead letters an hour while an audit queue keeps them a month
+(the Tier-1 bounds are broker-wide):
 
 ```
 queues.dlq_max_age_ms   INTEGER NOT NULL DEFAULT 0
@@ -203,8 +203,9 @@ Set them via `QueueConfig{DLQMaxAge, DLQMaxCount, DLQMaxBytes}` (SDK; `DLQMaxAge
 `reapDLQ` now resolves each DLQ-bearing queue's effective bounds and applies age /
 count / bytes per queue (still drop-oldest, batched, `state='dead_lettered'` only).
 
-> Schema v2 is an **incompatible** change: pre-1.0, `Open` refuses a v1 database
-> (`ErrSchemaVersionMismatch`) rather than migrating — recreate it.
+> These columns changed the schema **incompatibly**. mqlite keeps a single canonical
+> schema with no migrations, so (pre-1.0, experimental) `Open` refuses any database
+> created before this change (`ErrSchemaVersionMismatch`) — recreate it.
 
 ## Caveat: age is measured from `enqueued_at`
 
@@ -223,13 +224,13 @@ Tracked in Plane as children of MQLITE-21:
 MQLITE-28  Tier 1: reapDLQ loop + MQLITE_DLQ_MAX_AGE/MAX_COUNT/MAX_BYTES, default   SHIPPED
            ON for the broker; batched + rate-limited; only state='dead_lettered'; no schema.
 MQLITE-29  Tier 2: per-queue overrides (dlq_max_age_ms / dlq_max_count /            SHIPPED
-           dlq_max_bytes) — schema v2; inherit(0) / override(>0) / unbounded(<0).
+           dlq_max_bytes) — schema change; inherit(0) / override(>0) / unbounded(<0).
 MQLITE-30  Document the operator archival pattern (Peek/Redrive/Purge) in README. docs
 MQLITE-31  Opt-in incremental_vacuum maintenance step (CLI) for disk give-back.   later
 ```
 
 Status: **MQLITE-28 and MQLITE-29 are shipped** — the broker bounds its DLQ by age +
 count + bytes on by default (Tier 1), and each queue may override those bounds with its
-own age/count/bytes (Tier 2, schema v2). **MQLITE-30** is a short README addition;
+own age/count/bytes (Tier 2). **MQLITE-30** is a short README addition;
 **MQLITE-31** only when a deployment actually needs to return disk to the OS after a
 large DLQ flush.
