@@ -7,6 +7,11 @@ OUT=/data
 mkdir -p "$OUT"
 DUR="${BENCH_DUR:-5s}"
 MSG="${BENCH_MSG:-256}"
+# Optional: cap prefill (slow remote backends) and/or point at a shared DB (Turso).
+# BENCH_DB set => remote backend; auth token via MQLITE_DB_AUTH_TOKEN (passed through).
+EXTRA=""
+[ -n "${BENCH_PREFILLCAP:-}" ] && EXTRA="$EXTRA -prefillcap $BENCH_PREFILLCAP"
+[ -n "${BENCH_DB:-}" ] && EXTRA="$EXTRA -db $BENCH_DB"
 
 # environment facts (so the report is reproducible / honest about the host)
 {
@@ -23,8 +28,8 @@ MSG="${BENCH_MSG:-256}"
 ( iostat -x 1 > "$OUT/iostat.log" 2>&1 ) & IOSTAT=$!
 ( vmstat 1     > "$OUT/vmstat.log" 2>&1 ) & VMSTAT=$!
 
-echo ">>> running mqlite-bench (dur=$DUR msg=${MSG}B)"
-mqlite-bench -dir "$OUT" -dur "$DUR" -msgsize "$MSG" -out "$OUT/results.json"
+echo ">>> running mqlite-bench (dur=$DUR msg=${MSG}B${EXTRA})"
+mqlite-bench -dir "$OUT" -dur "$DUR" -msgsize "$MSG" -out "$OUT/results.json" $EXTRA
 RC=$?
 
 kill "$IOSTAT" "$VMSTAT" 2>/dev/null

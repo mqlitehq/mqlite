@@ -182,11 +182,23 @@ type Result struct {
 	Note            string   `json:"note,omitempty"`
 }
 
-var dir = flag.String("dir", "/data", "data directory for bench DBs")
+var dir = flag.String("dir", "/data", "data directory for bench DBs (local-file mode)")
 var dur = flag.Duration("dur", 5*time.Second, "duration per timed scenario")
 var msg = flag.Int("msgsize", 256, "message body size in bytes")
 var outPath = flag.String("out", "/data/results.json", "JSON results output path")
 var only = flag.String("only", "", "run only scenarios whose name contains this substring")
+
+// dbDSN selects the storage backend. Empty (default) = a fresh local SQLite file per
+// scenario under -dir (local-disk benchmark). A shared DSN — e.g. a remote
+// libsql://host (Turso) — runs every scenario against that one database instead, with
+// a per-scenario queue for isolation; the auth token comes from MQLITE_DB_AUTH_TOKEN.
+// File-size metrics are N/A in shared mode (the store is remote).
+var dbDSN = flag.String("db", "", "shared DB DSN (libsql://… for Turso); empty = a fresh local file per scenario")
+
+// prefillCap bounds each scenario's (unmeasured) prefill so the fixed-volume
+// scenarios (drain/bloat) stay feasible on a slow remote backend; the same cap is
+// passed to every backend so the matrix stays comparable. 0 = no cap.
+var prefillCap = flag.Int("prefillcap", 0, "cap each scenario's prefill at N messages (0 = no cap)")
 
 func main() {
 	flag.Parse()
@@ -251,25 +263,37 @@ func main() {
 }
 
 func run(s scen) Result {
-	dbPath := filepath.Join(*dir, s.Name+".db")
-	for _, ext := range []string{"", "-wal", "-shm"} {
-		os.Remove(dbPath + ext)
+	remote := *dbDSN != ""
+	var dbPath, dbArg, q string
+	if remote {
+		// Shared remote store: one DB, a per-scenario queue for isolation. No local
+		// file to wipe or measure.
+		dbArg, q = *dbDSN, s.Name
+	} else {
+		dbPath = filepath.Join(*dir, s.Name+".db")
+		for _, ext := range []string{"", "-wal", "-shm"} {
+			os.Remove(dbPath + ext)
+		}
+		dbArg, q = "file:"+dbPath, "bench"
 	}
 	ctx := context.Background()
-	eng, err := engine.Open(ctx, engine.Options{DB: "file:" + dbPath, Synchronous: s.Sync})
+	eng, err := engine.Open(ctx, engine.Options{DB: dbArg, AuthToken: os.Getenv("MQLITE_DB_AUTH_TOKEN"), Synchronous: s.Sync})
 	if err != nil {
 		return Result{Name: s.Name, Note: "open error: " + err.Error()}
 	}
 	defer eng.Close()
-	const q = "bench"
 	_ = eng.CreateQueue(ctx, q, engine.QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 1000})
 
 	res := Result{Name: s.Name, Kind: s.Kind, Producers: s.P, Consumers: s.C,
 		Batch: s.Batch, MsgSize: s.Msg, Sync: orDefault(s.Sync, "NORMAL")}
 
-	// prefill (not measured) for drain
-	if s.Prefill > 0 {
-		prefill(ctx, eng, q, s.Prefill, s.Batch, s.Msg)
+	// prefill (not measured) for drain/bloat, capped for slow backends.
+	prefillN := s.Prefill
+	if *prefillCap > 0 && prefillN > *prefillCap {
+		prefillN = *prefillCap
+	}
+	if prefillN > 0 {
+		prefill(ctx, eng, q, prefillN, s.Batch, s.Msg)
 	}
 
 	runtime.GC()
@@ -296,7 +320,7 @@ func run(s scen) Result {
 	case "props":
 		ops, h = propsRun(ctx, eng, q, *dur, s.P, s.Batch, s.Msg)
 	case "bloat":
-		ops, h = bloatRun(ctx, eng, q, s.Prefill, s.Batch, s.Msg)
+		ops, h = bloatRun(ctx, eng, q, prefillN, s.Batch, s.Msg)
 	case "rampdown":
 		ops, h = rampDownRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
 	case "churn":
@@ -352,8 +376,8 @@ func run(s scen) Result {
 			res.FileBytesPerMsg = float64(dbPeak) / float64(ops)
 		}
 	case "bloat":
-		if s.Prefill > 0 {
-			res.FileBytesPerMsg = float64(dbPeak) / float64(s.Prefill)
+		if prefillN > 0 {
+			res.FileBytesPerMsg = float64(dbPeak) / float64(prefillN)
 		}
 	}
 	return res
