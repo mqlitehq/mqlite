@@ -93,6 +93,12 @@ type QueueConfig struct {
 	DeadLetterOnExpire *bool
 	DedupWindow        time.Duration
 	Ordering           OrderingMode // "" -> standard
+	// Per-queue DLQ retention overrides (MQLITE-29). For each: 0 -> inherit the
+	// broker default; >0 -> this queue's drop-oldest bound; a negative value ->
+	// explicitly unbounded (opt out of the default).
+	DLQMaxAge   time.Duration
+	DLQMaxCount int
+	DLQMaxBytes int64
 }
 
 func (c QueueConfig) toEngine() engine.QueueConfig {
@@ -103,6 +109,9 @@ func (c QueueConfig) toEngine() engine.QueueConfig {
 		DeadLetterOnExpire: c.DeadLetterOnExpire,
 		DedupWindowMs:      c.DedupWindow.Milliseconds(),
 		Ordering:           c.Ordering,
+		DLQMaxAgeMs:        c.DLQMaxAge.Milliseconds(),
+		DLQMaxCount:        c.DLQMaxCount,
+		DLQMaxBytes:        c.DLQMaxBytes,
 	}
 }
 

@@ -136,3 +136,86 @@ func TestDLQRetentionDisabledByDefault(t *testing.T) {
 		t.Fatalf("unbounded DLQ: want all 5 kept, got %d", mt.DeadLettered)
 	}
 }
+
+// ─── Per-queue retention overrides (MQLITE-29) ──────────────────────────────
+
+func TestEffectiveBound(t *testing.T) {
+	cases := []struct{ perQueue, def, want int64 }{
+		{0, 100, 100}, // 0 inherits the engine default
+		{50, 100, 50}, // a positive override wins
+		{200, 0, 200}, // override even when the default is off
+		{-1, 100, 0},  // negative = explicitly unbounded (opt out)
+		{0, 0, 0},     // both off
+		{-1, 0, 0},    // unbounded over an off default
+	}
+	for _, c := range cases {
+		if got := effectiveBound(c.perQueue, c.def); got != c.want {
+			t.Errorf("effectiveBound(%d, %d) = %d, want %d", c.perQueue, c.def, got, c.want)
+		}
+	}
+}
+
+// A per-queue count bound applies even when the engine default is off, and a queue
+// without an override stays unbounded.
+func TestDLQRetentionPerQueueOverride(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 0, 0) // engine defaults OFF
+	mustQueue(t, e, "capped", QueueConfig{DefaultTTLMs: 1000, DLQMaxCount: 2})
+	mustQueue(t, e, "uncapped", QueueConfig{DefaultTTLMs: 1000}) // inherits off -> unbounded
+
+	sendBodies(t, e, "capped", 5)
+	sendBodies(t, e, "uncapped", 5)
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx)
+
+	if mt, _ := e.Stats(ctx, "capped"); mt.DeadLettered != 2 {
+		t.Fatalf("per-queue cap=2: want 2 dead-lettered, got %d", mt.DeadLettered)
+	}
+	if mt, _ := e.Stats(ctx, "uncapped"); mt.DeadLettered != 5 {
+		t.Fatalf("no override inherits off (unbounded): want 5, got %d", mt.DeadLettered)
+	}
+	if got := dlqBodies(t, e, "capped"); len(got) != 2 || got[0] != 3 || got[1] != 4 {
+		t.Fatalf("drop-oldest survivors {3,4}, got %v", got)
+	}
+}
+
+// A per-queue bound of 0 inherits the engine default; -1 explicitly opts out.
+func TestDLQRetentionPerQueueInheritAndOptOut(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 2, 0)                                             // engine default: keep 2
+	mustQueue(t, e, "inherit", QueueConfig{DefaultTTLMs: 1000})                  // 0 -> inherit (2)
+	mustQueue(t, e, "keepall", QueueConfig{DefaultTTLMs: 1000, DLQMaxCount: -1}) // -1 -> unbounded
+
+	sendBodies(t, e, "inherit", 5)
+	sendBodies(t, e, "keepall", 5)
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx)
+
+	if mt, _ := e.Stats(ctx, "inherit"); mt.DeadLettered != 2 {
+		t.Fatalf("inherit engine default (2): want 2, got %d", mt.DeadLettered)
+	}
+	if mt, _ := e.Stats(ctx, "keepall"); mt.DeadLettered != 5 {
+		t.Fatalf("per-queue -1 overrides default to unbounded: want 5, got %d", mt.DeadLettered)
+	}
+}
+
+// A per-queue age bound is applied per queue independent of the engine default.
+func TestDLQRetentionPerQueueAge(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 0, 0) // engine defaults off
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000, DLQMaxAgeMs: time.Hour.Milliseconds()})
+
+	sendBodies(t, e, "q", 3) // dead-lettered at ~T0
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // fresh (<1h) -> kept
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 3 {
+		t.Fatalf("fresh dead letters kept: got %d", mt.DeadLettered)
+	}
+	advance(ms, 2*time.Hour) // the 3 are now >1h old
+	sendBodies(t, e, "q", 1)
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // per-queue age drops the 3 old; fresh one stays
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 1 {
+		t.Fatalf("per-queue age bound: want 1, got %d", mt.DeadLettered)
+	}
+}

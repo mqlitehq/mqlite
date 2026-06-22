@@ -285,6 +285,36 @@ func TestBrokerExercise(t *testing.T) {
 	_ = got[0].Complete(ctx)
 }
 
+// Per-queue DLQ retention (MQLITE-29) set via the remote CreateQueue is stored and
+// honored end-to-end: the wire QueueConfig round-trips into the engine and reapDLQ
+// caps that queue's DLQ to its own bound.
+func TestRemoteQueueRetentionConfig(t *testing.T) {
+	ctx := context.Background()
+	cli, emb := newBroker(t, "")
+	if err := cli.CreateQueue(ctx, "rq", mqlite.QueueConfig{MaxDeliveryCount: 1, DLQMaxCount: 2}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := cli.SendOne(ctx, "rq", mqlite.OutMessage{Body: []byte{byte(i)}}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	// Dead-letter all five (reject moves straight to the DLQ).
+	for i := 0; i < 5; i++ {
+		ms, err := cli.Receive(ctx, "rq", mqlite.RecvOpts{Max: 1, Wait: 2 * time.Second})
+		if err != nil || len(ms) != 1 {
+			t.Fatalf("receive %d: %v n=%d", i, err, len(ms))
+		}
+		if err := ms[0].Reject(ctx, mqlite.RejectOpts{Reason: "x"}); err != nil {
+			t.Fatalf("reject %d: %v", i, err)
+		}
+	}
+	emb.Engine().RunMaintenanceOnce(ctx) // drive retention deterministically
+	if mt, _ := cli.Stats(ctx, "rq"); mt.DeadLettered != 2 {
+		t.Fatalf("per-queue DLQMaxCount=2 via remote CreateQueue: want 2, got %d", mt.DeadLettered)
+	}
+}
+
 // ─── Embedded (in-process) ──────────────────────────────────────────────────
 
 // Example_embedded runs the whole queue in-process — no broker, no HTTP — against a

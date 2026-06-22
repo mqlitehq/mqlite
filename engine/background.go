@@ -17,9 +17,10 @@ func (e *Engine) startBackground(ctx context.Context) {
 	e.spawn(ctx, 10*time.Second, e.expireTTL)         // active TTL -> DLQ/discard
 	e.spawn(ctx, 60*time.Second, e.cleanupDedup)      // drop out-of-window dedup rows
 	e.spawn(ctx, 60*time.Second, e.cleanupExpiredAux) // drop expired settle/receive receipts
-	if e.dlqMaxAgeMs > 0 || e.dlqMaxCount > 0 || e.dlqMaxBytes > 0 {
-		e.spawn(ctx, 60*time.Second, e.reapDLQ) // DLQ retention: drop-oldest past age/count/bytes
-	}
+	// DLQ retention (MQLITE-21/29): always run when background loops are on. A
+	// per-queue bound may exist even with no engine-global default, and the pass is
+	// a cheap no-op when nothing is bounded (it just lists DLQ queues and skips).
+	e.spawn(ctx, 60*time.Second, e.reapDLQ) // drop-oldest past age/count/bytes
 }
 
 func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(context.Context)) {
@@ -138,51 +139,49 @@ func (e *Engine) cleanupExpiredAux(ctx context.Context) {
 	}
 }
 
-// reapDLQ enforces the DLQ retention bounds (MQLITE-21): drop-oldest dead letters
-// past the configured max age and/or per-queue max count, in bounded batches so the
-// single writer never stalls. ONLY state='dead_lettered' rows are ever deleted —
-// undelivered / in-flight / scheduled work is never touched. No-op if both bounds
-// are 0 (the engine default; the broker sets sane defaults).
+// effectiveBound resolves a per-queue retention override against the engine default
+// (MQLITE-29): a positive per-queue value wins; a negative value means "explicitly
+// unbounded" (0); 0 inherits the engine default.
+func effectiveBound(perQueue, engineDefault int64) int64 {
+	switch {
+	case perQueue > 0:
+		return perQueue
+	case perQueue < 0:
+		return 0 // opt out of the default
+	default:
+		return engineDefault
+	}
+}
+
+// reapDLQ enforces DLQ retention (MQLITE-21/29): drop-oldest dead letters past the
+// effective age / count / body-byte bound, per queue, in bounded batches so the
+// single writer never stalls. Each queue's bound is its own override if set, else the
+// engine default (see effectiveBound). ONLY state='dead_lettered' rows are ever
+// deleted — undelivered / in-flight / scheduled work is never touched. A queue with
+// no effective bound is skipped; with no dead letters at all the pass is a no-op.
 func (e *Engine) reapDLQ(ctx context.Context) {
 	const batch = 1000
 	const maxBatches = 100 // bound work per pass; the 60s cadence rate-limits the rest
 
-	if e.dlqMaxAgeMs > 0 {
-		cutoff := e.now() - e.dlqMaxAgeMs
-		for i := 0; i < maxBatches; i++ {
-			res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
-				SELECT id FROM messages WHERE state='dead_lettered' AND enqueued_at < ?
-				ORDER BY id LIMIT ?)`, cutoff, batch)
-			if err != nil {
-				e.log.Error("dlq-retention: age purge failed", "err", err)
-				break
-			}
-			if n, _ := res.RowsAffected(); n < batch {
-				break
-			}
+	for _, q := range e.distinctQueues(ctx, `state='dead_lettered'`) {
+		qr, err := e.loadQueue(ctx, q)
+		if err != nil {
+			e.log.Error("dlq-retention: load queue failed", "queue", q, "err", err)
+			continue
 		}
-	}
+		maxAge := effectiveBound(qr.dlqMaxAgeMs, e.dlqMaxAgeMs)
+		maxCount := effectiveBound(qr.dlqMaxCount, int64(e.dlqMaxCount))
+		maxBytes := effectiveBound(qr.dlqMaxBytes, e.dlqMaxBytes)
 
-	if e.dlqMaxCount > 0 {
-		for _, q := range e.distinctQueues(ctx, `state='dead_lettered'`) {
-			// The (maxCount+1)-th newest dead letter, by id: it and everything older
-			// are surplus. NULL -> the queue is at or under the cap, nothing to drop.
-			var cutoffID sql.NullInt64
-			if err := e.db.queryRowScan(ctx, []any{&cutoffID},
-				`SELECT id FROM messages WHERE queue=? AND state='dead_lettered'
-				 ORDER BY id DESC LIMIT 1 OFFSET ?`, q, e.dlqMaxCount); err != nil {
-				e.log.Error("dlq-retention: count cutoff failed", "queue", q, "err", err)
-				continue
-			}
-			if !cutoffID.Valid {
-				continue
-			}
+		// age: drop dead letters enqueued before the cutoff.
+		if maxAge > 0 {
+			cutoff := e.now() - maxAge
 			for i := 0; i < maxBatches; i++ {
 				res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
-					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
-					ORDER BY id LIMIT ?)`, q, cutoffID.Int64, batch)
+					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND enqueued_at < ?
+					ORDER BY id LIMIT ?)`, q, cutoff, batch)
 				if err != nil {
-					e.log.Error("dlq-retention: count purge failed", "queue", q, "err", err)
+					e.log.Error("dlq-retention: age purge failed", "queue", q, "err", err)
 					break
 				}
 				if n, _ := res.RowsAffected(); n < batch {
@@ -190,36 +189,50 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 				}
 			}
 		}
-	}
 
-	if e.dlqMaxBytes > 0 {
-		for _, q := range e.distinctQueues(ctx, `state='dead_lettered'`) {
-			// Scanning newest->oldest, the first dead letter whose cumulative body
-			// bytes exceed the cap (and everything older) is surplus. NULL -> under cap.
+		// count: the (maxCount+1)-th newest dead letter and everything older is surplus.
+		if maxCount > 0 {
+			var cutoffID sql.NullInt64
+			if err := e.db.queryRowScan(ctx, []any{&cutoffID},
+				`SELECT id FROM messages WHERE queue=? AND state='dead_lettered'
+				 ORDER BY id DESC LIMIT 1 OFFSET ?`, q, maxCount); err != nil {
+				e.log.Error("dlq-retention: count cutoff failed", "queue", q, "err", err)
+			} else if cutoffID.Valid {
+				e.purgeDLQUpToID(ctx, q, cutoffID.Int64, batch, maxBatches, "count")
+			}
+		}
+
+		// bytes: newest->oldest, the first dead letter whose cumulative body bytes
+		// exceed the cap (and everything older) is surplus.
+		if maxBytes > 0 {
 			var cutoffID sql.NullInt64
 			if err := e.db.queryRowScan(ctx, []any{&cutoffID},
 				`SELECT id FROM (
 				     SELECT id, SUM(length(body)) OVER (ORDER BY id DESC) AS cum
 				     FROM messages WHERE queue=? AND state='dead_lettered'
-				 ) WHERE cum > ? ORDER BY id DESC LIMIT 1`, q, e.dlqMaxBytes); err != nil {
+				 ) WHERE cum > ? ORDER BY id DESC LIMIT 1`, q, maxBytes); err != nil {
 				e.log.Error("dlq-retention: bytes cutoff failed", "queue", q, "err", err)
-				continue
+			} else if cutoffID.Valid {
+				e.purgeDLQUpToID(ctx, q, cutoffID.Int64, batch, maxBatches, "bytes")
 			}
-			if !cutoffID.Valid {
-				continue
-			}
-			for i := 0; i < maxBatches; i++ {
-				res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
-					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
-					ORDER BY id LIMIT ?)`, q, cutoffID.Int64, batch)
-				if err != nil {
-					e.log.Error("dlq-retention: bytes purge failed", "queue", q, "err", err)
-					break
-				}
-				if n, _ := res.RowsAffected(); n < batch {
-					break
-				}
-			}
+		}
+	}
+}
+
+// purgeDLQUpToID drops dead letters with id <= cutoffID for one queue, in bounded
+// batches. Shared by the count and bytes bounds (both compute a cutoff id, then
+// delete it and everything older).
+func (e *Engine) purgeDLQUpToID(ctx context.Context, q string, cutoffID int64, batch, maxBatches int, label string) {
+	for i := 0; i < maxBatches; i++ {
+		res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
+			SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
+			ORDER BY id LIMIT ?)`, q, cutoffID, batch)
+		if err != nil {
+			e.log.Error("dlq-retention: "+label+" purge failed", "queue", q, "err", err)
+			return
+		}
+		if n, _ := res.RowsAffected(); n < int64(batch) {
+			return
 		}
 	}
 }

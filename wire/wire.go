@@ -153,6 +153,11 @@ type QueueConfigJSON struct {
 	DeadLetterOnExpire *bool  `json:"dead_letter_on_expire,omitempty"`
 	DedupWindowMs      int64  `json:"dedup_window_ms,omitempty"`
 	OrderingMode       string `json:"ordering_mode,omitempty"`
+	// Per-queue DLQ retention overrides (MQLITE-29): 0 inherits the broker default,
+	// >0 sets this queue's bound, -1 is explicitly unbounded.
+	DLQMaxAgeMs int64 `json:"dlq_max_age_ms,omitempty"`
+	DLQMaxCount int   `json:"dlq_max_count,omitempty"`
+	DLQMaxBytes int64 `json:"dlq_max_bytes,omitempty"`
 }
 type CreateQueueRequest struct {
 	Name   string          `json:"name"`
@@ -266,5 +271,8 @@ func (c QueueConfigJSON) ToConfig() engine.QueueConfig {
 		DeadLetterOnExpire: c.DeadLetterOnExpire,
 		DedupWindowMs:      c.DedupWindowMs,
 		Ordering:           engine.OrderingMode(c.OrderingMode),
+		DLQMaxAgeMs:        c.DLQMaxAgeMs,
+		DLQMaxCount:        c.DLQMaxCount,
+		DLQMaxBytes:        c.DLQMaxBytes,
 	}
 }

@@ -92,6 +92,10 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   *(engine/retention_dlq_test.go)*
 - **8.2** With no bound (the engine default), the DLQ is unbounded — no auto-deletion.
   *(engine/retention_dlq_test.go `TestDLQRetentionDisabledByDefault`)*
+- **8.3** Each queue's effective bound is its own override resolved against the engine
+  default (`effectiveBound`): `0` inherits the default, `>0` overrides it, `<0` is
+  explicitly unbounded. *(engine/retention_dlq_test.go `TestEffectiveBound`,
+  `TestDLQRetentionPerQueueOverride`, `TestDLQRetentionPerQueueInheritAndOptOut`)*
 
 ## 9 · Auth & errors (broker)
 
