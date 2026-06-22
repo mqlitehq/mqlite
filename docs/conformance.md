@@ -113,7 +113,7 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   process / second `OpenEmbedded` on the same file MUST fail fast with `ErrDBLocked`.
   *(engine/storage_test.go)*
 - **10.2** `Open` MUST refuse a DB whose recorded `schemaVersion` differs from the
-  binary's (`ErrSchemaVersionMismatch`) rather than silently mis-migrating.
+  binary's (`ErrSchemaVersionMismatch`) rather than running mismatched DDL against it.
   *(engine/storage_test.go)*
 - **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
   tests. The remote (Turso) path retries transient errors with backoff; the local

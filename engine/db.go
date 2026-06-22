@@ -129,17 +129,16 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 	return &db{sql: sdb, remote: remote, lock: lock}, nil
 }
 
-// migrate creates tables/indexes idempotently and records the schema version.
-// Because it only does CREATE IF NOT EXISTS, a bumped schemaVersion would NOT
-// alter an already-initialized database — so if the recorded version differs it
-// refuses to open rather than silently running new DDL against an old layout
-// (MQLITE-24). The fix is to recreate the database or migrate it explicitly.
-func (d *db) migrate(ctx context.Context) error {
+// initSchema creates the tables/indexes idempotently (CREATE IF NOT EXISTS) and
+// records the schema token. mqlite keeps a single canonical schema and does not
+// migrate: a database whose recorded token differs is refused (never altered in
+// place), so a stale experimental DB is simply recreated.
+func (d *db) initSchema(ctx context.Context) error {
 	if v, ok, err := d.recordedSchemaVersion(ctx); err != nil {
 		return err
 	} else if ok && v != schemaVersion {
-		return fmt.Errorf("%w: database is schema version %q but this build expects %q; "+
-			"recreate the database (delete the file / drop the tables) or migrate it before upgrading",
+		return fmt.Errorf("%w: database schema is %q but this build expects %q; "+
+			"recreate it (delete the file / drop the tables) — mqlite keeps a single schema and does not migrate",
 			ErrSchemaVersionMismatch, v, schemaVersion)
 	}
 	for _, stmt := range schemaStmts {

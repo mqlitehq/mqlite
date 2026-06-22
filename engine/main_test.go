@@ -6,13 +6,11 @@ import (
 	"testing"
 )
 
-// TestMain gives the remote Turso suite a clean slate. The schema-version guard
-// (MQLITE-24) refuses to open a database stamped with a different schema version,
-// and the shared Turso test DB still carries a pre-MQLITE-25 stamp ("4") from
-// before the migration ladder was collapsed to "1". When MQLITE_TEST_DB is set
-// (the nightly path) we drop the mqlite tables so the next engine.Open rebuilds
-// exactly the current schema; with no creds set this is a no-op and the local,
-// hermetic engine tests run unchanged.
+// TestMain gives the remote Turso suite a clean slate. mqlite's schema guard refuses
+// a database whose schema token differs from this build's, so when MQLITE_TEST_DB is
+// set (the creds-gated path) we drop the mqlite tables and let engine.Open rebuild the
+// current schema. With no creds set this is a no-op and the local, hermetic engine
+// tests run unchanged.
 func TestMain(m *testing.M) {
 	if dsn := os.Getenv("MQLITE_TEST_DB"); dsn != "" {
 		resetRemoteTestDB(dsn, os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"))
