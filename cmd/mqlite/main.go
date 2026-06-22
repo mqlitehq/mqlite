@@ -6,7 +6,8 @@
 //	MQLITE_DB=file:./mq.db | :memory: | libsql://<db>.turso.io   (embedded mode)
 //	MQLITE_DB_AUTH_TOKEN=<jwt>                                    (remote Turso/libSQL)
 //	MQLITE_ENDPOINT=http://host:port + MQLITE_TOKEN=<bearer>      (client mode; wins if set)
-//	MQLITE_TOKENS=mqk_a,mqk_b                                     (tokens `serve` accepts)
+//	MQLITE_TOKENS=mqk_a,mqk_b   (tokens `serve` accepts; UNSET => a token is generated
+//	                             and printed; =off disables auth — localhost/LAN only)
 //	MQLITE_MAX_MESSAGE_BYTES=<n>                                  (reject larger bodies)
 //	MQLITE_SYNC=NORMAL|FULL|OFF                                   (durability; embedded/serve)
 //	MQLITE_DLQ_MAX_AGE=14d-ish (e.g. 336h) · MQLITE_DLQ_MAX_COUNT=1000000 · MQLITE_DLQ_RETENTION=off
@@ -202,14 +203,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	defer eng.Close()
 
-	tokens := os.Getenv("MQLITE_TOKENS")
+	tokens, authNote := resolveBrokerTokens(os.Getenv("MQLITE_TOKENS"))
 	remote := ""
 	if eng.Engine().Remote() {
 		remote = " (remote Turso/libSQL)"
-	}
-	authNote := "auth: Bearer tokens required"
-	if strings.TrimSpace(tokens) == "" {
-		authNote = "auth: DISABLED (no MQLITE_TOKENS set — localhost/LAN only)"
 	}
 	host := *addr
 	if strings.HasPrefix(host, ":") {
@@ -221,6 +218,24 @@ func cmdServe(ctx context.Context, args []string) error {
 	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return eng.Serve(sctx, *addr, mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version))
+}
+
+// resolveBrokerTokens decides the broker's accepted Bearer tokens from MQLITE_TOKENS,
+// secure by default: if it is unset, a fresh token is generated and printed (so the
+// broker is never accidentally wide open); if it is "off", auth is explicitly
+// disabled (localhost/LAN); otherwise the provided comma-separated tokens are used.
+// Returns the token CSV (empty = no auth) and a human note for the startup banner.
+func resolveBrokerTokens(env string) (csv, note string) {
+	switch {
+	case strings.EqualFold(strings.TrimSpace(env), "off"):
+		return "", "auth: DISABLED (MQLITE_TOKENS=off — localhost/LAN only)"
+	case strings.TrimSpace(env) == "":
+		t := mqlite.GenerateToken()
+		return t, "auth: ON — generated a token (set MQLITE_TOKENS to use your own, " +
+			"or MQLITE_TOKENS=off to disable):\n  " + t
+	default:
+		return env, "auth: ON — Bearer tokens from MQLITE_TOKENS"
+	}
 }
 
 func cmdCreateQueue(ctx context.Context, args []string) error {

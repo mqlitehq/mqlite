@@ -22,9 +22,12 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
 
-> **Auth:** if `MQLITE_TOKENS` is unset, **auth is disabled** (localhost/LAN only).
-> Always set it for anything reachable beyond localhost. The `/` discovery and
-> `/healthz` endpoints stay open; everything else needs `Authorization: Bearer <token>`.
+> **Auth (secure by default):** if `MQLITE_TOKENS` is **unset**, `serve` **generates a
+> random `mqk_…` token and prints it at startup** — the broker is never silently open.
+> Set `MQLITE_TOKENS` to your own token(s) for a stable value (rotate by updating it),
+> or `MQLITE_TOKENS=off` to explicitly disable auth (localhost/LAN only). The `/`
+> discovery and `/healthz` endpoints stay open; everything else needs
+> `Authorization: Bearer <token>`.
 
 The broker listens on `:8080` by default (`mqlite serve --addr :8080`). Full endpoint
 and error reference: [api-reference.md](api-reference.md).
