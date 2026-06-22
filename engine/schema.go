@@ -1,11 +1,10 @@
 package engine
 
-// schemaVersion identifies the on-disk schema. "1" was the first public release
-// (the internal v2→v4 ladder collapsed into one clean init schema, MQLITE-25). "2"
-// adds per-queue DLQ-retention columns (MQLITE-29). Bump it only on an incompatible
-// DDL change; Open then refuses an older database instead of silently running new DDL
-// against it (MQLITE-24, see db.go). Pre-1.0 there is no migration — a stale DB is
-// recreated.
+// schemaVersion is an opaque guard token for the current on-disk schema. mqlite keeps
+// a single canonical schema (schemaStmts below) and does not migrate: on Open, a DB
+// whose recorded version differs is refused with ErrSchemaVersionMismatch (see db.go)
+// rather than running today's DDL against a layout it doesn't match. Change the token
+// whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
 const schemaVersion = "2"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).

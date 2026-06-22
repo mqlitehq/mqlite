@@ -183,10 +183,12 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   injectable (`Options.Now` / `WithClock`) for tests.
 - **One SQL statement per `exec`** — remote Hrana (libSQL) requires it; schema is a
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
-- **Schema versioning**: `schemaVersion` is `"1"`. `migrate` is CREATE-IF-NOT-EXISTS
-  only, so a bumped version would NOT alter an existing DB — instead `Open` **refuses**
-  a DB whose recorded version differs (`ErrSchemaVersionMismatch`). Bump only on an
-  incompatible DDL change.
+- **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do
+  not keep version history or migrations. `schemaVersion` is just an opaque guard
+  token. `migrate` is CREATE-IF-NOT-EXISTS only, so it never alters an existing DB —
+  instead `Open` **refuses** a DB whose recorded token differs
+  (`ErrSchemaVersionMismatch`). Change the token whenever the schema changes
+  incompatibly; pre-1.0 there is no migration, a stale DB is recreated.
 - **DB DSN is read only from the environment**, never compiled in. Auth tokens are
   injected at `resolveDSN` time. `MQLITE_DB` (embedded/serve) vs
   `MQLITE_ENDPOINT`+`MQLITE_TOKEN` (client mode, wins if set); `MQLITE_TOKENS` =
