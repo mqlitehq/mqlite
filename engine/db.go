@@ -58,7 +58,12 @@ func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 		return "sqlite", "file::memory:?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", false
 	}
 	path := strings.TrimPrefix(dsn, "file:")
+	// auto_vacuum=INCREMENTAL (set at creation, before any table exists) lets a new DB
+	// return free pages to the OS via `PRAGMA incremental_vacuum` (the `vacuum` command /
+	// Engine.Compact) without a full rewrite or a global lock — a fit for a queue that
+	// churns. Existing DBs created without it keep their mode until a full VACUUM.
 	pragmas := "_pragma=journal_mode(WAL)&_pragma=synchronous(" + syncMode + ")" +
+		"&_pragma=auto_vacuum(INCREMENTAL)" +
 		"&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)"
 	return "sqlite", "file:" + path + "?" + pragmas, false
 }

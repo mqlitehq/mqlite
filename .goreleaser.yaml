@@ -1,0 +1,55 @@
+# GoReleaser — cross-platform binary archives for each v* tag (the GitHub Release).
+# The multi-arch container image is built separately by .github/workflows/release-image.yml
+# (GHCR); these two run in parallel on a tag and produce different artifacts.
+version: 2
+project_name: mqlite
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: mqlite
+    main: ./cmd/mqlite
+    binary: mqlite
+    env: [CGO_ENABLED=0] # pure Go (modernc SQLite) — static, cross-compiles cleanly
+    flags: [-trimpath]
+    ldflags: [-s -w]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+  - id: mqlite-mcp
+    main: ./cmd/mqlite-mcp
+    binary: mqlite-mcp
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  # one archive per OS/arch containing both binaries (mqlite + mqlite-mcp).
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore'
+      - 'Merge pull request'
+      - 'Merge branch'
+
+release:
+  github:
+    owner: mqlitehq
+    name: mqlite
+  prerelease: auto

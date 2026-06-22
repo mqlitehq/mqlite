@@ -115,6 +115,11 @@ func (e *Embedded) Engine() *engine.Engine { return e.eng }
 // Close stops background loops and closes the DB.
 func (e *Embedded) Close() error { return e.eng.Close() }
 
+// Compact reclaims free DB pages to the OS: `PRAGMA incremental_vacuum` (no global
+// lock; new local DBs default to auto_vacuum=INCREMENTAL), or a full `VACUUM` when
+// full=true (rewrites the file, global lock — maintenance only). Local-only.
+func (e *Embedded) Compact(ctx context.Context, full bool) error { return e.eng.Compact(ctx, full) }
+
 func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
 	return &Message{
 		SequenceNumber: m.SeqNumber,

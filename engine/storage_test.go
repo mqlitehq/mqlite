@@ -224,3 +224,48 @@ func TestIsBusyErr(t *testing.T) {
 		}
 	}
 }
+
+// ─── Compaction ─────────────────────────────────────────────────────────────
+
+// New local DBs are created with auto_vacuum=INCREMENTAL, and Compact reclaims free
+// pages with either incremental_vacuum (default) or a full VACUUM — neither errors.
+func TestCompact(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t) // local file DB
+
+	var av int64
+	if err := e.db.queryRowScan(ctx, []any{&av}, "PRAGMA auto_vacuum"); err != nil {
+		t.Fatalf("read auto_vacuum: %v", err)
+	}
+	if av != 2 { // 0=NONE, 1=FULL, 2=INCREMENTAL
+		t.Fatalf("fresh local DB auto_vacuum=%d, want 2 (INCREMENTAL)", av)
+	}
+
+	// Churn so there are free pages to reclaim, then compact both ways.
+	mustQueue(t, e, "q", QueueConfig{})
+	for i := 0; i < 300; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: make([]byte, 256)}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	for {
+		ms, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 64})
+		if err != nil {
+			t.Fatalf("receive: %v", err)
+		}
+		if len(ms) == 0 {
+			break
+		}
+		for _, m := range ms {
+			if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+		}
+	}
+	if err := e.Compact(ctx, false); err != nil {
+		t.Fatalf("incremental compact: %v", err)
+	}
+	if err := e.Compact(ctx, true); err != nil {
+		t.Fatalf("full compact: %v", err)
+	}
+}

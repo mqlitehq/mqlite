@@ -36,7 +36,7 @@ import (
 	"github.com/mqlitehq/mqlite"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -69,6 +69,8 @@ func main() {
 		err = cmdRedrive(ctx, args)
 	case "purge-dlq":
 		err = cmdPurgeDLQ(ctx, args)
+	case "vacuum":
+		err = cmdVacuum(ctx, args)
 	case "version", "-v", "--version":
 		fmt.Println("mqlite", version)
 	case "help", "-h", "--help":
@@ -99,6 +101,7 @@ usage: mqlite <command> [flags]
   list                   list queues/subscriptions
   redrive <queue>        move dead-lettered messages back to active
   purge-dlq <queue>      permanently delete dead-lettered messages
+  vacuum                 reclaim free DB pages to the OS (local maintenance; --full)
   version | help
 
 connection via env: MQLITE_ENDPOINT+MQLITE_TOKEN (client) or MQLITE_DB[+token] (embedded)
@@ -492,6 +495,56 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	fmt.Printf("ok: purged %d dead-lettered message(s)\n", purged)
 	return nil
 }
+
+// cmdVacuum reclaims free DB pages to the OS. It is a LOCAL maintenance command: it
+// opens the file DB directly (so stop the broker first — the single-writer lock will
+// otherwise reject it), runs incremental_vacuum (or a full VACUUM with --full), and
+// reports the file size before/after.
+func cmdVacuum(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("vacuum", flag.ExitOnError)
+	full := fs.Bool("full", false, "full VACUUM (rewrites the DB, global lock) instead of incremental")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if os.Getenv("MQLITE_ENDPOINT") != "" {
+		return fmt.Errorf("vacuum is a local maintenance command: unset MQLITE_ENDPOINT and point MQLITE_DB at the file")
+	}
+	db := os.Getenv("MQLITE_DB")
+	if db == "" {
+		db = "file:./mq.db"
+	}
+	eng, err := mqlite.OpenEmbedded(ctx, db, embeddedOpts()...)
+	if err != nil {
+		return err
+	}
+	defer eng.Close()
+	before := dbFileBytes(db)
+	if err := eng.Compact(ctx, *full); err != nil {
+		return err
+	}
+	after := dbFileBytes(db)
+	kind := "incremental_vacuum"
+	if *full {
+		kind = "VACUUM"
+	}
+	fmt.Printf("ok: %s — %.2f MiB -> %.2f MiB (freed %.2f MiB)\n",
+		kind, mib(before), mib(after), mib(before-after))
+	return nil
+}
+
+// dbFileBytes returns the size of a local file DSN's main DB file (0 if not a file).
+func dbFileBytes(dsn string) int64 {
+	p := strings.TrimPrefix(dsn, "file:")
+	if p == "" || strings.Contains(strings.ToLower(p), ":memory:") {
+		return 0
+	}
+	if fi, err := os.Stat(p); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+func mib(b int64) float64 { return float64(b) / (1 << 20) }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 

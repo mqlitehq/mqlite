@@ -365,6 +365,23 @@ func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
 	return nil
 }
 
+// Compact reclaims free database pages to the OS (MQLITE-31). New local DBs use
+// auto_vacuum=INCREMENTAL, so the default runs `PRAGMA incremental_vacuum` — bounded,
+// no global lock, janitor-friendly. full=true runs a full `VACUUM`, which rewrites the
+// whole file and holds a global write lock (a maintenance-window operation). Both are
+// local-only — a remote Turso/libSQL store manages its own storage.
+func (e *Engine) Compact(ctx context.Context, full bool) error {
+	if e.Remote() {
+		return errors.New("mqlite: compact is not supported on a remote (Turso/libSQL) store")
+	}
+	stmt := "PRAGMA incremental_vacuum"
+	if full {
+		stmt = "VACUUM"
+	}
+	_, err := e.db.exec(ctx, stmt)
+	return err
+}
+
 // send is the shared enqueue path. forced state is 'active' or 'scheduled'.
 func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs int64, forced State) ([]int64, error) {
 	seqs, _, err := e.sendTracked(ctx, name, ms, atMs, forced)

@@ -3,7 +3,12 @@
 # mqlite
 
 [![CI](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite)
+[![Go Report Card](https://goreportcard.com/badge/github.com/mqlitehq/mqlite)](https://goreportcard.com/report/github.com/mqlitehq/mqlite)
 [![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
+[![Release](https://img.shields.io/github/v/release/mqlitehq/mqlite?sort=semver)](https://github.com/mqlitehq/mqlite/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/mqlitehq/mqlite)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A small, SQLite/Turso-backed online message queue with **Azure Service Bus–style
 semantics** — Peek-Lock, retries, DLQ, scheduling, dedup, GroupID
