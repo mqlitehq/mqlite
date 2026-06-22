@@ -75,9 +75,27 @@ Computed from the message; always defined (cannot error on absence).
 | `body_size` | int | byte length — `body_size < 4096` (route by size, not content) |
 | `property_keys` | []string | sorted property names — `len(property_keys) > 0`, `"tier" in property_keys` |
 
-> Routing on **body content** (`body_json` / `body_text`) is deliberately **not** in
-> this version — its absent-value handling is a footgun and it's tracked as a separate
-> task. Use `body_size` and `properties` to route without parsing the payload.
+### Body content
+
+Route on the payload itself. These are **projected only when your filter references
+them**, so filters that don't touch the body pay nothing.
+
+| variable | type | example |
+|---|---|---|
+| `body_text` | string | the raw body as text — `body_text contains "urgent"` (always defined; `""` for an empty body) |
+| `body_json` | map | the body decoded as a JSON object — `body_json.amount > 100`, `body_json["tier"] == "gold"`, `"k" in body_json` |
+
+`body_json` is **only decoded when `content_type` looks like JSON** (or is unset);
+an explicit non-JSON type, an empty body, invalid JSON, or a non-object JSON
+(array/scalar) all yield an empty object `{}`. So `body_json` itself is never null —
+but reaching into an **absent field** (`body_json.amount` when there is no `amount`)
+yields `nil`, and comparing that (`nil > 100`) is a runtime error → **fail-closed**
+(the message isn't routed to that subscription, logged). Guard with a presence check
+when the field may be missing:
+
+```
+"amount" in body_json && body_json.amount > 100
+```
 
 ## Language
 
@@ -115,6 +133,8 @@ subject startsWith "payment." and not (properties["test"] == "true")
 body_size < 4096                                          # small messages only
 visible_at - enqueued_at > days(1)                        # delayed > 1 day
 len(subject_parts) >= 2 && subject_parts[1] == "eu"
+"amount" in body_json && body_json.amount > 100           # route on payload (guarded)
+body_text contains "urgent"
 ```
 
 ## Safety

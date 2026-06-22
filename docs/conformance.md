@@ -123,8 +123,10 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   `ErrInvalidFilter` (HTTP 400 `invalid_argument`) and **not** stored — no backing
   queue is created. *(engine/filter_test.go, server/errors_test.go)*
 - **11.2** The filter is evaluated at **publish** against the message env (core fields,
-  `enqueued_at`/`visible_at`, and the derived `subject_parts`/`body_size`/
-  `property_keys`); a message is routed to a subscription iff its filter returns true.
+  `enqueued_at`/`visible_at`, the derived `subject_parts`/`body_size`/`property_keys`,
+  and the body fields `body_text`/`body_json` — projected only when referenced, with
+  `body_json` decoded only for a JSON content type, else `{}`); a message is routed to
+  a subscription iff its filter returns true.
   `enqueued_at` is the publish time and `visible_at` is the delivery time (equal for an
   immediate send, the scheduled time for a delayed one), so a delay is
   `visible_at - enqueued_at`. *(engine/filter_test.go `TestFilterFanoutConditions`,

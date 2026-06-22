@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/vm"
 )
 
@@ -54,10 +56,20 @@ type filterEnv struct {
 	EnqueuedAt time.Time `expr:"enqueued_at"`
 	VisibleAt  time.Time `expr:"visible_at"`
 
-	// Derived — total-valued (cannot error on absence), so they are safe in P0.
+	// Derived — total-valued (cannot error on absence).
 	SubjectParts []string `expr:"subject_parts"` // "orders.eu.new" -> [orders eu new]
 	BodySize     int      `expr:"body_size"`     // byte length; route by size, not content
 	PropertyKeys []string `expr:"property_keys"` // sorted custom-property names
+
+	// Body content (MQLITE-47). Populated only when the filter references them
+	// (see filterEntry.usesBody*), so filters that don't touch the body pay nothing.
+	// Both are total-valued so an absent/unparseable body can't nil-panic the env:
+	// body_text is the raw bytes as a string (""-default); body_json is the decoded
+	// JSON object ({}-default, never nil — only attempted for a JSON content_type).
+	// Reaching INTO an absent field (e.g. body_json.amount on {}) yields nil and is
+	// handled fail-closed at eval (not routed, logged) — never a crash.
+	BodyText string         `expr:"body_text"`
+	BodyJSON map[string]any `expr:"body_json"`
 }
 
 // filterOptions is the Safe profile, the single definition of the language surface.
@@ -96,11 +108,15 @@ func filterOptions() []expr.Option {
 
 // filterEntry is a compiled filter cached by subscription name. err is set only if a
 // stored filter failed to compile — which Subscribe validation should prevent, but
-// it is handled fail-closed regardless.
+// it is handled fail-closed regardless. usesBodyText/usesBodyJSON record whether the
+// expression references the body fields, so the (potentially expensive) body
+// projection is done only when a filter actually needs it.
 type filterEntry struct {
-	expr string
-	prog *vm.Program
-	err  error
+	expr         string
+	prog         *vm.Program
+	err          error
+	usesBodyText bool
+	usesBodyJSON bool
 }
 
 // compiledFilter returns the cached compiled program for a subscription, recompiling
@@ -112,7 +128,13 @@ func (e *Engine) compiledFilter(sub, exprStr string) *filterEntry {
 		return ent
 	}
 	prog, err := compileFilter(exprStr)
-	ent := &filterEntry{expr: exprStr, prog: prog, err: err}
+	ent := &filterEntry{
+		expr:         exprStr,
+		prog:         prog,
+		err:          err,
+		usesBodyText: referencesVar(prog, "body_text"),
+		usesBodyJSON: referencesVar(prog, "body_json"),
+	}
 	e.filterCache[sub] = ent
 	return ent
 }
@@ -143,7 +165,16 @@ func (e *Engine) filterAccepts(t target, m OutMessage, enqueuedAtMs, visibleAtMs
 	if t.entry.prog == nil {
 		return true // empty filter -> match all
 	}
-	ok, err := evalFilter(t.entry.prog, buildFilterEnv(m, enqueuedAtMs, visibleAtMs))
+	env := buildFilterEnv(m, enqueuedAtMs, visibleAtMs)
+	// Project the body only when this filter references it (otherwise body_text stays
+	// "" and body_json stays {} — never read, so the value is irrelevant).
+	if t.entry.usesBodyText {
+		env.BodyText = string(m.Body)
+	}
+	if t.entry.usesBodyJSON {
+		env.BodyJSON = decodeBodyJSON(m)
+	}
+	ok, err := evalFilter(t.entry.prog, env)
 	if err != nil {
 		e.log.Error("subscription filter evaluation failed; routing skipped (fail-closed)",
 			"subscription", t.name, "expr", t.entry.expr, "error", err)
@@ -192,8 +223,9 @@ func evalFilter(prog *vm.Program, env filterEnv) (matched bool, err error) {
 }
 
 // buildFilterEnv projects a message + its timestamps into the filter env. Properties
-// is never nil (so `properties[...]` / `... in properties` are safe), and the
-// derived fields are computed here.
+// is never nil (so `properties[...]` / `... in properties` are safe), and the derived
+// fields are computed here. The body fields are left at their safe non-nil zero values
+// (`""` / `{}`); the caller (filterAccepts) fills them only when the filter uses them.
 func buildFilterEnv(m OutMessage, enqueuedAtMs, visibleAtMs int64) filterEnv {
 	props := m.Properties
 	if props == nil {
@@ -212,7 +244,53 @@ func buildFilterEnv(m OutMessage, enqueuedAtMs, visibleAtMs int64) filterEnv {
 		SubjectParts:  subjectParts(m.Subject),
 		BodySize:      len(m.Body),
 		PropertyKeys:  propertyKeys(props),
+		BodyJSON:      map[string]any{}, // never nil; replaced with the decoded body if used
 	}
+}
+
+// referencesVar reports whether a compiled program references the named variable
+// (used to decide whether to project the body fields). A nil program references
+// nothing.
+func referencesVar(prog *vm.Program, name string) bool {
+	if prog == nil {
+		return false
+	}
+	found := false
+	node := prog.Node()
+	ast.Walk(&node, exprVisitor(func(n *ast.Node) {
+		if id, ok := (*n).(*ast.IdentifierNode); ok && id.Value == name {
+			found = true
+		}
+	}))
+	return found
+}
+
+// exprVisitor adapts a func to expr's ast.Visitor.
+type exprVisitor func(*ast.Node)
+
+func (v exprVisitor) Visit(n *ast.Node) { v(n) }
+
+// decodeBodyJSON decodes a message body into a JSON object for `body_json`. It is
+// total-valued: a non-JSON content_type, an empty/invalid body, or a non-object JSON
+// (array/scalar) all yield an empty map ({}), never nil — so `body_json` is always a
+// map and only reaching into an absent *field* yields nil (handled fail-closed).
+func decodeBodyJSON(m OutMessage) map[string]any {
+	if len(m.Body) == 0 || !isJSONContentType(m.ContentType) {
+		return map[string]any{}
+	}
+	var v map[string]any
+	if err := json.Unmarshal(m.Body, &v); err != nil || v == nil {
+		return map[string]any{}
+	}
+	return v
+}
+
+// isJSONContentType decides whether to attempt JSON decoding: a content_type that
+// looks like JSON (e.g. application/json, application/vnd.api+json), or an unset
+// content_type (best-effort). An explicit non-JSON type (text/plain, …) is respected
+// — the body is not parsed and `body_json` stays {}.
+func isJSONContentType(ct string) bool {
+	return ct == "" || strings.Contains(strings.ToLower(ct), "json")
 }
 
 // subjectParts splits a dotted subject into its hierarchy, MQTT-style. An empty
