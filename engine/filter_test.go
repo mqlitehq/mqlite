@@ -405,3 +405,159 @@ func mustCompile(t *testing.T, src string) *vm.Program {
 	}
 	return prog
 }
+
+// ─── Body content: body_text / body_json (MQLITE-47) ────────────────────────
+
+// evalBody mirrors the engine fan-out path: it projects the body fields only when
+// the compiled filter references them (the cost gate), then evaluates.
+func evalBody(t *testing.T, src string, m OutMessage) (bool, error) {
+	t.Helper()
+	prog := mustCompile(t, src)
+	env := buildFilterEnv(m, 0, 0)
+	if referencesVar(prog, "body_text") {
+		env.BodyText = string(m.Body)
+	}
+	if referencesVar(prog, "body_json") {
+		env.BodyJSON = decodeBodyJSON(m)
+	}
+	return evalFilter(prog, env)
+}
+
+func TestFilterBodyJSON(t *testing.T) {
+	j := OutMessage{
+		ContentType: "application/json",
+		Body:        []byte(`{"amount":150,"tier":"gold","nested":{"k":"v"},"tags":["a","b"]}`),
+	}
+	cases := []struct {
+		name, src string
+		want      bool
+	}{
+		{"dot gt", `body_json.amount > 100`, true},
+		{"dot lt false", `body_json.amount < 100`, false},
+		{"index access", `body_json["tier"] == "gold"`, true},
+		{"nested", `body_json.nested.k == "v"`, true},
+		{"array elem", `body_json.tags[0] == "a"`, true},
+		{"key present", `"amount" in body_json`, true},
+		{"key absent", `"missing" in body_json`, false},
+		{"len", `len(body_json) == 4`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalBody(t, c.src, j)
+			if err != nil {
+				t.Fatalf("%q: %v", c.src, err)
+			}
+			if got != c.want {
+				t.Errorf("%q = %v, want %v", c.src, got, c.want)
+			}
+		})
+	}
+}
+
+// Absent fields, non-JSON content types, and non-object JSON are total-valued ({})
+// or fail-closed — never a nil panic, never a default match.
+func TestFilterBodyJSONEdgeCases(t *testing.T) {
+	// Reaching into an absent field then comparing numerically must NOT match
+	// (fail-closed: nil compare yields false, with or without a reported error).
+	if got, _ := evalBody(t, `body_json.amount > 100`,
+		OutMessage{ContentType: "application/json", Body: []byte(`{"other":1}`)}); got {
+		t.Error("absent field comparison must not match")
+	}
+	// A presence check on an empty object is total-valued: false, no error.
+	if got, err := evalBody(t, `"amount" in body_json`,
+		OutMessage{ContentType: "application/json", Body: []byte(`{}`)}); got || err != nil {
+		t.Errorf("absent-key presence: got=%v err=%v, want false/nil", got, err)
+	}
+	// An explicit non-JSON content type is respected → body_json stays {}.
+	if got, err := evalBody(t, `"amount" in body_json`,
+		OutMessage{ContentType: "text/plain", Body: []byte(`{"amount":1}`)}); got || err != nil {
+		t.Errorf("non-JSON content type must not parse: got=%v err=%v", got, err)
+	}
+	// Invalid JSON and non-object JSON (array) both fall back to {}.
+	for _, body := range []string{`not json`, `[1,2,3]`, `42`, ``} {
+		if got, err := evalBody(t, `len(body_json) == 0`,
+			OutMessage{ContentType: "application/json", Body: []byte(body)}); !got || err != nil {
+			t.Errorf("body %q → empty map expected: got=%v err=%v", body, got, err)
+		}
+	}
+}
+
+func TestFilterBodyText(t *testing.T) {
+	m := OutMessage{Body: []byte("ALERT: disk full urgent")}
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{`body_text contains "urgent"`, true},
+		{`body_text startsWith "ALERT"`, true},
+		{`body_text contains "ok"`, false},
+		{`len(body_text) > 0`, true},
+	}
+	for _, c := range cases {
+		got, err := evalBody(t, c.src, m)
+		if err != nil || got != c.want {
+			t.Errorf("%q = %v (err %v), want %v", c.src, got, err, c.want)
+		}
+	}
+	// Empty body → body_text is "" (total-valued).
+	if got, err := evalBody(t, `body_text == ""`, OutMessage{}); err != nil || !got {
+		t.Errorf("empty body → empty body_text: got=%v err=%v", got, err)
+	}
+}
+
+// The body is projected only when the filter references it.
+func TestFilterBodyGate(t *testing.T) {
+	if !referencesVar(mustCompile(t, `body_json.x == 1`), "body_json") {
+		t.Error("body_json use not detected")
+	}
+	if !referencesVar(mustCompile(t, `body_text contains "x"`), "body_text") {
+		t.Error("body_text use not detected")
+	}
+	if referencesVar(mustCompile(t, `subject == "x"`), "body_json") {
+		t.Error("false positive: body_json on a subject filter")
+	}
+	if referencesVar(mustCompile(t, `properties["k"] == "v"`), "body_text") {
+		t.Error("false positive: body_text on a property filter")
+	}
+	// A filter that doesn't reference the body must work even when the body is
+	// invalid JSON — because it is never parsed (the gate is what makes this safe).
+	if got, err := evalBody(t, `subject == "x"`,
+		OutMessage{Subject: "x", ContentType: "application/json", Body: []byte("garbage{")}); err != nil || !got {
+		t.Errorf("non-body filter must ignore the body: got=%v err=%v", got, err)
+	}
+}
+
+// Through the engine: body filters route fan-out over a batch of real messages.
+func TestFilterBodyFanout(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	sub := func(name, expr string) {
+		t.Helper()
+		var f *Filter
+		if expr != "" {
+			f = &Filter{Expr: expr}
+		}
+		if err := e.Subscribe(ctx, "bev", name, f); err != nil {
+			t.Fatalf("subscribe %s: %v", name, err)
+		}
+	}
+	sub("all", "")
+	sub("big", `body_json.amount > 100`)
+	sub("urgent", `body_text contains "urgent"`)
+
+	send := func(ct, body string) {
+		if _, err := e.SendOne(ctx, "bev", OutMessage{ContentType: ct, Body: []byte(body)}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	send("application/json", `{"amount":150}`)                  // big
+	send("application/json", `{"amount":50}`)                   // neither
+	send("text/plain", "this is urgent")                        // urgent (body_json stays {})
+	send("application/json", `{"amount":200,"note":"urgent!"}`) // big + urgent
+
+	for name, n := range map[string]int64{"all": 4, "big": 2, "urgent": 2} {
+		if st, _ := e.Stats(ctx, name); st.Active != n {
+			t.Errorf("subscription %q active=%d, want %d", name, st.Active, n)
+		}
+	}
+}
