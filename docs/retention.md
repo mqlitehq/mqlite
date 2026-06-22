@@ -225,7 +225,8 @@ MQLITE-28  Tier 1: reapDLQ loop + MQLITE_DLQ_MAX_AGE/MAX_COUNT/MAX_BYTES, defaul
 MQLITE-29  Tier 2: per-queue overrides (dlq_max_age_ms / dlq_max_count /            SHIPPED
            dlq_max_bytes) — schema change; inherit(0) / override(>0) / unbounded(<0).
 MQLITE-30  Document the operator archival pattern (Peek/Redrive/Purge) in README. docs
-MQLITE-31  Opt-in incremental_vacuum maintenance step (CLI) for disk give-back.   later
+MQLITE-31  incremental_vacuum maintenance step (CLI `vacuum`, --full) for disk     SHIPPED
+           give-back; new local DBs default to auto_vacuum=INCREMENTAL.
 ```
 
 Status: **MQLITE-28 and MQLITE-29 are shipped** — the broker bounds its DLQ by age +

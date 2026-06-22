@@ -125,6 +125,16 @@ mqlite purge-dlq orders --older-than 24h
 | `--max` | 0 (all) | max messages |
 | `--older-than` | 0 | only messages older than this |
 
+### `vacuum` — reclaim free DB pages to the OS
+Local maintenance (embedded; **stop the broker first** — the single-writer lock will
+reject it otherwise). New local DBs use `auto_vacuum=INCREMENTAL`, so the default is a
+no-lock `PRAGMA incremental_vacuum`; `--full` runs a full `VACUUM` (rewrites the file,
+global lock). Not applicable to a remote Turso/libSQL store.
+```bash
+MQLITE_DB=file:/data/mq.db mqlite vacuum          # incremental
+MQLITE_DB=file:/data/mq.db mqlite vacuum --full   # full rewrite
+```
+
 ### `version` / `help`
 ```bash
 mqlite version
