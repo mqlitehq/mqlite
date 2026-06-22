@@ -1,11 +1,12 @@
 package engine
 
-// schemaVersion identifies the on-disk schema. It is "1" for the public release:
-// the internal v2→v4 ladder collapsed into this single clean init schema (MQLITE-25)
-// — no external database ever ran an intermediate version, so there is no history to
-// migrate. Bump it only on an incompatible DDL change; Open then refuses an older
-// database instead of silently running new DDL against it (MQLITE-24, see db.go).
-const schemaVersion = "1"
+// schemaVersion identifies the on-disk schema. "1" was the first public release
+// (the internal v2→v4 ladder collapsed into one clean init schema, MQLITE-25). "2"
+// adds per-queue DLQ-retention columns (MQLITE-29). Bump it only on an incompatible
+// DDL change; Open then refuses an older database instead of silently running new DDL
+// against it (MQLITE-24, see db.go). Pre-1.0 there is no migration — a stale DB is
+// recreated.
+const schemaVersion = "2"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc
@@ -23,6 +24,12 @@ var schemaStmts = []string{
 	    dedup_window_ms       INTEGER NOT NULL DEFAULT 0,
 	    ordering_mode         TEXT NOT NULL DEFAULT 'standard'
 	                              CHECK (ordering_mode IN ('standard','group_fifo','strict_fifo')),
+	    -- per-queue DLQ retention overrides (MQLITE-29). 0 = inherit the broker/engine
+	    -- default; >0 = this queue's own bound; -1 = explicitly unbounded (opt out of
+	    -- the default). Enforced drop-oldest by reapDLQ.
+	    dlq_max_age_ms        INTEGER NOT NULL DEFAULT 0,
+	    dlq_max_count         INTEGER NOT NULL DEFAULT 0,
+	    dlq_max_bytes         INTEGER NOT NULL DEFAULT 0,
 	    created_at            INTEGER NOT NULL,
 	    updated_at            INTEGER NOT NULL
 	) STRICT`,

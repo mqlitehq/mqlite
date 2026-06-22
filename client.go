@@ -295,6 +295,7 @@ func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 			LockDurationMs: ec.LockDurationMs, MaxDeliveryCount: ec.MaxDeliveryCount,
 			DefaultTTLMs: ec.DefaultTTLMs, DeadLetterOnExpire: ec.DeadLetterOnExpire, DedupWindowMs: ec.DedupWindowMs,
 			OrderingMode: string(ec.Ordering),
+			DLQMaxAgeMs:  ec.DLQMaxAgeMs, DLQMaxCount: ec.DLQMaxCount, DLQMaxBytes: ec.DLQMaxBytes,
 		},
 	}, &wire.Empty{})
 }

@@ -55,20 +55,20 @@ func TestSynchronousPragma(t *testing.T) {
 
 // ─── Schema version guard ───────────────────────────────────────────────────
 
-// MQLITE-24/25: a fresh DB records the single init schema version ("1"), and
-// reopening a DB stamped with a different version is refused rather than silently
-// running new DDL against an incompatible layout.
+// MQLITE-24/25/29: a fresh DB records the current init schema version, and reopening
+// a DB stamped with a different version is refused rather than silently running new
+// DDL against an incompatible layout.
 func TestSchemaVersionGuard(t *testing.T) {
 	ctx := context.Background()
 	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
 
-	// A fresh DB records the collapsed init version (MQLITE-25).
+	// A fresh DB records the current init version ("2" since per-queue retention).
 	e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
 	if err != nil {
 		t.Fatalf("fresh open: %v", err)
 	}
-	if schemaVersion != "1" {
-		t.Fatalf("init schemaVersion = %q, want \"1\" (the v2→v4 ladder is collapsed)", schemaVersion)
+	if schemaVersion != "2" {
+		t.Fatalf("init schemaVersion = %q, want \"2\" (per-queue DLQ retention, MQLITE-29)", schemaVersion)
 	}
 	var v string
 	if err := e.db.queryRowScan(ctx, []any{&v}, `SELECT value FROM meta WHERE key='schema_version'`); err != nil {

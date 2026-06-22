@@ -67,6 +67,11 @@ type queueRow struct {
 	deadLetterOnExp  bool
 	dedupWindowMs    int64
 	ordering         OrderingMode
+	// per-queue DLQ retention overrides (MQLITE-29): 0 = inherit engine default,
+	// >0 = this queue's bound, -1 = explicitly unbounded.
+	dlqMaxAgeMs int64
+	dlqMaxCount int64
+	dlqMaxBytes int64
 }
 
 // Open opens (and migrates) the store, performs single-broker crash recovery,
@@ -169,8 +174,9 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	now := e.now()
 	_, err := e.db.exec(ctx, `
 		INSERT INTO queues (name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		                    dead_letter_on_expire,dedup_window_ms,ordering_mode,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)
+		                    dead_letter_on_expire,dedup_window_ms,ordering_mode,
+		                    dlq_max_age_ms,dlq_max_count,dlq_max_bytes,created_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(name) DO UPDATE SET
 		    lock_duration_ms=excluded.lock_duration_ms,
 		    max_delivery_count=excluded.max_delivery_count,
@@ -178,8 +184,12 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 		    dead_letter_on_expire=excluded.dead_letter_on_expire,
 		    dedup_window_ms=excluded.dedup_window_ms,
 		    ordering_mode=excluded.ordering_mode,
+		    dlq_max_age_ms=excluded.dlq_max_age_ms,
+		    dlq_max_count=excluded.dlq_max_count,
+		    dlq_max_bytes=excluded.dlq_max_bytes,
 		    updated_at=excluded.updated_at`,
-		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, string(ordering), now, now)
+		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, string(ordering),
+		cfg.DLQMaxAgeMs, cfg.DLQMaxCount, cfg.DLQMaxBytes, now, now)
 	if err != nil {
 		return err
 	}
@@ -265,9 +275,11 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 	var dle int
 	var ordering string
 	if err := e.db.queryRowScan(ctx,
-		[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering}, `
+		[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering,
+			&q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes}, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms,ordering_mode FROM queues WHERE name=?`, name); err != nil {
+		       dead_letter_on_expire,dedup_window_ms,ordering_mode,
+		       dlq_max_age_ms,dlq_max_count,dlq_max_bytes FROM queues WHERE name=?`, name); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return queueRow{}, ErrQueueNotFound
 		}

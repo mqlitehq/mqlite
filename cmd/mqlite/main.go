@@ -230,12 +230,15 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	ttl := fs.Duration("ttl", 0, "default message TTL")
 	dedup := fs.Duration("dedup", 0, "dedup window (0=off)")
 	ordering := fs.String("ordering", "", "ordering mode: standard|group_fifo|strict_fifo (default standard)")
+	dlqAge := fs.Duration("dlq-max-age", 0, "per-queue DLQ retention: drop dead letters older than this (0=inherit broker default)")
+	dlqCount := fs.Int("dlq-max-count", 0, "per-queue DLQ retention: keep at most N dead letters (0=inherit, -1=unbounded)")
+	dlqBytes := fs.Int64("dlq-max-bytes", 0, "per-queue DLQ retention: cap dead-letter body bytes (0=inherit, -1=unbounded)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m --ordering standard]")
+		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m --ordering standard --dlq-max-age 336h --dlq-max-count 1000 --dlq-max-bytes 10485760]")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -244,7 +247,8 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	defer c.Close()
 	if err := c.CreateQueue(ctx, pos[0], mqlite.QueueConfig{
 		LockDuration: *lock, MaxDeliveryCount: *maxdc, DefaultTTL: *ttl, DedupWindow: *dedup,
-		Ordering: mqlite.OrderingMode(*ordering),
+		Ordering:  mqlite.OrderingMode(*ordering),
+		DLQMaxAge: *dlqAge, DLQMaxCount: *dlqCount, DLQMaxBytes: *dlqBytes,
 	}); err != nil {
 		return err
 	}

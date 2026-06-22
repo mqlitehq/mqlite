@@ -62,6 +62,12 @@ type QueueConfig struct {
 	DeadLetterOnExpire *bool        // nil -> true
 	DedupWindowMs      int64        // 0 -> dedup disabled
 	Ordering           OrderingMode // "" -> standard
+	// Per-queue DLQ retention overrides (MQLITE-29). For each: 0 -> inherit the
+	// broker/engine default; >0 -> this queue's own drop-oldest bound; -1 ->
+	// explicitly unbounded (opt out of the default).
+	DLQMaxAgeMs int64 // dead letters older than this (by enqueued_at) are dropped
+	DLQMaxCount int   // keep at most this many dead letters in this queue
+	DLQMaxBytes int64 // cap total dead-letter body bytes in this queue
 }
 
 // OutMessage is a message to enqueue. Body is opaque; the broker never parses it.
