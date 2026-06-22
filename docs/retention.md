@@ -5,8 +5,8 @@ If nothing ever shrinks the database, write latency climbs, the volume fills, an
 the broker eventually stalls — the opposite of the "lightweight, reliable" goal.
 This note is the design investigation: what MQLite keeps today, how other queues
 bound their storage, the full design space (triggers, actions, safe deletion,
-space reclamation, archival), and the *smallest* subset to ship for v0.1 without
-re-opening the frozen schema (MQLITE-25).
+space reclamation, archival), and the *smallest* subset to ship first (Tier 1 shipped
+without a schema change; Tier 2 added per-queue columns once that was worthwhile).
 
 ## What MQLite retains today
 
@@ -153,8 +153,7 @@ A `reapDLQ` background loop (alongside the existing janitors) bounds the DLQ by
 **age, per-queue count, and per-queue body bytes** — drop-oldest, **batched +
 rate-limited**, touching **only `state='dead_lettered'`** (undelivered / in-flight /
 scheduled work is never deleted). All three are broker-wide settings enforced over
-existing columns (`enqueued_at`, `length(body)`), so there's no new column, no
-migration, fully backward-compatible.
+existing columns (`enqueued_at`, `length(body)`), so Tier 1 needed no schema change.
 
 **On by default for the broker** so it is safe to run online long-term out of the
 box (the maintainer's call — the one unbounded sink should not silently fill the

@@ -185,7 +185,7 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
 - **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do
   not keep version history or migrations. `schemaVersion` is just an opaque guard
-  token. `migrate` is CREATE-IF-NOT-EXISTS only, so it never alters an existing DB —
+  token. `initSchema` is CREATE-IF-NOT-EXISTS only, so it never alters an existing DB —
   instead `Open` **refuses** a DB whose recorded token differs
   (`ErrSchemaVersionMismatch`). Change the token whenever the schema changes
   incompatibly; pre-1.0 there is no migration, a stale DB is recreated.

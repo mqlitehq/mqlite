@@ -74,14 +74,14 @@ type queueRow struct {
 	dlqMaxBytes int64
 }
 
-// Open opens (and migrates) the store, performs single-broker crash recovery,
-// and starts background maintenance loops.
+// Open opens the store (initializing the schema), performs single-broker crash
+// recovery, and starts background maintenance loops.
 func Open(ctx context.Context, opts Options) (*Engine, error) {
 	d, err := openDB(ctx, opts.DB, opts.AuthToken, opts.Synchronous)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.migrate(ctx); err != nil {
+	if err := d.initSchema(ctx); err != nil {
 		_ = d.close()
 		return nil, err
 	}
