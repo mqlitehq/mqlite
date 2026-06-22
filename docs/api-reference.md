@@ -22,9 +22,11 @@ and the Go SDK, so the two can't drift) and the server's error mapping.
 ## Auth
 
 Bearer token via `Authorization: Bearer <token>`. The broker accepts the tokens in
-`MQLITE_TOKENS` (comma-separated). If `MQLITE_TOKENS` is unset, **auth is disabled**
-(localhost/LAN downgrade). When auth is on, every endpoint needs the token **except**
-the open ones below. A missing/invalid token → `401 unauthenticated`.
+`MQLITE_TOKENS` (comma-separated). **Secure by default:** if `MQLITE_TOKENS` is
+**unset**, `mqlite serve` **generates a random token** (`mqk_…`, 128-bit) and prints it
+at startup — the broker is never silently wide open. Set `MQLITE_TOKENS=off` to
+explicitly disable auth (localhost/LAN only). When auth is on, every endpoint needs the
+token **except** the open ones below. A missing/invalid token → `401 unauthenticated`.
 
 ## Open endpoints (no auth)
 

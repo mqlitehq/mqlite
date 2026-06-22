@@ -19,7 +19,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_DB` | embedded DB DSN: `file:./mq.db` / `:memory:` / `libsql://<db>.turso.io` |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: a running broker + its Bearer token |
-| `MQLITE_TOKENS` | broker mode (`serve`): comma-separated tokens to accept |
+| `MQLITE_TOKENS` | broker (`serve`) Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` durability (embedded/serve) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`) |
 

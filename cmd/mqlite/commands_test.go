@@ -3,10 +3,29 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mqlitehq/mqlite"
 )
+
+// TestResolveBrokerTokens covers the broker's secure-by-default token policy.
+func TestResolveBrokerTokens(t *testing.T) {
+	// unset -> a token is generated (broker is never silently wide open).
+	if csv, note := resolveBrokerTokens(""); !strings.HasPrefix(csv, mqlite.TokenPrefix) || !strings.Contains(note, "generated") {
+		t.Errorf("unset: csv=%q note=%q, want a generated mqk_ token", csv, note)
+	}
+	// off (case/space-insensitive) -> auth explicitly disabled.
+	for _, off := range []string{"off", "OFF", "  off  "} {
+		if csv, note := resolveBrokerTokens(off); csv != "" || !strings.Contains(note, "DISABLED") {
+			t.Errorf("%q: csv=%q note=%q, want disabled", off, csv, note)
+		}
+	}
+	// provided -> passed through verbatim.
+	if csv, note := resolveBrokerTokens("a,b"); csv != "a,b" || !strings.Contains(note, "MQLITE_TOKENS") {
+		t.Errorf("provided: csv=%q note=%q", csv, note)
+	}
+}
 
 // TestCommandsEndToEnd drives the CLI command handlers against one embedded DB,
 // exercising flag parsing, dispatch, and output formatting (MQLITE-26). Each
