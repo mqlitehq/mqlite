@@ -179,11 +179,11 @@ curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 Full endpoint, request/response, and error reference: [docs/api-reference.md](docs/api-reference.md).
 
-### 3b. Web UI (read-only ops panel)
+### 3b. Admin console
 
-The broker serves a read-only dashboard at **`http://<host>/ui`** — list queues with
-live counts, browse messages by state, and (the one write action) redrive a DLQ.
-The page loads without auth; its data calls use the Bearer token you paste in.
+A standalone web console connects to a broker over this same HTTP API — list queues with
+live counts, browse messages, edit subscription filters, send, and redrive a DLQ. It
+ships separately for now; embedding it into the broker is planned.
 
 ### 4. Or the Go SDK (remote)
 

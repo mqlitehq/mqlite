@@ -35,7 +35,7 @@ MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :8080
 |---|---|---|
 | `--addr` | `:8080` | listen address |
 
-Serves the RPC API, `/metrics`, `/ui`, and the open `/` + `/healthz`.
+Serves the RPC API, `/metrics`, and the open `/` + `/healthz`.
 
 ### `create-queue <name>` — create/update a queue
 ```bash

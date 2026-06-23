@@ -34,7 +34,6 @@ token **except** the open ones below. A missing/invalid token → `401 unauthent
 |---|---|---|
 | `GET` | `/` | JSON discovery card: `{name, version, status, auth, docs, endpoints}` |
 | `GET` | `/healthz` | `200 ok` (liveness) |
-| `GET` | `/ui` | read-only ops dashboard (HTML; its data calls still use the token) |
 
 ```bash
 curl https://<host>/                 # what is this? (no auth)
