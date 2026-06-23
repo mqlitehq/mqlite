@@ -128,6 +128,7 @@ type PeekedMessage struct {
 	DeliveryCount         int
 	EnqueuedAtMs          int64
 	VisibleAtMs           int64
+	ExpiresAtMs           int64 // 0 = no TTL
 	LockedUntilMs         int64
 	DeadLetterReason      string
 	DeadLetterDescription string

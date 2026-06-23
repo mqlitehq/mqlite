@@ -172,6 +172,62 @@ func TestTTLDiscard(t *testing.T) {
 	}
 }
 
+// TTL cap: a per-message TTL is honored but the queue default is a ceiling (Azure Service
+// Bus DefaultMessageTimeToLive semantics). Also exercises Peek surfacing expires_at.
+func TestTTLCapAtQueueDefault(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	now := e.now()
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 3_600_000}) // 1h ceiling
+
+	expiresOf := func(seq int64) int64 {
+		t.Helper()
+		pk, _ := e.Peek(ctx, "q", PeekOptions{Max: 1000})
+		for _, p := range pk {
+			if p.SeqNumber == seq {
+				return p.ExpiresAtMs
+			}
+		}
+		t.Fatalf("seq %d not found", seq)
+		return 0
+	}
+
+	long, _ := e.SendOne(ctx, "q", OutMessage{Body: []byte("a"), TTLMs: 2 * 3_600_000}) // 2h > 1h
+	if got := expiresOf(long); got != now+3_600_000 {
+		t.Errorf("over-long TTL: expires=%d, want capped to now+1h=%d", got, now+3_600_000)
+	}
+	short, _ := e.SendOne(ctx, "q", OutMessage{Body: []byte("b"), TTLMs: 600_000}) // 10m < 1h
+	if got := expiresOf(short); got != now+600_000 {
+		t.Errorf("short TTL: expires=%d, want honored now+10m=%d", got, now+600_000)
+	}
+	deflt, _ := e.SendOne(ctx, "q", OutMessage{Body: []byte("c")}) // none → queue default
+	if got := expiresOf(deflt); got != now+3_600_000 {
+		t.Errorf("no msg TTL: expires=%d, want queue default now+1h=%d", got, now+3_600_000)
+	}
+}
+
+// A queue with no default TTL does not cap a per-message TTL; Peek returns 0 when no TTL.
+func TestTTLNoQueueDefault(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	now := e.now()
+	mustQueue(t, e, "q", QueueConfig{}) // unlimited
+
+	withTTL, _ := e.SendOne(ctx, "q", OutMessage{Body: []byte("x"), TTLMs: 5 * 60_000})
+	noTTL, _ := e.SendOne(ctx, "q", OutMessage{Body: []byte("y")})
+	pk, _ := e.Peek(ctx, "q", PeekOptions{Max: 10})
+	exp := map[int64]int64{}
+	for _, p := range pk {
+		exp[p.SeqNumber] = p.ExpiresAtMs
+	}
+	if exp[withTTL] != now+5*60_000 {
+		t.Errorf("uncapped TTL: expires=%d, want now+5m=%d", exp[withTTL], now+5*60_000)
+	}
+	if exp[noTTL] != 0 {
+		t.Errorf("no TTL: expires=%d, want 0", exp[noTTL])
+	}
+}
+
 // Cancel prevents a future scheduled message from ever activating.
 func TestCancelScheduled(t *testing.T) {
 	ctx := context.Background()

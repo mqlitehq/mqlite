@@ -21,8 +21,11 @@ func (e *Engine) insertOne(ctx context.Context, tx *sql.Tx, q queueRow, m OutMes
 	if forced == StateScheduled {
 		visibleAt = atMs
 	}
+	// Effective TTL — Azure Service Bus DefaultMessageTimeToLive semantics: a per-message
+	// TTL is honored but the queue's default TTL is a CEILING (a message cannot outlive
+	// it). With no per-message TTL the queue default applies. defaultTTLMs==0 = unlimited.
 	ttl := m.TTLMs
-	if ttl <= 0 {
+	if q.defaultTTLMs > 0 && (ttl <= 0 || ttl > q.defaultTTLMs) {
 		ttl = q.defaultTTLMs
 	}
 	var expiresAt int64

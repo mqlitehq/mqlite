@@ -24,7 +24,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	args = append(args, max)
 	rows, err := e.db.query(ctx, `
 		SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
-		       properties,delivery_count,enqueued_at,visible_at,locked_until,
+		       properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
 		       dead_letter_reason,dead_letter_description
 		FROM messages WHERE queue=? AND id>=?`+stateClause+`
 		ORDER BY id ASC LIMIT ?`, args...)
@@ -38,7 +38,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 		var st string
 		var messageID, groupID, correlationID, replyTo, subject, ctype, props, dlr, dld sql.NullString
 		if err := rows.Scan(&p.SeqNumber, &st, &p.Body, &messageID, &groupID, &correlationID,
-			&replyTo, &subject, &ctype, &props, &p.DeliveryCount, &p.EnqueuedAtMs, &p.VisibleAtMs, &p.LockedUntilMs,
+			&replyTo, &subject, &ctype, &props, &p.DeliveryCount, &p.EnqueuedAtMs, &p.VisibleAtMs, &p.ExpiresAtMs, &p.LockedUntilMs,
 			&dlr, &dld); err != nil {
 			return nil, err
 		}
