@@ -25,11 +25,13 @@ const (
 	PathPeek            = "/mqlite.v1.QueueService/Peek"
 	PathStats           = "/mqlite.v1.QueueService/Stats"
 
-	PathCreateQueue = "/mqlite.v1.AdminService/CreateQueue"
-	PathSubscribe   = "/mqlite.v1.AdminService/Subscribe"
-	PathListQueues  = "/mqlite.v1.AdminService/ListQueues"
-	PathRedrive     = "/mqlite.v1.AdminService/Redrive"
-	PathPurge       = "/mqlite.v1.AdminService/Purge"
+	PathCreateQueue       = "/mqlite.v1.AdminService/CreateQueue"
+	PathSubscribe         = "/mqlite.v1.AdminService/Subscribe"
+	PathListQueues        = "/mqlite.v1.AdminService/ListQueues"
+	PathListSubscriptions = "/mqlite.v1.AdminService/ListSubscriptions"
+	PathTestFilter        = "/mqlite.v1.AdminService/TestFilter"
+	PathRedrive           = "/mqlite.v1.AdminService/Redrive"
+	PathPurge             = "/mqlite.v1.AdminService/Purge"
 )
 
 // Message is the wire form of a message (both send input and receive output).
@@ -198,6 +200,30 @@ type PurgeRequest struct {
 }
 type PurgeResponse struct {
 	Purged int `json:"purged"`
+}
+
+// SubscriptionJSON is one topic→subscription mapping + its filter expression.
+type SubscriptionJSON struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"`
+}
+type ListSubscriptionsResponse struct {
+	Subscriptions []SubscriptionJSON `json:"subscriptions"`
+}
+
+// TestFilter dry-runs a filter expression: it compiles `expr` and, if `message` is
+// given, evaluates it (no enqueue). Message carries the sample (body base64, subject,
+// properties, and optional enqueued_at_ms/visible_at_ms for time fields).
+type TestFilterRequest struct {
+	Expr    string   `json:"expr"`
+	Message *Message `json:"message,omitempty"`
+}
+type TestFilterResponse struct {
+	Valid   bool   `json:"valid"`
+	Error   string `json:"error,omitempty"`
+	Ran     bool   `json:"ran"`
+	Matched bool   `json:"matched"`
 }
 
 type Empty struct{}

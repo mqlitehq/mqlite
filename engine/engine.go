@@ -265,6 +265,42 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 	return nil
 }
 
+// SubscriptionInfo describes one topic→subscription mapping and its filter.
+type SubscriptionInfo struct {
+	Topic string
+	Name  string
+	Expr  string // the filter expression; "" = match all
+}
+
+// ListSubscriptions returns every subscription with its topic and filter expression,
+// ordered by topic then name. (ListQueues shows the backing queues; this exposes the
+// topic membership + filter that ListQueues does not.)
+func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
+	rows, err := e.db.query(ctx,
+		`SELECT topic, subscription, filter_json FROM subscriptions ORDER BY topic, subscription`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SubscriptionInfo
+	for rows.Next() {
+		var topic, sub string
+		var fj sql.NullString
+		if err := rows.Scan(&topic, &sub, &fj); err != nil {
+			return nil, err
+		}
+		s := SubscriptionInfo{Topic: topic, Name: sub}
+		if fj.Valid && fj.String != "" {
+			var f Filter
+			if json.Unmarshal([]byte(fj.String), &f) == nil {
+				s.Expr = f.Expr
+			}
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 	e.qmu.RLock()
 	q, ok := e.qcache[name]
