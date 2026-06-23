@@ -201,6 +201,18 @@ Permanently delete dead-lettered messages.
 - **Request** `PurgeRequest`: `queue`, `max` (int), `older_than_ms` (int; both zero
   purges the whole DLQ). **Response** `PurgeResponse`: `purged` (int).
 
+### Status
+
+A desensitized runtime snapshot for an ops view — never includes a connection string
+or auth token.
+
+- **Request** `{}`. **Response** `StatusResponse`: `version`, `backend`
+  (`memory` | `local file` | `remote libSQL/Turso`), `remote` (bool), `location` (a
+  local path, or a masked remote host like `libsql://***.turso.io`), `schema_version`,
+  `ping_ms` (a `SELECT 1` read round-trip; `-1` if it failed), `db_size_bytes` (local
+  on-disk footprint: db + WAL + shm; `0` for memory/remote), `queues`, `subscriptions`,
+  `uptime_ms`, `auth` (bool).
+
 ## The `Message` object
 
 Shared shape for send input and receive/peek output (fields omitted when empty):

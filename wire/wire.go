@@ -32,6 +32,7 @@ const (
 	PathTestFilter        = "/mqlite.v1.AdminService/TestFilter"
 	PathRedrive           = "/mqlite.v1.AdminService/Redrive"
 	PathPurge             = "/mqlite.v1.AdminService/Purge"
+	PathStatus            = "/mqlite.v1.AdminService/Status"
 )
 
 // Message is the wire form of a message (both send input and receive output).
@@ -224,6 +225,23 @@ type TestFilterResponse struct {
 	Error   string `json:"error,omitempty"`
 	Ran     bool   `json:"ran"`
 	Matched bool   `json:"matched"`
+}
+
+// StatusResponse is a desensitized runtime snapshot (AdminService/Status). It never
+// includes a connection string or auth token: `location` is a local path or a masked
+// remote host.
+type StatusResponse struct {
+	Version       string `json:"version"`
+	Backend       string `json:"backend"` // memory | local file | remote libSQL/Turso
+	Remote        bool   `json:"remote"`
+	Location      string `json:"location"`
+	SchemaVersion string `json:"schema_version"`
+	PingMs        int64  `json:"ping_ms"`       // SELECT 1 read round-trip; -1 if it failed
+	DBSizeBytes   int64  `json:"db_size_bytes"` // local on-disk footprint; 0 for memory/remote
+	Queues        int    `json:"queues"`
+	Subscriptions int    `json:"subscriptions"`
+	UptimeMs      int64  `json:"uptime_ms"`
+	Auth          bool   `json:"auth"`
 }
 
 type Empty struct{}
