@@ -1,14 +1,50 @@
-# mqlite benchmark report
+# mqlite benchmarks, sizing & tuning
 
 Measured, reproducible numbers for the mqlite engine across realistic workloads —
-**not** a single throughput figure. The suite exercises throughput, write
-amplification, **whole-process memory + reclamation**, **DB-file bloat vs
-reclamation**, **KV-property (enriched) messages**, a **body-size sweep**, and
-**load ramp / consumer churn (上下线)**. Run **locally** (a fast multi-core box) and
-on a deliberately tiny **cloud** box so the two tell different truths.
+**not** a single throughput figure — plus what they mean for **deployment sizing** and
+**tuning**. The suite exercises throughput, write amplification, **whole-process memory
++ reclamation**, **DB-file bloat vs reclamation**, **KV-property (enriched) messages**, a
+**body-size sweep**, and **load ramp / consumer churn (上下线)**. Run **locally** (a fast
+multi-core box) and on a deliberately tiny **cloud** box so the two tell different truths.
 
 > Philosophy: measure before claiming. Every number here is produced by
 > `test/bench/` and can be reproduced with the commands below.
+
+## Sizing & deployment (Fly.io)
+
+How much does a broker cost to run? **Less than you'd think** — a pure-Go single binary
+with an embedded SQLite engine (no JVM, no sidecar, no page-cache-hungry log segments)
+fits Fly's *smallest* machine with room to spare.
+
+```
+┌─────────────┬──────────────────────────┬──────────────────────────────────────┐
+│ resource    │ measured (1 broker)      │ Fly choice                            │
+├─────────────┼──────────────────────────┼──────────────────────────────────────┤
+│ memory      │ 19 MB idle               │ shared-cpu-1x · 256 MB  (>6× headroom)│
+│             │ 38 MB @ 50k msgs queued  │   bump to 512 MB only for >500k       │
+│             │                          │   in-flight backlogs                  │
+│ disk        │ ~0.4 KB / 256 B message  │ 1 GB volume  (~2M messages)           │
+│             │ + ~4 MB WAL (constant)   │   size = backlog × 0.6 KB × 1.5       │
+│ vCPU        │ tiny/op; 1000s/s batched │ 1 shared vCPU is ample                │
+│ image       │ 10.9 MiB static binary   │ distroless/scratch ≈ 15 MB image,     │
+│             │   (CGO-free)             │   cold start < 1 s (scale-to-zero ok) │
+└─────────────┴──────────────────────────┴──────────────────────────────────────┘
+```
+
+**Topology:** mqlite is **single-writer** (one process holds a file lock per DB), so run
+**one machine per volume** — do not horizontally scale several machines onto the same
+SQLite file. Need HA / multi-region? Point the broker at a Turso/libSQL DSN instead of a
+local file ([turso.md](turso.md)).
+
+Disk is sized by **peak backlog depth**, not lifetime throughput (`Complete`/`Purge`
+delete rows); files plateau at the high-water mark and don't shrink without `VACUUM`
+(see §3):
+
+| backlog depth (256 B msgs) | DB on disk | Fly volume |
+|--------------:|-----------:|:-----------|
+| 100k          | ~40 MB     | 1 GB       |
+| 1M            | ~0.4 GB    | 1 GB       |
+| 5M            | ~2 GB      | 3 GB       |
 
 ## Environments
 
@@ -181,10 +217,24 @@ The Fly `shared-cpu-1x` is `GOMAXPROCS=1` with CPU-steal. Versus the 12-core loc
    multi-goroutine scenarios (CPU-steal stalls); single-producer scenarios keep p99
    under ~5 ms.
 
-**Calibrating the earlier estimate** (`resource-profile.md`: "Fly 上预计数千条/秒"):
-confirmed — **with batching, ~6k msg/s sustained** on the cheapest shared-cpu-1x;
-**without batching (concurrent single sends), only hundreds/s.** The "thousands per
-second" figure holds *only when* the client batches.
+**The bottom line for the cheapest box:** **with batching, ~6k msg/s sustained** on a
+shared-cpu-1x; **without batching (concurrent single sends), only hundreds/s.** The
+"thousands per second" figure holds *only when* the client batches.
+
+## Tuning knobs
+
+mqlite ships sensible defaults; most deployments change nothing. In rough order of impact:
+
+| knob | default | when to change |
+|---|---|---|
+| **batch size** (`messages:[…]`) | — | the biggest lever — ~9× less write amplification, ~2× throughput. Batch whenever you can. |
+| **`MQLITE_SYNC`** | `NORMAL` | `FULL` only if a power cut losing the last few commits is unacceptable; it costs ~11–18× on single sends, so pair it with batching. |
+| `wal_autocheckpoint` | 1000 pages (~4 MB) | matches the observed WAL plateau; raise for fewer checkpoints at the cost of a larger WAL + slower crash recovery. |
+| `cache_size` | ~2 MB | the working set (queue heads + indexes) is small; raise only after profiling shows cache pressure under deep backlogs — it costs RAM on a 256 MB machine. |
+| `mmap_size` | off | `modernc.org/sqlite` is pure-Go; don't assume C-SQLite mmap gains — measure first. |
+| connection pool | local 1 / remote 4 | **don't change** — local=1 *is* the single writer (atomic claims); remote=4 is tuned for Turso's Hrana streams. |
+
+`busy_timeout=5000` and `temp_store=MEMORY` are already set by mqlite.
 
 ## Findings summary
 

@@ -41,31 +41,20 @@ that forces the decision below — security wins over the embedding floor.
 ## `expr-lang/expr` — the topic-filter dependency (MQLITE-17)
 
 Subscription filters are an [`expr-lang/expr`](https://github.com/expr-lang/expr)
-boolean predicate (see [concepts.md § filters](concepts.md#subscription-filters-expr)). expr is a **direct core
-dependency** — pinned at **v1.17.8**. It was vetted as a *long-term stable* choice,
-not just a convenient one:
+boolean predicate (see [concepts.md § filters](concepts.md#subscription-filters-expr)),
+a **direct core dependency** pinned at **v1.17.8**. It's a deliberate long-term choice:
+maintained by the `expr-lang` org (not a single author), **zero transitive
+dependencies**, MIT, and "memory-safe, side-effect-free, always-terminating" by
+construction — a sandboxed predicate evaluator. Its `go.mod` floor is only go 1.18, so
+it puts no pressure on the freeze above.
 
-| signal | finding |
-|---|---|
-| maturity | v1.x line, 100+ releases, ~8k★; latest v1.17.8 (Feb 2026) |
-| maintenance | maintained by the `expr-lang` org (not a single author); on OSS-Fuzz; documented security policy |
-| adoption | Google (GCP), Uber, ByteDance, Alibaba; and infra projects OpenTelemetry, KEDA, CoreDNS, Argo, CrowdSec — adopters that keep its API stable |
-| supply chain | **zero transitive dependencies**, 99.9% Go, MIT |
-| floor | its `go.mod` needs only **go 1.18** (< our 1.21 floor) — no pressure on the freeze above |
-| design fit | "memory-safe, side-effect-free, always-terminating" by construction — exactly a sandboxed predicate evaluator |
-
-**Security.** The one relevant advisory is **CVE-2025-29786** (parser memory
-exhaustion from an unbounded AST), fixed in the v1.17.x line we pin. We add defense
-in depth in `engine/filter.go`: a source-length cap + `expr.MaxNodes`, plus a
-fail-closed `recover` so a hostile or buggy filter can never crash the broker or
-silently match — it simply isn't routed to that subscription (logged). The
-CVSS-9.8 RCE that search engines surface for "expr" is the **JavaScript** `expr-eval`
-library — a different project, not this Go package. `govulncheck` (CI) covers expr
-at the pin like every other dependency.
-
-**Insulation.** We curate the builtin surface (the Safe profile in
-`engine/filter.go`) and funnel all use through one wrapper, so an upstream change —
-or a swap to another evaluator — touches one file, not the call sites.
+**Security.** The one relevant advisory, **CVE-2025-29786** (parser memory exhaustion
+from an unbounded AST), is fixed in the v1.17.x line we pin. Defense in depth in
+`engine/filter.go`: a source-length cap + `expr.MaxNodes`, plus a fail-closed `recover`
+so a hostile or buggy filter can never crash the broker or silently match. (The CVSS-9.8
+RCE search engines surface for "expr" is the **JavaScript** `expr-eval` library — a
+different project.) All filter use funnels through one wrapper, so an upstream change or
+evaluator swap touches one file; `govulncheck` (CI) covers expr at the pin.
 
 ## When the freeze lifts
 

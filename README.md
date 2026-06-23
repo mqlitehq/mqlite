@@ -251,8 +251,7 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 **Understand it:**
 [Concepts & filters](docs/concepts.md) (model + `expr` filter language) ·
 [Conformance / TCK](docs/conformance.md) ·
-[Resource profile](docs/resource-profile.md) ·
-[Benchmarks](docs/benchmark.md) ·
+[Benchmarks, sizing & tuning](docs/benchmark.md) ·
 [Dependencies](docs/dependencies.md)
 
 ## Durability
@@ -308,7 +307,7 @@ docker run --platform linux/amd64 -p 8080:8080 \
 
 **Footprint:** ~11 MB static (CGO-free) binary, ~19 MB idle RSS, ~0.4 KB per message
 on disk — fits Fly's smallest 256 MB machine with room to spare. Measured numbers and
-Fly.io machine/volume sizing: [docs/resource-profile.md](docs/resource-profile.md).
+Fly.io machine/volume sizing: [docs/benchmark.md](docs/benchmark.md).
 
 Full copy-runnable recipes — Docker/GHCR, **Fly.io** (minimal-cost, scale-to-zero),
 **systemd**, and **Turso** — with auth and verification:

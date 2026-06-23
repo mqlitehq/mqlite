@@ -19,6 +19,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/mqlitehq/mqlite"
 	"github.com/mqlitehq/mqlite/server"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // ─── Harness ────────────────────────────────────────────────────────────────
@@ -389,4 +392,57 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 		}
 	}
 	t.Fatal("no `go 1.x` directive found in go.mod")
+}
+
+// TestCreateQueueDocMatchesWireConfig keeps docs/api-reference.md honest: the
+// CreateQueue config table MUST list exactly the json fields of wire.QueueConfigJSON
+// — no more, no less. This is the doc-side analogue of the MCP wire-shape guard:
+// add/rename/remove a config field on the wire type (or drift the table) and this
+// fails, so the reference can't silently fall behind the contract (this caught a
+// real gap — three dlq_* fields had been omitted from the table).
+func TestCreateQueueDocMatchesWireConfig(t *testing.T) {
+	// json tags actually on the wire type
+	want := map[string]bool{}
+	rt := reflect.TypeOf(wire.QueueConfigJSON{})
+	for i := 0; i < rt.NumField(); i++ {
+		tag := strings.Split(rt.Field(i).Tag.Get("json"), ",")[0]
+		if tag != "" && tag != "-" {
+			want[tag] = true
+		}
+	}
+
+	// the CreateQueue section of the reference (up to the next "### " heading)
+	b, err := os.ReadFile(filepath.Join("docs", "api-reference.md"))
+	if err != nil {
+		t.Fatalf("read api-reference.md: %v", err)
+	}
+	doc := string(b)
+	start := strings.Index(doc, "### CreateQueue")
+	if start < 0 {
+		t.Fatal("no `### CreateQueue` section in api-reference.md")
+	}
+	section := doc[start:]
+	if end := strings.Index(section[len("### CreateQueue"):], "\n### "); end >= 0 {
+		section = section[:len("### CreateQueue")+end]
+	}
+
+	// field names are the first table column: lines like  | `field_name` | ...
+	got := map[string]bool{}
+	re := regexp.MustCompile("(?m)^\\| `([a-z0-9_]+)` \\|")
+	for _, m := range re.FindAllStringSubmatch(section, -1) {
+		got[m[1]] = true
+	}
+
+	for f := range want {
+		if !got[f] {
+			t.Errorf("wire.QueueConfigJSON field %q is NOT documented in the api-reference.md "+
+				"CreateQueue config table — add a row for it", f)
+		}
+	}
+	for f := range got {
+		if !want[f] {
+			t.Errorf("api-reference.md documents config field %q that is not in "+
+				"wire.QueueConfigJSON — stale row, remove or rename it", f)
+		}
+	}
 }
