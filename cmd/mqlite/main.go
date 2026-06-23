@@ -220,13 +220,8 @@ func cmdServe(ctx context.Context, args []string) error {
 	if eng.Engine().Remote() {
 		backend = "remote Turso/libSQL"
 	}
-	host := *addr
-	if strings.HasPrefix(host, ":") {
-		host = "localhost" + host
-	}
 
 	lg.Info("mqlite broker", "version", version, "addr", *addr, "db", redact(db), "backend", backend)
-	lg.Info("web console", "url", "http://"+host+"/ui")
 	switch {
 	case tokens == "":
 		lg.Warn("auth disabled — anyone can call this broker (localhost/LAN only; set MQLITE_TOKENS)")
