@@ -5,7 +5,6 @@ package server
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,9 +16,6 @@ import (
 	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/wire"
 )
-
-//go:embed ui.html
-var uiHTML []byte
 
 // Server adapts an Engine to HTTP with static Bearer-token auth.
 type Server struct {
@@ -82,14 +78,6 @@ func (s *Server) routes() {
 	// Prometheus metrics: per-queue gauges. Behind auth like the RPCs (a scraper
 	// passes the Bearer token); only /healthz stays open for liveness.
 	s.mux.HandleFunc("/metrics", s.handleMetrics)
-	// read-only ops dashboard (static page; data still goes through the authed API).
-	s.mux.HandleFunc("/ui", s.handleUI)
-	s.mux.HandleFunc("/ui/", s.handleUI)
-}
-
-func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(uiHTML)
 }
 
 // handleIndex is the open discovery endpoint at "/": no params, no auth, just a JSON
@@ -114,7 +102,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"endpoints": map[string]string{
 			"health":  "GET /healthz",
 			"metrics": "GET /metrics (Bearer)",
-			"ui":      "GET /ui",
 			"rpc":     "POST /mqlite.v1.{Service}/{Method} (Bearer)",
 		},
 	})
@@ -182,7 +169,7 @@ func postOnly(fn http.HandlerFunc) http.HandlerFunc {
 // auth enforces Bearer tokens (skips /healthz and when no tokens configured).
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/ui") {
+		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" {
 			next.ServeHTTP(w, r)
 			return
 		}
