@@ -300,6 +300,7 @@ func FromPeeked(p *engine.PeekedMessage) Message {
 		DeliveryCount:         p.DeliveryCount,
 		EnqueuedAtMs:          p.EnqueuedAtMs,
 		VisibleAtMs:           p.VisibleAtMs,
+		ExpiresAtMs:           p.ExpiresAtMs,
 		LockedUntilMs:         p.LockedUntilMs,
 		DeadLetterReason:      p.DeadLetterReason,
 		DeadLetterDescription: p.DeadLetterDescription,
