@@ -255,7 +255,7 @@ func cmdServe(ctx context.Context, args []string) error {
 func serveLogger() *charmlog.Logger {
 	return charmlog.NewWithOptions(os.Stderr, charmlog.Options{
 		ReportTimestamp: true,
-		TimeFormat:      "15:04:05",
+		TimeFormat:      "15:04:05.000", // millisecond precision — RPCs are sub-ms apart
 	})
 }
 
