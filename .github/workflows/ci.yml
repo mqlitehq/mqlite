@@ -23,6 +23,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go: ['1.21.x', 'stable'] # floor (go.mod directive) + latest stable
+        exclude:
+          # macos-latest is now macOS 15, whose dyld rejects binaries from the Go 1.21
+          # linker ("missing LC_UUID load command" -> abort trap). Go 1.21 is EOL and
+          # never got the backport, so we keep the 1.21 floor on macOS via macos-14
+          # (Sonoma), whose dyld still loads them. stable stays on macos-latest.
+          - os: macos-latest
+            go: '1.21.x'
+        include:
+          - os: macos-14
+            go: '1.21.x'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
