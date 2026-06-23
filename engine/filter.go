@@ -375,3 +375,45 @@ func parseDuration(s string) (time.Duration, error) {
 	}
 	return total, nil
 }
+
+// FilterTestResult is a dry-run of a filter expression (TestFilter): whether it
+// compiles and, if a sample message is given, whether it would match.
+type FilterTestResult struct {
+	Valid   bool   // the expression compiled
+	Error   string // compile error, or a runtime/eval error when Ran
+	Ran     bool   // a sample message was evaluated
+	Matched bool   // the sample matched (meaningful only when Ran && Valid && Error == "")
+}
+
+// TestFilter compiles a filter expression and, when sample != nil, evaluates it against
+// that message exactly as publish-time fan-out would (same env, body-field gating, and
+// fail-closed handling). It is pure and read-only — nothing is enqueued — so a console
+// or `mqlite expr` REPL can validate / test an expression before it is used (MQLITE-17).
+func TestFilter(expr string, sample *OutMessage, enqueuedAtMs, visibleAtMs int64) FilterTestResult {
+	prog, err := compileFilter(expr)
+	if err != nil {
+		return FilterTestResult{Error: err.Error()}
+	}
+	res := FilterTestResult{Valid: true}
+	if sample == nil {
+		return res
+	}
+	res.Ran = true
+	if prog == nil {
+		res.Matched = true // an empty expression matches every message
+		return res
+	}
+	env := buildFilterEnv(*sample, enqueuedAtMs, visibleAtMs)
+	if referencesVar(prog, "body_text") {
+		env.BodyText = string(sample.Body)
+	}
+	if referencesVar(prog, "body_json") {
+		env.BodyJSON = decodeBodyJSON(*sample)
+	}
+	matched, evalErr := evalFilter(prog, env)
+	res.Matched = matched
+	if evalErr != nil {
+		res.Error = evalErr.Error()
+	}
+	return res
+}

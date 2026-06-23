@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/wire"
@@ -61,6 +62,8 @@ func (s *Server) routes() {
 	h(wire.PathCreateQueue, s.handleCreateQueue)
 	h(wire.PathSubscribe, s.handleSubscribe)
 	h(wire.PathListQueues, s.handleListQueues)
+	h(wire.PathListSubscriptions, s.handleListSubscriptions)
+	h(wire.PathTestFilter, s.handleTestFilter)
 	h(wire.PathRedrive, s.handleRedrive)
 	h(wire.PathPurge, s.handlePurge)
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -492,6 +495,44 @@ func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, resp)
+}
+
+func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
+	subs, err := s.eng.ListSubscriptions(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	resp := wire.ListSubscriptionsResponse{Subscriptions: make([]wire.SubscriptionJSON, len(subs))}
+	for i, su := range subs {
+		resp.Subscriptions[i] = wire.SubscriptionJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr}
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleTestFilter(w http.ResponseWriter, r *http.Request) {
+	var req wire.TestFilterRequest
+	if err := decode(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		return
+	}
+	now := time.Now().UnixMilli()
+	enq, vis := now, now
+	var sample *engine.OutMessage
+	if req.Message != nil {
+		m := req.Message.ToOut()
+		sample = &m
+		if req.Message.EnqueuedAtMs != 0 {
+			enq = req.Message.EnqueuedAtMs
+		}
+		if req.Message.VisibleAtMs != 0 {
+			vis = req.Message.VisibleAtMs
+		} else {
+			vis = enq
+		}
+	}
+	res := engine.TestFilter(req.Expr, sample, enq, vis)
+	writeJSON(w, wire.TestFilterResponse{Valid: res.Valid, Error: res.Error, Ran: res.Ran, Matched: res.Matched})
 }
 
 func (s *Server) handleRedrive(w http.ResponseWriter, r *http.Request) {

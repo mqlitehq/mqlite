@@ -561,3 +561,65 @@ func TestFilterBodyFanout(t *testing.T) {
 		}
 	}
 }
+
+// ─── TestFilter + ListSubscriptions (console support) ───────────────────────
+
+func TestTestFilter(t *testing.T) {
+	m := OutMessage{Subject: "orders.eu", Properties: map[string]string{"tier": "gold"}}
+
+	// compile-only (no sample): valid vs invalid.
+	if r := TestFilter(`subject == "a"`, nil, 0, 0); !r.Valid || r.Error != "" || r.Ran {
+		t.Errorf("valid compile: %+v", r)
+	}
+	if r := TestFilter(`subject ==`, nil, 0, 0); r.Valid || r.Error == "" {
+		t.Errorf("invalid compile must report error: %+v", r)
+	}
+	// evaluate against a sample.
+	if r := TestFilter(`properties["tier"] == "gold"`, &m, 0, 0); !r.Valid || !r.Ran || !r.Matched || r.Error != "" {
+		t.Errorf("should match: %+v", r)
+	}
+	if r := TestFilter(`properties["tier"] == "silver"`, &m, 0, 0); !r.Ran || r.Matched {
+		t.Errorf("should not match: %+v", r)
+	}
+	// empty expression matches all.
+	if r := TestFilter("", &m, 0, 0); !r.Valid || !r.Matched {
+		t.Errorf("empty matches all: %+v", r)
+	}
+	// runtime error → fail-closed (matched false, error reported).
+	if r := TestFilter(`subject_parts[5] == "x"`, &OutMessage{Subject: "a"}, 0, 0); r.Matched || r.Error == "" {
+		t.Errorf("runtime error must fail-closed: %+v", r)
+	}
+	// body content fields work in the dry run too.
+	bj := OutMessage{ContentType: "application/json", Body: []byte(`{"amount":150}`)}
+	if r := TestFilter(`body_json.amount > 100`, &bj, 0, 0); !r.Matched {
+		t.Errorf("body_json should match: %+v", r)
+	}
+}
+
+func TestListSubscriptions(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	if err := e.Subscribe(ctx, "events", "all", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Subscribe(ctx, "events", "gold", &Filter{Expr: `properties["tier"]=="gold"`}); err != nil {
+		t.Fatal(err)
+	}
+	subs, err := e.ListSubscriptions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("want 2 subscriptions, got %d", len(subs))
+	}
+	by := map[string]SubscriptionInfo{}
+	for _, s := range subs {
+		by[s.Name] = s
+	}
+	if by["all"].Topic != "events" || by["all"].Expr != "" {
+		t.Errorf("all: %+v", by["all"])
+	}
+	if by["gold"].Expr != `properties["tier"]=="gold"` {
+		t.Errorf("gold expr: %+v", by["gold"])
+	}
+}

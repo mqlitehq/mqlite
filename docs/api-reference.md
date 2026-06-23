@@ -171,6 +171,21 @@ Register subscription `name` under `topic` (creates its backing queue).
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
   `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`, `dedup_window_ms`}]).
 
+### ListSubscriptions
+
+- **Request** `{}`. **Response** `{subscriptions: [{topic, name, expr}]}` — every
+  subscription with its topic and [filter expression](filters.md) (`expr` empty = match
+  all). `ListQueues` shows the backing queues; this exposes the topic + filter it omits.
+
+### TestFilter
+
+- **Request** `{expr, message?}` — dry-run a [filter expression](filters.md): it
+  compiles `expr` and, if `message` (a sample, body base64) is given, evaluates it
+  exactly as publish-time fan-out would (nothing is enqueued).
+- **Response** `{valid, error?, ran, matched}` — `valid` = compiled; `error` = the
+  precise compile error or a runtime/eval error; `ran` = a sample was evaluated;
+  `matched` = the sample would route to a subscription using this filter.
+
 ### Redrive
 
 Move dead-lettered messages back to active (or to another queue).
