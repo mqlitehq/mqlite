@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/server"
 )
 
 func call(t *testing.T, line string) rpcResponse {
@@ -86,6 +91,80 @@ func TestToolsCallForwards(t *testing.T) {
 	text := m["content"].([]map[string]any)[0]["text"].(string)
 	if !strings.Contains(text, "seq_numbers") {
 		t.Fatalf("result text = %q", text)
+	}
+}
+
+// ─── schema ↔ forward ↔ wire consistency ────────────────────────────────────
+//
+// Closes the gap noted in docs/mcp-wire-compat-notes.md: a tool's hand-written
+// inputSchema, the string keys its forward reads (str(a,"queue")), and the wire.*Request
+// fields have no compile-time link, so a typo or a wire rename silently sends an empty
+// value. These tests make that drift a CI failure instead of a runtime surprise.
+
+func fwdBody(tl tool, a map[string]any) string {
+	_, body := tl.forward(a)
+	b, _ := json.Marshal(body)
+	return string(b)
+}
+
+// Every schema property must actually change the forwarded request when set — i.e. the
+// key forward reads matches the schema property name and lands in a wire.*Request field.
+// A mismatch (schema "queue" vs forward str(a,"queu")) makes the property inert → fail.
+func TestToolSchemaForwardConsistency(t *testing.T) {
+	for _, tl := range tools {
+		props, _ := tl.schema["properties"].(map[string]any)
+		if req, ok := tl.schema["required"].([]string); ok {
+			for _, r := range req {
+				if _, present := props[r]; !present {
+					t.Errorf("%s: required %q is not in properties", tl.name, r)
+				}
+			}
+		}
+		base := fwdBody(tl, map[string]any{})
+		for key, spec := range props {
+			var sentinel any = "SENTINEL-" + key
+			if typ, _ := spec.(map[string]any)["type"].(string); typ == "integer" {
+				sentinel = float64(987654) // JSON numbers decode to float64 in args
+			}
+			if fwdBody(tl, map[string]any{key: sentinel}) == base {
+				t.Errorf("%s: schema property %q has no effect on the forwarded request — "+
+					"the key forward reads doesn't match it, or it isn't wired into the wire.*Request", tl.name, key)
+			}
+		}
+	}
+}
+
+// Every tool's forward path must be a route the broker actually serves. Catches a tool
+// pointing at a stale/renamed path (a 404 "no such path"); a legitimate business error
+// is fine — it still proves the route exists.
+func TestToolForwardsHitRealBrokerRoutes(t *testing.T) {
+	eng, err := engine.Open(context.Background(), engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(context.Background(), "q", engine.QueueConfig{}); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	ts := httptest.NewServer(server.New(eng, nil).Handler()) // no auth
+	defer ts.Close()
+	broker.endpoint = ts.URL
+	broker.token = ""
+	broker.http = ts.Client()
+
+	// One superset of args; each forward reads only the keys it needs.
+	args := map[string]any{
+		"name": "q", "queue": "q", "body": "hi", "message_id": "m1", "group_id": "g1",
+		"seq_number": float64(1), "lock_token": "tok", "max_messages": float64(1),
+		"wait_time_ms": float64(0), "state": "active", "max": float64(8),
+		"reason": "because", "delay_ms": float64(0),
+	}
+	for _, tl := range tools {
+		res := callTool(tl.name, args)
+		text := res["content"].([]map[string]any)[0]["text"].(string)
+		if strings.Contains(text, "no such path") {
+			t.Errorf("tool %q forwards to a route the broker does not serve: %s", tl.name, text)
+		}
 	}
 }
 
