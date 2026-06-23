@@ -276,9 +276,10 @@ func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 // ── serve: upgrade in-process engine to a network broker ─────────────────────
 
 type serveConfig struct {
-	tokens  []string
-	version string
-	cors    string
+	tokens    []string
+	version   string
+	cors      string
+	reqLogger *slog.Logger
 }
 
 // ServeOption configures Serve.
@@ -314,6 +315,14 @@ func WithCORS(origin string) ServeOption {
 	return func(c *serveConfig) { c.cors = origin }
 }
 
+// WithRequestLog enables a per-request access log on the broker, emitted through lg (one
+// line per RPC: method, status, latency, at a level chosen by status). nil leaves request
+// logging off. Separate from WithLogger (which routes the engine's background-loop
+// failures) so a caller can colour the broker's live traffic without touching engine logs.
+func WithRequestLog(lg *slog.Logger) ServeOption {
+	return func(c *serveConfig) { c.reqLogger = lg }
+}
+
 // Serve exposes this engine as an HTTP broker until ctx is canceled.
 func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) error {
 	var sc serveConfig
@@ -323,6 +332,7 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv := server.New(e.eng, sc.tokens)
 	srv.Version = sc.version
 	srv.CORS = sc.cors
+	srv.Logger = sc.reqLogger
 	hs := &http.Server{Addr: addr, Handler: srv.Handler()}
 	errCh := make(chan error, 1)
 	go func() { errCh <- hs.ListenAndServe() }()

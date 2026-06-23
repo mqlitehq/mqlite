@@ -28,12 +28,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	charmlog "github.com/charmbracelet/log"
 
 	"github.com/mqlitehq/mqlite"
 )
@@ -198,32 +201,62 @@ func cmdServe(ctx context.Context, args []string) error {
 	addr := fs.String("addr", ":8080", "listen address")
 	_ = fs.Parse(args)
 
+	lg := serveLogger()
+	slogger := slog.New(lg)
+
 	db := os.Getenv("MQLITE_DB")
 	if db == "" {
 		db = "file:./mq.db"
 	}
-	eng, err := mqlite.OpenEmbedded(ctx, db, embeddedOpts()...)
+	eng, err := mqlite.OpenEmbedded(ctx, db, append(embeddedOpts(), mqlite.WithLogger(slogger))...)
 	if err != nil {
 		return err
 	}
 	defer eng.Close()
 
 	tokens, authNote := resolveBrokerTokens(os.Getenv("MQLITE_TOKENS"))
-	corsOrigin, corsNote := resolveCORS(os.Getenv("MQLITE_CORS"))
-	remote := ""
+	corsOrigin, _ := resolveCORS(os.Getenv("MQLITE_CORS"))
+	backend := "local"
 	if eng.Engine().Remote() {
-		remote = " (remote Turso/libSQL)"
+		backend = "remote Turso/libSQL"
 	}
 	host := *addr
 	if strings.HasPrefix(host, ":") {
 		host = "localhost" + host
 	}
-	fmt.Printf("mqlite %s serving on %s — DB %s%s\n%s\n%s\nweb UI: http://%s/ui\n",
-		version, *addr, redact(db), remote, authNote, corsNote, host)
+
+	lg.Info("mqlite broker", "version", version, "addr", *addr, "db", redact(db), "backend", backend)
+	lg.Info("web console", "url", "http://"+host+"/ui")
+	switch {
+	case tokens == "":
+		lg.Warn("auth disabled — anyone can call this broker (localhost/LAN only; set MQLITE_TOKENS)")
+	case strings.Contains(authNote, "generated"):
+		lg.Info("auth enabled — generated a token (set MQLITE_TOKENS to use your own, or =off to disable)", "token", tokens)
+	default:
+		lg.Info("auth enabled — tokens from MQLITE_TOKENS")
+	}
+	corsPolicy := corsOrigin
+	if corsPolicy == "" {
+		corsPolicy = "off"
+	}
+	lg.Info("cors", "allow-origin", corsPolicy)
 
 	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return eng.Serve(sctx, *addr, mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version), mqlite.WithCORS(corsOrigin))
+	lg.Info("ready — Ctrl-C to stop")
+	return eng.Serve(sctx, *addr,
+		mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version),
+		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger))
+}
+
+// serveLogger builds the broker's console logger: charmbracelet/log, colourised when
+// stderr is a TTY (auto-detected) and plain when piped. Levels colour the startup lines
+// and the per-request access log so live traffic is readable at a glance.
+func serveLogger() *charmlog.Logger {
+	return charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+		ReportTimestamp: true,
+		TimeFormat:      "15:04:05",
+	})
 }
 
 // resolveBrokerTokens decides the broker's accepted Bearer tokens from MQLITE_TOKENS,

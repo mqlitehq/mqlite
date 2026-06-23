@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -25,8 +26,9 @@ type Server struct {
 	eng     *engine.Engine
 	tokens  map[string]bool // empty -> auth disabled (dev/LAN only)
 	mux     *http.ServeMux
-	Version string // reported by the open "/" discovery endpoint; "" -> "dev"
-	CORS    string // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
+	Version string       // reported by the open "/" discovery endpoint; "" -> "dev"
+	CORS    string       // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
+	Logger  *slog.Logger // per-request access log; nil -> no request logging (see logging.go)
 	started time.Time
 }
 
@@ -44,8 +46,8 @@ func New(eng *engine.Engine, tokens []string) *Server {
 }
 
 // Handler returns the HTTP handler: CORS (outermost, so preflight bypasses auth) wrapping
-// Bearer-token auth wrapping the route mux.
-func (s *Server) Handler() http.Handler { return s.cors(s.auth(s.mux)) }
+// the optional request log, Bearer-token auth, and the route mux.
+func (s *Server) Handler() http.Handler { return s.cors(s.logging(s.auth(s.mux))) }
 
 func (s *Server) routes() {
 	h := func(path string, fn http.HandlerFunc) { s.mux.HandleFunc(path, postOnly(fn)) }
