@@ -82,7 +82,7 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
   security fixes — the low floor governs who can *import* the SDK, not what compiles
   the release.
 - Longer design notes that don't fit in code live in `docs/`: `dependencies.md`,
-  `turso.md`, `retention.md`, `resource-profile.md`.
+  `turso.md`, `retention.md`, `benchmark.md`.
 
 ## Architecture
 
@@ -101,7 +101,7 @@ cmd/mqlite/         CLI: serve | send | receive | peek | metrics | redrive | ...
    │   Embedded and Client both implement the private `settler` / `receiveSource`
    │   interfaces (mqlite.go), so *Message and Receiver work identically on both.
    ▼
-server/             Connect-style JSON-over-HTTP broker + Bearer auth + /ui + /metrics
+server/             Connect-style JSON-over-HTTP broker + Bearer auth + /metrics
    ▼ (shares ↓)
 wire/               THE JSON contract (request/response structs + route paths).
    │                Single source of truth imported by BOTH server and client — keep

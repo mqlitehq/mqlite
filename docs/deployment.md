@@ -91,7 +91,7 @@ curl https://your-mqlite.fly.dev/                # discovery card
 runs only while serving requests (cold-starts in seconds, stops when idle), so the
 steady-state cost is essentially the 1 GB volume. mqlite uses ~25–34 MB RSS for any
 workload, so 256 MB has ~8× headroom — see [benchmark.md](benchmark.md). For sizing
-and a full cost note, [resource-profile.md](resource-profile.md).
+and a full cost note, [benchmark.md](benchmark.md).
 
 ## systemd (bare metal)
 

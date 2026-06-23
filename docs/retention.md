@@ -36,7 +36,7 @@ DLQ.**
 
 Dead-lettered messages persist until an operator runs `Redrive` or `purge-dlq`. A
 poison-message storm or an unattended broker grows the volume without limit — at
-~0.4 KB/message ([resource-profile.md](resource-profile.md)) a runaway producer
+~0.4 KB/message ([benchmark.md](benchmark.md)) a runaway producer
 fills a 1 GB Fly volume with ~2.5M dead letters. The DLQ needs a *default ceiling*,
 not just a manual broom. (A secondary, milder risk: a queue whose consumers fall
 permanently behind grows its active backlog — but that is a capacity problem, not a
