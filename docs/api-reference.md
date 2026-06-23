@@ -163,7 +163,7 @@ Create or update a queue (idempotent on name).
 Register subscription `name` under `topic` (creates its backing queue).
 
 - **Request** `SubscribeRequest`: `topic`, `name`, `filter` (optional —
-  `{"expr": "<predicate>"}`, an [expr boolean over the message](filters.md); empty/omitted
+  `{"expr": "<predicate>"}`, an [expr boolean over the message](concepts.md#subscription-filters-expr); empty/omitted
   matches all). A malformed expr is rejected with `400 invalid_argument`. **Response** `{}`.
 
 ### ListQueues
@@ -174,12 +174,12 @@ Register subscription `name` under `topic` (creates its backing queue).
 ### ListSubscriptions
 
 - **Request** `{}`. **Response** `{subscriptions: [{topic, name, expr}]}` — every
-  subscription with its topic and [filter expression](filters.md) (`expr` empty = match
+  subscription with its topic and [filter expression](concepts.md#subscription-filters-expr) (`expr` empty = match
   all). `ListQueues` shows the backing queues; this exposes the topic + filter it omits.
 
 ### TestFilter
 
-- **Request** `{expr, message?}` — dry-run a [filter expression](filters.md): it
+- **Request** `{expr, message?}` — dry-run a [filter expression](concepts.md#subscription-filters-expr): it
   compiles `expr` and, if `message` (a sample, body base64) is given, evaluates it
   exactly as publish-time fan-out would (nothing is enqueued).
 - **Response** `{valid, error?, ran, matched}` — `valid` = compiled; `error` = the

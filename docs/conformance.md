@@ -63,7 +63,9 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 
 ## 5 · Ordering modes
 
-- **5.1 `standard`** — no ordering constraint; maximum parallelism. *(engine/functional_test.go)*
+- **5.1 `standard`** — per-`GroupID` FIFO with cross-group parallelism; messages with no
+  `GroupID` are unordered. Claim eligibility is identical to `group_fifo` — the only
+  difference is `group_fifo` additionally requires a `GroupID` at send time. *(engine/functional_test.go)*
 - **5.2 `group_fifo`** — strict FIFO per `GroupID` (head-of-line per group); a send
   without a `GroupID` MUST be rejected with `ErrGroupRequired`. *(engine/functional_test.go)*
 - **5.3 `strict_fifo`** — global FIFO: at most one message in flight for the queue at a
@@ -130,7 +132,7 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   `enqueued_at`/`visible_at`, the derived `subject_parts`/`body_size`/`property_keys`,
   and the body fields `body_text`/`body_json` — projected only when referenced, with
   `body_json` decoded only for a JSON content type, else `{}`); a message is routed to
-  a subscription iff its filter returns true.
+  a subscription if and only if its filter returns true.
   `enqueued_at` is the publish time and `visible_at` is the delivery time (equal for an
   immediate send, the scheduled time for a delayed one), so a delay is
   `visible_at - enqueued_at`. *(engine/filter_test.go `TestFilterFanoutConditions`,

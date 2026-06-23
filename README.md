@@ -239,7 +239,6 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 |---|---|
 | [CLI reference](docs/cli.md) | every command + flags; works embedded or against a broker |
 | [HTTP API reference](docs/api-reference.md) | endpoints, request/response, error codes |
-| [Subscription filters](docs/filters.md) | the `expr` topic-filter language + message env |
 | [MCP server](docs/mcp.md) | drive mqlite from an AI agent |
 | [Examples](docs/examples.md) | copy-runnable Go (embedded · outbox · remote) + curl |
 
@@ -250,6 +249,7 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 [Turso](docs/turso.md)
 
 **Understand it:**
+[Concepts & filters](docs/concepts.md) (model + `expr` filter language) ·
 [Conformance / TCK](docs/conformance.md) ·
 [Resource profile](docs/resource-profile.md) ·
 [Benchmarks](docs/benchmark.md) ·
@@ -298,12 +298,12 @@ peak backlog rather than shrinking; `VACUUM` is manual). See
 ```bash
 # --pull forces the latest golang:1.25 base (newest Go stdlib security patches) —
 # use it for release builds so a cached old base layer can't ship known CVEs.
-docker build --platform linux/amd64 --pull -t mqlite:0.1.0 .
-docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.1.0
+docker build --platform linux/amd64 --pull -t mqlite:0.1.1 .
+docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.1.1
 # remote Turso instead of the local volume:
 docker run --platform linux/amd64 -p 8080:8080 \
   -e MQLITE_DB=libsql://<db>.turso.io -e MQLITE_DB_AUTH_TOKEN=<jwt> \
-  -e MQLITE_TOKENS=mqk_dev mqlite:0.1.0
+  -e MQLITE_TOKENS=mqk_dev mqlite:0.1.1
 ```
 
 **Footprint:** ~11 MB static (CGO-free) binary, ~19 MB idle RSS, ~0.4 KB per message
