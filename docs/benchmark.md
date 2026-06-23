@@ -184,7 +184,7 @@ The Fly `shared-cpu-1x` is `GOMAXPROCS=1` with CPU-steal. Versus the 12-core loc
 **Calibrating the earlier estimate** (`resource-profile.md`: "Fly 上预计数千条/秒"):
 confirmed — **with batching, ~6k msg/s sustained** on the cheapest shared-cpu-1x;
 **without batching (concurrent single sends), only hundreds/s.** The "thousands per
-second" figure holds *iff* the client batches.
+second" figure holds *only when* the client batches.
 
 ## Findings summary
 

@@ -21,7 +21,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: a running broker + its Bearer token |
 | `MQLITE_TOKENS` | broker (`serve`) Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` durability (embedded/serve) |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`) |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
 The DB string / endpoint is **only** read from the environment, never compiled in.
 
@@ -43,19 +43,23 @@ mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering st
 ```
 | Flag | Default | |
 |---|---|---|
-| `--lock` | 30s | Peek-Lock duration |
-| `--max-delivery` | 10 | deliveries before a message goes to the DLQ |
+| `--lock` | 0 → 30s | Peek-Lock duration (`0` inherits the engine default, 30s) |
+| `--max-delivery` | 0 → 10 | deliveries before a message goes to the DLQ (`0` inherits 10) |
 | `--ttl` | 0 (unlimited) | default message TTL |
 | `--dedup` | 0 (off) | dedup window |
 | `--ordering` | `standard` | `standard` / `group_fifo` / `strict_fifo` |
+| `--dlq-max-age` | 0 (inherit) | per-queue DLQ retention: drop dead letters older than this |
+| `--dlq-max-count` | 0 (inherit) | per-queue: keep at most N dead letters (`-1` = unbounded) |
+| `--dlq-max-bytes` | 0 (inherit) | per-queue: cap dead-letter body bytes (`-1` = unbounded) |
 
 ### `subscribe <topic> <name>` — create a subscription
+*(alias: `create-subscription`)*
 ```bash
 mqlite subscribe orders eu-orders --expr 'subject_parts[0]=="orders" && properties["region"]=="eu"'
 ```
 | Flag | | |
 |---|---|---|
-| `--expr` | "" | subscription filter — an [expr](filters.md) boolean predicate; empty = match all |
+| `--expr` | "" | subscription filter — an [expr](concepts.md#subscription-filters-expr) boolean predicate; empty = match all |
 
 ### `send <queue> <body>` — enqueue a message
 `body` of `-` reads stdin; or use `--file`.

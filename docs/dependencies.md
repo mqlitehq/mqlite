@@ -41,7 +41,7 @@ that forces the decision below — security wins over the embedding floor.
 ## `expr-lang/expr` — the topic-filter dependency (MQLITE-17)
 
 Subscription filters are an [`expr-lang/expr`](https://github.com/expr-lang/expr)
-boolean predicate (see [filters.md](filters.md)). expr is a **direct core
+boolean predicate (see [concepts.md § filters](concepts.md#subscription-filters-expr)). expr is a **direct core
 dependency** — pinned at **v1.17.8**. It was vetted as a *long-term stable* choice,
 not just a convenient one:
 

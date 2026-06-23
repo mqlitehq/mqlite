@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQLite — Core Concepts</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --ink:#e7eaf0; --muted:#9aa3b2;
+    --line:#2a2f3a; --accent:#5b8cff; --accent2:#34d399; --warn:#f4b740; --danger:#f87171;
+    --mono:'SF Mono',ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;
+    --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.65;font-size:15px}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:960px;margin:0 auto;padding:0 24px}
+  header{padding:64px 0 28px;border-bottom:1px solid var(--line)}
+  .logo{display:inline-flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.3px}
+  .logo .dot{width:11px;height:11px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+  h1{font-size:34px;line-height:1.2;margin:18px 0 8px;font-weight:760;letter-spacing:-.4px}
+  .sub{color:var(--muted);font-size:16px;max-width:680px}
+  nav{position:sticky;top:0;z-index:5;background:rgba(15,17,21,.82);backdrop-filter:blur(10px);
+      border-bottom:1px solid var(--line);padding:11px 0;font-size:13.5px}
+  nav .wrap{display:flex;gap:18px;flex-wrap:wrap}
+  nav a{color:var(--muted)} nav a:hover{color:var(--ink);text-decoration:none}
+  section{padding:46px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:23px;margin:0 0 6px;letter-spacing:-.2px}
+  h2 .num{color:var(--accent);font-variant-numeric:tabular-nums;margin-right:10px;font-weight:600}
+  .lead{color:var(--muted);margin:0 0 22px;max-width:720px}
+  h3{font-size:16px;margin:26px 0 8px}
+  p{margin:10px 0}
+  code{font-family:var(--mono);font-size:.88em;background:var(--panel2);padding:2px 6px;border-radius:5px;color:#cdd6ea}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:16px 0}
+  .grid{display:grid;gap:14px}
+  @media(min-width:680px){.grid.c2{grid-template-columns:1fr 1fr}}
+  .concept{display:flex;gap:14px;align-items:flex-start}
+  .badge{flex:0 0 auto;width:40px;height:40px;border-radius:11px;display:grid;place-items:center;
+    font-family:var(--mono);font-weight:700;font-size:15px;background:var(--panel2);border:1px solid var(--line)}
+  .b-q{color:var(--accent)} .b-t{color:var(--accent2)} .b-s{color:#c084fc}
+  .b-f{color:var(--warn)} .b-i{color:#67e8f9}
+  pre.diagram{font-family:var(--mono);font-size:12px;line-height:1.5;background:var(--panel2);
+    border:1px solid var(--line);border-radius:12px;padding:18px;overflow-x:auto;color:#b9c2d6;margin:18px 0}
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;background:var(--panel)}
+  tbody tr:hover{background:var(--panel)}
+  .yes{color:var(--accent2);font-weight:600} .no{color:var(--danger);font-weight:600} .warnx{color:var(--warn);font-weight:600}
+  .qa{border-left:3px solid var(--accent);padding:4px 0 4px 16px;margin:18px 0}
+  .qa .q{font-weight:650;margin-bottom:4px}
+  .qa .a{color:var(--muted)}
+  .pill{display:inline-block;font-family:var(--mono);font-size:11.5px;padding:2px 9px;border-radius:999px;
+    border:1px solid var(--line);background:var(--panel2);color:var(--muted);margin:0 4px 4px 0}
+  .callout{display:flex;gap:12px;background:linear-gradient(180deg,rgba(91,140,255,.08),rgba(91,140,255,.02));
+    border:1px solid #2c3b63;border-radius:12px;padding:16px 18px;margin:18px 0}
+  .callout .i{flex:0 0 auto;font-size:18px}
+  .warnbox{background:linear-gradient(180deg,rgba(244,183,64,.08),transparent);border-color:#4a3d1c}
+  ul.tight{margin:10px 0;padding-left:20px} ul.tight li{margin:6px 0}
+  .tag-row{margin:8px 0 2px}
+  footer{padding:40px 0 70px;color:var(--muted);font-size:13px}
+  .kbd{font-family:var(--mono);font-size:12px;color:var(--accent2)}
+  /* advantage strip */
+  .adv{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}
+  .adv span{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink);
+    background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 13px}
+  .adv span::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent2)}
+  .adv b{color:var(--accent2);font-weight:700}
+  /* interactive fan-out simulator */
+  .sim{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin:20px 0}
+  .sim-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .chip{cursor:pointer;font-family:var(--mono);font-size:12px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--accent2);border-radius:8px;padding:6px 11px;user-select:none;transition:.12s}
+  .chip:hover{border-color:var(--accent2)}
+  .btn{cursor:pointer;background:linear-gradient(135deg,var(--accent),#6f7bff);color:#fff;border:none;
+    border-radius:9px;padding:9px 18px;font-weight:650;font-size:13px}
+  .btn:active{transform:translateY(1px)}
+  .subrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 13px;border:1px solid var(--line);
+    border-radius:10px;margin:8px 0;background:var(--panel2);transition:.15s}
+  .subrow.hit{border-color:#2f6f53;box-shadow:inset 0 0 0 1px rgba(52,211,153,.25)}
+  .subrow.miss{opacity:.45}
+  .subrow .nm{font-weight:650;min-width:108px}
+  .subrow .fx{font-family:var(--mono);font-size:11.5px;color:#cdd6ea;flex:1;min-width:160px}
+  .gate{font-family:var(--mono);font-size:11.5px;font-weight:700;white-space:nowrap}
+  .gate.pass{color:var(--accent2)} .gate.block{color:var(--danger)}
+  .qbox{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:188px;text-align:right}
+  .simnote{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin:12px 0 2px}
+  /* inline svg figures */
+  .fig{display:block;margin:18px auto;max-width:100%}
+  .fig text{font-family:var(--sans);fill:var(--ink)}
+  .fig .mut{fill:var(--muted)}
+  .fig .mono{font-family:var(--mono)}
+  /* filter sections */
+  .expr{display:block;font-family:var(--mono);font-size:13px;background:var(--panel2);border:1px solid var(--line);
+    border-left:3px solid var(--accent2);border-radius:8px;padding:11px 14px;margin:10px 0;color:#cfe3d6;white-space:pre-wrap;overflow-x:auto}
+  .expr .c{color:var(--muted)}
+  .vartype{color:var(--warn);font-family:var(--mono);font-size:.85em}
+  .dangerbox{background:linear-gradient(180deg,rgba(248,113,113,.08),transparent);border-color:#4a2424}
+  .tester{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin:18px 0}
+  .chiprow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 2px}
+  .chiprow .lbl{font-size:12px;color:var(--muted);min-width:74px}
+  .fexpr{display:flex;align-items:center;gap:10px;justify-content:space-between;cursor:pointer;
+    font-family:var(--mono);font-size:12.5px;background:var(--panel2);border:1px solid var(--line);
+    border-left:3px solid var(--line);border-radius:8px;padding:9px 12px;margin:7px 0;color:#cfe3d6;transition:.12s}
+  .fexpr:hover{border-color:var(--accent)}
+  .fexpr.route{border-left-color:var(--accent2)} .fexpr.drop{border-left-color:var(--danger);opacity:.72}
+  .verdict{font-family:var(--mono);font-size:11px;font-weight:700;white-space:nowrap}
+  .verdict.r{color:var(--accent2)} .verdict.d{color:var(--danger)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <span class="logo"><span class="dot"></span> MQLite</span>
+    <h1>Core concepts: Queue · Topic · Subscription · Filter · DLQ</h1>
+    <p class="sub">One SQLite file is the entire message broker. The model sits closest
+    to Azure Service Bus, but is simplified from first principles. This page explains how
+    it works, and how it compares to the equivalents on Azure / AWS / GCP.</p>
+    <div class="adv">
+      <span>One <b>SQLite file</b> · no cluster</span>
+      <span><b>Embeddable</b> in-process · zero-ops</span>
+      <span><b>Service Bus</b>-flavored API</span>
+      <span><b>Agent-native</b> · ships an MCP server</span>
+      <span><b>At-least-once</b> · DLQ · dedup</span>
+    </div>
+  </div>
+</header>
+
+<nav><div class="wrap">
+  <a href="#map">Overview</a>
+  <a href="#concepts">Five concepts</a>
+  <a href="#provision">Provisioning</a>
+  <a href="#ids">Two IDs</a>
+  <a href="#faq">FAQ</a>
+  <a href="#cloud">Cloud comparison</a>
+  <a href="#traps">Speedbumps</a>
+  <a href="#filters">Filters (expr)</a>
+  <a href="#env">Filter env</a>
+</div></nav>
+
+<section id="map">
+  <div class="wrap">
+    <h2><span class="num">01</span>The whole picture</h2>
+    <p class="lead">MQLite has two delivery targets: <b>send straight to a queue</b>, or
+      <b>publish to a topic and fan out</b>. One sentence to remember —
+      <b>a Topic stores nothing; it is just a rule that copies a message into a number of
+      subscription queues.</b> The thing that stores, is consumed, and dead-letters is
+      always a Queue.</p>
+    <svg class="fig" viewBox="0 0 720 300" width="720" height="300" role="img" aria-label="Queue vs Topic fan-out">
+      <defs>
+        <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#5b8cff"/>
+        </marker>
+        <marker id="arg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#34d399"/>
+        </marker>
+      </defs>
+      <!-- A: direct queue -->
+      <text x="20" y="24" font-size="13" font-weight="700">A · send → Queue</text>
+      <text class="mut" x="20" y="44" font-size="11">the only thing that stores messages</text>
+      <line x1="60" y1="60" x2="60" y2="92" stroke="#5b8cff" stroke-width="1.5" marker-end="url(#ar)"/>
+      <rect x="24" y="96" width="150" height="150" rx="10" fill="#171a21" stroke="#2a2f3a"/>
+      <text x="38" y="118" font-size="12" class="mono" font-weight="700">queue "orders"</text>
+      <rect x="40" y="130" width="118" height="26" rx="5" fill="#1d212b" stroke="#2a3550"/><text x="50" y="147" font-size="11" class="mono" fill="#cdd6ea">active</text>
+      <rect x="40" y="162" width="118" height="26" rx="5" fill="#1d212b" stroke="#2a3550"/><text x="50" y="179" font-size="11" class="mono" fill="#cdd6ea">locked</text>
+      <rect x="40" y="194" width="118" height="26" rx="5" fill="#1d212b" stroke="#4a3d1c"/><text x="50" y="211" font-size="11" class="mono" fill="#f4b740">DLQ (sub-state)</text>
+      <!-- B: topic fan-out -->
+      <text x="300" y="24" font-size="13" font-weight="700">B · publish → Topic, fan out</text>
+      <text class="mut" x="300" y="44" font-size="11">routing only — stores nothing itself</text>
+      <line x1="340" y1="60" x2="340" y2="78" stroke="#34d399" stroke-width="1.5" marker-end="url(#arg)"/>
+      <rect x="300" y="82" width="392" height="34" rx="8" fill="rgba(52,211,153,.08)" stroke="#2f6f53"/>
+      <text x="316" y="104" font-size="12" class="mono" font-weight="700" fill="#34d399">topic "events"</text>
+      <!-- three subs -->
+      <g font-size="10.5" class="mono">
+        <!-- sub 1 -->
+        <line x1="360" y1="116" x2="360" y2="146" stroke="#34d399" stroke-width="1.5" marker-end="url(#arg)"/>
+        <text class="mut" x="368" y="135">filter ✓</text>
+        <rect x="300" y="150" width="120" height="44" rx="8" fill="#171a21" stroke="#2f6f53"/>
+        <text x="312" y="170" fill="#e7eaf0" font-weight="700">audit</text>
+        <text class="mut" x="312" y="186">backing queue</text>
+        <!-- sub 2 -->
+        <line x1="500" y1="116" x2="500" y2="146" stroke="#34d399" stroke-width="1.5" marker-end="url(#arg)"/>
+        <text class="mut" x="508" y="135">filter ✓</text>
+        <rect x="440" y="150" width="120" height="44" rx="8" fill="#171a21" stroke="#2f6f53"/>
+        <text x="452" y="170" fill="#e7eaf0" font-weight="700">billing</text>
+        <text class="mut" x="452" y="186">backing queue</text>
+        <!-- sub 3 -->
+        <line x1="640" y1="116" x2="640" y2="146" stroke="#f87171" stroke-width="1.5" stroke-dasharray="3 3"/>
+        <text x="620" y="135" fill="#f87171">filter ✗ no copy</text>
+        <rect x="580" y="150" width="112" height="44" rx="8" fill="#171a21" stroke="#2a2f3a" opacity=".5"/>
+        <text x="592" y="170" fill="#9aa3b2">eu-only</text>
+        <text class="mut" x="592" y="186">(skipped)</text>
+      </g>
+      <text class="mut" x="300" y="222" font-size="11">each subscription = an independent queue · own seq_number · own DLQ</text>
+      <text class="mut" x="300" y="240" font-size="11">copies share <tspan fill="#f4b740">message_id</tspan>, get different <tspan fill="#34d399">seq_number</tspan></text>
+    </svg>
+
+    <p class="lead" style="margin-top:8px">Try it — toggle the message's properties and hit
+      <b>Publish</b>. Watch which subscriptions receive a copy, and how each copy gets its own
+      <code>seq_number</code> while sharing one <code>message_id</code>:</p>
+    <div class="sim" id="sim">
+      <div class="sim-row" style="justify-content:space-between">
+        <div class="sim-row">
+          <span class="chip" data-k="tier">tier=gold</span>
+          <span class="chip" data-k="region">region=eu</span>
+        </div>
+        <button class="btn" id="pub">Publish ▶</button>
+      </div>
+      <div id="subs"></div>
+      <div class="simnote" id="note">next publish → message_id "order-1"</div>
+    </div>
+  </div>
+</section>
+
+<section id="concepts">
+  <div class="wrap">
+    <h2><span class="num">02</span>The five concepts</h2>
+    <p class="lead">Queue is the only entity that actually stores messages; Topic /
+      Subscription / Filter are the routing layer around it.</p>
+
+    <div class="grid c2">
+      <div class="card concept">
+        <div class="badge b-q">Q</div>
+        <div>
+          <h3 style="margin-top:0">Queue</h3>
+          <p>A named container, the only place messages live. State machine:
+            <code>active → locked →</code> deleted on complete; <code>abandon</code>/timeout
+            returns to active; <code>reject</code> or delivery-count overflow goes to <b>DLQ</b>.</p>
+          <p><b>The DLQ is not another queue</b> — it is the same queue's
+            <code>state='dead_lettered'</code> sub-state, worked with
+            <code>peek</code> / <code>redrive</code> / <code>purge</code>.</p>
+        </div>
+      </div>
+
+      <div class="card concept">
+        <div class="badge b-t">T</div>
+        <div>
+          <h3 style="margin-top:0">Topic</h3>
+          <p>A <b>logical name</b> standing for "the set of subscriptions attached to it".</p>
+          <p>It is <b>not an explicitly created object</b> — it exists exactly while a
+            subscription references it. <b>A zero-subscription topic does not exist</b>, and a
+            topic <b>holds no messages</b>: no inbox, no buffer, no retention.</p>
+        </div>
+      </div>
+
+      <div class="card concept">
+        <div class="badge b-s">S</div>
+        <div>
+          <h3 style="margin-top:0">Subscription</h3>
+          <p>The binding from a Topic to an <b>independent backing queue</b>, with an optional Filter.</p>
+          <p>Each subscription has its own consumption, own seq, own DLQ, and belongs to
+            <b>one</b> topic. "A topic has many queues" precisely means:
+            <b>each subscription owns a queue, and the topic fans out through them</b>.</p>
+        </div>
+      </div>
+
+      <div class="card concept">
+        <div class="badge b-f">ƒ</div>
+        <div>
+          <h3 style="margin-top:0">Filter</h3>
+          <p>A <b>single expr-lang boolean expression</b> on a subscription, evaluated per
+            message at publish. Empty = match everything.</p>
+          <p><code>subject_parts[0] == "orders" &amp;&amp; properties["tier"] == "gold"</code></p>
+          <p>Compiled and type-checked at Subscribe; a bad one is rejected (400).</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="provision">
+  <div class="wrap">
+    <h2><span class="num">03</span>Provisioning: what you create, what is created for you</h2>
+    <p class="lead">You only ever do <b>two</b> kinds of "create". You never create a topic,
+      and never create a subscription's queue yourself.</p>
+    <table>
+      <thead><tr><th>Entity</th><th>How it comes to exist</th><th>Primitive</th></tr></thead>
+      <tbody>
+        <tr><td>Plain Queue</td><td class="warnx">created explicitly</td>
+            <td><code>CreateQueue(name)</code> — must exist before <code>Send</code>, else error (<b>no auto-create</b>)</td></tr>
+        <tr><td>Topic</td><td class="no">no create op (implicit)</td>
+            <td>springs into existence with its first subscription, gone when the last is removed — <b>no CreateTopic</b></td></tr>
+        <tr><td>Subscription + backing queue</td><td class="yes">created together, one call</td>
+            <td><code>Subscribe(topic, name, filter)</code> provisions the backing queue for you</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warnbox"><div class="i">⚠️</div><div>
+      <b>Common misconception:</b> there is no "create topic" and no same-named queue behind a
+      topic. The backing queue is named after the <b>subscription</b>, not the topic. You do
+      <b>not</b> pre-create a queue to attach a subscription — one call does it (guard: if
+      <code>name</code> is already a plain queue or a subscription under another topic →
+      <code>ErrNameConflict</code>).
+    </div></div>
+    <pre class="diagram">
+  You only ever do two kinds of "create":
+    CreateQueue(name)             -> one independent work queue (must exist before Send)
+    Subscribe(topic, sub, filter) -> auto-creates backing queue=sub + attaches to topic
+                                     (the topic comes into being as a side effect)
+
+  Name resolution (send / receive / ... all address by name):
+    name has subscription rows -> topic, fan out  ·  else -> existing queue  ·  else -> error</pre>
+    <div class="callout"><div class="i">🧭</div><div>
+      Difference from ASB: in ASB both the Topic and the Subscription are created explicitly;
+      MQLite makes "create topic" implicit and "create the subscription's queue" automatic —
+      <b>two fewer steps</b>.
+    </div></div>
+  </div>
+</section>
+
+<section id="ids">
+  <div class="wrap">
+    <h2><span class="num">04</span>Two IDs: don't conflate them</h2>
+    <p class="lead">When a message fans out to many subscriptions these two IDs behave the
+      opposite way — the single easiest thing to trip on.</p>
+    <table>
+      <thead><tr><th></th><th><code>message_id</code></th><th><code>seq_number</code></th></tr></thead>
+      <tbody>
+        <tr><td>Who assigns it</td><td>app, optionally</td><td>broker (globally monotonic)</td></tr>
+        <tr><td>Fanned out to N subs</td><td class="warnx"><b>identical</b> in every copy</td><td class="yes"><b>different</b> in every copy</td></tr>
+        <tr><td>Purpose</td><td>idempotency / dedup key<br>(dedup is per-queue: <code>(queue, message_id)</code>)</td>
+            <td>handle to locate + settle on consume<br>(≈ ASB SequenceNumber)</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><div class="i">💡</div><div>
+      So after fan-out the two copies share a <code>message_id</code> but not a
+      <code>seq_number</code>; they are <b>two fully independent rows</b>, each settled with its
+      own <code>seq_number</code> + <code>lock_token</code>, with no effect on the other.
+    </div></div>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <h2><span class="num">05</span>FAQ</h2>
+
+    <div class="qa">
+      <div class="q">Q: A message fans out to two subscriptions — same ID?</div>
+      <div class="a"><code>message_id</code> is <b>the same</b> (copied verbatim);
+        <code>seq_number</code> is <b>different</b> (each backing queue assigns its own
+        globally-monotonic id). Independent rows, settled separately.</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Q: I add a filtered subscription — do historical messages route to it?</div>
+      <div class="a"><b>No.</b> Fan-out happens <b>only at publish time</b>, against the
+        subscriptions that exist then. No replay, no offset rewind. A new subscription only
+        receives messages published <b>after</b> it (and matching its filter).
+        (Unlike Kafka; same as ASB / SNS+SQS.)</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Q: A topic gets a message with no subscriptions — dropped? buffered? a default inbox?</div>
+      <div class="a"><b>No inbox; not retained.</b> ① subscriptions exist but none match →
+        <b>silently dropped</b> (not an error); ② no subscription targets the name at all →
+        falls back to "must be an existing queue", delivered if one exists, else an error.
+        <b>To retain a message, have a matching subscription before publishing.</b></div>
+    </div>
+  </div>
+</section>
+
+<section id="cloud">
+  <div class="wrap">
+    <h2><span class="num">06</span>Comparison with cloud services</h2>
+    <p class="lead">MQLite is designed from first principles, but conceptually sits closest to
+      Azure Service Bus — used here as the main reference frame.</p>
+
+    <h3>Concept mapping</h3>
+    <table>
+      <thead><tr><th>MQLite</th><th>Azure Service Bus</th><th>AWS</th><th>GCP Pub/Sub</th></tr></thead>
+      <tbody>
+        <tr><td>Queue</td><td>Queue</td><td>SQS Queue</td><td>(Topic + single sub, roughly)</td></tr>
+        <tr><td>Topic</td><td>Topic</td><td>SNS Topic</td><td>Topic</td></tr>
+        <tr><td>Subscription</td><td>Subscription</td><td>SNS→SQS subscription</td><td>Subscription</td></tr>
+        <tr><td>Filter (expr-lang)</td><td>SQL/Correlation Filter</td><td>SNS Filter Policy</td><td>Subscription Filter</td></tr>
+        <tr><td>peek-lock + complete</td><td>Peek-Lock + Complete</td><td>Visibility Timeout + Delete</td><td>ack / nack</td></tr>
+        <tr><td><code>seq_number</code></td><td>SequenceNumber</td><td class="no">none</td><td class="no">none</td></tr>
+        <tr><td>DLQ (sub-state)</td><td>DLQ (sub-queue)</td><td>Redrive → DLQ</td><td>Dead-letter Topic</td></tr>
+        <tr><td>dedup window</td><td>Duplicate Detection</td><td>SQS FIFO dedup (5min)</td><td class="no">none native</td></tr>
+        <tr><td>group_id ordering</td><td>Session</td><td>FIFO MessageGroupId</td><td>Ordering Key</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Behavioral differences (the ones that bite)</h3>
+    <table>
+      <thead><tr><th>Dimension</th><th>MQLite</th><th>ASB</th><th>SNS+SQS</th><th>GCP Pub/Sub</th><th>Kafka</th></tr></thead>
+      <tbody>
+        <tr><td>New sub gets history</td><td class="no">✗</td><td class="no">✗</td><td class="no">✗</td><td class="warnx">⚠ seek replay</td><td class="yes">✓ offset 0</td></tr>
+        <tr><td>Topic stores messages</td><td class="no">✗ routing only</td><td class="no">✗</td><td class="no">SNS✗</td><td class="yes">✓ retention</td><td class="yes">✓ log is store</td></tr>
+        <tr><td>No matching subscriber</td><td>dropped</td><td>dropped</td><td>dropped</td><td>dropped</td><td class="yes">stays in log</td></tr>
+        <tr><td>Fan-out copies independent</td><td class="yes">✓ own seq+DLQ</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="warnx">⚠ many groups</td></tr>
+        <tr><td>Deployment shape</td><td class="yes">single SQLite file / embeddable</td><td>managed cluster</td><td>managed</td><td>managed</td><td>cluster</td></tr>
+        <tr><td>Ordering model</td><td>group_id FIFO (optional)</td><td>Session</td><td>FIFO queue</td><td>Ordering Key</td><td>per-partition</td></tr>
+      </tbody>
+    </table>
+
+    <div class="grid c2" style="margin-top:18px">
+      <div class="card">
+        <h3 style="margin-top:0;color:var(--accent2)">✓ Like Azure Service Bus</h3>
+        <p>peek-lock + DLQ + Topic/Subscription + Filter + SequenceNumber + dedup map almost
+          one-to-one. If you know ASB, the learning curve is near zero.</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0;color:var(--danger)">✗ Unlike Kafka</h3>
+        <p>MQLite is <b>subscription-based, keeps no log, cannot replay</b>. It is a "work queue
+          + topic fan-out", not a "message log / stream". For replay / event sourcing, choose
+          something like Kafka.</p>
+      </div>
+    </div>
+    <div class="callout"><div class="i">🧭</div><div>
+      <b>MQLite's own trade-off:</b> the whole broker is a single SQLite file — embeddable
+      in-process, zero-ops, agent-friendly (ships an MCP server). The price is exactly the
+      "no replay / no topic retention" simplifications above — a deliberate first-principles
+      design, not a gap.
+    </div></div>
+  </div>
+</section>
+
+<section id="traps">
+  <div class="wrap">
+    <h2><span class="num">07</span>Speedbumps</h2>
+    <div class="callout warnbox"><div class="i">⚠️</div><div>
+      <ul class="tight" style="margin:0">
+        <li>Treating a Topic as "an inbox that stores my messages" — it doesn't; subscribe first.</li>
+        <li>Assuming fan-out copies share one <code>seq_number</code> — they don't; settle each separately.</li>
+        <li>Assuming a new subscription back-fills history — it can't.</li>
+        <li>Treating the DLQ as a queue you create separately — it is a state of the same queue.</li>
+        <li>Publishing to a zero-subscription topic name expecting a buffer — it looks for a same-named queue, or errors.</li>
+      </ul>
+    </div>
+    <div class="tag-row">
+      <span class="pill">peek-lock</span><span class="pill">at-least-once</span>
+      <span class="pill">per-subscription DLQ</span><span class="pill">expr-lang filter</span>
+      <span class="pill">no replay</span><span class="pill">single-file</span><span class="pill">MCP-native</span>
+    </div>
+  </div>
+</section>
+
+<section id="filters">
+  <div class="wrap">
+    <h2><span class="num">08</span>Subscription filters (expr)</h2>
+    <p class="lead">A filter is the per-subscription gate in the topic fan-out above. An
+      <b>empty filter matches every message</b>. The expression is
+      <b>type-checked and compiled once when you subscribe</b> (a bad one is rejected
+      immediately with <code>400 invalid_argument</code>) and <b>run once per message at
+      publish time</b>.</p>
+    <svg class="fig" viewBox="0 0 720 150" width="720" height="150" role="img" aria-label="compile at subscribe, run at publish">
+      <defs>
+        <marker id="fa" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#5b8cff"/></marker>
+        <marker id="fag" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#34d399"/></marker>
+      </defs>
+      <text x="20" y="20" font-size="12" font-weight="700" fill="#5b8cff">Subscribe (once)</text>
+      <rect x="20" y="30" width="120" height="38" rx="8" fill="#171a21" stroke="#2a3550"/><text x="34" y="54" font-size="11.5" class="mono">your expr</text>
+      <line x1="140" y1="49" x2="186" y2="49" stroke="#5b8cff" stroke-width="1.5" marker-end="url(#fa)"/>
+      <rect x="190" y="30" width="150" height="38" rx="8" fill="#171a21" stroke="#2a3550"/><text x="204" y="48" font-size="11" class="mono">compile +</text><text x="204" y="61" font-size="11" class="mono">type-check</text>
+      <line x1="340" y1="49" x2="386" y2="49" stroke="#5b8cff" stroke-width="1.5" marker-end="url(#fa)"/>
+      <rect x="390" y="30" width="120" height="38" rx="8" fill="#171a21" stroke="#2a3550"/><text x="404" y="54" font-size="11.5" class="mono">cached</text>
+      <text x="548" y="44" font-size="11" fill="#f87171" class="mono">bad expr</text><text x="548" y="58" font-size="11" fill="#f87171" class="mono">→ 400</text>
+      <text x="20" y="100" font-size="12" font-weight="700" fill="#34d399">Publish (per message)</text>
+      <rect x="20" y="110" width="130" height="32" rx="8" fill="#171a21" stroke="#2f6f53"/><text x="34" y="131" font-size="11.5" class="mono">message</text>
+      <line x1="150" y1="126" x2="196" y2="126" stroke="#34d399" stroke-width="1.5" marker-end="url(#fag)"/>
+      <rect x="200" y="110" width="190" height="32" rx="8" fill="#171a21" stroke="#2f6f53"/><text x="214" y="131" font-size="11" class="mono">run program(message)</text>
+      <line x1="390" y1="126" x2="436" y2="126" stroke="#34d399" stroke-width="1.5" marker-end="url(#fag)"/>
+      <rect x="440" y="110" width="170" height="32" rx="8" fill="rgba(52,211,153,.08)" stroke="#2f6f53"/><text x="454" y="131" font-size="11" class="mono" fill="#34d399">route when true</text>
+    </svg>
+    <p>Because the filter runs at publish it sees the message's own fields and timestamps;
+      evaluation is deterministic and replayable (it never reads a wall clock).</p>
+
+    <h3>Try it — does this message route?</h3>
+    <p class="lead" style="margin-bottom:10px">Toggle the sample message, then click a filter to
+      evaluate it live against the current message (illustrative — the real engine runs expr-lang):</p>
+    <div class="tester" id="tester">
+      <div class="chiprow"><span class="lbl">subject</span><span class="chip" data-k="subject">orders.eu.new</span></div>
+      <div class="chiprow"><span class="lbl">properties</span>
+        <span class="chip" data-k="tier">tier=gold</span>
+        <span class="chip" data-k="region">region=eu</span>
+        <span class="chip" data-k="priority">priority=high</span>
+      </div>
+      <div class="chiprow"><span class="lbl">body.amount</span><span class="chip" data-k="amount">120</span>
+        <span class="lbl" style="min-width:0">body_text</span><span class="chip" data-k="text">"urgent: ship now"</span></div>
+      <div id="filters-out" style="margin-top:12px"></div>
+    </div>
+  </div>
+</section>
+
+<section id="setf">
+  <div class="wrap">
+    <h2><span class="num">09</span>Setting a filter</h2>
+    <table>
+      <thead><tr><th>Surface</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>CLI</td><td><code>mqlite subscribe orders orders-gold --expr 'properties["tier"]=="gold"'</code></td></tr>
+        <tr><td>Go SDK</td><td><code>cli.Subscribe(ctx, "orders", "orders-gold", &amp;mqlite.Filter{Expr: `properties["tier"]=="gold"`})</code></td></tr>
+        <tr><td>HTTP</td><td><code>POST /mqlite.v1.AdminService/Subscribe</code> body <code>{"topic":"orders","name":"orders-gold","filter":{"expr":"..."}}</code></td></tr>
+      </tbody>
+    </table>
+    <p>Re-subscribing with the same name and a new <code>expr</code> replaces the filter
+      (recompiled on the next publish). Omit the filter (or use an empty <code>expr</code>) to
+      receive everything.</p>
+  </div>
+</section>
+
+<section id="env">
+  <div class="wrap">
+    <h2><span class="num">10</span>The message environment</h2>
+    <p class="lead">The variables a filter can reference. <b>Unknown names are a compile
+      error</b>, so a typo is caught at <code>Subscribe</code>, not silently at runtime.</p>
+
+    <h3>Core</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Type</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>subject</code></td><td class="vartype">string</td><td>the routing label (= ASB Label)</td></tr>
+        <tr><td><code>properties</code></td><td class="vartype">map</td><td>custom string headers — <code>properties["k"]</code>, <code>"k" in properties</code> (absent key → <code>""</code>)</td></tr>
+        <tr><td><code>group_id</code></td><td class="vartype">string</td><td>ordering/session key</td></tr>
+        <tr><td><code>correlation_id</code></td><td class="vartype">string</td><td></td></tr>
+        <tr><td><code>reply_to</code></td><td class="vartype">string</td><td></td></tr>
+        <tr><td><code>message_id</code></td><td class="vartype">string</td><td>dedup/idempotency id</td></tr>
+        <tr><td><code>content_type</code></td><td class="vartype">string</td><td>e.g. <code>application/json</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Time</h3>
+    <p>Both are the message's own timestamps (epoch-derived <code>time.Time</code>, UTC), not a
+      wall-clock read.</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Type</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>enqueued_at</code></td><td class="vartype">time</td><td>when the message was published — and since fan-out runs at publish, this <i>is</i> "now"</td></tr>
+        <tr><td><code>visible_at</code></td><td class="vartype">time</td><td>when it becomes deliverable: equal to <code>enqueued_at</code> for an immediate send, the scheduled time for a delayed/<code>Schedule</code>d one (never null)</td></tr>
+      </tbody>
+    </table>
+    <p>Compute a delay by subtraction (<code>time - time</code> → duration):</p>
+    <span class="expr">visible_at - enqueued_at > days(1)        <span class="c"># only route significantly-delayed messages</span>
+enqueued_at.Hour() >= 9 && enqueued_at.Hour() <= 21   <span class="c"># business-hours publish window</span></span>
+
+    <h3>Derived</h3>
+    <p>Computed from the message; always defined (cannot error on absence).</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Type</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><code>subject_parts</code></td><td class="vartype">[]string</td><td><code>"orders.eu.new"</code> → <code>["orders","eu","new"]</code> — MQTT-style hierarchy: <code>subject_parts[0] == "orders"</code></td></tr>
+        <tr><td><code>body_size</code></td><td class="vartype">int</td><td>byte length — <code>body_size < 4096</code> (route by size, not content)</td></tr>
+        <tr><td><code>property_keys</code></td><td class="vartype">[]string</td><td>sorted property names — <code>len(property_keys) > 0</code>, <code>"tier" in property_keys</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Body content</h3>
+    <p>Route on the payload itself. These are <b>projected only when your filter references
+      them</b>, so filters that don't touch the body pay nothing.</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Type</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><code>body_text</code></td><td class="vartype">string</td><td>the raw body as text — <code>body_text contains "urgent"</code> (always defined; <code>""</code> for an empty body)</td></tr>
+        <tr><td><code>body_json</code></td><td class="vartype">map</td><td>the body decoded as a JSON object — <code>body_json.amount > 100</code>, <code>body_json["tier"] == "gold"</code>, <code>"k" in body_json</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout warnbox"><div class="i">⚠️</div><div>
+      <code>body_json</code> is <b>only decoded when <code>content_type</code> looks like JSON</b>
+      (or is unset); an explicit non-JSON type, an empty body, invalid JSON, or a non-object
+      JSON (array/scalar) all yield an empty object <code>{}</code>. So <code>body_json</code>
+      itself is never null — but reaching into an <b>absent field</b>
+      (<code>body_json.amount</code> with no <code>amount</code>) yields <code>nil</code>, and
+      comparing that (<code>nil > 100</code>) is a runtime error → <b>fail-closed</b> (not
+      routed, logged). Guard with a presence check:
+      <span class="expr">"amount" in body_json && body_json.amount > 100</span>
+    </div></div>
+  </div>
+</section>
+
+<section id="lang">
+  <div class="wrap">
+    <h2><span class="num">11</span>Filter language</h2>
+    <p class="lead">Standard expr operators and builtins are available.</p>
+    <ul class="tight">
+      <li>comparison <code>== != &lt; &lt;= &gt; &gt;=</code>, boolean <code>&amp;&amp; || !</code> (or <code>and</code>/<code>or</code>/<code>not</code>), membership <code>in</code></li>
+      <li>strings: <code>startsWith</code>, <code>endsWith</code>, <code>contains</code>, <code>matches</code> (regex)</li>
+      <li>collections: <code>len()</code>, <code>all()</code>, <code>any()</code>, <code>none()</code>, <code>filter()</code>, <code>map()</code>, indexing <code>x[0]</code></li>
+    </ul>
+    <h3>Durations</h3>
+    <p>For the time fields, durations are spelled with <b>type-checked helpers</b>
+      (recommended, unambiguous) or an extended <code>duration()</code>:</p>
+    <table>
+      <thead><tr><th>Form</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>seconds(n)</code> <code>minutes(n)</code> <code>hours(n)</code> <code>days(n)</code> <code>weeks(n)</code></td><td>a duration; <code>days</code>/<code>weeks</code> are fixed (24h / 7d)</td></tr>
+        <tr><td><code>duration("90m")</code> <code>duration("1d12h")</code> <code>duration("2w")</code></td><td>string form; Go's units <b>plus</b> <code>d</code> (=24h) and <code>w</code> (=7d)</td></tr>
+      </tbody>
+    </table>
+    <p>There is no month/year unit — calendars make them ambiguous as fixed spans. For
+      "older than a month", use <code>days(30)</code>.</p>
+    <span class="expr">visible_at - enqueued_at == hours(2)
+visible_at - enqueued_at > duration("1d")</span>
+
+    <h3>expr-lang reference</h3>
+    <p>The filter engine <b>is</b> <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener"><code>expr-lang/expr</code></a>
+      (pinned <b>v1.17.8</b>), so its full language — every operator, literal, and builtin —
+      is available and documented upstream. Only the <b>message environment</b> (§10) and the
+      duration helpers are MQLite-specific; everything else is stock expr.</p>
+    <table>
+      <thead><tr><th>What</th><th>Link</th></tr></thead>
+      <tbody>
+        <tr><td>Source / project</td><td><a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">github.com/expr-lang/expr</a></td></tr>
+        <tr><td>Language reference (canonical)</td><td><a href="https://expr-lang.org/docs/language-definition" target="_blank" rel="noopener">expr-lang.org/docs/language-definition</a></td></tr>
+        <tr><td>Operators</td><td><a href="https://expr-lang.org/docs/language-definition#operators" target="_blank" rel="noopener">…#operators</a></td></tr>
+        <tr><td>String builtins</td><td><a href="https://expr-lang.org/docs/language-definition#string-functions" target="_blank" rel="noopener">…#string-functions</a></td></tr>
+        <tr><td>Array / collection builtins</td><td><a href="https://expr-lang.org/docs/language-definition#array-functions" target="_blank" rel="noopener">…#array-functions</a></td></tr>
+        <tr><td>Date / duration builtins</td><td><a href="https://expr-lang.org/docs/language-definition#date-functions" target="_blank" rel="noopener">…#date-functions</a></td></tr>
+        <tr><td>Number builtins</td><td><a href="https://expr-lang.org/docs/language-definition#number-functions" target="_blank" rel="noopener">…#number-functions</a></td></tr>
+        <tr><td>Docs home</td><td><a href="https://expr-lang.org/docs/getting-started" target="_blank" rel="noopener">expr-lang.org/docs/getting-started</a></td></tr>
+      </tbody>
+    </table>
+    <p style="color:var(--muted)">The evaluator is sandboxed (memory-safe, side-effect-free,
+      always-terminating; §13), so IO/non-deterministic upstream builtins don't apply.
+      <code>days()</code>/<code>weeks()</code>/<code>duration("…d…w")</code> are MQLite extensions
+      on top of expr's date functions.</p>
+  </div>
+</section>
+
+<section id="fex">
+  <div class="wrap">
+    <h2><span class="num">12</span>Filter examples</h2>
+    <span class="expr">subject_parts[0] == "orders"                              <span class="c"># topic hierarchy</span>
+properties["tier"] == "gold" && properties["region"] == "eu"
+"priority" in properties && properties["priority"] == "high"
+subject startsWith "payment." and not (properties["test"] == "true")
+body_size < 4096                                          <span class="c"># small messages only</span>
+visible_at - enqueued_at > days(1)                        <span class="c"># delayed > 1 day</span>
+len(subject_parts) >= 2 && subject_parts[1] == "eu"
+"amount" in body_json && body_json.amount > 100           <span class="c"># route on payload (guarded)</span>
+body_text contains "urgent"</span>
+  </div>
+</section>
+
+<section id="fsafe">
+  <div class="wrap">
+    <h2><span class="num">13</span>Filter safety</h2>
+    <p class="lead">Filters are safe to accept from untrusted callers — the env is the only
+      input and there is no IO.</p>
+    <ul class="tight">
+      <li>expr is <b>memory-safe, side-effect-free, and always-terminating</b> by design (no
+        file or network access, no unbounded loops).</li>
+      <li>A filter must be a <b>boolean</b> (<code>expr.AsBool</code>); a non-bool expression is
+        rejected at <code>Subscribe</code>.</li>
+      <li>Resource bounds: the source length and compiled AST size are capped.</li>
+    </ul>
+    <div class="callout dangerbox"><div class="i">🛡️</div><div>
+      <b>Fail-closed:</b> if a filter errors at runtime (e.g. <code>subject_parts[3]</code> on a
+      two-part subject) or panics, the message is <b>not</b> routed to that subscription and the
+      error is logged — never a broker crash, never a silent match.
+    </div></div>
+    <div style="margin-top:14px">
+      <span class="pill">expr-lang</span><span class="pill">compile-at-subscribe</span>
+      <span class="pill">run-at-publish</span><span class="pill">fail-closed</span>
+      <span class="pill">no IO</span><span class="pill">always-terminating</span>
+    </div>
+    <p style="margin-top:18px;color:var(--muted)">Reference:
+      <a href="https://github.com/expr-lang/expr" target="_blank" rel="noopener">github.com/expr-lang/expr</a> ·
+      <a href="https://expr-lang.org/docs/language-definition" target="_blank" rel="noopener">language definition</a> ·
+      <a href="dependencies.md">dependencies.md</a> (why expr is a stable dependency) ·
+      <a href="conformance.md">conformance.md</a> §11 (normative filter invariants).</p>
+  </div>
+</section>
+
+<footer><div class="wrap">
+  MQLite · concepts &amp; subscription filters · same source as <span class="kbd">docs/concepts.md</span> ·
+  behavior per <span class="kbd">engine/engine.go</span>
+  <span class="kbd">sendTracked</span> / <span class="kbd">resolveTargets</span>.
+</div></footer>
+
+<script>
+(function(){
+  var msg = {tier:'gold', region:'eu'};
+  var alt = {tier:{gold:'silver',silver:'gold'}, region:{eu:'us',us:'eu'}};
+  var seq = 0, n = 0;
+  var subs = [
+    {nm:'audit',      fx:'(empty filter — all)',     f:function(){return true;}},
+    {nm:'billing',    fx:'properties["region"]=="eu"', f:function(m){return m.region==='eu';}},
+    {nm:'gold-orders',fx:'properties["tier"]=="gold"', f:function(m){return m.tier==='gold';}}
+  ];
+  subs.forEach(function(s){ s.last=''; });
+  var elSubs = document.getElementById('subs');
+  var elNote = document.getElementById('note');
+  function render(){
+    elSubs.innerHTML = subs.map(function(s){
+      var pass = s.f(msg);
+      return '<div class="subrow '+(pass?'hit':'miss')+'">'
+        + '<span class="nm">'+s.nm+'</span>'
+        + '<span class="fx">'+s.fx+'</span>'
+        + '<span class="gate '+(pass?'pass':'block')+'">'+(pass?'PASS ▸':'BLOCK ✗')+'</span>'
+        + '<span class="qbox">'+(s.last||'—')+'</span></div>';
+    }).join('');
+    elNote.textContent = 'next publish → message_id "order-'+(n+1)+'"';
+  }
+  document.querySelectorAll('#sim .chip').forEach(function(c){
+    c.onclick = function(){
+      var k = c.dataset.k; msg[k] = alt[k][msg[k]]; c.textContent = k+'='+msg[k]; render();
+    };
+  });
+  document.getElementById('pub').onclick = function(){
+    n++; var mid = 'order-'+n; var any=false;
+    subs.forEach(function(s){
+      if (s.f(msg)) { seq++; s.last = '✓ '+mid+' → seq #'+seq; any=true; }
+      else { s.last = '✗ dropped (filter)'; }
+    });
+    render();
+    elNote.textContent = any
+      ? 'published '+mid+': copies share message_id "'+mid+'", different seq_number ↑'
+      : 'published '+mid+': no filter matched — message dropped, stored nowhere';
+  };
+  render();
+})();
+</script>
+
+<script>
+(function(){
+  var m = {subject:'orders.eu.new', tier:'gold', region:'eu', priority:'high', amount:120, text:'"urgent: ship now"'};
+  var alt = {
+    subject:{'orders.eu.new':'payment.us.refund','payment.us.refund':'orders.eu.new'},
+    tier:{gold:'silver',silver:'gold'}, region:{eu:'us',us:'eu'}, priority:{high:'low',low:'high'},
+    amount:{120:'40',40:'120'}, text:{'"urgent: ship now"':'"all good"','"all good"':'"urgent: ship now"'}
+  };
+  function parts(){ return m.subject.split('.'); }
+  function amt(){ return parseInt(m.amount,10); }
+  var filters = [
+    {x:'subject_parts[0] == "orders"', f:function(){return parts()[0]==='orders';}},
+    {x:'properties["tier"]=="gold" && properties["region"]=="eu"', f:function(){return m.tier==='gold'&&m.region==='eu';}},
+    {x:'"priority" in properties && properties["priority"]=="high"', f:function(){return m.priority==='high';}},
+    {x:'body_size < 4096', f:function(){return true;}},
+    {x:'"amount" in body_json && body_json.amount > 100', f:function(){return amt()>100;}},
+    {x:'body_text contains "urgent"', f:function(){return m.text.indexOf('urgent')>=0;}}
+  ];
+  var elF = document.getElementById('filters-out');
+  function render(){
+    elF.innerHTML = filters.map(function(fl){
+      var ok = fl.f();
+      return '<div class="fexpr '+(ok?'route':'drop')+'"><span>'+fl.x.replace(/</g,'&lt;')+'</span>'
+        + '<span class="verdict '+(ok?'r':'d')+'">'+(ok?'ROUTE ▸':'DROP ✗')+'</span></div>';
+    }).join('');
+  }
+  document.querySelectorAll('#tester .chip').forEach(function(c){
+    c.onclick = function(){ var k=c.dataset.k; m[k]=alt[k][m[k]];
+      c.textContent = (k==='subject'||k==='amount'||k==='text') ? m[k] : k+'='+m[k]; render(); };
+  });
+  render();
+})();
+</script>
+</body>
+</html>

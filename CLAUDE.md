@@ -174,8 +174,8 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   out to each subscription's backing queue (addressed by the bare subscription name).
   A subscription filter is one `expr-lang` boolean predicate over the message
   (`Filter{Expr}`), compiled+type-checked at Subscribe (cached per subscription) and
-  run fail-closed at publish — see `docs/filters.md`. Receive/Redrive/Stats target the
-  subscription by name.
+  run fail-closed at publish — see `docs/concepts.md` (§ Subscription filters).
+  Receive/Redrive/Stats target the subscription by name.
 
 ### Conventions specific to this repo
 

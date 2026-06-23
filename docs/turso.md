@@ -35,15 +35,16 @@ Turso closes idle Hrana streams; `libsql-client-go` then returns a **wrapped**
 `driver.ErrBadConn` (`"stream is closed: driver: bad connection"`). Because it is
 wrapped, `database/sql` will not transparently retry it, so MQLite does:
 
-- **Bounded retry on connection errors only** — `maxConnAttempts = 3`. A closed
+- **Bounded retry on transient errors only** — `maxConnAttempts = 6`. A closed
   stream means the statement never reached the server, so retrying on a fresh
   pooled connection cannot double-execute. `exec`, `query`, `queryRowScan` and the
   whole-transaction `inTx` all retry under this rule.
-- **Never retry a logical error.** `retryable = remote && isConnErr`. A constraint
-  violation or `no such table` is final — retrying could double-apply a committed
-  write. Local stores never retry at all (a single conn is the single writer).
-- **`busy_timeout(5000)`** absorbs transient `SQLITE_BUSY` at the driver level
-  rather than surfacing it as an error.
+- **Never retry a logical error.** `retryable = remote && (isConnErr || isBusyErr)`.
+  A constraint violation or `no such table` is final — retrying could double-apply a
+  committed write. Local stores never retry at all (a single conn is the single writer).
+- **`busy_timeout(5000)`** absorbs most transient `SQLITE_BUSY` at the driver level;
+  any `database is locked` / `SQLITE_BUSY` that still surfaces is caught by `isBusyErr`
+  and retried under the same bound.
 
 The classifier that decides all this is unit-tested hermetically — see
 `TestIsConnErr` / `TestRetryableAndAttempts` in `engine/storage_test.go` — so the
