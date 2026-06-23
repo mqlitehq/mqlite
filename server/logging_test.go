@@ -35,7 +35,7 @@ func (c capture) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 func (c capture) WithAttrs([]slog.Attr) slog.Handler { return c }
-func (c capture) WithGroup(string) slog.Handler       { return c }
+func (c capture) WithGroup(string) slog.Handler      { return c }
 
 // The access log emits one line per request, with the level chosen by status and the
 // shortened RPC as the message.
@@ -55,13 +55,17 @@ func TestRequestLog(t *testing.T) {
 	// authed → 200 info
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+wire.PathListQueues, bytes.NewReader([]byte("{}")))
 	req.Header.Set("Authorization", "Bearer secret")
-	if _, err := http.DefaultClient.Do(req); err != nil {
+	res1, err := http.DefaultClient.Do(req)
+	if err != nil {
 		t.Fatal(err)
 	}
+	res1.Body.Close()
 	// no token → 401 warn
-	if _, err := http.Post(ts.URL+wire.PathListQueues, "application/json", bytes.NewReader([]byte("{}"))); err != nil {
+	res2, err := http.Post(ts.URL+wire.PathListQueues, "application/json", bytes.NewReader([]byte("{}")))
+	if err != nil {
 		t.Fatal(err)
 	}
+	res2.Body.Close()
 
 	if len(lines) != 2 {
 		t.Fatalf("want 2 access-log lines, got %d: %+v", len(lines), lines)
