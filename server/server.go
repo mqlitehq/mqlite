@@ -27,12 +27,13 @@ type Server struct {
 	mux     *http.ServeMux
 	Version string // reported by the open "/" discovery endpoint; "" -> "dev"
 	CORS    string // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
+	started time.Time
 }
 
 // New builds a Server. tokens is the set of accepted Bearer tokens; pass nil/empty
 // to disable auth (documented as a localhost/LAN downgrade, §7.5).
 func New(eng *engine.Engine, tokens []string) *Server {
-	s := &Server{eng: eng, tokens: map[string]bool{}, mux: http.NewServeMux()}
+	s := &Server{eng: eng, tokens: map[string]bool{}, mux: http.NewServeMux(), started: time.Now()}
 	for _, t := range tokens {
 		if t = strings.TrimSpace(t); t != "" {
 			s.tokens[t] = true
@@ -68,6 +69,7 @@ func (s *Server) routes() {
 	h(wire.PathTestFilter, s.handleTestFilter)
 	h(wire.PathRedrive, s.handleRedrive)
 	h(wire.PathPurge, s.handlePurge)
+	h(wire.PathStatus, s.handleStatus)
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -510,6 +512,42 @@ func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request)
 		resp.Subscriptions[i] = wire.SubscriptionJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr}
 	}
 	writeJSON(w, resp)
+}
+
+// handleStatus reports a desensitized runtime snapshot for an ops view: backend kind,
+// redacted location, read latency, local footprint, counts, uptime. Behind auth.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	st := s.eng.Status(ctx)
+	version := s.Version
+	if version == "" {
+		version = "dev"
+	}
+	// Counts are best-effort — a count failure must not fail the whole status read.
+	var queues, subs int
+	if qs, err := s.eng.ListQueues(ctx); err == nil {
+		for _, q := range qs {
+			if q.Kind != "subscription" {
+				queues++
+			}
+		}
+	}
+	if ss, err := s.eng.ListSubscriptions(ctx); err == nil {
+		subs = len(ss)
+	}
+	writeJSON(w, wire.StatusResponse{
+		Version:       version,
+		Backend:       st.Backend,
+		Remote:        st.Remote,
+		Location:      st.Location,
+		SchemaVersion: st.SchemaVersion,
+		PingMs:        st.PingMs,
+		DBSizeBytes:   st.SizeBytes,
+		Queues:        queues,
+		Subscriptions: subs,
+		UptimeMs:      time.Since(s.started).Milliseconds(),
+		Auth:          len(s.tokens) > 0,
+	})
 }
 
 func (s *Server) handleTestFilter(w http.ResponseWriter, r *http.Request) {

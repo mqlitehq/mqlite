@@ -22,6 +22,7 @@ import (
 type db struct {
 	sql    *sql.DB
 	remote bool
+	dsn    string    // the user-facing DB string (no auth token — that's only in the conn string)
 	lock   io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
 }
 
@@ -131,7 +132,7 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		}
 		return nil, fmt.Errorf("ping %s: %w", driver, err)
 	}
-	return &db{sql: sdb, remote: remote, lock: lock}, nil
+	return &db{sql: sdb, remote: remote, dsn: dsn, lock: lock}, nil
 }
 
 // initSchema creates the tables/indexes idempotently (CREATE IF NOT EXISTS) and
