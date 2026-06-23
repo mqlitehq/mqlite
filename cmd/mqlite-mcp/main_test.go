@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -164,6 +166,108 @@ func TestToolForwardsHitRealBrokerRoutes(t *testing.T) {
 		text := res["content"].([]map[string]any)[0]["text"].(string)
 		if strings.Contains(text, "no such path") {
 			t.Errorf("tool %q forwards to a route the broker does not serve: %s", tl.name, text)
+		}
+	}
+}
+
+// wireShape walks a wire.*Request type and returns the sorted set of json field
+// paths reachable from it (one level into nested structs and slices-of-structs, so
+// `messages[].body` and `config.dlq_max_age_ms` are included). `[]byte` and maps are
+// leaves (not recursed).
+func wireShape(t reflect.Type) []string {
+	out := []string{}
+	var walk func(rt reflect.Type, prefix string)
+	walk = func(rt reflect.Type, prefix string) {
+		for rt.Kind() == reflect.Ptr {
+			rt = rt.Elem()
+		}
+		if rt.Kind() != reflect.Struct {
+			return
+		}
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			tag := strings.Split(f.Tag.Get("json"), ",")[0]
+			if tag == "" || tag == "-" {
+				continue
+			}
+			ft := f.Type
+			for ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			switch {
+			case ft.Kind() == reflect.Struct:
+				walk(ft, prefix+tag+".")
+			case (ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array) &&
+				ft.Elem().Kind() == reflect.Struct:
+				walk(ft.Elem(), prefix+tag+"[].")
+			default:
+				out = append(out, prefix+tag)
+			}
+		}
+	}
+	walk(t, "")
+	sort.Strings(out)
+	return out
+}
+
+// goldenWireShapes pins the exact field shape of every wire.*Request type the MCP
+// tools forward into. The reverse guard to TestToolSchemaForwardConsistency: that test
+// proves every *schema property* is wired in; this one proves no *wire field* drifts
+// in/out unnoticed. Adding/removing/renaming a field on any of these wire types fails
+// here — forcing a conscious decision about whether the MCP tool schema should expose
+// it (then update this golden). Closes gap 1-reverse in docs/mcp-wire-compat-notes.md.
+var goldenWireShapes = map[string][]string{
+	"wire.Empty": {},
+	"wire.CreateQueueRequest": {
+		"config.dead_letter_on_expire", "config.default_ttl_ms", "config.dedup_window_ms",
+		"config.dlq_max_age_ms", "config.dlq_max_bytes", "config.dlq_max_count", "config.kind",
+		"config.lock_duration_ms", "config.max_delivery_count", "config.ordering_mode", "name",
+	},
+	"wire.SendRequest": {
+		"messages[].body", "messages[].content_type", "messages[].correlation_id",
+		"messages[].dead_letter_description", "messages[].dead_letter_reason",
+		"messages[].delivery_count", "messages[].enqueued_at_ms", "messages[].expires_at_ms",
+		"messages[].group_id", "messages[].locked_until_ms", "messages[].lock_token",
+		"messages[].message_id", "messages[].properties", "messages[].reply_to",
+		"messages[].seq_number", "messages[].state", "messages[].subject",
+		"messages[].visible_at_ms", "queue", "scheduled_enqueue_time_ms", "ttl_ms",
+	},
+	"wire.ReceiveRequest": {"max_messages", "queue", "receive_attempt_id", "receive_mode", "wait_time_ms"},
+	"wire.SettleRequest": {
+		"dead_letter_description", "dead_letter_reason", "delay_ms", "lock_token", "queue", "seq_number",
+	},
+	"wire.PeekRequest":    {"from_seq", "max", "queue", "state"},
+	"wire.MetricsRequest": {"queue"},
+	"wire.RedriveRequest": {"max", "older_than_ms", "queue", "rate_per_sec", "target"},
+	"wire.PurgeRequest":   {"max", "older_than_ms", "queue"},
+}
+
+func TestToolWireShapesPinned(t *testing.T) {
+	seen := map[string]bool{}
+	for _, tl := range tools {
+		_, body := tl.forward(map[string]any{})
+		name := reflect.TypeOf(body).String()
+		seen[name] = true
+		want, ok := goldenWireShapes[name]
+		if !ok {
+			t.Errorf("tool %q forwards %s, which is not pinned in goldenWireShapes — add it "+
+				"(and decide whether the tool schema should expose its fields)", tl.name, name)
+			continue
+		}
+		sort.Strings(want) // golden literals need not be hand-sorted
+		if got := wireShape(reflect.TypeOf(body)); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s field shape changed.\n  got:  %v\n  want: %v\n"+
+				"A wire request type the MCP forwards into gained/lost/renamed a field. Review "+
+				"whether cmd/mqlite-mcp's tool schema should expose it, then update goldenWireShapes.",
+				name, got, want)
+		}
+	}
+	for name := range goldenWireShapes {
+		if !seen[name] {
+			t.Errorf("goldenWireShapes pins %s, but no tool forwards it anymore — remove the stale entry", name)
 		}
 	}
 }
