@@ -102,8 +102,8 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 ## 9 · Auth & errors (broker)
 
 - **9.1** When `MQLITE_TOKENS` is set, every endpoint MUST require a valid
-  `Authorization: Bearer` token **except** the open `/` (discovery), `/healthz`, and
-  `/ui`; a missing/invalid token → 401 `unauthenticated`. *(server/errors_test.go, server/index_test.go)*
+  `Authorization: Bearer` token **except** the open `/` (discovery) and `/healthz`;
+  a missing/invalid token → 401 `unauthenticated`. *(server/errors_test.go, server/index_test.go)*
 - **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status:
   400 `invalid_argument`/`group_required` · 401 `unauthenticated` · 404 `not_found` ·
   409 `already_exists`/`lock_lost`/`name_conflict` · 413 `message_too_large` · 500

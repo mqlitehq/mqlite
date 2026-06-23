@@ -1,9 +1,8 @@
 # Observability
 
 The broker exposes Prometheus metrics at **`GET /metrics`** (behind Bearer auth, like
-the RPCs — a scraper passes the token; only `/` and `/healthz` are open). Plus the
-read-only **`/ui`** dashboard for eyeballing queues. This guide wires `/metrics` into
-Prometheus + Grafana and suggests alerts.
+the RPCs — a scraper passes the token; only `/` and `/healthz` are open). This guide
+wires `/metrics` into Prometheus + Grafana and suggests alerts.
 
 ## Metrics
 
