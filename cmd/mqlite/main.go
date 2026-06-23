@@ -8,6 +8,8 @@
 //	MQLITE_ENDPOINT=http://host:port + MQLITE_TOKEN=<bearer>      (client mode; wins if set)
 //	MQLITE_TOKENS=mqk_a,mqk_b   (tokens `serve` accepts; UNSET => a token is generated
 //	                             and printed; =off disables auth — localhost/LAN only)
+//	MQLITE_CORS=* | https://app.example | off   (Access-Control-Allow-Origin for `serve`;
+//	                             UNSET => *, since RPCs still need a token; =off disables)
 //	MQLITE_MAX_MESSAGE_BYTES=<n>                                  (reject larger bodies)
 //	MQLITE_SYNC=NORMAL|FULL|OFF                                   (durability; embedded/serve)
 //	MQLITE_DLQ_MAX_AGE=14d-ish (e.g. 336h) · MQLITE_DLQ_MAX_COUNT=1000000 · MQLITE_DLQ_RETENTION=off
@@ -207,6 +209,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	defer eng.Close()
 
 	tokens, authNote := resolveBrokerTokens(os.Getenv("MQLITE_TOKENS"))
+	corsOrigin, corsNote := resolveCORS(os.Getenv("MQLITE_CORS"))
 	remote := ""
 	if eng.Engine().Remote() {
 		remote = " (remote Turso/libSQL)"
@@ -215,12 +218,12 @@ func cmdServe(ctx context.Context, args []string) error {
 	if strings.HasPrefix(host, ":") {
 		host = "localhost" + host
 	}
-	fmt.Printf("mqlite %s serving on %s — DB %s%s\n%s\nweb UI: http://%s/ui\n",
-		version, *addr, redact(db), remote, authNote, host)
+	fmt.Printf("mqlite %s serving on %s — DB %s%s\n%s\n%s\nweb UI: http://%s/ui\n",
+		version, *addr, redact(db), remote, authNote, corsNote, host)
 
 	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return eng.Serve(sctx, *addr, mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version))
+	return eng.Serve(sctx, *addr, mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version), mqlite.WithCORS(corsOrigin))
 }
 
 // resolveBrokerTokens decides the broker's accepted Bearer tokens from MQLITE_TOKENS,
@@ -238,6 +241,22 @@ func resolveBrokerTokens(env string) (csv, note string) {
 			"or MQLITE_TOKENS=off to disable):\n  " + t
 	default:
 		return env, "auth: ON — Bearer tokens from MQLITE_TOKENS"
+	}
+}
+
+// resolveCORS decides the broker's Access-Control-Allow-Origin from MQLITE_CORS. The
+// default (unset) is "*": the broker is meant to be driven by clients — including the
+// browser console served from another origin — and every RPC still requires a Bearer
+// token (the API sets no cookies), so a wildcard exposes nothing. "off" disables CORS;
+// any other value is sent verbatim as the single allowed origin.
+func resolveCORS(env string) (origin, note string) {
+	switch e := strings.TrimSpace(env); {
+	case strings.EqualFold(e, "off"):
+		return "", "cors: off"
+	case e == "":
+		return "*", "cors: * (any origin — RPCs still require a token)"
+	default:
+		return e, "cors: " + e
 	}
 }
 

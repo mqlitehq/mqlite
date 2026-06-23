@@ -278,6 +278,7 @@ func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 type serveConfig struct {
 	tokens  []string
 	version string
+	cors    string
 }
 
 // ServeOption configures Serve.
@@ -305,6 +306,14 @@ func WithTokenCSV(csv string) ServeOption {
 	}
 }
 
+// WithCORS sets the Access-Control-Allow-Origin the broker sends, enabling browser apps
+// served from another origin (the standalone console) to call it. "" (the default) leaves
+// CORS off; "*" allows any origin — safe here because every RPC needs a Bearer token and
+// the API uses no cookies, so a cross-origin page gains nothing without the token.
+func WithCORS(origin string) ServeOption {
+	return func(c *serveConfig) { c.cors = origin }
+}
+
 // Serve exposes this engine as an HTTP broker until ctx is canceled.
 func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) error {
 	var sc serveConfig
@@ -313,6 +322,7 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	}
 	srv := server.New(e.eng, sc.tokens)
 	srv.Version = sc.version
+	srv.CORS = sc.cors
 	hs := &http.Server{Addr: addr, Handler: srv.Handler()}
 	errCh := make(chan error, 1)
 	go func() { errCh <- hs.ListenAndServe() }()

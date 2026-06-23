@@ -26,6 +26,7 @@ type Server struct {
 	tokens  map[string]bool // empty -> auth disabled (dev/LAN only)
 	mux     *http.ServeMux
 	Version string // reported by the open "/" discovery endpoint; "" -> "dev"
+	CORS    string // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
 }
 
 // New builds a Server. tokens is the set of accepted Bearer tokens; pass nil/empty
@@ -41,8 +42,9 @@ func New(eng *engine.Engine, tokens []string) *Server {
 	return s
 }
 
-// Handler returns the auth-wrapped HTTP handler.
-func (s *Server) Handler() http.Handler { return s.auth(s.mux) }
+// Handler returns the HTTP handler: CORS (outermost, so preflight bypasses auth) wrapping
+// Bearer-token auth wrapping the route mux.
+func (s *Server) Handler() http.Handler { return s.cors(s.auth(s.mux)) }
 
 func (s *Server) routes() {
 	h := func(path string, fn http.HandlerFunc) { s.mux.HandleFunc(path, postOnly(fn)) }
