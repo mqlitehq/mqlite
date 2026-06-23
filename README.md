@@ -181,9 +181,11 @@ Full endpoint, request/response, and error reference: [docs/api-reference.md](do
 
 ### 3b. Admin console
 
-A standalone web console connects to a broker over this same HTTP API — list queues with
-live counts, browse messages, edit subscription filters, send, and redrive a DLQ. It
-ships separately for now; embedding it into the broker is planned.
+The broker bakes a web console into the binary and serves it at **`/ui`** (e.g.
+`http://127.0.0.1:8080/ui`) — no separate process or Node runtime. Paste your broker URL
++ token and you can list queues with live counts, browse messages, send/receive/settle,
+edit subscription filters, and redrive a DLQ. It's on by default; set `MQLITE_UI=off` to
+run headless. (The same console is also published standalone for hosting elsewhere.)
 
 ### 4. Or the Go SDK (remote)
 

@@ -50,6 +50,7 @@ token **except** the open ones below. A missing/invalid token → `401 unauthent
 |---|---|---|
 | `GET` | `/` | JSON discovery card (see below) |
 | `GET` | `/healthz` | `200 ok` (liveness) |
+| `GET` | `/ui` | Embedded admin console (when enabled — see below) |
 
 ```bash
 curl https://<host>/                 # what is this? (no auth)
@@ -58,6 +59,11 @@ curl https://<host>/                 # what is this? (no auth)
 #    "endpoints":["/mqlite.v1.QueueService/Send", ...]}
 curl https://<host>/healthz          # ok
 ```
+
+`/ui` serves the **embedded admin console** (a static single-page app baked into the
+binary) and is auth-exempt — the page itself loads without a token; its API calls
+carry one you paste in. It's on by default; set `MQLITE_UI=off` to run headless, in
+which case `/ui` 404s and is dropped from the discovery card's `endpoints` list.
 
 ## Other endpoints
 

@@ -10,6 +10,8 @@
 //	                             and printed; =off disables auth — localhost/LAN only)
 //	MQLITE_CORS=* | https://app.example | off   (Access-Control-Allow-Origin for `serve`;
 //	                             UNSET => *, since RPCs still need a token; =off disables)
+//	MQLITE_UI=on|off            (serve the embedded admin console at /ui for `serve`;
+//	                             UNSET => on; =off runs headless — /ui 404s)
 //	MQLITE_MAX_MESSAGE_BYTES=<n>                                  (reject larger bodies)
 //	MQLITE_SYNC=NORMAL|FULL|OFF                                   (durability; embedded/serve)
 //	MQLITE_DLQ_MAX_AGE=14d-ish (e.g. 336h) · MQLITE_DLQ_MAX_COUNT=1000000 · MQLITE_DLQ_RETENTION=off
@@ -216,12 +218,20 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	tokens, authNote := resolveBrokerTokens(os.Getenv("MQLITE_TOKENS"))
 	corsOrigin, _ := resolveCORS(os.Getenv("MQLITE_CORS"))
+	ui := resolveUI(os.Getenv("MQLITE_UI"))
 	backend := "local"
 	if eng.Engine().Remote() {
 		backend = "remote Turso/libSQL"
 	}
+	host := *addr
+	if strings.HasPrefix(host, ":") {
+		host = "localhost" + host
+	}
 
 	lg.Info("mqlite broker", "version", version, "addr", *addr, "db", redact(db), "backend", backend)
+	if ui {
+		lg.Info("admin console", "url", "http://"+host+"/ui")
+	}
 	switch {
 	case tokens == "":
 		lg.Warn("auth disabled — anyone can call this broker (localhost/LAN only; set MQLITE_TOKENS)")
@@ -241,7 +251,18 @@ func cmdServe(ctx context.Context, args []string) error {
 	lg.Info("ready — Ctrl-C to stop")
 	return eng.Serve(sctx, *addr,
 		mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version),
-		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger))
+		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui))
+}
+
+// resolveUI decides whether the embedded admin console is served, from MQLITE_UI. Default
+// (unset) is ON. "off"/"false"/"0"/"no" disable it (the broker runs headless — /ui 404s).
+func resolveUI(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "off", "false", "0", "no":
+		return false
+	default:
+		return true
+	}
 }
 
 // serveLogger builds the broker's console logger: charmbracelet/log, colourised when
