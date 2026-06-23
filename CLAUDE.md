@@ -192,7 +192,10 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 - **DB DSN is read only from the environment**, never compiled in. Auth tokens are
   injected at `resolveDSN` time. `MQLITE_DB` (embedded/serve) vs
   `MQLITE_ENDPOINT`+`MQLITE_TOKEN` (client mode, wins if set); `MQLITE_TOKENS` =
-  broker's accepted Bearer tokens; `MQLITE_SYNC` = durability knob (NORMAL/FULL/OFF).
+  broker's accepted Bearer tokens; `MQLITE_CORS` = `Access-Control-Allow-Origin` the
+  broker sends (unset → `*`, since RPCs still need a token; `off` disables — lets a
+  browser console on another origin reach the broker); `MQLITE_SYNC` = durability knob
+  (NORMAL/FULL/OFF).
 - **Dedup-conflict batch semantics**: in a multi-message `Send`, a conflicting slot
   (same `message_id`, different body) comes back as seq `0` (skipped) while the rest
   commit; a single-message Send/Schedule surfaces it as `ErrDedupConflict` (HTTP 409).

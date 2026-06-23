@@ -27,6 +27,22 @@ func TestResolveBrokerTokens(t *testing.T) {
 	}
 }
 
+// TestResolveCORS covers the broker's CORS policy: open by default (token still required),
+// off on request, otherwise a verbatim origin.
+func TestResolveCORS(t *testing.T) {
+	if origin, _ := resolveCORS(""); origin != "*" {
+		t.Errorf("unset: origin=%q, want *", origin)
+	}
+	for _, off := range []string{"off", "OFF", "  off  "} {
+		if origin, note := resolveCORS(off); origin != "" || !strings.Contains(note, "off") {
+			t.Errorf("%q: origin=%q note=%q, want disabled", off, origin, note)
+		}
+	}
+	if origin, _ := resolveCORS("https://app.example"); origin != "https://app.example" {
+		t.Errorf("provided: origin=%q", origin)
+	}
+}
+
 // TestCommandsEndToEnd drives the CLI command handlers against one embedded DB,
 // exercising flag parsing, dispatch, and output formatting (MQLITE-26). Each
 // command dials and closes its own DB, so calls run sequentially.
