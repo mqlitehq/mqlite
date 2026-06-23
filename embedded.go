@@ -280,6 +280,7 @@ type serveConfig struct {
 	version   string
 	cors      string
 	reqLogger *slog.Logger
+	ui        bool
 }
 
 // ServeOption configures Serve.
@@ -323,6 +324,12 @@ func WithRequestLog(lg *slog.Logger) ServeOption {
 	return func(c *serveConfig) { c.reqLogger = lg }
 }
 
+// WithUI serves the embedded admin console (the built mqlite-web SPA) at /ui. Off by
+// default for the embedded library; the `mqlite serve` binary turns it on (MQLITE_UI).
+func WithUI(on bool) ServeOption {
+	return func(c *serveConfig) { c.ui = on }
+}
+
 // Serve exposes this engine as an HTTP broker until ctx is canceled.
 func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) error {
 	var sc serveConfig
@@ -333,6 +340,7 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.Version = sc.version
 	srv.CORS = sc.cors
 	srv.Logger = sc.reqLogger
+	srv.UI = sc.ui
 	hs := &http.Server{Addr: addr, Handler: srv.Handler()}
 	errCh := make(chan error, 1)
 	go func() { errCh <- hs.ListenAndServe() }()

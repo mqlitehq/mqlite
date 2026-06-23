@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="32" height="32" role="img" aria-label="mqlite">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#bg)"/>
+  <circle cx="17" cy="32" r="3.6" fill="#ffffff" opacity=".55"/>
+  <circle cx="28" cy="32" r="3.6" fill="#ffffff" opacity=".8"/>
+  <circle cx="39" cy="32" r="3.6" fill="#ffffff"/>
+  <path d="M45.5 32 h3" stroke="#facc15" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="53" cy="32" r="4.4" fill="#facc15"/>
+</svg>

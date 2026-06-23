@@ -25,6 +25,7 @@ type Server struct {
 	Version string       // reported by the open "/" discovery endpoint; "" -> "dev"
 	CORS    string       // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
 	Logger  *slog.Logger // per-request access log; nil -> no request logging (see logging.go)
+	UI      bool         // serve the embedded admin console at /ui (see console.go)
 	started time.Time
 }
 
@@ -78,6 +79,16 @@ func (s *Server) routes() {
 	// Prometheus metrics: per-queue gauges. Behind auth like the RPCs (a scraper
 	// passes the Bearer token); only /healthz stays open for liveness.
 	s.mux.HandleFunc("/metrics", s.handleMetrics)
+	// Embedded admin console (the built mqlite-web SPA) at /ui, when Server.UI is on
+	// (MQLITE_UI). The static page is open; its API calls carry the Bearer token.
+	s.mux.Handle("/ui/", s.console())
+	s.mux.HandleFunc("/ui", func(w http.ResponseWriter, r *http.Request) {
+		if !s.UI {
+			writeErr(w, http.StatusNotFound, "not_found", "no such path: /ui")
+			return
+		}
+		http.Redirect(w, r, "/ui/", http.StatusMovedPermanently)
+	})
 }
 
 // handleIndex is the open discovery endpoint at "/": no params, no auth, just a JSON
@@ -92,6 +103,14 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if version == "" {
 		version = "dev"
 	}
+	endpoints := map[string]string{
+		"health":  "GET /healthz",
+		"metrics": "GET /metrics (Bearer)",
+		"rpc":     "POST /mqlite.v1.{Service}/{Method} (Bearer)",
+	}
+	if s.UI {
+		endpoints["ui"] = "GET /ui"
+	}
 	writeJSON(w, map[string]any{
 		"name":        "mqlite",
 		"description": "Lightweight SQLite-backed message queue with Azure Service Bus-style semantics.",
@@ -99,11 +118,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"status":      "ok",
 		"auth":        len(s.tokens) > 0, // true -> RPCs need a Bearer token
 		"docs":        "https://github.com/mqlitehq/mqlite",
-		"endpoints": map[string]string{
-			"health":  "GET /healthz",
-			"metrics": "GET /metrics (Bearer)",
-			"rpc":     "POST /mqlite.v1.{Service}/{Method} (Bearer)",
-		},
+		"endpoints":   endpoints,
 	})
 }
 
@@ -169,7 +184,7 @@ func postOnly(fn http.HandlerFunc) http.HandlerFunc {
 // auth enforces Bearer tokens (skips /healthz and when no tokens configured).
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" {
+		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/ui") {
 			next.ServeHTTP(w, r)
 			return
 		}

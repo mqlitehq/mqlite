@@ -21,13 +21,20 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` (local file only) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
+| `MQLITE_UI` | serve the embedded admin console at `/ui` (default on; `off` runs headless) |
 
 > **Auth (secure by default):** if `MQLITE_TOKENS` is **unset**, `serve` **generates a
 > random `mqk_…` token and prints it at startup** — the broker is never silently open.
 > Set `MQLITE_TOKENS` to your own token(s) for a stable value (rotate by updating it),
 > or `MQLITE_TOKENS=off` to explicitly disable auth (localhost/LAN only). The `/`
-> discovery and `/healthz` endpoints stay open; everything else needs
+> discovery and `/healthz` endpoints stay open, as does the static `/ui` console when
+> enabled (its API calls still carry a token); everything else needs
 > `Authorization: Bearer <token>`.
+
+> **Admin console:** the broker bakes a static web console into the binary and serves
+> it at `/ui` (e.g. `http://localhost:8080/ui`) — no separate process or Node runtime.
+> Paste your broker URL + token in the console to drive every queue operation. Set
+> `MQLITE_UI=off` to disable it for headless deployments.
 
 The broker listens on `:8080` by default (`mqlite serve --addr :8080`). Full endpoint
 and error reference: [api-reference.md](api-reference.md).
