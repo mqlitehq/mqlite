@@ -250,18 +250,23 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-	} else {
-		seqs, err = s.eng.Send(ctx, req.Queue, outs...)
+	} else if len(outs) == 1 {
+		// Single send via SendOne, which tells the two causes of a seq-0 apart: a real
+		// dedup conflict (same id, different body) → ErrDedupConflict (409), versus a
+		// topic publish that matched no subscription → a valid no-op (seq 0, 200). The
+		// batch path drops the conflict flags, which is why a no-subscriber publish used
+		// to be mislabeled as a dedup conflict.
+		var seq int64
+		seq, err = s.eng.SendOne(ctx, req.Queue, outs[0])
 		if err != nil {
 			s.fail(w, err)
 			return
 		}
-		// A single Send that hit a dedup conflict (same id, different body) comes
-		// back as seq 0 — the batch path skips the offending slot to keep the rest
-		// of the batch. Surface it as 409, like engine.SendOne, so an HTTP client
-		// isn't handed 200 with a bogus seq 0 for a message that was never enqueued.
-		if len(req.Messages) == 1 && len(seqs) == 1 && seqs[0] == 0 {
-			s.fail(w, engine.ErrDedupConflict)
+		seqs = []int64{seq}
+	} else {
+		seqs, err = s.eng.Send(ctx, req.Queue, outs...)
+		if err != nil {
+			s.fail(w, err)
 			return
 		}
 	}
