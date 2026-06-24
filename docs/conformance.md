@@ -30,7 +30,12 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   max); `delay_ms` re-hides it for backoff. *(engine/engine_test.go)*
 - **2.3 Reject** moves it to `dead_lettered` with a reason. *(engine/functional_test.go)*
 - **2.4 Defer** sets it aside; it is retrieved later by seq via `ReceiveDeferred`.
-  *(engine/functional_test.go)*
+  Normal `Receive` never returns a deferred message. In an **ordered** queue a deferred
+  message **holds the head-of-line** — later messages in its group (or the whole queue
+  under `strict_fifo`) are not claimable until it is retrieved and settled; other groups
+  proceed. There is no automatic recovery without a TTL (the reaper never reclaims
+  deferred rows); recover a lost seq via `Peek state=deferred`.
+  *(engine/functional_test.go: TestDeferHoldsHeadOfLine)*
 - **2.5 Renew** extends the lock by the queue's lock duration. *(engine/ga_fixes_test.go)*
 - **2.6** Settling with a wrong/expired token MUST fail with `ErrLockLost` (HTTP 409)
   — **except** an idempotent replay (a live settlement receipt for that token) returns

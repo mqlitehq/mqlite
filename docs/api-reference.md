@@ -130,6 +130,13 @@ an expired or wrong `lock_token` → `409 lock_lost`.
 
 `SettleRequest`: `queue`, `seq_number`, `lock_token` (+ the extras above).
 
+> **Defer + ordering.** A deferred message keeps its head-of-line position: in a
+> `group_fifo`/`strict_fifo` (or otherwise grouped) queue the messages behind it — its
+> group, or the **whole queue** under `strict_fifo` — stay blocked until it is retrieved
+> via `ReceiveDeferred` and settled (other groups proceed). Normal `Receive` never
+> returns a deferred message, and with no TTL there is no auto-recovery, so recover a
+> lost `seq_number` via `Peek` with `state=deferred`.
+
 ### CompleteBatch
 
 Complete many messages in **one round-trip** — settle a whole received batch without
