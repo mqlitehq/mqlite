@@ -210,6 +210,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	logf(w, "code", code)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: code, Message: msg})
@@ -246,6 +247,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	logf(w, "queue", req.Queue)
 	outs := make([]engine.OutMessage, len(req.Messages))
 	for i, m := range req.Messages {
 		o := m.ToOut()
@@ -285,6 +287,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	logf(w, "n", len(seqs))
+	if len(outs) == 1 && outs[0].MessageID != "" {
+		logf(w, "msg_id", outs[0].MessageID)
+	}
 	writeJSON(w, wire.SendResponse{SeqNumbers: seqs})
 }
 
@@ -296,6 +302,7 @@ func (s *Server) handleReceive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue)
 	msgs, err := s.eng.Receive(r.Context(), req.Queue, engine.ReceiveOptions{
 		MaxMessages: req.MaxMessages,
 		WaitMs:      req.WaitTimeMs,
@@ -305,6 +312,10 @@ func (s *Server) handleReceive(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.fail(w, err)
 		return
+	}
+	logf(w, "msgs", len(msgs))
+	if len(msgs) == 0 {
+		logQuiet(w) // empty receive / idle long-poll → demote to Debug
 	}
 	resp := wire.ReceiveResponse{Messages: make([]wire.Message, len(msgs))}
 	for i, m := range msgs {
@@ -319,11 +330,13 @@ func (s *Server) handleReceiveDeferred(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue)
 	msgs, err := s.eng.ReceiveDeferred(r.Context(), req.Queue, req.SeqNumbers...)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
+	logf(w, "msgs", len(msgs))
 	resp := wire.ReceiveResponse{Messages: make([]wire.Message, len(msgs))}
 	for i, m := range msgs {
 		resp.Messages[i] = wire.FromEngineMessage(m)
@@ -353,6 +366,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
 	s.settleOK(w, s.eng.Complete(r.Context(), req.Queue, req.SeqNumber, req.LockToken))
 }
 
@@ -362,6 +376,7 @@ func (s *Server) handleCompleteBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue, "n", len(req.Messages))
 	items := make([]engine.SettleItem, len(req.Messages))
 	for i, m := range req.Messages {
 		items[i] = engine.SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
@@ -384,6 +399,7 @@ func (s *Server) handleAbandon(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
 	s.settleOK(w, s.eng.Abandon(r.Context(), req.Queue, req.SeqNumber, req.LockToken, req.DelayMs))
 }
 
@@ -393,6 +409,7 @@ func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
 	s.settleOK(w, s.eng.Reject(r.Context(), req.Queue, req.SeqNumber, req.LockToken,
 		req.DeadLetterReason, req.DeadLetterDescription))
 }
@@ -403,6 +420,7 @@ func (s *Server) handleDefer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
 	s.settleOK(w, s.eng.Defer(r.Context(), req.Queue, req.SeqNumber, req.LockToken))
 }
 
@@ -412,6 +430,7 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
 	s.settleOK(w, s.eng.Renew(r.Context(), req.Queue, req.SeqNumber, req.LockToken))
 }
 
@@ -421,6 +440,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
 	if err := s.eng.Cancel(r.Context(), req.Queue, req.SeqNumber); err != nil {
 		s.fail(w, err)
 		return
@@ -434,6 +454,7 @@ func (s *Server) handlePeek(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue)
 	ms, err := s.eng.Peek(r.Context(), req.Queue, engine.PeekOptions{
 		FromSeq: req.FromSeq, State: engine.State(req.State), Max: req.Max,
 	})
@@ -441,6 +462,7 @@ func (s *Server) handlePeek(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	logf(w, "msgs", len(ms))
 	resp := wire.PeekResponse{Messages: make([]wire.Message, len(ms))}
 	for i, m := range ms {
 		resp.Messages[i] = wire.FromPeeked(m)
@@ -454,6 +476,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue)
 	m, err := s.eng.Stats(r.Context(), req.Queue)
 	if err != nil {
 		s.fail(w, err)
@@ -474,6 +497,7 @@ func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Name)
 	if err := s.eng.CreateQueue(r.Context(), req.Name, req.Config.ToConfig()); err != nil {
 		s.fail(w, err)
 		return
@@ -487,6 +511,7 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "topic", req.Topic, "sub", req.Name)
 	if err := s.eng.Subscribe(r.Context(), req.Topic, req.Name, req.Filter); err != nil {
 		s.fail(w, err)
 		return
@@ -590,6 +615,7 @@ func (s *Server) handleRedrive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue)
 	moved, err := s.eng.Redrive(r.Context(), req.Queue, engine.RedriveOptions{
 		Target: req.Target, Max: req.Max, OlderThanMs: req.OlderThanMs, RatePerSec: req.RatePerSec,
 	})
@@ -597,6 +623,7 @@ func (s *Server) handleRedrive(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	logf(w, "n", moved)
 	writeJSON(w, wire.RedriveResponse{Moved: moved})
 }
 
@@ -606,6 +633,7 @@ func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
+	logf(w, "queue", req.Queue)
 	purged, err := s.eng.Purge(r.Context(), req.Queue, engine.RedriveOptions{
 		Max: req.Max, OlderThanMs: req.OlderThanMs,
 	})
@@ -613,5 +641,6 @@ func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	logf(w, "n", purged)
 	writeJSON(w, wire.PurgeResponse{Purged: purged})
 }

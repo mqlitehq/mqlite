@@ -32,6 +32,29 @@ Quick check:
 curl -H "Authorization: Bearer $MQLITE_TOKEN" https://<host>/metrics
 ```
 
+## Access log
+
+When a request logger is configured, the broker emits **one line per RPC** with
+per-request context, so lines are distinguishable and long durations are explained.
+The level is the HTTP status (`2xx` info · `4xx` warn · `5xx` error), and the RPC path
+is shortened (`/mqlite.v1.QueueService/Send` → `QueueService/Send`):
+
+```
+QueueService/Send          status=200 queue=orders n=1 msg_id=order-42 dur=2ms
+QueueService/CompleteBatch status=200 queue=orders n=16              dur=324ms
+QueueService/Complete      status=200 queue=orders seq=42            dur=1ms
+QueueService/Complete      status=409 queue=orders seq=42 code=lock_lost dur=1ms
+QueueService/Receive       status=200 queue=orders msgs=3           dur=8ms
+```
+
+Fields: `queue` (every queue/admin op), `msgs` (`Receive`/`Peek`) and `n`
+(`Send`/`CompleteBatch`/`Redrive`/`Purge`) counts, `seq` (single settles), `msg_id`
+(single `Send`, when supplied), and `code` on a `4xx`/`5xx` (e.g. `lock_lost`,
+`not_found`). **An empty `Receive` (`msgs=0`) is logged at Debug**, not Info — an idle
+long-poll that returns nothing (up to `wait_time_ms`, max 20s) is expected noise, so the
+default Info stream stays clean; enable Debug to see them. (A *slow* `Receive` that does
+return messages stays at Info, so genuine slowness is still visible.)
+
 ## Prometheus scrape config
 
 `/metrics` needs the Bearer token, so set `authorization` on the scrape job:
