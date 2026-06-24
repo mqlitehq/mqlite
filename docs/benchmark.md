@@ -37,8 +37,8 @@ SQLite file. Need HA / multi-region? Point the broker at a Turso/libSQL DSN inst
 local file ([turso.md](turso.md)).
 
 Disk is sized by **peak backlog depth**, not lifetime throughput (`Complete`/`Purge`
-delete rows); files plateau at the high-water mark and don't shrink without `VACUUM`
-(see §3):
+delete rows); files plateau at the high-water mark, and a background `incremental_vacuum`
+returns freed pages to the OS over time (MQLITE-53, see §3):
 
 | backlog depth (256 B msgs) | DB on disk | Fly volume |
 |--------------:|-----------:|:-----------|
@@ -156,9 +156,14 @@ SQLite has no auto-VACUUM, so freed pages go to the **freelist and are reused** 
 the next messages — the on-disk high-water mark persists. The same signature shows in
 *every* scenario's `dbPeak == dbEnd` on both boxes. This is correct, predictable
 behaviour (steady-state queues plateau; no per-message file thrash), but **size disk
-for the peak backlog, not the average** — a manual `VACUUM` is the only thing that
-returns space to the filesystem, and mqlite does not run one automatically. *(A known
-property, not a surprise.)*
+for the peak backlog, not the average**. *(A known property, not a surprise.)*
+
+> **Update (MQLITE-53):** a background pass now runs `PRAGMA incremental_vacuum` when the
+> freelist grows, so a local file DB **does** return freed pages to the OS over time —
+> without a manual `VACUUM` or stopping the broker. The table above predates that and
+> shows the old plateau-forever behaviour; with auto-reclaim the file shrinks after a
+> drain instead of holding the high-water mark. (`auto_vacuum=INCREMENTAL` is set at DB
+> creation; remote Turso manages its own storage.)
 
 ## 4 · Enriched messages — KV properties
 
@@ -246,8 +251,8 @@ mqlite ships sensible defaults; most deployments change nothing. In rough order 
    — same on arm64 local and amd64 cloud.
 4. **Single-writer model**: more producers ≠ more write throughput; on one core they
    make it *worse*. Prefer one batching producer.
-5. **Files plateau, they don't shrink** — size disk for peak backlog; `VACUUM` is
-   manual.
+5. **Files plateau at the peak backlog**, then a background `incremental_vacuum` returns
+   freed pages to the OS over time (MQLITE-53); size disk for the peak, not the average.
 6. **NORMAL vs FULL** is an ~11× durability dial (local); pick per host failure model.
 7. **Properties are affordable**; large bodies are byte-bound and storage-linear.
 

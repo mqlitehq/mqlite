@@ -269,3 +269,64 @@ func TestCompact(t *testing.T) {
 		t.Fatalf("full compact: %v", err)
 	}
 }
+
+// reclaimFreePages (the background MQLITE-53 pass) returns freed pages to the OS on a
+// local file DB once the freelist has grown past freePageReclaimMin, and is a safe no-op
+// for :memory: (no OS pages to return).
+func TestBackgroundReclaimFreePages(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t) // local file DB, auto_vacuum=INCREMENTAL
+	mustQueue(t, e, "q", QueueConfig{})
+
+	// Churn enough rows to free well over freePageReclaimMin pages.
+	body := make([]byte, 1024)
+	for i := 0; i < 2000; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	for {
+		ms, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 200})
+		if err != nil {
+			t.Fatalf("receive: %v", err)
+		}
+		if len(ms) == 0 {
+			break
+		}
+		items := make([]SettleItem, len(ms))
+		for i, m := range ms {
+			items[i] = SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+		}
+		if _, err := e.CompleteBatch(ctx, "q", items); err != nil {
+			t.Fatalf("complete batch: %v", err)
+		}
+	}
+	// Flush the WAL so the freed pages land on the main-DB freelist.
+	if rows, err := e.db.query(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err == nil {
+		rows.Close()
+	}
+
+	freelist := func() int {
+		var n int
+		if err := e.db.queryRowScan(ctx, []any{&n}, "PRAGMA freelist_count"); err != nil {
+			t.Fatalf("freelist_count: %v", err)
+		}
+		return n
+	}
+	before := freelist()
+	if before < freePageReclaimMin {
+		t.Fatalf("churn freed only %d pages, need >= %d to exercise reclaim", before, freePageReclaimMin)
+	}
+	e.reclaimFreePages(ctx)
+	if after := freelist(); after >= before {
+		t.Fatalf("reclaim did not shrink the freelist: before=%d after=%d", before, after)
+	}
+
+	// :memory: has no OS pages to return — reclaim must be a harmless no-op.
+	mem, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open memory: %v", err)
+	}
+	defer mem.Close()
+	mem.reclaimFreePages(ctx)
+}
