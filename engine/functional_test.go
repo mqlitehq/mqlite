@@ -557,3 +557,95 @@ func TestGroupFIFORequiresGroupID(t *testing.T) {
 		t.Fatalf("expected grouped message, got %+v", m)
 	}
 }
+
+// ─── defer × ordering: head-of-line (MQLITE-48) ────────────────────────────────
+
+// A Defer'd message keeps its head-of-line position: in an ordered queue the
+// messages behind it (its group, or the whole queue under strict_fifo) are NOT
+// claimable until it is retrieved via ReceiveDeferred and settled. Ungrouped
+// standard messages are exempt (group_id IS NULL short-circuits the claim's
+// head-of-line check). This pins the claim-SQL semantics documented in
+// docs/conformance.md §2.4; removing deferred from the head-of-line block set
+// would silently violate FIFO.
+func TestDeferHoldsHeadOfLine(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("standard ungrouped does not block", func(t *testing.T) {
+		e, _ := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("a")})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("b")})
+
+		head := recvOne(t, e, "q")
+		if err := e.Defer(ctx, "q", head.SeqNumber, head.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		// "b" stays claimable — no head-of-line for ungrouped standard messages.
+		if got := recvOne(t, e, "q"); got == nil || string(got.Body) != "b" {
+			t.Fatalf("ungrouped defer must not block later messages, got %+v", got)
+		}
+	})
+
+	t.Run("group_fifo: deferred head blocks its group, others proceed", func(t *testing.T) {
+		e, _ := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderGroupFIFO})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g1a"), GroupID: "G1"})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g1b"), GroupID: "G1"})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g2a"), GroupID: "G2"})
+
+		head := recvOne(t, e, "q") // G1 head
+		if head == nil || head.GroupID != "G1" {
+			t.Fatalf("expected G1 head first, got %+v", head)
+		}
+		if err := e.Defer(ctx, "q", head.SeqNumber, head.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		// Other group proceeds; G1's next stays blocked behind the deferred head.
+		if other := recvOne(t, e, "q"); other == nil || other.GroupID != "G2" {
+			t.Fatalf("independent group must proceed, got %+v", other)
+		}
+		if blocked := recvOne(t, e, "q"); blocked != nil {
+			t.Fatalf("G1 must stay blocked behind its deferred head, got %q", blocked.Body)
+		}
+		// Retrieve + settle the deferred head -> G1 advances to g1b.
+		got, err := e.ReceiveDeferred(ctx, "q", head.SeqNumber)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("receive deferred: %v %+v", err, got)
+		}
+		if err := e.Complete(ctx, "q", got[0].SeqNumber, got[0].LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if next := recvOne(t, e, "q"); next == nil || string(next.Body) != "g1b" {
+			t.Fatalf("after settling the deferred head, G1 should advance to g1b, got %+v", next)
+		}
+	})
+
+	t.Run("strict_fifo: one deferred message stalls the whole queue", func(t *testing.T) {
+		e, _ := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderStrictFIFO})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("m1")})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("m2")})
+
+		m1 := recvOne(t, e, "q")
+		if m1 == nil || string(m1.Body) != "m1" {
+			t.Fatalf("expected m1 first, got %+v", m1)
+		}
+		if err := e.Defer(ctx, "q", m1.SeqNumber, m1.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		// Whole queue stalls behind the single deferred message.
+		if blocked := recvOne(t, e, "q"); blocked != nil {
+			t.Fatalf("strict_fifo must stall the whole queue behind a deferred message, got %q", blocked.Body)
+		}
+		got, err := e.ReceiveDeferred(ctx, "q", m1.SeqNumber)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("receive deferred: %v %+v", err, got)
+		}
+		if err := e.Complete(ctx, "q", got[0].SeqNumber, got[0].LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if m2 := recvOne(t, e, "q"); m2 == nil || string(m2.Body) != "m2" {
+			t.Fatalf("after settling the deferred m1, m2 should be claimable, got %+v", m2)
+		}
+	})
+}
