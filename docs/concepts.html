@@ -225,9 +225,12 @@
         <div class="badge b-q">Q</div>
         <div>
           <h3 style="margin-top:0">Queue</h3>
-          <p>A named container, the only place messages live. State machine:
-            <code>active → locked →</code> deleted on complete; <code>abandon</code>/timeout
-            returns to active; <code>reject</code> or delivery-count overflow goes to <b>DLQ</b>.</p>
+          <p>A named container, the only place messages live. A message moves
+            <code>scheduled → active → locked</code>, then <b>completes</b> (row deleted),
+            <b>defers</b> for later retrieval by seq, or is redelivered on
+            <code>abandon</code> / lock-expiry — until <code>delivery_count</code> hits
+            <code>max</code> (or an explicit <code>reject</code> / TTL expiry), which routes it
+            to the <b>DLQ</b>.</p>
           <p><b>The DLQ is not another queue</b> — it is the same queue's
             <code>state='dead_lettered'</code> sub-state, worked with
             <code>peek</code> / <code>redrive</code> / <code>purge</code>.</p>
