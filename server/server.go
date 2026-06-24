@@ -168,6 +168,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, st := range stats {
 		fmt.Fprintf(&b, "mqlite_queue_oldest_message_age_ms{queue=%q} %d\n", st.name, st.m.OldestMessageAgeMs)
 	}
+	// Lifetime completed messages per queue — a running count that survives the
+	// row being deleted on Complete (MQLITE-54). In-process and resets on restart;
+	// Prometheus rate()/increase() absorb the reset.
+	completed := s.eng.CompletedCounts()
+	b.WriteString("# HELP mqlite_messages_completed_total Messages successfully completed, cumulative since broker start.\n")
+	b.WriteString("# TYPE mqlite_messages_completed_total counter\n")
+	for _, st := range stats {
+		fmt.Fprintf(&b, "mqlite_messages_completed_total{queue=%q} %d\n", st.name, completed[st.name])
+	}
 	s.rpcLat.write(&b) // per-RPC latency histogram (rpchist.go)
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))

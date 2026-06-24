@@ -53,6 +53,53 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+// /metrics exposes a lifetime completed-message counter that persists past the row
+// being deleted on Complete — so "how many were processed" is readable even on an
+// empty queue (MQLITE-54).
+func TestMetricsCompletedCounter(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "orders", engine.QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10}); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := eng.SendOne(ctx, "orders", engine.OutMessage{Body: []byte("x")}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	msgs, err := eng.Receive(ctx, "orders", engine.ReceiveOptions{MaxMessages: 3})
+	if err != nil || len(msgs) != 3 {
+		t.Fatalf("receive: got %d (err %v)", len(msgs), err)
+	}
+	for _, m := range msgs {
+		if err := eng.Complete(ctx, "orders", m.SeqNumber, m.LockToken); err != nil {
+			t.Fatalf("complete: %v", err)
+		}
+	}
+
+	ts := httptest.NewServer(server.New(eng, nil).Handler()) // auth off
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	out := string(body)
+	for _, want := range []string{
+		"# TYPE mqlite_messages_completed_total counter",
+		`mqlite_messages_completed_total{queue="orders"} 3`, // the queue is empty, yet the count survives
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("/metrics missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // /metrics also exposes a per-RPC latency histogram, fed by every RPC call — so a slow
 // dequeue is visible in monitoring, not just in tests.
 func TestMetricsRPCLatencyHistogram(t *testing.T) {

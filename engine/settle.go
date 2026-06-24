@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync/atomic"
 )
 
 // settlementTTLMs bounds how long a settle receipt survives — long enough to
@@ -60,16 +61,50 @@ func (e *Engine) settleOp(ctx context.Context, token, op string, do func(tx *sql
 	})
 }
 
+// markCompleted bumps the per-queue lifetime "completed" counter by n. It is
+// called only after a settle's transaction has committed AND actually removed
+// rows (n>0), so an idempotent lost-response replay — which deletes nothing —
+// never double-counts. (MQLITE-54)
+func (e *Engine) markCompleted(queue string, n int64) {
+	if n <= 0 {
+		return
+	}
+	v, ok := e.processed.Load(queue)
+	if !ok {
+		v, _ = e.processed.LoadOrStore(queue, new(atomic.Uint64))
+	}
+	v.(*atomic.Uint64).Add(uint64(n))
+}
+
+// CompletedCounts snapshots the lifetime completed-message count per queue.
+// In-process and rough (resets on restart); surfaced as mqlite_messages_completed_total.
+func (e *Engine) CompletedCounts() map[string]uint64 {
+	out := map[string]uint64{}
+	e.processed.Range(func(k, v any) bool {
+		out[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	return out
+}
+
 // Complete removes a successfully-processed message (fencing on lock_token).
 func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token string) error {
-	return e.settleOp(ctx, token, "completed", func(tx *sql.Tx) (int64, error) {
+	var removed int64
+	err := e.settleOp(ctx, token, "completed", func(tx *sql.Tx) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=?`, seq, queue, token)
 		if err != nil {
 			return 0, err
 		}
-		return res.RowsAffected()
+		// Assignment (not +=) keeps this retry-safe: the remote inTx may replay
+		// the closure, and we want the last attempt's count, not the sum.
+		removed, err = res.RowsAffected()
+		return removed, err
 	})
+	if err == nil {
+		e.markCompleted(queue, removed)
+	}
+	return err
 }
 
 // Abandon releases the lock and redelivers, or dead-letters if delivery_count
@@ -168,7 +203,9 @@ type SettleResult struct {
 func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []SettleItem) ([]SettleResult, error) {
 	out := make([]SettleResult, len(items))
 	now := e.now()
+	var removed int64 // messages actually deleted this commit (for the completed counter)
 	err := e.inTx(ctx, func(tx *sql.Tx) error {
+		removed = 0 // reset per attempt: the remote inTx may replay the closure
 		for i, it := range items {
 			out[i].SeqNumber = it.SeqNumber
 			if it.LockToken == "" {
@@ -187,6 +224,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 					return err
 				}
 				out[i].Ok = true
+				removed++
 				continue
 			}
 			// rows=0: idempotent replay if a live receipt exists, else the lock is lost.
@@ -206,5 +244,6 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 	if err != nil {
 		return nil, err
 	}
+	e.markCompleted(queue, removed)
 	return out, nil
 }
