@@ -69,7 +69,7 @@ RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
 // message is claimable only when no earlier id in the queue is still in flight
 // (locked/deferred/scheduled), regardless of group. The whole queue therefore
 // delivers strictly one-at-a-time in id order. Parameter layout is identical to
-// claimSQL (lockUntil, token, queue, now, now, now) so claimOne just swaps the
+// claimSQL (lockUntil, token, queue, now, now, now) so claimOneTx just swaps the
 // SQL string per the queue's ordering mode.
 const claimStrictSQL = `
 UPDATE messages
@@ -153,56 +153,25 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 	}
 }
 
+// claimUpTo claims up to max messages in a SINGLE transaction — one commit for the whole
+// batch instead of one per message. It reuses the same tx-scoped claim loop as the
+// idempotent-receive path (claimUpToTx/claimOneTx). The single-writer connection is held
+// for the batch, but writes serialize through it regardless, so this costs nothing and
+// saves N-1 commits/fsyncs — the dominant cost when many consumers drain one queue
+// concurrently (MQLITE-50). On a mid-batch error the whole batch rolls back (no orphaned
+// locks); Receive discards a partial batch on error anyway.
 func (e *Engine) claimUpTo(ctx context.Context, q queueRow, max int, mode ReceiveMode) ([]*Message, error) {
-	var out []*Message
 	now := e.now()
-	for i := 0; i < max; i++ {
-		m, err := e.claimOne(ctx, q, now)
-		if err != nil {
-			return out, err
-		}
-		if m == nil {
-			break
-		}
-		if mode == ReceiveAndDelete {
-			if _, err := e.db.exec(ctx,
-				`DELETE FROM messages WHERE id=? AND lock_token=?`, m.SeqNumber, m.LockToken); err != nil {
-				return out, err
-			}
-			m.LockToken = "" // already removed; not settleable
-		}
-		out = append(out, m)
-	}
-	return out, nil
-}
-
-func (e *Engine) claimOne(ctx context.Context, q queueRow, now int64) (*Message, error) {
-	token := randToken()
-	lockUntil := now + q.lockDurationMs
-	var (
-		m                                                          Message
-		groupID, messageID, correlationID, replyTo, subject, ctype sql.NullString
-		props                                                      sql.NullString
-	)
-	err := e.db.queryRowScan(ctx,
-		[]any{&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
-			&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs},
-		claimSQLFor(q.ordering), lockUntil, token, q.name, now, now, now)
+	var out []*Message
+	err := e.inTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		out, err = e.claimUpToTx(ctx, tx, q, max, mode, now)
+		return err
+	})
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	m.LockToken = token
-	m.GroupID = groupID.String
-	m.MessageID = messageID.String
-	m.CorrelationID = correlationID.String
-	m.ReplyTo = replyTo.String
-	m.Subject = subject.String
-	m.ContentType = ctype.String
-	m.Properties = parseProps(props)
-	return &m, nil
+	return out, nil
 }
 
 // ReceiveDeferred locks previously-deferred messages by seq_number (§8.7).
