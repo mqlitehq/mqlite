@@ -36,6 +36,12 @@ type Engine struct {
 
 	filterMu    sync.Mutex              // guards filterCache
 	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
+
+	// processed counts lifetime Completed messages per queue — in-process and
+	// rough: it resets on restart (no durable store, no schema change). Exposed
+	// as the mqlite_messages_completed_total counter; Prometheus rate()/increase()
+	// absorb the restart reset. Zero value is ready; values are *atomic.Uint64. (MQLITE-54)
+	processed sync.Map
 }
 
 // Options configures Open.

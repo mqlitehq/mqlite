@@ -14,6 +14,7 @@ Prometheus text format (`text/plain; version=0.0.4`). Per-queue **gauges**
 | `mqlite_queue_messages` | gauge | `queue`, `state` | messages by state: `active`, `locked`, `deferred`, `scheduled`, `dead_lettered` |
 | `mqlite_queue_total` | gauge | `queue` | total messages in the queue |
 | `mqlite_queue_oldest_message_age_ms` | gauge | `queue` | age of the oldest message (ms) |
+| `mqlite_messages_completed_total` | counter | `queue` | messages successfully completed, cumulative since broker start |
 | `mqlite_rpc_duration_seconds` | histogram | `rpc`, `le` | RPC handler latency by method (`_bucket` + `_sum` + `_count`) |
 
 ```
@@ -23,11 +24,23 @@ mqlite_queue_messages{queue="orders",state="active"} 42
 ...
 mqlite_queue_total{queue="orders"} 45
 mqlite_queue_oldest_message_age_ms{queue="orders"} 1873
+# TYPE mqlite_messages_completed_total counter
+mqlite_messages_completed_total{queue="orders"} 1280431
 # TYPE mqlite_rpc_duration_seconds histogram
 mqlite_rpc_duration_seconds_bucket{rpc="QueueService/Receive",le="0.01"} 37
 mqlite_rpc_duration_seconds_bucket{rpc="QueueService/Receive",le="+Inf"} 84
 mqlite_rpc_duration_seconds_sum{rpc="QueueService/Receive"} 1.426651
 mqlite_rpc_duration_seconds_count{rpc="QueueService/Receive"} 84
+```
+
+`mqlite_messages_completed_total` is a **lifetime count of processed (Completed)
+messages** — it keeps growing after the message row is deleted, so you can answer "how
+many were handled" even on an empty queue. It is **in-process and resets on broker
+restart** (no durable counter); `rate()` / `increase()` absorb the reset, so processed
+throughput stays correct across restarts:
+```promql
+sum(rate(mqlite_messages_completed_total[5m])) by (queue)   # processed msg/s
+increase(mqlite_messages_completed_total[1h])               # processed in the last hour
 ```
 
 The histogram makes a **slow dequeue visible** — e.g. p99 receive latency in Grafana:
