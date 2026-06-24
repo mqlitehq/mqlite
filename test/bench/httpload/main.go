@@ -1,19 +1,23 @@
-// Command httpload is an HTTP load generator for a *running mqlite broker*. Unlike
-// test/bench (which drives the embedded engine, no network), this drives the real wire
-// path — the client SDK over HTTP + Bearer auth — so it measures the broker end to end.
-// It is the reproducible harness behind the MQLITE-50 dequeue-throughput work: run it
-// once for a baseline, apply a change, run it again, and diff the SUMMARY line.
+// Command httpload is an HTTP load generator + integrity checker for a *running mqlite
+// broker*. Unlike test/bench (which drives the embedded engine, no network), this drives
+// the real wire path — the client SDK over HTTP + Bearer auth — so it measures the broker
+// end to end. It is the reproducible harness behind the MQLITE-50/53 work: run it once for
+// a baseline, apply a change, run it again, and diff the SUMMARY line.
 //
-// Each run does three things against one queue (default `bench-load`):
+// Each run does, against one queue (default `bench-load`):
 //  1. a single-connection latency probe (send, and send→receive→complete) — the RTT floor;
-//  2. a SEND throughput phase (conc workers spamming SendOne for -dur);
-//  3. a DRAIN throughput phase (conc workers: Receive≤50 then CompleteBatch, until empty).
+//  2. a SEND phase — conc workers send -n messages (or for -dur when -n is 0);
+//  3. a DRAIN phase — conc workers Receive≤50 then CompleteBatch, until empty.
 //
-// It drains any leftover backlog first and reports p50/p95/p99/max for each op.
+// It drains any leftover backlog first and reports p50/p95/p99/max per op plus a SUMMARY
+// line. With -verify, every message carries its index and the drain asserts each is
+// received exactly once — INTEGRITY=OK/FAIL with missing (data loss) and duplicated
+// (double delivery) counts, plus a final queue-state line.
 //
 // Usage:
 //
-//	MQLITE_TOKEN=mqk_… go run ./test/bench/httpload -endpoint https://mqlite.fly.dev -conc 32 -dur 10s
+//	MQLITE_TOKEN=mqk_… go run ./test/bench/httpload -endpoint http://127.0.0.1:8080 -conc 32 -dur 10s
+//	MQLITE_TOKEN=mqk_… go run ./test/bench/httpload -endpoint http://127.0.0.1:8080 -conc 32 -n 20000 -verify
 //
 // Note on Fly: driving a Fly broker from far away is network-RTT-bound (the numbers
 // measure distance, not the broker). For true capacity run this co-located in the same
