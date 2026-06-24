@@ -267,6 +267,15 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 	}
 	if _, err := e.db.exec(ctx, `PRAGMA incremental_vacuum`); err != nil {
 		e.log.Error("janitor: incremental_vacuum failed", "err", err)
+		return
+	}
+	// incremental_vacuum removes pages from the DB, but in WAL mode the file is only
+	// truncated at a checkpoint — without this the freed space isn't returned to the OS
+	// until some later write happens to cross the auto-checkpoint threshold, so a
+	// drained-then-idle broker would hold its high-water mark indefinitely. A TRUNCATE
+	// checkpoint applies the truncation now (single writer, so it won't be blocked).
+	if _, err := e.db.exec(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		e.log.Error("janitor: wal_checkpoint after reclaim failed", "err", err)
 	}
 }
 
