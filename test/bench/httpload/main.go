@@ -226,10 +226,10 @@ func main() {
 	if *verify {
 		var once, missing, dup, extra int64
 		for _, c := range seen {
-			switch {
-			case c == 0:
+			switch c {
+			case 0:
 				missing++ // never delivered → DATA LOSS
-			case c == 1:
+			case 1:
 				once++ // exactly once → correct
 			default:
 				dup++ // delivered more than once → DUPLICATION
