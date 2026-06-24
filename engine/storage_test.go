@@ -15,6 +15,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -317,9 +318,24 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 	if before < freePageReclaimMin {
 		t.Fatalf("churn freed only %d pages, need >= %d to exercise reclaim", before, freePageReclaimMin)
 	}
-	e.reclaimFreePages(ctx)
+	path, _ := localFilePath(e.db.dsn)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat db: %v", err)
+	}
+	sizeBefore := fi.Size()
+
+	e.reclaimFreePages(ctx) // incremental_vacuum + TRUNCATE checkpoint → file shrinks
+
 	if after := freelist(); after >= before {
 		t.Fatalf("reclaim did not shrink the freelist: before=%d after=%d", before, after)
+	}
+	fi2, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat db after: %v", err)
+	}
+	if fi2.Size() >= sizeBefore {
+		t.Fatalf("reclaim did not return file space to the OS: before=%d after=%d bytes", sizeBefore, fi2.Size())
 	}
 
 	// :memory: has no OS pages to return — reclaim must be a harmless no-op.
