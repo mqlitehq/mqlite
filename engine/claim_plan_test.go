@@ -53,6 +53,43 @@ func TestClaimPlanPinning(t *testing.T) {
 	}
 }
 
+// TestMaintenanceQueryPlansPinned pins the background-loop queries to their partial
+// indexes. The reaper/scheduler/TTL/DLQ passes run every 1–10s on the single writer, so a
+// query or index change that drops one to a full table SCAN would silently degrade the
+// whole broker as the table grows — and nothing else catches it. Each must SEARCH via its
+// index. (The WHERE clauses mirror background.go; an index drop/rename fails this
+// regardless of the SET/SELECT list, which is what the plan ignores.)
+func TestMaintenanceQueryPlansPinned(t *testing.T) {
+	e, _ := testEngine(t)
+	seedMixedBacklog(t, e)
+
+	for _, tc := range []struct {
+		name, want, sql string
+		args            []any
+	}{
+		{"reaper: expired locks", "idx_msg_locked",
+			`UPDATE messages SET state='active', locked_until=0, lock_token=NULL WHERE state='locked' AND locked_until<=?`,
+			[]any{int64(0)}},
+		{"scheduler: due scheduled", "idx_msg_scheduled",
+			`UPDATE messages SET state='active' WHERE state='scheduled' AND visible_at<=?`,
+			[]any{int64(0)}},
+		{"ttl: dead-letter expired", "idx_msg_expire",
+			`UPDATE messages SET state='dead_lettered' WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred')`,
+			[]any{int64(0)}},
+		{"ttl: discard expired", "idx_msg_expire",
+			`DELETE FROM messages WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')`,
+			[]any{int64(0)}},
+		{"dlq retention: drop-oldest", "idx_msg_dlq",
+			`SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND enqueued_at < ?`,
+			[]any{"q2", int64(0)}},
+	} {
+		plan := explainPlan(t, e, tc.sql, tc.args...)
+		if !strings.Contains(plan, tc.want) {
+			t.Errorf("%s: no longer SEARCHes via %s — full-scan regression:\n%s", tc.name, tc.want, plan)
+		}
+	}
+}
+
 // TestClaimDeepBacklogBounded is the plan-agnostic guard: a claim against a deep
 // backlog stuck behind a locked head must stay fast (~20-30s @ 20k before the fix).
 func TestClaimDeepBacklogBounded(t *testing.T) {
