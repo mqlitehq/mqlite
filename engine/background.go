@@ -21,6 +21,9 @@ func (e *Engine) startBackground(ctx context.Context) {
 	// per-queue bound may exist even with no engine-global default, and the pass is
 	// a cheap no-op when nothing is bounded (it just lists DLQ queues and skips).
 	e.spawn(ctx, 60*time.Second, e.reapDLQ) // drop-oldest past age/count/bytes
+	// free-page reclamation (MQLITE-53): hand deleted pages back to the OS so a
+	// churning queue's file doesn't bloat — no manual stop-the-broker VACUUM.
+	e.spawn(ctx, 60*time.Second, e.reclaimFreePages)
 }
 
 func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(context.Context)) {
@@ -237,6 +240,36 @@ func (e *Engine) purgeDLQUpToID(ctx context.Context, q string, cutoffID int64, b
 	}
 }
 
+// freePageReclaimMin is the freelist size (in pages) below which background reclamation
+// skips the write — an incremental_vacuum is only worth a pass once enough pages free up.
+const freePageReclaimMin = 256 // ~1 MiB at a 4 KiB page size
+
+// reclaimFreePages hands freed pages back to the OS via PRAGMA incremental_vacuum once the
+// freelist has grown. A churning queue deletes rows constantly; auto_vacuum=INCREMENTAL
+// (set at DB creation, see resolveDSN) parks those pages on the freelist, and this returns
+// them without a full VACUUM or a global lock — so the file doesn't bloat and no operator
+// has to stop the broker to compact it (MQLITE-53). Local file DBs only: :memory: has no
+// OS pages to return and remote Turso manages its own storage. Best-effort.
+func (e *Engine) reclaimFreePages(ctx context.Context) {
+	if e.db.remote {
+		return
+	}
+	if _, ok := localFilePath(e.db.dsn); !ok {
+		return // in-memory DB
+	}
+	var free int
+	if err := e.db.queryRowScan(ctx, []any{&free}, `PRAGMA freelist_count`); err != nil {
+		e.log.Error("janitor: read freelist_count failed", "err", err)
+		return
+	}
+	if free < freePageReclaimMin {
+		return
+	}
+	if _, err := e.db.exec(ctx, `PRAGMA incremental_vacuum`); err != nil {
+		e.log.Error("janitor: incremental_vacuum failed", "err", err)
+	}
+}
+
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
 // DisableBackground use this to drive time-based transitions deterministically.
 func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
@@ -246,4 +279,5 @@ func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
 	e.cleanupDedup(ctx)
 	e.cleanupExpiredAux(ctx)
 	e.reapDLQ(ctx)
+	e.reclaimFreePages(ctx)
 }
