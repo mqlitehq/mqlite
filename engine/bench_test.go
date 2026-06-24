@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -89,6 +90,66 @@ func BenchmarkReceiveComplete(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msg/s")
+}
+
+// BenchmarkDrainConcurrent measures the path the MQLITE-50 fix actually changed: many
+// consumers draining one queue with Receive(batch)+CompleteBatch. The claim is a write,
+// so all workers serialize on the single writer — this is where N-commits-per-Receive
+// used to collapse. The msg/s metric is the regression signal: prefill b.N, drain with
+// `workers` goroutines, report throughput. (Single-threaded dequeue is BenchmarkReceiveComplete.)
+func BenchmarkDrainConcurrent(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	_ = e.CreateQueue(ctx, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 100})
+	body := make([]byte, 256)
+	for i := 0; i < b.N; i++ { // prefill (untimed)
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	const workers = 16
+	var mu sync.Mutex
+	var benchErr error
+	fail := func(err error) {
+		mu.Lock()
+		if benchErr == nil {
+			benchErr = err
+		}
+		mu.Unlock()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 50})
+				if err != nil {
+					fail(err)
+					return
+				}
+				if len(msgs) == 0 {
+					return // drained
+				}
+				items := make([]SettleItem, len(msgs))
+				for i, m := range msgs {
+					items[i] = SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+				}
+				if _, err := e.CompleteBatch(ctx, "q", items); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	b.StopTimer()
+	if benchErr != nil {
+		b.Fatal(benchErr)
+	}
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msg/s")
 }
 
