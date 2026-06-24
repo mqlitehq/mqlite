@@ -82,6 +82,12 @@ func TestMaintenanceQueryPlansPinned(t *testing.T) {
 		{"dlq retention: drop-oldest", "idx_msg_dlq",
 			`SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND enqueued_at < ?`,
 			[]any{"q2", int64(0)}},
+		{"janitor: prune settlement receipts", "idx_settlement_expire",
+			`DELETE FROM settlement_receipts WHERE expires_at < ?`, []any{int64(0)}},
+		{"janitor: prune receive attempts", "idx_recv_attempt_expire",
+			`DELETE FROM receive_attempts WHERE expires_at < ?`, []any{int64(0)}},
+		{"janitor: prune dedup window", "idx_dedup_seen",
+			`DELETE FROM dedup WHERE seen_at < ?`, []any{int64(0)}},
 	} {
 		plan := explainPlan(t, e, tc.sql, tc.args...)
 		if !strings.Contains(plan, tc.want) {
