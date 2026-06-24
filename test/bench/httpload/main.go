@@ -24,6 +24,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"net/http"
@@ -43,7 +44,12 @@ func main() {
 	conc := flag.Int("conc", 32, "concurrency (workers / max keep-alive conns)")
 	msgsize := flag.Int("msgsize", 256, "message body bytes")
 	probeN := flag.Int("probe", 50, "sequential ops for the single-connection latency probe")
+	n := flag.Int("n", 0, "send exactly N messages (0 = send for -dur instead); required by -verify")
+	verify := flag.Bool("verify", false, "integrity check: each message carries its index; assert every one is received exactly once (no loss, no duplication)")
 	flag.Parse()
+	if *verify && (*n <= 0 || *msgsize < 8) {
+		fatal("-verify requires -n > 0 and -msgsize >= 8")
+	}
 
 	tok := os.Getenv("MQLITE_TOKEN")
 	ctx := context.Background()
@@ -98,8 +104,19 @@ func main() {
 	drainAll(ctx, cli, *queue, 1)
 
 	// ── SEND throughput ──
+	// -verify: each message body starts with its 8-byte index; -n sends exactly N. A
+	// correctness run retries a failed send so every index is enqueued — otherwise a
+	// send error would masquerade as data loss in the integrity check.
+	mkBody := func(idx int64) []byte {
+		if !*verify {
+			return body
+		}
+		b := make([]byte, *msgsize)
+		binary.BigEndian.PutUint64(b, uint64(idx))
+		return b
+	}
 	sendLat := make([][]time.Duration, *conc)
-	var sent, sendErr int64
+	var sent, sendErr, nextIdx int64
 	deadline := time.Now().Add(*dur)
 	var wg sync.WaitGroup
 	tSend := time.Now()
@@ -107,9 +124,23 @@ func main() {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for time.Now().Before(deadline) {
+			for {
+				var idx int64
+				if *n > 0 {
+					if idx = atomic.AddInt64(&nextIdx, 1) - 1; idx >= int64(*n) {
+						return
+					}
+				} else if !time.Now().Before(deadline) {
+					return
+				}
 				s := time.Now()
-				if _, err := cli.SendOne(ctx, *queue, mqlite.OutMessage{Body: body}); err != nil {
+				_, err := cli.SendOne(ctx, *queue, mqlite.OutMessage{Body: mkBody(idx)})
+				for tries := 0; err != nil && *verify && tries < 200; tries++ {
+					atomic.AddInt64(&sendErr, 1)
+					time.Sleep(15 * time.Millisecond)
+					_, err = cli.SendOne(ctx, *queue, mqlite.OutMessage{Body: mkBody(idx)})
+				}
+				if err != nil {
 					atomic.AddInt64(&sendErr, 1)
 					continue
 				}
@@ -124,7 +155,11 @@ func main() {
 	// ── DRAIN throughput (Receive batch → CompleteBatch, until empty) ──
 	recvLat := make([][]time.Duration, *conc)
 	complLat := make([][]time.Duration, *conc)
-	var completed, drainErr int64
+	var completed, drainErr, oorRecv int64
+	var seen []int32 // verify: deliveries per message index
+	if *verify {
+		seen = make([]int32, *n)
+	}
 	tDrain := time.Now()
 	for w := 0; w < *conc; w++ {
 		wg.Add(1)
@@ -141,6 +176,17 @@ func main() {
 					return // drained (no concurrent sender)
 				}
 				recvLat[w] = append(recvLat[w], time.Since(s))
+				if *verify { // count this delivery against the message's index
+					for _, m := range msgs {
+						if len(m.Body) >= 8 {
+							if idx := int64(binary.BigEndian.Uint64(m.Body)); idx >= 0 && idx < int64(*n) {
+								atomic.AddInt32(&seen[idx], 1)
+								continue
+							}
+						}
+						atomic.AddInt64(&oorRecv, 1)
+					}
+				}
 				cs := time.Now()
 				if _, err := cli.CompleteBatch(ctx, *queue, msgs...); err != nil {
 					atomic.AddInt64(&drainErr, 1)
@@ -175,6 +221,32 @@ func main() {
 	fmt.Printf("\nSUMMARY conc=%d send=%.0f/s send_p50=%s drain=%.0f/s recv_p50=%s recv_max=%s errs=%d\n",
 		*conc, sendRate, pct(sl, .50).Round(time.Millisecond), drainRate,
 		pct(rl, .50).Round(time.Millisecond), dmax(rl).Round(time.Millisecond), sendErr+drainErr)
+
+	// ── INTEGRITY: every sent index must be received exactly once — no loss, no dup ──
+	if *verify {
+		var once, missing, dup, extra int64
+		for _, c := range seen {
+			switch {
+			case c == 0:
+				missing++ // never delivered → DATA LOSS
+			case c == 1:
+				once++ // exactly once → correct
+			default:
+				dup++ // delivered more than once → DUPLICATION
+				extra += int64(c - 1)
+			}
+		}
+		status := "OK"
+		if missing != 0 || dup != 0 || oorRecv != 0 {
+			status = "FAIL"
+		}
+		fmt.Printf("\nINTEGRITY=%s sent=%d received_once=%d missing=%d duplicated=%d extra_deliveries=%d out_of_range=%d\n",
+			status, *n, once, missing, dup, extra, oorRecv)
+	}
+	if m, err := cli.Stats(ctx, *queue); err == nil {
+		fmt.Printf("final queue: active=%d locked=%d deferred=%d dead_lettered=%d total=%d\n",
+			m.Active, m.Locked, m.Deferred, m.DeadLettered, m.Total)
+	}
 }
 
 func drainAll(ctx context.Context, cli *mqlite.Client, q string, conc int) {
