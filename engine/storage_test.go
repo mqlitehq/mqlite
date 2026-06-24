@@ -325,17 +325,24 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 	}
 	sizeBefore := fi.Size()
 
-	e.reclaimFreePages(ctx) // incremental_vacuum + TRUNCATE checkpoint → file shrinks
+	e.reclaimFreePages(ctx) // checkpoint + incremental_vacuum + checkpoint → file shrinks
 
-	if after := freelist(); after >= before {
-		t.Fatalf("reclaim did not shrink the freelist: before=%d after=%d", before, after)
-	}
+	afterFree := freelist()
 	fi2, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat db after: %v", err)
 	}
-	if fi2.Size() >= sizeBefore {
-		t.Fatalf("reclaim did not return file space to the OS: before=%d after=%d bytes", sizeBefore, fi2.Size())
+	t.Logf("reclaim: freelist %d -> %d pages, file %d -> %d bytes (%.0f%% returned to OS)",
+		before, afterFree, sizeBefore, fi2.Size(), 100*float64(sizeBefore-fi2.Size())/float64(sizeBefore))
+	// A working reclaim returns essentially the WHOLE freelist to the OS, not a few
+	// pages. incremental_vacuum needs the freed pages on the main-DB freelist AND a
+	// checkpoint to truncate the file — a weak "shrank at all" check would pass even on
+	// a near-total leak, which is exactly what an empty-queue-but-10MB-file looks like.
+	if afterFree >= freePageReclaimMin {
+		t.Fatalf("reclaim left %d free pages on the freelist (was %d) — not returned to the OS", afterFree, before)
+	}
+	if fi2.Size() > sizeBefore/2 {
+		t.Fatalf("reclaim returned only %d of %d bytes — expected most of the freelist back", sizeBefore-fi2.Size(), sizeBefore)
 	}
 
 	// :memory: has no OS pages to return — reclaim must be a harmless no-op.
