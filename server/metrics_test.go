@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/server"
@@ -49,5 +50,59 @@ func TestMetricsEndpoint(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("/metrics output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// /metrics also exposes a per-RPC latency histogram, fed by every RPC call — so a slow
+// dequeue is visible in monitoring, not just in tests.
+func TestMetricsRPCLatencyHistogram(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	ts := httptest.NewServer(server.New(eng, nil).Handler()) // auth off
+	defer ts.Close()
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		res, err := http.Post(ts.URL+"/mqlite.v1.AdminService/ListQueues", "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+	}
+
+	// observe() runs just after the handler returns, so a read can race the last call —
+	// poll until the histogram has counted all n (it settles in microseconds).
+	want := `mqlite_rpc_duration_seconds_count{rpc="AdminService/ListQueues"} 5`
+	var out string
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		res, err := http.Get(ts.URL + "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if out = string(body); strings.Contains(out, want) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for _, w := range []string{
+		want,
+		`mqlite_rpc_duration_seconds_bucket{rpc="AdminService/ListQueues",le="+Inf"} 5`,
+		`mqlite_rpc_duration_seconds_sum{rpc="AdminService/ListQueues"}`,
+		"# TYPE mqlite_rpc_duration_seconds histogram",
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("histogram missing %q:\n%s", w, out)
+		}
+	}
+	// the observer covers only RPCs — not /metrics itself, /healthz, or static paths.
+	if strings.Contains(out, `rpc="metrics"`) || strings.Contains(out, `rpc="healthz"`) {
+		t.Errorf("histogram should not include non-RPC paths:\n%s", out)
 	}
 }

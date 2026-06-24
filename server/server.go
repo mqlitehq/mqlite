@@ -26,13 +26,14 @@ type Server struct {
 	CORS    string       // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
 	Logger  *slog.Logger // per-request access log; nil -> no request logging (see logging.go)
 	UI      bool         // serve the embedded admin console at /ui (see console.go)
+	rpcLat  *rpcLatency  // per-RPC latency histogram, exposed at /metrics (see rpchist.go)
 	started time.Time
 }
 
 // New builds a Server. tokens is the set of accepted Bearer tokens; pass nil/empty
 // to disable auth (documented as a localhost/LAN downgrade, §7.5).
 func New(eng *engine.Engine, tokens []string) *Server {
-	s := &Server{eng: eng, tokens: map[string]bool{}, mux: http.NewServeMux(), started: time.Now()}
+	s := &Server{eng: eng, tokens: map[string]bool{}, mux: http.NewServeMux(), rpcLat: newRPCLatency(), started: time.Now()}
 	for _, t := range tokens {
 		if t = strings.TrimSpace(t); t != "" {
 			s.tokens[t] = true
@@ -43,8 +44,8 @@ func New(eng *engine.Engine, tokens []string) *Server {
 }
 
 // Handler returns the HTTP handler: CORS (outermost, so preflight bypasses auth) wrapping
-// the optional request log, Bearer-token auth, and the route mux.
-func (s *Server) Handler() http.Handler { return s.cors(s.logging(s.auth(s.mux))) }
+// the optional request log, Bearer-token auth, the RPC-latency observer, and the route mux.
+func (s *Server) Handler() http.Handler { return s.cors(s.logging(s.auth(s.observe(s.mux)))) }
 
 func (s *Server) routes() {
 	h := func(path string, fn http.HandlerFunc) { s.mux.HandleFunc(path, postOnly(fn)) }
@@ -167,6 +168,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, st := range stats {
 		fmt.Fprintf(&b, "mqlite_queue_oldest_message_age_ms{queue=%q} %d\n", st.name, st.m.OldestMessageAgeMs)
 	}
+	s.rpcLat.write(&b) // per-RPC latency histogram (rpchist.go)
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))
 }

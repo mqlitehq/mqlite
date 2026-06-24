@@ -6,25 +6,38 @@ wires `/metrics` into Prometheus + Grafana and suggests alerts.
 
 ## Metrics
 
-Prometheus text format (`text/plain; version=0.0.4`). All are **gauges**, one series
-per queue (subscriptions appear as their backing queue name):
+Prometheus text format (`text/plain; version=0.0.4`). Per-queue **gauges**
+(subscriptions appear as their backing queue name) plus a per-RPC latency **histogram**:
 
-| Metric | Labels | Meaning |
-|---|---|---|
-| `mqlite_queue_messages` | `queue`, `state` | messages by state: `active`, `locked`, `deferred`, `scheduled`, `dead_lettered` |
-| `mqlite_queue_total` | `queue` | total messages in the queue |
-| `mqlite_queue_oldest_message_age_ms` | `queue` | age of the oldest message (ms) |
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `mqlite_queue_messages` | gauge | `queue`, `state` | messages by state: `active`, `locked`, `deferred`, `scheduled`, `dead_lettered` |
+| `mqlite_queue_total` | gauge | `queue` | total messages in the queue |
+| `mqlite_queue_oldest_message_age_ms` | gauge | `queue` | age of the oldest message (ms) |
+| `mqlite_rpc_duration_seconds` | histogram | `rpc`, `le` | RPC handler latency by method (`_bucket` + `_sum` + `_count`) |
 
 ```
 # HELP mqlite_queue_messages Messages in a queue by state.
 # TYPE mqlite_queue_messages gauge
 mqlite_queue_messages{queue="orders",state="active"} 42
-mqlite_queue_messages{queue="orders",state="locked"} 3
-mqlite_queue_messages{queue="orders",state="dead_lettered"} 0
 ...
 mqlite_queue_total{queue="orders"} 45
 mqlite_queue_oldest_message_age_ms{queue="orders"} 1873
+# TYPE mqlite_rpc_duration_seconds histogram
+mqlite_rpc_duration_seconds_bucket{rpc="QueueService/Receive",le="0.01"} 37
+mqlite_rpc_duration_seconds_bucket{rpc="QueueService/Receive",le="+Inf"} 84
+mqlite_rpc_duration_seconds_sum{rpc="QueueService/Receive"} 1.426651
+mqlite_rpc_duration_seconds_count{rpc="QueueService/Receive"} 84
 ```
+
+The histogram makes a **slow dequeue visible** — e.g. p99 receive latency in Grafana:
+```promql
+histogram_quantile(0.99, sum by (le) (rate(mqlite_rpc_duration_seconds_bucket{rpc="QueueService/Receive"}[5m])))
+```
+A rising `Receive` / `CompleteBatch` tail is the signature of dequeue contention (the
+claim path serialising on the single writer). The `rpc` label is the shortened RPC name
+(`/mqlite.v1.QueueService/Send` → `QueueService/Send`); only RPCs are timed, not
+`/metrics` / `/healthz` / `/ui`.
 
 Quick check:
 
