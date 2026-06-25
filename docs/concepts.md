@@ -50,27 +50,27 @@ runs this state machine — a row is in exactly one state at a time; below `coun
 is deleted from the database:
 
 ```
-  Send(schedule)                                      Send
-       │                                               │
-       ▼            scheduler (enqueue time due)        ▼
-  ┌───────────┐ ────────────────────────────────► ┌──────────┐ ◄─┐
-  │ scheduled │                                    │  active  │   │ redrive
-  └─────┬─────┘                                    └────┬─────┘   │ (DLQ→queue,
-     cancel                         receive / claim │   ▲          │  count→0)
-        ▼                                 (count++) ▼   │ abandon / lock expires,
-    ✗ removed                             ┌──────────┐  │ count < max  (reaper)
-                       renew ────────────►│  locked  │──┘
-                    (extend lease)        │          │── defer ──► ┌──────────┐
-                                          │          │◄ Receive ── │ deferred │
-                                          └────┬─────┘  Deferred   └──────────┘
-                  complete ──► ✗ removed ◄─────┤
-                                               │ reject / abandon / lock expires,
-                                               ▼ count ≥ max
-                                       ┌───────────────┐
-              TTL expires ───────────► │ dead_lettered │ ──► redrive (up to active)
-              active/locked/deferred   └───────┬───────┘
-              → DLQ (discard ✗ if              │
-              dead_letter_on_expire=0)  purge / DLQ retention ──► ✗ removed
+                   ┌───────────┐
+  Send(scheduled)  │ scheduled │   scheduler, when due ─► active
+  ───────────────► └─────┬─────┘   cancel ─► ✗ removed
+                         │
+                         ▼
+  Send             ┌──────────┐ ◄── requeue: abandon / lock-expiry, count < max  (reaper)
+  ───────────────► │  active  │ ◄── redrive: from dead_lettered (count → 0)
+                   └────┬─────┘
+                        │ receive / claim (count++)
+                        ▼
+                   ┌──────────┐ ──── defer ──────► ┌──────────┐
+                   │  locked  │ ◄─ ReceiveDeferred  │ deferred │
+                   └────┬─────┘    (by seq)         └──────────┘
+                        │ complete ─► ✗ removed
+                        │ renew ─► (stays locked)
+                        │ reject, or abandon / lock-expiry, count ≥ max:
+                        ▼
+                   ┌───────────────┐ ◄── TTL expiry (active / locked / deferred;
+                   │ dead_lettered │      ✗ removed if dead_letter_on_expire = 0)
+                   └───────┬───────┘
+                           │ purge / DLQ retention ─► ✗ removed
 ```
 
 Every transition, with its trigger and the condition under which it fires:
