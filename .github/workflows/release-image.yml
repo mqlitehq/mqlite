@@ -44,7 +44,7 @@ jobs:
       # Pure-Go cross-compile (Dockerfile uses BUILDPLATFORM + GOARCH=$TARGETARCH),
       # so amd64 + arm64 build natively without QEMU emulation.
       - name: build + push (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
