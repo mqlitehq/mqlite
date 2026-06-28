@@ -45,21 +45,66 @@ backing queue behind a subscription).
 
 ### Queue
 A named message container, and the only entity that actually stores messages. A message
-in a queue runs a state machine:
+runs this state machine — a row is in exactly one state at a time; below `count` =
+`delivery_count`, `max` = the queue's `max_delivery_count`, and `✗ removed` means the row
+is deleted from the database:
 
 ```
- active ──claim/receive──> locked ──complete──> (deleted)
-   ▲                          │
-   │       abandon/timeout     │ reject, or delivery count reaches max
-   └──────────────────────────┤
-                              ▼
-                        dead_lettered (the DLQ sub-state)
+                   ┌───────────┐
+  Send(scheduled)  │ scheduled │   scheduler, when due ─► active
+  ───────────────► └─────┬─────┘   cancel ─► ✗ removed
+                         │
+                         ▼
+  Send             ┌──────────┐ ◄── requeue: abandon / lock-expiry, count < max  (reaper)
+  ───────────────► │  active  │ ◄── redrive: from dead_lettered (count → 0)
+                   └────┬─────┘
+                        │ receive / claim (count++)
+                        ▼
+                   ┌──────────┐ ──── defer ──────► ┌──────────┐
+                   │  locked  │ ◄─ ReceiveDeferred  │ deferred │
+                   └────┬─────┘    (by seq)         └──────────┘
+                        │ complete ─► ✗ removed
+                        │ renew ─► (stays locked)
+                        │ reject, or abandon / lock-expiry, count ≥ max:
+                        ▼
+                   ┌───────────────┐ ◄── TTL expiry (active / locked / deferred;
+                   │ dead_lettered │      ✗ removed if dead_letter_on_expire = 0)
+                   └───────┬───────┘
+                           │ purge / DLQ retention ─► ✗ removed
 ```
+
+Every transition, with its trigger and the condition under which it fires:
+
+| From | Trigger | To | When |
+|---|---|---|---|
+| _(new)_ | `Send` | active | delivered immediately |
+| _(new)_ | `Send` scheduled | scheduled | enqueue time is in the future |
+| scheduled | scheduler loop | active | enqueue time reached |
+| scheduled | `Cancel` | ✗ removed | cancel before it activates |
+| active | `Receive` / claim | locked | `count`++; lock acquired |
+| locked | `Complete` | ✗ removed | fenced on `lock_token` |
+| locked | `Abandon` | active | `count < max`; optional backoff delay |
+| locked | `Abandon` | dead_lettered | `count ≥ max` |
+| locked | lock expiry (reaper) | active | `count < max`; auto-redelivered |
+| locked | lock expiry (reaper) | dead_lettered | `count ≥ max` (`MaxDeliveryCountExceeded`) |
+| locked | `Reject` | dead_lettered | explicit, with a reason |
+| locked | `Defer` | deferred | set aside; fetched later by seq |
+| locked | `Renew` | locked | extends the lock lease |
+| deferred | `ReceiveDeferred` | locked | fetched by seq; `count`++ |
+| active / locked / deferred | TTL expiry | dead_lettered | queue has `dead_letter_on_expire=1` (`TTLExpired`) |
+| active / locked / deferred / scheduled | TTL expiry | ✗ removed | queue has `dead_letter_on_expire=0` (discard) |
+| dead_lettered | `Redrive` | active | back to this (or a target) queue; `count` reset to 0 |
+| dead_lettered | `Purge` | ✗ removed | manual deletion |
+| dead_lettered | DLQ retention | ✗ removed | background janitor bounds (age / count / bytes); touches **only** dead-letter rows |
 
 - **The DLQ is not a separate queue.** It is messages in the same queue with
-  `state='dead_lettered'`. A message lands there when its delivery count reaches
-  `max_delivery_count` (i.e. `≥`), or on an explicit `reject`. Inspect with
-  `peek state=dead_lettered`, send back with `redrive`, or delete with `purge`.
+  `state='dead_lettered'`. A message lands there when its `delivery_count` reaches
+  `max_delivery_count` (i.e. `≥`), on an explicit `reject`, or on TTL expiry (when the
+  queue's `dead_letter_on_expire=1`). Inspect with `peek state=dead_lettered`, send back
+  with `redrive`, or delete with `purge`.
+- **Two redelivery paths.** `Abandon` is an explicit, client-driven settlement; **lock
+  expiry** is automatic — the reaper (~1s) reclaims a lock held past `lock_duration`
+  without settling. Both redeliver while `count < max` and dead-letter once `count ≥ max`.
 - You can have any number of independent plain queues.
 
 ### Topic
