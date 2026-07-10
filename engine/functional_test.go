@@ -404,6 +404,82 @@ func TestTopicSubscriptionIsolation(t *testing.T) {
 	}
 }
 
+// Queue, subscription and topic names are ONE disjoint namespace (MQLITE-57).
+// resolveTargets resolves a subscribed name as a topic FIRST, so before the
+// symmetric guards a topic could shadow a live queue and every Send for that
+// name silently rerouted to the fan-out (review F2) — and, in reverse, a queue
+// created under a live topic's name could never be reached by Send. Conflicts
+// must fail loud (ErrNameConflict, HTTP 409) at creation time, in BOTH
+// directions, including against subscription backing queues and the degenerate
+// self-reference. Legal upserts (same-name queue reconfig, same (topic,name)
+// re-subscribe) stay open.
+func TestTopicQueueNamespaceDisjoint(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+
+	// Forward guard: a live plain queue's name cannot become a topic.
+	mustQueue(t, e, "orders", QueueConfig{})
+	if err := e.Subscribe(ctx, "orders", "s1", nil); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("topic shadowing a live queue must be ErrNameConflict, got %v", err)
+	}
+	// ...and Send still reaches the queue afterwards (nothing was half-created).
+	if _, err := e.SendOne(ctx, "orders", OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatalf("send to the queue after the rejected subscribe: %v", err)
+	}
+	if m := recvOne(t, e, "orders"); m == nil || string(m.Body) != "x" {
+		t.Fatalf("queue must still receive its messages, got %+v", m)
+	}
+
+	// Reverse guard: a live topic's name cannot become a queue.
+	if err := e.Subscribe(ctx, "billing", "billing_sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "billing", QueueConfig{}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("queue under a live topic's name must be ErrNameConflict, got %v", err)
+	}
+
+	// A topic cannot shadow a subscription backing queue either (queues table
+	// holds both kinds — the guard must not filter to kind='queue').
+	if err := e.Subscribe(ctx, "billing_sub", "y", nil); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("topic shadowing a subscription backing queue must be ErrNameConflict, got %v", err)
+	}
+
+	// A subscription cannot take a live topic's name (its backing queue would
+	// itself resolve as that topic), and the failed call must not half-register
+	// its own topic.
+	if err := e.Subscribe(ctx, "t2", "billing", nil); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("subscription named after a live topic must be ErrNameConflict, got %v", err)
+	}
+	if _, err := e.SendOne(ctx, "t2", OutMessage{Body: []byte("x")}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("t2 must not exist after the rejected subscribe, got %v", err)
+	}
+
+	// Degenerate self-reference: Subscribe(topic=X, name=X) is rejected.
+	if err := e.Subscribe(ctx, "same", "same", nil); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("self-referential subscription must be ErrNameConflict, got %v", err)
+	}
+
+	// Cross-kind upsert is rejected: a plain CreateQueue must not silently
+	// retune a subscription's backing queue, nor a kind=subscription request a
+	// plain queue. A deliberate same-kind reconfig stays open.
+	if err := e.CreateQueue(ctx, "billing_sub", QueueConfig{}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("plain CreateQueue over a backing queue must be ErrNameConflict, got %v", err)
+	}
+	if err := e.CreateQueue(ctx, "orders", QueueConfig{Kind: "subscription"}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("kind=subscription over a plain queue must be ErrNameConflict, got %v", err)
+	}
+	if err := e.CreateQueue(ctx, "billing_sub", QueueConfig{Kind: "subscription", LockDurationMs: 60_000}); err != nil {
+		t.Fatalf("explicit same-kind backing-queue reconfig should succeed: %v", err)
+	}
+
+	// Legal upserts stay open: reconfiguring an existing queue by name, and
+	// re-subscribing the same (topic, name).
+	mustQueue(t, e, "orders", QueueConfig{LockDurationMs: 60_000})
+	if err := e.Subscribe(ctx, "billing", "billing_sub", nil); err != nil {
+		t.Fatalf("idempotent re-subscribe should succeed: %v", err)
+	}
+}
+
 // Concurrent claim with mixed session/no-session messages (eval report r2 P0-4 TCK):
 // no-session messages are claimed in parallel by competing consumers, while each
 // session group is delivered strictly FIFO and groups never block one another.

@@ -197,7 +197,12 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 ### CreateQueue
 
 Create a queue, or **update** one (idempotent **upsert** on `name`: calling it again
-with the same name overwrites that queue's config — existing messages are untouched).
+with the same name **and the same `kind`** overwrites that queue's config — existing
+messages are untouched). Names are one flat namespace shared with subscriptions and
+topics: a `name` that is live as a **topic**, or that belongs to an entity of a
+**different kind** (e.g. a plain create over a subscription's backing queue), is
+rejected with `409 name_conflict` instead of silently taking over
+([concepts → provisioning](concepts.md#provisioning--what-you-create-vs-what-is-created-for-you)).
 **Response** `{}` (Empty).
 
 **Request** `CreateQueueRequest`: `name` (string) + `config` (`QueueConfigJSON`, all
@@ -236,6 +241,10 @@ Register subscription `name` under `topic` (creates its backing queue).
 - **Request** `SubscribeRequest`: `topic`, `name`, `filter` (optional —
   `{"expr": "<predicate>"}`, an [expr boolean over the message](concepts.md#subscription-filters-expr); empty/omitted
   matches all). A malformed expr is rejected with `400 invalid_argument`. **Response** `{}`.
+- Name conflicts are rejected with `409 name_conflict`: a `topic` that names an
+  existing queue or subscription, a `name` that belongs to a plain queue / another
+  topic's subscription / a live topic, and `topic == name`. Re-subscribing the same
+  `(topic, name)` is the idempotent filter-update path and succeeds.
 
 ### ListQueues
 
@@ -338,7 +347,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
 | 404 | `not_found` | the queue or message doesn't exist; or an unknown path |
 | 409 | `already_exists` | single-message dedup conflict (same id, different body) |
-| 409 | `name_conflict` | reusing a subscription/queue name across topics |
+| 409 | `name_conflict` | a queue/subscription/topic name collision at creation time — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
 | 409 | `lock_lost` | settle with an expired or wrong `lock_token` |
 | 413 | `message_too_large` | body over `MaxMessageBytes` (default 1 MiB) |
 | 499 | `canceled` | the client canceled the request |

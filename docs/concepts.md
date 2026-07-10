@@ -155,11 +155,24 @@ publish.
 - There is **no "create topic" operation** and **no same-named queue behind a topic**.
   The backing queue is named after the **subscription**, not the topic.
 - You never pre-create a queue to attach a subscription to — one `Subscribe` call
-  builds the backing queue and the fan-out mapping. Guard: if `name` is already a plain
-  queue, or already a subscription under another topic, `Subscribe` fails with
-  `ErrNameConflict` rather than hijacking it.
+  builds the backing queue and the fan-out mapping.
+- **One flat namespace, disjoint by construction.** Plain-queue names, subscription
+  names (= their backing-queue names) and topic names never overlap; conflicts fail
+  loud with `ErrNameConflict` (HTTP 409) at creation time, in both directions:
+  `Subscribe` rejects a **topic** that names an existing queue or subscription, a
+  **subscription name** that belongs to a plain queue, to another topic's
+  subscription, or to a live topic, and the degenerate `topic == name`;
+  `CreateQueue` rejects a name that is live as a topic, and a **cross-kind upsert**
+  (a plain `CreateQueue` over a subscription's backing queue, or `kind=subscription`
+  over a plain queue) — a deliberate same-kind reconfig stays open. (ASB behaves the
+  same way: queues and topics share one entity namespace, so a same-name create
+  conflicts instead of silently rerouting sends.) The guards apply to creations from
+  this version on; a pre-existing colliding pair in an old DB keeps resolving
+  topic-first and now fails loud on any attempt to re-create either side.
 - Name resolution at publish/send: a name with subscription rows → **topic** (fan-out);
-  otherwise it must be an **existing queue**; otherwise the call errors.
+  otherwise it must be an **existing queue**; otherwise the call errors. Because the
+  namespace is disjoint, this resolution is **unambiguous** — a name can never be a
+  topic and a queue at the same time, so a `Send` is never silently rerouted.
 
 ```
 You only ever do two kinds of "create":

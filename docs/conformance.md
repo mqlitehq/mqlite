@@ -157,6 +157,24 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   no-op (`SendOne`/`Schedule` return `0, nil`), not an `ErrDedupConflict`.
   *(engine/filter_test.go `TestFilterReSubscribeRecompiles`)*
 
+## 12 · Topics & naming
+
+- **12.1** Plain-queue names, subscription names (their backing queues) and topic
+  names are **one disjoint namespace**. Every collision MUST be rejected with
+  `ErrNameConflict` (HTTP 409) at creation time, in both directions: `Subscribe`
+  rejects a topic naming any existing queues row (plain or backing), a subscription
+  name that is a plain queue / another topic's subscription / a live topic, and
+  `topic == name`; `CreateQueue` rejects a name that is live as a topic and any
+  cross-kind upsert. Same-kind upserts (queue reconfig, `(topic,name)` re-subscribe)
+  stay open. A failed creation MUST leave nothing behind (guards + inserts are one
+  transaction).
+  *(engine/functional_test.go: TestTopicQueueNamespaceDisjoint,
+  TestTopicSubscriptionIsolation)*
+- **12.2** Because names are disjoint, send/publish resolution (topic-first, else
+  queue, else `ErrQueueNotFound`) is **unambiguous** — a `Send` can never be silently
+  rerouted between a queue and a same-named topic.
+  *(engine/functional_test.go: TestTopicQueueNamespaceDisjoint)*
+
 ---
 
 *This spec is the contract a non-SQLite storage backend (see the Store-interface
