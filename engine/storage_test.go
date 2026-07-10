@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -124,6 +125,50 @@ func TestFileDBSingleWriter(t *testing.T) {
 		t.Fatalf("reopen after close: %v", err)
 	}
 	_ = e3.Close()
+}
+
+// MQLITE-60: the lock sidecar is keyed on the CANONICAL path, so every spelling
+// of the same physical file must collide on one .lock — dot segments, DSN query
+// options, and (where the file exists) symlinked directories included. Before
+// the fix each spelling derived its own sidecar and two writers could open one
+// file.
+func TestFileDBSingleWriterPathSpellings(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	clean := filepath.Join(dir, "mq.db")
+
+	e1, err := Open(ctx, Options{DB: "file:" + clean, DisableBackground: true})
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	defer e1.Close()
+
+	sep := string(os.PathSeparator)
+	dotted := dir + sep + "." + sep + "mq.db"                                      // dir/./mq.db
+	parent := dir + sep + ".." + sep + filepath.Base(dir) + sep + "mq.db"          // dir/../dir/mq.db
+	for _, spelling := range []string{dotted, parent, clean + "?_pragma=foo(1)"} { // + DSN options
+		e2, err := Open(ctx, Options{DB: "file:" + spelling, DisableBackground: true})
+		if !errors.Is(err, ErrDBLocked) {
+			if e2 != nil {
+				_ = e2.Close()
+			}
+			t.Fatalf("spelling %q must collide on the same lock: got err=%v, want ErrDBLocked", spelling, err)
+		}
+	}
+
+	if runtime.GOOS != "windows" { // symlinks need privileges on Windows runners
+		link := filepath.Join(t.TempDir(), "dir-link")
+		if err := os.Symlink(dir, link); err != nil {
+			t.Skipf("symlink: %v", err)
+		}
+		e2, err := Open(ctx, Options{DB: "file:" + filepath.Join(link, "mq.db"), DisableBackground: true})
+		if !errors.Is(err, ErrDBLocked) {
+			if e2 != nil {
+				_ = e2.Close()
+			}
+			t.Fatalf("symlinked spelling must collide on the same lock: got err=%v, want ErrDBLocked", err)
+		}
+	}
 }
 
 // :memory: DBs are private per handle, so concurrent opens must NOT be locked.

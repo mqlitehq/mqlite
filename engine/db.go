@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -71,12 +72,31 @@ func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 
 // localFilePath returns the on-disk path of a local file DSN, or ok=false for an
 // in-memory DB (which needs no single-writer lock — each :memory: is its own DB).
+//
+// The path is CANONICALIZED (MQLITE-60 / review F5): the lock sidecar is keyed on
+// it, so every spelling of the same physical file must derive the same .lock —
+// otherwise two processes opening "./mq.db" and "/abs/dir/mq.db" each take their
+// own lock and the single-writer guarantee is gone. DSN query options are not
+// part of the file identity; Abs+Clean folds relative segments; EvalSymlinks
+// resolves symlinked spellings once the target exists (a not-yet-created DB
+// keeps the absolute path — the sidecar then lives next to the symlink, which
+// still locks consistently for every opener using any non-symlinked spelling).
 func localFilePath(dsn string) (string, bool) {
 	low := strings.ToLower(strings.TrimSpace(dsn))
 	if low == "" || strings.Contains(low, ":memory:") {
 		return "", false
 	}
-	return strings.TrimPrefix(dsn, "file:"), true
+	path := strings.TrimPrefix(strings.TrimSpace(dsn), "file:")
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return path, true
 }
 
 func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
