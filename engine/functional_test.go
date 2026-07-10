@@ -649,3 +649,85 @@ func TestDeferHoldsHeadOfLine(t *testing.T) {
 		}
 	})
 }
+
+// ─── lock expiry × ordering: head-of-line (MQLITE-56) ──────────────────────────
+
+// FIFO must survive a consumer timeout. A locked head whose lock has EXPIRED but
+// which the reaper has not yet resettled keeps blocking its group (strict_fifo:
+// the whole queue): successors are never delivered ahead of it, and the expired
+// head itself is redelivered first — in id order — once the reaper runs. Before
+// MQLITE-56 the locked head-of-line probe carried `AND b.locked_until>?`, so in
+// the ≤1s reaper window successors overtook the head (out-of-order delivery) and
+// the group ran two messages in flight at once. SQS FIFO semantics: a group with
+// an in-flight message stays blocked for the whole in-flight window, expired or
+// not. Cost of the fix: a consumer timeout stalls the group ≤ one reaper
+// interval; Abandon (explicit settle) still releases immediately.
+func TestFIFOHoldsAcrossLockExpiry(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("group_fifo: expired head still blocks its group, others proceed", func(t *testing.T) {
+		e, ms := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderGroupFIFO})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g1a"), GroupID: "G1"})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g1b"), GroupID: "G1"})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g2a"), GroupID: "G2"})
+
+		head := recvOne(t, e, "q") // G1 head, locked for the default 30s
+		if head == nil || string(head.Body) != "g1a" {
+			t.Fatalf("expected g1a first, got %+v", head)
+		}
+		advance(ms, 31*time.Second) // lock expired; reaper has NOT run
+
+		// The expired-but-unreaped head must still hold its group's line...
+		if got := recvOne(t, e, "q"); got == nil || got.GroupID != "G2" {
+			t.Fatalf("only G2 may proceed past G1's expired head, got %+v", got)
+		}
+		if blocked := recvOne(t, e, "q"); blocked != nil {
+			t.Fatalf("g1b must not overtake G1's expired head, got %q", blocked.Body)
+		}
+
+		// ...until the reaper resettles it; then the HEAD is redelivered first.
+		e.RunMaintenanceOnce(ctx)
+		redelivered := recvOne(t, e, "q")
+		if redelivered == nil || string(redelivered.Body) != "g1a" {
+			t.Fatalf("expired head must be redelivered before its successors, got %+v", redelivered)
+		}
+		if redelivered.DeliveryCount != 2 {
+			t.Fatalf("redelivery must bump delivery_count to 2, got %d", redelivered.DeliveryCount)
+		}
+		if err := e.Complete(ctx, "q", redelivered.SeqNumber, redelivered.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if next := recvOne(t, e, "q"); next == nil || string(next.Body) != "g1b" {
+			t.Fatalf("after the head settles, G1 advances to g1b, got %+v", next)
+		}
+	})
+
+	t.Run("strict_fifo: expired head stalls the whole queue until reaped", func(t *testing.T) {
+		e, ms := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderStrictFIFO})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("m1")})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("m2")})
+
+		m1 := recvOne(t, e, "q")
+		if m1 == nil || string(m1.Body) != "m1" {
+			t.Fatalf("expected m1 first, got %+v", m1)
+		}
+		advance(ms, 31*time.Second) // lock expired; reaper has NOT run
+
+		if blocked := recvOne(t, e, "q"); blocked != nil {
+			t.Fatalf("m2 must not overtake the expired head, got %q", blocked.Body)
+		}
+		e.RunMaintenanceOnce(ctx)
+		redelivered := recvOne(t, e, "q")
+		if redelivered == nil || string(redelivered.Body) != "m1" {
+			t.Fatalf("expired head must be redelivered first, got %+v", redelivered)
+		}
+		if err := e.Complete(ctx, "q", redelivered.SeqNumber, redelivered.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if m2 := recvOne(t, e, "q"); m2 == nil || string(m2.Body) != "m2" {
+			t.Fatalf("m2 follows once the head settles, got %+v", m2)
+		}
+	})
+}

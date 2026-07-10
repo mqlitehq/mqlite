@@ -82,7 +82,10 @@ var schemaStmts = []string{
 	`CREATE INDEX IF NOT EXISTS idx_msg_dlq       ON messages(queue, id)            WHERE state='dead_lettered'`,
 	// partial index for group-ordered claim — only grouped messages pay for it (§11.1).
 	// The split per-state head-of-line probe in claimSQL seeks this by its
-	// (queue,group_id,state[,locked_until]) prefix (MQLITE-22).
+	// (queue,group_id,state) prefix (MQLITE-22). The trailing locked_until column
+	// is no longer read by any probe (MQLITE-56 made the locked probe ignore
+	// expiry) but stays: dropping it would change the schema token and orphan
+	// every existing DB for zero read benefit.
 	`CREATE INDEX IF NOT EXISTS idx_msg_group_inflight ON messages(queue, group_id, state, locked_until)
 	  WHERE group_id IS NOT NULL`,
 	// Per-state head-of-line probes for the ordered-claim paths (MQLITE-22): each

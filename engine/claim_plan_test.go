@@ -41,7 +41,7 @@ func TestClaimPlanPinning(t *testing.T) {
 	e, _ := testEngine(t)
 	seedMixedBacklog(t, e) // a few queues × every in-flight state, ANALYZEd
 
-	dummy := []any{int64(0), "tok", "q2", int64(0), int64(0), int64(0)} // lockUntil,token,queue,now,now,now
+	dummy := []any{int64(0), "tok", "q2", int64(0), int64(0)} // lockUntil,token,queue,now,now
 	for _, tc := range []struct{ name, sql string }{{"group_fifo", claimSQL}, {"strict_fifo", claimStrictSQL}} {
 		plan := explainPlan(t, e, tc.sql, dummy...)
 		if !strings.Contains(plan, "idx_msg_active") {
@@ -49,6 +49,11 @@ func TestClaimPlanPinning(t *testing.T) {
 		}
 		if strings.Contains(plan, "rowid<") {
 			t.Errorf("%s: head-of-line probe scans rowid<? (O(n^2) regression):\n%s", tc.name, plan)
+		}
+		// Pin the whole surface: a claim plan must be all index SEARCHes — any SCAN
+		// (outer or probe) is a planner regression the two checks above might miss.
+		if strings.Contains(plan, "SCAN") {
+			t.Errorf("%s: claim plan contains a full scan:\n%s", tc.name, plan)
 		}
 	}
 }
