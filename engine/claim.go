@@ -11,7 +11,13 @@ import (
 
 func randToken() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	// Lock tokens fence settlement and key the idempotency receipts — everything
+	// downstream assumes they are unique. If the system CSPRNG fails there is no
+	// safe fallback (an all-zero token would let any caller settle any claim), so
+	// crash loudly instead of degrading silently (MQLITE-63 / review F12).
+	if _, err := rand.Read(b); err != nil {
+		panic("mqlite: crypto/rand failed: " + err.Error())
+	}
 	return hex.EncodeToString(b)
 }
 
