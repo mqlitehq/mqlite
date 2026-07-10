@@ -105,6 +105,13 @@ Every transition, with its trigger and the condition under which it fires:
 - **Two redelivery paths.** `Abandon` is an explicit, client-driven settlement; **lock
   expiry** is automatic — the reaper (~1s) reclaims a lock held past `lock_duration`
   without settling. Both redeliver while `count < max` and dead-letter once `count ≥ max`.
+- **Ordering survives lock expiry.** On `group_fifo` / `strict_fifo` queues an
+  expired-but-not-yet-reaped lock still blocks its group (strict: the whole queue):
+  successors are never delivered ahead of the expired head, and the head itself is
+  redelivered first, in id order, once the reaper runs. The cost is that a consumer
+  timeout stalls its group for up to one reaper interval (~1s) — the same trade SQS
+  FIFO makes. A slow-but-alive consumer should `Renew` its lock rather than let it
+  lapse; an explicit `Abandon` releases the head immediately.
 - You can have any number of independent plain queues.
 
 ### Topic

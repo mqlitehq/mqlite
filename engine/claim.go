@@ -34,6 +34,11 @@ func claimSQLFor(ordering OrderingMode) string {
 // group_id IS NULL  -> the message is its own group (never group-blocked);
 // otherwise the group head is released only when no earlier same-group message
 // is still locked/deferred/scheduled (in-order, FIFO-per-group).
+// The locked probe deliberately ignores locked_until (MQLITE-56): an expired
+// lock keeps blocking its group until the reaper resettles the head, so a
+// consumer timeout stalls the group for ≤ the reaper interval instead of
+// letting successors overtake the head (out-of-order delivery) — SQS FIFO
+// behaves the same way. A slow-but-alive consumer should Renew instead.
 const claimSQL = `
 UPDATE messages
    SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
@@ -59,7 +64,7 @@ UPDATE messages
                           AND b.state='scheduled' AND b.id < m.id )
            OR EXISTS ( SELECT 1 FROM messages b
                         WHERE b.queue=m.queue AND b.group_id=m.group_id
-                          AND b.state='locked' AND b.locked_until>? AND b.id < m.id ) ) )
+                          AND b.state='locked' AND b.id < m.id ) ) )
     ORDER BY m.id ASC LIMIT 1)
 RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
           reply_to, subject, content_type, properties, enqueued_at, locked_until`
@@ -69,8 +74,10 @@ RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
 // message is claimable only when no earlier id in the queue is still in flight
 // (locked/deferred/scheduled), regardless of group. The whole queue therefore
 // delivers strictly one-at-a-time in id order. Parameter layout is identical to
-// claimSQL (lockUntil, token, queue, now, now, now) so claimOneTx just swaps the
-// SQL string per the queue's ordering mode.
+// claimSQL (lockUntil, token, queue, now, now) so claimOneTx just swaps the
+// SQL string per the queue's ordering mode. Like claimSQL, the locked probe
+// ignores locked_until (MQLITE-56) so an expired lock never lets successors
+// overtake the head.
 const claimStrictSQL = `
 UPDATE messages
    SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
@@ -92,7 +99,7 @@ UPDATE messages
                           AND b.state='scheduled' AND b.id < m.id )
            OR EXISTS ( SELECT 1 FROM messages b
                         WHERE b.queue=m.queue
-                          AND b.state='locked' AND b.locked_until>? AND b.id < m.id ) )
+                          AND b.state='locked' AND b.id < m.id ) )
     ORDER BY m.id ASC LIMIT 1)
 RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
           reply_to, subject, content_type, properties, enqueued_at, locked_until`

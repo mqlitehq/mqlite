@@ -41,7 +41,7 @@ func TestClaimPlanPinning(t *testing.T) {
 	e, _ := testEngine(t)
 	seedMixedBacklog(t, e) // a few queues × every in-flight state, ANALYZEd
 
-	dummy := []any{int64(0), "tok", "q2", int64(0), int64(0), int64(0)} // lockUntil,token,queue,now,now,now
+	dummy := []any{int64(0), "tok", "q2", int64(0), int64(0)} // lockUntil,token,queue,now,now
 	for _, tc := range []struct{ name, sql string }{{"group_fifo", claimSQL}, {"strict_fifo", claimStrictSQL}} {
 		plan := explainPlan(t, e, tc.sql, dummy...)
 		if !strings.Contains(plan, "idx_msg_active") {
