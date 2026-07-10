@@ -46,8 +46,11 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 
 ## 3 · Idempotency & at-least-once
 
-- **3.1** On `Open`, every orphaned `locked` row (a crash leftover) MUST reset to
-  `active` (single-broker recovery). *(engine/engine_test.go)*
+- **3.1** On `Open`, every orphaned `locked` row (a crash leftover) MUST be
+  reclaimed under the same rule as the reaper: back to `active`, or to
+  `dead_lettered` (`MaxDeliveryCountExceeded`) once `delivery_count >=
+  max_delivery_count` — a crash never buys an extra delivery.
+  *(engine/engine_test.go: TestCrashRecoveryRespectsMaxDelivery)*
 - **3.2** A settle whose response was lost MUST replay as success, not `ErrLockLost`
   (`settlement_receipts`, fenced on `lock_token`). *(engine/ga_fixes_test.go)*
 - **3.3** A `Receive` retried with the same `AttemptID` MUST replay the same batch /

@@ -118,10 +118,19 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	}
 
 	// Single-broker crash recovery (§4.4): any 'locked' row is an orphan from a
-	// previous process — reclaim it to 'active' immediately (delivery_count was
-	// already incremented at claim time, so this counts as one redelivery).
-	if _, err := e.db.exec(ctx,
-		`UPDATE messages SET state='active', locked_until=0, lock_token=NULL WHERE state='locked'`); err != nil {
+	// previous process — reclaim it immediately (delivery_count was already
+	// incremented at claim time, so this counts as one redelivery). Same rule as
+	// the reaper (MQLITE-58): a message that died on its LAST allowed attempt is
+	// dead-lettered here, not redelivered an (max+1)th time — max_delivery_count
+	// is a bound on deliveries, not on deliveries-without-a-crash.
+	if _, err := e.db.exec(ctx, `
+		UPDATE messages SET
+		    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
+		                 THEN 'dead_lettered' ELSE 'active' END,
+		    locked_until = 0, lock_token = NULL,
+		    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
+		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
+		 WHERE state='locked'`); err != nil {
 		_ = d.close()
 		return nil, fmt.Errorf("crash recovery: %w", err)
 	}
