@@ -38,3 +38,9 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin GoReleaser to THE tag that triggered this run. With two tags on
+          # one commit (an rc and its promotion) GoReleaser's own tag discovery
+          # picked the rc, rebuilt rc-named artifacts and failed uploading them
+          # to the existing rc release (v0.2.0, 2026-07-11). The ref name is
+          # always the pushed tag here (workflow triggers on tags only).
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
