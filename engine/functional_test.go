@@ -157,6 +157,34 @@ func TestTTLToDeadLetter(t *testing.T) {
 	}
 }
 
+// A message that expires while STILL in state 'scheduled' is dead-lettered by the
+// TTL pass, same as active/locked/deferred (MQLITE-61) — both TTL branches cover
+// the same state set. TTL is anchored at visible_at (§8.7), so this state is only
+// reachable when the scheduler lags past visible_at + ttl: a paused/stopped broker
+// (downtime longer than the ttl) or the 1s scheduler cadence with a sub-second ttl.
+// The TTL pass is called directly (white-box) because RunMaintenanceOnce runs the
+// scheduler first, which would activate the row and mask the scheduled branch.
+func TestTTLScheduledToDeadLetter(t *testing.T) {
+	ctx := context.Background()
+	e, msp := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+	// visible_at = now+1s, expires_at = visible_at + 1s (queue default) = now+2s.
+	if _, err := e.Schedule(ctx, "q", OutMessage{Body: []byte("stale")}, e.now()+1000); err != nil {
+		t.Fatal(err)
+	}
+	advance(msp, 3*time.Second) // both lapsed; no scheduler ran (downtime simulation)
+	e.expireTTL(ctx)
+	pk, _ := e.Peek(ctx, "q", PeekOptions{State: StateDeadLettered})
+	if len(pk) != 1 || pk[0].DeadLetterReason != ReasonTTLExpired {
+		t.Fatalf("scheduled message must dead-letter once expired, got %+v", pk)
+	}
+	// The scheduler afterwards must not resurrect it.
+	e.RunMaintenanceOnce(ctx)
+	if got := recvOne(t, e, "q"); got != nil {
+		t.Fatalf("dead-lettered row must not be deliverable, got %q", got.Body)
+	}
+}
+
 // TTL expiry discards when dead_letter_on_expire=0.
 func TestTTLDiscard(t *testing.T) {
 	ctx := context.Background()

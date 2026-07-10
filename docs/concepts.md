@@ -67,7 +67,7 @@ is deleted from the database:
                         │ renew ─► (stays locked)
                         │ reject, or abandon / lock-expiry, count ≥ max:
                         ▼
-                   ┌───────────────┐ ◄── TTL expiry (active / locked / deferred;
+                   ┌───────────────┐ ◄── TTL expiry (active/locked/deferred/scheduled;
                    │ dead_lettered │      ✗ removed if dead_letter_on_expire = 0)
                    └───────┬───────┘
                            │ purge / DLQ retention ─► ✗ removed
@@ -91,7 +91,7 @@ Every transition, with its trigger and the condition under which it fires:
 | locked | `Defer` | deferred | set aside; fetched later by seq |
 | locked | `Renew` | locked | extends the lock lease |
 | deferred | `ReceiveDeferred` | locked | fetched by seq; `count`++ |
-| active / locked / deferred | TTL expiry | dead_lettered | queue has `dead_letter_on_expire=1` (`TTLExpired`) |
+| active / locked / deferred / scheduled | TTL expiry | dead_lettered | queue has `dead_letter_on_expire=1` (`TTLExpired`) |
 | active / locked / deferred / scheduled | TTL expiry | ✗ removed | queue has `dead_letter_on_expire=0` (discard) |
 | dead_lettered | `Redrive` | active | back to this (or a target) queue; `count` reset to 0 |
 | dead_lettered | `Purge` | ✗ removed | manual deletion |

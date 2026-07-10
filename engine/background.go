@@ -96,13 +96,16 @@ func (e *Engine) activateScheduled(ctx context.Context) {
 }
 
 // expireTTL is the authoritative TTL pass (§8.8): expired messages go to the DLQ
-// (queues with dead_letter_on_expire=1) or are discarded.
+// (queues with dead_letter_on_expire=1) or are discarded. Both branches MUST
+// cover the same state set — 'scheduled' included, so a message whose TTL lapses
+// before it ever activates is dead-lettered now, not only after activation
+// (MQLITE-61; the discard branch always had it).
 func (e *Engine) expireTTL(ctx context.Context) {
 	now := e.now()
 	if _, err := e.db.exec(ctx, `
 		UPDATE messages SET state='dead_lettered', dead_letter_reason='TTLExpired',
 		    locked_until=0, lock_token=NULL
-		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred')
+		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
 		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1)`, now); err != nil {
 		e.log.Error("ttl: dead-letter expired messages failed", "err", err)
 	}

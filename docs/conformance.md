@@ -95,7 +95,12 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   until its time, then the scheduler activates it; `Cancel` deletes a not-yet-active
   scheduled message. *(engine/functional_test.go)*
 - **7.2 TTL** — an expired message (`expires_at`) MUST move to the DLQ when the queue
-  has `dead_letter_on_expire`, else be discarded. *(engine/functional_test.go)*
+  has `dead_letter_on_expire`, else be discarded. The two branches cover the **same
+  state set** — every non-terminal state including `scheduled`: a row the scheduler
+  has not yet activated when its TTL lapses (broker downtime, scheduler lag) is
+  dead-lettered in place, not resurrected first. (TTL is anchored at `visible_at`,
+  so for scheduled messages the clock starts at their delivery time.)
+  *(engine/functional_test.go: TestTTLScheduledToDeadLetter)*
 
 ## 8 · DLQ retention
 

@@ -79,7 +79,7 @@ func TestMaintenanceQueryPlansPinned(t *testing.T) {
 			`UPDATE messages SET state='active' WHERE state='scheduled' AND visible_at<=?`,
 			[]any{int64(0)}},
 		{"ttl: dead-letter expired", "idx_msg_expire",
-			`UPDATE messages SET state='dead_lettered' WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred')`,
+			`UPDATE messages SET state='dead_lettered' WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')`,
 			[]any{int64(0)}},
 		{"ttl: discard expired", "idx_msg_expire",
 			`DELETE FROM messages WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')`,
