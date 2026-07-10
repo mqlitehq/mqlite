@@ -29,6 +29,13 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   (seq `0`), no longer `409` (#82).
 - **A per-message TTL is capped at the queue's `default_ttl_ms`** (ASB
   semantics), and `Peek` surfaces `expires_at` (#80).
+- **Crash recovery applies `max_delivery_count`** (MQLITE-58): an orphaned lock
+  already on its last allowed attempt dead-letters on startup (same rule as the
+  reaper) instead of being redelivered past the bound.
+- **A message expiring while still `scheduled` dead-letters like every other
+  state** (MQLITE-61) — previously its TTL was honored only after activation.
+- **Requests over the new 32 MiB body cap return `413 message_too_large`**, and
+  `/uixyz`-style paths no longer ride the `/ui` auth exemption (MQLITE-64).
 
 ### Added
 
@@ -51,6 +58,15 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 
 ### Fixed
 
+- The single-writer lock is keyed on the **canonical** DB path — relative,
+  dot-segment, DSN-option and symlinked spellings of one file can no longer
+  yield two writers (MQLITE-60).
+- Unregistered `/mqlite.v1.*` paths no longer create never-evicted `/metrics`
+  series (label-cardinality DoS, MQLITE-62), and a `crypto/rand` failure now
+  crashes instead of minting all-zero lock tokens (MQLITE-63).
+- Server hardening (MQLITE-64): Slowloris/idle timeouts on the broker,
+  constant-time Bearer comparison, a schema-content golden test pinned to the
+  schema version token, and `CompleteBatch` retry-replay hygiene.
 - Release image ships `tzdata` (#70). Release binaries and the MCP server now
   report one shared version constant, CI-verified against the tag.
 
