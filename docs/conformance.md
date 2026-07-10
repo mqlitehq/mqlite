@@ -75,6 +75,12 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   without a `GroupID` MUST be rejected with `ErrGroupRequired`. *(engine/functional_test.go)*
 - **5.3 `strict_fifo`** — global FIFO: at most one message in flight for the queue at a
   time. *(engine/functional_test.go, engine/claim_plan_test.go)*
+- **5.4** Head-of-line MUST survive lock expiry: an expired-but-not-yet-reaped lock
+  still blocks its group (`strict_fifo`: the whole queue) — successors are never
+  delivered ahead of the expired head, and once the reaper resettles it the head is
+  redelivered first, in id order (or dead-lettered at `count ≥ max`, which unblocks
+  the group). The accepted cost is a group stall of up to one reaper interval on a
+  consumer timeout. *(engine/functional_test.go: TestFIFOHoldsAcrossLockExpiry)*
 
 ## 6 · Dead-letter queue
 

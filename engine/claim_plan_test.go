@@ -50,6 +50,11 @@ func TestClaimPlanPinning(t *testing.T) {
 		if strings.Contains(plan, "rowid<") {
 			t.Errorf("%s: head-of-line probe scans rowid<? (O(n^2) regression):\n%s", tc.name, plan)
 		}
+		// Pin the whole surface: a claim plan must be all index SEARCHes — any SCAN
+		// (outer or probe) is a planner regression the two checks above might miss.
+		if strings.Contains(plan, "SCAN") {
+			t.Errorf("%s: claim plan contains a full scan:\n%s", tc.name, plan)
+		}
 	}
 }
 
