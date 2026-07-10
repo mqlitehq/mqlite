@@ -8,7 +8,7 @@ records what changes semantics, adds capability, or fixes something you could hi
 mqlite is pre-1.0: any release may change behavior, and a schema change makes old
 DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 
-## v0.2.0 — unreleased
+## v0.2.0 — 2026-07-11
 
 ### Behavior changes
 
