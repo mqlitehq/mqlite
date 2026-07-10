@@ -157,6 +157,37 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	if name == "" {
 		return errors.New("mqlite: queue name required")
 	}
+	if err := e.inTx(ctx, func(tx *sql.Tx) error {
+		return e.createQueueTx(ctx, tx, name, cfg)
+	}); err != nil {
+		return err
+	}
+	e.qmu.Lock()
+	delete(e.qcache, name)
+	e.qmu.Unlock()
+	return nil
+}
+
+// createQueueTx is CreateQueue's body bound to a transaction so callers
+// (CreateQueue, Subscribe) keep the name guard and the insert atomic.
+//
+// Queue, subscription and topic names share ONE flat namespace and must stay
+// disjoint (MQLITE-56.. review F2 / MQLITE-57): resolveTargets resolves a name
+// with subscription rows as a topic FIRST, so a queue sharing a live topic's
+// name could never be reached by Send. Refuse to create the unreachable queue
+// (fail loud at creation) instead of letting sends silently fan out past it.
+// The upsert path for an existing queue of the same name stays open — once the
+// guard holds in both directions a live topic name can never also be a queue.
+func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg QueueConfig) error {
+	var one int
+	err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM subscriptions WHERE topic=? LIMIT 1`, name).Scan(&one)
+	if err == nil {
+		return fmt.Errorf("%w: %q is already a topic", ErrNameConflict, name)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	kind := cfg.Kind
 	if kind == "" {
 		kind = "queue"
@@ -178,7 +209,7 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 		ordering = OrderStandard
 	}
 	now := e.now()
-	_, err := e.db.exec(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO queues (name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
 		                    dead_letter_on_expire,dedup_window_ms,ordering_mode,
 		                    dlq_max_age_ms,dlq_max_count,dlq_max_bytes,created_at,updated_at)
@@ -196,48 +227,35 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 		    updated_at=excluded.updated_at`,
 		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, string(ordering),
 		cfg.DLQMaxAgeMs, cfg.DLQMaxCount, cfg.DLQMaxBytes, now, now)
-	if err != nil {
-		return err
-	}
-	e.qmu.Lock()
-	delete(e.qcache, name)
-	e.qmu.Unlock()
-	return nil
+	return err
 }
 
 // Subscribe registers subscription `name` under `topic`, creating the
 // subscription's backing queue and the fan-out mapping (§10.1).
+//
+// Names are guarded in BOTH directions so queue, subscription and topic names
+// stay one disjoint namespace (MQLITE-57; ASB works the same way — entities
+// share a namespace and same-name creation conflicts):
+//   - the subscription name must not belong to a plain queue or to a different
+//     topic's subscription — reusing it would silently merge two delivery
+//     targets into one backing queue (pub/sub isolation breach, eval report r2
+//     §architecture/P0-3);
+//   - the TOPIC name must not belong to any existing queue or subscription —
+//     resolveTargets resolves a subscribed name as a topic first, so a topic
+//     shadowing a live queue would silently reroute every Send for that name
+//     to the fan-out and starve the queue (review F2);
+//   - topic == name is rejected: it would make the backing queue's own name
+//     resolve as the topic.
+//
+// Per-topic-scoped subscription naming (reusing a name across topics) was
+// considered and rejected in favor of this flat disjoint namespace — it moves
+// the ambiguity into addressing instead of removing it.
 func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filter) error {
 	if topic == "" || name == "" {
 		return errors.New("mqlite: topic and subscription name required")
 	}
-	// A subscription's backing queue is addressed by the bare subscription name
-	// (messages fan out into queue `name`, and Receive/Metrics/Redrive target it
-	// by that name). Reusing a name that already belongs to a plain queue, or to a
-	// *different* topic's subscription, would silently merge two delivery targets
-	// into one backing queue and leak messages across topics (pub/sub isolation
-	// breach, eval report r2 §architecture/P0-3). Fail loud instead of corrupting
-	// data. Per-topic-scoped naming (so the same name may be reused across topics)
-	// is a public addressing/API change tracked separately (#13).
-	var existingKind sql.NullString
-	if err := e.db.queryRowScan(ctx, []any{&existingKind},
-		`SELECT kind FROM queues WHERE name=?`, name); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if existingKind.Valid {
-		if existingKind.String != "subscription" {
-			return fmt.Errorf("%w: %q is already a queue", ErrNameConflict, name)
-		}
-		var otherTopic sql.NullString
-		if err := e.db.queryRowScan(ctx, []any{&otherTopic},
-			`SELECT topic FROM subscriptions WHERE subscription=? AND topic<>? LIMIT 1`,
-			name, topic); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if otherTopic.Valid {
-			return fmt.Errorf("%w: subscription %q already exists under topic %q",
-				ErrNameConflict, name, otherTopic.String)
-		}
+	if topic == name {
+		return fmt.Errorf("%w: subscription %q cannot use its own topic's name", ErrNameConflict, name)
 	}
 	// Validate the filter expression up front: a bad one is rejected here
 	// (ErrInvalidFilter -> 400) with the precise compiler error and never stored.
@@ -245,10 +263,6 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 		if _, err := compileFilter(filter.Expr); err != nil {
 			return err
 		}
-	}
-	cfg := QueueConfig{Kind: "subscription"}
-	if err := e.CreateQueue(ctx, name, cfg); err != nil {
-		return err
 	}
 	var fj sql.NullString
 	if filter != nil {
@@ -258,13 +272,56 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 		}
 		fj = sql.NullString{String: string(b), Valid: true}
 	}
-	if _, err := e.db.exec(ctx, `
-		INSERT INTO subscriptions (topic,subscription,filter_json,created_at)
-		VALUES (?,?,?,?)
-		ON CONFLICT(topic,subscription) DO UPDATE SET filter_json=excluded.filter_json`,
-		topic, name, fj, e.now()); err != nil {
+	// Guards + backing-queue upsert + mapping upsert run in ONE transaction so a
+	// concurrent CreateQueue/Subscribe can't slip between check and insert (the
+	// local single connection serializes anyway; the remote pool does not).
+	if err := e.inTx(ctx, func(tx *sql.Tx) error {
+		var topicKind string
+		err := tx.QueryRowContext(ctx,
+			`SELECT kind FROM queues WHERE name=?`, topic).Scan(&topicKind)
+		if err == nil {
+			return fmt.Errorf("%w: topic %q is already a %s", ErrNameConflict, topic, topicKind)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var existingKind sql.NullString
+		if err := tx.QueryRowContext(ctx,
+			`SELECT kind FROM queues WHERE name=?`, name).Scan(&existingKind); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if existingKind.Valid {
+			if existingKind.String != "subscription" {
+				return fmt.Errorf("%w: %q is already a queue", ErrNameConflict, name)
+			}
+			var otherTopic sql.NullString
+			if err := tx.QueryRowContext(ctx,
+				`SELECT topic FROM subscriptions WHERE subscription=? AND topic<>? LIMIT 1`,
+				name, topic).Scan(&otherTopic); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if otherTopic.Valid {
+				return fmt.Errorf("%w: subscription %q already exists under topic %q",
+					ErrNameConflict, name, otherTopic.String)
+			}
+		}
+		// createQueueTx additionally rejects a subscription name that is itself a
+		// live topic — the same shadowing hazard from the other side.
+		if err := e.createQueueTx(ctx, tx, name, QueueConfig{Kind: "subscription"}); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO subscriptions (topic,subscription,filter_json,created_at)
+			VALUES (?,?,?,?)
+			ON CONFLICT(topic,subscription) DO UPDATE SET filter_json=excluded.filter_json`,
+			topic, name, fj, e.now())
+		return err
+	}); err != nil {
 		return err
 	}
+	e.qmu.Lock()
+	delete(e.qcache, name)
+	e.qmu.Unlock()
 	// A re-subscribe may have changed the filter — drop any cached program so the
 	// next publish recompiles from the freshly stored expression.
 	e.invalidateFilter(name)
