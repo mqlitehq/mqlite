@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,14 +27,22 @@ type Server struct {
 	CORS    string       // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
 	Logger  *slog.Logger // per-request access log; nil -> no request logging (see logging.go)
 	UI      bool         // serve the embedded admin console at /ui (see console.go)
-	rpcLat  *rpcLatency  // per-RPC latency histogram, exposed at /metrics (see rpchist.go)
-	started time.Time
+	// MaxBodyBytes bounds any single RPC request body BEFORE JSON decoding
+	// (review F8): without it a multi-GB body OOMs the broker before the
+	// per-message MaxMessageBytes check ever runs. Bodies are base64 (x4/3) and
+	// a batched Send carries many messages, so the default (32 MiB) sits far
+	// above normal use while keeping one hostile request a fraction of the
+	// smallest supported deployment's RAM. Over the cap -> 413 message_too_large.
+	MaxBodyBytes int64
+	rpcLat       *rpcLatency // per-RPC latency histogram, exposed at /metrics (see rpchist.go)
+	started      time.Time
 }
 
 // New builds a Server. tokens is the set of accepted Bearer tokens; pass nil/empty
 // to disable auth (documented as a localhost/LAN downgrade, §7.5).
 func New(eng *engine.Engine, tokens []string) *Server {
-	s := &Server{eng: eng, tokens: map[string]bool{}, mux: http.NewServeMux(), rpcLat: newRPCLatency(), started: time.Now()}
+	s := &Server{eng: eng, tokens: map[string]bool{}, mux: http.NewServeMux(), rpcLat: newRPCLatency(), started: time.Now(),
+		MaxBodyBytes: 32 << 20}
 	for _, t := range tokens {
 		if t = strings.TrimSpace(t); t != "" {
 			s.tokens[t] = true
@@ -48,7 +57,7 @@ func New(eng *engine.Engine, tokens []string) *Server {
 func (s *Server) Handler() http.Handler { return s.cors(s.logging(s.auth(s.observe(s.mux)))) }
 
 func (s *Server) routes() {
-	h := func(path string, fn http.HandlerFunc) { s.mux.HandleFunc(path, postOnly(fn)) }
+	h := func(path string, fn http.HandlerFunc) { s.mux.HandleFunc(path, s.postOnly(fn)) }
 	h(wire.PathSend, s.handleSend)
 	h(wire.PathReceive, s.handleReceive)
 	h(wire.PathComplete, s.handleComplete)
@@ -182,11 +191,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(b.String()))
 }
 
-func postOnly(fn http.HandlerFunc) http.HandlerFunc {
+func (s *Server) postOnly(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "unimplemented", "POST required")
 			return
+		}
+		if s.MaxBodyBytes > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, s.MaxBodyBytes)
 		}
 		fn(w, r)
 	}
@@ -195,12 +207,24 @@ func postOnly(fn http.HandlerFunc) http.HandlerFunc {
 // auth enforces Bearer tokens (skips /healthz and when no tokens configured).
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/ui") {
+		// /ui is matched exactly ("/ui" or "/ui/..."), not by loose prefix — a
+		// loose HasPrefix would also auth-exempt /uixyz (review F11).
+		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" ||
+			r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
 			next.ServeHTTP(w, r)
 			return
 		}
 		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if tok == "" || !s.tokens[tok] {
+		// Constant-time comparison against every configured token (review F10):
+		// a plain map lookup / == leaks how many leading bytes matched. No early
+		// break, so timing is independent of which token (if any) matches.
+		authed := false
+		for t := range s.tokens {
+			if len(t) == len(tok) && subtle.ConstantTimeCompare([]byte(t), []byte(tok)) == 1 {
+				authed = true
+			}
+		}
+		if tok == "" || !authed {
 			writeErr(w, http.StatusUnauthorized, "unauthenticated", "missing or invalid Bearer token")
 			return
 		}
@@ -213,6 +237,19 @@ func (s *Server) auth(next http.Handler) http.Handler {
 func decode(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
 	return dec.Decode(v)
+}
+
+// decodeErr maps a request-decoding failure: a body over the MaxBodyBytes cap is
+// 413 message_too_large (same code as the per-message cap); anything else is a
+// plain 400 invalid_argument.
+func decodeErr(w http.ResponseWriter, err error) {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		writeErr(w, http.StatusRequestEntityTooLarge, "message_too_large",
+			fmt.Sprintf("request body over %d bytes", mbe.Limit))
+		return
+	}
+	writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -254,7 +291,7 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	var req wire.SendRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	ctx := r.Context()
@@ -310,7 +347,7 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) { s.hand
 func (s *Server) handleReceive(w http.ResponseWriter, r *http.Request) {
 	var req wire.ReceiveRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue)
@@ -338,7 +375,7 @@ func (s *Server) handleReceive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReceiveDeferred(w http.ResponseWriter, r *http.Request) {
 	var req wire.ReceiveDeferredRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue)
@@ -374,7 +411,7 @@ func (s *Server) settleOK(w http.ResponseWriter, err error) {
 func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	var req wire.SettleRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
@@ -384,7 +421,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCompleteBatch(w http.ResponseWriter, r *http.Request) {
 	var req wire.CompleteBatchRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue, "n", len(req.Messages))
@@ -407,7 +444,7 @@ func (s *Server) handleCompleteBatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAbandon(w http.ResponseWriter, r *http.Request) {
 	var req wire.SettleRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
@@ -417,7 +454,7 @@ func (s *Server) handleAbandon(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 	var req wire.SettleRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
@@ -428,7 +465,7 @@ func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDefer(w http.ResponseWriter, r *http.Request) {
 	var req wire.SettleRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
@@ -438,7 +475,7 @@ func (s *Server) handleDefer(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	var req wire.SettleRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
@@ -448,7 +485,7 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	var req wire.CancelRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue, "seq", req.SeqNumber)
@@ -462,7 +499,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePeek(w http.ResponseWriter, r *http.Request) {
 	var req wire.PeekRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue)
@@ -484,7 +521,7 @@ func (s *Server) handlePeek(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	var req wire.MetricsRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue)
@@ -505,7 +542,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 	var req wire.CreateQueueRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Name)
@@ -519,7 +556,7 @@ func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req wire.SubscribeRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "topic", req.Topic, "sub", req.Name)
@@ -598,7 +635,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTestFilter(w http.ResponseWriter, r *http.Request) {
 	var req wire.TestFilterRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	now := time.Now().UnixMilli()
@@ -623,7 +660,7 @@ func (s *Server) handleTestFilter(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRedrive(w http.ResponseWriter, r *http.Request) {
 	var req wire.RedriveRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue)
@@ -641,7 +678,7 @@ func (s *Server) handleRedrive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
 	var req wire.PurgeRequest
 	if err := decode(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
+		decodeErr(w, err)
 		return
 	}
 	logf(w, "queue", req.Queue)

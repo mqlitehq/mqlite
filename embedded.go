@@ -341,7 +341,7 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.CORS = sc.cors
 	srv.Logger = sc.reqLogger
 	srv.UI = sc.ui
-	hs := &http.Server{Addr: addr, Handler: srv.Handler()}
+	hs := newHTTPServer(addr, srv.Handler())
 	errCh := make(chan error, 1)
 	go func() { errCh <- hs.ListenAndServe() }()
 	select {
@@ -374,4 +374,18 @@ func (e *Embedded) deferMsg(ctx context.Context, q string, seq int64, tok string
 }
 func (e *Embedded) renew(ctx context.Context, q string, seq int64, tok string) error {
 	return e.eng.Renew(ctx, q, seq, tok)
+}
+
+// newHTTPServer builds the broker's http.Server with hardening defaults
+// (review F9): ReadHeaderTimeout bounds how long a client may dribble request
+// headers (the Slowloris vector) and IdleTimeout reclaims dead keep-alive
+// connections. Read/Write timeouts stay zero on purpose — Receive long-polls up
+// to 20s and large request bodies are bounded by server.MaxBodyBytes instead.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 }

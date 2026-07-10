@@ -118,3 +118,20 @@ func TestNewAttemptIDUnique(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+// ─── broker http.Server hardening (review F9 / MQLITE-64) ──────────────────────
+
+// Serve's http.Server must carry the Slowloris/keep-alive hardening defaults.
+// White-box: newHTTPServer is unexported, and these fields are set nowhere else.
+func TestServeHTTPServerHardening(t *testing.T) {
+	hs := newHTTPServer(":0", nil)
+	if hs.ReadHeaderTimeout <= 0 {
+		t.Fatal("ReadHeaderTimeout must be set (Slowloris)")
+	}
+	if hs.IdleTimeout <= 0 {
+		t.Fatal("IdleTimeout must be set (dead keep-alive reclaim)")
+	}
+	if hs.ReadTimeout != 0 || hs.WriteTimeout != 0 {
+		t.Fatal("Read/WriteTimeout must stay 0: Receive long-polls up to 20s; bodies are bounded by server.MaxBodyBytes instead")
+	}
+}

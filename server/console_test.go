@@ -63,3 +63,18 @@ func TestConsole404WhenOff(t *testing.T) {
 		t.Fatalf("/ui/ with UI off = %d, want 404", res.StatusCode)
 	}
 }
+
+// The /ui auth exemption matches exactly "/ui" and "/ui/..." — a loose prefix
+// would also exempt /uixyz from Bearer auth (review F11 / MQLITE-64).
+func TestUIAuthExemptionIsExact(t *testing.T) {
+	ts := consoleServer(t, true, []string{"secret"})
+
+	res, err := http.Post(ts.URL+"/uixyz", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("/uixyz without a token = %d, want 401 (must not ride the /ui exemption)", res.StatusCode)
+	}
+}

@@ -22,14 +22,16 @@ and the Go SDK, so the two can't drift) and the server's error mapping.
 
 ### Size limits
 
-Only the **body** is capped. There is **no enforced length limit** on the string
-metadata fields (`subject`, `message_id`, `group_id`, `correlation_id`, `reply_to`,
+The message **body** is capped per message, and the whole request body is capped
+per RPC call (so an unbounded batch can't OOM the broker before per-message
+checks run). There is **no enforced length limit** on the string metadata fields (`subject`, `message_id`, `group_id`, `correlation_id`, `reply_to`,
 `content_type`, `properties` keys/values) — they are stored as SQLite `TEXT`; keep them
 reasonable (they count toward the JSON request you send, not toward the body cap).
 
 | limit | default | knob |
 |---|---|---|
 | `body` size | **1 MiB** → `413 message_too_large` over it | `MQLITE_MAX_MESSAGE_BYTES` (serve) / `Options.MaxMessageBytes` (embedded) |
+| request body per RPC call | **32 MiB** → `413 message_too_large` | `server.MaxBodyBytes` (bodies are base64; split very large batches) |
 | `max_messages` per `Receive` | 256 (max) | request field |
 | `wait_time_ms` long-poll | 20000 (max) | request field |
 | `Peek` `max` | 32 default, 1000 max | request field |

@@ -206,6 +206,9 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 	var removed int64 // messages actually deleted this commit (for the completed counter)
 	err := e.inTx(ctx, func(tx *sql.Tx) error {
 		removed = 0 // reset per attempt: the remote inTx may replay the closure
+		for i := range out {
+			out[i] = SettleResult{} // ditto: a replayed attempt must not inherit Ok flags
+		}
 		for i, it := range items {
 			out[i].SeqNumber = it.SeqNumber
 			if it.LockToken == "" {
