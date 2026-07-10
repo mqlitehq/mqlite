@@ -169,16 +169,23 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 }
 
 // createQueueTx is CreateQueue's body bound to a transaction so callers
-// (CreateQueue, Subscribe) keep the name guard and the insert atomic.
+// (CreateQueue, Subscribe) keep the name guards and the insert atomic.
 //
 // Queue, subscription and topic names share ONE flat namespace and must stay
-// disjoint (MQLITE-56.. review F2 / MQLITE-57): resolveTargets resolves a name
-// with subscription rows as a topic FIRST, so a queue sharing a live topic's
-// name could never be reached by Send. Refuse to create the unreachable queue
+// disjoint (review F2 / MQLITE-57): resolveTargets resolves a name with
+// subscription rows as a topic FIRST, so a queue sharing a live topic's name
+// could never be reached by Send. Refuse to create the unreachable queue
 // (fail loud at creation) instead of letting sends silently fan out past it.
-// The upsert path for an existing queue of the same name stays open — once the
-// guard holds in both directions a live topic name can never also be a queue.
+// The upsert path for an existing queue of the same name stays open ONLY for
+// the same kind: a plain CreateQueue over a subscription's backing queue (or a
+// kind='subscription' request over a plain queue) is rejected rather than
+// silently retuning an entity the caller doesn't think they own. A deliberate
+// backing-queue reconfig stays possible by passing Kind:"subscription".
 func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg QueueConfig) error {
+	kind := cfg.Kind
+	if kind == "" {
+		kind = "queue"
+	}
 	var one int
 	err := tx.QueryRowContext(ctx,
 		`SELECT 1 FROM subscriptions WHERE topic=? LIMIT 1`, name).Scan(&one)
@@ -188,9 +195,14 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	kind := cfg.Kind
-	if kind == "" {
-		kind = "queue"
+	var existingKind string
+	err = tx.QueryRowContext(ctx,
+		`SELECT kind FROM queues WHERE name=?`, name).Scan(&existingKind)
+	if err == nil && existingKind != kind {
+		return fmt.Errorf("%w: %q is already a %s", ErrNameConflict, name, existingKind)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
 	lock := cfg.LockDurationMs
 	if lock <= 0 {

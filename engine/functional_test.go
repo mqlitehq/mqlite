@@ -459,6 +459,19 @@ func TestTopicQueueNamespaceDisjoint(t *testing.T) {
 		t.Fatalf("self-referential subscription must be ErrNameConflict, got %v", err)
 	}
 
+	// Cross-kind upsert is rejected: a plain CreateQueue must not silently
+	// retune a subscription's backing queue, nor a kind=subscription request a
+	// plain queue. A deliberate same-kind reconfig stays open.
+	if err := e.CreateQueue(ctx, "billing_sub", QueueConfig{}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("plain CreateQueue over a backing queue must be ErrNameConflict, got %v", err)
+	}
+	if err := e.CreateQueue(ctx, "orders", QueueConfig{Kind: "subscription"}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("kind=subscription over a plain queue must be ErrNameConflict, got %v", err)
+	}
+	if err := e.CreateQueue(ctx, "billing_sub", QueueConfig{Kind: "subscription", LockDurationMs: 60_000}); err != nil {
+		t.Fatalf("explicit same-kind backing-queue reconfig should succeed: %v", err)
+	}
+
 	// Legal upserts stay open: reconfiguring an existing queue by name, and
 	// re-subscribing the same (topic, name).
 	mustQueue(t, e, "orders", QueueConfig{LockDurationMs: 60_000})
