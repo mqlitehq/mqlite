@@ -12,12 +12,15 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -92,6 +95,31 @@ func TestSchemaVersionGuard(t *testing.T) {
 	}
 	if !errors.Is(err, ErrSchemaVersionMismatch) {
 		t.Fatalf("reopen with mismatched version: got %v, want ErrSchemaVersionMismatch", err)
+	}
+}
+
+// The schema-content golden guard (review F13): schemaVersion is an opaque token
+// that MUST change whenever the DDL changes incompatibly — but nothing tied the
+// token to the actual statements, so a schema edit with a forgotten bump would
+// let an old DB pass the version guard and run against a layout it doesn't
+// match. Pin both: any DDL drift fails here and forces a DELIBERATE update of
+// the hash AND a decision about the token.
+//
+// If this test fails you changed schemaStmts. Update wantHash to the printed
+// value, and bump schemaVersion in schema.go unless the change is provably
+// compatible with existing DBs (a comment-only edit inside a statement is not —
+// the statements are the contract).
+func TestSchemaContentPinnedToVersionToken(t *testing.T) {
+	const (
+		wantVersion = "2"
+		wantHash    = "5b68da976fd289d276a4106f3af616e9f555efab7ae8c56de836cb6f584e0e93"
+	)
+	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
+	if got := hex.EncodeToString(sum[:]); got != wantHash {
+		t.Fatalf("schemaStmts changed (hash %s, pinned %s):\nbump schemaVersion (schema.go) if incompatible, then update wantHash here", got, wantHash)
+	}
+	if schemaVersion != wantVersion {
+		t.Fatalf("schemaVersion changed to %q without updating this pin (wantVersion %q): update both together", schemaVersion, wantVersion)
 	}
 }
 

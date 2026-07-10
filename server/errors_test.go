@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mqlitehq/mqlite/engine"
@@ -82,4 +83,47 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("bad filter expr", http.MethodPost, wire.PathSubscribe, "secret", sub("bad", "subject =="), http.StatusBadRequest, "invalid_argument")
 	check("unknown filter field", http.MethodPost, wire.PathSubscribe, "secret", sub("bad2", `nope == "x"`), http.StatusBadRequest, "invalid_argument")
 	check("valid filter", http.MethodPost, wire.PathSubscribe, "secret", sub("ok", `subject_parts[0] == "a"`), http.StatusOK, "")
+}
+
+// A request body over Server.MaxBodyBytes is rejected as 413 message_too_large
+// BEFORE JSON decoding (review F8 / MQLITE-64) — without the cap a multi-GB
+// body OOMs the broker before the per-message MaxMessageBytes check runs.
+func TestRequestBodyCap(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(eng, nil) // auth off
+	srv.MaxBodyBytes = 1024     // tiny cap for the test; default is 32 MiB
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	big := append([]byte(`{"queue":"q","messages":[{"body":"`),
+		append(bytes.Repeat([]byte("A"), 4096), []byte(`"}]}`)...)...)
+	res, err := http.Post(ts.URL+wire.PathSend, "application/json", bytes.NewReader(big))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e struct{ Code string }
+	_ = json.NewDecoder(res.Body).Decode(&e)
+	res.Body.Close()
+	if res.StatusCode != http.StatusRequestEntityTooLarge || e.Code != "message_too_large" {
+		t.Fatalf("oversized body = %d %q, want 413 message_too_large", res.StatusCode, e.Code)
+	}
+
+	// Under the cap still works.
+	ok, err := http.Post(ts.URL+wire.PathSend, "application/json",
+		strings.NewReader(`{"queue":"q","messages":[{"body":"aGk="}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("normal send under the cap = %d, want 200", ok.StatusCode)
+	}
 }
