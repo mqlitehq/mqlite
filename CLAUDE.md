@@ -76,7 +76,9 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
   (README/deployment/api-reference), and — if mqlite-web changed — refresh the
   embedded console dist under `server/web/`. A `vX.Y.Z-rc.N` tag runs the full
   pipeline without touching `:latest` (prerelease auto-detected) — cheap dress
-  rehearsal before the real tag.
+  rehearsal before the real tag. Delete the rc release + tag before promoting
+  (GORELEASER_CURRENT_TAG pins the build to the pushed tag either way, but a
+  dangling rc release invites confusion).
 - **One ticket → one PR**; CI must be green before merge (the `gh pr checks` exit
   code is the gate); reference the Backlog id (`MQLITE-N`) in the commit/PR.
 - **The `go 1.21` floor is deliberate** — it is the embedding-compatibility floor,
