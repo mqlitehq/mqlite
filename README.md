@@ -336,11 +336,12 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-v0.1 — the core is complete and tested (local SQLite + live Turso): hermetic
-unit + invariant (TCK-style) tests run in CI on every push, and live
-Turso/libSQL round-trips run in the nightly workflow. Not yet tagged for
-release.
+v0.1.x is released ([tagged releases](https://github.com/mqlitehq/mqlite/releases)
+with binaries and a GHCR image); the v0.2.0 correctness wave is staged on main —
+see [CHANGELOG.md](CHANGELOG.md). Hermetic unit + invariant (TCK-style) tests
+run in CI on every push, and live Turso/libSQL round-trips run in the nightly
+workflow.
 
 ## License
 
-[MIT](LICENSE) © mqlitehq
+[MIT](LICENSE) © The MQLite Authors
