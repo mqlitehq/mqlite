@@ -90,10 +90,22 @@ func (h *rpcLatency) write(b *strings.Builder) {
 // observe is the always-on middleware that times every RPC (/mqlite.v1.*) and feeds the
 // histogram. Non-RPC paths (/, /healthz, /metrics, /ui) pass straight through — we don't
 // want /metrics to time itself, and static/discovery latency isn't interesting.
+//
+// Only REGISTERED routes are ever labeled (MQLITE-62): an unregistered
+// /mqlite.v1.* path falls through the mux to the "/" catch-all (404), and its
+// pattern therefore differs from the request path. Labeling those would let any
+// client grow the histogram map without bound — one counter pair per invented
+// path name, never evicted — a memory / scrape-size DoS on the broker.
+// Asking the mux (instead of keeping a hand-written allowlist) means new routes
+// are covered automatically and nothing can drift.
 func (s *Server) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/mqlite.v1.") {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if _, pattern := s.mux.Handler(r); pattern != r.URL.Path {
+			next.ServeHTTP(w, r) // unregistered RPC path: serve the 404, record nothing
 			return
 		}
 		start := time.Now()
