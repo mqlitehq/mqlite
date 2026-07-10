@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -151,5 +152,59 @@ func TestMetricsRPCLatencyHistogram(t *testing.T) {
 	// the observer covers only RPCs — not /metrics itself, /healthz, or static paths.
 	if strings.Contains(out, `rpc="metrics"`) || strings.Contains(out, `rpc="healthz"`) {
 		t.Errorf("histogram should not include non-RPC paths:\n%s", out)
+	}
+}
+
+// MQLITE-62: only REGISTERED routes are ever labeled. An unregistered
+// /mqlite.v1.* path (the 404 catch-all) must not create histogram series —
+// otherwise any client can grow the label map without bound (one counter set
+// per invented path, never evicted): a memory / scrape-size DoS.
+func TestMetricsRPCLabelsOnlyForRegisteredRoutes(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	ts := httptest.NewServer(server.New(eng, nil).Handler()) // auth off
+	defer ts.Close()
+
+	// A burst of distinct invented RPC names — none may become a label.
+	for i := 0; i < 20; i++ {
+		res, err := http.Post(ts.URL+fmt.Sprintf("/mqlite.v1.QueueService/Nope%d", i),
+			"application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("invented RPC path should 404, got %d", res.StatusCode)
+		}
+	}
+	// One real RPC so the histogram section exists at all.
+	res, err := http.Post(ts.URL+"/mqlite.v1.AdminService/ListQueues", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	var out string
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		r, err := http.Get(ts.URL + "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		if out = string(body); strings.Contains(out, `rpc="AdminService/ListQueues"`) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(out, `rpc="AdminService/ListQueues"`) {
+		t.Fatalf("registered route must be labeled:\n%s", out)
+	}
+	if strings.Contains(out, "Nope") {
+		t.Fatalf("unregistered RPC paths must never become labels (cardinality DoS):\n%s", out)
 	}
 }
