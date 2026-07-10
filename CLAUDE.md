@@ -70,6 +70,13 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
 - **Tagging is gated.** Never create a git tag or GitHub Release without the
   maintainer's explicit go-ahead. Default version bumps are **patch** (semver)
   unless told otherwise.
+- **Pre-tag checklist:** bump `internal/version/version.go` (the single version
+  source both binaries report; release.yml refuses a tag that doesn't match it),
+  update `CHANGELOG.md`, sync the docs' pinned version examples
+  (README/deployment/api-reference), and — if mqlite-web changed — refresh the
+  embedded console dist under `server/web/`. A `vX.Y.Z-rc.N` tag runs the full
+  pipeline without touching `:latest` (prerelease auto-detected) — cheap dress
+  rehearsal before the real tag.
 - **One ticket → one PR**; CI must be green before merge (the `gh pr checks` exit
   code is the gate); reference the Backlog id (`MQLITE-N`) in the commit/PR.
 - **The `go 1.21` floor is deliberate** — it is the embedding-compatibility floor,
