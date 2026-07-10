@@ -41,9 +41,10 @@ import (
 	charmlog "github.com/charmbracelet/log"
 
 	"github.com/mqlitehq/mqlite"
+	ver "github.com/mqlitehq/mqlite/internal/version"
 )
 
-const version = "0.1.2"
+const version = ver.Version
 
 func main() {
 	if len(os.Args) < 2 {

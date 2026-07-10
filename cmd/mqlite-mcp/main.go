@@ -20,12 +20,13 @@ import (
 	"strings"
 	"time"
 
+	ver "github.com/mqlitehq/mqlite/internal/version"
 	"github.com/mqlitehq/mqlite/wire"
 )
 
 const (
 	serverName      = "mqlite-mcp"
-	serverVersion   = "0.1.0"
+	serverVersion   = ver.Version
 	defaultProtocol = "2024-11-05"
 )
 

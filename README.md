@@ -299,12 +299,12 @@ peak backlog rather than shrinking; `VACUUM` is manual). See
 ```bash
 # --pull forces the latest golang:1.25 base (newest Go stdlib security patches) —
 # use it for release builds so a cached old base layer can't ship known CVEs.
-docker build --platform linux/amd64 --pull -t mqlite:0.1.1 .
-docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.1.1
+docker build --platform linux/amd64 --pull -t mqlite:0.2.0 .
+docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.2.0
 # remote Turso instead of the local volume:
 docker run --platform linux/amd64 -p 8080:8080 \
   -e MQLITE_DB=libsql://<db>.turso.io -e MQLITE_DB_AUTH_TOKEN=<jwt> \
-  -e MQLITE_TOKENS=mqk_dev mqlite:0.1.1
+  -e MQLITE_TOKENS=mqk_dev mqlite:0.2.0
 ```
 
 **Footprint:** ~11 MB static (CGO-free) binary, ~19 MB idle RSS, ~0.4 KB per message

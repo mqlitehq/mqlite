@@ -17,6 +17,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history so the changelog can diff from the previous tag
+      # The version constant is the single source every binary self-reports
+      # (internal/version). Refuse to ship a tag the binaries would contradict;
+      # a pre-release tag (v0.2.0-rc.1) is checked against its base version.
+      - name: verify version constant matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          base="${tag%%-*}"
+          if ! grep -q "Version = \"${base}\"" internal/version/version.go; then
+            echo "internal/version/version.go does not declare Version = \"${base}\" for tag ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
       - uses: actions/setup-go@v6
         with:
           go-version: stable

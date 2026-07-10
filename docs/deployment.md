@@ -48,11 +48,11 @@ docker run -d --name mqlite -p 8080:8080 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
-  ghcr.io/mqlitehq/mqlite:0.1.0
+  ghcr.io/mqlitehq/mqlite:0.2.0
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin a version tag (`:0.1.0`) in production; `:0.1` tracks patches, `:latest` the newest release.
+- Pin a version tag (`:0.2.0`) in production; `:0.2` tracks patches, `:latest` the newest release.
 - Verify: `curl http://localhost:8080/` (discovery card) and `/healthz`.
 
 ## Fly.io (minimal cost)
@@ -65,7 +65,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.1.0"   # use the public image; no build on Fly
+  image = "ghcr.io/mqlitehq/mqlite:0.2.0"   # use the public image; no build on Fly
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
