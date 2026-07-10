@@ -342,6 +342,43 @@ func TestCrashRecovery(t *testing.T) {
 	}
 }
 
+// Crash recovery applies the same bound as the reaper (MQLITE-58): an orphaned
+// lock whose message already spent its LAST allowed attempt dead-letters on Open
+// with MaxDeliveryCountExceeded instead of being redelivered an (max+1)th time —
+// max_delivery_count bounds deliveries, not deliveries-without-a-crash. A message
+// still under the bound is redelivered as before.
+func TestCrashRecoveryRespectsMaxDelivery(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "mq.db")
+
+	e1, _ := testEngineAt(t, path)
+	mustQueue(t, e1, "last", QueueConfig{MaxDeliveryCount: 1})
+	mustQueue(t, e1, "spare", QueueConfig{MaxDeliveryCount: 10})
+	e1.SendOne(ctx, "last", OutMessage{Body: []byte("x")})
+	e1.SendOne(ctx, "spare", OutMessage{Body: []byte("y")})
+	if m := recvOne(t, e1, "last"); m == nil || m.DeliveryCount != 1 {
+		t.Fatalf("claim last (count=1=max): %+v", m)
+	}
+	if m := recvOne(t, e1, "spare"); m == nil || m.DeliveryCount != 1 {
+		t.Fatalf("claim spare (count=1<max): %+v", m)
+	}
+	_ = e1.Close() // crash stand-in: both locks never settled
+
+	e2, _ := testEngineAt(t, path) // Open runs recovery
+	// Over the bound → dead-lettered, never delivered again.
+	if got := recvOne(t, e2, "last"); got != nil {
+		t.Fatalf("recovery must not redeliver past max_delivery_count, got %q", got.Body)
+	}
+	pk, _ := e2.Peek(ctx, "last", PeekOptions{State: StateDeadLettered})
+	if len(pk) != 1 || pk[0].DeadLetterReason != ReasonMaxDeliveryCount {
+		t.Fatalf("expected 1 DLQ msg with MaxDeliveryCountExceeded, got %+v", pk)
+	}
+	// Under the bound → redelivered normally (claim bumps the count again).
+	if m := recvOne(t, e2, "spare"); m == nil || m.DeliveryCount != 2 {
+		t.Fatalf("under-bound message should redeliver with count=2, got %+v", m)
+	}
+}
+
 // I-outbox: Tx commits business write + enqueue atomically; rollback enqueues nothing.
 func TestTxAtomicEnqueue(t *testing.T) {
 	ctx := context.Background()
