@@ -276,6 +276,70 @@ func TestCancelScheduled(t *testing.T) {
 	}
 }
 
+// ─── seq allocation: never reused (MQLITE-71) ───────────────────────────────
+
+// After the highest message is deleted, the next insert must NOT reuse its seq: without
+// AUTOINCREMENT SQLite recycles a freed max rowid, which let a stale handle alias a later
+// message. The id must be strictly greater.
+func TestSeqNumberNeverReused(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+
+	first, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := recvOne(t, e, "q")
+	if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+		t.Fatal(err)
+	}
+	// the table is empty again; the next send must get a strictly greater seq, not `first`.
+	second, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second <= first {
+		t.Fatalf("seq reused/regressed: first=%d second=%d (want second > first)", first, second)
+	}
+}
+
+// The B03 data-loss scenario: a stale Cancel of a former seq must not delete a later
+// message. With AUTOINCREMENT the freed id is never reused, so B gets a fresh seq and the
+// replayed Cancel(seqA) hits no row.
+func TestStaleCancelDoesNotDeleteLaterMessage(t *testing.T) {
+	ctx := context.Background()
+	e, msp := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	at := atomicNow(msp) + time.Hour.Milliseconds()
+
+	seqA, err := e.Schedule(ctx, "q", OutMessage{Body: []byte("A")}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Cancel(ctx, "q", seqA); err != nil {
+		t.Fatal(err)
+	}
+	seqB, err := e.Schedule(ctx, "q", OutMessage{Body: []byte("B")}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seqB == seqA {
+		t.Fatalf("seq reused: A and B both got %d", seqA)
+	}
+	// replay the stale Cancel(seqA): it must be a no-op (row gone), never delete B.
+	if err := e.Cancel(ctx, "q", seqA); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale Cancel(%d) should be ErrNotFound, got %v", seqA, err)
+	}
+	pk, err := e.Peek(ctx, "q", PeekOptions{State: StateScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pk) != 1 || pk[0].SeqNumber != seqB || string(pk[0].Body) != "B" {
+		t.Fatalf("message B must survive the stale cancel; peek=%+v", pk)
+	}
+}
+
 // RenewLock extends the lease so the reaper does not reclaim mid-processing.
 func TestRenewLockExtendsLease(t *testing.T) {
 	ctx := context.Background()

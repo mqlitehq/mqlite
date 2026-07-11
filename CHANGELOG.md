@@ -12,6 +12,14 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 
 ### Behavior changes
 
+- **Schema v3: `seq_number` is now allocated with `AUTOINCREMENT` and never reused**
+  (MQLITE-71). Previously SQLite could recycle the highest `id` after its row was deleted,
+  so a stale `Cancel` (which is fenced only by `seq_number`) could delete a *later* message
+  that reused that id — real message loss. Sequence numbers are now strictly increasing and
+  never reused (they may gap); a settled/cancelled seq is gone for good. **Schema-breaking:**
+  pre-1.0, an existing DB is refused with `ErrSchemaVersionMismatch` and must be recreated —
+  **before upgrading, stop all writers and back up** (`VACUUM INTO` or a stopped-broker copy),
+  then start on a fresh DB. The broker never deletes your data automatically.
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container

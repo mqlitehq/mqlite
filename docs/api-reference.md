@@ -12,8 +12,9 @@ and the Go SDK, so the two can't drift) and the server's error mapping.
   health, and metrics endpoints below are `GET`.)
 - **`body`** is **base64** in JSON (Go marshals `[]byte` as base64).
 - **Timestamps** are **epoch milliseconds** (UTC) integers; so are durations (`*_ms`).
-- **Sequence numbers** (`seq_number`) are broker-assigned monotonic integers, unique
-  per queue — **the handle you settle with**. You never set them.
+- **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
+  and **never reused** (they may gap) — **the handle you settle with**, valid only while
+  the message lives. You never set them.
 - **At-least-once:** consumers must be idempotent. A message is delivered at least
   once and never silently dropped (see [retention.md](retention.md) for what is and
   isn't auto-deleted).
@@ -309,7 +310,7 @@ empty). "Dir" = whether *you set it on send* (**in**) or *the broker sets it on*
 | `subject` | string | in | free-form **routing label** (= ASB Label). **Not unique**, may repeat or be empty. Split on `.` into `subject_parts` for filters (`"orders.eu.new"` → `["orders","eu","new"]`). |
 | `correlation_id`, `reply_to`, `content_type` | string | in | free-form ASB-style metadata; the broker stores but never interprets them (`content_type` only hints filter `body_json` decoding). |
 | `properties` | object<string,string> | in | custom **string→string** headers, stored verbatim; visible to filters as `properties["k"]`. Values must be strings. |
-| `seq_number` | int | out | broker-assigned, monotonic, **unique per queue**; the handle you settle/peek with. |
+| `seq_number` | int | out | broker-assigned, strictly increasing, **never reused** (may gap); the handle you settle/peek with while the message lives. |
 | `delivery_count` | int | out | how many times this message has been delivered (claimed). |
 | `lock_token` | string | out | fencing token from peek-lock `Receive`; settle with it. |
 | `state` | string | out | `Peek` only: `active`/`locked`/`deferred`/`scheduled`/`dead_lettered`. |
