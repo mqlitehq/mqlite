@@ -20,6 +20,10 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   pre-1.0, an existing DB is refused with `ErrSchemaVersionMismatch` and must be recreated —
   **before upgrading, stop all writers and back up** (`VACUUM INTO` or a stopped-broker copy),
   then start on a fresh DB. The broker never deletes your data automatically.
+- **Scheduled multi-message `Send` is now atomic** (MQLITE-72): a mid-batch failure (e.g. a
+  `group_fifo` item missing its `group_id`) rolls back the whole batch instead of leaving
+  earlier items scheduled. A single scheduled message still distinguishes a dedup conflict
+  (`409`) from a no-subscriber no-op (`seq 0`).
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container

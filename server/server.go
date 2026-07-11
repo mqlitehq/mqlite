@@ -307,9 +307,20 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	var seqs []int64
 	var err error
 	if req.ScheduledEnqueueTimeMs > 0 {
-		seqs = make([]int64, len(outs))
-		for i, o := range outs {
-			seqs[i], err = s.eng.Schedule(ctx, req.Queue, o, req.ScheduledEnqueueTimeMs)
+		if len(outs) == 1 {
+			// Single schedule via Schedule, which tells a real dedup conflict (409) apart
+			// from a no-subscriber no-op (seq 0), matching the non-scheduled single path.
+			var seq int64
+			seq, err = s.eng.Schedule(ctx, req.Queue, outs[0], req.ScheduledEnqueueTimeMs)
+			if err != nil {
+				s.fail(w, err)
+				return
+			}
+			seqs = []int64{seq}
+		} else {
+			// Multi schedule is one atomic transaction — all-or-nothing, no partial commit
+			// on a mid-batch failure (MQLITE-72).
+			seqs, err = s.eng.ScheduleBatch(ctx, req.Queue, outs, req.ScheduledEnqueueTimeMs)
 			if err != nil {
 				s.fail(w, err)
 				return
