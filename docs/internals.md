@@ -312,6 +312,74 @@ never lie to you — then the whole stack under your queue is a ~30 MB process,
 one file you can copy with `cp`, and a set of promises you can re-verify by
 running `go test`.
 
+## 11 · Appendix: swapping the engine — the contract a new store must sign
+
+Does any of this *have* to be SQLite? No. The engine needs a set of
+**guarantees**, not a brand — SQLite is simply the implementation that delivers
+all of them in one pure-Go file. If you ever wanted to port mqlite onto another
+database, an embedded KV store, or something self-built, this is the contract
+your store signs. Each item maps back to the section that depends on it.
+
+**The eight core guarantees:**
+
+| # | Your store must provide | Because of |
+|---|---|---|
+| G1 | **Durable, ordered enqueue** with a monotonic, never-recycled-while-live sequence number | §2 — seq is the ordering anchor *and* the settlement handle |
+| G2 | **Atomic claim**: select the eligible head *and* lock it as one indivisible operation — two consumers can never win the same message | §4 — the claim UPDATE |
+| G3 | **Per-state ordered lookup in O(log n)** on a deep backlog: "oldest active in queue Q", "expired locks", "due scheduled", per group | §5 — the partial indexes |
+| G4 | **Secondary lookups**: dedup by message id, DLQ scans, expiry by deadline | §§6–7 |
+| G5 | **Multi-row ACID transactions** — and one that the *application can join* with its own tables | §7 receipts, §8 the outbox |
+| G6 | **Crash recovery from data alone**: after `kill -9`, the committed state is complete and consistent — locks must be rows, not memory | §2, §6 |
+| G7 | **Range deletes with space reclamation** — retention and purge must return disk, not just tombstone | §6 |
+| G8 | **Embeddability**: in-process, no CGO, no sidecar, ideally one copyable file | the whole point |
+
+**Four more that this document's fine print implies** — easy to miss, fatal to skip:
+
+- **Conditional writes (CAS).** Every settlement is `... WHERE lock_token = ?`
+  (§4). The store needs an atomic compare-on-field update, or fencing collapses
+  and a stale consumer can acknowledge someone else's delivery.
+- **A serialization story for the claim path.** mqlite gets atomicity by
+  funneling all writes through one connection (§3). Your store either offers the
+  same single-writer discipline, or true serializable transactions — snapshot
+  isolation with write skew is *not* enough for "exactly one claimer wins".
+- **Auxiliary writes in the same transaction.** The idempotency receipts (§7)
+  only work because the receipt commits *atomically with* the operation it
+  protects. A store that can't put the receipt in the same commit turns
+  "idempotent" into "usually idempotent".
+- **A tunable durability point** (§3's `NORMAL`/`FULL`) and a **multi-process
+  guard** (§3's advisory lock) — or a documented equivalent for each.
+
+**The good news: your migration test suite already exists.** The
+[conformance TCK](conformance.md) is written against behavior, not against
+SQLite — a store that passes it (with the race detector on) has proven G1–G7.
+Two things do *not* port and must be re-invented per engine: the plan-pinning
+tests (§5's `EXPLAIN QUERY PLAN` assertions are SQLite's dialect — you owe your
+new engine an equivalent performance pin, or the O(n²) class returns silently)
+and the schema golden test (pin whatever your layout artifact is).
+
+**How the usual candidates grade against this bar:**
+
+- **Another embedded SQL database** — clears everything by construction; the
+  work is porting SQL dialect and the performance pins.
+- **Embedded KV/LSM stores** (bbolt, Badger, Pebble) — G1/G2/G6 are fine; G3/G4
+  mean hand-building every index the schema got for free; and G5's second half
+  fails: your application cannot put *its* tables inside *their* transaction, so
+  **the outbox — the killer feature — is lost**, and on LSM engines G7's space
+  story needs care.
+- **An external store** (Redis, Postgres-as-a-service, a broker) — may clear
+  G1–G7, but fails G8, and with it the outbox and the "one file you can `cp`"
+  operations story. At that point you don't want mqlite — a Postgres-native queue (pgmq, River) fits better.
+- **A self-built log/BTree** — every guarantee above lands on your desk at once,
+  including the ones you only discover under `kill -9`. You would be rewriting
+  the hardest 20 % of SQLite to save the easiest 80 %.
+
+That grading is why mqlite runs on SQLite today: in a weighted evaluation of six
+candidates it was the only one delivering all eight guarantees — and uniquely
+the two differentiators, the shared-transaction outbox and the Turso remote.
+The engine keeps the question open behind a narrow store boundary (enqueue /
+claim / settle / recover / in-tx), but the price of admission is this appendix,
+with the conformance suite as the judge.
+
 ---
 
 *Want the view from outside? [concepts.md](concepts.md). The wire-level details?
