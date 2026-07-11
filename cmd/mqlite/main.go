@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -205,6 +206,7 @@ func dial(ctx context.Context) (api, error) {
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
+	insecureAllowRemote := fs.Bool("insecure-allow-remote", false, "allow a non-loopback bind while auth is disabled (MQLITE_TOKENS=off)")
 	_ = fs.Parse(args)
 
 	addrSet := false
@@ -224,6 +226,13 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// With auth disabled, refuse a non-loopback bind unless explicitly allowed: an open
+	// broker on all interfaces is remotely reachable by anyone (MQLITE-70 / D2).
+	if tokens == "" && !isLoopbackListen(listenAddr) && !*insecureAllowRemote {
+		return fmt.Errorf("refusing to serve with auth disabled on non-loopback address %q: "+
+			"bind loopback (e.g. 127.0.0.1:%s), set MQLITE_TOKENS, or pass --insecure-allow-remote",
+			listenAddr, defaults.BrokerPort)
+	}
 
 	lg := serveLogger()
 	slogger := slog.New(lg)
@@ -238,7 +247,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	defer eng.Close()
 
-	corsOrigin, _ := resolveCORS(os.Getenv("MQLITE_CORS"))
+	corsOrigin, _ := resolveCORS(os.Getenv("MQLITE_CORS"), tokens == "")
 	ui := resolveUI(os.Getenv("MQLITE_UI"))
 	backend := "local"
 	if eng.Engine().Remote() {
@@ -255,7 +264,11 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	switch {
 	case tokens == "":
-		lg.Warn("auth disabled — anyone can call this broker (localhost/LAN only; set MQLITE_TOKENS)")
+		reach := "reachable on loopback only"
+		if !isLoopbackListen(listenAddr) {
+			reach = "reachable by ANYONE on the network (--insecure-allow-remote)"
+		}
+		lg.Warn("auth disabled — no token required; " + reach + " (set MQLITE_TOKENS to enable auth)")
 	case strings.Contains(authNote, "generated"):
 		lg.Info("auth enabled — generated a token (set MQLITE_TOKENS to use your own, or =off to disable)", "token", tokens)
 	default:
@@ -356,20 +369,42 @@ func resolveBrokerTokens(env string) (csv, note string, err error) {
 	}
 }
 
-// resolveCORS decides the broker's Access-Control-Allow-Origin from MQLITE_CORS. The
-// default (unset) is "*": the broker is meant to be driven by clients — including the
-// browser console served from another origin — and every RPC still requires a Bearer
-// token (the API sets no cookies), so a wildcard exposes nothing. "off" disables CORS;
-// any other value is sent verbatim as the single allowed origin.
-func resolveCORS(env string) (origin, note string) {
+// resolveCORS decides the broker's Access-Control-Allow-Origin from MQLITE_CORS, with the
+// default depending on whether auth is on. A wildcard is only safe because every RPC needs
+// a Bearer token; when auth is disabled that premise is gone, so the default becomes off
+// (MQLITE-70 / D6). "off" always disables it; any explicit origin — or an explicit "*" — is
+// honored verbatim as an opt-in, even with auth off.
+func resolveCORS(env string, authOff bool) (origin, note string) {
 	switch e := strings.TrimSpace(env); {
 	case strings.EqualFold(e, "off"):
 		return "", "cors: off"
-	case e == "":
-		return "*", "cors: * (any origin — RPCs still require a token)"
-	default:
+	case e == "*" && authOff:
+		return "*", "cors: * (explicit — WARNING: auth is disabled, so any origin can call this broker)"
+	case e != "":
 		return e, "cors: " + e
+	case authOff:
+		return "", "cors: off (auth disabled — set MQLITE_CORS to opt in to cross-origin)"
+	default:
+		return "*", "cors: * (any origin — RPCs still require a token)"
 	}
+}
+
+// isLoopbackListen reports whether a listen address binds only the loopback interface. An
+// empty host (":6754") or 0.0.0.0 binds all interfaces; 127.0.0.0/8, ::1, and "localhost"
+// are loopback. An unresolvable hostname is treated as non-loopback (the safe default).
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	switch {
+	case host == "":
+		return false
+	case strings.EqualFold(host, "localhost"):
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func cmdCreateQueue(ctx context.Context, args []string) error {

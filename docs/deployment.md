@@ -26,7 +26,9 @@ Everything is read from the environment — the DB string is never compiled in.
 > **Auth (secure by default):** if `MQLITE_TOKENS` is **unset**, `serve` **generates a
 > random `mqk_…` token and prints it at startup** — the broker is never silently open.
 > Set `MQLITE_TOKENS` to your own token(s) for a stable value (rotate by updating it),
-> or `MQLITE_TOKENS=off` to explicitly disable auth (localhost/LAN only). The `/`
+> or `MQLITE_TOKENS=off` to explicitly disable auth — but then the broker **refuses a
+> non-loopback bind**: bind `127.0.0.1` explicitly, or pass `--insecure-allow-remote` to
+> expose it (and `MQLITE_CORS` defaults to off while auth is off). The `/`
 > discovery and `/healthz` endpoints stay open, as does the static `/ui` console when
 > enabled (its API calls still carry a token); everything else needs
 > `Authorization: Bearer <token>`.

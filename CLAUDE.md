@@ -203,7 +203,8 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   `MQLITE_ENDPOINT`+`MQLITE_TOKEN` (client mode, wins if set); `MQLITE_ADDR` = broker
   listen address (`serve`; precedence `--addr` > `MQLITE_ADDR` > `:6754`); `MQLITE_TOKENS` =
   broker's accepted Bearer tokens; `MQLITE_CORS` = `Access-Control-Allow-Origin` the
-  broker sends (unset → `*`, since RPCs still need a token; `off` disables — lets a
+  broker sends (unset → `*` while auth is on since RPCs still need a token, but off while
+  auth is off; `off` disables — lets a
   browser console on another origin reach the broker); `MQLITE_SYNC` = durability knob
   (NORMAL/FULL/OFF).
 - **Dedup-conflict batch semantics**: in a multi-message `Send`, a conflicting slot
