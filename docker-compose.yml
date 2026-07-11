@@ -1,19 +1,23 @@
-# Local broker on :6754, backed by a persistent named volume.
+# Local dev broker on 127.0.0.1:6754 (loopback only), backed by a persistent named volume.
+# Secure by default: no token is baked in — the broker generates one and prints it at
+# startup (`docker compose logs mqlite`), or set your own MQLITE_TOKENS in a .env file.
+# CORS is off; set MQLITE_CORS to opt a cross-origin browser app in.
 # For remote Turso instead of a local file, set in your shell or an .env file:
 #   MQLITE_DB=libsql://<db>.turso.io
 #   MQLITE_DB_AUTH_TOKEN=<jwt>
-# (never commit the token — see .env.example)
+# (never commit tokens — see .env.example)
 services:
   mqlite:
     build:
       context: .
     image: mqlite:dev
     ports:
-      - "6754:6754"
+      - "127.0.0.1:6754:6754"   # loopback only — not exposed on the LAN
     environment:
       MQLITE_DB: ${MQLITE_DB:-file:/data/mq.db}
       MQLITE_DB_AUTH_TOKEN: ${MQLITE_DB_AUTH_TOKEN:-}
-      MQLITE_TOKENS: ${MQLITE_TOKENS:-mqk_dev_local}
+      MQLITE_TOKENS: ${MQLITE_TOKENS:-}   # empty -> broker generates a token and logs it (no baked-in secret)
+      MQLITE_CORS: ${MQLITE_CORS:-off}     # off by default; set an origin to allow a cross-origin browser app
     volumes:
       - mqlite-data:/data
     healthcheck:
