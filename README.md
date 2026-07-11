@@ -137,7 +137,7 @@ eng.Tx(ctx, func(tx *engine.EngineTx) error {
 ```
 
 > Outgrow a single process? The *same* engine upgrades to a network broker with one
-> call — `eng.Serve(ctx, ":8080")` — and remote clients speak the same semantics
+> call — `eng.Serve(ctx, ":6754")` — and remote clients speak the same semantics
 > over HTTP (§2–§4). Embedded and broker are not two products; they are one engine.
 
 ### 2. Serve a broker
@@ -146,7 +146,7 @@ eng.Tx(ctx, func(tx *engine.EngineTx) error {
 export MQLITE_DB="file:./mq.db"           # or libsql://<db>.turso.io
 export MQLITE_DB_AUTH_TOKEN="<jwt>"        # only for remote Turso
 export MQLITE_TOKENS="mqk_dev"             # accepted Bearer tokens
-mqlite serve --addr :8080
+mqlite serve --addr :6754
 ```
 
 ### 3. Talk to it with curl
@@ -154,22 +154,22 @@ mqlite serve --addr :8080
 ```bash
 TOKEN=mqk_dev
 # discovery: hit the root with no auth — a JSON card (name, version, status, endpoints)
-curl http://127.0.0.1:8080/
+curl http://127.0.0.1:6754/
 
 # create the queue first — sending to a queue that doesn't exist is a 404
 curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"name":"orders","config":{}}' \
-  http://127.0.0.1:8080/mqlite.v1.AdminService/CreateQueue
+  http://127.0.0.1:6754/mqlite.v1.AdminService/CreateQueue
 
 # send (body is base64)
 curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data "{\"queue\":\"orders\",\"messages\":[{\"body\":\"$(printf hello | base64)\"}]}" \
-  http://127.0.0.1:8080/mqlite.v1.QueueService/Send
+  http://127.0.0.1:6754/mqlite.v1.QueueService/Send
 
 # receive (long-poll 5s) → returns lock_token
 curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"queue":"orders","max_messages":1,"wait_time_ms":5000}' \
-  http://127.0.0.1:8080/mqlite.v1.QueueService/Receive
+  http://127.0.0.1:6754/mqlite.v1.QueueService/Receive
 ```
 
 > **`Send` response.** `/Send` returns `{"seq_numbers":[…]}` — one per message, in
@@ -182,7 +182,7 @@ Full endpoint, request/response, and error reference: [docs/api-reference.md](do
 ### 3b. Admin console
 
 The broker bakes a web console into the binary and serves it at **`/ui`** (e.g.
-`http://127.0.0.1:8080/ui`) — no separate process or Node runtime. Paste your broker URL
+`http://127.0.0.1:6754/ui`) — no separate process or Node runtime. Paste your broker URL
 + token and you can list queues with live counts, browse messages, send/receive/settle,
 edit subscription filters, and redrive a DLQ. It's on by default; set `MQLITE_UI=off` to
 run headless. (The same console is also published standalone for hosting elsewhere.)
@@ -190,7 +190,7 @@ run headless. (The same console is also published standalone for hosting elsewhe
 ### 4. Or the Go SDK (remote)
 
 ```go
-cli, _ := mqlite.Open(ctx, "http://127.0.0.1:8080", mqlite.WithToken("mqk_dev"))
+cli, _ := mqlite.Open(ctx, "http://127.0.0.1:6754", mqlite.WithToken("mqk_dev"))
 seq, _ := cli.SendOne(ctx, "orders", mqlite.OutMessage{Body: []byte("hi")})
 
 // hands-off consumer: nil -> Complete, error -> Abandon, auto lock renewal
@@ -300,12 +300,12 @@ peak backlog rather than shrinking; `VACUUM` is manual). See
 ```bash
 # --pull forces the latest golang:1.25 base (newest Go stdlib security patches) —
 # use it for release builds so a cached old base layer can't ship known CVEs.
-docker build --platform linux/amd64 --pull -t mqlite:0.2.0 .
-docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.2.0
+docker build --platform linux/amd64 --pull -t mqlite:dev .
+docker run --platform linux/amd64 -p 6754:6754 -e MQLITE_TOKENS=mqk_dev mqlite:dev
 # remote Turso instead of the local volume:
-docker run --platform linux/amd64 -p 8080:8080 \
+docker run --platform linux/amd64 -p 6754:6754 \
   -e MQLITE_DB=libsql://<db>.turso.io -e MQLITE_DB_AUTH_TOKEN=<jwt> \
-  -e MQLITE_TOKENS=mqk_dev mqlite:0.2.0
+  -e MQLITE_TOKENS=mqk_dev mqlite:dev
 ```
 
 **Footprint:** ~11 MB static (CGO-free) binary, ~19 MB idle RSS, ~0.4 KB per message

@@ -8,6 +8,26 @@ records what changes semantics, adds capability, or fixes something you could hi
 mqlite is pre-1.0: any release may change behavior, and a schema change makes old
 DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 
+## Unreleased
+
+### Behavior changes
+
+- **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
+  `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
+  `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container
+  images `>= 0.3.0` `EXPOSE 6754` and default to it. There is no fallback to the old port
+  and no port probing. Upgrading: if you relied on the previous default, set it explicitly
+  — `mqlite serve --addr :8080` (or `MQLITE_ADDR=:8080`), and map the container with
+  `-p 8080:6754` — and update SDK/CLI/MCP endpoints, health probes, and firewall rules
+  copied from the old value.
+- **New `MQLITE_ADDR`** sets the broker listen address; precedence is `--addr` >
+  `MQLITE_ADDR` > `:6754`. A blank/whitespace value is rejected (it would otherwise bind
+  port 80).
+- **Custom DSN schemes supply the product port** when it is omitted: `mqlite://host` →
+  `http://host:6754`, `mqlites://host` → `https://host:6754` (previously they fell through
+  to `:80`/`:443`). Plain `http://`/`https://` keep standard 80/443; an explicit port
+  always wins.
+
 ## v0.2.0 — 2026-07-11
 
 ### Behavior changes

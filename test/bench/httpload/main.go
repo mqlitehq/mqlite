@@ -16,13 +16,13 @@
 //
 // Usage:
 //
-//	MQLITE_TOKEN=mqk_… go run ./test/bench/httpload -endpoint http://127.0.0.1:8080 -conc 32 -dur 10s
-//	MQLITE_TOKEN=mqk_… go run ./test/bench/httpload -endpoint http://127.0.0.1:8080 -conc 32 -n 20000 -verify
+//	MQLITE_TOKEN=mqk_… go run ./test/bench/httpload -endpoint http://127.0.0.1:6754 -conc 32 -dur 10s
+//	MQLITE_TOKEN=mqk_… go run ./test/bench/httpload -endpoint http://127.0.0.1:6754 -conc 32 -n 20000 -verify
 //
 // Note on Fly: driving a Fly broker from far away is network-RTT-bound (the numbers
 // measure distance, not the broker). For true capacity run this co-located in the same
 // region as a one-off Fly app, pointing at the broker's PRIVATE address
-// (http://<app>.internal:8080) — the public address hairpins through the edge and hangs.
+// (http://<app>.internal:6754) — the public address hairpins through the edge and hangs.
 package main
 
 import (
@@ -42,7 +42,7 @@ import (
 )
 
 func main() {
-	endpoint := flag.String("endpoint", "http://127.0.0.1:8080", "broker URL")
+	endpoint := flag.String("endpoint", "http://127.0.0.1:6754", "broker URL")
 	queue := flag.String("queue", "bench-load", "queue name")
 	dur := flag.Duration("dur", 10*time.Second, "duration of the SEND throughput phase")
 	conc := flag.Int("conc", 32, "concurrency (workers / max keep-alive conns)")

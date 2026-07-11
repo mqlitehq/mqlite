@@ -29,11 +29,14 @@ The DB string / endpoint is **only** read from the environment, never compiled i
 
 ### `serve` — run the broker
 ```bash
-MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :8080
+MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :6754
 ```
 | Flag | Default | |
 |---|---|---|
-| `--addr` | `:8080` | listen address |
+| `--addr` | `:6754` | listen address |
+
+The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
+`MQLITE_ADDR` > `:6754`; a blank value is rejected).
 
 Serves the RPC API, `/metrics`, the open `/` + `/healthz`, and — unless
 `MQLITE_UI=off` — the embedded admin console at `/ui`.

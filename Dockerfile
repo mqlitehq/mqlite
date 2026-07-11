@@ -1,6 +1,6 @@
 # mqlite broker — single static pure-Go binary (no CGO).
-# Build:  docker build --platform linux/amd64 -t mqlite:0.1.0 .
-# Run:    docker run --platform linux/amd64 -p 8080:8080 -e MQLITE_TOKENS=mqk_dev mqlite:0.1.0
+# Build:  docker build --platform linux/amd64 -t mqlite:dev .
+# Run:    docker run --platform linux/amd64 -p 6754:6754 -e MQLITE_TOKENS=mqk_dev mqlite:dev
 
 # golang:1.25-alpine is a rolling tag — each pull is the latest 1.25.x patch, so the
 # release binary always carries the current Go stdlib security fixes. Do NOT pin to a
@@ -26,10 +26,11 @@ FROM alpine:3.20
 # so this is only for correctness when a non-UTC zone is actually used.
 RUN apk add --no-cache ca-certificates tzdata && mkdir -p /data
 COPY --from=build /out/mqlite /usr/local/bin/mqlite
-EXPOSE 8080
+EXPOSE 6754
 # Default to a local file DB on the /data volume. Override MQLITE_DB with a
 # libsql://... URL (+ MQLITE_DB_AUTH_TOKEN) to use remote Turso instead.
 ENV MQLITE_DB=file:/data/mq.db
 VOLUME ["/data"]
 ENTRYPOINT ["mqlite"]
-CMD ["serve", "--addr", ":8080"]
+# No --addr: use the built-in default :6754 (MQLITE_ADDR can still override it).
+CMD ["serve"]

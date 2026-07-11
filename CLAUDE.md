@@ -200,7 +200,8 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   incompatibly; pre-1.0 there is no migration, a stale DB is recreated.
 - **DB DSN is read only from the environment**, never compiled in. Auth tokens are
   injected at `resolveDSN` time. `MQLITE_DB` (embedded/serve) vs
-  `MQLITE_ENDPOINT`+`MQLITE_TOKEN` (client mode, wins if set); `MQLITE_TOKENS` =
+  `MQLITE_ENDPOINT`+`MQLITE_TOKEN` (client mode, wins if set); `MQLITE_ADDR` = broker
+  listen address (`serve`; precedence `--addr` > `MQLITE_ADDR` > `:6754`); `MQLITE_TOKENS` =
   broker's accepted Bearer tokens; `MQLITE_CORS` = `Access-Control-Allow-Origin` the
   broker sends (unset → `*`, since RPCs still need a token; `off` disables — lets a
   browser console on another origin reach the broker); `MQLITE_SYNC` = durability knob
