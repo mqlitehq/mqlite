@@ -218,6 +218,12 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Validate auth config before opening the DB, so a misconfigured MQLITE_TOKENS fails
+	// fast without acquiring the single-writer lock.
+	tokens, authNote, err := resolveBrokerTokens(os.Getenv("MQLITE_TOKENS"))
+	if err != nil {
+		return err
+	}
 
 	lg := serveLogger()
 	slogger := slog.New(lg)
@@ -232,7 +238,6 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	defer eng.Close()
 
-	tokens, authNote := resolveBrokerTokens(os.Getenv("MQLITE_TOKENS"))
 	corsOrigin, _ := resolveCORS(os.Getenv("MQLITE_CORS"))
 	ui := resolveUI(os.Getenv("MQLITE_UI"))
 	backend := "local"
@@ -319,17 +324,35 @@ func serveLogger() *charmlog.Logger {
 // secure by default: if it is unset, a fresh token is generated and printed (so the
 // broker is never accidentally wide open); if it is "off", auth is explicitly
 // disabled (localhost/LAN); otherwise the provided comma-separated tokens are used.
-// Returns the token CSV (empty = no auth) and a human note for the startup banner.
-func resolveBrokerTokens(env string) (csv, note string) {
+// Returns the cleaned token CSV (empty = no auth), a human note for the startup banner,
+// and an error if MQLITE_TOKENS is set but yields no usable token (which must fail loudly
+// rather than silently disable auth — MQLITE-69).
+func resolveBrokerTokens(env string) (csv, note string, err error) {
+	trimmed := strings.TrimSpace(env)
 	switch {
-	case strings.EqualFold(strings.TrimSpace(env), "off"):
-		return "", "auth: DISABLED (MQLITE_TOKENS=off — localhost/LAN only)"
-	case strings.TrimSpace(env) == "":
+	case strings.EqualFold(trimmed, "off"):
+		return "", "auth: DISABLED (MQLITE_TOKENS=off — localhost/LAN only)", nil
+	case trimmed == "":
 		t := mqlite.GenerateToken()
 		return t, "auth: ON — generated a token (set MQLITE_TOKENS to use your own, " +
-			"or MQLITE_TOKENS=off to disable):\n  " + t
+			"or MQLITE_TOKENS=off to disable):\n  " + t, nil
 	default:
-		return env, "auth: ON — Bearer tokens from MQLITE_TOKENS"
+		// A non-blank, non-"off" value must contain at least one real token. Parse it the
+		// same way the server does (split on comma, drop blank elements); if nothing is
+		// left — e.g. ",", " , ", ",," — fail instead of passing an empty set to the server,
+		// which would disable auth while the banner claimed it was on.
+		var toks []string
+		for _, t := range strings.Split(env, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				toks = append(toks, t)
+			}
+		}
+		if len(toks) == 0 {
+			return "", "", fmt.Errorf("MQLITE_TOKENS is set but has no usable token " +
+				"(only blanks/commas); give it a token, unset it to auto-generate one, or set " +
+				"MQLITE_TOKENS=off to disable auth")
+		}
+		return strings.Join(toks, ","), "auth: ON — Bearer tokens from MQLITE_TOKENS", nil
 	}
 }
 

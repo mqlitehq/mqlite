@@ -13,18 +13,24 @@ import (
 // TestResolveBrokerTokens covers the broker's secure-by-default token policy.
 func TestResolveBrokerTokens(t *testing.T) {
 	// unset -> a token is generated (broker is never silently wide open).
-	if csv, note := resolveBrokerTokens(""); !strings.HasPrefix(csv, mqlite.TokenPrefix) || !strings.Contains(note, "generated") {
-		t.Errorf("unset: csv=%q note=%q, want a generated mqk_ token", csv, note)
+	if csv, note, err := resolveBrokerTokens(""); err != nil || !strings.HasPrefix(csv, mqlite.TokenPrefix) || !strings.Contains(note, "generated") {
+		t.Errorf("unset: csv=%q note=%q err=%v, want a generated mqk_ token", csv, note, err)
 	}
 	// off (case/space-insensitive) -> auth explicitly disabled.
 	for _, off := range []string{"off", "OFF", "  off  "} {
-		if csv, note := resolveBrokerTokens(off); csv != "" || !strings.Contains(note, "DISABLED") {
-			t.Errorf("%q: csv=%q note=%q, want disabled", off, csv, note)
+		if csv, note, err := resolveBrokerTokens(off); err != nil || csv != "" || !strings.Contains(note, "DISABLED") {
+			t.Errorf("%q: csv=%q note=%q err=%v, want disabled", off, csv, note, err)
 		}
 	}
-	// provided -> passed through verbatim.
-	if csv, note := resolveBrokerTokens("a,b"); csv != "a,b" || !strings.Contains(note, "MQLITE_TOKENS") {
-		t.Errorf("provided: csv=%q note=%q", csv, note)
+	// provided -> cleaned CSV of the valid tokens (blank elements dropped, spaces trimmed).
+	if csv, note, err := resolveBrokerTokens("a, b ,c"); err != nil || csv != "a,b,c" || !strings.Contains(note, "MQLITE_TOKENS") {
+		t.Errorf("provided: csv=%q note=%q err=%v, want a,b,c", csv, note, err)
+	}
+	// set-but-empty (only blanks/commas) MUST fail, not silently disable auth (MQLITE-69).
+	for _, bad := range []string{",", " , ", ",,", "   ,"} {
+		if csv, _, err := resolveBrokerTokens(bad); err == nil {
+			t.Errorf("%q: want an error (no usable token), got csv=%q nil err", bad, csv)
+		}
 	}
 }
 
