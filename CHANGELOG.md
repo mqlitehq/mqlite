@@ -28,6 +28,15 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   (MQLITE-73): re-subscribing changes only the mapping/filter; lock duration, delivery
   count, TTL, dedup, ordering and DLQ settings previously configured on the backing queue
   now survive (they were silently reset to defaults on every filter update).
+- **Malformed `MQLITE_TOKENS` now fails startup instead of silently disabling auth**
+  (MQLITE-69): a value that is non-blank but parses to no token (e.g. `","`, `" , "`) used
+  to log "auth enabled" while running fully open. Only the exact `off` disables auth.
+- **With auth disabled, CORS defaults off and a non-loopback bind is refused** (MQLITE-70):
+  `MQLITE_TOKENS=off` on an all-interfaces address now errors — bind `127.0.0.1`, or pass the
+  new `--insecure-allow-remote`. An explicit `MQLITE_CORS` still opts a wildcard/origin in.
+- **The dev `docker-compose.yml` is secure by default** (MQLITE-74): it binds loopback only
+  (`127.0.0.1`), ships no baked-in token (the broker generates one and logs it), and defaults
+  CORS off.
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container
