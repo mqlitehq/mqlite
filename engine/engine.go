@@ -472,6 +472,19 @@ func (e *Engine) Schedule(ctx context.Context, queue string, m OutMessage, atMs 
 	return seqs[0], nil
 }
 
+// ScheduleBatch enqueues one or more messages to become visible at atMs, atomically: like
+// Send, the whole batch commits in one transaction or none does — a mid-batch failure never
+// leaves earlier items scheduled. A conflicting slot (same message_id, different body) comes
+// back as seq 0 while the rest commit; a publish that matches no subscription is a valid
+// no-op (seq 0). Use Schedule for a single message when you must tell a dedup conflict apart
+// from a no-subscriber no-op.
+func (e *Engine) ScheduleBatch(ctx context.Context, queue string, ms []OutMessage, atMs int64) ([]int64, error) {
+	if len(ms) == 0 {
+		return nil, nil
+	}
+	return e.send(ctx, queue, ms, atMs, StateScheduled)
+}
+
 // Cancel deletes a not-yet-activated scheduled message by seq.
 func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
 	res, err := e.db.exec(ctx,

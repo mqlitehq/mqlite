@@ -388,6 +388,39 @@ func TestStaleCancelDoesNotDeleteLaterMessage(t *testing.T) {
 	}
 }
 
+// A scheduled multi-message batch is atomic: a mid-batch failure rolls back the whole batch,
+// never leaving earlier items scheduled (MQLITE-72).
+func TestScheduleBatchAtomic(t *testing.T) {
+	ctx := context.Background()
+	e, msp := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{Ordering: OrderGroupFIFO})
+	at := atomicNow(msp) + time.Hour.Milliseconds()
+
+	// item 2 lacks a group_id → group_fifo requires it → the whole batch must roll back.
+	_, err := e.ScheduleBatch(ctx, "q", []OutMessage{
+		{Body: []byte("a"), GroupID: "g1"},
+		{Body: []byte("b")},
+	}, at)
+	if !errors.Is(err, ErrGroupRequired) {
+		t.Fatalf("want ErrGroupRequired, got %v", err)
+	}
+	if pk, _ := e.Peek(ctx, "q", PeekOptions{State: StateScheduled}); len(pk) != 0 {
+		t.Fatalf("failed scheduled batch must leave nothing; got %d scheduled", len(pk))
+	}
+
+	// a valid batch schedules all of them in one transaction.
+	seqs, err := e.ScheduleBatch(ctx, "q", []OutMessage{
+		{Body: []byte("a"), GroupID: "g1"},
+		{Body: []byte("b"), GroupID: "g2"},
+	}, at)
+	if err != nil || len(seqs) != 2 {
+		t.Fatalf("valid batch: seqs=%v err=%v", seqs, err)
+	}
+	if pk, _ := e.Peek(ctx, "q", PeekOptions{State: StateScheduled}); len(pk) != 2 {
+		t.Fatalf("valid batch should schedule 2, got %d", len(pk))
+	}
+}
+
 // RenewLock extends the lease so the reaper does not reclaim mid-processing.
 func TestRenewLockExtendsLease(t *testing.T) {
 	ctx := context.Background()
