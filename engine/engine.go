@@ -167,7 +167,7 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 		return errors.New("mqlite: queue name required")
 	}
 	if err := e.inTx(ctx, func(tx *sql.Tx) error {
-		return e.createQueueTx(ctx, tx, name, cfg)
+		return e.createQueueTx(ctx, tx, name, cfg, true)
 	}); err != nil {
 		return err
 	}
@@ -190,7 +190,12 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 // kind='subscription' request over a plain queue) is rejected rather than
 // silently retuning an entity the caller doesn't think they own. A deliberate
 // backing-queue reconfig stays possible by passing Kind:"subscription".
-func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg QueueConfig) error {
+// createQueueTx creates the queue `name`, or — when overwrite is true — reconfigures an
+// existing one from cfg (CreateQueue's documented "update config if exists" contract).
+// overwrite=false only ensures the row exists and never touches an existing queue's config:
+// Subscribe uses it so re-subscribing (a filter update) can't reset the backing queue's
+// lock/delivery/TTL/dedup/ordering/DLQ settings (MQLITE-73). The name guards run either way.
+func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg QueueConfig, overwrite bool) error {
 	kind := cfg.Kind
 	if kind == "" {
 		kind = "queue"
@@ -230,12 +235,11 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg
 		ordering = OrderStandard
 	}
 	now := e.now()
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO queues (name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		                    dead_letter_on_expire,dedup_window_ms,ordering_mode,
-		                    dlq_max_age_ms,dlq_max_count,dlq_max_bytes,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(name) DO UPDATE SET
+	// One statement either way (Hrana wants one per exec). overwrite chooses the conflict
+	// action: reconfigure (CreateQueue) vs leave an existing queue untouched (Subscribe).
+	conflict := ` ON CONFLICT(name) DO NOTHING`
+	if overwrite {
+		conflict = ` ON CONFLICT(name) DO UPDATE SET
 		    lock_duration_ms=excluded.lock_duration_ms,
 		    max_delivery_count=excluded.max_delivery_count,
 		    default_ttl_ms=excluded.default_ttl_ms,
@@ -245,7 +249,13 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg
 		    dlq_max_age_ms=excluded.dlq_max_age_ms,
 		    dlq_max_count=excluded.dlq_max_count,
 		    dlq_max_bytes=excluded.dlq_max_bytes,
-		    updated_at=excluded.updated_at`,
+		    updated_at=excluded.updated_at`
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO queues (name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
+		                    dead_letter_on_expire,dedup_window_ms,ordering_mode,
+		                    dlq_max_age_ms,dlq_max_count,dlq_max_bytes,created_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`+conflict,
 		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, string(ordering),
 		cfg.DLQMaxAgeMs, cfg.DLQMaxCount, cfg.DLQMaxBytes, now, now)
 	return err
@@ -328,7 +338,7 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 		}
 		// createQueueTx additionally rejects a subscription name that is itself a
 		// live topic — the same shadowing hazard from the other side.
-		if err := e.createQueueTx(ctx, tx, name, QueueConfig{Kind: "subscription"}); err != nil {
+		if err := e.createQueueTx(ctx, tx, name, QueueConfig{Kind: "subscription"}, false); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `

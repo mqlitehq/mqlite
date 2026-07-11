@@ -24,6 +24,10 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   `group_fifo` item missing its `group_id`) rolls back the whole batch instead of leaving
   earlier items scheduled. A single scheduled message still distinguishes a dedup conflict
   (`409`) from a no-subscriber no-op (`seq 0`).
+- **Updating a subscription filter no longer resets its backing queue's config**
+  (MQLITE-73): re-subscribing changes only the mapping/filter; lock duration, delivery
+  count, TTL, dedup, ordering and DLQ settings previously configured on the backing queue
+  now survive (they were silently reset to defaults on every filter update).
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container
