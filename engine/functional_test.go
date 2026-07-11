@@ -421,6 +421,36 @@ func TestScheduleBatchAtomic(t *testing.T) {
 	}
 }
 
+// Re-subscribing to update a filter must NOT reset the backing queue's config (MQLITE-73):
+// only the mapping/filter changes; lock/delivery/etc. set on the backing queue survive.
+func TestSubscribeFilterUpdatePreservesQueueConfig(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+
+	if err := e.Subscribe(ctx, "events", "sub", &Filter{Expr: `subject == "a"`}); err != nil {
+		t.Fatal(err)
+	}
+	// give the backing queue non-default config (the documented reconfigure path).
+	on := true
+	if err := e.CreateQueue(ctx, "sub", QueueConfig{
+		Kind: "subscription", LockDurationMs: 60000, MaxDeliveryCount: 25, DeadLetterOnExpire: &on,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// update the filter by re-subscribing — must leave the queue config untouched.
+	if err := e.Subscribe(ctx, "events", "sub", &Filter{Expr: `subject == "b"`}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := e.loadQueue(ctx, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.lockDurationMs != 60000 || q.maxDeliveryCount != 25 {
+		t.Fatalf("filter update reset backing queue config: lock=%d maxdc=%d (want 60000/25)",
+			q.lockDurationMs, q.maxDeliveryCount)
+	}
+}
+
 // RenewLock extends the lease so the reaper does not reclaim mid-processing.
 func TestRenewLockExtendsLease(t *testing.T) {
 	ctx := context.Background()
