@@ -103,6 +103,23 @@ func TestRemoteCompleteBatch(t *testing.T) {
 	}
 }
 
+// A remote publish to a topic that no subscription filter accepts is a valid no-op —
+// (0, nil), matching the embedded SDK — not a spurious ErrDedupConflict (MQLITE-75).
+func TestRemoteTopicNoMatchIsNoOp(t *testing.T) {
+	cli, _ := newBroker(t, "tok")
+	ctx := context.Background()
+	if err := cli.Subscribe(ctx, "events", "sub", &mqlite.Filter{Expr: `subject == "never"`}); err != nil {
+		t.Fatal(err)
+	}
+	seq, err := cli.SendOne(ctx, "events", mqlite.OutMessage{Body: []byte("x"), Subject: "other"})
+	if err != nil {
+		t.Fatalf("no-match publish should be a no-op, got err %v", err)
+	}
+	if seq != 0 {
+		t.Fatalf("no-match publish should return seq 0, got %d", seq)
+	}
+}
+
 func TestRemoteRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	cli, _ := newBroker(t, "mqk_test")

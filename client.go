@@ -166,9 +166,13 @@ func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts .
 	if err := c.post(ctx, path, req, &resp); err != nil {
 		return 0, err
 	}
-	if len(resp.SeqNumbers) == 0 || resp.SeqNumbers[0] == 0 {
-		return 0, ErrDedupConflict
+	if len(resp.SeqNumbers) == 0 {
+		return 0, fmt.Errorf("mqlite: malformed Send response (no seq_numbers)")
 	}
+	// seq 0 on a 200 response is a topic publish that matched no subscription — a valid no-op
+	// returning (0, nil), matching the embedded SDK. A real single-message dedup conflict
+	// arrives as HTTP 409 already_exists (mapped to ErrDedupConflict by c.post above), so it
+	// never reaches here as a 0 seq (MQLITE-75).
 	return resp.SeqNumbers[0], nil
 }
 
