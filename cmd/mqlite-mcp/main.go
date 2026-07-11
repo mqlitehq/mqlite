@@ -5,7 +5,7 @@
 // mqlite's "friendly to AI agents" goal and its dependency-light ethos — stdlib +
 // the in-repo wire contract only, no MCP SDK.
 //
-// Config (env): MQLITE_ENDPOINT (default http://127.0.0.1:8080) + MQLITE_TOKEN.
+// Config (env): MQLITE_ENDPOINT (default http://127.0.0.1:6754) + MQLITE_TOKEN.
 // Run it as a stdio MCP server from your agent host.
 package main
 
@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mqlitehq/mqlite/internal/defaults"
 	ver "github.com/mqlitehq/mqlite/internal/version"
 	"github.com/mqlitehq/mqlite/wire"
 )
@@ -36,11 +37,18 @@ var broker struct {
 	http     *http.Client
 }
 
-func main() {
-	broker.endpoint = strings.TrimRight(os.Getenv("MQLITE_ENDPOINT"), "/")
-	if broker.endpoint == "" {
-		broker.endpoint = "http://127.0.0.1:8080"
+// resolveEndpoint normalizes MQLITE_ENDPOINT (trailing slash trimmed) and falls back to
+// the shared loopback default when it is empty, so the MCP server and the broker CLI agree
+// on the default port without either hardcoding a literal.
+func resolveEndpoint(env string) string {
+	if ep := strings.TrimRight(strings.TrimSpace(env), "/"); ep != "" {
+		return ep
 	}
+	return defaults.BrokerLoopbackEndpoint
+}
+
+func main() {
+	broker.endpoint = resolveEndpoint(os.Getenv("MQLITE_ENDPOINT"))
 	broker.token = os.Getenv("MQLITE_TOKEN")
 	broker.http = &http.Client{Timeout: 30 * time.Second}
 

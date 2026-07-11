@@ -6,6 +6,8 @@
 //	MQLITE_DB=file:./mq.db | :memory: | libsql://<db>.turso.io   (embedded mode)
 //	MQLITE_DB_AUTH_TOKEN=<jwt>                                    (remote Turso/libSQL)
 //	MQLITE_ENDPOINT=http://host:port + MQLITE_TOKEN=<bearer>      (client mode; wins if set)
+//	MQLITE_ADDR=host:port       (listen address for `serve`; precedence: --addr >
+//	                             MQLITE_ADDR > :6754; a blank value is rejected)
 //	MQLITE_TOKENS=mqk_a,mqk_b   (tokens `serve` accepts; UNSET => a token is generated
 //	                             and printed; =off disables auth — localhost/LAN only)
 //	MQLITE_CORS=* | https://app.example | off   (Access-Control-Allow-Origin for `serve`;
@@ -41,6 +43,7 @@ import (
 	charmlog "github.com/charmbracelet/log"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/internal/defaults"
 	ver "github.com/mqlitehq/mqlite/internal/version"
 )
 
@@ -201,8 +204,20 @@ func dial(ctx context.Context) (api, error) {
 
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", ":8080", "listen address")
+	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
 	_ = fs.Parse(args)
+
+	addrSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "addr" {
+			addrSet = true
+		}
+	})
+	envAddr, envSet := os.LookupEnv("MQLITE_ADDR")
+	listenAddr, err := resolveListenAddr(*addr, addrSet, envAddr, envSet)
+	if err != nil {
+		return err
+	}
 
 	lg := serveLogger()
 	slogger := slog.New(lg)
@@ -224,12 +239,12 @@ func cmdServe(ctx context.Context, args []string) error {
 	if eng.Engine().Remote() {
 		backend = "remote Turso/libSQL"
 	}
-	host := *addr
+	host := listenAddr
 	if strings.HasPrefix(host, ":") {
 		host = "localhost" + host
 	}
 
-	lg.Info("mqlite broker", "version", version, "addr", *addr, "db", redact(db), "backend", backend)
+	lg.Info("mqlite broker", "version", version, "addr", listenAddr, "db", redact(db), "backend", backend)
 	if ui {
 		lg.Info("admin console", "url", "http://"+host+"/ui")
 	}
@@ -250,9 +265,33 @@ func cmdServe(ctx context.Context, args []string) error {
 	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	lg.Info("ready — Ctrl-C to stop")
-	return eng.Serve(sctx, *addr,
+	return eng.Serve(sctx, listenAddr,
 		mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version),
 		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui))
+}
+
+// resolveListenAddr picks the broker's listen address with precedence
+//
+//	explicit --addr  >  non-empty MQLITE_ADDR  >  defaults.BrokerListenAddr (:6754)
+//
+// A blank or whitespace-only explicit --addr or MQLITE_ADDR is rejected: passing an empty
+// address to Go's net/http would otherwise bind the named service ":http" (port 80),
+// silently breaking the deterministic-endpoint contract. Invalid but non-blank addresses
+// are left to fail loudly at Listen time, which reports the offending value.
+func resolveListenAddr(flagVal string, flagSet bool, env string, envSet bool) (string, error) {
+	if flagSet {
+		if v := strings.TrimSpace(flagVal); v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("--addr is blank; pass a host:port such as %s", defaults.BrokerListenAddr)
+	}
+	if envSet {
+		if v := strings.TrimSpace(env); v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("MQLITE_ADDR is blank; unset it or pass a host:port such as %s", defaults.BrokerListenAddr)
+	}
+	return defaults.BrokerListenAddr, nil
 }
 
 // resolveUI decides whether the embedded admin console is served, from MQLITE_UI. Default
