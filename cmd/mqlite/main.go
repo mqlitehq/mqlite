@@ -264,7 +264,11 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	switch {
 	case tokens == "":
-		lg.Warn("auth disabled — anyone can call this broker (localhost/LAN only; set MQLITE_TOKENS)")
+		reach := "reachable on loopback only"
+		if !isLoopbackListen(listenAddr) {
+			reach = "reachable by ANYONE on the network (--insecure-allow-remote)"
+		}
+		lg.Warn("auth disabled — no token required; " + reach + " (set MQLITE_TOKENS to enable auth)")
 	case strings.Contains(authNote, "generated"):
 		lg.Info("auth enabled — generated a token (set MQLITE_TOKENS to use your own, or =off to disable)", "token", tokens)
 	default:

@@ -34,9 +34,12 @@ MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :6754
 | Flag | Default | |
 |---|---|---|
 | `--addr` | `:6754` | listen address |
+| `--insecure-allow-remote` | `false` | with auth disabled, allow a non-loopback bind (otherwise refused) |
 
 The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
-`MQLITE_ADDR` > `:6754`; a blank value is rejected).
+`MQLITE_ADDR` > `:6754`; a blank value is rejected). With auth disabled
+(`MQLITE_TOKENS=off`) the broker **refuses a non-loopback bind** unless
+`--insecure-allow-remote` is passed, and **`MQLITE_CORS` defaults to off**.
 
 Serves the RPC API, `/metrics`, the open `/` + `/healthz`, and — unless
 `MQLITE_UI=off` — the embedded admin console at `/ui`.
