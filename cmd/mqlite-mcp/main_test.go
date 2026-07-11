@@ -12,8 +12,23 @@ import (
 	"testing"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/defaults"
 	"github.com/mqlitehq/mqlite/server"
 )
+
+// TestResolveEndpoint pins the MCP endpoint fallback to the shared loopback default and the
+// trailing-slash trim (MQLITE-84), without any network call.
+func TestResolveEndpoint(t *testing.T) {
+	if got := resolveEndpoint(""); got != defaults.BrokerLoopbackEndpoint {
+		t.Errorf("empty -> %q, want %q", got, defaults.BrokerLoopbackEndpoint)
+	}
+	if got := resolveEndpoint("http://x:1/"); got != "http://x:1" {
+		t.Errorf("trailing slash -> %q, want http://x:1", got)
+	}
+	if got := resolveEndpoint("https://q.example"); got != "https://q.example" {
+		t.Errorf("passthrough -> %q, want https://q.example", got)
+	}
+}
 
 func call(t *testing.T, line string) rpcResponse {
 	t.Helper()

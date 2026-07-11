@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/internal/defaults"
 )
 
 // TestResolveBrokerTokens covers the broker's secure-by-default token policy.
@@ -46,6 +47,29 @@ func TestResolveCORS(t *testing.T) {
 // TestCommandsEndToEnd drives the CLI command handlers against one embedded DB,
 // exercising flag parsing, dispatch, and output formatting (MQLITE-26). Each
 // command dials and closes its own DB, so calls run sequentially.
+// TestResolveListenAddr covers the listen-address precedence (MQLITE-84):
+// explicit --addr > non-empty MQLITE_ADDR > :6754, with blank values rejected.
+func TestResolveListenAddr(t *testing.T) {
+	if got, err := resolveListenAddr("", false, "", false); err != nil || got != defaults.BrokerListenAddr {
+		t.Fatalf("default: got %q err %v, want %q", got, err, defaults.BrokerListenAddr)
+	}
+	if got, err := resolveListenAddr("", false, "127.0.0.1:9000", true); err != nil || got != "127.0.0.1:9000" {
+		t.Errorf("env used when flag unset: got %q err %v", got, err)
+	}
+	if got, err := resolveListenAddr(":9001", true, "127.0.0.1:9000", true); err != nil || got != ":9001" {
+		t.Errorf("explicit flag beats env: got %q err %v", got, err)
+	}
+	if got, err := resolveListenAddr(" :9002 ", true, "", false); err != nil || got != ":9002" {
+		t.Errorf("flag value trimmed: got %q err %v", got, err)
+	}
+	if _, err := resolveListenAddr("   ", true, "", false); err == nil {
+		t.Error("blank --addr should be rejected")
+	}
+	if _, err := resolveListenAddr("", false, "  ", true); err == nil {
+		t.Error("blank MQLITE_ADDR should be rejected")
+	}
+}
+
 func TestCommandsEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("MQLITE_ENDPOINT", "") // force the embedded path in dial()
