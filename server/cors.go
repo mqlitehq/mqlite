@@ -4,10 +4,11 @@ import "net/http"
 
 // cors optionally makes the broker reachable from a browser app served by a different
 // origin — the standalone admin console pointed at this broker. It is disabled when
-// Server.CORS == "" (the library default). The broker binary defaults it to "*": every
-// RPC already requires a Bearer token and the API sets no cookies, so a permissive
-// Allow-Origin grants a cross-origin page nothing it couldn't do with the token from
-// anywhere else. Set MQLITE_CORS to a specific origin to narrow it.
+// Server.CORS == "" (the library default). The broker binary defaults it to "*" only while
+// auth is on — every RPC then requires a Bearer token and the API sets no cookies, so a
+// permissive Allow-Origin grants a cross-origin page nothing it couldn't do with the token
+// from anywhere else. With auth disabled the binary defaults CORS off (a wildcard would let
+// any page drive an unauthenticated broker). Set MQLITE_CORS to a specific origin to narrow it.
 //
 // It is the outermost middleware so a CORS preflight (OPTIONS, which carries no
 // Authorization header) is answered here, before auth would reject it.

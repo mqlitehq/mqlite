@@ -34,19 +34,52 @@ func TestResolveBrokerTokens(t *testing.T) {
 	}
 }
 
-// TestResolveCORS covers the broker's CORS policy: open by default (token still required),
-// off on request, otherwise a verbatim origin.
+// TestResolveCORS covers the broker's CORS policy: wildcard by default while auth is ON, but
+// OFF by default once auth is disabled (MQLITE-70 / D6); "off" always disables it and an
+// explicit origin / explicit "*" is an opt-in honored even with auth off.
 func TestResolveCORS(t *testing.T) {
-	if origin, _ := resolveCORS(""); origin != "*" {
-		t.Errorf("unset: origin=%q, want *", origin)
+	// auth ON, unset -> wildcard (a token is still required).
+	if origin, _ := resolveCORS("", false); origin != "*" {
+		t.Errorf("auth-on unset: origin=%q, want *", origin)
 	}
+	// auth OFF, unset -> off (a wildcard would let any page drive an open broker).
+	if origin, note := resolveCORS("", true); origin != "" || !strings.Contains(note, "auth disabled") {
+		t.Errorf("auth-off unset: origin=%q note=%q, want off", origin, note)
+	}
+	// "off" disables regardless of auth.
 	for _, off := range []string{"off", "OFF", "  off  "} {
-		if origin, note := resolveCORS(off); origin != "" || !strings.Contains(note, "off") {
-			t.Errorf("%q: origin=%q note=%q, want disabled", off, origin, note)
+		for _, authOff := range []bool{false, true} {
+			if origin, note := resolveCORS(off, authOff); origin != "" || !strings.Contains(note, "off") {
+				t.Errorf("%q (authOff=%v): origin=%q note=%q, want disabled", off, authOff, origin, note)
+			}
 		}
 	}
-	if origin, _ := resolveCORS("https://app.example"); origin != "https://app.example" {
+	// explicit origin -> verbatim.
+	if origin, _ := resolveCORS("https://app.example", true); origin != "https://app.example" {
 		t.Errorf("provided: origin=%q", origin)
+	}
+	// explicit "*" with auth off -> honored (opt-in) but the note warns.
+	if origin, note := resolveCORS("*", true); origin != "*" || !strings.Contains(note, "WARNING") {
+		t.Errorf("explicit wildcard auth-off: origin=%q note=%q, want * with warning", origin, note)
+	}
+}
+
+// TestIsLoopbackListen covers the auth-off bind guard's loopback classification (MQLITE-70).
+func TestIsLoopbackListen(t *testing.T) {
+	cases := map[string]bool{
+		":6754":            false, // all interfaces
+		"0.0.0.0:6754":     false,
+		"192.168.1.5:6754": false,
+		"[::]:6754":        false, // IPv6 unspecified
+		"127.0.0.1:6754":   true,
+		"127.0.0.5:6754":   true, // 127.0.0.0/8
+		"localhost:6754":   true,
+		"[::1]:6754":       true,
+	}
+	for addr, want := range cases {
+		if got := isLoopbackListen(addr); got != want {
+			t.Errorf("isLoopbackListen(%q) = %v, want %v", addr, got, want)
+		}
 	}
 }
 
