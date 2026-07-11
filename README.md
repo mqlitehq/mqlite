@@ -252,6 +252,7 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 
 **Understand it:**
 [Concepts & filters](docs/concepts.md) (model + `expr` filter language) ·
+[Internals](docs/internals.md) (how it's built: schema, single-writer, fencing, recovery) ·
 [Conformance / TCK](docs/conformance.md) ·
 [Benchmarks, sizing & tuning](docs/benchmark.md) ·
 [Dependencies](docs/dependencies.md)
