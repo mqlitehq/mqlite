@@ -5,7 +5,7 @@ package engine
 // whose recorded version differs is refused with ErrSchemaVersionMismatch (see db.go)
 // rather than running today's DDL against a layout it doesn't match. Change the token
 // whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
-const schemaVersion = "2"
+const schemaVersion = "3"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc
@@ -44,10 +44,15 @@ var schemaStmts = []string{
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_subs_by_topic ON subscriptions(topic)`,
 
-	// core message table. id (INTEGER PRIMARY KEY = rowid) is the broker-assigned,
-	// monotonic, gap-free seq_number (ASB SequenceNumber analogue).
+	// core message table. id (INTEGER PRIMARY KEY AUTOINCREMENT = rowid) is the
+	// broker-assigned seq_number (ASB SequenceNumber analogue): strictly increasing for
+	// committed messages and NEVER reused, even after the highest row is deleted — without
+	// AUTOINCREMENT SQLite would recycle a freed max rowid, letting a stale seq handle alias
+	// a later message (MQLITE-71). It may gap (deleting the highest row retires that id — the
+	// next insert jumps past it), and it is not a durable cross-lifetime handle: once a
+	// message is settled/cancelled its seq is gone for good.
 	`CREATE TABLE IF NOT EXISTS messages (
-	    id             INTEGER PRIMARY KEY,
+	    id             INTEGER PRIMARY KEY AUTOINCREMENT,
 	    queue          TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
 	    state          TEXT NOT NULL DEFAULT 'active'
 	                       CHECK (state IN ('active','locked','deferred','scheduled','completed','dead_lettered')),

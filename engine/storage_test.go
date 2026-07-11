@@ -111,8 +111,8 @@ func TestSchemaVersionGuard(t *testing.T) {
 // the statements are the contract).
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
-		wantVersion = "2"
-		wantHash    = "5b68da976fd289d276a4106f3af616e9f555efab7ae8c56de836cb6f584e0e93"
+		wantVersion = "3"
+		wantHash    = "9cde8ede1b6c3a2018ea57491a0a4f8441bf4c0a9ddfc59156bede68624ddf0f"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
