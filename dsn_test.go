@@ -16,6 +16,8 @@ func TestParseDSN(t *testing.T) {
 		{name: "explicit port wins", dsn: "mqlite://host:9000", endpoint: "http://host:9000"},
 		{name: "explicit port wins on mqlites", dsn: "mqlites://host:8443", endpoint: "https://host:8443"},
 		{name: "token extracted + product port", dsn: "mqlite://tok@host", endpoint: "http://host:6754", token: "tok"},
+		{name: "token + explicit port both kept", dsn: "mqlite://tok@host:9000", endpoint: "http://host:9000", token: "tok"},
+		{name: "plain http passthrough does not extract userinfo as token", dsn: "http://tok@host", endpoint: "http://tok@host", token: ""},
 		{name: "tls=true query upgrades scheme", dsn: "mqlite://host?tls=true", endpoint: "https://host:6754"},
 		{name: "ipv6 no port", dsn: "mqlite://[::1]", endpoint: "http://[::1]:6754"},
 		{name: "ipv6 with port", dsn: "mqlite://[::1]:9000", endpoint: "http://[::1]:9000"},

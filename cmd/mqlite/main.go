@@ -6,6 +6,8 @@
 //	MQLITE_DB=file:./mq.db | :memory: | libsql://<db>.turso.io   (embedded mode)
 //	MQLITE_DB_AUTH_TOKEN=<jwt>                                    (remote Turso/libSQL)
 //	MQLITE_ENDPOINT=http://host:port + MQLITE_TOKEN=<bearer>      (client mode; wins if set)
+//	MQLITE_ADDR=host:port       (listen address for `serve`; precedence: --addr >
+//	                             MQLITE_ADDR > :6754; a blank value is rejected)
 //	MQLITE_TOKENS=mqk_a,mqk_b   (tokens `serve` accepts; UNSET => a token is generated
 //	                             and printed; =off disables auth — localhost/LAN only)
 //	MQLITE_CORS=* | https://app.example | off   (Access-Control-Allow-Origin for `serve`;

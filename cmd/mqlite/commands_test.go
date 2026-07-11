@@ -65,6 +65,9 @@ func TestResolveListenAddr(t *testing.T) {
 	if _, err := resolveListenAddr("   ", true, "", false); err == nil {
 		t.Error("blank --addr should be rejected")
 	}
+	if _, err := resolveListenAddr("  ", true, "127.0.0.1:9000", true); err == nil {
+		t.Error("blank --addr must error even when MQLITE_ADDR is valid (explicit wins)")
+	}
 	if _, err := resolveListenAddr("", false, "  ", true); err == nil {
 		t.Error("blank MQLITE_ADDR should be rejected")
 	}

@@ -41,7 +41,7 @@ var broker struct {
 // the shared loopback default when it is empty, so the MCP server and the broker CLI agree
 // on the default port without either hardcoding a literal.
 func resolveEndpoint(env string) string {
-	if ep := strings.TrimRight(env, "/"); ep != "" {
+	if ep := strings.TrimRight(strings.TrimSpace(env), "/"); ep != "" {
 		return ep
 	}
 	return defaults.BrokerLoopbackEndpoint
