@@ -48,9 +48,9 @@ var schemaStmts = []string{
 	// broker-assigned seq_number (ASB SequenceNumber analogue): strictly increasing for
 	// committed messages and NEVER reused, even after the highest row is deleted — without
 	// AUTOINCREMENT SQLite would recycle a freed max rowid, letting a stale seq handle alias
-	// a later message (MQLITE-71). It may gap (a rolled-back insert still consumes an id),
-	// and it is not a durable cross-lifetime handle: once a message is settled/cancelled its
-	// seq is gone for good.
+	// a later message (MQLITE-71). It may gap (deleting the highest row retires that id — the
+	// next insert jumps past it), and it is not a durable cross-lifetime handle: once a
+	// message is settled/cancelled its seq is gone for good.
 	`CREATE TABLE IF NOT EXISTS messages (
 	    id             INTEGER PRIMARY KEY AUTOINCREMENT,
 	    queue          TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,

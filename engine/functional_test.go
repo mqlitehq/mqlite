@@ -294,13 +294,61 @@ func TestSeqNumberNeverReused(t *testing.T) {
 	if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
 		t.Fatal(err)
 	}
+	// a full VACUUM must not rebase the AUTOINCREMENT high-water either.
+	if err := e.Compact(ctx, true); err != nil {
+		t.Fatal(err)
+	}
 	// the table is empty again; the next send must get a strictly greater seq, not `first`.
 	second, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("second")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second <= first {
-		t.Fatalf("seq reused/regressed: first=%d second=%d (want second > first)", first, second)
+		t.Fatalf("seq reused/regressed after drain+vacuum: first=%d second=%d (want second > first)", first, second)
+	}
+}
+
+// The never-reuse guarantee must survive a broker restart: the AUTOINCREMENT high-water
+// lives in the DB (sqlite_sequence), so a stale Cancel replayed after a bounce still can't
+// alias a message scheduled post-restart.
+func TestSeqHighWaterSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "mq.db")
+	e, msp := testEngineAt(t, path)
+	mustQueue(t, e, "q", QueueConfig{})
+	at := atomicNow(msp) + time.Hour.Milliseconds()
+
+	seqA, err := e.Schedule(ctx, "q", OutMessage{Body: []byte("A")}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Cancel(ctx, "q", seqA); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// reopen the same file — a fresh broker process.
+	e2, msp2 := testEngineAt(t, path)
+	at2 := atomicNow(msp2) + time.Hour.Milliseconds()
+	seqB, err := e2.Schedule(ctx, "q", OutMessage{Body: []byte("B")}, at2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seqB <= seqA {
+		t.Fatalf("seq high-water not durable across reopen: A=%d B=%d (want B > A)", seqA, seqB)
+	}
+	// a Cancel(seqA) replayed after the restart must not touch B.
+	if err := e2.Cancel(ctx, "q", seqA); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("post-restart stale Cancel(%d) should be ErrNotFound, got %v", seqA, err)
+	}
+	pk, err := e2.Peek(ctx, "q", PeekOptions{State: StateScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pk) != 1 || pk[0].SeqNumber != seqB {
+		t.Fatalf("message B must survive the post-restart stale cancel; peek=%+v", pk)
 	}
 }
 

@@ -47,7 +47,7 @@ The heart, abridged:
 
 ```sql
 CREATE TABLE messages (
-    id             INTEGER PRIMARY KEY,   -- SQLite rowid = the sequence number
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- SQLite rowid = the sequence number
     queue          TEXT NOT NULL REFERENCES queues(name),
     state          TEXT NOT NULL DEFAULT 'active'
                        CHECK (state IN ('active','locked','deferred',
@@ -64,8 +64,8 @@ CREATE TABLE messages (
 
 Three deliberate choices hide in this table:
 
-- **`id INTEGER PRIMARY KEY` *is* SQLite's rowid** — monotonically assigned,
-  never reused while the row lives. That single column gives
+- **`id INTEGER PRIMARY KEY AUTOINCREMENT` *is* SQLite's rowid** — strictly increasing
+  and never reused, even after the row is deleted (it may gap). That single column gives
   mqlite its sequence numbers, its FIFO order, *and* its fastest possible index,
   for free.
 - **State is data, not memory.** A message being "locked" is a row value, not a
@@ -324,7 +324,7 @@ your store signs. Each item maps back to the section that depends on it.
 
 | # | Your store must provide | Because of |
 |---|---|---|
-| G1 | **Durable, ordered enqueue** with a monotonic, never-recycled-while-live sequence number | §2 — seq is the ordering anchor *and* the settlement handle |
+| G1 | **Durable, ordered enqueue** with a strictly-increasing, never-recycled sequence number | §2 — seq is the ordering anchor *and* the settlement handle |
 | G2 | **Atomic claim**: select the eligible head *and* lock it as one indivisible operation — two consumers can never win the same message | §4 — the claim UPDATE |
 | G3 | **Per-state ordered lookup in O(log n)** on a deep backlog: "oldest active in queue Q", "expired locks", "due scheduled", per group | §5 — the partial indexes |
 | G4 | **Secondary lookups**: dedup by message id, DLQ scans, expiry by deadline | §§6–7 |
