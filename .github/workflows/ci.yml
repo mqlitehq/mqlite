@@ -153,10 +153,10 @@ jobs:
         run: docker build --platform linux/amd64 -t mqlite:ci .
       - name: run + /healthz smoke
         run: |
-          docker run -d --name mq -p 8080:8080 mqlite:ci
+          docker run -d --name mq -p 6754:6754 mqlite:ci
           ok=""
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:8080/healthz >/dev/null; then ok=1; break; fi
+            if curl -fsS http://localhost:6754/healthz >/dev/null; then ok=1; break; fi
             sleep 1
           done
           if [ -z "$ok" ]; then echo "healthz never came up"; docker logs mq; exit 1; fi

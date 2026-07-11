@@ -32,11 +32,11 @@ Everything is read from the environment — the DB string is never compiled in.
 > `Authorization: Bearer <token>`.
 
 > **Admin console:** the broker bakes a static web console into the binary and serves
-> it at `/ui` (e.g. `http://localhost:8080/ui`) — no separate process or Node runtime.
+> it at `/ui` (e.g. `http://localhost:6754/ui`) — no separate process or Node runtime.
 > Paste your broker URL + token in the console to drive every queue operation. Set
 > `MQLITE_UI=off` to disable it for headless deployments.
 
-The broker listens on `:8080` by default (`mqlite serve --addr :8080`). Full endpoint
+The broker listens on `:6754` by default (`mqlite serve --addr :6754`). Full endpoint
 and error reference: [api-reference.md](api-reference.md).
 
 ## Docker / GHCR
@@ -44,16 +44,16 @@ and error reference: [api-reference.md](api-reference.md).
 The published image is multi-arch (amd64 + arm64):
 
 ```bash
-docker run -d --name mqlite -p 8080:8080 \
+docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
-  ghcr.io/mqlitehq/mqlite:0.2.0
+  ghcr.io/mqlitehq/mqlite:0.3.0
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin a version tag (`:0.2.0`) in production; `:0.2` tracks patches, `:latest` the newest release.
-- Verify: `curl http://localhost:8080/` (discovery card) and `/healthz`.
+- Pin a version tag (`:0.3.0`) in production; `:0.3` tracks patches, `:latest` the newest release. Images `>= 0.3.0` listen on `6754`.
+- Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`.
 
 ## Fly.io (minimal cost)
 
@@ -65,7 +65,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.2.0"   # use the public image; no build on Fly
+  image = "ghcr.io/mqlitehq/mqlite:0.3.0"   # use the public image; no build on Fly
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -75,7 +75,7 @@ primary_region = "sin"            # pick a region near you
   destination = "/data"
 
 [http_service]
-  internal_port        = 8080
+  internal_port        = 6754
   force_https          = true
   auto_stop_machines   = "stop"             # fully stop when idle (cheapest)
   auto_start_machines  = true               # start on the next request
@@ -116,7 +116,7 @@ Description=mqlite broker
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/mqlite serve --addr :8080
+ExecStart=/usr/local/bin/mqlite serve --addr :6754
 Environment=MQLITE_DB=file:/var/lib/mqlite/mq.db
 Environment=MQLITE_TOKENS=mqk_prod_CHANGEME
 Environment=MQLITE_SYNC=NORMAL
@@ -130,7 +130,7 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl daemon-reload && systemctl enable --now mqlite
-curl http://localhost:8080/healthz
+curl http://localhost:6754/healthz
 ```
 
 Put a TLS-terminating reverse proxy (Caddy/nginx) in front for anything public.

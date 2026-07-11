@@ -18,7 +18,7 @@ it with the broker endpoint + token:
 
 | Env | Default | Meaning |
 |---|---|---|
-| `MQLITE_ENDPOINT` | `http://127.0.0.1:8080` | the broker base URL |
+| `MQLITE_ENDPOINT` | `http://127.0.0.1:6754` | the broker base URL |
 | `MQLITE_TOKEN` | — | Bearer token (one of the broker's `MQLITE_TOKENS`) |
 
 ## Connect an agent host
