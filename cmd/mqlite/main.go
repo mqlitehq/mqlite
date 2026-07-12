@@ -187,6 +187,12 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 		positionals = append(positionals, fs.Arg(0))
 		args = fs.Args()[1:]
 	}
+	// Validate --output for the commands that registered it (via newFlags), so a typo like
+	// `--output jsno` is a loud usage error, not a silent fall-through to text (serve does
+	// not register it, so it is skipped).
+	if fs.Lookup("output") != nil && gOutput != "text" && gOutput != "json" {
+		return nil, fmt.Errorf("invalid --output %q: want text or json", gOutput)
+	}
 	return positionals, nil
 }
 
@@ -628,23 +634,24 @@ func cmdReceive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Auto-Complete each message PROMPTLY — before rendering the batch. Rendering a large
+	// batch (up to 256 × 1 MiB) to slow stdout could otherwise let the reaper expire the
+	// earlier locks mid-print and force a redelivery. --no-ack/--delete leave nothing to
+	// settle. A settlement failure must exit nonzero (MQLITE-88).
+	var settleErrs []error
+	if !*del && !*noAck {
+		for _, m := range msgs {
+			if err := m.Complete(ctx); err != nil {
+				fmt.Fprintln(os.Stderr, "  warn: complete:", err)
+				settleErrs = append(settleErrs, err)
+			}
+		}
+	}
 	// Show the lock token only when the message stays locked (--no-ack), so it can be
 	// settled in a later invocation (complete/abandon/reject/defer/renew <queue> <seq>
-	// <token>). On auto-complete or --delete there is nothing left to settle.
+	// <token>).
 	if err := printMsgs(msgs, *noAck && !*del); err != nil {
 		return err
-	}
-	if *del || *noAck {
-		return nil
-	}
-	// Auto-Complete each; a settlement failure must exit nonzero — otherwise automation
-	// reads exit 0 and assumes the messages settled when they will redeliver (MQLITE-88).
-	var settleErrs []error
-	for _, m := range msgs {
-		if err := m.Complete(ctx); err != nil {
-			fmt.Fprintln(os.Stderr, "  warn: complete:", err)
-			settleErrs = append(settleErrs, err)
-		}
 	}
 	if len(settleErrs) > 0 {
 		return fmt.Errorf("%d of %d message(s) failed to settle (see warnings above): %w",

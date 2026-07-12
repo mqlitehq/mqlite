@@ -287,7 +287,13 @@ func (e *Embedded) Status(ctx context.Context) (StatusInfo, error) {
 		SchemaVersion: s.SchemaVersion, PingMs: s.PingMs, SizeBytes: s.SizeBytes,
 	}
 	if qs, err := e.eng.ListQueues(ctx); err == nil {
-		info.Queues = len(qs)
+		// Exclude subscription backing queues from the queue count so embedded status
+		// matches what the broker's /status reports (queues vs subscriptions are disjoint).
+		for _, q := range qs {
+			if q.Kind != "subscription" {
+				info.Queues++
+			}
+		}
 	}
 	if ss, err := e.eng.ListSubscriptions(ctx); err == nil {
 		info.Subscriptions = len(ss)
@@ -307,6 +313,15 @@ func (e *Embedded) TestFilter(ctx context.Context, expr string, sample *OutMessa
 	if sample != nil {
 		s := sample.toEngine()
 		es = &s
+	}
+	// Match the broker's /TestFilter defaulting so time-based expressions agree in both
+	// modes: a zero enqueued_at means "now"; a zero visible_at means "= enqueued_at".
+	now := time.Now().UnixMilli()
+	if enqueuedAtMs == 0 {
+		enqueuedAtMs = now
+	}
+	if visibleAtMs == 0 {
+		visibleAtMs = enqueuedAtMs
 	}
 	return engine.TestFilter(expr, es, enqueuedAtMs, visibleAtMs), nil
 }

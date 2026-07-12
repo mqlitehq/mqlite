@@ -360,18 +360,27 @@ func cmdTestFilter(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if jsonOut() {
-		return emitJSON(res)
+	// The outcome error is the same in both output modes, so a script's exit status does
+	// not change just because it asked for JSON.
+	var outErr error
+	switch {
+	case !res.Valid:
+		outErr = fmt.Errorf("invalid filter: %s", res.Error)
+	case res.Ran && res.Error != "":
+		outErr = fmt.Errorf("filter errored on the sample: %s", res.Error)
 	}
-	if !res.Valid {
-		return fmt.Errorf("invalid filter: %s", res.Error)
+	if jsonOut() {
+		if err := emitJSON(res); err != nil {
+			return err
+		}
+		return outErr
+	}
+	if outErr != nil {
+		return outErr
 	}
 	if !res.Ran {
 		fmt.Println("ok: expression is valid (no sample given)")
 		return nil
-	}
-	if res.Error != "" {
-		return fmt.Errorf("filter errored on the sample: %s", res.Error)
 	}
 	fmt.Printf("ok: valid; sample %s\n", map[bool]string{true: "MATCHED", false: "did NOT match"}[res.Matched])
 	return nil

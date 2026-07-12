@@ -210,6 +210,12 @@ func TestParityCommands(t *testing.T) {
 	ok("create-queue", cmdCreateQueue(ctx, []string{"orders"}))
 	ok("subscribe", cmdCreateSubscription(ctx, []string{"events", "subA", "--expr", `subject == "x"`}))
 
+	// Embedded status must exclude subscription backing queues from the queue count, so it
+	// agrees with what the broker's /status reports for the same DB (queues=1, subs=1).
+	if s := embStatus(t, ctx); s.Queues != 1 || s.Subscriptions != 1 {
+		t.Errorf("embedded status counts = queues %d subs %d, want 1/1 (backing queue excluded)", s.Queues, s.Subscriptions)
+	}
+
 	// status / list / list-subscriptions / test-filter (both branches).
 	ok("status", cmdStatus(ctx, nil))
 	ok("list-subs", cmdListSubscriptions(ctx, nil))
@@ -229,13 +235,20 @@ func TestParityCommands(t *testing.T) {
 	dSeq := apiDeferOne(t, ctx, "orders")
 	ok("receive-deferred", cmdReceiveDeferred(ctx, []string{"orders", "--seq", strconv.FormatInt(dSeq, 10)}))
 
-	// --output json branch on a few commands.
-	gOutput = "json"
-	ok("list-json", cmdList(ctx, nil))
-	ok("metrics-json", cmdMetrics(ctx, []string{"orders"}))
-	ok("status-json", cmdStatus(ctx, nil))
-	ok("peek-json", cmdPeek(ctx, []string{"orders"}))
-	gOutput = "text"
+	// --output json branch — pass the flag so newFlags actually sets gOutput (assigning it
+	// directly would be overwritten by StringVar's "text" default on the next Parse).
+	ok("list-json", cmdList(ctx, []string{"--output", "json"}))
+	ok("metrics-json", cmdMetrics(ctx, []string{"orders", "--output", "json"}))
+	ok("status-json", cmdStatus(ctx, []string{"--output", "json"}))
+	ok("peek-json", cmdPeek(ctx, []string{"orders", "--output", "json"}))
+	// test-filter in json mode must still exit nonzero on an invalid expression.
+	if err := cmdTestFilter(ctx, []string{`subject ==`, "--output", "json"}); err == nil {
+		t.Error("test-filter --output json with a bad expr should still error")
+	}
+	// an unsupported --output value is a usage error, not a silent fall-through.
+	if err := cmdList(ctx, []string{"--output", "jsno"}); err == nil {
+		t.Error("invalid --output should be a usage error")
+	}
 
 	// settlement wrapper: a bogus token fails (embedded reclaims the lock) but exercises
 	// cmdSettle end to end; usage errors must not panic.
@@ -255,6 +268,21 @@ func TestParityCommands(t *testing.T) {
 			t.Errorf("%s: expected a usage error, got nil", name)
 		}
 	}
+}
+
+// embStatus reads the embedded backend status (open+close so no lock is held after).
+func embStatus(t *testing.T, ctx context.Context) mqlite.StatusInfo {
+	t.Helper()
+	c, err := dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	s, err := c.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
 
 // apiSchedule schedules a message and returns its seq, opening+closing the embedded
