@@ -112,6 +112,14 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   `Message.LockToken()`, `Client/Embedded.Message(queue, seq, token)`, `Status()`,
   `ListSubscriptions()`, `TestFilter()`. (Settling across separate invocations needs a running
   broker; embedded mode reclaims orphaned locks each open.)
+- **CLI safety hardening** (MQLITE-93, follow-up review): `receive` now renders output
+  **before** settling and settles the whole batch with a single `CompleteBatch` — a closed
+  stdout / broken pipe exits non-zero and leaves the messages locked for redelivery instead
+  of silently acknowledging a message the caller never received. Negative `purge-dlq`/`redrive`
+  limits are rejected (they previously meant "no limit") at the engine boundary, so raw HTTP
+  is covered too, and an unbounded `purge-dlq` now requires an explicit `--all`. The `--`
+  terminator is honored (a message body keeps its flag-looking words). `--token=` sends no
+  token, and `--endpoint` to a different host no longer forwards an ambient `MQLITE_TOKEN`.
 
 ## v0.2.0 — 2026-07-11
 
