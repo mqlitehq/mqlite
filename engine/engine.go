@@ -498,6 +498,9 @@ func (e *Engine) Send(ctx context.Context, queue string, ms ...OutMessage) ([]in
 // As with SendOne, a dedup conflict surfaces as ErrDedupConflict while a publish that
 // no subscription accepts is a no-op returning (0, nil).
 func (e *Engine) Schedule(ctx context.Context, queue string, m OutMessage, atMs int64) (int64, error) {
+	if err := validateScheduleTime(atMs, e.now()); err != nil {
+		return 0, err
+	}
 	seqs, conflicts, err := e.sendTracked(ctx, queue, []OutMessage{m}, atMs, StateScheduled)
 	if err != nil {
 		return 0, err
@@ -518,7 +521,21 @@ func (e *Engine) ScheduleBatch(ctx context.Context, queue string, ms []OutMessag
 	if len(ms) == 0 {
 		return nil, nil
 	}
+	if err := validateScheduleTime(atMs, e.now()); err != nil {
+		return nil, err
+	}
 	return e.send(ctx, queue, ms, atMs, StateScheduled)
+}
+
+// validateScheduleTime enforces future delivery against the ENGINE (broker) clock, so a
+// schedule accepted/rejected decision doesn't depend on the caller's clock (a CLI on a
+// skewed host would otherwise reject a broker-future time or accept a broker-past one —
+// review 2026-07-12 P2-1 / codex). `schedule` is future delivery; use Send for immediate.
+func validateScheduleTime(atMs, nowMs int64) error {
+	if atMs <= nowMs {
+		return fmt.Errorf("%w: scheduled time must be in the future (use Send for immediate delivery)", ErrInvalidArgument)
+	}
+	return nil
 }
 
 // Cancel deletes a not-yet-activated scheduled message by seq.

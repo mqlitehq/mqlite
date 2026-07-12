@@ -199,9 +199,9 @@ func cmdSchedule(ctx context.Context, args []string) error {
 }
 
 // parseWhen accepts an absolute RFC3339 timestamp or a duration from now, and requires the
-// result to be in the future — `schedule` is future-delivery, and rejecting a past time is
-// consistent across embedded and remote (a past schedule otherwise activates immediately,
-// so its state read back differs by timing between modes — review 2026-07-12 P2-1).
+// result to be in the future — a clear CLI-side preflight for the common "typed a past date"
+// mistake. The authoritative future check is enforced by the broker against ITS clock
+// (engine.validateScheduleTime), so a skewed CLI host can't decide it (review 2026-07-12 P2-1).
 func parseWhen(s string) (time.Time, error) {
 	var when time.Time
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
