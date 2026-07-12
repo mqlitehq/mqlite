@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mqlitehq/mqlite"
 	"github.com/mqlitehq/mqlite/internal/defaults"
@@ -185,5 +187,145 @@ func deadLetterOne(t *testing.T, ctx context.Context, queue string) {
 	}
 	if err := msgs[0].Reject(ctx, mqlite.RejectOpts{Reason: "test"}); err != nil {
 		t.Fatalf("reject (dead-letter): %v", err)
+	}
+}
+
+// TestParityCommands exercises the API-parity commands added in MQLITE-92 (schedule,
+// cancel, receive-deferred, status, list-subscriptions, test-filter, --output json) on the
+// embedded path. Settlement across separate invocations is intentionally NOT covered here
+// — embedded Open reclaims orphaned locks each time, so settle-later is a broker-only
+// contract, tested against a live broker in TestRemoteSettleByToken.
+func TestParityCommands(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	t.Cleanup(func() { gOutput = "text" }) // package var — don't leak json to other tests
+
+	ok := func(name string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	ok("create-queue", cmdCreateQueue(ctx, []string{"orders"}))
+	ok("subscribe", cmdCreateSubscription(ctx, []string{"events", "subA", "--expr", `subject == "x"`}))
+
+	// status / list / list-subscriptions / test-filter (both branches).
+	ok("status", cmdStatus(ctx, nil))
+	ok("list-subs", cmdListSubscriptions(ctx, nil))
+	ok("test-filter-valid", cmdTestFilter(ctx, []string{`subject == "x"`}))
+	ok("test-filter-sample", cmdTestFilter(ctx, []string{`subject == "x"`, "--subject", "x"}))
+	if err := cmdTestFilter(ctx, []string{`subject ==`}); err == nil {
+		t.Error("test-filter with a bad expression must error")
+	}
+
+	// schedule then cancel by the seq the API hands back. Each api call opens+closes the
+	// embedded engine on its own — a second open while one is held would ErrDBLocked.
+	sSeq := apiSchedule(t, ctx, "orders")
+	ok("schedule", cmdSchedule(ctx, []string{"orders", "later", "--at", "30m"}))
+	ok("cancel", cmdCancel(ctx, []string{"orders", strconv.FormatInt(sSeq, 10)}))
+
+	// receive-deferred: send + receive + defer (persists as deferred), then fetch it by seq.
+	dSeq := apiDeferOne(t, ctx, "orders")
+	ok("receive-deferred", cmdReceiveDeferred(ctx, []string{"orders", "--seq", strconv.FormatInt(dSeq, 10)}))
+
+	// --output json branch on a few commands.
+	gOutput = "json"
+	ok("list-json", cmdList(ctx, nil))
+	ok("metrics-json", cmdMetrics(ctx, []string{"orders"}))
+	ok("status-json", cmdStatus(ctx, nil))
+	ok("peek-json", cmdPeek(ctx, []string{"orders"}))
+	gOutput = "text"
+
+	// settlement wrapper: a bogus token fails (embedded reclaims the lock) but exercises
+	// cmdSettle end to end; usage errors must not panic.
+	if err := cmdSettle(ctx, "complete", []string{"orders", "1", "no-such-token"}); err == nil {
+		t.Error("complete with a bogus token should error")
+	}
+	for name, err := range map[string]error{
+		"schedule/none":  cmdSchedule(ctx, nil),
+		"schedule/no-at": cmdSchedule(ctx, []string{"orders", "body"}),
+		"cancel/none":    cmdCancel(ctx, []string{"orders"}),
+		"cancel/badseq":  cmdCancel(ctx, []string{"orders", "notnum"}),
+		"complete/short": cmdSettle(ctx, "complete", []string{"orders", "1"}),
+		"rdeferred/none": cmdReceiveDeferred(ctx, []string{"orders"}),
+		"testfilter/non": cmdTestFilter(ctx, nil),
+	} {
+		if err == nil {
+			t.Errorf("%s: expected a usage error, got nil", name)
+		}
+	}
+}
+
+// apiSchedule schedules a message and returns its seq, opening+closing the embedded
+// engine so no lock is held when the CLI command dials next.
+func apiSchedule(t *testing.T, ctx context.Context, queue string) int64 {
+	t.Helper()
+	c, err := dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	seq, err := c.SendOne(ctx, queue, mqlite.OutMessage{Body: []byte("s")}, mqlite.SendOpts{At: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// apiDeferOne sends a message, receives it, and Defers it (persists as deferred), then
+// returns its seq — again opening+closing so the CLI can dial afterward.
+func apiDeferOne(t *testing.T, ctx context.Context, queue string) int64 {
+	t.Helper()
+	c, err := dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	seq, err := c.SendOne(ctx, queue, mqlite.OutMessage{Body: []byte("d")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := c.Receive(ctx, queue, mqlite.RecvOpts{Max: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		if m.SequenceNumber == seq {
+			if err := m.Defer(ctx); err != nil {
+				t.Fatal(err)
+			}
+			return seq
+		}
+	}
+	t.Fatalf("seq %d not received to defer", seq)
+	return 0
+}
+
+// TestCLIParseHelpers covers the small argument parsers.
+func TestCLIParseHelpers(t *testing.T) {
+	if _, err := parseWhen("2026-01-02T15:04:05Z"); err != nil {
+		t.Errorf("RFC3339: %v", err)
+	}
+	if w, err := parseWhen("30m"); err != nil || w.IsZero() {
+		t.Errorf("duration: %v", err)
+	}
+	if _, err := parseWhen("nonsense"); err == nil {
+		t.Error("garbage --at must error")
+	}
+	if seqs, err := parseSeqCSV(" 42, 57 ,8"); err != nil || len(seqs) != 3 || seqs[1] != 57 {
+		t.Errorf("parseSeqCSV = %v, %v", seqs, err)
+	}
+	if _, err := parseSeqCSV("42,x"); err == nil {
+		t.Error("non-numeric seq must error")
+	}
+	if props, err := parseProps("a=1,b=2"); err != nil || props["a"] != "1" || props["b"] != "2" {
+		t.Errorf("parseProps = %v, %v", props, err)
+	}
+	if _, err := parseProps("bad"); err == nil {
+		t.Error("prop without = must error")
+	}
+	if props, _ := parseProps(""); props != nil {
+		t.Error("empty --prop should be nil")
 	}
 }

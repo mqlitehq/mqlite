@@ -387,9 +387,9 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 
 // SubscriptionInfo describes one topic→subscription mapping and its filter.
 type SubscriptionInfo struct {
-	Topic string
-	Name  string
-	Expr  string // the filter expression; "" = match all
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"` // the filter expression; "" = match all
 }
 
 // ListSubscriptions returns every subscription with its topic and filter expression,

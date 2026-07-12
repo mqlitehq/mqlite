@@ -379,10 +379,10 @@ func parseDuration(s string) (time.Duration, error) {
 // FilterTestResult is a dry-run of a filter expression (TestFilter): whether it
 // compiles and, if a sample message is given, whether it would match.
 type FilterTestResult struct {
-	Valid   bool   // the expression compiled
-	Error   string // compile error, or a runtime/eval error when Ran
-	Ran     bool   // a sample message was evaluated
-	Matched bool   // the sample matched (meaningful only when Ran && Valid && Error == "")
+	Valid   bool   `json:"valid"`           // the expression compiled
+	Error   string `json:"error,omitempty"` // compile error, or a runtime/eval error when Ran
+	Ran     bool   `json:"ran"`             // a sample message was evaluated
+	Matched bool   `json:"matched"`         // the sample matched (meaningful only when Ran && Valid && Error == "")
 }
 
 // TestFilter compiles a filter expression and, when sample != nil, evaluates it against

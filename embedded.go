@@ -171,6 +171,13 @@ func (e *Embedded) Cancel(ctx context.Context, queue string, seq int64) error {
 // CompleteBatch completes many received messages in one transaction (mirrors the
 // remote Client method; for the in-process engine there is no round-trip to save,
 // but it keeps the API symmetric and settles atomically).
+// Message rehydrates a settleable handle for a message you already received but did not
+// settle (the embedded twin of Client.Message). Pass the queue, its SequenceNumber, and
+// the LockToken() from that receive; the returned *Message settles through this engine.
+func (e *Embedded) Message(queue string, seq int64, lockToken string) *Message {
+	return &Message{queue: queue, SequenceNumber: seq, lockToken: lockToken, s: e}
+}
+
 func (e *Embedded) CompleteBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]engine.SettleItem, len(msgs))
 	for i, m := range msgs {
@@ -271,6 +278,39 @@ func (e *Embedded) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (
 }
 
 // Receiver returns a stateful receive loop bound to the embedded engine.
+// Status returns a desensitized snapshot of the local backend (the embedded twin of
+// Client.Status). Version is empty (no broker); queue/subscription counts are live.
+func (e *Embedded) Status(ctx context.Context) (StatusInfo, error) {
+	s := e.eng.Status(ctx)
+	info := StatusInfo{
+		Backend: s.Backend, Remote: s.Remote, Location: s.Location,
+		SchemaVersion: s.SchemaVersion, PingMs: s.PingMs, SizeBytes: s.SizeBytes,
+	}
+	if qs, err := e.eng.ListQueues(ctx); err == nil {
+		info.Queues = len(qs)
+	}
+	if ss, err := e.eng.ListSubscriptions(ctx); err == nil {
+		info.Subscriptions = len(ss)
+	}
+	return info, nil
+}
+
+// ListSubscriptions returns every subscription with its topic and filter expression.
+func (e *Embedded) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
+	return e.eng.ListSubscriptions(ctx)
+}
+
+// TestFilter dry-runs a subscription filter expression against an optional sample message
+// (nothing is enqueued) — the embedded twin of Client.TestFilter.
+func (e *Embedded) TestFilter(ctx context.Context, expr string, sample *OutMessage, enqueuedAtMs, visibleAtMs int64) (FilterTestResult, error) {
+	var es *engine.OutMessage
+	if sample != nil {
+		s := sample.toEngine()
+		es = &s
+	}
+	return engine.TestFilter(expr, es, enqueuedAtMs, visibleAtMs), nil
+}
+
 func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 	return newReceiver(e, queue, opts)
 }

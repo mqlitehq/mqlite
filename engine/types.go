@@ -142,24 +142,24 @@ type PeekedMessage struct {
 
 // Metrics mirrors pgmq-style queue counters (§7.3 Stats).
 type Metrics struct {
-	Queue              string
-	Active             int64
-	Locked             int64
-	Deferred           int64
-	Scheduled          int64
-	DeadLettered       int64
-	Total              int64
-	OldestMessageAgeMs int64
+	Queue              string `json:"queue"`
+	Active             int64  `json:"active"`
+	Locked             int64  `json:"locked"`
+	Deferred           int64  `json:"deferred"`
+	Scheduled          int64  `json:"scheduled"`
+	DeadLettered       int64  `json:"dead_lettered"`
+	Total              int64  `json:"total"`
+	OldestMessageAgeMs int64  `json:"oldest_message_age_ms"`
 }
 
 // QueueInfo describes a queue for listing.
 type QueueInfo struct {
-	Name             string
-	Kind             string
-	LockDurationMs   int64
-	MaxDeliveryCount int
-	DefaultTTLMs     int64
-	DedupWindowMs    int64
+	Name             string `json:"name"`
+	Kind             string `json:"kind"`
+	LockDurationMs   int64  `json:"lock_duration_ms"`
+	MaxDeliveryCount int    `json:"max_delivery_count"`
+	DefaultTTLMs     int64  `json:"default_ttl_ms"`
+	DedupWindowMs    int64  `json:"dedup_window_ms"`
 }
 
 // ReceiveOptions controls a Receive call.
