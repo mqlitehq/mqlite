@@ -57,16 +57,22 @@ token **except** the open ones below. A missing/invalid token → `401 unauthent
 
 ```bash
 curl https://<host>/                 # what is this? (no auth)
-# → {"name":"mqlite","version":"0.2.0","description":"...","status":"ok",
+# → {"name":"mqlite","version":"0.3.0","description":"...","status":"ok",
 #    "auth":"bearer","docs":"https://github.com/mqlitehq/mqlite",
-#    "endpoints":["/mqlite.v1.QueueService/Send", ...]}
+#    "endpoints":["/mqlite.v1.QueueService/Send", ...every RPC route...],
+#    "health":"/healthz","metrics":"/metrics"}
 curl https://<host>/healthz          # ok
 ```
+
+The card's `auth` is `"bearer"` when RPCs require a token or `"none"` when auth is off,
+so an agent can branch on it directly. `endpoints` is the **complete** list of RPC route
+paths (it always matches what the broker serves — a pinned contract), while `health` and
+`metrics` are the well-known non-RPC routes.
 
 `/ui` serves the **embedded admin console** (a static single-page app baked into the
 binary) and is auth-exempt — the page itself loads without a token; its API calls
 carry one you paste in. It's on by default; set `MQLITE_UI=off` to run headless, in
-which case `/ui` 404s and is dropped from the discovery card's `endpoints` list.
+which case `/ui` 404s and the card's optional `ui` field is omitted.
 
 ## Other endpoints
 

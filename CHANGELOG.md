@@ -81,6 +81,12 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   queue name or an unknown `kind`/`ordering_mode` enum now returns `400 invalid_argument`
   (`mqlite.ErrInvalidArgument`) instead of leaking an opaque `500` from a SQLite CHECK.
   Agent-facing APIs fail loud and predictably.
+- **The `/` discovery card now matches its documented, agent-facing shape** (MQLITE-87):
+  `auth` is a string — `"bearer"` when RPCs need a token, `"none"` when auth is off (was a
+  bool), and `endpoints` is the **complete array of every RPC route path** the broker
+  serves (was a small labelled route-family map), with `health`/`metrics`/`ui` as separate
+  well-known fields. The catalog is generated from the actual route registration and pinned
+  by a golden test, so it can never silently drift from what's served.
 
 ## v0.2.0 — 2026-07-11
 

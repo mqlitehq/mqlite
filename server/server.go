@@ -36,6 +36,10 @@ type Server struct {
 	MaxBodyBytes int64
 	rpcLat       *rpcLatency // per-RPC latency histogram, exposed at /metrics (see rpchist.go)
 	started      time.Time
+	// rpcPaths is every RPC route, collected as routes() registers them, so the "/"
+	// discovery card enumerates exactly what is actually served — it can't drift from
+	// registration. Pinned by TestDiscoveryCardPinned (MQLITE-87).
+	rpcPaths []string
 }
 
 // New builds a Server. tokens is the set of accepted Bearer tokens; pass nil/empty
@@ -57,7 +61,10 @@ func New(eng *engine.Engine, tokens []string) *Server {
 func (s *Server) Handler() http.Handler { return s.cors(s.logging(s.auth(s.observe(s.mux)))) }
 
 func (s *Server) routes() {
-	h := func(path string, fn http.HandlerFunc) { s.mux.HandleFunc(path, s.postOnly(fn)) }
+	h := func(path string, fn http.HandlerFunc) {
+		s.mux.HandleFunc(path, s.postOnly(fn))
+		s.rpcPaths = append(s.rpcPaths, path) // feeds the "/" discovery catalog
+	}
 	h(wire.PathSend, s.handleSend)
 	h(wire.PathReceive, s.handleReceive)
 	h(wire.PathComplete, s.handleComplete)
@@ -113,23 +120,25 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if version == "" {
 		version = "dev"
 	}
-	endpoints := map[string]string{
-		"health":  "GET /healthz",
-		"metrics": "GET /metrics (Bearer)",
-		"rpc":     "POST /mqlite.v1.{Service}/{Method} (Bearer)",
+	auth := "none" // auth off -> RPCs are open (dev/loopback)
+	if len(s.tokens) > 0 {
+		auth = "bearer"
+	}
+	card := wire.DiscoveryCard{
+		Name:        "mqlite",
+		Description: "Lightweight SQLite-backed message queue with Azure Service Bus-style semantics.",
+		Version:     version,
+		Status:      "ok",
+		Auth:        auth,
+		Docs:        "https://github.com/mqlitehq/mqlite",
+		Endpoints:   s.rpcPaths, // the complete RPC catalog, exactly as registered
+		Health:      "/healthz",
+		Metrics:     "/metrics",
 	}
 	if s.UI {
-		endpoints["ui"] = "GET /ui"
+		card.UI = "/ui"
 	}
-	writeJSON(w, map[string]any{
-		"name":        "mqlite",
-		"description": "Lightweight SQLite-backed message queue with Azure Service Bus-style semantics.",
-		"version":     version,
-		"status":      "ok",
-		"auth":        len(s.tokens) > 0, // true -> RPCs need a Bearer token
-		"docs":        "https://github.com/mqlitehq/mqlite",
-		"endpoints":   endpoints,
-	})
+	writeJSON(w, card)
 }
 
 // handleMetrics exposes per-queue counters in Prometheus text format (MQLITE-5).

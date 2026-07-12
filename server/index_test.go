@@ -39,14 +39,15 @@ func TestIndexDiscovery(t *testing.T) {
 		t.Fatalf("content-type: want application/json, got %q", ct)
 	}
 	var card struct {
-		Name, Version, Status string
-		Auth                  bool
+		Name, Version, Status, Auth string
 	}
 	body, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(body, &card); err != nil {
 		t.Fatalf("decode: %v (%s)", err, body)
 	}
-	if card.Name != "mqlite" || card.Status != "ok" || card.Version != "9.9.9" || !card.Auth {
+	// auth is a string ("bearer" when tokens are set) so an agent can match it; the
+	// exact card shape + full endpoint catalog are pinned in TestDiscoveryCardPinned.
+	if card.Name != "mqlite" || card.Status != "ok" || card.Version != "9.9.9" || card.Auth != "bearer" {
 		t.Fatalf("unexpected index card: %+v (%s)", card, body)
 	}
 }
