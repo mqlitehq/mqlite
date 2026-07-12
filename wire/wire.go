@@ -244,6 +244,24 @@ type StatusResponse struct {
 	Auth          bool   `json:"auth"`
 }
 
+// DiscoveryCard is the open, unauthenticated "/" response: a machine-readable
+// description of the broker for humans and agents. Endpoints is the complete catalog
+// of RPC route paths (agents iterate it); Auth is "bearer" when RPCs need a token or
+// "none" when auth is off. The exact shape is pinned by the server's
+// TestDiscoveryCardPinned so any drift is loud (MQLITE-87).
+type DiscoveryCard struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Version     string   `json:"version"`
+	Status      string   `json:"status"`
+	Auth        string   `json:"auth"`
+	Docs        string   `json:"docs"`
+	Endpoints   []string `json:"endpoints"`
+	Health      string   `json:"health"`
+	Metrics     string   `json:"metrics"`
+	UI          string   `json:"ui,omitempty"` // present only when the console is enabled
+}
+
 type Empty struct{}
 
 // ErrorBody is the Connect-style JSON error envelope.
