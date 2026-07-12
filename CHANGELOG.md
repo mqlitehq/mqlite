@@ -41,6 +41,9 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   checkpoint → `incremental_vacuum` (to completion) → checkpoint sequence, so freed pages are
   returned to the OS and the file shrinks. Previously it freed a single page and never shrank
   the file while still reporting success.
+- **A stdin message body over 16 MiB now errors instead of being silently truncated**
+  (MQLITE-79): `mqlite send ... -` reads one byte past the cap and fails loud; use `--file`
+  (uncapped) for larger payloads. The broker's own `413 message_too_large` remains the ceiling.
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container
