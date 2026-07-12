@@ -47,6 +47,10 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 - **The MCP server gained `renew`, `defer`, and `receive_deferred` tools** (MQLITE-82): an
   agent can now hold a lock across long work and use the deferred-message lifecycle over MCP,
   not only the fallback raw-HTTP path (14 tools total).
+- **Peek and Receive responses are bounded by a total body-byte budget** (MQLITE-80): a legal
+  1000×1 MiB Peek no longer materializes ~1.3 GiB and OOMs a small VM. Both stop after the
+  message that crosses a 32 MiB budget; Peek pages past it with `from_seq`, Receive locks only
+  the messages it returns, and a single over-budget message is still delivered.
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container

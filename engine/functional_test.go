@@ -541,6 +541,36 @@ func TestPeekRespectsByteBudget(t *testing.T) {
 	}
 }
 
+// A single message larger than the whole budget must still be delivered — Receive returns
+// and locks it, Peek returns it — otherwise it would be stuck forever. Golden-pins the
+// append-then-break ordering (a refactor to "check budget before claiming" would strand it).
+func TestSingleOverBudgetMessageStillDelivered(t *testing.T) {
+	old := maxResponseBytes
+	maxResponseBytes = 1024
+	defer func() { maxResponseBytes = old }()
+
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: make([]byte, 2048)}); err != nil { // one body > budget
+		t.Fatal(err)
+	}
+	pk, err := e.Peek(ctx, "q", PeekOptions{Max: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pk) != 1 {
+		t.Fatalf("Peek must return the single oversized message; got %d", len(pk))
+	}
+	got, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].LockToken == "" {
+		t.Fatalf("Receive must return and lock the single oversized message; got %+v", got)
+	}
+}
+
 // RenewLock extends the lease so the reaper does not reclaim mid-processing.
 func TestRenewLockExtendsLease(t *testing.T) {
 	ctx := context.Background()
