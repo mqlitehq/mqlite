@@ -147,8 +147,11 @@ func TestToolSchemaForwardConsistency(t *testing.T) {
 		base := fwdBody(tl, map[string]any{})
 		for key, spec := range props {
 			var sentinel any = "SENTINEL-" + key
-			if typ, _ := spec.(map[string]any)["type"].(string); typ == "integer" {
+			switch typ, _ := spec.(map[string]any)["type"].(string); typ {
+			case "integer":
 				sentinel = float64(987654) // JSON numbers decode to float64 in args
+			case "array":
+				sentinel = []any{float64(987654)} // JSON arrays decode to []any
 			}
 			if fwdBody(tl, map[string]any{key: sentinel}) == base {
 				t.Errorf("%s: schema property %q has no effect on the forwarded request — "+
@@ -257,7 +260,8 @@ var goldenWireShapes = map[string][]string{
 		"messages[].seq_number", "messages[].state", "messages[].subject",
 		"messages[].visible_at_ms", "queue", "scheduled_enqueue_time_ms", "ttl_ms",
 	},
-	"wire.ReceiveRequest": {"max_messages", "queue", "receive_attempt_id", "receive_mode", "wait_time_ms"},
+	"wire.ReceiveRequest":         {"max_messages", "queue", "receive_attempt_id", "receive_mode", "wait_time_ms"},
+	"wire.ReceiveDeferredRequest": {"queue", "seq_numbers"},
 	"wire.SettleRequest": {
 		"dead_letter_description", "dead_letter_reason", "delay_ms", "lock_token", "queue", "seq_number",
 	},
