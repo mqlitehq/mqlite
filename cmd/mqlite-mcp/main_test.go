@@ -19,14 +19,21 @@ import (
 // TestResolveEndpoint pins the MCP endpoint fallback to the shared loopback default and the
 // trailing-slash trim (MQLITE-84), without any network call.
 func TestResolveEndpoint(t *testing.T) {
-	if got := resolveEndpoint(""); got != defaults.BrokerLoopbackEndpoint {
-		t.Errorf("empty -> %q, want %q", got, defaults.BrokerLoopbackEndpoint)
+	if got, err := resolveEndpoint(""); err != nil || got != defaults.BrokerLoopbackEndpoint {
+		t.Errorf("empty -> %q err %v, want %q", got, err, defaults.BrokerLoopbackEndpoint)
 	}
-	if got := resolveEndpoint("http://x:1/"); got != "http://x:1" {
-		t.Errorf("trailing slash -> %q, want http://x:1", got)
+	if got, err := resolveEndpoint("http://x:1/"); err != nil || got != "http://x:1" {
+		t.Errorf("trailing slash -> %q err %v, want http://x:1", got, err)
 	}
-	if got := resolveEndpoint("https://q.example"); got != "https://q.example" {
-		t.Errorf("passthrough -> %q, want https://q.example", got)
+	if got, err := resolveEndpoint("https://q.example"); err != nil || got != "https://q.example" {
+		t.Errorf("passthrough -> %q err %v, want https://q.example", got, err)
+	}
+	// A malformed endpoint is rejected here (startup), not deferred to a nil-request deref on
+	// the first tool call (MQLITE-81).
+	for _, bad := range []string{"://bad", "notaurl", "ftp://host", "http://"} {
+		if _, err := resolveEndpoint(bad); err == nil {
+			t.Errorf("resolveEndpoint(%q) should reject a malformed endpoint", bad)
+		}
 	}
 }
 
