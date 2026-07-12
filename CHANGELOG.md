@@ -87,6 +87,22 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   serves (was a small labelled route-family map), with `health`/`metrics`/`ui` as separate
   well-known fields. The catalog is generated from the actual route registration and pinned
   by a golden test, so it can never silently drift from what's served.
+- **Server/CLI hardening bundle** (MQLITE-88):
+  - An unrecognized **`MQLITE_SYNC`** (e.g. `FULLL`) now **fails startup** with a clear error
+    instead of silently running on `NORMAL` — a durability typo can't quietly weaken the
+    guarantee. Accepted values: `NORMAL`/`FULL`/`OFF`/`EXTRA`. Unparseable size/DLQ limits
+    (`MQLITE_MAX_MESSAGE_BYTES`, `MQLITE_DLQ_MAX_*`) now log a warning instead of vanishing.
+  - The broker HTTP server gained a **60s `ReadTimeout`** (bounds a slow-drip request body;
+    it doesn't touch the Receive long-poll — only `WriteTimeout`, still 0, would), its
+    **shutdown grace went 5s → 25s** so an in-flight 20s long-poll drains on Ctrl-C instead
+    of being cut, a **failed shutdown is surfaced** (not swallowed), and **"ready" is logged
+    only after the listener actually binds** — a bind failure now surfaces as an error rather
+    than a misleading "ready" line.
+  - `mqlite receive` now **exits non-zero when a message fails to settle** (it previously
+    printed a warning and exited 0, so automation saw success while messages redelivered).
+  - **Broker DLQ retention no longer applies to one-shot CLI commands** — `send`/`receive`/etc.
+    no longer start the retention janitor; only `serve` applies it (docs already documented it
+    as serve-only).
 
 ## v0.2.0 — 2026-07-11
 

@@ -258,7 +258,14 @@ func TestServeHTTPServerHardening(t *testing.T) {
 	if hs.IdleTimeout <= 0 {
 		t.Fatal("IdleTimeout must be set (dead keep-alive reclaim)")
 	}
-	if hs.ReadTimeout != 0 || hs.WriteTimeout != 0 {
-		t.Fatal("Read/WriteTimeout must stay 0: Receive long-polls up to 20s; bodies are bounded by server.MaxBodyBytes instead")
+	// ReadTimeout bounds the whole request read (slow-drip body); it only covers
+	// reading the request, so it doesn't touch a Receive long-poll (that wait + the
+	// response come after). WriteTimeout MUST stay 0 — it would cap the response and
+	// break the 20s long-poll (MQLITE-88).
+	if hs.ReadTimeout <= 0 {
+		t.Fatal("ReadTimeout must be set (slow-drip body); it doesn't affect the long-poll")
+	}
+	if hs.WriteTimeout != 0 {
+		t.Fatal("WriteTimeout must stay 0: it would cap the response and break the 20s Receive long-poll")
 	}
 }

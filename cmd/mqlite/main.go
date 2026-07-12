@@ -15,7 +15,8 @@
 //	MQLITE_UI=on|off            (serve the embedded admin console at /ui for `serve`;
 //	                             UNSET => on; =off runs headless — /ui 404s)
 //	MQLITE_MAX_MESSAGE_BYTES=<n>                                  (reject larger bodies)
-//	MQLITE_SYNC=NORMAL|FULL|OFF                                   (durability; embedded/serve)
+//	MQLITE_SYNC=NORMAL|FULL|OFF|EXTRA        (durability; embedded/serve; unknown value
+//	                                          is rejected at startup, never silently NORMAL)
 //	MQLITE_DLQ_MAX_AGE=14d-ish (e.g. 336h) · MQLITE_DLQ_MAX_COUNT=1000000 · MQLITE_DLQ_RETENTION=off
 //	                                                             (broker DLQ retention; serve)
 //
@@ -29,6 +30,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -151,44 +153,67 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	return positionals, nil
 }
 
-// embeddedOpts builds embedded options from the environment (DB token + size cap).
+// warnEnv surfaces a config value that failed to parse instead of silently swallowing
+// it. These fall back to a safe default (unlike MQLITE_SYNC, which fails startup), so a
+// warning is enough — but a typo shouldn't vanish without a trace (MQLITE-88).
+func warnEnv(name, val string) {
+	fmt.Fprintf(os.Stderr, "warning: ignoring unparseable %s=%q; using default\n", name, val)
+}
+
+// embeddedOpts builds the common embedded options EVERY CLI command shares: DB auth
+// token, message size cap, durability. DLQ retention is deliberately NOT here — it is a
+// broker-lifecycle policy (serveRetentionOpts), and a one-shot command like `send` or
+// `receive` must not start the retention janitor (docs/cli.md documents it as
+// serve-only; MQLITE-88 / P2-3).
 func embeddedOpts() []mqlite.EmbeddedOption {
 	opts := []mqlite.EmbeddedOption{mqlite.WithDBAuthToken(os.Getenv("MQLITE_DB_AUTH_TOKEN"))}
 	if v := os.Getenv("MQLITE_MAX_MESSAGE_BYTES"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			opts = append(opts, mqlite.WithMaxMessageBytes(n))
+		} else {
+			warnEnv("MQLITE_MAX_MESSAGE_BYTES", v)
 		}
 	}
-	if v := os.Getenv("MQLITE_SYNC"); v != "" { // NORMAL (default) | FULL | OFF — durability knob (MQLITE-7)
+	if v := os.Getenv("MQLITE_SYNC"); v != "" { // NORMAL (default) | FULL | OFF | EXTRA — validated at Open
 		opts = append(opts, mqlite.WithSynchronous(v))
 	}
-	// DLQ retention (MQLITE-21): bound the dead-letter queue by default so the broker
-	// can run online long-term without the one unbounded sink filling the disk. Drop
-	// oldest-first past 14 days or 1,000,000 dead letters per queue; an optional byte
-	// cap (MQLITE_DLQ_MAX_BYTES, deployment-specific) is off by default. Override
-	// MQLITE_DLQ_MAX_AGE / MQLITE_DLQ_MAX_COUNT, or disable with MQLITE_DLQ_RETENTION=off.
-	if !strings.EqualFold(os.Getenv("MQLITE_DLQ_RETENTION"), "off") {
-		age := 14 * 24 * time.Hour
-		count := 1_000_000
-		var maxBytes int64 // 0 = off; age+count already bound growth without knowing disk size
-		if v := os.Getenv("MQLITE_DLQ_MAX_AGE"); v != "" {
-			if d, err := time.ParseDuration(v); err == nil {
-				age = d
-			}
-		}
-		if v := os.Getenv("MQLITE_DLQ_MAX_COUNT"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				count = n
-			}
-		}
-		if v := os.Getenv("MQLITE_DLQ_MAX_BYTES"); v != "" {
-			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-				maxBytes = n
-			}
-		}
-		opts = append(opts, mqlite.WithDLQRetention(age, count, maxBytes))
-	}
 	return opts
+}
+
+// serveRetentionOpts is the broker-only DLQ retention policy (MQLITE-21): bound the
+// dead-letter queue so a long-running broker never lets that one unbounded sink fill the
+// disk. Drop oldest-first past 14 days or 1,000,000 dead letters per queue; the optional
+// byte cap (MQLITE_DLQ_MAX_BYTES) is off by default. Only `serve` applies it (MQLITE-88).
+// Override MQLITE_DLQ_MAX_AGE / MQLITE_DLQ_MAX_COUNT, or disable with MQLITE_DLQ_RETENTION=off.
+func serveRetentionOpts() []mqlite.EmbeddedOption {
+	if strings.EqualFold(os.Getenv("MQLITE_DLQ_RETENTION"), "off") {
+		return nil
+	}
+	age := 14 * 24 * time.Hour
+	count := 1_000_000
+	var maxBytes int64 // 0 = off; age+count already bound growth without knowing disk size
+	if v := os.Getenv("MQLITE_DLQ_MAX_AGE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			age = d
+		} else {
+			warnEnv("MQLITE_DLQ_MAX_AGE", v)
+		}
+	}
+	if v := os.Getenv("MQLITE_DLQ_MAX_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			count = n
+		} else {
+			warnEnv("MQLITE_DLQ_MAX_COUNT", v)
+		}
+	}
+	if v := os.Getenv("MQLITE_DLQ_MAX_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			maxBytes = n
+		} else {
+			warnEnv("MQLITE_DLQ_MAX_BYTES", v)
+		}
+	}
+	return []mqlite.EmbeddedOption{mqlite.WithDLQRetention(age, count, maxBytes)}
 }
 
 // dial picks client mode (MQLITE_ENDPOINT set) or embedded mode (MQLITE_DB).
@@ -241,7 +266,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	if db == "" {
 		db = "file:./mq.db"
 	}
-	eng, err := mqlite.OpenEmbedded(ctx, db, append(embeddedOpts(), mqlite.WithLogger(slogger))...)
+	// serve is the only path that applies broker DLQ retention (serveRetentionOpts).
+	serveOpts := append(embeddedOpts(), serveRetentionOpts()...)
+	serveOpts = append(serveOpts, mqlite.WithLogger(slogger))
+	eng, err := mqlite.OpenEmbedded(ctx, db, serveOpts...)
 	if err != nil {
 		return err
 	}
@@ -282,10 +310,12 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	lg.Info("ready — Ctrl-C to stop")
+	// "ready" fires from WithReady, i.e. only after the listener actually binds — so a
+	// bind failure surfaces as an error instead of a misleading "ready" line (MQLITE-88).
 	return eng.Serve(sctx, listenAddr,
 		mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version),
-		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui))
+		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui),
+		mqlite.WithReady(func() { lg.Info("ready — Ctrl-C to stop") }))
 }
 
 // resolveListenAddr picks the broker's listen address with precedence
@@ -528,13 +558,21 @@ func cmdReceive(ctx context.Context, args []string) error {
 		fmt.Println("(no messages)")
 		return nil
 	}
+	var settleErrs []error
 	for _, m := range msgs {
 		printMsg(m)
 		if !*del && !*noAck {
 			if err := m.Complete(ctx); err != nil {
 				fmt.Fprintln(os.Stderr, "  warn: complete:", err)
+				settleErrs = append(settleErrs, err)
 			}
 		}
+	}
+	// A settlement failure must exit nonzero — otherwise automation reads exit 0 and
+	// assumes the messages were completed when they will actually redeliver (MQLITE-88).
+	if len(settleErrs) > 0 {
+		return fmt.Errorf("%d of %d message(s) failed to settle (see warnings above): %w",
+			len(settleErrs), len(msgs), errors.Join(settleErrs...))
 	}
 	return nil
 }

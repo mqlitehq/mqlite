@@ -394,6 +394,25 @@ func TestRetryableWrite(t *testing.T) {
 	}
 }
 
+// An unrecognized MQLITE_SYNC / Options.Synchronous must fail Open loudly, not silently
+// downgrade to NORMAL — a durability typo can't quietly weaken the guarantee (MQLITE-88).
+func TestValidateSync(t *testing.T) {
+	for _, ok := range []string{"", "NORMAL", "normal", " full ", "OFF", "EXTRA"} {
+		if err := validateSync(ok); err != nil {
+			t.Errorf("validateSync(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"FULLL", "fastest", "1", "yes"} {
+		if err := validateSync(bad); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("validateSync(%q) = %v, want ErrInvalidArgument", bad, err)
+		}
+	}
+	// End to end: a bad value fails Open rather than opening on the NORMAL default.
+	if _, err := Open(context.Background(), Options{DB: ":memory:", Synchronous: "FULLL", DisableBackground: true}); !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("Open with bad Synchronous = %v, want ErrInvalidArgument", err)
+	}
+}
+
 // isBusyErr classifies a contended-write failure from the remote primary, which —
 // unlike a logical error — is safe to retry because the lock was never acquired
 // (MQLITE-4 concurrency hardening).
