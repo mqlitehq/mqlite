@@ -224,6 +224,14 @@ func toSettleResults(rs []wire.SettleItemResult) []SettleResult {
 // CompleteBatch completes many received messages in one round-trip — the fix for the
 // drain N+1 (settling a received batch one HTTP call at a time). Messages should
 // share one queue; a stale lock comes back as Ok=false rather than failing the batch.
+// Message rehydrates a settleable handle for a message you already received but did not
+// settle (e.g. `mqlite receive --no-ack`, then settle in a later invocation). Pass the
+// queue, its SequenceNumber, and the LockToken() from that receive; the returned *Message
+// settles through this Client (Complete/Abandon/Reject/Defer/Renew).
+func (c *Client) Message(queue string, seq int64, lockToken string) *Message {
+	return &Message{queue: queue, SequenceNumber: seq, lockToken: lockToken, s: c}
+}
+
 func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]wire.SettleItem, len(msgs))
 	for i, m := range msgs {
@@ -361,6 +369,49 @@ func (c *Client) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (in
 		return 0, err
 	}
 	return resp.Purged, nil
+}
+
+// Status returns a desensitized snapshot of the broker's backend (never a token or DSN).
+func (c *Client) Status(ctx context.Context) (StatusInfo, error) {
+	var resp wire.StatusResponse
+	if err := c.post(ctx, wire.PathStatus, wire.Empty{}, &resp); err != nil {
+		return StatusInfo{}, err
+	}
+	return StatusInfo{
+		Version: resp.Version, Backend: resp.Backend, Remote: resp.Remote, Location: resp.Location,
+		SchemaVersion: resp.SchemaVersion, PingMs: resp.PingMs, SizeBytes: resp.DBSizeBytes,
+		Queues: resp.Queues, Subscriptions: resp.Subscriptions,
+	}, nil
+}
+
+// ListSubscriptions returns every subscription with its topic and filter expression.
+func (c *Client) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
+	var resp wire.ListSubscriptionsResponse
+	if err := c.post(ctx, wire.PathListSubscriptions, wire.Empty{}, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]SubscriptionInfo, len(resp.Subscriptions))
+	for i, s := range resp.Subscriptions {
+		out[i] = SubscriptionInfo{Topic: s.Topic, Name: s.Name, Expr: s.Expr}
+	}
+	return out, nil
+}
+
+// TestFilter dry-runs a subscription filter expression: it compiles expr and, when sample
+// is non-nil, evaluates it against that message (nothing is enqueued). Read-only.
+func (c *Client) TestFilter(ctx context.Context, expr string, sample *OutMessage, enqueuedAtMs, visibleAtMs int64) (FilterTestResult, error) {
+	req := wire.TestFilterRequest{Expr: expr}
+	if sample != nil {
+		wm := outToWire(*sample)
+		wm.EnqueuedAtMs = enqueuedAtMs
+		wm.VisibleAtMs = visibleAtMs
+		req.Message = &wm
+	}
+	var resp wire.TestFilterResponse
+	if err := c.post(ctx, wire.PathTestFilter, req, &resp); err != nil {
+		return FilterTestResult{}, err
+	}
+	return FilterTestResult{Valid: resp.Valid, Error: resp.Error, Ran: resp.Ran, Matched: resp.Matched}, nil
 }
 
 // Receiver returns a stateful receive loop bound to this client.

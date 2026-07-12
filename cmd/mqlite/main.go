@@ -71,14 +71,28 @@ func main() {
 		err = cmdCreateSubscription(ctx, args)
 	case "send":
 		err = cmdSend(ctx, args)
+	case "schedule":
+		err = cmdSchedule(ctx, args)
+	case "cancel":
+		err = cmdCancel(ctx, args)
 	case "receive":
 		err = cmdReceive(ctx, args)
+	case "receive-deferred":
+		err = cmdReceiveDeferred(ctx, args)
+	case "complete", "abandon", "reject", "defer", "renew":
+		err = cmdSettle(ctx, cmd, args)
 	case "peek":
 		err = cmdPeek(ctx, args)
 	case "metrics":
 		err = cmdMetrics(ctx, args)
+	case "status":
+		err = cmdStatus(ctx, args)
 	case "list":
 		err = cmdList(ctx, args)
+	case "list-subscriptions":
+		err = cmdListSubscriptions(ctx, args)
+	case "test-filter":
+		err = cmdTestFilter(ctx, args)
 	case "redrive":
 		err = cmdRedrive(ctx, args)
 	case "purge-dlq":
@@ -105,32 +119,55 @@ func usage() {
 
 usage: mqlite <command> [flags]
 
-  serve                  run the HTTP broker (embedded engine + Serve)
-  create-queue <name>    create/update a queue
-  subscribe <topic> <n>  create a subscription <n> under <topic> (--expr 'predicate')
-  send <queue> <body>    send a message (body "-" reads stdin; --file reads a file)
-  receive <queue>        receive (Peek-Lock, auto-Complete unless --no-ack)
-  peek <queue>           browse without locking
-  metrics <queue>        show queue counters
-  list                   list queues/subscriptions
-  redrive <queue>        move dead-lettered messages back to active
-  purge-dlq <queue>      permanently delete dead-lettered messages
-  vacuum                 reclaim free DB pages to the OS (local maintenance; --full)
+ broker
+  serve                     run the HTTP broker (embedded engine + Serve)
+
+ admin
+  create-queue <name>       create/update a queue
+  subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate')
+  list                      list queues
+  list-subscriptions        list subscriptions with their topic + filter
+  test-filter <expr>        dry-run a filter expression against an optional sample
+  metrics <queue>           show queue counters
+  status                    backend snapshot (backend, ping, size, counts)
+  redrive <queue>           move dead-lettered messages back to active
+  purge-dlq <queue>         permanently delete dead-lettered messages
+  vacuum                    reclaim free DB pages to the OS (local maintenance; --full)
+
+ messages
+  send <queue> <body>       send now (body "-" reads stdin; --file reads a file)
+  schedule <queue> <body>   send for future delivery (--at RFC3339|duration)
+  cancel <queue> <seq>      delete a not-yet-activated scheduled message
+  receive <queue>           receive (Peek-Lock, auto-Complete unless --no-ack)
+  receive-deferred <queue>  fetch deferred messages back by seq (--seq 42,57)
+  complete <queue> <seq> <token>   settle a --no-ack message: done
+  abandon  <queue> <seq> <token>   settle: release for retry (--delay)
+  reject   <queue> <seq> <token>   settle: dead-letter (--reason --detail)
+  defer    <queue> <seq> <token>   settle: set aside for receive-deferred
+  renew    <queue> <seq> <token>   extend the lock lease
+
   version | help
 
-connection via env: MQLITE_ENDPOINT+MQLITE_TOKEN (client) or MQLITE_DB[+token] (embedded)
+global flags (any command): --endpoint URL --token T --output text|json
+connection: --endpoint/--token or MQLITE_ENDPOINT+MQLITE_TOKEN (client), else MQLITE_DB (embedded)
 `)
 }
 
-// api is the subset shared by *mqlite.Client and *mqlite.Embedded.
+// api is the subset shared by *mqlite.Client and *mqlite.Embedded, so every CLI command
+// works identically in client (remote broker) and embedded (in-process) mode.
 type api interface {
 	SendOne(ctx context.Context, queue string, m mqlite.OutMessage, opts ...mqlite.SendOpts) (int64, error)
 	Receive(ctx context.Context, queue string, opts ...mqlite.RecvOpts) ([]*mqlite.Message, error)
 	Peek(ctx context.Context, queue string, opts ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error)
+	Message(queue string, seq int64, lockToken string) *mqlite.Message
+	Cancel(ctx context.Context, queue string, seq int64) error
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
 	ListQueues(ctx context.Context) ([]mqlite.QueueInfo, error)
+	ListSubscriptions(ctx context.Context) ([]mqlite.SubscriptionInfo, error)
+	TestFilter(ctx context.Context, expr string, sample *mqlite.OutMessage, enqueuedAtMs, visibleAtMs int64) (mqlite.FilterTestResult, error)
 	Stats(ctx context.Context, queue string) (mqlite.Metrics, error)
+	Status(ctx context.Context) (mqlite.StatusInfo, error)
 	Redrive(ctx context.Context, dlq string, opts ...mqlite.RedriveOpts) (int, error)
 	Purge(ctx context.Context, queue string, opts ...mqlite.PurgeOpts) (int, error)
 	Close() error
@@ -149,6 +186,12 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 		}
 		positionals = append(positionals, fs.Arg(0))
 		args = fs.Args()[1:]
+	}
+	// Validate --output for the commands that registered it (via newFlags), so a typo like
+	// `--output jsno` is a loud usage error, not a silent fall-through to text (serve does
+	// not register it, so it is skipped).
+	if fs.Lookup("output") != nil && gOutput != "text" && gOutput != "json" {
+		return nil, fmt.Errorf("invalid --output %q: want text or json", gOutput)
 	}
 	return positionals, nil
 }
@@ -216,10 +259,50 @@ func serveRetentionOpts() []mqlite.EmbeddedOption {
 	return []mqlite.EmbeddedOption{mqlite.WithDLQRetention(age, count, maxBytes)}
 }
 
-// dial picks client mode (MQLITE_ENDPOINT set) or embedded mode (MQLITE_DB).
+// Global flags shared by every data-plane command, registered via newFlags. Package-level
+// because a CLI runs exactly one command per process; --endpoint/--token override the
+// MQLITE_ENDPOINT/MQLITE_TOKEN env, and --output switches human text for JSON (scripting).
+var (
+	gEndpoint string
+	gToken    string
+	gOutput   string
+)
+
+// newFlags builds a command FlagSet with the global connection/output flags pre-registered,
+// so every command speaks --endpoint/--token/--output uniformly.
+func newFlags(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.StringVar(&gEndpoint, "endpoint", "", "broker endpoint (overrides MQLITE_ENDPOINT; client mode)")
+	fs.StringVar(&gToken, "token", "", "bearer token (overrides MQLITE_TOKEN)")
+	fs.StringVar(&gOutput, "output", "text", "output format: text | json")
+	return fs
+}
+
+// jsonOut reports whether --output json was requested.
+func jsonOut() bool { return gOutput == "json" }
+
+// emitJSON prints v as indented JSON (used when --output json).
+func emitJSON(v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(b))
+	return nil
+}
+
+// dial picks client mode (--endpoint / MQLITE_ENDPOINT set) or embedded mode (MQLITE_DB).
 func dial(ctx context.Context) (api, error) {
-	if ep := os.Getenv("MQLITE_ENDPOINT"); ep != "" {
-		return mqlite.Open(ctx, ep, mqlite.WithToken(os.Getenv("MQLITE_TOKEN")))
+	ep := gEndpoint
+	if ep == "" {
+		ep = os.Getenv("MQLITE_ENDPOINT")
+	}
+	if ep != "" {
+		tok := gToken
+		if tok == "" {
+			tok = os.Getenv("MQLITE_TOKEN")
+		}
+		return mqlite.Open(ctx, ep, mqlite.WithToken(tok))
 	}
 	db := os.Getenv("MQLITE_DB")
 	if db == "" {
@@ -438,7 +521,7 @@ func isLoopbackListen(addr string) bool {
 }
 
 func cmdCreateQueue(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("create-queue", flag.ExitOnError)
+	fs := newFlags("create-queue")
 	lock := fs.Duration("lock", 0, "lock duration (e.g. 30s)")
 	maxdc := fs.Int("max-delivery", 0, "max delivery count before DLQ")
 	ttl := fs.Duration("ttl", 0, "default message TTL")
@@ -466,12 +549,11 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	}); err != nil {
 		return err
 	}
-	fmt.Println("ok: queue", pos[0])
-	return nil
+	return okResult(map[string]any{"action": "create-queue", "queue": pos[0]}, "action", "queue")
 }
 
 func cmdCreateSubscription(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("subscribe", flag.ExitOnError)
+	fs := newFlags("subscribe")
 	exprStr := fs.String("expr", "", `filter expression (expr-lang), e.g. 'subject_parts[0]=="orders"'; empty = match all`)
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
@@ -492,12 +574,11 @@ func cmdCreateSubscription(ctx context.Context, args []string) error {
 	if err := c.Subscribe(ctx, pos[0], pos[1], f); err != nil {
 		return err
 	}
-	fmt.Printf("ok: subscription %s under topic %s\n", pos[1], pos[0])
-	return nil
+	return okResult(map[string]any{"action": "subscribe", "subscription": pos[1], "topic": pos[0]}, "action", "subscription", "topic")
 }
 
 func cmdSend(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	fs := newFlags("send")
 	file := fs.String("file", "", "read body from file")
 	msgID := fs.String("message-id", "", "message id (dedup/idempotency key)")
 	group := fs.String("group", "", "group id (MessageGroupId)")
@@ -527,12 +608,11 @@ func cmdSend(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ok: seq=%d\n", seq)
-	return nil
+	return okResult(map[string]any{"queue": queue, "seq": seq}, "queue", "seq")
 }
 
 func cmdReceive(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("receive", flag.ExitOnError)
+	fs := newFlags("receive")
 	max := fs.Int("max", 1, "max messages")
 	wait := fs.Duration("wait", 0, "long-poll wait (e.g. 5s)")
 	noAck := fs.Bool("no-ack", false, "leave messages locked (do not Complete)")
@@ -554,22 +634,25 @@ func cmdReceive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(msgs) == 0 {
-		fmt.Println("(no messages)")
-		return nil
-	}
+	// Auto-Complete each message PROMPTLY — before rendering the batch. Rendering a large
+	// batch (up to 256 × 1 MiB) to slow stdout could otherwise let the reaper expire the
+	// earlier locks mid-print and force a redelivery. --no-ack/--delete leave nothing to
+	// settle. A settlement failure must exit nonzero (MQLITE-88).
 	var settleErrs []error
-	for _, m := range msgs {
-		printMsg(m)
-		if !*del && !*noAck {
+	if !*del && !*noAck {
+		for _, m := range msgs {
 			if err := m.Complete(ctx); err != nil {
 				fmt.Fprintln(os.Stderr, "  warn: complete:", err)
 				settleErrs = append(settleErrs, err)
 			}
 		}
 	}
-	// A settlement failure must exit nonzero — otherwise automation reads exit 0 and
-	// assumes the messages were completed when they will actually redeliver (MQLITE-88).
+	// Show the lock token only when the message stays locked (--no-ack), so it can be
+	// settled in a later invocation (complete/abandon/reject/defer/renew <queue> <seq>
+	// <token>).
+	if err := printMsgs(msgs, *noAck && !*del); err != nil {
+		return err
+	}
 	if len(settleErrs) > 0 {
 		return fmt.Errorf("%d of %d message(s) failed to settle (see warnings above): %w",
 			len(settleErrs), len(msgs), errors.Join(settleErrs...))
@@ -578,7 +661,7 @@ func cmdReceive(ctx context.Context, args []string) error {
 }
 
 func cmdPeek(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("peek", flag.ExitOnError)
+	fs := newFlags("peek")
 	state := fs.String("state", "", "filter by state (active/locked/deferred/scheduled/dead_lettered)")
 	from := fs.Int64("from", 0, "start seq")
 	max := fs.Int("max", 16, "max messages")
@@ -602,6 +685,9 @@ func cmdPeek(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if jsonOut() {
+		return emitJSON(viewPeeked(ms))
+	}
 	if len(ms) == 0 {
 		fmt.Println("(empty)")
 		return nil
@@ -613,7 +699,12 @@ func cmdPeek(ctx context.Context, args []string) error {
 }
 
 func cmdMetrics(ctx context.Context, args []string) error {
-	if len(args) < 1 {
+	fs := newFlags("metrics")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 1 {
 		return fmt.Errorf("usage: metrics <queue>")
 	}
 	c, err := dial(ctx)
@@ -621,16 +712,23 @@ func cmdMetrics(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	m, err := c.Stats(ctx, args[0])
+	m, err := c.Stats(ctx, pos[0])
 	if err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(m, "", "  ")
-	fmt.Println(string(b))
+	if jsonOut() {
+		return emitJSON(m)
+	}
+	fmt.Printf("queue=%s active=%d locked=%d deferred=%d scheduled=%d dead=%d total=%d oldest=%dms\n",
+		m.Queue, m.Active, m.Locked, m.Deferred, m.Scheduled, m.DeadLettered, m.Total, m.OldestMessageAgeMs)
 	return nil
 }
 
 func cmdList(ctx context.Context, args []string) error {
+	fs := newFlags("list")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
@@ -639,6 +737,9 @@ func cmdList(ctx context.Context, args []string) error {
 	qs, err := c.ListQueues(ctx)
 	if err != nil {
 		return err
+	}
+	if jsonOut() {
+		return emitJSON(qs)
 	}
 	if len(qs) == 0 {
 		fmt.Println("(no queues)")
@@ -652,7 +753,7 @@ func cmdList(ctx context.Context, args []string) error {
 }
 
 func cmdRedrive(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("redrive", flag.ExitOnError)
+	fs := newFlags("redrive")
 	to := fs.String("to", "", "target queue (default: back to source)")
 	max := fs.Int("max", 0, "max messages (0=all)")
 	older := fs.Duration("older-than", 0, "only messages older than this")
@@ -672,12 +773,11 @@ func cmdRedrive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ok: moved %d message(s)\n", moved)
-	return nil
+	return okResult(map[string]any{"action": "redrive", "moved": moved}, "action", "moved")
 }
 
 func cmdPurgeDLQ(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("purge-dlq", flag.ExitOnError)
+	fs := newFlags("purge-dlq")
 	max := fs.Int("max", 0, "max messages (0=all)")
 	older := fs.Duration("older-than", 0, "only messages older than this")
 	pos, err := parseInterspersed(fs, args)
@@ -696,8 +796,7 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ok: purged %d dead-lettered message(s)\n", purged)
-	return nil
+	return okResult(map[string]any{"action": "purge-dlq", "purged": purged}, "action", "purged")
 }
 
 // cmdVacuum reclaims free DB pages to the OS. It is a LOCAL maintenance command: it
@@ -705,13 +804,13 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 // otherwise reject it), runs incremental_vacuum (or a full VACUUM with --full), and
 // reports the file size before/after.
 func cmdVacuum(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("vacuum", flag.ExitOnError)
+	fs := newFlags("vacuum")
 	full := fs.Bool("full", false, "full VACUUM (rewrites the DB, global lock) instead of incremental")
 	if _, err := parseInterspersed(fs, args); err != nil {
 		return err
 	}
-	if os.Getenv("MQLITE_ENDPOINT") != "" {
-		return fmt.Errorf("vacuum is a local maintenance command: unset MQLITE_ENDPOINT and point MQLITE_DB at the file")
+	if gEndpoint != "" || os.Getenv("MQLITE_ENDPOINT") != "" {
+		return fmt.Errorf("vacuum is a local maintenance command: drop --endpoint/MQLITE_ENDPOINT and point MQLITE_DB at the file")
 	}
 	db := os.Getenv("MQLITE_DB")
 	if db == "" {
@@ -730,6 +829,11 @@ func cmdVacuum(ctx context.Context, args []string) error {
 	kind := "incremental_vacuum"
 	if *full {
 		kind = "VACUUM"
+	}
+	if jsonOut() {
+		return emitJSON(map[string]any{
+			"action": kind, "before_bytes": before, "after_bytes": after, "freed_bytes": before - after,
+		})
 	}
 	fmt.Printf("ok: %s — %.2f MiB -> %.2f MiB (freed %.2f MiB)\n",
 		kind, mib(before), mib(after), mib(before-after))
@@ -783,7 +887,28 @@ func readBody(file string, rest []string) ([]byte, error) {
 	return []byte(strings.Join(rest, " ")), nil
 }
 
-func printMsg(m *mqlite.Message) {
+// printMsgs renders received messages: a JSON array under --output json, else one human
+// line each. withToken includes the lock token (only when the message stays locked and
+// must be settled later).
+func printMsgs(msgs []*mqlite.Message, withToken bool) error {
+	if jsonOut() {
+		views := make([]msgView, len(msgs))
+		for i, m := range msgs {
+			views[i] = viewMsg(m, withToken)
+		}
+		return emitJSON(views)
+	}
+	if len(msgs) == 0 {
+		fmt.Println("(no messages)")
+		return nil
+	}
+	for _, m := range msgs {
+		printMsg(m, withToken)
+	}
+	return nil
+}
+
+func printMsg(m *mqlite.Message, withToken bool) {
 	fmt.Printf("seq=%d deliveries=%d", m.SequenceNumber, m.DeliveryCount)
 	if m.MessageID != "" {
 		fmt.Printf(" message-id=%s", m.MessageID)
@@ -793,6 +918,9 @@ func printMsg(m *mqlite.Message) {
 	}
 	if m.ReplyTo != "" {
 		fmt.Printf(" reply-to=%s", m.ReplyTo)
+	}
+	if withToken {
+		fmt.Printf(" lock-token=%s", m.LockToken())
 	}
 	fmt.Printf(" body=%q\n", string(m.Body))
 }

@@ -124,6 +124,28 @@ type Metrics = engine.Metrics
 // QueueInfo mirrors engine.QueueInfo.
 type QueueInfo = engine.QueueInfo
 
+// SubscriptionInfo mirrors engine.SubscriptionInfo (topic, name, filter expression).
+type SubscriptionInfo = engine.SubscriptionInfo
+
+// FilterTestResult mirrors engine.FilterTestResult — the dry-run of a filter expression.
+type FilterTestResult = engine.FilterTestResult
+
+// StatusInfo is a desensitized runtime snapshot of the backend (Client.Status /
+// Embedded.Status): never a connection string or token — Location is a local path or a
+// masked remote host. Version/Queues/Subscriptions come from the broker on the remote
+// path; embedded fills what it can locally (Version is empty embedded).
+type StatusInfo struct {
+	Version       string `json:"version,omitempty"`
+	Backend       string `json:"backend"`
+	Remote        bool   `json:"remote"`
+	Location      string `json:"location"`
+	SchemaVersion string `json:"schema_version"`
+	PingMs        int64  `json:"ping_ms"`
+	SizeBytes     int64  `json:"size_bytes"`
+	Queues        int    `json:"queues"`
+	Subscriptions int    `json:"subscriptions"`
+}
+
 // ── data-plane options ───────────────────────────────────────────────────────
 //
 // These are plain option structs passed as a trailing variadic argument: callers

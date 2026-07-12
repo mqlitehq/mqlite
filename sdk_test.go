@@ -268,6 +268,95 @@ func TestServeReadyAfterBind(t *testing.T) {
 	}
 }
 
+// TestRemoteSettleByToken is the SDK contract the CLI's settle-later commands rely on
+// (MQLITE-92): receive a message, read its LockToken(), then settle it through a freshly
+// rehydrated Client.Message(queue, seq, token) — as a separate `mqlite complete …`
+// invocation would against a running broker. A spent token must then be fenced out.
+func TestRemoteSettleByToken(t *testing.T) {
+	ctx := context.Background()
+	cli, _ := newBroker(t, "")
+	if err := cli.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("hi")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := cli.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	tok := msgs[0].LockToken()
+	if tok == "" {
+		t.Fatal("LockToken() returned empty")
+	}
+	seq := msgs[0].SequenceNumber
+
+	// Rehydrate a settleable handle from (queue, seq, token) and complete it.
+	if err := cli.Message("q", seq, tok).Complete(ctx); err != nil {
+		t.Fatalf("complete via rehydrated handle: %v", err)
+	}
+	m, err := cli.Stats(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Total != 0 || m.Locked != 0 {
+		t.Fatalf("after complete: total=%d locked=%d, want 0/0", m.Total, m.Locked)
+	}
+	// The SAME token is idempotent (settlement-receipt lost-response replay); a WRONG
+	// token is fenced out.
+	if err := cli.Message("q", seq, tok).Complete(ctx); err != nil {
+		t.Errorf("re-completing with the same token should be idempotent, got %v", err)
+	}
+	if err := cli.Message("q", seq, "not-the-token").Complete(ctx); err == nil {
+		t.Error("completing with a wrong lock token should fail (fencing)")
+	}
+}
+
+// TestRemoteStatusSubsFilter round-trips the read-only admin surface the CLI exposes
+// (status / list-subscriptions / test-filter) against a real broker (MQLITE-92).
+func TestRemoteStatusSubsFilter(t *testing.T) {
+	ctx := context.Background()
+	cli, _ := newBroker(t, "")
+	if err := cli.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Subscribe(ctx, "ev", "s1", &mqlite.Filter{Expr: `subject == "x"`}); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := cli.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Backend == "" || s.SchemaVersion == "" {
+		t.Errorf("status incomplete: %+v", s)
+	}
+
+	subs, err := cli.ListSubscriptions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, su := range subs {
+		if su.Name == "s1" && su.Topic == "ev" && su.Expr == `subject == "x"` {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("s1 not found in subscriptions: %+v", subs)
+	}
+
+	if r, err := cli.TestFilter(ctx, `subject == "x"`, &mqlite.OutMessage{Subject: "x"}, 0, 0); err != nil || !r.Valid || !r.Ran || !r.Matched {
+		t.Errorf("test-filter match: r=%+v err=%v", r, err)
+	}
+	if r, _ := cli.TestFilter(ctx, `subject == "x"`, &mqlite.OutMessage{Subject: "y"}, 0, 0); !r.Valid || r.Matched {
+		t.Errorf("test-filter no-match: %+v", r)
+	}
+	if r, _ := cli.TestFilter(ctx, `subject ==`, nil, 0, 0); r.Valid {
+		t.Errorf("test-filter invalid should be !Valid: %+v", r)
+	}
+}
+
 func TestReceiverRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

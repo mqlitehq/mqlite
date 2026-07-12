@@ -103,6 +103,15 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   - **Broker DLQ retention no longer applies to one-shot CLI commands** — `send`/`receive`/etc.
     no longer start the retention janitor; only `serve` applies it (docs already documented it
     as serve-only).
+- **The `mqlite` CLI is now a complete client for the HTTP API** (MQLITE-92): new commands
+  `complete`/`abandon`/`reject`/`defer`/`renew` (settle a `receive --no-ack` message by
+  `<queue> <seq> <lock-token>`), `schedule`/`cancel`, `receive-deferred`, `status`,
+  `list-subscriptions`, and `test-filter`; global `--endpoint`/`--token` flags (override the
+  env) and `--output text|json` for scripting (bodies base64, keys snake_case); and
+  `receive --no-ack` now prints each `lock-token`. New SDK surface backs it —
+  `Message.LockToken()`, `Client/Embedded.Message(queue, seq, token)`, `Status()`,
+  `ListSubscriptions()`, `TestFilter()`. (Settling across separate invocations needs a running
+  broker; embedded mode reclaims orphaned locks each open.)
 
 ## v0.2.0 — 2026-07-11
 

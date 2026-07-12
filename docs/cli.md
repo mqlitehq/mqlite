@@ -25,6 +25,25 @@ mqlite <command> [flags] [args]
 
 The DB string / endpoint is **only** read from the environment, never compiled in.
 
+## Global flags (any command)
+
+| Flag | Meaning |
+|---|---|
+| `--endpoint <url>` | client mode: a running broker (overrides `MQLITE_ENDPOINT`) |
+| `--token <bearer>` | Bearer token for `--endpoint` (overrides `MQLITE_TOKEN`) |
+| `--output text\|json` | `text` (default, human) or `json` (machine-readable, for scripting) |
+
+The CLI is a complete client for the HTTP API — every operation the broker exposes has a
+command, in both embedded and client mode. In `--output json`, message bodies are base64
+(the same lossless encoding as the wire).
+
+> **Settling across invocations needs a broker.** `receive --no-ack` locks a message and
+> prints its `lock-token`; you settle it later with `complete/abandon/reject/defer/renew
+> <queue> <seq> <token>`. This works against a running broker (client mode), which holds
+> the lock between calls. In **embedded** mode each invocation opens the DB fresh and
+> reclaims orphaned locks, so a `--no-ack` lock does not survive to the next command — use
+> a broker (`mqlite serve` + `--endpoint`) when you need manual settle-later.
+
 ## Commands
 
 ### `serve` — run the broker
@@ -84,8 +103,9 @@ echo '{"id":2}' | mqlite send orders -
 | `--ttl` | per-message TTL |
 
 ### `receive <queue>` — consume (Peek-Lock)
-By default it receives and auto-Completes. Use `--no-ack` to inspect without
-settling, or `--delete` for at-most-once.
+By default it receives and auto-Completes. Use `--no-ack` to leave messages locked and
+print each `lock-token` (settle them later — see settlement commands below), or `--delete`
+for at-most-once.
 ```bash
 mqlite receive orders --max 10 --wait 5s
 ```
@@ -145,6 +165,56 @@ global lock). Not applicable to a remote Turso/libSQL store.
 MQLITE_DB=file:/data/mq.db mqlite vacuum          # incremental
 MQLITE_DB=file:/data/mq.db mqlite vacuum --full   # full rewrite
 ```
+
+### `complete` / `abandon` / `reject` / `defer` / `renew` — settle a message
+Settle a message received earlier with `receive --no-ack` (which printed its
+`lock-token`). Positional args are always `<queue> <seq> <lock-token>`. Client mode only
+in practice (a broker holds the lock between calls — see the note under Global flags).
+```bash
+mqlite complete orders 42 lt_9f3a…                 # done
+mqlite abandon  orders 42 lt_9f3a… --delay 60s     # release for retry, after a backoff
+mqlite reject   orders 42 lt_9f3a… --reason bad    # dead-letter it (--detail …)
+mqlite defer    orders 42 lt_9f3a…                 # set aside for receive-deferred
+mqlite renew    orders 42 lt_9f3a…                 # extend the lock lease
+```
+
+### `schedule <queue> <body>` — enqueue for future delivery
+```bash
+mqlite schedule orders '{"id":1}' --at 30m                     # a duration from now
+mqlite schedule orders '{"id":1}' --at 2026-01-02T15:04:05Z    # or an absolute RFC3339 time
+```
+| Flag | | |
+|---|---|---|
+| `--at` | required | delivery time: RFC3339 or a duration (`30m`, `2h`) |
+| `--file` · `--message-id` · `--group` · `--subject` | | same as `send` |
+
+Cancel a scheduled message before it activates with **`cancel <queue> <seq>`**.
+
+### `receive-deferred <queue> --seq …` — fetch deferred messages by seq
+```bash
+mqlite receive-deferred orders --seq 42,57      # re-locks them and prints tokens to settle
+```
+
+### `status` — backend snapshot
+```bash
+mqlite status                 # backend, location, schema, ping, size, queue/subscription counts
+```
+
+### `list-subscriptions` — subscriptions with topic + filter
+```bash
+mqlite list-subscriptions
+```
+
+### `test-filter <expr>` — dry-run a subscription filter
+Compiles the expression and, with a sample, reports whether it would match (nothing is
+enqueued).
+```bash
+mqlite test-filter 'subject == "ord.created"'                       # just validate
+mqlite test-filter 'subject == "ord.created"' --subject ord.created # validate + test a sample
+```
+| Flag | | |
+|---|---|---|
+| `--subject` · `--group` · `--prop k=v,k=v` · `--file` | | build the sample message |
 
 ### `version` / `help`
 ```bash
