@@ -7,9 +7,9 @@ dead-letter + redrive, defer, schedule, dedup, and fencing.
 
 | File | Lang | What it covers |
 |---|---|---|
-| `api_curl.sh` | bash + curl + jq | Every HTTP endpoint is curl-able; wire format, auth (401), error codes, fan-out, one DLQ+redrive flow, defer. The **"用 API"** path. |
+| `api_curl.sh` | bash + curl + jq | Every HTTP endpoint is curl-able; wire format, auth (401), error codes, fan-out, one DLQ+redrive flow, defer. The **API** path. |
 | `api_tests.py` | Python 3 (stdlib) | Behavioural matrix with an independent HTTP client: lifecycle, visibility timeout, abandon→redelivery, DLQ+redrive, explicit dead-letter, defer, schedule, dedup window + conflict, session ordering, receive-and-delete, fencing. |
-| `sdkcheck/main.go` | Go (mqlite SDK) | The **"用 SDK"** path: remote `mqlite.Client` for all the flows above, plus embedded `OpenEmbedded` + `Tx` (same-DB transactional enqueue, commit & rollback) and `Receiver.Run`. |
+| `sdkcheck/main.go` | Go (mqlite SDK) | The **SDK** path: remote `mqlite.Client` for all the flows above, plus embedded `OpenEmbedded` + `Tx` (same-DB transactional enqueue, commit & rollback) and `Receiver.Run`. |
 | `run.sh` | bash | Builds the binary, boots an ephemeral broker, runs all three suites, aggregates pass/fail, tears down. |
 
 ## Run

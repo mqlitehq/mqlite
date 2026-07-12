@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # API suite via raw curl — proves every endpoint is curl-able and the wire format
-# / auth / error codes behave. (The "用 API" path; mirrors design §7.4.)
+# / auth / error codes behave. (The API path; mirrors design §7.4.)
 set -uo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=lib.sh

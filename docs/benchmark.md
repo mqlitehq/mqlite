@@ -4,7 +4,7 @@ Measured, reproducible numbers for the mqlite engine across realistic workloads 
 **not** a single throughput figure — plus what they mean for **deployment sizing** and
 **tuning**. The suite exercises throughput, write amplification, **whole-process memory
 + reclamation**, **DB-file bloat vs reclamation**, **KV-property (enriched) messages**, a
-**body-size sweep**, and **load ramp / consumer churn (上下线)**. Run **locally** (a fast
+**body-size sweep**, and **load ramp / consumer churn**. Run **locally** (a fast
 multi-core box) and on a deliberately tiny **cloud** box so the two tell different truths.
 
 > Philosophy: measure before claiming. Every number here is produced by
@@ -198,7 +198,7 @@ On-disk storage scales ~linearly with body size plus a small fixed row+index ove
 (~150–250 B). Throughput is commit-bound up to ~256 B, then byte-bound for large
 bodies. Default body cap is 1 MiB (`MaxMessageBytes`).
 
-## 6 · 上下线 — load ramp & consumer churn (local)
+## 6 · Load ramp & consumer churn (local)
 
 - **rampdown_4x4**: produce hard, then stop producing while consumers drain to idle.
   RSS peak 31 MB → 27 MB after the load goes away — memory tracks the workload *down*,

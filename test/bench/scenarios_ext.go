@@ -116,7 +116,7 @@ func bloatRun(ctx context.Context, eng *engine.Engine, q string, prefillN, batch
 }
 
 // rampDownRun produces hard for the first ~55% of d, then STOPS producing while
-// consumers keep draining for the remainder — the "上下线" (load up then down)
+// consumers keep draining for the remainder — the "load ramp" (load up then down)
 // curve. The sampler captures peak RSS/heap/DB during the busy phase vs the idle
 // tail, so we see whether memory and file are reclaimed once load goes away.
 func rampDownRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, msg int) (int64, *hist) {
