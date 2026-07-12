@@ -43,7 +43,7 @@ The agent then sees the tools below and can drive the broker directly.
 
 ## Tools
 
-Minimal, 1:1 with the core API (kept small on purpose — over-specified tools make
+Minimal — selected core routes map 1:1 (kept small on purpose — over-specified tools make
 models misuse them):
 
 | Tool | Does |
@@ -55,6 +55,9 @@ models misuse them):
 | `complete` | acknowledge a message (`queue`, `seq_number`, `lock_token`) |
 | `abandon` | release a message for redelivery |
 | `reject` | dead-letter a message |
+| `renew` | extend a message's lock so long-running work isn't redelivered |
+| `defer` | set a message aside for later retrieval by `seq_number` |
+| `receive_deferred` | retrieve deferred messages by their `seq_numbers` |
 | `peek` | browse without locking (optionally by `state`) |
 | `stats` | queue counters by state |
 | `redrive` | move dead letters back to active |

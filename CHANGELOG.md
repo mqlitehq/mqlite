@@ -44,6 +44,9 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 - **A stdin message body over 16 MiB now errors instead of being silently truncated**
   (MQLITE-79): `mqlite send ... -` reads one byte past the cap and fails loud; use `--file`
   (uncapped) for larger payloads. The broker's own `413 message_too_large` remains the ceiling.
+- **The MCP server gained `renew`, `defer`, and `receive_deferred` tools** (MQLITE-82): an
+  agent can now hold a lock across long work and use the deferred-message lifecycle over MCP,
+  not only the fallback raw-HTTP path (14 tools total).
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container

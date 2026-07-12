@@ -202,6 +202,25 @@ func num(a map[string]any, k string) int64 {
 	}
 	return 0
 }
+func intArrProp(desc string) map[string]any {
+	return map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": desc}
+}
+func intArr(a map[string]any, k string) []int64 {
+	raw, ok := a[k].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]int64, 0, len(raw))
+	for _, v := range raw {
+		switch n := v.(type) {
+		case float64:
+			out = append(out, int64(n))
+		case int64:
+			out = append(out, n)
+		}
+	}
+	return out
+}
 
 var tools = []tool{
 	{
@@ -259,6 +278,33 @@ var tools = []tool{
 		}, "queue", "seq_number", "lock_token"),
 		forward: func(a map[string]any) (string, any) {
 			return wire.PathAbandon, wire.SettleRequest{Queue: str(a, "queue"), SeqNumber: num(a, "seq_number"), LockToken: str(a, "lock_token"), DelayMs: num(a, "delay_ms")}
+		},
+	},
+	{
+		name: "renew", desc: "Renew a received message's lock so it isn't redelivered while long work continues.",
+		schema: obj(map[string]any{
+			"queue": strProp("queue name"), "seq_number": intProp("message seq number"), "lock_token": strProp("lock token from receive"),
+		}, "queue", "seq_number", "lock_token"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathRenew, wire.SettleRequest{Queue: str(a, "queue"), SeqNumber: num(a, "seq_number"), LockToken: str(a, "lock_token")}
+		},
+	},
+	{
+		name: "defer", desc: "Defer a received message: set it aside for later retrieval by seq_number (see receive_deferred).",
+		schema: obj(map[string]any{
+			"queue": strProp("queue name"), "seq_number": intProp("message seq number"), "lock_token": strProp("lock token from receive"),
+		}, "queue", "seq_number", "lock_token"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathDefer, wire.SettleRequest{Queue: str(a, "queue"), SeqNumber: num(a, "seq_number"), LockToken: str(a, "lock_token")}
+		},
+	},
+	{
+		name: "receive_deferred", desc: "Retrieve previously deferred messages by their seq_numbers (re-locks them for settling).",
+		schema: obj(map[string]any{
+			"queue": strProp("queue name"), "seq_numbers": intArrProp("seq numbers of deferred messages to retrieve"),
+		}, "queue", "seq_numbers"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: str(a, "queue"), SeqNumbers: intArr(a, "seq_numbers")}
 		},
 	},
 	{
