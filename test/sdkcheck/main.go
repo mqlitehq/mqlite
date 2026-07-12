@@ -1,4 +1,4 @@
-// Command sdkcheck is the SDK end-to-end suite (the "用 SDK" path). It drives a
+// Command sdkcheck is the SDK end-to-end suite (the SDK path). It drives a
 // running broker through the remote mqlite.Client, and exercises the embedded
 // engine (mqlite.OpenEmbedded) for the same-DB transactional enqueue (Tx) that
 // only exists in-process.

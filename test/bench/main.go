@@ -223,7 +223,7 @@ func main() {
 		{Name: "size_16KB", Kind: "produce", P: 4, Msg: 16384},
 		// ── DB file bloat + reclamation: fill then drain, does the file shrink? ──
 		{Name: "bloat_50k", Kind: "bloat", Prefill: 50_000, Batch: 64, Msg: *msg},
-		// ── 上下线: load up then down; memory/file reclamation after idle ──
+		// ── Load ramp: load up then down; memory/file reclamation after idle ──
 		{Name: "rampdown_4x4", Kind: "rampdown", P: 4, C: 4, Msg: *msg},
 		{Name: "churn_consumers", Kind: "churn", P: 4, C: 4, Msg: *msg},
 		// heaviest (200k prefill) LAST so a constrained box still gets all the rest
