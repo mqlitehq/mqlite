@@ -41,6 +41,7 @@ const (
 var (
 	ErrQueueNotFound         = errors.New("mqlite: queue not found")
 	ErrLockLost              = errors.New("mqlite: lock lost or already settled")
+	ErrUnauthenticated       = errors.New("mqlite: unauthenticated (bad or missing token)")
 	ErrDedupConflict         = errors.New("mqlite: dedup conflict (same id, different body)")
 	ErrNotFound              = errors.New("mqlite: not found")
 	ErrClosed                = errors.New("mqlite: engine closed")

@@ -20,6 +20,7 @@ import (
 // Re-exported sentinel errors so callers can use errors.Is on either mode.
 var (
 	ErrLockLost        = engine.ErrLockLost
+	ErrUnauthenticated = engine.ErrUnauthenticated
 	ErrNotFound        = engine.ErrNotFound
 	ErrQueueNotFound   = engine.ErrQueueNotFound
 	ErrDedupConflict   = engine.ErrDedupConflict
