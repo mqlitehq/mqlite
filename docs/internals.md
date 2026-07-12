@@ -309,8 +309,9 @@ hear it from us:
 
 If your problem fits inside those lines — one node, thousands-per-second, must
 never lie to you — then the whole stack under your queue is a ~30 MB process,
-one file you can copy with `cp`, and a set of promises you can re-verify by
-running `go test`.
+one file on disk (copyable with `cp` when stopped; use `VACUUM INTO` for a hot backup —
+see [deployment.md](deployment.md#backup--restore)), and a set of promises you can
+re-verify by running `go test`.
 
 ## 11 · Appendix: swapping the engine — the contract a new store must sign
 

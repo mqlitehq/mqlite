@@ -118,7 +118,10 @@ Description=mqlite broker
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/mqlite serve --addr :6754
+# Bind loopback: the reverse proxy below is the only public entry point, so the broker
+# is not reachable on the LAN even without a firewall rule. Use --addr :6754 only if you
+# deliberately want it on all interfaces (and then add a firewall rule).
+ExecStart=/usr/local/bin/mqlite serve --addr 127.0.0.1:6754
 Environment=MQLITE_DB=file:/var/lib/mqlite/mq.db
 Environment=MQLITE_TOKENS=mqk_prod_CHANGEME
 Environment=MQLITE_SYNC=NORMAL
@@ -135,7 +138,29 @@ systemctl daemon-reload && systemctl enable --now mqlite
 curl http://localhost:6754/healthz
 ```
 
-Put a TLS-terminating reverse proxy (Caddy/nginx) in front for anything public.
+Put a TLS-terminating reverse proxy (Caddy/nginx) in front for anything public; it
+connects to the broker on `127.0.0.1:6754`, which is the only interface the broker binds
+above — so the proxy (with TLS + whatever access control you add) is the single entry
+point, not a bypassable layer over an all-interfaces socket.
+
+## Backup & restore
+
+The queue lives in one SQLite file — but a **live** broker also holds `-wal`/`-shm`
+sidecars, so a bare `cp` of the main file mid-write can capture a torn state. Take a
+consistent backup one of two ways:
+
+- **Hot (broker running)** — one consistent snapshot, no downtime:
+  ```bash
+  sqlite3 /var/lib/mqlite/mq.db "VACUUM INTO '/backup/mq-$(date +%F).db'"
+  ```
+  (The file is standard SQLite, so the `sqlite3` CLI works on it even though mqlite
+  itself is pure-Go.)
+- **Cold (broker stopped)** — `systemctl stop mqlite`, then copy **all** of `mq.db`,
+  `mq.db-wal`, `mq.db-shm` (or checkpoint first so the WAL folds into `mq.db` and you can
+  copy just that one file), then start again.
+
+Restore: stop the broker, put the backup at `MQLITE_DB`'s path, start it. Never restore
+onto a running broker. On Turso, durability and backups are the server's responsibility.
 
 ## Turso (remote libSQL)
 
@@ -170,8 +195,9 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 
 - [ ] `MQLITE_TOKENS` set (auth on); rotate by updating it.
 - [ ] HTTPS in front (Fly `force_https`, or a reverse proxy for systemd/Docker).
-- [ ] Persistent storage sized for the **peak** backlog — files plateau, they don't
-      shrink ([retention.md](retention.md)).
+- [ ] Persistent storage sized for the **peak** backlog — the file grows to peak, then a
+      background janitor returns freed pages to the OS (`incremental_vacuum`) so it shrinks
+      back gradually as the queue drains ([retention.md](retention.md)).
 - [ ] DLQ retention left on (default) or tuned for your volume.
 - [ ] Pinned image/binary version.
 - [ ] Scrape `/metrics` (Prometheus) for queue depths — see [api-reference.md](api-reference.md).
