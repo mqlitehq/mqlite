@@ -123,6 +123,65 @@ func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	}
 }
 
+// ─── Free-page reclamation ──────────────────────────────────────────────────
+
+// Compact(full=false) must actually return freed pages to the OS — a single
+// incremental_vacuum step with no checkpoint reclaimed almost nothing and never shrank the
+// file (MQLITE-78). After draining a queue, Compact empties the freelist and shrinks the file.
+func TestCompactReclaimsFreePages(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "mq.db")
+	e, _ := testEngineAt(t, path)
+	mustQueue(t, e, "q", QueueConfig{})
+
+	body := make([]byte, 4096)
+	for i := 0; i < 500; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 500; i++ {
+		m := recvOne(t, e, "q")
+		if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Materialize the deletes onto the main-DB freelist so the "before" state is deterministic.
+	if _, err := e.db.exec(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	fi1, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := e.db.queryRowScan(ctx, []any{&before}, `PRAGMA freelist_count`); err != nil {
+		t.Fatal(err)
+	}
+	if before < 100 {
+		t.Fatalf("expected a sizable freelist to reclaim; got %d free pages", before)
+	}
+
+	if err := e.Compact(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+
+	var after int
+	if err := e.db.queryRowScan(ctx, []any{&after}, `PRAGMA freelist_count`); err != nil {
+		t.Fatal(err)
+	}
+	if after > 16 {
+		t.Fatalf("Compact left %d free pages (was %d); incremental reclaim should empty the freelist", after, before)
+	}
+	fi2, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi2.Size() >= fi1.Size() {
+		t.Fatalf("Compact did not shrink the file: %d -> %d bytes", fi1.Size(), fi2.Size())
+	}
+}
+
 // ─── Single-writer lock ─────────────────────────────────────────────────────
 
 // MQLITE-6: a local file DB is single-writer — a second opener is rejected with

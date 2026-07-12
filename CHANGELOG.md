@@ -37,6 +37,10 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 - **The dev `docker-compose.yml` is secure by default** (MQLITE-74): it binds loopback only
   (`127.0.0.1`), ships no baked-in token (the broker generates one and logs it), and defaults
   CORS off.
+- **`mqlite vacuum` (incremental) now actually reclaims disk** (MQLITE-78): it runs the full
+  checkpoint → `incremental_vacuum` (to completion) → checkpoint sequence, so freed pages are
+  returned to the OS and the file shrinks. Previously it freed a single page and never shrank
+  the file while still reporting success.
 - **Default broker port is now `6754`, not `8080`** (MQLITE-84). `mqlite serve` with no
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container

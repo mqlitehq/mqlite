@@ -268,44 +268,42 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 	if free < freePageReclaimMin {
 		return
 	}
-	// Pin ONE connection so the three steps share session state — splitting them across
-	// pooled exec() calls reclaims almost nothing, because the freelist incremental_vacuum
-	// sees isn't the materialized one (a drained-but-idle broker then keeps its high-water
-	// file). The sequence: (1) TRUNCATE checkpoint flushes the WAL's freed pages onto the
-	// main-DB freelist; (2) incremental_vacuum moves them to the end and drops the page
-	// count; (3) a second TRUNCATE checkpoint hands the truncated tail back to the OS (in
-	// WAL mode the file only shrinks at a checkpoint). Single writer, so neither blocks.
+	if err := e.reclaimPages(ctx); err != nil {
+		e.log.Error("janitor: reclaim failed", "err", err)
+	}
+}
+
+// reclaimPages returns free pages to the OS on a pinned connection so the steps share
+// session state (splitting them across pooled exec() calls reclaims almost nothing). The
+// sequence: (1) a TRUNCATE checkpoint flushes the WAL's freed pages onto the main-DB
+// freelist; (2) incremental_vacuum moves them to the end and drops the page count — it frees
+// one page per result step, so the rows MUST be drained to completion (a single Exec reclaims
+// exactly one page); (3) a second TRUNCATE checkpoint hands the truncated tail back to the OS
+// (in WAL mode the file only shrinks at a checkpoint). Single writer, so neither blocks.
+// Shared by the background janitor and Compact(false) (MQLITE-78).
+func (e *Engine) reclaimPages(ctx context.Context) error {
 	conn, err := e.db.sql.Conn(ctx)
 	if err != nil {
-		e.log.Error("janitor: reclaim acquire conn failed", "err", err)
-		return
+		return err
 	}
 	defer conn.Close()
 	if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		e.log.Error("janitor: reclaim pre-checkpoint failed", "err", err)
-		return
+		return err
 	}
-	// incremental_vacuum frees one page per result step, so the rows MUST be iterated to
-	// completion — an Exec (a single step) reclaims exactly one page, leaving the rest on
-	// the freelist. Drive it to the end, then a TRUNCATE checkpoint returns the truncated
-	// tail to the OS (in WAL mode the file only shrinks at a checkpoint).
 	rows, err := conn.QueryContext(ctx, `PRAGMA incremental_vacuum`)
 	if err != nil {
-		e.log.Error("janitor: incremental_vacuum failed", "err", err)
-		return
+		return err
 	}
 	for rows.Next() {
 		// each step frees one more page; iterating reclaims the whole freelist
 	}
-	cerr := rows.Err()
+	if cerr := rows.Err(); cerr != nil {
+		_ = rows.Close()
+		return cerr
+	}
 	_ = rows.Close()
-	if cerr != nil {
-		e.log.Error("janitor: incremental_vacuum drain failed", "err", cerr)
-		return
-	}
-	if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		e.log.Error("janitor: reclaim post-checkpoint failed", "err", err)
-	}
+	_, err = conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
 }
 
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
