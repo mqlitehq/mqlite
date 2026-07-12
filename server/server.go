@@ -279,6 +279,12 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 	case errors.Is(err, engine.ErrMessageTooLarge):
 		writeErr(w, http.StatusRequestEntityTooLarge, "message_too_large", err.Error())
+	case errors.Is(err, engine.ErrOutcomeUnknown):
+		// The remote write may or may not have applied (lost commit ack). Give it a
+		// distinct code so the SDK reconstructs ErrOutcomeUnknown and the caller
+		// reconciles by message_id/dedup instead of blindly retrying a 500 into a
+		// double-apply (MQLITE-59). 503: the durability is uncertain, not a bad request.
+		writeErr(w, http.StatusServiceUnavailable, "outcome_unknown", err.Error())
 	case errors.Is(err, context.Canceled):
 		writeErr(w, 499, "canceled", err.Error())
 	default:

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -224,15 +225,30 @@ func (d *db) close() error {
 
 const maxConnAttempts = 6
 
+// isConnErr reports a dropped/half-open remote transport: the request may or may not
+// have reached the primary. It gates both read retry (safe — reads are idempotent) and
+// the write outcome-unknown signal. It deliberately spans the WHOLE transport-failure
+// family, not just "connection reset": the libSQL/Hrana client returns the network error
+// un-wrapped from the POST that carries a write, so a lost commit ack most often surfaces
+// as a bare io.EOF / "broken pipe" / "i/o timeout" — especially behind a proxy like Fly,
+// where an upstream drop reads as EOF, not RST (MQLITE-59). A structured server *response*
+// ("error code 500: …") is a definite non-commit and is intentionally NOT matched here.
 func isConnErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, driver.ErrBadConn) {
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
 		return true
 	}
 	s := err.Error()
-	for _, sub := range []string{"bad connection", "stream is closed", "stream closed", "connection reset"} {
+	for _, sub := range []string{
+		"bad connection", "stream is closed", "stream closed",
+		"connection reset", "broken pipe", "i/o timeout", "unexpected EOF", "EOF",
+	} {
 		if strings.Contains(s, sub) {
 			return true
 		}
