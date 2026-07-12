@@ -178,6 +178,7 @@ func (e *Embedded) Message(queue string, seq int64, lockToken string) *Message {
 	return &Message{queue: queue, SequenceNumber: seq, lockToken: lockToken, s: e}
 }
 
+// CompleteBatch completes many messages in one transaction, returning a per-message result.
 func (e *Embedded) CompleteBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]engine.SettleItem, len(msgs))
 	for i, m := range msgs {
@@ -243,7 +244,9 @@ func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]
 			SequenceNumber: p.SeqNumber, State: p.State, Body: p.Body, MessageID: p.MessageID,
 			GroupID: p.GroupID, CorrelationID: p.CorrelationID, ReplyTo: p.ReplyTo, Subject: p.Subject, ContentType: p.ContentType,
 			Properties: p.Properties, DeliveryCount: p.DeliveryCount,
-			EnqueuedAt: msToTime(p.EnqueuedAtMs), VisibleAt: msToTime(p.VisibleAtMs), LockedUntil: msToTime(p.LockedUntilMs),
+			EnqueuedAt: msToTime(p.EnqueuedAtMs), VisibleAt: msToTime(p.VisibleAtMs),
+			ExpiresAt: msToTime(p.ExpiresAtMs), LockedUntil: msToTime(p.LockedUntilMs),
+			DeadLetterReason: p.DeadLetterReason, DeadLetterDescription: p.DeadLetterDescription,
 		}
 	}
 	return out, nil
@@ -277,7 +280,6 @@ func (e *Embedded) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (
 	return e.eng.Purge(ctx, queue, firstOpt(opts).toEngine())
 }
 
-// Receiver returns a stateful receive loop bound to the embedded engine.
 // Status returns a desensitized snapshot of the local backend (the embedded twin of
 // Client.Status). Version is empty (no broker); queue/subscription counts are live.
 func (e *Embedded) Status(ctx context.Context) (StatusInfo, error) {
@@ -326,6 +328,7 @@ func (e *Embedded) TestFilter(ctx context.Context, expr string, sample *OutMessa
 	return engine.TestFilter(expr, es, enqueuedAtMs, visibleAtMs), nil
 }
 
+// Receiver returns a stateful receive loop bound to the embedded engine.
 func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 	return newReceiver(e, queue, opts)
 }

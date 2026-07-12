@@ -1,9 +1,10 @@
 package main
 
-// The data-plane / admin commands that complete the CLI to full HTTP-API + MCP parity
-// (MQLITE-92): settlement by lock token, schedule/cancel, deferred receive, status,
-// test-filter, list-subscriptions. Each works identically in client and embedded mode via
-// the shared `api` interface, and honors --output text|json.
+// The data-plane / admin commands that make the CLI a high-value first-party client for the
+// common broker operations (MQLITE-92): settlement by lock token, schedule/cancel, deferred
+// receive, status, test-filter, list-subscriptions. Each works in client and embedded mode
+// via the shared `api` interface, and honors --output text|json. It is NOT a lossless view
+// of every wire field — for the full HTTP contract see docs/api-reference.md.
 
 import (
 	"context"
@@ -17,31 +18,51 @@ import (
 )
 
 // msgView is the JSON shape for a delivered message (--output json). Body is base64, the
-// same lossless encoding the HTTP wire uses. LockToken is included only where the caller
-// needs it to settle later (receive --no-ack, receive-deferred).
+// same lossless encoding the HTTP wire uses; timestamps are epoch-ms (0 = unset, omitted).
+// LockToken is included only where the caller needs it to settle later (receive --no-ack,
+// receive-deferred). Keys mirror the wire (review 2026-07-12 P2-2).
 type msgView struct {
 	Seq           int64             `json:"seq"`
 	DeliveryCount int               `json:"delivery_count,omitempty"`
 	MessageID     string            `json:"message_id,omitempty"`
 	GroupID       string            `json:"group_id,omitempty"`
+	CorrelationID string            `json:"correlation_id,omitempty"`
 	Subject       string            `json:"subject,omitempty"`
 	ReplyTo       string            `json:"reply_to,omitempty"`
+	ContentType   string            `json:"content_type,omitempty"`
 	Body          string            `json:"body"`
 	Properties    map[string]string `json:"properties,omitempty"`
+	EnqueuedAtMs  int64             `json:"enqueued_at_ms,omitempty"`
+	LockedUntilMs int64             `json:"locked_until_ms,omitempty"`
 	LockToken     string            `json:"lock_token,omitempty"`
 }
 
 // peekView is the JSON shape for a browsed (peeked) message — no lock token (peek never
-// locks). Body is base64, like the wire.
+// locks). Body is base64; DLQ reason/description are set for dead-lettered messages.
 type peekView struct {
-	Seq           int64             `json:"seq"`
-	State         string            `json:"state"`
-	DeliveryCount int               `json:"delivery_count,omitempty"`
-	MessageID     string            `json:"message_id,omitempty"`
-	GroupID       string            `json:"group_id,omitempty"`
-	Subject       string            `json:"subject,omitempty"`
-	Body          string            `json:"body"`
-	Properties    map[string]string `json:"properties,omitempty"`
+	Seq                   int64             `json:"seq"`
+	State                 string            `json:"state"`
+	DeliveryCount         int               `json:"delivery_count,omitempty"`
+	MessageID             string            `json:"message_id,omitempty"`
+	GroupID               string            `json:"group_id,omitempty"`
+	CorrelationID         string            `json:"correlation_id,omitempty"`
+	Subject               string            `json:"subject,omitempty"`
+	ReplyTo               string            `json:"reply_to,omitempty"`
+	ContentType           string            `json:"content_type,omitempty"`
+	Body                  string            `json:"body"`
+	Properties            map[string]string `json:"properties,omitempty"`
+	EnqueuedAtMs          int64             `json:"enqueued_at_ms,omitempty"`
+	ExpiresAtMs           int64             `json:"expires_at_ms,omitempty"`
+	DeadLetterReason      string            `json:"dead_letter_reason,omitempty"`
+	DeadLetterDescription string            `json:"dead_letter_description,omitempty"`
+}
+
+// msIfSet returns t as epoch-ms, or 0 for the zero time (so omitempty drops it).
+func msIfSet(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
 }
 
 func viewPeeked(ms []*mqlite.PeekedMessage) []peekView {
@@ -49,8 +70,11 @@ func viewPeeked(ms []*mqlite.PeekedMessage) []peekView {
 	for i, m := range ms {
 		out[i] = peekView{
 			Seq: m.SequenceNumber, State: string(m.State), DeliveryCount: m.DeliveryCount,
-			MessageID: m.MessageID, GroupID: m.GroupID, Subject: m.Subject,
+			MessageID: m.MessageID, GroupID: m.GroupID, CorrelationID: m.CorrelationID,
+			Subject: m.Subject, ReplyTo: m.ReplyTo, ContentType: m.ContentType,
 			Body: base64.StdEncoding.EncodeToString(m.Body), Properties: m.Properties,
+			EnqueuedAtMs: msIfSet(m.EnqueuedAt), ExpiresAtMs: msIfSet(m.ExpiresAt),
+			DeadLetterReason: m.DeadLetterReason, DeadLetterDescription: m.DeadLetterDescription,
 		}
 	}
 	return out
@@ -59,8 +83,10 @@ func viewPeeked(ms []*mqlite.PeekedMessage) []peekView {
 func viewMsg(m *mqlite.Message, withToken bool) msgView {
 	v := msgView{
 		Seq: m.SequenceNumber, DeliveryCount: m.DeliveryCount, MessageID: m.MessageID,
-		GroupID: m.GroupID, Subject: m.Subject, ReplyTo: m.ReplyTo,
+		GroupID: m.GroupID, CorrelationID: m.CorrelationID, Subject: m.Subject,
+		ReplyTo: m.ReplyTo, ContentType: m.ContentType,
 		Body: base64.StdEncoding.EncodeToString(m.Body), Properties: m.Properties,
+		EnqueuedAtMs: msIfSet(m.EnqueuedAt), LockedUntilMs: msIfSet(m.LockedUntil),
 	}
 	if withToken {
 		v.LockToken = m.LockToken()
@@ -103,7 +129,7 @@ func cmdSettle(ctx context.Context, verb string, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 3 {
+	if len(pos) != 3 {
 		return fmt.Errorf("usage: %s <queue> <seq> <lock-token>", verb)
 	}
 	seq, err := strconv.ParseInt(pos[1], 10, 64)
@@ -169,18 +195,26 @@ func cmdSchedule(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return okResult(map[string]any{"queue": pos[0], "seq": seq, "at": when.UTC().Format(time.RFC3339)}, "queue", "seq", "at")
+	return okResult(map[string]any{"queue": pos[0], "seq": seq, "at": when.UTC().Format(time.RFC3339Nano)}, "queue", "seq", "at")
 }
 
-// parseWhen accepts an absolute RFC3339 timestamp or a duration from now.
+// parseWhen accepts an absolute RFC3339 timestamp or a duration from now, and requires the
+// result to be in the future — `schedule` is future-delivery, and rejecting a past time is
+// consistent across embedded and remote (a past schedule otherwise activates immediately,
+// so its state read back differs by timing between modes — review 2026-07-12 P2-1).
 func parseWhen(s string) (time.Time, error) {
+	var when time.Time
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t, nil
+		when = t
+	} else if d, derr := time.ParseDuration(s); derr == nil {
+		when = time.Now().Add(d)
+	} else {
+		return time.Time{}, fmt.Errorf("invalid --at %q: want RFC3339 (2026-01-02T15:04:05Z) or a duration (30m)", s)
 	}
-	if d, err := time.ParseDuration(s); err == nil {
-		return time.Now().Add(d), nil
+	if !when.After(time.Now()) {
+		return time.Time{}, fmt.Errorf("--at must be in the future (got %s)", when.Format(time.RFC3339))
 	}
-	return time.Time{}, fmt.Errorf("invalid --at %q: want RFC3339 (2026-01-02T15:04:05Z) or a duration (30m)", s)
+	return when, nil
 }
 
 // ─── cancel: delete a not-yet-activated scheduled message ───────────────────────────
@@ -190,7 +224,7 @@ func cmdCancel(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 2 {
+	if len(pos) != 2 {
 		return fmt.Errorf("usage: cancel <queue> <seq>")
 	}
 	seq, err := strconv.ParseInt(pos[1], 10, 64)
@@ -216,7 +250,7 @@ func cmdReceiveDeferred(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 || *seqCSV == "" {
+	if len(pos) != 1 || *seqCSV == "" {
 		return fmt.Errorf("usage: receive-deferred <queue> --seq 42,57")
 	}
 	seqs, err := parseSeqCSV(*seqCSV)
@@ -257,8 +291,12 @@ func parseSeqCSV(s string) ([]int64, error) {
 // ─── status: desensitized backend snapshot ──────────────────────────────────────────
 func cmdStatus(ctx context.Context, args []string) error {
 	fs := newFlags("status")
-	if _, err := parseInterspersed(fs, args); err != nil {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) != 0 {
+		return fmt.Errorf("usage: status  (takes no arguments)")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -290,8 +328,12 @@ func cmdStatus(ctx context.Context, args []string) error {
 // ─── list-subscriptions: topic membership + filter expressions ──────────────────────
 func cmdListSubscriptions(ctx context.Context, args []string) error {
 	fs := newFlags("list-subscriptions")
-	if _, err := parseInterspersed(fs, args); err != nil {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) != 0 {
+		return fmt.Errorf("usage: list-subscriptions  (takes no arguments)")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -303,6 +345,9 @@ func cmdListSubscriptions(ctx context.Context, args []string) error {
 		return err
 	}
 	if jsonOut() {
+		if subs == nil {
+			subs = []mqlite.SubscriptionInfo{} // JSON must be [] not null
+		}
 		return emitJSON(subs)
 	}
 	if len(subs) == 0 {

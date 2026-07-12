@@ -128,6 +128,7 @@ usage: mqlite <command> [flags]
   subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate')
   list                      list queues
   list-subscriptions        list subscriptions with their topic + filter
+  peek <queue>              browse messages without locking (--state --from --max)
   test-filter <expr>        dry-run a filter expression against an optional sample
   metrics <queue>           show queue counters
   status                    backend snapshot (backend, ping, size, counts)
@@ -149,7 +150,7 @@ usage: mqlite <command> [flags]
 
   version | help
 
-global flags (any command): --endpoint URL --token T --output text|json
+global flags (data/admin commands, not serve): --endpoint URL --token T --output text|json
 connection: --endpoint/--token or MQLITE_ENDPOINT+MQLITE_TOKEN (client), else MQLITE_DB (embedded)
 `)
 }
@@ -678,8 +679,11 @@ func cmdReceive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 {
-		return fmt.Errorf("usage: receive <queue> [--max 1 --wait 5s --no-ack --delete]")
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: receive <queue> [--max 1 --wait 5s --no-ack | --delete]")
+	}
+	if *del && *noAck { // mutually exclusive — don't silently let one win
+		return fmt.Errorf("--delete and --no-ack are mutually exclusive")
 	}
 	queue := pos[0]
 	c, err := dial(ctx)
@@ -814,6 +818,9 @@ func cmdList(ctx context.Context, args []string) error {
 		return err
 	}
 	if jsonOut() {
+		if qs == nil {
+			qs = []mqlite.QueueInfo{} // JSON must be [] not null (embedded returns a nil slice)
+		}
 		return emitJSON(qs)
 	}
 	if len(qs) == 0 {
