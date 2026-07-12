@@ -332,11 +332,19 @@ func apiDeferOne(t *testing.T, ctx context.Context, queue string) int64 {
 
 // TestCLIParseHelpers covers the small argument parsers.
 func TestCLIParseHelpers(t *testing.T) {
-	if _, err := parseWhen("2026-01-02T15:04:05Z"); err != nil {
-		t.Errorf("RFC3339: %v", err)
+	// A future RFC3339 or duration is accepted; a past time or garbage is rejected (P2-1).
+	future := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	if _, err := parseWhen(future); err != nil {
+		t.Errorf("future RFC3339: %v", err)
 	}
 	if w, err := parseWhen("30m"); err != nil || w.IsZero() {
 		t.Errorf("duration: %v", err)
+	}
+	if _, err := parseWhen("2000-01-01T00:00:00Z"); err == nil {
+		t.Error("a past --at must be rejected")
+	}
+	if _, err := parseWhen("-30m"); err == nil {
+		t.Error("a negative duration --at must be rejected")
 	}
 	if _, err := parseWhen("nonsense"); err == nil {
 		t.Error("garbage --at must error")

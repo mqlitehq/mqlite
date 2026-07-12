@@ -232,6 +232,8 @@ func (c *Client) Message(queue string, seq int64, lockToken string) *Message {
 	return &Message{queue: queue, SequenceNumber: seq, lockToken: lockToken, s: c}
 }
 
+// CompleteBatch completes many messages in one request (one settlement RPC instead of N),
+// returning a per-message result so a caller can see which sequence numbers settled.
 func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]wire.SettleItem, len(msgs))
 	for i, m := range msgs {
@@ -463,7 +465,11 @@ type PeekedMessage struct {
 	DeliveryCount  int
 	EnqueuedAt     time.Time
 	VisibleAt      time.Time
+	ExpiresAt      time.Time // TTL expiry (zero = no TTL)
 	LockedUntil    time.Time
+	// Dead-letter metadata, set for messages in the dead_lettered state (triage).
+	DeadLetterReason      string
+	DeadLetterDescription string
 }
 
 func wireToPeeked(wm wire.Message) *PeekedMessage {
@@ -481,6 +487,10 @@ func wireToPeeked(wm wire.Message) *PeekedMessage {
 		DeliveryCount:  wm.DeliveryCount,
 		EnqueuedAt:     msToTime(wm.EnqueuedAtMs),
 		VisibleAt:      msToTime(wm.VisibleAtMs),
+		ExpiresAt:      msToTime(wm.ExpiresAtMs),
 		LockedUntil:    msToTime(wm.LockedUntilMs),
+
+		DeadLetterReason:      wm.DeadLetterReason,
+		DeadLetterDescription: wm.DeadLetterDescription,
 	}
 }

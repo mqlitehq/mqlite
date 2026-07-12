@@ -33,9 +33,11 @@ The DB string / endpoint is **only** read from the environment, never compiled i
 | `--token <bearer>` | Bearer token for `--endpoint` (overrides `MQLITE_TOKEN`) |
 | `--output text\|json` | `text` (default, human) or `json` (machine-readable, for scripting) |
 
-The CLI is a complete client for the HTTP API — every operation the broker exposes has a
-command, in both embedded and client mode. In `--output json`, message bodies are base64
-(the same lossless encoding as the wire).
+The CLI is a first-party client covering the common broker operations, in both embedded and
+client mode. It is not a lossless view of every wire field — for the complete HTTP contract
+(all fields, batch send, attempt ids) use raw HTTP against the routes in
+[api-reference.md](api-reference.md). In `--output json`, message bodies are base64 (the
+same lossless encoding as the wire) and timestamps are epoch-ms.
 
 > **Settling across invocations needs a broker.** `receive --no-ack` locks a message and
 > prints its `lock-token`; you settle it later with `complete/abandon/reject/defer/renew
@@ -127,8 +129,12 @@ mqlite peek orders --state dead_lettered --max 20
 | `--max` | 16 | max messages |
 
 ### `metrics <queue>` — queue counters
+Prints a human line by default; use `--output json` for the JSON object. (**Changed in
+0.3.0:** `metrics` previously printed JSON unconditionally — scripts that parsed the old
+default must add `--output json`.)
 ```bash
-mqlite metrics orders     # active / locked / deferred / scheduled / dead_lettered / total
+mqlite metrics orders                 # active / locked / deferred / scheduled / dead_lettered / total
+mqlite metrics orders --output json   # machine-readable
 ```
 
 ### `list` — list queues & subscriptions
@@ -186,7 +192,7 @@ mqlite renew    orders 42 lt_9f3a…                 # extend the lock lease
 ### `schedule <queue> <body>` — enqueue for future delivery
 ```bash
 mqlite schedule orders '{"id":1}' --at 30m                     # a duration from now
-mqlite schedule orders '{"id":1}' --at 2026-01-02T15:04:05Z    # or an absolute RFC3339 time
+mqlite schedule orders '{"id":1}' --at 2027-01-02T15:04:05Z    # or an absolute RFC3339 time (must be future)
 ```
 | Flag | | |
 |---|---|---|

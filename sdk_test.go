@@ -371,6 +371,20 @@ func TestRemoteNegativeDurationRejected(t *testing.T) {
 	}
 }
 
+// TestRemoteSchedulePastRejected proves the future-schedule check is enforced at the broker
+// (engine clock), not just the CLI — a past schedule via the SDK is rejected regardless of
+// the caller's clock (MQLITE-94 codex follow-up).
+func TestRemoteSchedulePastRejected(t *testing.T) {
+	ctx := context.Background()
+	cli, _ := newBroker(t, "")
+	if err := cli.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}, mqlite.SendOpts{At: time.Now().Add(-time.Hour)}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Errorf("a past schedule should be rejected at the broker, got %v", err)
+	}
+}
+
 func TestReceiverRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

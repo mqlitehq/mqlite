@@ -103,7 +103,15 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   - **Broker DLQ retention no longer applies to one-shot CLI commands** — `send`/`receive`/etc.
     no longer start the retention janitor; only `serve` applies it (docs already documented it
     as serve-only).
-- **The `mqlite` CLI is now a complete client for the HTTP API** (MQLITE-92): new commands
+- **Scheduling a past/now time is now rejected** (0.3.0): `Schedule`/`ScheduleBatch` (and the
+  broker's Schedule route) return `invalid_argument` when the time is not in the future —
+  `schedule` is future delivery; use `Send` for immediate. Enforced against the broker clock,
+  so a CLI on a skewed host can't disagree.
+- **`mqlite metrics` now prints a human line by default** (0.3.0), not JSON — it honored no
+  `--output` flag before. Scripts that parsed the old JSON default must add `--output json`.
+- **The `mqlite` CLI is now a first-party client for the common broker operations** (MQLITE-92,
+  covering the everyday surface — not a lossless view of every wire field; use raw HTTP for the
+  full contract): new commands
   `complete`/`abandon`/`reject`/`defer`/`renew` (settle a `receive --no-ack` message by
   `<queue> <seq> <lock-token>`), `schedule`/`cancel`, `receive-deferred`, `status`,
   `list-subscriptions`, and `test-filter`; global `--endpoint`/`--token` flags (override the

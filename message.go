@@ -5,8 +5,9 @@ import (
 	"time"
 )
 
-// Message is a delivered message handle. The lock token is held internally and
-// never exposed, so settlement can't be misrouted (§17.1).
+// Message is a delivered message handle. The lock token is held internally so settlement
+// through the Complete/Abandon/… methods can't be misrouted (§17.1); LockToken() exposes it
+// for callers that must settle out of band (e.g. the CLI across processes).
 type Message struct {
 	SequenceNumber int64
 	Body           []byte
