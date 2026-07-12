@@ -335,6 +335,28 @@ func TestRetryableAndAttempts(t *testing.T) {
 	}
 }
 
+// A WRITE/COMMIT may only be replayed when the error guarantees it never applied
+// (driver.ErrBadConn or busy). A broad transport error like "connection reset" is
+// outcome-unknown — replaying it could double-apply, so it is NOT retryable for a write
+// (the caller gets ErrOutcomeUnknown). MQLITE-59.
+func TestRetryableWrite(t *testing.T) {
+	remote := &db{remote: true}
+	if !remote.retryableWrite(fmt.Errorf("exec: %w", driver.ErrBadConn)) {
+		t.Error("write on ErrBadConn must be retryable (the statement never ran)")
+	}
+	if !remote.retryableWrite(errors.New("database is locked")) {
+		t.Error("write on a busy error must be retryable (lock never acquired)")
+	}
+	for _, broad := range []string{"stream is closed", "read tcp: connection reset by peer", "bad connection"} {
+		if remote.retryableWrite(errors.New(broad)) {
+			t.Errorf("write on %q must NOT be retryable — outcome unknown, don't double-apply", broad)
+		}
+	}
+	if (&db{}).retryableWrite(fmt.Errorf("x: %w", driver.ErrBadConn)) {
+		t.Error("local writes must never retry")
+	}
+}
+
 // isBusyErr classifies a contended-write failure from the remote primary, which —
 // unlike a logical error — is safe to retry because the lock was never acquired
 // (MQLITE-4 concurrency hardening).

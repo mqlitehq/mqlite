@@ -277,6 +277,16 @@ func (d *db) retryable(err error) bool {
 	return d.remote && (isConnErr(err) || isBusyErr(err))
 }
 
+// retryableWrite is retryable for a WRITE or COMMIT: safe to replay only when the error
+// guarantees the statement never applied — driver.ErrBadConn (database/sql's "retry on a
+// fresh connection" signal) or a busy error (the lock was never acquired). A broad transport
+// error like "connection reset" on a write is outcome-unknown (the primary may have committed
+// before the ack was lost), so it is NOT replayed — the caller gets ErrOutcomeUnknown instead
+// of a silent double-apply (MQLITE-59).
+func (d *db) retryableWrite(err error) bool {
+	return d.remote && (errors.Is(err, driver.ErrBadConn) || isBusyErr(err))
+}
+
 func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	var res sql.Result
 	var err error
@@ -285,9 +295,16 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 			d.backoff(ctx, i)
 		}
 		res, err = d.sql.ExecContext(ctx, query, args...)
-		if err == nil || !d.retryable(err) {
-			return res, err
+		if err == nil || !d.retryableWrite(err) {
+			break
 		}
+	}
+	// A remote write that ended on an outcome-unknown transport error (a broad "connection
+	// reset", not driver.ErrBadConn/busy) may have applied server-side before the ack was
+	// lost — surface it as ErrOutcomeUnknown so the caller can't blindly retry into a
+	// double-apply (MQLITE-59).
+	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
+		return res, fmt.Errorf("%w: %v", ErrOutcomeUnknown, err)
 	}
 	return res, err
 }
@@ -371,8 +388,15 @@ func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		}
 		err = tx.Commit()
 		if err != nil {
-			if e.db.retryable(err) {
-				continue
+			if e.db.retryableWrite(err) {
+				continue // ErrBadConn / busy: the commit provably didn't land, safe to replay
+			}
+			if e.db.remote && isConnErr(err) {
+				// Outcome-unknown commit transport error: the primary may have durably
+				// committed before the ack was lost, so replaying the whole closure would
+				// double-apply (e.g. a second insert). Surface it instead of retrying
+				// (MQLITE-59). Transparent retry needs durable per-op idempotency — deferred.
+				return fmt.Errorf("%w: %v", ErrOutcomeUnknown, err)
 			}
 			return err
 		}
