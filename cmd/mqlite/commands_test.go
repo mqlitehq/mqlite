@@ -112,6 +112,19 @@ func TestResolveListenAddr(t *testing.T) {
 	}
 }
 
+// TestReadCapped: an over-limit stdin body must error, never be silently truncated (MQLITE-79).
+func TestReadCapped(t *testing.T) {
+	if b, err := readCapped(strings.NewReader("hello"), 16); err != nil || string(b) != "hello" {
+		t.Fatalf("under cap: got %q err %v", b, err)
+	}
+	if b, err := readCapped(strings.NewReader(strings.Repeat("x", 16)), 16); err != nil || len(b) != 16 {
+		t.Fatalf("exactly at cap: len %d err %v", len(b), err)
+	}
+	if _, err := readCapped(strings.NewReader(strings.Repeat("x", 17)), 16); err == nil {
+		t.Fatal("one byte over the cap must error, not truncate")
+	}
+}
+
 func TestCommandsEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("MQLITE_ENDPOINT", "") // force the embedded path in dial()

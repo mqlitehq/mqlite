@@ -714,6 +714,24 @@ func mib(b int64) float64 { return float64(b) / (1 << 20) }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+// maxStdinBytes caps a '-' (stdin) message body. It is a local safety net that fails loud
+// rather than silently truncating; the broker's own limit (413 message_too_large) is the
+// real ceiling, and --file has no cap for genuinely large payloads.
+const maxStdinBytes = 16 << 20 // 16 MiB
+
+// readCapped reads all of r but returns an error if it exceeds max bytes, instead of
+// silently truncating an over-limit body (MQLITE-79).
+func readCapped(r io.Reader, max int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("stdin body exceeds the %d MiB CLI limit; use --file for larger messages", max>>20)
+	}
+	return b, nil
+}
+
 func readBody(file string, rest []string) ([]byte, error) {
 	if file != "" {
 		return os.ReadFile(file)
@@ -722,7 +740,7 @@ func readBody(file string, rest []string) ([]byte, error) {
 		return nil, fmt.Errorf("no body given (provide a body argument, --file, or '-')")
 	}
 	if rest[0] == "-" {
-		return io.ReadAll(io.LimitReader(os.Stdin, 16<<20))
+		return readCapped(os.Stdin, maxStdinBytes)
 	}
 	return []byte(strings.Join(rest, " ")), nil
 }
