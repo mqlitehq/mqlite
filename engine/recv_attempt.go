@@ -84,6 +84,7 @@ func storeAttempt(ctx context.Context, tx *sql.Tx, queue, attemptID string, msgs
 // claimUpToTx is claimUpTo bound to an explicit transaction (idempotent receive).
 func (e *Engine) claimUpToTx(ctx context.Context, tx *sql.Tx, q queueRow, max int, mode ReceiveMode, now int64) ([]*Message, error) {
 	var out []*Message
+	var bytes int64
 	for i := 0; i < max; i++ {
 		m, err := e.claimOneTx(ctx, tx, q, now)
 		if err != nil {
@@ -100,6 +101,13 @@ func (e *Engine) claimUpToTx(ctx context.Context, tx *sql.Tx, q queueRow, max in
 			m.LockToken = ""
 		}
 		out = append(out, m)
+		// Stop once the response reaches the byte budget: we only ever claim messages we
+		// return (no claim-then-truncate), so the un-claimed rest stays active for the next
+		// Receive, and a single legal batch can't materialize gigabytes (MQLITE-80).
+		bytes += int64(len(m.Body))
+		if bytes >= maxResponseBytes {
+			break
+		}
 	}
 	return out, nil
 }
