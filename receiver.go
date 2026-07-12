@@ -42,10 +42,10 @@ func WithConcurrency(n int) ReceiverOption { return func(c *receiverConfig) { c.
 func WithPrefetch(n int) ReceiverOption { return func(c *receiverConfig) { c.prefetch = n } }
 
 // WithErrorHandler registers a callback for errors the receive loop would otherwise swallow:
-// a transient receive error being retried, or a per-message settle/renew failure (e.g. a
-// lost lock). It is advisory — for logging or metrics — and must not block. Errors that mean
-// the consumer is misconfigured or the source is gone (bad token, missing queue, engine
-// closed) are instead returned from Run (MQLITE-77); those are also passed here first.
+// a transient receive error being retried, or a per-message settle/renew failure (e.g. a lost
+// lock). It is advisory — for logging or metrics — is called serially (the Receiver guards
+// it, so a plain slice-append or counter is safe), and must not block. A permanent error
+// (bad token, missing queue) is passed here first and then also returned from Run (MQLITE-77).
 func WithErrorHandler(fn func(error)) ReceiverOption {
 	return func(c *receiverConfig) { c.onError = fn }
 }
@@ -56,6 +56,7 @@ type Receiver struct {
 	src   receiveSource
 	queue string
 	cfg   receiverConfig
+	errMu sync.Mutex // serializes onError across the loop, worker, and renew goroutines
 }
 
 func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiver {
@@ -70,20 +71,22 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 }
 
 func (r *Receiver) notify(err error) {
-	if r.cfg.onError != nil && err != nil {
-		r.cfg.onError(err)
+	if r.cfg.onError == nil || err == nil {
+		return
 	}
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	r.cfg.onError(err)
 }
 
 // isPermanent reports whether an error will not be fixed by retrying and means the consumer
-// is misconfigured (bad token, missing queue) or the source is gone (engine closed): the
-// receive loop stops and Run returns it, instead of spinning forever. Transient errors
-// (network, 5xx, timeouts) and an expected ErrLockLost are not permanent.
+// is misconfigured — a bad token or a missing queue: the receive loop stops and Run returns
+// it, instead of spinning forever. Transient errors (network, 5xx, timeouts) and an expected
+// ErrLockLost are not permanent.
 func isPermanent(err error) bool {
 	return errors.Is(err, ErrUnauthenticated) ||
 		errors.Is(err, ErrNotFound) ||
-		errors.Is(err, ErrQueueNotFound) ||
-		errors.Is(err, engine.ErrClosed)
+		errors.Is(err, ErrQueueNotFound)
 }
 
 // reserve blocks until at least one worker slot is free (ctx-aware), then greedily takes up
@@ -159,11 +162,13 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		if err != nil && rctx.Err() == nil {
 			msgs, err = r.src.receiveOne(rctx, r.queue, n, 20000, engine.PeekLock, attemptID)
 		}
-		// Release the slots we reserved but did not fill.
-		for i := len(msgs); i < n; i++ {
-			<-sem
-		}
 		if err != nil {
+			// Release ALL reserved slots and drop any returned messages (their locks expire
+			// and redeliver — at-least-once safe): never leak capacity, even if a source ever
+			// returned messages together with an error.
+			for i := 0; i < n; i++ {
+				<-sem
+			}
 			if rctx.Err() != nil {
 				return done()
 			}
@@ -178,6 +183,10 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			case <-time.After(500 * time.Millisecond): // transient backoff
 			}
 			continue
+		}
+		// Release the slots we reserved but did not fill, then run a worker per message.
+		for i := len(msgs); i < n; i++ {
+			<-sem
 		}
 		for _, m := range msgs {
 			wg.Add(1)

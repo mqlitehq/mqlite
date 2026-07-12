@@ -180,6 +180,56 @@ func TestReceiverReservesCapacityBeforeClaim(t *testing.T) {
 	}
 }
 
+// MQLITE-77: an expected ErrLockLost on settle (the message was redelivered) is NOT fatal —
+// the loop keeps consuming and Run ends only on ctx cancellation — but it is still observed.
+func TestReceiverLockLostSettleIsNotFatal(t *testing.T) {
+	f := &fakeSource{completeErr: ErrLockLost}
+	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
+	var mu sync.Mutex
+	var observed error
+	r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(e error) {
+		mu.Lock()
+		observed = e
+		mu.Unlock()
+	})})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := r.Run(ctx, func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ErrLockLost settle must be non-fatal; Run should end on ctx, got %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !errors.Is(observed, ErrLockLost) {
+		t.Fatalf("observer should still see the lost-lock settle error, got %v", observed)
+	}
+}
+
+// A clean shutdown (ctx cancelled) still ends Run with ctx.Err(), never a spurious fatal —
+// the contract this change is careful to preserve.
+func TestReceiverGracefulShutdownReturnsCtxErr(t *testing.T) {
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
+	r := newReceiver(f, "q", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	handled := make(chan struct{}, 1)
+	errc := make(chan error, 1)
+	go func() {
+		errc <- r.Run(ctx, func(context.Context, *Message) error {
+			select {
+			case handled <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+	}()
+	<-handled // a message was processed
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("graceful shutdown must return context.Canceled, got %v", err)
+	}
+}
+
 // Each receive round must use a fresh, unique attempt id so distinct batches are
 // not collapsed by idempotent-receive dedup.
 func TestNewAttemptIDUnique(t *testing.T) {
