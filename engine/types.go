@@ -52,6 +52,10 @@ var (
 	ErrDBLocked              = errors.New("mqlite: database file is already open by another process")
 	ErrSchemaVersionMismatch = errors.New("mqlite: database schema version is incompatible with this build")
 	ErrInvalidFilter         = errors.New("mqlite: invalid subscription filter expression")
+	// ErrInvalidArgument is a caller-side request/config error (empty name, unknown
+	// enum, malformed body) — the server maps it to 400 invalid_argument rather than
+	// letting it leak out as an opaque 500 (MQLITE-86).
+	ErrInvalidArgument = errors.New("mqlite: invalid argument")
 )
 
 // QueueConfig configures a queue or subscription (entity-level defaults).

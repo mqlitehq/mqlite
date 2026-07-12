@@ -96,6 +96,8 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrNameConflict, eb.Message)
 	case "group_required":
 		return fmt.Errorf("%w: %s", ErrGroupRequired, eb.Message)
+	case "invalid_argument":
+		return fmt.Errorf("%w: %s", ErrInvalidArgument, eb.Message)
 	case "message_too_large":
 		return fmt.Errorf("%w: %s", ErrMessageTooLarge, eb.Message)
 	case "lock_lost":

@@ -83,6 +83,22 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("bad filter expr", http.MethodPost, wire.PathSubscribe, "secret", sub("bad", "subject =="), http.StatusBadRequest, "invalid_argument")
 	check("unknown filter field", http.MethodPost, wire.PathSubscribe, "secret", sub("bad2", `nope == "x"`), http.StatusBadRequest, "invalid_argument")
 	check("valid filter", http.MethodPost, wire.PathSubscribe, "secret", sub("ok", `subject_parts[0] == "a"`), http.StatusOK, "")
+
+	// Strict request validation (MQLITE-86): an unknown field or data after the JSON
+	// body is a typed 400, not a silently-dropped typo; empty name / unknown enum map
+	// to 400 invalid_argument instead of faulting a SQLite CHECK into a 500.
+	check("unknown field", http.MethodPost, wire.PathSend, "secret",
+		[]byte(`{"queue":"q","messsages":[]}`), http.StatusBadRequest, "invalid_argument")
+	check("trailing data after body", http.MethodPost, wire.PathSend, "secret",
+		[]byte(`{"queue":"q","messages":[]}{"queue":"q"}`), http.StatusBadRequest, "invalid_argument")
+	check("empty queue name", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: ""}), http.StatusBadRequest, "invalid_argument")
+	check("unknown ordering_mode", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "vq", Config: wire.QueueConfigJSON{OrderingMode: "fifo"}}),
+		http.StatusBadRequest, "invalid_argument")
+	check("valid create queue", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "vq", Config: wire.QueueConfigJSON{OrderingMode: "group_fifo"}}),
+		http.StatusOK, "")
 }
 
 // A request body over Server.MaxBodyBytes is rejected as 413 message_too_large

@@ -345,7 +345,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 
 | HTTP | `code` | When |
 |---|---|---|
-| 400 | `invalid_argument` | malformed JSON or a bad field |
+| 400 | `invalid_argument` | malformed JSON, an **unknown field**, trailing data after the object, a bad filter expression, an empty queue name, or an unknown enum (`kind` / `ordering_mode`). The decoder is strict — a typo'd field is a 400, not a silently-dropped no-op (`mqlite.ErrInvalidArgument`). |
 | 400 | `group_required` | a `group_fifo`/`strict_fifo` send with no `group_id` |
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
 | 404 | `not_found` | the queue or message doesn't exist; or an unknown path |
@@ -358,4 +358,5 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 500 | `internal` | unexpected server error |
 
 The Go SDK re-exports the sentinel errors (`mqlite.ErrLockLost`, `ErrDedupConflict`,
-`ErrOutcomeUnknown`, …) so `errors.Is` works in both embedded and client mode.
+`ErrInvalidArgument`, `ErrOutcomeUnknown`, …) so `errors.Is` works in both embedded and
+client mode.

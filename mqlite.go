@@ -22,6 +22,7 @@ var (
 	ErrLockLost        = engine.ErrLockLost
 	ErrUnauthenticated = engine.ErrUnauthenticated
 	ErrOutcomeUnknown  = engine.ErrOutcomeUnknown
+	ErrInvalidArgument = engine.ErrInvalidArgument
 	ErrNotFound        = engine.ErrNotFound
 	ErrQueueNotFound   = engine.ErrQueueNotFound
 	ErrDedupConflict   = engine.ErrDedupConflict

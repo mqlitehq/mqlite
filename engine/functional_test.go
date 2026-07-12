@@ -736,6 +736,41 @@ func TestTopicSubscriptionIsolation(t *testing.T) {
 // directions, including against subscription backing queues and the degenerate
 // self-reference. Legal upserts (same-name queue reconfig, same (topic,name)
 // re-subscribe) stay open.
+// CreateQueue/Subscribe must reject a request that would otherwise fault a SQLite
+// CHECK / NOT NULL into an opaque 500: an empty name or an unknown kind/ordering enum
+// comes back as the typed ErrInvalidArgument (→ 400) on BOTH paths (MQLITE-86 / D5).
+func TestCreateQueueValidation(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+
+	bad := []struct {
+		name string
+		q    string
+		cfg  QueueConfig
+	}{
+		{"empty name", "", QueueConfig{}},
+		{"unknown kind", "q", QueueConfig{Kind: "bogus"}},
+		{"unknown ordering", "q", QueueConfig{Ordering: "fifo"}},
+	}
+	for _, c := range bad {
+		if err := e.CreateQueue(ctx, c.q, c.cfg); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("%s: CreateQueue err = %v, want ErrInvalidArgument", c.name, err)
+		}
+	}
+
+	// Every valid ordering enum is still accepted (the guard didn't over-reject).
+	for _, ord := range []OrderingMode{OrderStandard, OrderGroupFIFO, OrderStrictFIFO} {
+		if err := e.CreateQueue(ctx, "q_"+string(ord), QueueConfig{Ordering: ord}); err != nil {
+			t.Errorf("ordering %q must be accepted: %v", ord, err)
+		}
+	}
+
+	// Subscribe routes through the same guard (empty subscription name).
+	if err := e.Subscribe(ctx, "ev", "", nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("Subscribe empty name = %v, want ErrInvalidArgument", err)
+	}
+}
+
 func TestTopicQueueNamespaceDisjoint(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
