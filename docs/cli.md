@@ -148,13 +148,18 @@ mqlite redrive orders --to orders-replay     # to another queue
 | `--older-than` | 0 | only messages older than this |
 
 ### `purge-dlq <queue>` — delete dead letters
+Destructive. An **unbounded** purge requires an explicit `--all`; otherwise pass a bound
+(`--max`/`--older-than`). Negative bounds are rejected (they would otherwise mean "no
+limit"). Exactly one positional `<queue>` — a stray argument is an error, not ignored.
 ```bash
-mqlite purge-dlq orders --older-than 24h
+mqlite purge-dlq orders --older-than 24h    # bounded
+mqlite purge-dlq orders --all               # delete the entire DLQ (explicit)
 ```
 | Flag | Default | |
 |---|---|---|
-| `--max` | 0 (all) | max messages |
-| `--older-than` | 0 | only messages older than this |
+| `--max` | 0 | max messages to delete (0 = unbounded → `--all` required) |
+| `--older-than` | 0 | only delete messages older than this |
+| `--all` | false | delete the entire DLQ (required to run unbounded) |
 
 ### `vacuum` — reclaim free DB pages to the OS
 Local maintenance (embedded; **stop the broker first** — the single-writer lock will

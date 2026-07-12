@@ -212,8 +212,19 @@ type RedriveOpts struct {
 	Rate      int           // throughput limit per second
 }
 
+// olderThanMs converts a duration to ms while PRESERVING the sign of a negative value: a
+// sub-millisecond negative (e.g. -1ns) would otherwise truncate to 0 and slip past the
+// engine's non-negative validation, letting a bounded purge/redrive delete everything
+// (review 2026-07-12). A real negative maps to -1 so validation rejects it.
+func olderThanMs(d time.Duration) int64 {
+	if d < 0 {
+		return -1
+	}
+	return d.Milliseconds()
+}
+
 func (o RedriveOpts) toEngine() engine.RedriveOptions {
-	return engine.RedriveOptions{Target: o.To, Max: o.Max, OlderThanMs: o.OlderThan.Milliseconds(), RatePerSec: o.Rate}
+	return engine.RedriveOptions{Target: o.To, Max: o.Max, OlderThanMs: olderThanMs(o.OlderThan), RatePerSec: o.Rate}
 }
 
 // PurgeOpts configures a Purge call.
@@ -223,7 +234,7 @@ type PurgeOpts struct {
 }
 
 func (o PurgeOpts) toEngine() engine.RedriveOptions {
-	return engine.RedriveOptions{Max: o.Max, OlderThanMs: o.OlderThan.Milliseconds()}
+	return engine.RedriveOptions{Max: o.Max, OlderThanMs: olderThanMs(o.OlderThan)}
 }
 
 // firstOpt returns opts[0] or the zero value, the shared "trailing variadic"

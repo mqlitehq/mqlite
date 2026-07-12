@@ -28,14 +28,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -160,6 +161,7 @@ type api interface {
 	Receive(ctx context.Context, queue string, opts ...mqlite.RecvOpts) ([]*mqlite.Message, error)
 	Peek(ctx context.Context, queue string, opts ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error)
 	Message(queue string, seq int64, lockToken string) *mqlite.Message
+	CompleteBatch(ctx context.Context, queue string, msgs ...*mqlite.Message) ([]mqlite.SettleResult, error)
 	Cancel(ctx context.Context, queue string, seq int64) error
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
@@ -177,16 +179,35 @@ type api interface {
 // (Go's flag package stops at the first positional otherwise).
 func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	var positionals []string
-	for {
+	for len(args) > 0 {
 		if err := fs.Parse(args); err != nil {
 			return nil, err
 		}
-		if fs.NArg() == 0 {
+		rest := fs.Args()
+		if len(rest) == 0 {
 			break
 		}
-		positionals = append(positionals, fs.Arg(0))
-		args = fs.Args()[1:]
+		// If flag.Parse stopped at a literal `--` terminator, every remaining token is a
+		// positional and must NEVER be re-parsed as a flag — standard CLI semantics, and it
+		// keeps a message body like `-- hello --output json` intact instead of truncating it
+		// and hijacking --output (review 2026-07-12 P1-4).
+		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+			positionals = append(positionals, rest...)
+			break
+		}
+		positionals = append(positionals, rest[0])
+		args = rest[1:]
 	}
+	// Note which global flags were explicitly given (Visit reports only set flags) so dial
+	// can honor `--token=` and isolate an ambient token from a changed endpoint (P1-5).
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "endpoint":
+			gEndpointSet = true
+		case "token":
+			gTokenSet = true
+		}
+	})
 	// Validate --output for the commands that registered it (via newFlags), so a typo like
 	// `--output jsno` is a loud usage error, not a silent fall-through to text (serve does
 	// not register it, so it is skipped).
@@ -263,9 +284,11 @@ func serveRetentionOpts() []mqlite.EmbeddedOption {
 // because a CLI runs exactly one command per process; --endpoint/--token override the
 // MQLITE_ENDPOINT/MQLITE_TOKEN env, and --output switches human text for JSON (scripting).
 var (
-	gEndpoint string
-	gToken    string
-	gOutput   string
+	gEndpoint    string
+	gToken       string
+	gOutput      string
+	gEndpointSet bool // --endpoint was explicitly passed (vs env fallback)
+	gTokenSet    bool // --token was explicitly passed (so an empty value means "no token")
 )
 
 // newFlags builds a command FlagSet with the global connection/output flags pre-registered,
@@ -281,26 +304,31 @@ func newFlags(name string) *flag.FlagSet {
 // jsonOut reports whether --output json was requested.
 func jsonOut() bool { return gOutput == "json" }
 
-// emitJSON prints v as indented JSON (used when --output json).
+// emitJSON prints v as indented JSON (used when --output json). It writes to stdout in one
+// call and RETURNS the write error — a lost/closed stdout must be observable so a consumer
+// (e.g. receive) never settles a message whose output failed (review 2026-07-12 P1-1).
 func emitJSON(v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	fmt.Println(string(b))
-	return nil
+	_, err = os.Stdout.Write(append(b, '\n'))
+	return err
 }
 
 // dial picks client mode (--endpoint / MQLITE_ENDPOINT set) or embedded mode (MQLITE_DB).
 func dial(ctx context.Context) (api, error) {
-	ep := gEndpoint
-	if ep == "" {
-		ep = os.Getenv("MQLITE_ENDPOINT")
+	envEp := os.Getenv("MQLITE_ENDPOINT")
+	ep := envEp
+	if gEndpointSet {
+		ep = gEndpoint
 	}
 	if ep != "" {
-		tok := gToken
-		if tok == "" {
-			tok = os.Getenv("MQLITE_TOKEN")
+		tok := resolveToken(ep, envEp)
+		// An explicit `--token=` means "send no credential" — also strip one embedded in the
+		// endpoint DSN (mqlite://secret@host), which WithToken("") would otherwise retain.
+		if gTokenSet && tok == "" {
+			ep = stripEndpointCredentials(ep)
 		}
 		return mqlite.Open(ctx, ep, mqlite.WithToken(tok))
 	}
@@ -309,6 +337,35 @@ func dial(ctx context.Context) (api, error) {
 		db = "file:./mq.db"
 	}
 	return mqlite.OpenEmbedded(ctx, db, embeddedOpts()...)
+}
+
+// resolveToken picks the bearer token for endpoint ep. An explicit --token wins verbatim —
+// including `--token=`, which means "send no token". Without --token, the ambient
+// MQLITE_TOKEN is reused ONLY when talking to the environment's own endpoint; if --endpoint
+// changed the authority, the token is withheld (and a warning printed) so a production
+// credential is never silently sent to a different host (review 2026-07-12 P1-5).
+func resolveToken(ep, envEp string) string {
+	if gTokenSet {
+		return gToken
+	}
+	if !gEndpointSet || ep == envEp {
+		return os.Getenv("MQLITE_TOKEN")
+	}
+	if os.Getenv("MQLITE_TOKEN") != "" {
+		fmt.Fprintln(os.Stderr, "warning: --endpoint changes the target host; MQLITE_TOKEN is NOT forwarded to it — pass --token to authenticate")
+	}
+	return ""
+}
+
+// stripEndpointCredentials removes any userinfo embedded in an endpoint DSN (e.g.
+// mqlite://secret@host), so an explicit `--token=` truly sends no credential.
+func stripEndpointCredentials(ep string) string {
+	u, err := url.Parse(ep)
+	if err != nil || u.User == nil {
+		return ep
+	}
+	u.User = nil
+	return u.String()
 }
 
 func cmdServe(ctx context.Context, args []string) error {
@@ -634,28 +691,46 @@ func cmdReceive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	// Auto-Complete each message PROMPTLY — before rendering the batch. Rendering a large
-	// batch (up to 256 × 1 MiB) to slow stdout could otherwise let the reaper expire the
-	// earlier locks mid-print and force a redelivery. --no-ack/--delete leave nothing to
-	// settle. A settlement failure must exit nonzero (MQLITE-88).
-	var settleErrs []error
-	if !*del && !*noAck {
-		for _, m := range msgs {
-			if err := m.Complete(ctx); err != nil {
-				fmt.Fprintln(os.Stderr, "  warn: complete:", err)
-				settleErrs = append(settleErrs, err)
-			}
-		}
+	// Render output FIRST and require it to succeed BEFORE settling. Settling before the
+	// caller actually receives the output would acknowledge a message they never got — on a
+	// closed stdout / broken pipe that silently downgrades Peek-Lock to at-most-once and
+	// LOSES the message (review 2026-07-12 P1-1). The lock token is shown only when the
+	// message stays locked (--no-ack) so it can be settled later.
+	autoAck := !*del && !*noAck
+	render := func() error { return printMsgs(msgs, *noAck && !*del) }
+	var outErr error
+	if autoAck {
+		// Keep the leases renewed while output is written, so a slow sink can't let the
+		// reaper reclaim messages whose bodies were already emitted (review 2026-07-12 P1).
+		outErr = renewWhile(ctx, msgs, render)
+	} else {
+		outErr = render()
 	}
-	// Show the lock token only when the message stays locked (--no-ack), so it can be
-	// settled in a later invocation (complete/abandon/reject/defer/renew <queue> <seq>
-	// <token>).
-	if err := printMsgs(msgs, *noAck && !*del); err != nil {
+	if *del || *noAck {
+		return outErr // nothing to auto-settle; surface any output error as a nonzero exit
+	}
+	if outErr != nil {
+		// Do NOT settle — leave the messages locked so they redeliver instead of vanishing.
+		return fmt.Errorf("output failed — %d message(s) left locked for redelivery: %w", len(msgs), outErr)
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	// Output delivered: settle the whole batch in ONE CompleteBatch RPC. N individual
+	// Completes at high latency can let later locks expire mid-batch (review 2026-07-12
+	// P1-3). Report the exact seqs that failed to settle (they will redeliver — MQLITE-88).
+	results, err := c.CompleteBatch(ctx, queue, msgs...)
+	if err != nil {
 		return err
 	}
-	if len(settleErrs) > 0 {
-		return fmt.Errorf("%d of %d message(s) failed to settle (see warnings above): %w",
-			len(settleErrs), len(msgs), errors.Join(settleErrs...))
+	var failed []int64
+	for _, r := range results {
+		if !r.Ok {
+			failed = append(failed, r.SequenceNumber)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%d of %d message(s) failed to settle (seq %v) — they will redeliver", len(failed), len(msgs), failed)
 	}
 	return nil
 }
@@ -761,8 +836,11 @@ func cmdRedrive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 {
+	if len(pos) != 1 { // exact arity — a stray positional must not be silently ignored (P1-2)
 		return fmt.Errorf("usage: redrive <queue> [--to target --max n --older-than 1h]")
+	}
+	if *max < 0 || *older < 0 {
+		return fmt.Errorf("--max and --older-than must be >= 0")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -778,14 +856,22 @@ func cmdRedrive(ctx context.Context, args []string) error {
 
 func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	fs := newFlags("purge-dlq")
-	max := fs.Int("max", 0, "max messages (0=all)")
-	older := fs.Duration("older-than", 0, "only messages older than this")
+	max := fs.Int("max", 0, "max messages to delete (0 = unbounded, then --all is required)")
+	older := fs.Duration("older-than", 0, "only delete messages older than this")
+	all := fs.Bool("all", false, "delete the ENTIRE DLQ (required to run with no --max/--older-than bound)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 {
-		return fmt.Errorf("usage: purge-dlq <queue> [--max n --older-than 1h]")
+	if len(pos) != 1 { // exact arity — a stray positional must not be silently ignored (P1-2)
+		return fmt.Errorf("usage: purge-dlq <queue> [--max n | --older-than 1h | --all]")
+	}
+	if *max < 0 || *older < 0 { // a negative bound would otherwise slip past the --all guard
+		return fmt.Errorf("--max and --older-than must be >= 0")
+	}
+	// Guard an unbounded destructive purge behind an explicit --all (review 2026-07-12 P1-2).
+	if *max == 0 && *older == 0 && !*all {
+		return fmt.Errorf("refusing to purge the entire DLQ without a bound — pass --max/--older-than, or --all to delete everything")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -891,38 +977,116 @@ func readBody(file string, rest []string) ([]byte, error) {
 // line each. withToken includes the lock token (only when the message stays locked and
 // must be settled later).
 func printMsgs(msgs []*mqlite.Message, withToken bool) error {
-	if jsonOut() {
-		views := make([]msgView, len(msgs))
-		for i, m := range msgs {
-			views[i] = viewMsg(m, withToken)
+	// Stream through a bufio.Writer: each message is written (and its error observed) as it
+	// is formatted, so output-before-settle holds WITHOUT holding the whole batch in memory.
+	// A legal 32 MiB batch %q-expands up to ~4×, which would OOM a small CLI if buffered
+	// (review 2026-07-12 P2). The final Flush surfaces a lost/closed stdout (P1-1).
+	w := bufio.NewWriter(os.Stdout)
+	switch {
+	case jsonOut():
+		if err := writeMsgJSON(w, msgs, withToken); err != nil {
+			return err
 		}
-		return emitJSON(views)
+	case len(msgs) == 0:
+		if _, err := w.WriteString("(no messages)\n"); err != nil {
+			return err
+		}
+	default:
+		for _, m := range msgs {
+			if _, err := w.WriteString(formatMsg(m, withToken)); err != nil {
+				return err
+			}
+		}
 	}
-	if len(msgs) == 0 {
-		fmt.Println("(no messages)")
-		return nil
-	}
-	for _, m := range msgs {
-		printMsg(m, withToken)
-	}
-	return nil
+	return w.Flush()
 }
 
-func printMsg(m *mqlite.Message, withToken bool) {
-	fmt.Printf("seq=%d deliveries=%d", m.SequenceNumber, m.DeliveryCount)
+// writeMsgJSON streams the message array element by element (never one batch-sized alloc).
+func writeMsgJSON(w *bufio.Writer, msgs []*mqlite.Message, withToken bool) error {
+	if _, err := w.WriteString("[\n"); err != nil {
+		return err
+	}
+	for i, m := range msgs {
+		b, err := json.MarshalIndent(viewMsg(m, withToken), "  ", "  ")
+		if err != nil {
+			return err
+		}
+		sep := "\n"
+		if i < len(msgs)-1 {
+			sep = ",\n"
+		}
+		if _, err := w.WriteString("  " + string(b) + sep); err != nil {
+			return err
+		}
+	}
+	_, err := w.WriteString("]\n")
+	return err
+}
+
+// renewWhile keeps a received batch's Peek-Lock leases alive (best-effort) while fn runs,
+// then returns fn's error. It renews at roughly half the tightest remaining lease, so a
+// slow output sink can't let the reaper reclaim messages whose bodies were already emitted
+// (review 2026-07-12 P1). During normal fast output the ticker never fires.
+func renewWhile(ctx context.Context, msgs []*mqlite.Message, fn func() error) error {
+	if len(msgs) == 0 {
+		return fn()
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(renewInterval(msgs))
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				for _, m := range msgs {
+					_ = m.Renew(ctx) // best-effort; a failed renew just risks a redelivery
+				}
+			}
+		}
+	}()
+	err := fn()
+	close(done)
+	return err
+}
+
+// renewInterval is about half the tightest remaining lease across the batch (min 1s), so a
+// renew lands well before any lock expires.
+func renewInterval(msgs []*mqlite.Message) time.Duration {
+	now := time.Now()
+	tightest := time.Duration(0)
+	for _, m := range msgs {
+		if d := m.LockedUntil.Sub(now); d > 0 && (tightest == 0 || d < tightest) {
+			tightest = d
+		}
+	}
+	if tightest <= 0 {
+		tightest = 30 * time.Second // the default lock duration
+	}
+	if half := tightest / 2; half > time.Second {
+		return half
+	}
+	return time.Second
+}
+
+func formatMsg(m *mqlite.Message, withToken bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "seq=%d deliveries=%d", m.SequenceNumber, m.DeliveryCount)
 	if m.MessageID != "" {
-		fmt.Printf(" message-id=%s", m.MessageID)
+		fmt.Fprintf(&b, " message-id=%s", m.MessageID)
 	}
 	if m.GroupID != "" {
-		fmt.Printf(" group=%s", m.GroupID)
+		fmt.Fprintf(&b, " group=%s", m.GroupID)
 	}
 	if m.ReplyTo != "" {
-		fmt.Printf(" reply-to=%s", m.ReplyTo)
+		fmt.Fprintf(&b, " reply-to=%s", m.ReplyTo)
 	}
 	if withToken {
-		fmt.Printf(" lock-token=%s", m.LockToken())
+		fmt.Fprintf(&b, " lock-token=%s", m.LockToken())
 	}
-	fmt.Printf(" body=%q\n", string(m.Body))
+	fmt.Fprintf(&b, " body=%q\n", string(m.Body))
+	return b.String()
 }
 
 // redact hides any auth token embedded in a DSN before printing.

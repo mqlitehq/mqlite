@@ -37,9 +37,13 @@ func TestCmdPurgeDLQ(t *testing.T) {
 	}
 	_ = c.Close()
 
-	// Act: the CLI command purges the DLQ.
-	if err := cmdPurgeDLQ(ctx, []string{"q"}); err != nil {
+	// Act: the CLI command purges the DLQ (unbounded purge now needs an explicit --all).
+	if err := cmdPurgeDLQ(ctx, []string{"q", "--all"}); err != nil {
 		t.Fatalf("purge-dlq: %v", err)
+	}
+	// An unbounded purge without --all must be refused.
+	if err := cmdPurgeDLQ(ctx, []string{"q"}); err == nil {
+		t.Error("purge-dlq without a bound or --all should be refused")
 	}
 
 	// Assert: nothing dead-lettered remains.

@@ -99,6 +99,14 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("valid create queue", http.MethodPost, wire.PathCreateQueue, "secret",
 		jsonOf(wire.CreateQueueRequest{Name: "vq", Config: wire.QueueConfigJSON{OrderingMode: "group_fifo"}}),
 		http.StatusOK, "")
+
+	// A negative destructive limit must be rejected at the HTTP boundary too (not just the
+	// CLI) — otherwise a raw request degrades a bounded purge/redrive into "delete all"
+	// (review 2026-07-12 P1-2).
+	check("negative purge max", http.MethodPost, wire.PathPurge, "secret",
+		jsonOf(wire.PurgeRequest{Queue: "q", Max: -1}), http.StatusBadRequest, "invalid_argument")
+	check("negative redrive older", http.MethodPost, wire.PathRedrive, "secret",
+		jsonOf(wire.RedriveRequest{Queue: "q", OlderThanMs: -1}), http.StatusBadRequest, "invalid_argument")
 }
 
 // A request body over Server.MaxBodyBytes is rejected as 413 message_too_large

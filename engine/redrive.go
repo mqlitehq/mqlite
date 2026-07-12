@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -23,7 +24,27 @@ type dlqRec struct {
 //   - RatePerSec>0 throttles the move into per-second chunks (each chunk atomic),
 //     so draining a huge DLQ does not flood the target. RatePerSec<=0 moves
 //     everything in a single atomic transaction.
+//
+// validate rejects negative bounds. A negative Max/OlderThanMs/RatePerSec would otherwise
+// skip its `> 0` guard below and silently REMOVE the restriction — turning a bounded
+// redrive/purge into an unrestricted destructive op (review 2026-07-12 P1-2). Rejected at
+// this boundary so the CLI, the SDK, and a raw HTTP request are all covered.
+func (o RedriveOptions) validate() error {
+	switch {
+	case o.Max < 0:
+		return fmt.Errorf("%w: max must be >= 0 (got %d)", ErrInvalidArgument, o.Max)
+	case o.OlderThanMs < 0:
+		return fmt.Errorf("%w: older-than must be >= 0", ErrInvalidArgument)
+	case o.RatePerSec < 0:
+		return fmt.Errorf("%w: rate must be >= 0 (got %d)", ErrInvalidArgument, o.RatePerSec)
+	}
+	return nil
+}
+
 func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (int, error) {
+	if err := opts.validate(); err != nil {
+		return 0, err
+	}
 	if _, err := e.loadQueue(ctx, dlq); err != nil {
 		return 0, err
 	}
@@ -138,6 +159,9 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 // reprocessed. opts.Max / opts.OlderThanMs scope the purge; both zero purges the
 // whole DLQ. Returns the number of rows deleted.
 func (e *Engine) Purge(ctx context.Context, queue string, opts RedriveOptions) (int, error) {
+	if err := opts.validate(); err != nil {
+		return 0, err
+	}
 	if _, err := e.loadQueue(ctx, queue); err != nil {
 		return 0, err
 	}
