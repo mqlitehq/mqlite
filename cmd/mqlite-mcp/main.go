@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -40,15 +41,27 @@ var broker struct {
 // resolveEndpoint normalizes MQLITE_ENDPOINT (trailing slash trimmed) and falls back to
 // the shared loopback default when it is empty, so the MCP server and the broker CLI agree
 // on the default port without either hardcoding a literal.
-func resolveEndpoint(env string) string {
-	if ep := strings.TrimRight(strings.TrimSpace(env), "/"); ep != "" {
-		return ep
+func resolveEndpoint(env string) (string, error) {
+	ep := strings.TrimRight(strings.TrimSpace(env), "/")
+	if ep == "" {
+		ep = defaults.BrokerLoopbackEndpoint
 	}
-	return defaults.BrokerLoopbackEndpoint
+	// Validate at startup so a malformed endpoint fails loud here instead of a nil-request
+	// deref on the first tool call (MQLITE-81).
+	u, err := url.Parse(ep)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("invalid MQLITE_ENDPOINT %q: want an http(s):// broker URL", ep)
+	}
+	return ep, nil
 }
 
 func main() {
-	broker.endpoint = resolveEndpoint(os.Getenv("MQLITE_ENDPOINT"))
+	ep, err := resolveEndpoint(os.Getenv("MQLITE_ENDPOINT"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mqlite-mcp:", err)
+		os.Exit(1)
+	}
+	broker.endpoint = ep
 	broker.token = os.Getenv("MQLITE_TOKEN")
 	broker.http = &http.Client{Timeout: 30 * time.Second}
 
@@ -308,8 +321,14 @@ func textResult(text string, isErr bool) map[string]any {
 }
 
 func post(path string, body any) (string, error) {
-	b, _ := json.Marshal(body)
-	req, _ := http.NewRequest(http.MethodPost, broker.endpoint+path, bytes.NewReader(b))
+	b, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, broker.endpoint+path, bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if broker.token != "" {
 		req.Header.Set("Authorization", "Bearer "+broker.token)
@@ -319,7 +338,10 @@ func post(path string, body any) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	rb, _ := io.ReadAll(resp.Body)
+	rb, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("broker %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
 	}
