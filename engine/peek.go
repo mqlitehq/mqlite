@@ -5,6 +5,13 @@ import (
 	"database/sql"
 )
 
+// maxResponseBytes bounds the total body bytes a single Peek/Receive response accumulates.
+// Their item caps (Peek 1000, Receive 256) times the 1 MiB default body allow a legal request
+// to materialize ~1.3 GiB and OOM a small VM; this stops after the message that crosses the
+// budget (so a single large message is still returned, and only claimed messages are locked —
+// MQLITE-80). Peek pages past it with PeekOptions.FromSeq. A var so tests can lower it.
+var maxResponseBytes int64 = 32 << 20 // 32 MiB
+
 // Peek browses messages without locking or settling them (§7.3). Useful for
 // triage and for recovering the seq_number of a deferred message.
 func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*PeekedMessage, error) {
@@ -33,6 +40,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	}
 	defer rows.Close()
 	var out []*PeekedMessage
+	var bytes int64
 	for rows.Next() {
 		var p PeekedMessage
 		var st string
@@ -53,6 +61,11 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 		p.DeadLetterReason = dlr.String
 		p.DeadLetterDescription = dld.String
 		out = append(out, &p)
+		// Bound the response size; page past this with FromSeq (MQLITE-80).
+		bytes += int64(len(p.Body))
+		if bytes >= maxResponseBytes {
+			break
+		}
 	}
 	return out, rows.Err()
 }

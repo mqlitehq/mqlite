@@ -451,6 +451,126 @@ func TestSubscribeFilterUpdatePreservesQueueConfig(t *testing.T) {
 	}
 }
 
+// Receive stops claiming once the response reaches the byte budget, and only locks the
+// messages it returns — the rest stay active and nothing is lost (MQLITE-80).
+func TestReceiveRespectsByteBudget(t *testing.T) {
+	old := maxResponseBytes
+	maxResponseBytes = 4096
+	defer func() { maxResponseBytes = old }()
+
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	body := make([]byte, 2048) // ~2 KiB each; the 4 KiB budget stops the batch early
+	for i := 0; i < 5; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 || len(got) >= 5 {
+		t.Fatalf("byte budget should cap the batch below 5; got %d", len(got))
+	}
+	// Drain the rest: every message must still be claimable — nothing was claimed-then-dropped.
+	total := 0
+	for _, batch := range [][]*Message{got} {
+		for _, m := range batch {
+			if m.LockToken == "" {
+				t.Fatalf("returned message %d must be locked", m.SeqNumber)
+			}
+			if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+				t.Fatal(err)
+			}
+			total++
+		}
+	}
+	for {
+		more, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(more) == 0 {
+			break
+		}
+		for _, m := range more {
+			if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+				t.Fatal(err)
+			}
+			total++
+		}
+	}
+	if total != 5 {
+		t.Fatalf("draining must retrieve all 5 messages (none lost/dropped); got %d", total)
+	}
+}
+
+// Peek bounds its response by the byte budget and pages past it with FromSeq (MQLITE-80).
+func TestPeekRespectsByteBudget(t *testing.T) {
+	old := maxResponseBytes
+	maxResponseBytes = 4096
+	defer func() { maxResponseBytes = old }()
+
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	body := make([]byte, 2048)
+	for i := 0; i < 5; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pk, err := e.Peek(ctx, "q", PeekOptions{Max: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pk) == 0 || len(pk) >= 5 {
+		t.Fatalf("peek byte budget should cap below 5; got %d", len(pk))
+	}
+	// FromSeq paging returns the remaining messages.
+	pk2, err := e.Peek(ctx, "q", PeekOptions{Max: 5, FromSeq: pk[len(pk)-1].SeqNumber + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pk2) == 0 {
+		t.Fatal("FromSeq paging should return the messages past the first budgeted page")
+	}
+}
+
+// A single message larger than the whole budget must still be delivered — Receive returns
+// and locks it, Peek returns it — otherwise it would be stuck forever. Golden-pins the
+// append-then-break ordering (a refactor to "check budget before claiming" would strand it).
+func TestSingleOverBudgetMessageStillDelivered(t *testing.T) {
+	old := maxResponseBytes
+	maxResponseBytes = 1024
+	defer func() { maxResponseBytes = old }()
+
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: make([]byte, 2048)}); err != nil { // one body > budget
+		t.Fatal(err)
+	}
+	pk, err := e.Peek(ctx, "q", PeekOptions{Max: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pk) != 1 {
+		t.Fatalf("Peek must return the single oversized message; got %d", len(pk))
+	}
+	got, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].LockToken == "" {
+		t.Fatalf("Receive must return and lock the single oversized message; got %+v", got)
+	}
+}
+
 // RenewLock extends the lease so the reaper does not reclaim mid-processing.
 func TestRenewLockExtendsLease(t *testing.T) {
 	ctx := context.Background()
