@@ -320,7 +320,10 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 	// lost — surface it as ErrOutcomeUnknown so the caller can't blindly retry into a
 	// double-apply (MQLITE-59).
 	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
-		return res, fmt.Errorf("%w: %v", ErrOutcomeUnknown, err)
+		// %s (not %w) on purpose: the raw transport error must stay OUT of the
+		// errors.Is chain — a caller checks errors.Is(err, ErrOutcomeUnknown), never
+		// the underlying EOF/reset (which reads as "safe to retry").
+		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
 	}
 	return res, err
 }
@@ -412,7 +415,7 @@ func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 				// committed before the ack was lost, so replaying the whole closure would
 				// double-apply (e.g. a second insert). Surface it instead of retrying
 				// (MQLITE-59). Transparent retry needs durable per-op idempotency — deferred.
-				return fmt.Errorf("%w: %v", ErrOutcomeUnknown, err)
+				return fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error()) // %s: keep raw err out of the errors.Is chain
 			}
 			return err
 		}
