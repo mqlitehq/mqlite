@@ -202,17 +202,27 @@ cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
 
 ### 5. CLI
 
+The `mqlite` binary is a first-party client for the common broker operations — the same
+commands work embedded (against `MQLITE_DB`) or against a running broker (`--endpoint`):
+
 ```bash
 mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering strict_fifo
 mqlite send orders "hello" --message-id m1 --group order-42 --reply-to replies
-mqlite receive orders --wait 5s
+mqlite schedule orders "later" --at 30m          # future delivery; cancel <queue> <seq>
+mqlite receive orders --wait 5s                  # auto-Complete; --no-ack prints lock tokens
+mqlite complete orders 42 <lock-token>           # settle a --no-ack message (also abandon/reject/defer/renew)
 mqlite peek orders --state dead_lettered
-mqlite metrics orders
-mqlite redrive orders --max 100        # DLQ → active
-mqlite purge-dlq orders --older-than 24h # delete dead-lettered messages
+mqlite status                                    # backend / ping / counts
+mqlite list-subscriptions ; mqlite test-filter 'subject == "x"'
+mqlite metrics orders --output json              # every command takes --output text|json
+mqlite redrive orders --max 100                  # DLQ → active
+mqlite purge-dlq orders --older-than 24h         # delete dead-lettered (unbounded needs --all)
 ```
 
-Connection is read from the environment:
+Every command takes the global flags `--endpoint <url>` / `--token <t>` (override the
+environment) and `--output text|json`. See the [CLI reference](docs/cli.md) for the full set.
+
+Connection is read from `--endpoint`/`--token`, or from the environment:
 
 | Env | Meaning |
 |---|---|
@@ -220,7 +230,7 @@ Connection is read from the environment:
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
 | `MQLITE_TOKENS` | comma-separated Bearer tokens that `serve` accepts |
-| `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` |
+| `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
 > The DB connection string is **only ever read from the environment** — it is
