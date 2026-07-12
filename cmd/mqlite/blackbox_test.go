@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/mqlitehq/mqlite/engine"
@@ -26,6 +27,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	mqliteBin = filepath.Join(dir, "mqlite")
+	if runtime.GOOS == "windows" {
+		mqliteBin += ".exe" // `go build -o` produces a .exe on Windows
+	}
 	build := exec.Command("go", "build", "-o", mqliteBin, ".")
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
