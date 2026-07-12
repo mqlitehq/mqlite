@@ -224,7 +224,10 @@ Connection is read from the environment:
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
 > The DB connection string is **only ever read from the environment** — it is
-> never compiled into the binary. Copy `.env.example` → `.env.local` (gitignored).
+> never compiled into the binary. `.env.example` lists the variables mqlite reads;
+> the binary does **not** auto-load a dotenv file, so export them into the process
+> yourself — `set -a && . ./.env.local && set +a` for a shell, or an `Environment=`/
+> compose `environment:` block for systemd/Docker.
 
 ### 6. MCP (drive it from an AI agent)
 
@@ -291,9 +294,10 @@ drops dead letters oldest-first once they are older than **14 days** or beyond
 per-queue byte cap `MQLITE_DLQ_MAX_BYTES` is off by default; `MQLITE_DLQ_RETENTION=off`
 disables all). Only the DLQ is ever touched — undelivered and in-flight
 work is never auto-deleted. The embedded library leaves this off unless you opt in
-with `mqlite.WithDLQRetention(...)`. Freed pages are reused (the file plateaus at
-peak backlog rather than shrinking; `VACUUM` is manual). See
-[docs/retention.md](docs/retention.md).
+with `mqlite.WithDLQRetention(...)`. Freed pages are reused, and a background janitor
+hands them back to the OS via `incremental_vacuum`, so the file grows to the peak backlog
+and then shrinks back gradually as the queue drains (a full `VACUUM` rewrite stays
+manual-only, via `mqlite vacuum`). See [docs/retention.md](docs/retention.md).
 
 ## Docker
 

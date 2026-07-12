@@ -99,23 +99,25 @@ producers. Rules:
 
 ## Space reclamation
 
-Deleting rows frees SQLite *pages* but does **not** shrink the file — the freed
-pages sit on the free list and the file stays at its high-water mark. Options, in
-order of cost:
+Deleting rows frees SQLite *pages*. mqlite opens every DB with
+`auto_vacuum=INCREMENTAL` (set at creation), and a background janitor runs
+`PRAGMA incremental_vacuum` once enough pages free up — so the file grows to the peak
+backlog and then **shrinks back gradually** as the queue drains, without a full rewrite
+or a lock on the hot path. The mechanisms, in order of cost:
 
-- **Reuse (default).** Free pages are reused by later inserts. For a queue at steady
-  state this is exactly right — the file plateaus at peak backlog and churns in
-  place. No action needed.
-- **`PRAGMA incremental_vacuum`** (requires `auto_vacuum=INCREMENTAL` set at DB
-  creation). Returns a bounded number of free pages to the OS *without a full
-  rewrite or a global lock* — a good fit for a background janitor that wants to give
-  disk back gradually after a one-off DLQ flush.
-- **`VACUUM`** rewrites the whole DB and takes a **global write lock** for the
-  duration — unacceptable on the hot path; only ever in an explicit maintenance
-  window (CLI command), never automatic.
+- **Reuse + background incremental_vacuum (default).** Free pages are reused by later
+  inserts, and the janitor hands the surplus back to the OS a bounded chunk at a time.
+  For a steady-state queue the file churns in place; after a one-off DLQ flush it recovers
+  the disk on its own. No action needed.
+- **`mqlite vacuum`** runs the same checkpoint → `incremental_vacuum` → checkpoint
+  sequence on demand, to reclaim immediately instead of waiting for the janitor.
+- **`mqlite vacuum --full`** (a full `VACUUM`) rewrites the whole DB and takes a
+  **global write lock** for the duration — unacceptable on the hot path; only ever in an
+  explicit maintenance window, never automatic.
 
-Recommendation: rely on page reuse; expose `incremental_vacuum` as an *opt-in*
-maintenance step (CLI), and document that `VACUUM` is manual-only.
+Recommendation: rely on the default (reuse + background reclaim); reach for
+`mqlite vacuum` to force an immediate incremental reclaim, and keep `--full` for rare,
+deliberate maintenance.
 
 ## Archive sink interface (if archival is ever built)
 

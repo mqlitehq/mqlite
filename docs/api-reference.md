@@ -119,7 +119,7 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 # → {"messages":[{
 #      "seq_number":42,"lock_token":"lt_9f3a…","delivery_count":1,
 #      "body":"aGk=","message_id":"order-42","group_id":"cust-7",
-#      "enqueued_at_ms":1750000000000,"visible_at_ms":1750000000000
+#      "enqueued_at_ms":1750000000000,"locked_until_ms":1750000030000
 #    }]}
 # settle it: POST .../Complete {"queue":"orders","seq_number":42,"lock_token":"lt_9f3a…"}
 ```
@@ -312,7 +312,7 @@ empty). "Dir" = whether *you set it on send* (**in**) or *the broker sets it on*
 |---|---|---|---|
 | `body` | base64 | in | the payload, **opaque** to the broker (it never parses it). The only size-capped field — **≤ 1 MiB** by default (`413` over it). Empty body is allowed. |
 | `message_id` | string | in | optional **dedup / idempotency key**. No effect unless the queue has dedup on (`dedup_window_ms > 0`); empty → the body's SHA-256 is used. Not required to be unique. **See the next section.** |
-| `group_id` | string | in | **ordering / session key** — messages with the same `group_id` are FIFO among themselves (= SQS MessageGroupId / ASB SessionId). **Required** on every send to a `group_fifo`/`strict_fifo` queue (else `400 group_required`). Not a consumer group. |
+| `group_id` | string | in | **ordering / session key** — messages with the same `group_id` are FIFO among themselves (= SQS MessageGroupId / ASB SessionId). **Required** on every send to a `group_fifo` queue (else `400 group_required`); `strict_fifo` is one global FIFO and does **not** need a `group_id`. Not a consumer group. |
 | `subject` | string | in | free-form **routing label** (= ASB Label). **Not unique**, may repeat or be empty. Split on `.` into `subject_parts` for filters (`"orders.eu.new"` → `["orders","eu","new"]`). |
 | `correlation_id`, `reply_to`, `content_type` | string | in | free-form ASB-style metadata; the broker stores but never interprets them (`content_type` only hints filter `body_json` decoding). |
 | `properties` | object<string,string> | in | custom **string→string** headers, stored verbatim; visible to filters as `properties["k"]`. Values must be strings. |
@@ -352,7 +352,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | HTTP | `code` | When |
 |---|---|---|
 | 400 | `invalid_argument` | malformed JSON, an **unknown field**, trailing data after the object, a bad filter expression, an empty queue name, or an unknown enum (`kind` / `ordering_mode`). The decoder is strict — a typo'd field is a 400, not a silently-dropped no-op (`mqlite.ErrInvalidArgument`). |
-| 400 | `group_required` | a `group_fifo`/`strict_fifo` send with no `group_id` |
+| 400 | `group_required` | a `group_fifo` send with no `group_id` |
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
 | 404 | `not_found` | the queue or message doesn't exist; or an unknown path |
 | 409 | `already_exists` | single-message dedup conflict (same id, different body) |
