@@ -80,6 +80,33 @@ func TestResolveToken(t *testing.T) {
 	}
 }
 
+// P1-5 (codex follow-up): --token= must also clear a credential embedded in the endpoint
+// DSN, which WithToken("") would otherwise keep.
+func TestStripEndpointCredentials(t *testing.T) {
+	if got := stripEndpointCredentials("mqlite://secret@host:6754"); got != "mqlite://host:6754" {
+		t.Errorf("strip = %q, want mqlite://host:6754", got)
+	}
+	if got := stripEndpointCredentials("http://host:6754"); got != "http://host:6754" {
+		t.Errorf("no-userinfo endpoint must be unchanged, got %q", got)
+	}
+}
+
+// P1-2 (codex follow-up): a sub-millisecond negative --older-than truncates to 0 in the
+// SDK conversion, so it must be rejected at the CLI before it can bypass the --all guard.
+func TestCLIRejectsNegativeDuration(t *testing.T) {
+	resetGlobals(t)
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err := cmdPurgeDLQ(ctx0, []string{"q", "--older-than", "-1ns"}); err == nil {
+		t.Error("purge-dlq --older-than=-1ns must be rejected")
+	}
+	if err := cmdRedrive(ctx0, []string{"q", "--older-than", "-1ns"}); err == nil {
+		t.Error("redrive --older-than=-1ns must be rejected")
+	}
+}
+
+var ctx0 = context.Background()
+
 // P1-2: negative destructive limits are rejected at the engine boundary (so CLI, SDK, and
 // raw HTTP are all covered) and delete/move nothing.
 func TestNegativeDestructiveLimits(t *testing.T) {

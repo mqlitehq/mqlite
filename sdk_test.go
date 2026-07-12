@@ -357,6 +357,20 @@ func TestRemoteStatusSubsFilter(t *testing.T) {
 	}
 }
 
+// TestRemoteNegativeDurationRejected pins the SDK side of the negative-limit fix: a
+// sub-millisecond negative OlderThan must not truncate to 0 and become an unbounded purge —
+// it maps to a negative and is rejected as ErrInvalidArgument (MQLITE-93 codex follow-up).
+func TestRemoteNegativeDurationRejected(t *testing.T) {
+	ctx := context.Background()
+	cli, _ := newBroker(t, "")
+	if err := cli.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.Purge(ctx, "q", mqlite.PurgeOpts{OlderThan: -time.Nanosecond}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Errorf("sub-ms negative OlderThan should be rejected, got %v", err)
+	}
+}
+
 func TestReceiverRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

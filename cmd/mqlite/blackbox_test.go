@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/mqlitehq/mqlite/engine"
@@ -153,5 +154,20 @@ func TestBlackboxEmptyTokenSendsNoAuth(t *testing.T) {
 	cleared.Env = env
 	if code, _ := exitCode(cleared); code == 0 {
 		t.Error("list --token= must send no token and be rejected by the authed broker")
+	}
+
+	// A credential embedded in the endpoint DSN (mqlite://token@host) authenticates on its
+	// own, but --token= must strip it too.
+	dsn := "mqlite://need-a-token@" + strings.TrimPrefix(url, "http://")
+	dsnEnv := append(os.Environ(), "MQLITE_ENDPOINT="+dsn)
+	viaDSN := exec.Command(mqliteBin, "list")
+	viaDSN.Env = dsnEnv
+	if code, se := exitCode(viaDSN); code != 0 {
+		t.Fatalf("DSN-embedded credential should authenticate, exited %d: %s", code, se)
+	}
+	dsnCleared := exec.Command(mqliteBin, "list", "--token=")
+	dsnCleared.Env = dsnEnv
+	if code, _ := exitCode(dsnCleared); code == 0 {
+		t.Error("--token= must strip a DSN-embedded credential (mqlite://token@host)")
 	}
 }

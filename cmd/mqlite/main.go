@@ -28,6 +28,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -35,6 +36,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -322,7 +324,13 @@ func dial(ctx context.Context) (api, error) {
 		ep = gEndpoint
 	}
 	if ep != "" {
-		return mqlite.Open(ctx, ep, mqlite.WithToken(resolveToken(ep, envEp)))
+		tok := resolveToken(ep, envEp)
+		// An explicit `--token=` means "send no credential" — also strip one embedded in the
+		// endpoint DSN (mqlite://secret@host), which WithToken("") would otherwise retain.
+		if gTokenSet && tok == "" {
+			ep = stripEndpointCredentials(ep)
+		}
+		return mqlite.Open(ctx, ep, mqlite.WithToken(tok))
 	}
 	db := os.Getenv("MQLITE_DB")
 	if db == "" {
@@ -347,6 +355,17 @@ func resolveToken(ep, envEp string) string {
 		fmt.Fprintln(os.Stderr, "warning: --endpoint changes the target host; MQLITE_TOKEN is NOT forwarded to it — pass --token to authenticate")
 	}
 	return ""
+}
+
+// stripEndpointCredentials removes any userinfo embedded in an endpoint DSN (e.g.
+// mqlite://secret@host), so an explicit `--token=` truly sends no credential.
+func stripEndpointCredentials(ep string) string {
+	u, err := url.Parse(ep)
+	if err != nil || u.User == nil {
+		return ep
+	}
+	u.User = nil
+	return u.String()
 }
 
 func cmdServe(ctx context.Context, args []string) error {
@@ -677,7 +696,16 @@ func cmdReceive(ctx context.Context, args []string) error {
 	// closed stdout / broken pipe that silently downgrades Peek-Lock to at-most-once and
 	// LOSES the message (review 2026-07-12 P1-1). The lock token is shown only when the
 	// message stays locked (--no-ack) so it can be settled later.
-	outErr := printMsgs(msgs, *noAck && !*del)
+	autoAck := !*del && !*noAck
+	render := func() error { return printMsgs(msgs, *noAck && !*del) }
+	var outErr error
+	if autoAck {
+		// Keep the leases renewed while output is written, so a slow sink can't let the
+		// reaper reclaim messages whose bodies were already emitted (review 2026-07-12 P1).
+		outErr = renewWhile(ctx, msgs, render)
+	} else {
+		outErr = render()
+	}
 	if *del || *noAck {
 		return outErr // nothing to auto-settle; surface any output error as a nonzero exit
 	}
@@ -811,6 +839,9 @@ func cmdRedrive(ctx context.Context, args []string) error {
 	if len(pos) != 1 { // exact arity — a stray positional must not be silently ignored (P1-2)
 		return fmt.Errorf("usage: redrive <queue> [--to target --max n --older-than 1h]")
 	}
+	if *max < 0 || *older < 0 {
+		return fmt.Errorf("--max and --older-than must be >= 0")
+	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
@@ -834,6 +865,9 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	}
 	if len(pos) != 1 { // exact arity — a stray positional must not be silently ignored (P1-2)
 		return fmt.Errorf("usage: purge-dlq <queue> [--max n | --older-than 1h | --all]")
+	}
+	if *max < 0 || *older < 0 { // a negative bound would otherwise slip past the --all guard
+		return fmt.Errorf("--max and --older-than must be >= 0")
 	}
 	// Guard an unbounded destructive purge behind an explicit --all (review 2026-07-12 P1-2).
 	if *max == 0 && *older == 0 && !*all {
@@ -943,25 +977,97 @@ func readBody(file string, rest []string) ([]byte, error) {
 // line each. withToken includes the lock token (only when the message stays locked and
 // must be settled later).
 func printMsgs(msgs []*mqlite.Message, withToken bool) error {
-	if jsonOut() {
-		views := make([]msgView, len(msgs))
-		for i, m := range msgs {
-			views[i] = viewMsg(m, withToken)
+	// Stream through a bufio.Writer: each message is written (and its error observed) as it
+	// is formatted, so output-before-settle holds WITHOUT holding the whole batch in memory.
+	// A legal 32 MiB batch %q-expands up to ~4×, which would OOM a small CLI if buffered
+	// (review 2026-07-12 P2). The final Flush surfaces a lost/closed stdout (P1-1).
+	w := bufio.NewWriter(os.Stdout)
+	switch {
+	case jsonOut():
+		if err := writeMsgJSON(w, msgs, withToken); err != nil {
+			return err
 		}
-		return emitJSON(views)
-	}
-	// Build the whole batch, then write it in one call so the write error is observable
-	// (a caller must not settle a message whose output failed — P1-1).
-	var b strings.Builder
-	if len(msgs) == 0 {
-		b.WriteString("(no messages)\n")
-	} else {
+	case len(msgs) == 0:
+		if _, err := w.WriteString("(no messages)\n"); err != nil {
+			return err
+		}
+	default:
 		for _, m := range msgs {
-			b.WriteString(formatMsg(m, withToken))
+			if _, err := w.WriteString(formatMsg(m, withToken)); err != nil {
+				return err
+			}
 		}
 	}
-	_, err := os.Stdout.WriteString(b.String())
+	return w.Flush()
+}
+
+// writeMsgJSON streams the message array element by element (never one batch-sized alloc).
+func writeMsgJSON(w *bufio.Writer, msgs []*mqlite.Message, withToken bool) error {
+	if _, err := w.WriteString("[\n"); err != nil {
+		return err
+	}
+	for i, m := range msgs {
+		b, err := json.MarshalIndent(viewMsg(m, withToken), "  ", "  ")
+		if err != nil {
+			return err
+		}
+		sep := "\n"
+		if i < len(msgs)-1 {
+			sep = ",\n"
+		}
+		if _, err := w.WriteString("  " + string(b) + sep); err != nil {
+			return err
+		}
+	}
+	_, err := w.WriteString("]\n")
 	return err
+}
+
+// renewWhile keeps a received batch's Peek-Lock leases alive (best-effort) while fn runs,
+// then returns fn's error. It renews at roughly half the tightest remaining lease, so a
+// slow output sink can't let the reaper reclaim messages whose bodies were already emitted
+// (review 2026-07-12 P1). During normal fast output the ticker never fires.
+func renewWhile(ctx context.Context, msgs []*mqlite.Message, fn func() error) error {
+	if len(msgs) == 0 {
+		return fn()
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(renewInterval(msgs))
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				for _, m := range msgs {
+					_ = m.Renew(ctx) // best-effort; a failed renew just risks a redelivery
+				}
+			}
+		}
+	}()
+	err := fn()
+	close(done)
+	return err
+}
+
+// renewInterval is about half the tightest remaining lease across the batch (min 1s), so a
+// renew lands well before any lock expires.
+func renewInterval(msgs []*mqlite.Message) time.Duration {
+	now := time.Now()
+	tightest := time.Duration(0)
+	for _, m := range msgs {
+		if d := m.LockedUntil.Sub(now); d > 0 && (tightest == 0 || d < tightest) {
+			tightest = d
+		}
+	}
+	if tightest <= 0 {
+		tightest = 30 * time.Second // the default lock duration
+	}
+	if half := tightest / 2; half > time.Second {
+		return half
+	}
+	return time.Second
 }
 
 func formatMsg(m *mqlite.Message, withToken bool) string {
