@@ -13,9 +13,11 @@ package mqlite_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -169,6 +171,33 @@ func TestRemoteAuth(t *testing.T) {
 	good, _ := mqlite.Open(ctx, ts.URL, mqlite.WithToken("right"))
 	if err := good.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
 		t.Fatalf("good token should succeed: %v", err)
+	}
+}
+
+// TestRemoteOutcomeUnknownPropagates pins the HTTP half of the ErrOutcomeUnknown
+// contract (MQLITE-59): a broker whose remote write lost its commit ack emits a
+// distinct "outcome_unknown" envelope, and the SDK reconstructs the typed sentinel so
+// a caller can errors.Is it and reconcile — instead of a generic 500 it would blindly
+// retry into a double-apply. A stub broker stands in because a real engine only emits
+// this on a remote-transport fault that can't be induced hermetically.
+func TestRemoteOutcomeUnknownPropagates(t *testing.T) {
+	ctx := context.Background()
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(wire.ErrorBody{
+			Code:    "outcome_unknown",
+			Message: "remote commit lost its acknowledgement",
+		})
+	}))
+	defer stub.Close()
+
+	cli, err := mqlite.Open(ctx, stub.URL)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := cli.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("SendOne error = %v; want errors.Is ErrOutcomeUnknown", err)
 	}
 }
 

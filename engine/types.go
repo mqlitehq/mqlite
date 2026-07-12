@@ -42,6 +42,7 @@ var (
 	ErrQueueNotFound         = errors.New("mqlite: queue not found")
 	ErrLockLost              = errors.New("mqlite: lock lost or already settled")
 	ErrUnauthenticated       = errors.New("mqlite: unauthenticated (bad or missing token)")
+	ErrOutcomeUnknown        = errors.New("mqlite: operation outcome unknown (remote commit lost its acknowledgement — it may or may not have applied; check by message_id/dedup before retrying)")
 	ErrDedupConflict         = errors.New("mqlite: dedup conflict (same id, different body)")
 	ErrNotFound              = errors.New("mqlite: not found")
 	ErrClosed                = errors.New("mqlite: engine closed")

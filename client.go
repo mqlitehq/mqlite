@@ -102,6 +102,8 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrLockLost, eb.Message)
 	case "unauthenticated":
 		return fmt.Errorf("%w: %s", ErrUnauthenticated, eb.Message)
+	case "outcome_unknown":
+		return fmt.Errorf("%w: %s", ErrOutcomeUnknown, eb.Message)
 	default:
 		if eb.Code == "" {
 			return fmt.Errorf("mqlite: request failed")

@@ -35,20 +35,38 @@ Turso closes idle Hrana streams; `libsql-client-go` then returns a **wrapped**
 `driver.ErrBadConn` (`"stream is closed: driver: bad connection"`). Because it is
 wrapped, `database/sql` will not transparently retry it, so MQLite does:
 
-- **Bounded retry on transient errors only** — `maxConnAttempts = 6`. A closed
-  stream means the statement never reached the server, so retrying on a fresh
-  pooled connection cannot double-execute. `exec`, `query`, `queryRowScan` and the
-  whole-transaction `inTx` all retry under this rule.
-- **Never retry a logical error.** `retryable = remote && (isConnErr || isBusyErr)`.
-  A constraint violation or `no such table` is final — retrying could double-apply a
-  committed write. Local stores never retry at all (a single conn is the single writer).
-- **`busy_timeout(5000)`** absorbs most transient `SQLITE_BUSY` at the driver level;
-  any `database is locked` / `SQLITE_BUSY` that still surfaces is caught by `isBusyErr`
-  and retried under the same bound.
+- **Bounded retry on transient errors only** — `maxConnAttempts = 6`.
+- **Reads retry on any transport drop.** `retryable = remote && (isConnErr || isBusyErr)`
+  gates `query`/`queryRowScan`: a read is idempotent, so replaying it on a fresh pooled
+  connection is always safe. `isConnErr` spans the whole transport-failure family —
+  `driver.ErrBadConn`, a closed Hrana stream, and their siblings `EOF` / `broken pipe` /
+  `i/o timeout` (behind a proxy like Fly a dropped connection reads as `EOF`, not `RST`).
+- **Writes retry only when the statement provably never applied** — `retryableWrite =
+  remote && (ErrBadConn || isBusyErr)`. A closed stream (`ErrBadConn`) or a `SQLITE_BUSY`
+  (lock never acquired) guarantees the write never ran, so replaying `exec` / the `inTx`
+  commit cannot double-apply. `busy_timeout(5000)` absorbs most `SQLITE_BUSY` first.
+- **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
+  other transport drop on a write/commit — the primary may have durably committed before
+  the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead
+  of being blindly replayed into a double-insert. The caller reconciles by
+  `message_id`/dedup before retrying; transparent recovery would need durable per-op
+  idempotency, which is deferred. **`errors.Is(err, mqlite.ErrOutcomeUnknown)` works in
+  both embedded and client mode.**
+- **Never retry a logical error.** A constraint violation or `no such table` is final,
+  and a structured server *response* (e.g. `error code 500: …`) is a definite non-commit
+  — neither is treated as outcome-unknown. Local stores never retry at all (a single
+  conn is the single writer).
+
+> **Transport caveat.** The outcome-unknown guarantee holds for the documented remote
+> transport `libsql://` (Hrana-over-HTTP). The `ws://`/`wss://` transports can wrap a
+> response-read failure as `ErrBadConn`, under which a lost commit ack *would* be
+> replayed — prefer `libsql://` for at-least-once remote writes.
 
 The classifier that decides all this is unit-tested hermetically — see
-`TestIsConnErr` / `TestRetryableAndAttempts` in `engine/storage_test.go` — so the
-retry contract can't silently drift without creds.
+`TestIsConnErr` / `TestRetryableWrite` / `TestRetryableAndAttempts` in
+`engine/storage_test.go`, and the broker→SDK propagation in `TestFailOutcomeUnknown`
+(server) + `TestRemoteOutcomeUnknownPropagates` (root) — so the retry contract can't
+silently drift without creds.
 
 ## Embedded replicas — evaluated, not adopted
 

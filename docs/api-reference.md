@@ -354,7 +354,8 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 409 | `lock_lost` | settle with an expired or wrong `lock_token` |
 | 413 | `message_too_large` | body over `MaxMessageBytes` (default 1 MiB) |
 | 499 | `canceled` | the client canceled the request |
+| 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile by `message_id`/dedup first (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
 
 The Go SDK re-exports the sentinel errors (`mqlite.ErrLockLost`, `ErrDedupConflict`,
-…) so `errors.Is` works in both embedded and client mode.
+`ErrOutcomeUnknown`, …) so `errors.Is` works in both embedded and client mode.

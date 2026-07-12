@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -224,15 +225,30 @@ func (d *db) close() error {
 
 const maxConnAttempts = 6
 
+// isConnErr reports a dropped/half-open remote transport: the request may or may not
+// have reached the primary. It gates both read retry (safe — reads are idempotent) and
+// the write outcome-unknown signal. It deliberately spans the WHOLE transport-failure
+// family, not just "connection reset": the libSQL/Hrana client returns the network error
+// un-wrapped from the POST that carries a write, so a lost commit ack most often surfaces
+// as a bare io.EOF / "broken pipe" / "i/o timeout" — especially behind a proxy like Fly,
+// where an upstream drop reads as EOF, not RST (MQLITE-59). A structured server *response*
+// ("error code 500: …") is a definite non-commit and is intentionally NOT matched here.
 func isConnErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, driver.ErrBadConn) {
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
 		return true
 	}
 	s := err.Error()
-	for _, sub := range []string{"bad connection", "stream is closed", "stream closed", "connection reset"} {
+	for _, sub := range []string{
+		"bad connection", "stream is closed", "stream closed",
+		"connection reset", "broken pipe", "i/o timeout", "unexpected EOF", "EOF",
+	} {
 		if strings.Contains(s, sub) {
 			return true
 		}
@@ -277,6 +293,16 @@ func (d *db) retryable(err error) bool {
 	return d.remote && (isConnErr(err) || isBusyErr(err))
 }
 
+// retryableWrite is retryable for a WRITE or COMMIT: safe to replay only when the error
+// guarantees the statement never applied — driver.ErrBadConn (database/sql's "retry on a
+// fresh connection" signal) or a busy error (the lock was never acquired). A broad transport
+// error like "connection reset" on a write is outcome-unknown (the primary may have committed
+// before the ack was lost), so it is NOT replayed — the caller gets ErrOutcomeUnknown instead
+// of a silent double-apply (MQLITE-59).
+func (d *db) retryableWrite(err error) bool {
+	return d.remote && (errors.Is(err, driver.ErrBadConn) || isBusyErr(err))
+}
+
 func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	var res sql.Result
 	var err error
@@ -285,9 +311,19 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 			d.backoff(ctx, i)
 		}
 		res, err = d.sql.ExecContext(ctx, query, args...)
-		if err == nil || !d.retryable(err) {
-			return res, err
+		if err == nil || !d.retryableWrite(err) {
+			break
 		}
+	}
+	// A remote write that ended on an outcome-unknown transport error (a broad "connection
+	// reset", not driver.ErrBadConn/busy) may have applied server-side before the ack was
+	// lost — surface it as ErrOutcomeUnknown so the caller can't blindly retry into a
+	// double-apply (MQLITE-59).
+	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
+		// %s (not %w) on purpose: the raw transport error must stay OUT of the
+		// errors.Is chain — a caller checks errors.Is(err, ErrOutcomeUnknown), never
+		// the underlying EOF/reset (which reads as "safe to retry").
+		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
 	}
 	return res, err
 }
@@ -371,8 +407,15 @@ func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		}
 		err = tx.Commit()
 		if err != nil {
-			if e.db.retryable(err) {
-				continue
+			if e.db.retryableWrite(err) {
+				continue // ErrBadConn / busy: the commit provably didn't land, safe to replay
+			}
+			if e.db.remote && isConnErr(err) {
+				// Outcome-unknown commit transport error: the primary may have durably
+				// committed before the ack was lost, so replaying the whole closure would
+				// double-apply (e.g. a second insert). Surface it instead of retrying
+				// (MQLITE-59). Transparent retry needs durable per-op idempotency — deferred.
+				return fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error()) // %s: keep raw err out of the errors.Is chain
 			}
 			return err
 		}

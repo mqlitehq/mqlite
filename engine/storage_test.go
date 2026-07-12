@@ -17,12 +17,24 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+// netTimeout is a net.Error whose message contains none of isConnErr's substrings,
+// so it exercises the errors.As(net.Error).Timeout() branch specifically (MQLITE-59).
+type netTimeout struct{}
+
+func (netTimeout) Error() string   { return "deadline exceeded" }
+func (netTimeout) Timeout() bool   { return true }
+func (netTimeout) Temporary() bool { return true }
+
+var _ net.Error = netTimeout{}
 
 // ─── Durability pragma ──────────────────────────────────────────────────────
 
@@ -292,6 +304,20 @@ func TestIsConnErr(t *testing.T) {
 		{"stream closed", errors.New("Hrana: stream closed"), true},
 		{"connection reset", errors.New("read tcp: connection reset by peer"), true},
 		{"plain bad connection", errors.New("write: bad connection"), true},
+		// Transport siblings of "connection reset": how a lost commit ack actually
+		// surfaces from the libSQL POST behind a proxy (Fly upstream drop → EOF, not
+		// RST). These MUST classify as conn errors so a write wraps ErrOutcomeUnknown
+		// instead of leaking a raw "EOF" that reads as safe-to-retry (MQLITE-59).
+		{"wrapped io.EOF", fmt.Errorf("read response: %w", io.EOF), true},
+		{"bare EOF string", errors.New("EOF"), true},
+		{"unexpected EOF", errors.New("unexpected EOF"), true},
+		{"wrapped ErrUnexpectedEOF", fmt.Errorf("body: %w", io.ErrUnexpectedEOF), true},
+		{"broken pipe", errors.New("write tcp 10.0.0.1->10.0.0.2: broken pipe"), true},
+		{"i/o timeout string", errors.New("read tcp: i/o timeout"), true},
+		{"net.Error timeout (no substring)", netTimeout{}, true},
+		// A structured server *response* is a definite non-commit — must NOT be
+		// treated as outcome-unknown (else a rejected write reads as "maybe applied").
+		{"server 500 response", errors.New("error code 500: SQLITE_ERROR"), false},
 		{"no such table", errors.New("no such table: messages"), false},
 		{"unique constraint", errors.New("UNIQUE constraint failed: dedup.message_id"), false},
 		{"context canceled", errors.New("context canceled"), false},
@@ -332,6 +358,39 @@ func TestRetryableAndAttempts(t *testing.T) {
 	}
 	if got := local.attempts(); got != 1 {
 		t.Errorf("local attempts = %d, want 1", got)
+	}
+}
+
+// A WRITE/COMMIT may only be replayed when the error guarantees it never applied
+// (driver.ErrBadConn or busy). A broad transport error like "connection reset" is
+// outcome-unknown — replaying it could double-apply, so it is NOT retryable for a write
+// (the caller gets ErrOutcomeUnknown). MQLITE-59.
+func TestRetryableWrite(t *testing.T) {
+	remote := &db{remote: true}
+	if !remote.retryableWrite(fmt.Errorf("exec: %w", driver.ErrBadConn)) {
+		t.Error("write on ErrBadConn must be retryable (the statement never ran)")
+	}
+	if !remote.retryableWrite(errors.New("database is locked")) {
+		t.Error("write on a busy error must be retryable (lock never acquired)")
+	}
+	// Every broad transport error — including the EOF/timeout/broken-pipe siblings
+	// isConnErr now spans — is outcome-unknown for a write: it may have applied before
+	// the ack was lost, so it must NOT be replayed (MQLITE-59). retryableWrite stays
+	// narrow (ErrBadConn/busy only) even though isConnErr(these) is true.
+	for _, broad := range []string{
+		"stream is closed", "read tcp: connection reset by peer", "bad connection",
+		"EOF", "unexpected EOF", "write tcp: broken pipe", "read tcp: i/o timeout",
+	} {
+		e := errors.New(broad)
+		if remote.retryableWrite(e) {
+			t.Errorf("write on %q must NOT be retryable — outcome unknown, don't double-apply", broad)
+		}
+		if !isConnErr(e) {
+			t.Errorf("isConnErr(%q) = false; a write on it must still wrap ErrOutcomeUnknown", broad)
+		}
+	}
+	if (&db{}).retryableWrite(fmt.Errorf("x: %w", driver.ErrBadConn)) {
+		t.Error("local writes must never retry")
 	}
 }
 

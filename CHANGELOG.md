@@ -66,6 +66,15 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   `http://host:6754`, `mqlites://host` → `https://host:6754` (previously they fell through
   to `:80`/`:443`). Plain `http://`/`https://` keep standard 80/443; an explicit port
   always wins.
+- **A remote write that loses its commit acknowledgement is no longer blindly retried**
+  (MQLITE-59). On a Turso/libSQL store, only errors that *guarantee the statement never
+  applied* (`driver.ErrBadConn`, `SQLITE_BUSY`) are replayed; any other transport drop on a
+  write/commit — where the primary may have committed before the ack was lost, which behind
+  a proxy typically surfaces as `EOF`/`broken pipe`/`i/o timeout`, not just `connection
+  reset` — now returns the new `mqlite.ErrOutcomeUnknown` (broker: `503 outcome_unknown`)
+  instead of silently double-inserting. `errors.Is(err, mqlite.ErrOutcomeUnknown)` works in
+  both embedded and client mode; reconcile by `message_id`/dedup before retrying. Local
+  file/`:memory:` stores never retried and are unaffected.
 
 ## v0.2.0 — 2026-07-11
 

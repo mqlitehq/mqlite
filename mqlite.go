@@ -21,6 +21,7 @@ import (
 var (
 	ErrLockLost        = engine.ErrLockLost
 	ErrUnauthenticated = engine.ErrUnauthenticated
+	ErrOutcomeUnknown  = engine.ErrOutcomeUnknown
 	ErrNotFound        = engine.ErrNotFound
 	ErrQueueNotFound   = engine.ErrQueueNotFound
 	ErrDedupConflict   = engine.ErrDedupConflict
