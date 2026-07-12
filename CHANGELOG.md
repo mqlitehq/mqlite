@@ -75,6 +75,12 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   instead of silently double-inserting. `errors.Is(err, mqlite.ErrOutcomeUnknown)` works in
   both embedded and client mode; reconcile by `message_id`/dedup before retrying. Local
   file/`:memory:` stores never retried and are unaffected.
+- **Request bodies are now strictly validated** (MQLITE-86): the JSON decoder rejects an
+  **unknown field** and any data after the first object (a typo like `messsages` was
+  previously dropped, turning a botched `Send` into a silent 200 no-op), and an empty
+  queue name or an unknown `kind`/`ordering_mode` enum now returns `400 invalid_argument`
+  (`mqlite.ErrInvalidArgument`) instead of leaking an opaque `500` from a SQLite CHECK.
+  Agent-facing APIs fail loud and predictably.
 
 ## v0.2.0 — 2026-07-11
 

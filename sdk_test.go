@@ -201,6 +201,22 @@ func TestRemoteOutcomeUnknownPropagates(t *testing.T) {
 	}
 }
 
+// TestRemoteInvalidArgumentPropagates checks that a caller-side request error
+// (empty name / unknown enum) round-trips as the typed ErrInvalidArgument through a
+// real broker — server maps it to 400 invalid_argument and the SDK reconstructs the
+// sentinel — instead of leaking a raw 500 (MQLITE-86).
+func TestRemoteInvalidArgumentPropagates(t *testing.T) {
+	ctx := context.Background()
+	cli, _ := newBroker(t, "")
+
+	if err := cli.CreateQueue(ctx, "", mqlite.QueueConfig{}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Errorf("empty name: err = %v, want ErrInvalidArgument", err)
+	}
+	if err := cli.CreateQueue(ctx, "q", mqlite.QueueConfig{Ordering: mqlite.OrderingMode("fifo")}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Errorf("bad ordering: err = %v, want ErrInvalidArgument", err)
+	}
+}
+
 func TestReceiverRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

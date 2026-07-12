@@ -162,9 +162,30 @@ func (e *Engine) Remote() bool { return e.db.remote }
 // ── queue metadata ──────────────────────────────────────────────────────────
 
 // CreateQueue creates a queue (idempotent on name; updates config if exists).
-func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {
+// validateQueueConfig rejects a request that would otherwise hit a SQLite CHECK or
+// NOT NULL constraint and surface as an opaque 500. The enum/name guards are
+// centralized here so BOTH CreateQueue and Subscribe fail loud with a typed
+// ErrInvalidArgument (→ 400) — agent-facing APIs must fail predictably (MQLITE-86 / D5).
+func validateQueueConfig(name string, cfg QueueConfig) error {
 	if name == "" {
-		return errors.New("mqlite: queue name required")
+		return fmt.Errorf("%w: queue name required", ErrInvalidArgument)
+	}
+	switch cfg.Kind {
+	case "", "queue", "subscription":
+	default:
+		return fmt.Errorf("%w: unknown kind %q (want \"queue\" or \"subscription\")", ErrInvalidArgument, cfg.Kind)
+	}
+	switch cfg.Ordering {
+	case "", OrderStandard, OrderGroupFIFO, OrderStrictFIFO:
+	default:
+		return fmt.Errorf("%w: unknown ordering_mode %q (want standard, group_fifo or strict_fifo)", ErrInvalidArgument, cfg.Ordering)
+	}
+	return nil
+}
+
+func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {
+	if err := validateQueueConfig(name, cfg); err != nil {
+		return err
 	}
 	if err := e.inTx(ctx, func(tx *sql.Tx) error {
 		return e.createQueueTx(ctx, tx, name, cfg, true)
@@ -196,6 +217,11 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 // Subscribe uses it so re-subscribing (a filter update) can't reset the backing queue's
 // lock/delivery/TTL/dedup/ordering/DLQ settings (MQLITE-73). The name guards run either way.
 func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg QueueConfig, overwrite bool) error {
+	// Central guard: also runs for Subscribe's backing-queue creation, so a bad name
+	// or enum can't reach the INSERT and CHECK-fault into a 500 (MQLITE-86).
+	if err := validateQueueConfig(name, cfg); err != nil {
+		return err
+	}
 	kind := cfg.Kind
 	if kind == "" {
 		kind = "queue"
@@ -283,7 +309,7 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg
 // the ambiguity into addressing instead of removing it.
 func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filter) error {
 	if topic == "" || name == "" {
-		return errors.New("mqlite: topic and subscription name required")
+		return fmt.Errorf("%w: topic and subscription name required", ErrInvalidArgument)
 	}
 	if topic == name {
 		return fmt.Errorf("%w: subscription %q cannot use its own topic's name", ErrNameConflict, name)

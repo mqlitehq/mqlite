@@ -234,9 +234,19 @@ func (s *Server) auth(next http.Handler) http.Handler {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+// decode strictly parses exactly one JSON object into v: an unknown field or any
+// data after the first value is a 400, not a silently-dropped typo (MQLITE-86). A
+// typo'd field like "messsages" would otherwise decode to an empty, successful Send.
 func decode(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
-	return dec.Decode(v)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errors.New("unexpected data after JSON body (want a single object)")
+	}
+	return nil
 }
 
 // decodeErr maps a request-decoding failure: a body over the MaxBodyBytes cap is
@@ -275,7 +285,7 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, "name_conflict", err.Error())
 	case errors.Is(err, engine.ErrGroupRequired):
 		writeErr(w, http.StatusBadRequest, "group_required", err.Error())
-	case errors.Is(err, engine.ErrInvalidFilter):
+	case errors.Is(err, engine.ErrInvalidFilter), errors.Is(err, engine.ErrInvalidArgument):
 		writeErr(w, http.StatusBadRequest, "invalid_argument", err.Error())
 	case errors.Is(err, engine.ErrMessageTooLarge):
 		writeErr(w, http.StatusRequestEntityTooLarge, "message_too_large", err.Error())
