@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -214,6 +215,56 @@ func TestRemoteInvalidArgumentPropagates(t *testing.T) {
 	}
 	if err := cli.CreateQueue(ctx, "q", mqlite.QueueConfig{Ordering: mqlite.OrderingMode("fifo")}); !errors.Is(err, mqlite.ErrInvalidArgument) {
 		t.Errorf("bad ordering: err = %v, want ErrInvalidArgument", err)
+	}
+}
+
+// TestServeReadyAfterBind checks the broker announces readiness only after the listener
+// actually binds: WithReady fires on a good bind (and cancelling ctx shuts down cleanly),
+// but a bind failure returns an error WITHOUT firing ready — so automation waiting for
+// "ready" never connects to a broker that failed to come up (MQLITE-88).
+func TestServeReadyAfterBind(t *testing.T) {
+	ctx := context.Background()
+	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+
+	// Occupy an address so the first Serve's bind fails.
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+
+	var readyOnFail atomic.Bool
+	if err := eng.Serve(ctx, busy.Addr().String(), mqlite.WithReady(func() { readyOnFail.Store(true) })); err == nil {
+		t.Fatal("Serve on a busy address must return a bind error")
+	}
+	if readyOnFail.Load() {
+		t.Fatal("ready must NOT fire when the bind fails")
+	}
+
+	// A free address: ready fires, then cancelling ctx returns from a clean shutdown.
+	sctx, cancel := context.WithCancel(ctx)
+	readyCh := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- eng.Serve(sctx, "127.0.0.1:0", mqlite.WithReady(func() { close(readyCh) }))
+	}()
+	select {
+	case <-readyCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ready never fired on a good bind")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("clean shutdown returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after ctx cancel")
 	}
 }
 

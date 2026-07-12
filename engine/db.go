@@ -48,7 +48,9 @@ func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 		return "libsql", conn, true
 	}
 
-	// PRAGMA synchronous: NORMAL is the durable+fast default for WAL.
+	// PRAGMA synchronous: NORMAL is the durable+fast default for WAL. The value is
+	// validated in openDB (validateSync) before we get here, so an unknown value has
+	// already failed startup; "" falls through to the NORMAL default.
 	syncMode := strings.ToUpper(strings.TrimSpace(sync))
 	switch syncMode {
 	case "FULL", "OFF", "NORMAL", "EXTRA":
@@ -100,7 +102,23 @@ func localFilePath(dsn string) (string, bool) {
 	return path, true
 }
 
+// validateSync rejects an unrecognized MQLITE_SYNC / Options.Synchronous value up front
+// instead of silently falling back to NORMAL: a durability typo (FULL -> "FULLL") must
+// not quietly weaken the guarantee the operator asked for — fail startup loudly, the same
+// way a malformed MQLITE_TOKENS/bind does (MQLITE-88). "" means "use the default".
+func validateSync(sync string) error {
+	switch strings.ToUpper(strings.TrimSpace(sync)) {
+	case "", "NORMAL", "FULL", "OFF", "EXTRA":
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown MQLITE_SYNC %q (want NORMAL, FULL, OFF or EXTRA)", ErrInvalidArgument, sync)
+	}
+}
+
 func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
+	if err := validateSync(sync); err != nil {
+		return nil, err
+	}
 	driver, conn, remote := resolveDSN(dsn, token, sync)
 
 	// Single-writer guard (MQLITE-6): a local file DB may be opened by only one

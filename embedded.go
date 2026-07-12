@@ -3,7 +3,9 @@ package mqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -281,6 +283,7 @@ type serveConfig struct {
 	cors      string
 	reqLogger *slog.Logger
 	ui        bool
+	ready     func()
 }
 
 // ServeOption configures Serve.
@@ -330,6 +333,13 @@ func WithUI(on bool) ServeOption {
 	return func(c *serveConfig) { c.ui = on }
 }
 
+// WithReady registers a callback Serve invokes once the listener is bound, before it
+// starts accepting — so a caller announces "ready" only after the bind actually
+// succeeded, never before a bind that then fails (MQLITE-88).
+func WithReady(fn func()) ServeOption {
+	return func(c *serveConfig) { c.ready = fn }
+}
+
 // Serve exposes this engine as an HTTP broker until ctx is canceled.
 func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) error {
 	var sc serveConfig
@@ -342,14 +352,27 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.Logger = sc.reqLogger
 	srv.UI = sc.ui
 	hs := newHTTPServer(addr, srv.Handler())
+
+	// Bind synchronously so a bind failure (port in use, bad addr) surfaces here —
+	// before any "ready" is announced — instead of after the caller already logged it.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+	if sc.ready != nil {
+		sc.ready()
+	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- hs.ListenAndServe() }()
+	go func() { errCh <- hs.Serve(ln) }()
 	select {
 	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Grace must exceed the longest in-flight request — a Receive long-poll runs up
+		// to 20s — so a clean Ctrl-C drains it instead of cutting it at 5s (MQLITE-88).
+		shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
-		_ = hs.Shutdown(shutCtx)
-		return nil
+		// Return the shutdown result: a DeadlineExceeded means connections didn't drain
+		// in time — a real signal, not something to swallow.
+		return hs.Shutdown(shutCtx)
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
@@ -376,16 +399,19 @@ func (e *Embedded) renew(ctx context.Context, q string, seq int64, tok string) e
 	return e.eng.Renew(ctx, q, seq, tok)
 }
 
-// newHTTPServer builds the broker's http.Server with hardening defaults
-// (review F9): ReadHeaderTimeout bounds how long a client may dribble request
-// headers (the Slowloris vector) and IdleTimeout reclaims dead keep-alive
-// connections. Read/Write timeouts stay zero on purpose — Receive long-polls up
-// to 20s and large request bodies are bounded by server.MaxBodyBytes instead.
+// newHTTPServer builds the broker's http.Server with hardening defaults (review F9,
+// MQLITE-88): ReadHeaderTimeout bounds header dribble (the Slowloris vector) and
+// ReadTimeout bounds the whole request read (a slow-drip body), while IdleTimeout
+// reclaims dead keep-alives. ReadTimeout only covers reading the request — the long-poll
+// wait and the response happen after — so 60s bounds slow uploads (a legal body is
+// <= MaxBodyBytes, 32 MiB) without cutting a Receive long-poll. WriteTimeout stays zero
+// ON PURPOSE: it would cap the response and break the 20s long-poll.
 func newHTTPServer(addr string, h http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
 }
