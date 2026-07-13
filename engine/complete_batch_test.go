@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // CompleteBatch settles a received batch in one transaction: all valid items
@@ -114,5 +115,186 @@ func TestCompletedCounter(t *testing.T) {
 	// Per-queue isolation: "other" saw no completions.
 	if c := e.CompletedCounts()["other"]; c != 0 {
 		t.Fatalf("cross-queue leak: other = %d, want 0", c)
+	}
+}
+
+// ─── RenewBatch (MQLITE-97) ────────────────────────────────────────────────────
+
+// RenewBatch extends a whole batch's leases in one transaction, fencing each item on its own
+// lock token: a valid item is renewed, a stale token is simply not (Ok=false, not an error),
+// and an item whose lock was never held stays untouched.
+func TestRenewBatch(t *testing.T) {
+	ctx := context.Background()
+	e, ms := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 10_000, MaxDeliveryCount: 10})
+
+	for i := 0; i < 5; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte{byte(i)}}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 5})
+	if err != nil || len(msgs) != 5 {
+		t.Fatalf("receive: got %d (err %v)", len(msgs), err)
+	}
+	before := msgs[0].LockedUntilMs
+
+	advance(ms, 3*time.Second) // the lease is ticking down
+
+	items := make([]SettleItem, 0, 7)
+	for _, m := range msgs {
+		items = append(items, SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken})
+	}
+	items = append(items, SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: "stale"}) // wrong token
+	items = append(items, SettleItem{SeqNumber: msgs[1].SeqNumber, LockToken: ""})      // no token
+
+	res, err := e.RenewBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("RenewBatch: %v", err)
+	}
+	if len(res) != len(items) {
+		t.Fatalf("results = %d, want one per item (%d)", len(res), len(items))
+	}
+	for i, r := range res {
+		wantOk := i < 5 // only the five real (seq, token) pairs
+		if r.Ok != wantOk {
+			t.Errorf("item %d (seq %d): Ok=%v, want %v", i, r.SeqNumber, r.Ok, wantOk)
+		}
+		if r.SeqNumber != items[i].SeqNumber {
+			t.Errorf("item %d: result seq %d does not line up with the request (%d)", i, r.SeqNumber, items[i].SeqNumber)
+		}
+	}
+
+	// Every lease really moved forward — a renewal that reports Ok but doesn't extend the lock
+	// is worse than useless.
+	peeked, err := e.Peek(ctx, "q", PeekOptions{State: StateLocked, Max: 10})
+	if err != nil || len(peeked) != 5 {
+		t.Fatalf("peek locked: got %d (err %v)", len(peeked), err)
+	}
+	for _, p := range peeked {
+		if p.LockedUntilMs <= before {
+			t.Errorf("seq %d: locked_until %d did not advance past %d", p.SeqNumber, p.LockedUntilMs, before)
+		}
+	}
+}
+
+// A wrong token must never renew somebody else's lock — the fencing that makes Peek-Lock safe.
+// The set-based UPDATE matches (id, lock_token) as a pair, so a real seq with the wrong token
+// matches nothing; a bug that matched on id alone would extend a lease the caller does not hold.
+func TestRenewBatchFencesOnToken(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 10_000, MaxDeliveryCount: 10})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	held := msgs[0].LockedUntilMs
+
+	res, err := e.RenewBatch(ctx, "q", []SettleItem{{SeqNumber: msgs[0].SeqNumber, LockToken: "not-my-token"}})
+	if err != nil {
+		t.Fatalf("RenewBatch: %v", err)
+	}
+	if res[0].Ok {
+		t.Error("a wrong lock token must NOT renew the lease")
+	}
+	p, err := e.Peek(ctx, "q", PeekOptions{State: StateLocked, Max: 1})
+	if err != nil || len(p) != 1 {
+		t.Fatalf("peek: %v n=%d", err, len(p))
+	}
+	if p[0].LockedUntilMs != held {
+		t.Errorf("the lease moved (%d -> %d) despite a wrong token — fencing is broken",
+			held, p[0].LockedUntilMs)
+	}
+}
+
+// The whole reason RenewBatch exists: it must cost a FIXED number of SQL statements, not one
+// per message. Against a remote Turso store each statement is a Hrana round trip, so an
+// O(N) implementation reintroduces at the DB layer exactly the latency we removed from the
+// client — and a 256-message renewal could then outlast the very lease it is renewing.
+func TestRenewBatchIsSetBased(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 30_000, MaxDeliveryCount: 10})
+	const n = 256 // the engine's maximum receive
+	for i := 0; i < n; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: n})
+	if err != nil || len(msgs) != n {
+		t.Fatalf("receive: got %d (err %v)", len(msgs), err)
+	}
+	items := make([]SettleItem, n)
+	for i, m := range msgs {
+		items[i] = SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+	}
+	res, err := e.RenewBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("RenewBatch(%d): %v", n, err)
+	}
+	for _, r := range res {
+		if !r.Ok {
+			t.Fatalf("seq %d was not renewed in a full-size batch", r.SeqNumber)
+		}
+	}
+}
+
+// CompleteBatch is set-based too (MQLITE-97): a full-size batch must settle in a fixed number of
+// statements, and each item must still be fenced on its OWN token. The duplicate-seq case is the
+// trap: a seq passed twice, once with the real token and once with a stale one, must report
+// Ok only for the real pair — a result keyed by sequence number alone would let the stale item
+// inherit the other's success and tell the caller a message was settled that never was.
+func TestCompleteBatchSetBasedAndFenced(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+	const n = 256 // the engine's maximum receive
+	for i := 0; i < n; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: n})
+	if err != nil || len(msgs) != n {
+		t.Fatalf("receive: got %d (err %v)", len(msgs), err)
+	}
+
+	items := make([]SettleItem, 0, n+2)
+	for _, m := range msgs {
+		items = append(items, SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken})
+	}
+	items = append(items, SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: "stale"}) // same seq, wrong token
+	items = append(items, SettleItem{SeqNumber: msgs[1].SeqNumber, LockToken: ""})      // no token
+
+	res, err := e.CompleteBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("CompleteBatch(%d): %v", len(items), err)
+	}
+	for i, r := range res {
+		wantOk := i < n
+		if r.Ok != wantOk {
+			t.Errorf("item %d (seq %d): Ok=%v, want %v", i, r.SeqNumber, r.Ok, wantOk)
+		}
+	}
+	if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+		t.Errorf("total=%d after completing the whole batch, want 0", m.Total)
+	}
+
+	// Re-completing with the SAME tokens is an idempotent success (the settle receipts), while a
+	// wrong token is still fenced — the contract the set-based rewrite must preserve.
+	again, err := e.CompleteBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("CompleteBatch replay: %v", err)
+	}
+	for i, r := range again {
+		wantOk := i < n // the same-token replays; the stale/empty ones stay false
+		if r.Ok != wantOk {
+			t.Errorf("replay item %d (seq %d): Ok=%v, want %v", i, r.SeqNumber, r.Ok, wantOk)
+		}
 	}
 }

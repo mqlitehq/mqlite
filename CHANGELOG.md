@@ -175,8 +175,13 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   lock, and most of the locks expired mid-pass and redelivered. New `RenewBatch` operation
   (HTTP `/mqlite.v1.QueueService/RenewBatch`; `Client.RenewBatch` / `Embedded.RenewBatch`;
   `Engine.RenewBatch`) renews a whole batch in one request and one transaction, so a renewal
-  pass is one round trip no matter how big the batch. The CLI's renewal interval is also a
-  fraction of the lease now (a third) rather than a fixed one-second floor — a queue whose lock
+  pass is one round trip no matter how big the batch. **Batch settlement and renewal are also
+  set-based inside the engine** — a fixed number of SQL statements rather than one (or two) per
+  message. On a remote Turso/libSQL store every statement is its own round trip, so the old
+  item-by-item loops made a 256-message settle ~512 remote round trips: the same O(N) latency,
+  one layer down, on the very RPC whose slowness lets the batch's own locks expire. The CLI's
+  renewal interval is also a fraction of the lease now (a third) rather than a fixed one-second
+  floor — a queue whose lock
   duration was one second or less previously had its first renewal scheduled at or *after* its
   own expiry, so its lease could not be held at all.
 - **A DLQ under its retention cap no longer logs a false ERROR every minute** (MQLITE-97): the
