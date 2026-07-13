@@ -748,3 +748,46 @@ func TestFreshHelpersBuildArgsAfterAcquiringAConn(t *testing.T) {
 		t.Error("the arguments were never built")
 	}
 }
+
+// An in-memory database lives INSIDE its connection: discard the connection and the schema goes
+// with it. So the statement helpers must never hand a local connection back to the pool to be
+// dropped — a renewal that quietly destroys the database is a spectacular way to fail.
+//
+// This is not hypothetical: reserving a *sql.Conn per attempt (right for a remote store, where
+// retries and backoff live) made a `:memory:` engine intermittently come back with
+// "no such table: messages" on CI. Hammer the fresh-argument paths and require the database to
+// still be there.
+func TestMemoryDBSurvivesRepeatedFreshStatements(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.CreateQueue(ctx, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
+
+	for i := 0; i < 200; i++ {
+		if _, err := e.RenewBatch(ctx, "q", []SettleItem{item}); err != nil {
+			t.Fatalf("RenewBatch #%d: %v", i, err)
+		}
+		if err := e.Renew(ctx, "q", item.SeqNumber, item.LockToken); err != nil {
+			t.Fatalf("Renew #%d: %v", i, err)
+		}
+	}
+	// The database — and the message — must still be there.
+	if m, err := e.Stats(ctx, "q"); err != nil {
+		t.Fatalf("stats after 200 renewals: %v (the in-memory database was destroyed)", err)
+	} else if m.Locked != 1 {
+		t.Errorf("locked=%d after renewals, want 1", m.Locked)
+	}
+}

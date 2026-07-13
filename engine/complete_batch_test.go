@@ -499,3 +499,101 @@ func TestRenewDeadlineMeasuredAtWriteTime(t *testing.T) {
 		}
 	}
 }
+
+// Two promises RenewBatch has to keep, both of them about the moment it ANSWERS (codex):
+//
+//  1. A renewal only ever EXTENDS a lease. Two renewals can race — a retry, a second consumer
+//     process — and the loser must not pull a lock back in by writing its older deadline.
+//  2. Ok means the lease is live. If the write itself outlives the lease (a slow remote store and
+//     a short lock), the deadline it just committed is already spent and the reaper may take the
+//     message at any moment. Reporting Ok there would make the caller settle a message it no
+//     longer holds.
+func TestRenewBatchNeverShortensAndNeverLiesAboutADeadLease(t *testing.T) {
+	ctx := context.Background()
+	e, ms := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 10_000, MaxDeliveryCount: 10})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
+
+	// 1. A renewal at t+5s pushes the lease to t+15s. A LATER renewal that (because the clock went
+	//    backwards, or a retry replayed an older deadline) would write t+10s must not shorten it.
+	advance(ms, 5*time.Second)
+	if _, err := e.RenewBatch(ctx, "q", []SettleItem{item}); err != nil {
+		t.Fatal(err)
+	}
+	locked, _ := e.Peek(ctx, "q", PeekOptions{State: StateLocked, Max: 1})
+	if len(locked) != 1 {
+		t.Fatal("peek locked")
+	}
+	pushedTo := locked[0].LockedUntilMs
+
+	advance(ms, -4*time.Second) // a stale/racing renewal computing an OLDER deadline
+	if _, err := e.RenewBatch(ctx, "q", []SettleItem{item}); err != nil {
+		t.Fatal(err)
+	}
+	locked, _ = e.Peek(ctx, "q", PeekOptions{State: StateLocked, Max: 1})
+	if locked[0].LockedUntilMs < pushedTo {
+		t.Errorf("the lease was SHORTENED: %d -> %d; a renewal may only ever extend it",
+			pushedTo, locked[0].LockedUntilMs)
+	}
+
+	// 2. Now let the lease actually expire. A renewal that lands after it is gone matches no row
+	//    (the reaper cleared the token) or writes a dead deadline — either way it must NOT say Ok.
+	advance(ms, time.Hour)
+	e.RunMaintenanceOnce(ctx) // the reaper reclaims the expired lock
+	res, err := e.RenewBatch(ctx, "q", []SettleItem{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].Ok {
+		t.Error("RenewBatch reported Ok for a lease that no longer exists")
+	}
+}
+
+// The deadline is verified AFTER the statement completes — that is the only way to know whether
+// the lease it just wrote is actually live. When the write itself outlives the lock (a slow remote
+// store, a short lease), the row is updated but its new deadline is already spent, and the reaper
+// may take the message at any moment. RenewBatch must say Ok=false there, not hand the caller a
+// lock it does not hold.
+//
+// A clock that jumps forward between reads stands in for that slow write: the deadline is computed
+// at one instant and checked at a much later one, exactly as it would be across a slow round trip.
+func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
+	ctx := context.Background()
+	var ms int64 = 1_700_000_000_000
+	e, err := Open(ctx, Options{
+		DB: ":memory:", DisableBackground: true,
+		Now: func() int64 { return atomic.LoadInt64(&ms) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1000, MaxDeliveryCount: 10}) // a 1s lease
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
+
+	// From here on, every clock read jumps an hour: whatever deadline the write computes, it is
+	// long gone by the time the statement finishes.
+	e.now = func() int64 { return atomic.AddInt64(&ms, time.Hour.Milliseconds()) }
+
+	res, err := e.RenewBatch(ctx, "q", []SettleItem{item})
+	if err != nil {
+		t.Fatalf("RenewBatch: %v", err)
+	}
+	if res[0].Ok {
+		t.Error("RenewBatch claimed Ok for a lease that was already expired when the write completed — the caller would settle a message it no longer holds")
+	}
+}

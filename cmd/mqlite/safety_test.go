@@ -419,11 +419,12 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 		t.Run(fmt.Sprintf("%d messages", n), func(t *testing.T) {
 			resetGlobals(t)
 			ctx := context.Background()
-			// Background loops ON: the reaper is what reclaims an expired lock. An in-memory DB
-			// with a ONE-transaction seed keeps the fixture cheap — 256 individually-committed
-			// sends is 256 fsyncs, which timed this test out on a slow Windows runner and told us
-			// nothing about renewal.
-			eng, err := engine.Open(ctx, engine.Options{DB: ":memory:"})
+			// Background loops ON: the reaper is what reclaims an expired lock. A file DB with a
+			// ONE-transaction seed keeps the fixture cheap — 256 individually-committed sends is
+			// 256 fsyncs, which timed this test out on a slow Windows runner and told us nothing
+			// about renewal. (Not :memory:, which a cancelled query can destroy — see the note in
+			// the handover: that is a separate, pre-existing engine bug.)
+			eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -498,7 +499,7 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 func TestRenewalFallsBackOnOldBroker(t *testing.T) {
 	resetGlobals(t)
 	ctx := context.Background()
-	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:"})
+	eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

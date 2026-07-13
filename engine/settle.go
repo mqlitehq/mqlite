@@ -181,7 +181,9 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	// loop — could commit a lease that has already expired by the time the write that actually
 	// lands runs (MQLITE-97). It is measured against the clock of each attempt.
 	res, err := e.db.execFresh(ctx,
-		`UPDATE messages SET locked_until=? WHERE id=? AND queue=? AND lock_token=?`,
+		// MAX(): a renewal only ever extends a lease. A racing renewal writing an older deadline
+		// would otherwise shorten a lock that had already been pushed further out.
+		`UPDATE messages SET locked_until=MAX(locked_until, ?) WHERE id=? AND queue=? AND lock_token=?`,
 		func() []any { return []any{e.now() + q.lockDurationMs, seq, queue, token} })
 	if err != nil {
 		return err
@@ -320,8 +322,16 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 	pairs := strings.Repeat(",(?,?)", len(rows))[1:]
 	args := pairArgs(queue, rows)
 	err = e.db.queryFresh(ctx,
-		`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
-		 RETURNING id, lock_token`,
+		// MAX(locked_until, ?): a renewal may only ever EXTEND a lease, never pull it back. Two
+		// renewals can race (a retry, a concurrent renewer), and the loser writing its older
+		// deadline would shorten a lock the winner had already pushed out.
+		//
+		// RETURNING the committed deadline — not just the row — so the caller can check it against
+		// the clock AFTER the statement finished. Whether a lease is live is a fact about the
+		// moment we answer, not the moment we asked.
+		`UPDATE messages SET locked_until=MAX(locked_until, ?)
+		   WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+		 RETURNING id, lock_token, locked_until`,
 		// The deadline is built per ATTEMPT, once a connection is already held — see queryFresh.
 		// Computed any earlier, a backoff (or a wait for a free connection) could leave it in the
 		// past by the time the successful attempt commits: the row would report Ok while the reaper
@@ -331,13 +341,22 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 			// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
 			// absent from the RETURNING set and its Ok stays false. That is Renew's contract, not
 			// an error.
+			//
+			// And a row we DID write is only reported Ok if the deadline it now carries is still in
+			// the future — read here, once the statement has completed. On a slow remote store the
+			// write itself can take longer than a short lease, in which case the deadline we just
+			// committed is already spent and the reaper may take the message at any moment. Saying
+			// Ok there would be a lie, and the caller would settle a message it no longer holds.
+			now := e.now()
 			for sel.Next() {
-				var id int64
+				var id, until int64
 				var tok string
-				if err := sel.Scan(&id, &tok); err != nil {
+				if err := sel.Scan(&id, &tok, &until); err != nil {
 					return err
 				}
-				renewed[settleKey(id, tok)] = true
+				if until > now {
+					renewed[settleKey(id, tok)] = true
+				}
 			}
 			return sel.Err()
 		})
