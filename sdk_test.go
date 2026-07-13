@@ -705,3 +705,80 @@ func TestStatusInfoMatchesWireStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestSubMsOlderThanIsBounded is the row-count proof the round-2 report asked for: a POSITIVE
+// sub-millisecond age bound must stay a BOUND. `purge-dlq --older-than 1ns` used to truncate to
+// OlderThanMs=0 — which the engine reads as "no bound" — and wipe the entire DLQ while looking
+// bounded. Any positive duration now rounds UP to 1ms, so a message younger than the bound
+// survives; the old code deleted it.
+//
+// The clock is frozen, so this asserts the semantics and never races real elapsed time.
+func TestSubMsOlderThanIsBounded(t *testing.T) {
+	ctx := context.Background()
+	now := int64(1_000_000_000_000)
+	clock := func() int64 { return now }
+
+	// Two dead letters: one aged well past any bound, one created "now".
+	newDLQ := func(t *testing.T) *mqlite.Embedded {
+		t.Helper()
+		e, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"), mqlite.WithClock(clock))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = e.Close() })
+		if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{MaxDeliveryCount: 1}); err != nil {
+			t.Fatal(err)
+		}
+		deadLetter := func() {
+			if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); err != nil {
+				t.Fatal(err)
+			}
+			ms, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+			if err != nil || len(ms) != 1 {
+				t.Fatalf("receive: %v n=%d", err, len(ms))
+			}
+			if err := ms[0].Reject(ctx, mqlite.RejectOpts{Reason: "poison"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		now -= time.Hour.Milliseconds() // the old one is dead-lettered an hour ago…
+		deadLetter()
+		now += time.Hour.Milliseconds() // …and the fresh one right now
+		deadLetter()
+		if m, _ := e.Stats(ctx, "q"); m.DeadLettered != 2 {
+			t.Fatalf("setup: dead_lettered = %d, want 2", m.DeadLettered)
+		}
+		return e
+	}
+
+	// Every positive sub-ms bound behaves as >= 1ms: the hour-old dead letter goes, the
+	// zero-age one stays. Unbounded (the bug) would have taken both.
+	for _, d := range []time.Duration{time.Nanosecond, 999999 * time.Nanosecond, time.Millisecond, 1500 * time.Microsecond} {
+		t.Run("purge "+d.String(), func(t *testing.T) {
+			e := newDLQ(t)
+			n, err := e.Purge(ctx, "q", mqlite.PurgeOpts{OlderThan: d})
+			if err != nil {
+				t.Fatalf("purge: %v", err)
+			}
+			if n != 1 {
+				t.Errorf("purged %d with --older-than %s, want 1 — a positive bound must never mean \"unbounded\"", n, d)
+			}
+			if m, _ := e.Stats(ctx, "q"); m.DeadLettered != 1 {
+				t.Errorf("dead_lettered = %d after a bounded purge, want 1 (the fresh message must survive)", m.DeadLettered)
+			}
+		})
+		t.Run("redrive "+d.String(), func(t *testing.T) {
+			e := newDLQ(t)
+			n, err := e.Redrive(ctx, "q", mqlite.RedriveOpts{OlderThan: d})
+			if err != nil {
+				t.Fatalf("redrive: %v", err)
+			}
+			if n != 1 {
+				t.Errorf("redrove %d with --older-than %s, want 1", n, d)
+			}
+			if m, _ := e.Stats(ctx, "q"); m.DeadLettered != 1 || m.Active != 1 {
+				t.Errorf("dead=%d active=%d after a bounded redrive, want 1/1", m.DeadLettered, m.Active)
+			}
+		})
+	}
+}
