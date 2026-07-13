@@ -6,6 +6,7 @@ package main
 // empty-collection [], past-schedule rejection, and top-level help completeness.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -34,11 +35,21 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 		t.Fatal(err)
 	}
 	os.Stdout = w
+
+	// Drain CONCURRENTLY. Reading only after fn returns deadlocks the moment fn writes more than
+	// the pipe's buffer — it blocks in write, forever, waiting for a reader that has not started.
+	// A 64-message receive fits; 256 does not, and the Windows buffer is smaller still, which is
+	// exactly how this hung the CI runner for ten minutes.
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+
 	runErr := fn()
 	_ = w.Close()
 	os.Stdout = old
-	out, _ := io.ReadAll(r)
-	return string(out), runErr
+	return <-done, runErr
 }
 
 func embeddedEnv(t *testing.T) {
@@ -185,7 +196,9 @@ func TestUsageListsAllCommands(t *testing.T) {
 
 // ─── arity, validation & reporting contract (review round-2 §3) ───
 
-// hides the mistake, and on a destructive command that is how you purge the wrong queue.
+// A non-body command takes an EXACT number of positionals. A surplus argument is a typo (a
+// misplaced flag, an unquoted value the shell split) — silently ignoring it and exiting 0 hides
+// the mistake, and on a destructive command that is how you purge the wrong queue.
 func TestExactArity(t *testing.T) {
 	resetGlobals(t)
 	t.Setenv("MQLITE_ENDPOINT", "")
@@ -348,5 +361,27 @@ func TestRound3ContractGaps(t *testing.T) {
 	}
 	if err := cmdServe(ctx, []string{"extra"}); err == nil {
 		t.Error("serve with a surplus positional must be rejected")
+	}
+}
+
+// captureStdout must drain the pipe while fn runs, not after it returns. Reading afterwards
+// deadlocks as soon as fn writes more than the pipe's buffer: the write blocks forever, waiting
+// for a reader that has not started. A 64-message receive fits in the buffer and a 256-message
+// one does not — and Windows' buffer is smaller still, which is how this hung a CI runner for
+// ten minutes and looked like a bug in the code under test.
+//
+// A payload larger than any plausible pipe buffer makes the guard platform-independent: on the
+// old helper this test hangs everywhere, not just on Windows.
+func TestCaptureStdoutDoesNotDeadlockOnLargeOutput(t *testing.T) {
+	const size = 4 << 20 // 4 MiB — far past every OS pipe buffer
+	out, err := captureStdout(t, func() error {
+		_, werr := os.Stdout.Write(bytes.Repeat([]byte("x"), size))
+		return werr
+	})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(out) != size {
+		t.Errorf("captured %d bytes, want %d", len(out), size)
 	}
 }
