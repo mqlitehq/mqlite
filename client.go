@@ -246,6 +246,22 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Messa
 	return toSettleResults(resp.Results), nil
 }
 
+// RenewBatch extends the lock lease of many messages in ONE request, returning a per-message
+// result. Renewing a batch with N separate Renew calls costs N round trips — on a slow link
+// that outlasts the very lease it is trying to save (a 64-message batch on a 50ms link needs
+// 3.2s of renewals against a 2s lease), so the locks expire mid-renewal.
+func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
+	items := make([]wire.SettleItem, len(msgs))
+	for i, m := range msgs {
+		items[i] = wire.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	}
+	var resp wire.RenewBatchResponse
+	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
+		return nil, err
+	}
+	return toSettleResults(resp.Results), nil
+}
+
 // ── receive ─────────────────────────────────────────────────────────────────
 
 // Receive claims up to N messages (Peek-Lock by default), with optional long-poll.

@@ -19,14 +19,16 @@ import (
 
 // A message in --output json IS a wire.Message — the exact struct the HTTP API returns, not a
 // CLI-specific lookalike. Emitting the canonical type (rather than a hand-copied view that
-// renamed seq_number to seq and quietly dropped visible_at_ms/locked_until_ms) means
-// `mqlite receive --output json` and a raw POST to /mqlite.v1.Queue/Receive produce the same
-// keys, and a field added to the wire can never silently go missing from the CLI. Bodies are
-// base64 and timestamps epoch-ms because that is what the wire does. Pinned by
-// TestCLIJSONIsWireShape (round-2 §3.4).
+// renamed seq_number to seq and quietly dropped visible_at_ms/locked_until_ms) means every
+// field the CLI prints carries its canonical wire name and encoding — base64 bodies, epoch-ms
+// timestamps — and a field added to the wire can never silently go missing from the CLI.
+// Pinned by TestCLIJSONIsWireShape (round-2 §3.4).
 //
-// The lock token is emitted only where the caller needs it to settle later (receive --no-ack,
-// receive-deferred); peek never locks, so it has none.
+// That is a claim about the FIELDS, not about the whole response: the CLI prints a bare array
+// where wire.ReceiveResponse has a {"messages":[...]} envelope, and it emits the lock token
+// only where the caller needs it to settle later (receive --no-ack, receive-deferred) — an
+// auto-ack receive has already Completed the batch, and peek never locks at all. Saying the CLI
+// and a raw POST agreed "field for field" overstated it (round-3 §3.3).
 
 // msIfSet returns t as epoch-ms, or 0 for the zero time (so omitempty drops it).
 func msIfSet(t time.Time) int64 {
@@ -104,9 +106,9 @@ func cmdSettle(ctx context.Context, verb string, args []string) error {
 	if len(pos) != 3 {
 		return fmt.Errorf("usage: %s <queue> <seq> <lock-token>", verb)
 	}
-	seq, err := strconv.ParseInt(pos[1], 10, 64)
+	seq, err := parseSeq(pos[1])
 	if err != nil {
-		return fmt.Errorf("invalid seq %q: %w", pos[1], err)
+		return err
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -199,9 +201,9 @@ func cmdCancel(ctx context.Context, args []string) error {
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: cancel <queue> <seq>")
 	}
-	seq, err := strconv.ParseInt(pos[1], 10, 64)
+	seq, err := parseSeq(pos[1])
 	if err != nil {
-		return fmt.Errorf("invalid seq %q: %w", pos[1], err)
+		return err
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -241,6 +243,20 @@ func cmdReceiveDeferred(ctx context.Context, args []string) error {
 	return printMsgs(msgs, true) // deferred fetch re-locks: show tokens so they can be settled
 }
 
+// parseSeq parses one <seq> positional. Sequence numbers start at 1, so 0 and negatives are
+// not messages — reject them here rather than shipping them to the backend to be refused there
+// (or, worse, silently matching nothing). Used by every command that takes a seq (round-3 §3.4).
+func parseSeq(s string) (int64, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid seq %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid seq %d: sequence numbers are positive", n)
+	}
+	return n, nil
+}
+
 func parseSeqCSV(s string) ([]int64, error) {
 	var out []int64
 	for _, part := range strings.Split(s, ",") {
@@ -251,6 +267,9 @@ func parseSeqCSV(s string) ([]int64, error) {
 		n, err := strconv.ParseInt(part, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("invalid seq %q: %w", part, err)
+		}
+		if n <= 0 { // seq numbers start at 1; 0 and negatives are not messages (round-3 §3.4)
+			return nil, fmt.Errorf("invalid seq %d: sequence numbers are positive", n)
 		}
 		out = append(out, n)
 	}

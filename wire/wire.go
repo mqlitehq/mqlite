@@ -20,6 +20,7 @@ const (
 	PathDefer           = "/mqlite.v1.QueueService/Defer"
 	PathReceiveDeferred = "/mqlite.v1.QueueService/ReceiveDeferred"
 	PathRenew           = "/mqlite.v1.QueueService/Renew"
+	PathRenewBatch      = "/mqlite.v1.QueueService/RenewBatch"
 	PathSchedule        = "/mqlite.v1.QueueService/Schedule"
 	PathCancel          = "/mqlite.v1.QueueService/Cancel"
 	PathPeek            = "/mqlite.v1.QueueService/Peek"
@@ -116,6 +117,16 @@ type SettleItemResult struct {
 	Ok        bool  `json:"ok"`
 }
 type CompleteBatchResponse struct {
+	Results []SettleItemResult `json:"results"`
+}
+
+// RenewBatch extends many leases in one request. Renewing N messages with N separate Renew
+// calls costs N round trips, which on a slow link outlasts the lease it is trying to save.
+type RenewBatchRequest struct {
+	Queue    string       `json:"queue"`
+	Messages []SettleItem `json:"messages"`
+}
+type RenewBatchResponse struct {
 	Results []SettleItemResult `json:"results"`
 }
 

@@ -183,6 +183,51 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	return affected(res)
 }
 
+// RenewBatch extends the lock lease of many messages in ONE transaction, returning a per-item
+// result so the caller can see exactly which leases still hold.
+//
+// Renewing a batch message-by-message does not scale: over a network each Renew is a separate
+// round trip, so N messages × the link latency can easily exceed the lease itself and the locks
+// expire *while they are being renewed* — a 64-message batch on a 50ms link needs 3.2s of
+// renewals against a 2s lease and loses most of them (review round-3). One request, one
+// transaction, one lease deadline for the whole batch.
+//
+// Like Renew, an item whose lock was already lost simply comes back Ok=false; it is not an
+// error for the batch. Fencing is on LockToken, exactly as in CompleteBatch.
+func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleItem) ([]SettleResult, error) {
+	q, err := e.loadQueue(ctx, queue)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SettleResult, len(items))
+	err = e.inTx(ctx, func(tx *sql.Tx) error {
+		for i := range out {
+			out[i] = SettleResult{} // the remote inTx may replay the closure — never inherit Ok
+		}
+		until := e.now() + q.lockDurationMs
+		for i, it := range items {
+			out[i].SeqNumber = it.SeqNumber
+			if it.LockToken == "" {
+				continue // Ok stays false
+			}
+			res, err := tx.ExecContext(ctx,
+				`UPDATE messages SET locked_until=? WHERE id=? AND queue=? AND lock_token=?`,
+				until, it.SeqNumber, queue, it.LockToken)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				out[i].Ok = true
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SettleItem identifies one message to settle in a batch (fenced on LockToken).
 type SettleItem struct {
 	SeqNumber int64

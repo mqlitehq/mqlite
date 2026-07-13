@@ -195,6 +195,24 @@ func (e *Embedded) CompleteBatch(ctx context.Context, queue string, msgs ...*Mes
 	return out, nil
 }
 
+// RenewBatch extends the lock lease of many messages in one transaction (the embedded twin of
+// Client.RenewBatch), returning a per-message result.
+func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
+	items := make([]engine.SettleItem, len(msgs))
+	for i, m := range msgs {
+		items[i] = engine.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	}
+	res, err := e.eng.RenewBatch(ctx, queue, items)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SettleResult, len(res))
+	for i, r := range res {
+		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok}
+	}
+	return out, nil
+}
+
 // Tx runs business writes and enqueues in one transaction (§4.5, embedded-only).
 func (e *Embedded) Tx(ctx context.Context, fn func(*engine.EngineTx) error) error {
 	return e.eng.Tx(ctx, fn)

@@ -44,14 +44,22 @@ another host — pass `--token` to authenticate there. `--token=` (empty) explic
 credential at all. Two spellings of the same broker (a trailing slash, `mqlite://h` vs
 `http://h:6754`) are the same target and keep the token.
 
-### `--output json` is the wire shape
+### `--output json` uses the wire's field names
 
-A message in `--output json` **is** the HTTP API's message object — the same struct, so the
-same keys (`seq_number`, `body` base64, epoch-ms timestamps). What you get from
-`mqlite receive --output json` and from a raw POST to `/mqlite.v1.Queue/Receive` agree
-field for field; see [api-reference.md](api-reference.md) for the complete contract. The CLI
-still doesn't expose *every* HTTP operation (batch send, attempt ids) — for those, use raw
-HTTP — but the JSON it does emit never invents or renames a key.
+Every message the CLI emits in `--output json` **is** the HTTP API's message object — the same
+struct, so the same field names and encodings (`seq_number`, `body` base64, epoch-ms
+timestamps). The CLI never invents or renames a key.
+
+Two things are the CLI's own, and are *not* claims about the HTTP response:
+
+- **The envelope.** `receive`/`peek` print a bare JSON **array** of messages; the HTTP API
+  returns a `{"messages": [...]}` object.
+- **The lock token.** It is emitted only where you need it to settle later — `receive --no-ack`
+  and `receive-deferred`. A default auto-ack `receive` has already Completed the messages, so it
+  omits `lock_token`; raw Peek-Lock Receive always returns one.
+
+The CLI also doesn't expose *every* HTTP operation (batch send, attempt ids). For the complete
+contract — all routes, all fields — see [api-reference.md](api-reference.md).
 
 > **Settling across invocations needs a broker.** `receive --no-ack` locks a message and
 > prints its `lock-token`; you settle it later with `complete/abandon/reject/defer/renew

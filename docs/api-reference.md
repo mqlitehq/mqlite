@@ -57,7 +57,7 @@ token **except** the open ones below. A missing/invalid token → `401 unauthent
 
 ```bash
 curl https://<host>/                 # what is this? (no auth)
-# → {"name":"mqlite","version":"0.3.0","description":"...","status":"ok",
+# → {"name":"mqlite","version":"<the broker's version>","description":"...","status":"ok",
 #    "auth":"bearer","docs":"https://github.com/mqlitehq/mqlite",
 #    "endpoints":["/mqlite.v1.QueueService/Send", ...every RPC route...],
 #    "health":"/healthz","metrics":"/metrics"}

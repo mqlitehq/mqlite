@@ -169,6 +169,26 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   else is treated as a different broker: you get a warning and pass `--token`.
   New SDK helper: `mqlite.EndpointIdentity`.
 
+- **Peek-Lock leases are renewed for the whole batch in one request** (MQLITE-97). Renewal was
+  per-message, so N messages cost N round trips — and on a slow link a renewal pass took *longer
+  than the lease it was renewing*: a 64-message batch at 50ms per call needs 3.2s against a 2s
+  lock, and most of the locks expired mid-pass and redelivered. New `RenewBatch` operation
+  (HTTP `/mqlite.v1.QueueService/RenewBatch`; `Client.RenewBatch` / `Embedded.RenewBatch`;
+  `Engine.RenewBatch`) renews a whole batch in one request and one transaction, so a renewal
+  pass is one round trip no matter how big the batch. The CLI's renewal interval is also a
+  fraction of the lease now (a third) rather than a fixed one-second floor — a queue whose lock
+  duration was one second or less previously had its first renewal scheduled at or *after* its
+  own expiry, so its lease could not be held at all.
+- **A DLQ under its retention cap no longer logs a false ERROR every minute** (MQLITE-97): the
+  cutoff query returns `sql.ErrNoRows` when there is nothing to purge — the normal steady state
+  — and that was being logged as a failure. With the default cap of a million dead letters, that
+  is very nearly every broker. Affected both the count and the byte bound.
+- **CLI strictness, round 2** (MQLITE-97): sequence numbers must be positive (`--seq 0,-1` was
+  accepted and quietly matched nothing); `version`, `help` and `serve` reject surplus arguments;
+  `purge-dlq --all --max 0` is now the same contradiction as `--all --max 10` (the check reads
+  whether the flag was *given*, not its value); and giving a body both as an argument and with
+  `--file` is an error instead of silently letting the file win.
+
 ## v0.2.0 — 2026-07-11
 
 ### Behavior changes

@@ -43,9 +43,17 @@ and error reference: [api-reference.md](api-reference.md).
 
 ## Docker / GHCR
 
+> **Release status — read before copy-pasting.**
+> These docs describe **`main`, which will ship as v0.3.0** and defaults to port **6754**.
+> **`0.3.0` is not published yet**, so the commands below are not runnable as written — they are
+> the shape they will have on release. The newest image you can actually pull today is
+> **`0.2.x`, and it listens on `8080`**: use `-p 8080:8080` and `ghcr.io/mqlitehq/mqlite:0.2.0`
+> until v0.3.0 is tagged. The port move is the headline change of that release.
+
 The published image is multi-arch (amd64 + arm64):
 
 ```bash
+# On release (v0.3.0, port 6754):
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
@@ -54,7 +62,9 @@ docker run -d --name mqlite -p 6754:6754 \
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin a version tag (`:0.3.0`) in production; `:0.3` tracks patches, `:latest` the newest release. Images `>= 0.3.0` listen on `6754`.
+- Pin a version tag in production; `:0.3` tracks patches, `:latest` the newest release.
+  Images `>= 0.3.0` listen on `6754`; **`0.2.x` and earlier listen on `8080`** — if you pin an
+  older tag, publish the port it actually uses.
 - Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`.
 
 ## Fly.io (minimal cost)
@@ -67,7 +77,9 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.3.0"   # use the public image; no build on Fly
+  image = "ghcr.io/mqlitehq/mqlite:0.3.0"   # public image, no build on Fly (see the release
+                                           # note above: 0.3.0 is not published yet; today's
+                                           # pullable tag is 0.2.x, which listens on 8080)
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume

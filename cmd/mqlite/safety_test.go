@@ -7,10 +7,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -358,9 +360,9 @@ func TestRenewerStopDoesNotHangOnStalledRenew(t *testing.T) {
 	inner := server.New(eng, nil).Handler()
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case wire.PathRenew:
+		case wire.PathRenew, wire.PathRenewBatch:
 			select {
-			case renewing <- struct{}{}: // record that a Renew really is in flight
+			case renewing <- struct{}{}: // record that a renewal really is in flight
 			default:
 			}
 			select {
@@ -396,5 +398,75 @@ func TestRenewerStopDoesNotHangOnStalledRenew(t *testing.T) {
 	case <-renewing:
 	default:
 		t.Fatal("no Renew was ever in flight — the test did not exercise the stalled-renew path")
+	}
+}
+
+// Round-3 P1: the supported-batch delayed-link requirement. Renewing message-by-message cost N
+// round trips, so on a slow link the renewal pass took LONGER than the lease it was saving —
+// 64 messages × 50ms = 3.2s against a 2s lock — and the reviewer watched 44 of 64 locks expire
+// mid-pass and redeliver. One RenewBatch per tick makes the pass one round trip regardless of
+// batch size.
+//
+// Reproduces the reviewer's setup exactly: short lease, per-Renew latency, a slow settle, and a
+// full-size batch. Asserts what they asked for — every message printed, exit 0, ONE batch
+// settlement, and an empty queue.
+func TestBatchRenewalUnderDelayedLink(t *testing.T) {
+	for _, n := range []int{64, 256} { // 256 is the engine's supported maximum receive
+		t.Run(fmt.Sprintf("%d messages", n), func(t *testing.T) {
+			resetGlobals(t)
+			ctx := context.Background()
+			// Background loops ON: the reaper is what reclaims an expired lock.
+			eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eng.Close()
+			if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 2000}); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < n; i++ {
+				if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var renews, settles atomic.Int64
+			inner := server.New(eng, nil).Handler()
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case wire.PathRenew, wire.PathRenewBatch:
+					renews.Add(1)
+					time.Sleep(50 * time.Millisecond) // per-renew link latency
+				case wire.PathCompleteBatch:
+					settles.Add(1)
+					time.Sleep(3 * time.Second) // a slow settle, longer than the 2s lease
+				}
+				inner.ServeHTTP(w, r)
+			}))
+			defer proxy.Close()
+
+			t.Setenv("MQLITE_ENDPOINT", proxy.URL)
+			t.Setenv("MQLITE_TOKEN", "")
+			out, err := captureStdout(t, func() error {
+				return cmdReceive(ctx, []string{"q", "--max", strconv.Itoa(n)})
+			})
+			if err != nil {
+				t.Fatalf("receive of %d messages over a delayed link must settle cleanly: %v", n, err)
+			}
+			if got := strings.Count(out, "seq="); got != n {
+				t.Errorf("printed %d message lines, want %d", got, n)
+			}
+			if s := settles.Load(); s != 1 {
+				t.Errorf("settlement requests = %d, want exactly 1 CompleteBatch", s)
+			}
+			// The whole point: the batch is settled, not redelivered.
+			if m, err := eng.Stats(ctx, "q"); err != nil || m.Total != 0 {
+				t.Fatalf("total=%d active=%d after settle, want 0 — leases were lost mid-renewal",
+					m.Total, m.Active)
+			}
+			// And a renewal pass is ONE request, so it cannot outgrow the lease: with per-message
+			// renewal this batch needed n round trips per pass.
+			t.Logf("%d messages: %d renewal request(s), %d settlement request(s)", n, renews.Load(), settles.Load())
+		})
 	}
 }

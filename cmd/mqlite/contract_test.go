@@ -271,13 +271,82 @@ func TestVacuumNewDBReportsNoNegativeFreed(t *testing.T) {
 		t.Errorf("vacuum reported negative freed space: %q", out)
 	}
 
+	// --output json must be passed as a FLAG: newFlags() re-registers --output and resets the
+	// global to "text", so setting gOutput directly never reached the JSON branch at all — the
+	// assertion below was running against text output and could not have failed (round-3 §3.4).
 	resetGlobals(t)
-	gOutput = "json"
-	out, err = captureStdout(t, func() error { return cmdVacuum(ctx0, nil) })
+	out, err = captureStdout(t, func() error { return cmdVacuum(ctx0, []string{"--output", "json"}) })
 	if err != nil {
 		t.Fatalf("vacuum --output json: %v", err)
 	}
-	if strings.Contains(out, `"freed_bytes": -`) {
-		t.Errorf("vacuum JSON reported negative freed_bytes: %q", out)
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("vacuum --output json did not emit JSON: %v\n%s", err, out)
+	}
+	freed, ok := got["freed_bytes"].(float64)
+	if !ok {
+		t.Fatalf("vacuum JSON has no freed_bytes: %v", got)
+	}
+	if freed < 0 {
+		t.Errorf("vacuum JSON reported negative freed_bytes: %v", freed)
+	}
+	if _, ok := got["grew_bytes"]; !ok {
+		t.Errorf("vacuum JSON must report growth separately: %v", got)
+	}
+}
+
+// Round-3 §3.4: the remaining contract gaps — arity on the meta commands, flag PRESENCE (not
+// value) for the destructive-mode conflict, strictly positive sequence numbers, and a body
+// given twice.
+func TestRound3ContractGaps(t *testing.T) {
+	embeddedEnv(t)
+	ctx := context.Background()
+
+	// A seq is a positive number: 0 and negatives are not messages. (A negative POSITIONAL is
+	// already rejected earlier, by the flag parser — it looks like a flag. The gap was the
+	// value reaching the backend, and the --seq list, where a negative is just a CSV field.)
+	if err := cmdSettle(ctx, "complete", []string{"q", "0", "tok"}); err == nil {
+		t.Error("complete with seq 0 must be rejected")
+	}
+	if err := cmdCancel(ctx, []string{"q", "0"}); err == nil {
+		t.Error("cancel with seq 0 must be rejected")
+	}
+	for _, bad := range []string{"0", "-1", "3,0", "3,-1"} {
+		if err := cmdReceiveDeferred(ctx, []string{"q", "--seq", bad}); err == nil {
+			t.Errorf("receive-deferred --seq %s must be rejected, not silently return []", bad)
+		}
+	}
+
+	// --all is "delete everything"; an explicit bound contradicts it even when the bound is 0.
+	// A value-only check sees 0 and waves it through.
+	for _, args := range [][]string{
+		{"q", "--all", "--max", "0"},
+		{"q", "--all", "--older-than", "0s"},
+	} {
+		if err := cmdPurgeDLQ(ctx, args); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+			t.Errorf("purge-dlq %v must be rejected as ambiguous, got %v", args, err)
+		}
+	}
+
+	// A body given twice is ambiguous — letting --file quietly win discards what was typed.
+	f := filepath.Join(t.TempDir(), "body.txt")
+	if err := os.WriteFile(f, []byte("from-file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSend(ctx, []string{"q", "typed-body", "--file", f}); err == nil {
+		t.Error("send with BOTH a positional body and --file must be rejected")
+	}
+
+	// Meta commands take no arguments.
+	for _, cmd := range []string{"version", "help"} {
+		if err := exactMeta(cmd, []string{"extra"}); err == nil {
+			t.Errorf("%s with a surplus argument must be rejected", cmd)
+		}
+		if err := exactMeta(cmd, nil); err != nil {
+			t.Errorf("%s with no arguments must be accepted, got %v", cmd, err)
+		}
+	}
+	if err := cmdServe(ctx, []string{"extra"}); err == nil {
+		t.Error("serve with a surplus positional must be rejected")
 	}
 }

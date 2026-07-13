@@ -69,6 +69,7 @@ func (s *Server) routes() {
 	h(wire.PathReceive, s.handleReceive)
 	h(wire.PathComplete, s.handleComplete)
 	h(wire.PathCompleteBatch, s.handleCompleteBatch)
+	h(wire.PathRenewBatch, s.handleRenewBatch)
 	h(wire.PathAbandon, s.handleAbandon)
 	h(wire.PathReject, s.handleReject)
 	h(wire.PathDefer, s.handleDefer)
@@ -483,6 +484,31 @@ func (s *Server) handleCompleteBatch(w http.ResponseWriter, r *http.Request) {
 		out[i] = wire.SettleItemResult{SeqNumber: res.SeqNumber, Ok: res.Ok}
 	}
 	writeJSON(w, wire.CompleteBatchResponse{Results: out})
+}
+
+// handleRenewBatch extends many leases in one request/transaction. N separate Renew calls cost
+// N round trips, which on a slow link takes longer than the lease they are meant to save.
+func (s *Server) handleRenewBatch(w http.ResponseWriter, r *http.Request) {
+	var req wire.RenewBatchRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	logf(w, "queue", req.Queue, "n", len(req.Messages))
+	items := make([]engine.SettleItem, len(req.Messages))
+	for i, m := range req.Messages {
+		items[i] = engine.SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+	}
+	results, err := s.eng.RenewBatch(r.Context(), req.Queue, items)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]wire.SettleItemResult, len(results))
+	for i, res := range results {
+		out[i] = wire.SettleItemResult{SeqNumber: res.SeqNumber, Ok: res.Ok}
+	}
+	writeJSON(w, wire.RenewBatchResponse{Results: out})
 }
 
 func (s *Server) handleAbandon(w http.ResponseWriter, r *http.Request) {

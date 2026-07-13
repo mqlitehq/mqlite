@@ -117,9 +117,15 @@ func main() {
 	case "vacuum":
 		err = cmdVacuum(ctx, args)
 	case "version", "-v", "--version":
-		fmt.Println("mqlite", version)
+		err = exactMeta(cmd, args)
+		if err == nil {
+			fmt.Println("mqlite", version)
+		}
 	case "help", "-h", "--help":
-		usage()
+		err = exactMeta(cmd, args)
+		if err == nil {
+			usage()
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command:", cmd)
 		usage()
@@ -129,6 +135,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// exactMeta rejects surplus arguments on the commands that take none. `mqlite version --json`
+// silently printing the plain version (and exiting 0) hides the caller's mistake — arity is a
+// contract on every command, not just the ones with positionals (round-3 §3.4).
+func exactMeta(cmd string, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("usage: mqlite %s   (takes no arguments, got %q)", cmd, strings.Join(args, " "))
+	}
+	return nil
 }
 
 func usage() {
@@ -179,6 +195,7 @@ type api interface {
 	Peek(ctx context.Context, queue string, opts ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error)
 	Message(queue string, seq int64, lockToken string) *mqlite.Message
 	CompleteBatch(ctx context.Context, queue string, msgs ...*mqlite.Message) ([]mqlite.SettleResult, error)
+	RenewBatch(ctx context.Context, queue string, msgs ...*mqlite.Message) ([]mqlite.SettleResult, error)
 	Cancel(ctx context.Context, queue string, seq int64) error
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
@@ -215,9 +232,13 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 		positionals = append(positionals, rest[0])
 		args = rest[1:]
 	}
-	// Note which global flags were explicitly given (Visit reports only set flags) so dial
-	// can honor `--token=` and isolate an ambient token from a changed endpoint (P1-5).
+	// Note which flags were explicitly given (Visit reports only set flags). Presence, not
+	// value: `--max 0` and "no --max at all" both parse to 0, so a conflict check that looks
+	// only at values accepts `purge-dlq --all --max 0` (round-3 §3.4). dial needs the same
+	// distinction to honor `--token=` and isolate an ambient token from a changed endpoint.
+	gFlagSeen = map[string]bool{}
 	fs.Visit(func(f *flag.Flag) {
+		gFlagSeen[f.Name] = true
 		switch f.Name {
 		case "endpoint":
 			gEndpointSet = true
@@ -321,6 +342,12 @@ func newFlags(name string) *flag.FlagSet {
 // jsonOut reports whether --output json was requested.
 func jsonOut() bool { return gOutput == "json" }
 
+// gFlagSeen records the flags explicitly passed on the command line (set by
+// parseInterspersed). A zero value is not the same as an absent flag.
+var gFlagSeen = map[string]bool{}
+
+func flagGiven(name string) bool { return gFlagSeen[name] }
+
 // emitJSON prints v as indented JSON (used when --output json). It writes to stdout in one
 // call and RETURNS the write error — a lost/closed stdout must be observable so a consumer
 // (e.g. receive) never settles a message whose output failed (review 2026-07-12 P1-1).
@@ -411,6 +438,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote", false, "allow a non-loopback bind while auth is disabled (MQLITE_TOKENS=off)")
 	_ = fs.Parse(args)
+	if fs.NArg() > 0 { // exact arity: serve takes flags only (round-3 §3.4)
+		return fmt.Errorf("usage: serve [--addr host:port] [--insecure-allow-remote]   (no positional arguments, got %q)",
+			strings.Join(fs.Args(), " "))
+	}
 
 	addrSet := false
 	fs.Visit(func(f *flag.Flag) {
@@ -751,7 +782,7 @@ func cmdReceive(ctx context.Context, args []string) error {
 		// reaper reclaim messages whose bodies were already emitted (round-2 §3.2). Registered
 		// after `defer c.Close()`, so it stops (and joins the goroutine) BEFORE the client is
 		// closed — no Renew races the shutdown.
-		defer startRenewer(ctx, msgs).Stop()
+		defer startRenewer(ctx, c, queue, msgs).Stop()
 	}
 	outErr := printMsgs(msgs, *noAck && !*del)
 	if *del || *noAck {
@@ -937,7 +968,7 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	// --all ("delete everything") and a bound are contradictory: the usage presents them as
 	// alternatives, so accepting `--all --max 10` and quietly honoring the bound is a trap
 	// (round-2 §3.3). Make the caller say which one they meant.
-	if *all && (*max > 0 || *older > 0) {
+	if *all && (flagGiven("max") || flagGiven("older-than")) {
 		return fmt.Errorf("--all deletes the entire DLQ and cannot be combined with --max/--older-than — pass one or the other")
 	}
 	c, err := dial(ctx)
@@ -1046,6 +1077,11 @@ func readCapped(r io.Reader, max int64) ([]byte, error) {
 
 func readBody(file string, rest []string) ([]byte, error) {
 	if file != "" {
+		// Ambiguous: the caller gave a body twice. Letting --file quietly win discards the
+		// text they typed (round-3 §3.4).
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("give the body either as an argument or with --file, not both")
+		}
 		return os.ReadFile(file)
 	}
 	if len(rest) == 0 {
@@ -1120,7 +1156,7 @@ type renewer struct {
 	once   sync.Once
 }
 
-func startRenewer(parent context.Context, msgs []*mqlite.Message) *renewer {
+func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Message) *renewer {
 	// Renewals run on a context WE can cancel. The CLI's own context never expires, so a Renew
 	// against a stalled broker would otherwise block in the goroutine forever — and Stop, which
 	// waits for it, would hang `receive` indefinitely even though the output and the settle had
@@ -1143,9 +1179,11 @@ func startRenewer(parent context.Context, msgs []*mqlite.Message) *renewer {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				for _, m := range msgs {
-					_ = m.Renew(ctx) // best-effort; a failed renew just risks a redelivery
-				}
+				// ONE request for the whole batch. Renewing message-by-message cost N round
+				// trips, so on a slow link the renewal pass outlasted the lease it was saving:
+				// 64 messages × 50ms = 3.2s against a 2s lock, and most locks expired mid-pass
+				// (review round-3). Best-effort — a failed renew only risks a redelivery.
+				_, _ = c.RenewBatch(ctx, queue, msgs...)
 			}
 		}
 	}()
@@ -1164,8 +1202,16 @@ func (r *renewer) Stop() {
 	<-r.done
 }
 
-// renewInterval is about half the tightest remaining lease across the batch (min 1s), so a
-// renew lands well before any lock expires.
+// renewInterval is a third of the tightest remaining lease in the batch, so the first renew
+// lands with the lease still two-thirds alive and a missed tick is survivable.
+//
+// It is a FRACTION of the lease, never a fixed floor. The old version clamped to a minimum of
+// one second, which meant a queue whose lock duration was one second or less had its first
+// renewal scheduled at or after its own expiry — the lease could not be held at all (review
+// round-3). The remaining floor is only a spin guard for a pathologically short lease; it is
+// well below any lock duration the engine will hand out.
+const minRenewInterval = 50 * time.Millisecond
+
 func renewInterval(msgs []*mqlite.Message) time.Duration {
 	now := time.Now()
 	tightest := time.Duration(0)
@@ -1177,10 +1223,10 @@ func renewInterval(msgs []*mqlite.Message) time.Duration {
 	if tightest <= 0 {
 		tightest = 30 * time.Second // the default lock duration
 	}
-	if half := tightest / 2; half > time.Second {
-		return half
+	if third := tightest / 3; third > minRenewInterval {
+		return third
 	}
-	return time.Second
+	return minRenewInterval
 }
 
 func formatMsg(m *mqlite.Message, withToken bool) string {

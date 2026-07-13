@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"testing"
 
@@ -18,6 +21,7 @@ import (
 // iterating endpoints[] can trust it lists every route, with none stale.
 var wantRPCRoutes = []string{
 	wire.PathSend, wire.PathReceive, wire.PathComplete, wire.PathCompleteBatch,
+	wire.PathRenewBatch,
 	wire.PathAbandon, wire.PathReject, wire.PathDefer, wire.PathReceiveDeferred,
 	wire.PathRenew, wire.PathSchedule, wire.PathCancel, wire.PathPeek, wire.PathStats,
 	wire.PathCreateQueue, wire.PathSubscribe, wire.PathListQueues, wire.PathListSubscriptions,
@@ -97,4 +101,48 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// Round-3 §3.3: the docs named `/mqlite.v1.Queue/Receive`, a route that does not exist (it is
+// `/mqlite.v1.QueueService/Receive`). Rather than fix the three occurrences and hope, pin the
+// whole surface: EVERY RPC path written in the docs must be a route the broker actually
+// registers. Invent one and this fails.
+//
+// The comparison is against the live catalog the server publishes on "/", so there is no second
+// list to keep in sync — the routes are their own source of truth.
+func TestDocsCiteOnlyRealRPCPaths(t *testing.T) {
+	card, _ := getCard(t, consoleServer(t, false, nil).URL+"/")
+	paths := card.Endpoints
+	real := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		real[p] = true
+	}
+
+	docs, err := filepath.Glob(filepath.Join("..", "docs", "*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs = append(docs, filepath.Join("..", "README.md"))
+	// Also cover the source comments, which is where the bad path was copied from.
+	more, _ := filepath.Glob(filepath.Join("..", "cmd", "mqlite", "*.go"))
+	docs = append(docs, more...)
+
+	re := regexp.MustCompile(`/mqlite\.v1\.[A-Za-z]+/[A-Za-z]+`)
+	checked := 0
+	for _, f := range docs {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, cited := range re.FindAllString(string(b), -1) {
+			checked++
+			if !real[cited] {
+				t.Errorf("%s cites %q, which the broker does not serve; the registered routes are %v",
+					filepath.Base(f), cited, paths)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no RPC paths found in the docs — the regex or the paths moved; this guard is not guarding")
+	}
 }
