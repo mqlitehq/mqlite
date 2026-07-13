@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -400,11 +399,26 @@ func TestTursoBatchSettle(t *testing.T) {
 	}
 	defer e.Close()
 
-	q := "batch-settle-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	// A FIXED queue name, reused every run. A unique one would leave a queues row behind on the
+	// live database forever: Purge only deletes dead letters, never the queue metadata, and a
+	// t.Cleanup would run AFTER the deferred e.Close() anyway, so it could not issue the request.
+	// Reusing one queue leaks nothing; drain whatever a previous failed run may have left.
+	const q = "batch-settle-turso"
 	if err := e.CreateQueue(ctx, q, QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}
-	t.Cleanup(func() { _, _ = e.Purge(context.Background(), q, RedriveOptions{}) })
+	if _, err := e.Purge(ctx, q, RedriveOptions{}); err != nil { // any dead letters from a past run
+		t.Fatalf("purge: %v", err)
+	}
+	for { // and any live messages from a past run
+		leftover, err := e.Receive(ctx, q, ReceiveOptions{MaxMessages: 256, Mode: ReceiveAndDelete})
+		if err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+		if len(leftover) == 0 {
+			break
+		}
+	}
 
 	const n = 32 // enough to be a real batch; small enough to keep the remote run quick
 	seed := make([]OutMessage, n)

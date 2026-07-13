@@ -273,41 +273,47 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		return nil, err
 	}
 
+	// Deliberately NOT one transaction. Renewal has no cross-item invariant to protect — each
+	// lease stands or falls on its own token, and the per-item result already says which held —
+	// so wrapping the chunks in a transaction buys nothing and costs two real things:
+	//
+	//   - a deadline computed for chunk 1 has to survive every later chunk's round trips AND the
+	//     final COMMIT. On a remote store, a large batch with a short lock could commit leases
+	//     that had already expired while it ran, and still report Ok — the reaper then reclaims
+	//     them immediately, which is precisely the bug this whole change exists to prevent;
+	//   - `Tx.Commit` takes no context. The pinned libSQL driver sends COMMIT on
+	//     context.Background(), so a stalled commit is UNCANCELLABLE — and `mqlite receive` waits
+	//     for the renewal goroutine before closing the client, which would hang the command
+	//     despite its cancellation (the very hang we fixed in round 2).
+	//
+	// Each chunk is therefore its own self-committing statement, with its deadline taken
+	// immediately before the single write it has to survive. For any realistic batch — Receive
+	// caps at 256 — that is ONE context-bound statement and no transaction at all.
 	renewed := make(map[string]bool, len(rows))
-	err = e.inTx(ctx, func(tx *sql.Tx) error {
-		for k := range renewed { // the remote inTx may replay the closure — never inherit results
-			delete(renewed, k)
+	err = chunkPairs(rows, func(group []SettleItem, pairs string) error {
+		// The write and the report of what it touched are the SAME statement: UPDATE ...
+		// RETURNING. A separate follow-up SELECT would put another round trip between the
+		// deadline and its commit, eating into the very lease it is trying to extend.
+		args := pairArgs(queue, group)
+		sel, err := e.db.query(ctx,
+			`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+			 RETURNING id, lock_token`,
+			append([]any{e.now() + q.lockDurationMs}, args...)...)
+		if err != nil {
+			return err
 		}
-		return chunkPairs(rows, func(group []SettleItem, pairs string) error {
-			// ONE statement per chunk: the write and the report of what it touched are the same
-			// UPDATE ... RETURNING. That is not a micro-optimization — it is what keeps the lease
-			// honest. Every statement is a separate round trip on a remote store, so any work
-			// between computing the deadline and committing it eats into the lease itself: with a
-			// separate follow-up SELECT, a short lock on a slow link could be ALREADY EXPIRED by
-			// the time the transaction became visible, while RenewBatch cheerfully reported Ok and
-			// the reaper reclaimed the messages immediately. The deadline is taken here, per chunk,
-			// immediately before the only write it has to survive.
-			args := pairArgs(queue, group)
-			sel, err := tx.QueryContext(ctx,
-				`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
-				 RETURNING id, lock_token`,
-				append([]any{e.now() + q.lockDurationMs}, args...)...)
-			if err != nil {
+		defer sel.Close()
+		// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
+		// absent from the RETURNING set and its Ok stays false. That is Renew's contract.
+		for sel.Next() {
+			var id int64
+			var tok string
+			if err := sel.Scan(&id, &tok); err != nil {
 				return err
 			}
-			defer sel.Close()
-			// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
-			// absent from the RETURNING set and its Ok stays false. That is Renew's contract.
-			for sel.Next() {
-				var id int64
-				var tok string
-				if err := sel.Scan(&id, &tok); err != nil {
-					return err
-				}
-				renewed[settleKey(id, tok)] = true
-			}
-			return sel.Err()
-		})
+			renewed[settleKey(id, tok)] = true
+		}
+		return sel.Err()
 	})
 	if err != nil {
 		return nil, err
