@@ -9,6 +9,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -112,6 +113,41 @@ func TestCLIRejectsNegativeDuration(t *testing.T) {
 }
 
 var ctx0 = context.Background()
+
+// Round-2 B1: the stdout guard decides whether `receive` may acknowledge, so a FALSE POSITIVE
+// is as bad as a false negative — it makes receive refuse to run at all. This pins both
+// directions on every platform CI builds (notably Windows, where os.SameFile reports a console
+// and a pipe as identical to NUL because their file ids are all zero — a naive port of the
+// Unix check breaks every Windows terminal).
+func TestStdoutUndeliverable(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if stdoutUndeliverable(f) {
+		t.Error("a regular file must be deliverable (`mqlite receive > out.json`)")
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if stdoutUndeliverable(w) {
+		t.Error("a pipe must be deliverable (`mqlite receive | jq`, and every captured CI run)")
+	}
+
+	nul, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nul.Close()
+	if !stdoutUndeliverable(nul) {
+		t.Error("the null device must be undeliverable — auto-ack there discards the bodies")
+	}
+}
 
 // P1-2: negative destructive limits are rejected at the engine boundary (so CLI, SDK, and
 // raw HTTP are all covered) and delete/move nothing.

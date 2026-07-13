@@ -141,9 +141,12 @@ type StatusInfo struct {
 	Location      string `json:"location"`
 	SchemaVersion string `json:"schema_version"`
 	PingMs        int64  `json:"ping_ms"`
-	SizeBytes     int64  `json:"size_bytes"`
+	DBSizeBytes   int64  `json:"db_size_bytes"` // local on-disk footprint; 0 for memory/remote
 	Queues        int    `json:"queues"`
 	Subscriptions int    `json:"subscriptions"`
+	// Broker-only facts: zero/false in embedded mode, which has no process uptime and no auth.
+	UptimeMs int64 `json:"uptime_ms"`
+	Auth     bool  `json:"auth"`
 }
 
 // ── data-plane options ───────────────────────────────────────────────────────

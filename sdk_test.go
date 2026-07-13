@@ -676,3 +676,32 @@ func TestCreateQueueDocMatchesWireConfig(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusInfoMatchesWireStatus pins the SDK's StatusInfo to wire.StatusResponse field for
+// field. StatusInfo had quietly renamed db_size_bytes to size_bytes and dropped uptime_ms and
+// auth, so `mqlite status --output json` and a raw POST to /mqlite.v1.Admin/Status disagreed
+// (round-2 §3.4). Comparing the whole tag set — not just the field someone last touched —
+// makes ANY future divergence loud and forces a deliberate decision.
+func TestStatusInfoMatchesWireStatus(t *testing.T) {
+	tags := func(rt reflect.Type) map[string]bool {
+		out := map[string]bool{}
+		for i := 0; i < rt.NumField(); i++ {
+			if tag := strings.Split(rt.Field(i).Tag.Get("json"), ",")[0]; tag != "" && tag != "-" {
+				out[tag] = true
+			}
+		}
+		return out
+	}
+	wireTags := tags(reflect.TypeOf(wire.StatusResponse{}))
+	sdkTags := tags(reflect.TypeOf(mqlite.StatusInfo{}))
+	for k := range wireTags {
+		if !sdkTags[k] {
+			t.Errorf("StatusInfo is missing the wire field %q — status JSON would drop it", k)
+		}
+	}
+	for k := range sdkTags {
+		if !wireTags[k] {
+			t.Errorf("StatusInfo has %q, which is not on the wire — the CLI must not invent keys", k)
+		}
+	}
+}

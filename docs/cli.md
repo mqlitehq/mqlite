@@ -23,9 +23,10 @@ mqlite <command> [flags] [args]
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
-The DB string / endpoint is **only** read from the environment, never compiled in.
+The DB string is **never compiled in** — it comes from the environment. The endpoint comes
+from the environment too, or from `--endpoint` (below), which overrides it.
 
-## Global flags (any command)
+## Global flags (data + admin commands)
 
 | Flag | Meaning |
 |---|---|
@@ -33,11 +34,24 @@ The DB string / endpoint is **only** read from the environment, never compiled i
 | `--token <bearer>` | Bearer token for `--endpoint` (overrides `MQLITE_TOKEN`) |
 | `--output text\|json` | `text` (default, human) or `json` (machine-readable, for scripting) |
 
-The CLI is a first-party client covering the common broker operations, in both embedded and
-client mode. It is not a lossless view of every wire field — for the complete HTTP contract
-(all fields, batch send, attempt ids) use raw HTTP against the routes in
-[api-reference.md](api-reference.md). In `--output json`, message bodies are base64 (the
-same lossless encoding as the wire) and timestamps are epoch-ms.
+They apply to the data and admin commands. **`serve`, `version` and `help` take none of them**
+(a broker is not a client), and **`vacuum` is local-only** — it rejects `--endpoint` outright,
+because reclaiming pages means opening the DB file directly.
+
+An ambient `MQLITE_TOKEN` is sent only to the endpoint that environment names. If `--endpoint`
+points at a *different* broker, the token is withheld (with a warning) rather than leaked to
+another host — pass `--token` to authenticate there. `--token=` (empty) explicitly sends no
+credential at all. Two spellings of the same broker (a trailing slash, `mqlite://h` vs
+`http://h:6754`) are the same target and keep the token.
+
+### `--output json` is the wire shape
+
+A message in `--output json` **is** the HTTP API's message object — the same struct, so the
+same keys (`seq_number`, `body` base64, epoch-ms timestamps). What you get from
+`mqlite receive --output json` and from a raw POST to `/mqlite.v1.Queue/Receive` agree
+field for field; see [api-reference.md](api-reference.md) for the complete contract. The CLI
+still doesn't expose *every* HTTP operation (batch send, attempt ids) — for those, use raw
+HTTP — but the JSON it does emit never invents or renames a key.
 
 > **Settling across invocations needs a broker.** `receive --no-ack` locks a message and
 > prints its `lock-token`; you settle it later with `complete/abandon/reject/defer/renew

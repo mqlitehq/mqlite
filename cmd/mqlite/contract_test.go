@@ -11,10 +11,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // captureStdout redirects os.Stdout for the duration of fn (tests run sequentially, so the
@@ -76,16 +78,52 @@ func TestReceiveJSONShape(t *testing.T) {
 	}
 	m := got[0]
 	for _, k := range []string{
-		"seq", "body", "message_id", "group_id", "correlation_id", "subject",
+		"seq_number", "body", "message_id", "group_id", "correlation_id", "subject",
 		"reply_to", "content_type", "properties", "enqueued_at_ms", "locked_until_ms", "lock_token",
 	} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("receive JSON missing key %q; got keys %v", k, keysOf(m))
 		}
 	}
+	if _, stale := m["seq"]; stale {
+		t.Error(`receive JSON uses "seq"; the wire key is "seq_number" (round-2 §3.4)`)
+	}
 	if m["body"] != "aGk=" { // base64("hi")
 		t.Errorf("body = %v, want base64 aGk=", m["body"])
 	}
+	// Every key the CLI emits must be a real wire.Message field — no CLI-invented names.
+	wireKeys := jsonTagsOf(reflect.TypeOf(wire.Message{}))
+	for k := range m {
+		if !wireKeys[k] {
+			t.Errorf("receive JSON key %q is not a wire.Message field — the CLI must not invent keys", k)
+		}
+	}
+}
+
+// §3.4: the CLI's JSON views ARE the wire types, not lookalikes that can drift apart. Pinning
+// the TYPE (not a hand-listed set of keys) means a field added to the wire is automatically
+// carried by the CLI, and reintroducing a hand-rolled view struct fails here immediately —
+// which is how `seq` vs `seq_number` and the dropped visible_at_ms/locked_until_ms happened.
+func TestCLIJSONIsWireShape(t *testing.T) {
+	want := reflect.TypeOf(wire.Message{})
+	if got := reflect.TypeOf(viewMsg(&mqlite.Message{}, false)); got != want {
+		t.Errorf("the receive/deferred JSON view is %v, want %v", got, want)
+	}
+	if got := reflect.TypeOf(viewPeeked(nil)).Elem(); got != want {
+		t.Errorf("the peek JSON view element is %v, want %v", got, want)
+	}
+}
+
+// jsonTagsOf returns the set of JSON key names a struct marshals to.
+func jsonTagsOf(t reflect.Type) map[string]bool {
+	out := make(map[string]bool, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			out[name] = true
+		}
+	}
+	return out
 }
 
 func keysOf(m map[string]any) []string {

@@ -41,6 +41,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -58,26 +59,14 @@ const version = ver.Version
 // caller (review 2026-07-12 round-2 B1).
 var stdoutInvalid bool
 
-// sanitizeStdout detects when the CLI's stdout cannot deliver output to the caller — either
-// fd 1 was closed at exec (`mqlite receive q 1>&-`, which the Go runtime silently reopens to
-// the null device before main, so writes then "succeed" into a black hole) or it was
-// redirected to the null device outright (`>/dev/null`). In both cases a data-plane command
-// like `receive` must NOT acknowledge messages whose bodies vanish; we record the condition
-// so it can refuse before claiming. (A truly closed fd is also reopened to /dev/null so a
-// later open can't reuse descriptor 1 and corrupt a data file with stray stdout writes.)
-func sanitizeStdout() {
-	so, err := os.Stdout.Stat()
-	if err != nil {
-		stdoutInvalid = true
-		if f, e := os.OpenFile(os.DevNull, os.O_WRONLY, 0); e == nil {
-			os.Stdout = f
-		}
-		return
-	}
-	if nul, nerr := os.Stat(os.DevNull); nerr == nil && os.SameFile(nul, so) {
-		stdoutInvalid = true // stdout is the null device — output would be discarded
-	}
-}
+// sanitizeStdout records whether stdout can actually deliver output to the caller — fd 1 was
+// closed at exec (`mqlite receive q 1>&-`, which the Go runtime silently reopens to the null
+// device before main, so writes then "succeed" into a black hole) or it was redirected to the
+// null device outright (`>/dev/null`). In both cases a data-plane command like `receive` must
+// NOT acknowledge messages whose bodies vanish; we record the condition so it can refuse
+// before claiming anything. The detection itself is platform-specific — see
+// stdout_unix.go / stdout_windows.go.
+func sanitizeStdout() { stdoutInvalid = stdoutUndeliverable(os.Stdout) }
 
 func main() {
 	sanitizeStdout()
@@ -376,13 +365,34 @@ func resolveToken(ep, envEp string) string {
 	if gTokenSet {
 		return gToken
 	}
-	if !gEndpointSet || ep == envEp {
+	if !gEndpointSet || sameEndpoint(ep, envEp) {
 		return os.Getenv("MQLITE_TOKEN")
 	}
 	if os.Getenv("MQLITE_TOKEN") != "" {
 		fmt.Fprintln(os.Stderr, "warning: --endpoint changes the target host; MQLITE_TOKEN is NOT forwarded to it — pass --token to authenticate")
 	}
 	return ""
+}
+
+// sameEndpoint reports whether two endpoint strings reach the same broker over the same
+// transport. The token boundary is the AUTHORITY (scheme/host/effective port), not the raw
+// text: `http://h:6754` and `http://h:6754/` are one host, and re-passing the environment's
+// own endpoint with a trailing slash must not cost the caller their token (round-2 §3.5).
+// If either string can't be parsed we fall back to exact text — an unparseable endpoint never
+// WIDENS the boundary.
+func sameEndpoint(a, b string) bool {
+	if a == b {
+		return true
+	}
+	na, err := mqlite.EndpointAuthority(a)
+	if err != nil {
+		return false
+	}
+	nb, err := mqlite.EndpointAuthority(b)
+	if err != nil {
+		return false
+	}
+	return na == nb
 }
 
 // stripEndpointCredentials removes any userinfo embedded in an endpoint DSN (e.g.
@@ -619,7 +629,7 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 {
+	if len(pos) != 1 { // exact arity — a surplus positional is a typo, not something to ignore
 		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m --ordering standard --dlq-max-age 336h --dlq-max-count 1000 --dlq-max-bytes 10485760]")
 	}
 	c, err := dial(ctx)
@@ -644,7 +654,7 @@ func cmdCreateSubscription(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 2 {
+	if len(pos) != 2 { // exact arity
 		return fmt.Errorf("usage: subscribe <topic> <subscription> [--expr 'predicate']")
 	}
 	c, err := dial(ctx)
@@ -735,15 +745,15 @@ func cmdReceive(ctx context.Context, args []string) error {
 	// LOSES the message (review 2026-07-12 P1-1). The lock token is shown only when the
 	// message stays locked (--no-ack) so it can be settled later.
 	autoAck := !*del && !*noAck
-	render := func() error { return printMsgs(msgs, *noAck && !*del) }
-	var outErr error
 	if autoAck {
-		// Keep the leases renewed while output is written, so a slow sink can't let the
-		// reaper reclaim messages whose bodies were already emitted (review 2026-07-12 P1).
-		outErr = renewWhile(ctx, msgs, render)
-	} else {
-		outErr = render()
+		// Renew the leases from here until this function RETURNS — covering both the output
+		// write and the CompleteBatch RPC, so neither a slow sink nor a slow settle can let the
+		// reaper reclaim messages whose bodies were already emitted (round-2 §3.2). Registered
+		// after `defer c.Close()`, so it stops (and joins the goroutine) BEFORE the client is
+		// closed — no Renew races the shutdown.
+		defer startRenewer(ctx, msgs).Stop()
 	}
+	outErr := printMsgs(msgs, *noAck && !*del)
 	if *del || *noAck {
 		return outErr // nothing to auto-settle; surface any output error as a nonzero exit
 	}
@@ -782,7 +792,7 @@ func cmdPeek(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 {
+	if len(pos) != 1 { // exact arity
 		return fmt.Errorf("usage: peek <queue> [--state s --from seq --max n]")
 	}
 	c, err := dial(ctx)
@@ -817,7 +827,7 @@ func cmdMetrics(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(pos) < 1 {
+	if len(pos) != 1 { // exact arity
 		return fmt.Errorf("usage: metrics <queue>")
 	}
 	c, err := dial(ctx)
@@ -839,8 +849,12 @@ func cmdMetrics(ctx context.Context, args []string) error {
 
 func cmdList(ctx context.Context, args []string) error {
 	fs := newFlags("list")
-	if _, err := parseInterspersed(fs, args); err != nil {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) != 0 { // exact arity — `list extra` is a typo, not a filter
+		return fmt.Errorf("usage: list")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -920,6 +934,12 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	if *max == 0 && *older == 0 && !*all {
 		return fmt.Errorf("refusing to purge the entire DLQ without a bound — pass --max/--older-than, or --all to delete everything")
 	}
+	// --all ("delete everything") and a bound are contradictory: the usage presents them as
+	// alternatives, so accepting `--all --max 10` and quietly honoring the bound is a trap
+	// (round-2 §3.3). Make the caller say which one they meant.
+	if *all && (*max > 0 || *older > 0) {
+		return fmt.Errorf("--all deletes the entire DLQ and cannot be combined with --max/--older-than — pass one or the other")
+	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
@@ -939,8 +959,12 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 func cmdVacuum(ctx context.Context, args []string) error {
 	fs := newFlags("vacuum")
 	full := fs.Bool("full", false, "full VACUUM (rewrites the DB, global lock) instead of incremental")
-	if _, err := parseInterspersed(fs, args); err != nil {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) != 0 { // exact arity — vacuum takes no positional (the DB comes from MQLITE_DB)
+		return fmt.Errorf("usage: vacuum [--full]   (the DB comes from MQLITE_DB)")
 	}
 	if gEndpoint != "" || os.Getenv("MQLITE_ENDPOINT") != "" {
 		return fmt.Errorf("vacuum is a local maintenance command: drop --endpoint/MQLITE_ENDPOINT and point MQLITE_DB at the file")
@@ -963,13 +987,26 @@ func cmdVacuum(ctx context.Context, args []string) error {
 	if *full {
 		kind = "VACUUM"
 	}
+	// A brand-new/empty DB materializes its schema pages while it is opened and vacuumed, so
+	// `after` can exceed `before` — and "freed -0.12 MiB" is nonsense. Reclaimed bytes are
+	// clamped at zero and growth is reported as growth (round-2 §3.6).
+	freed, grew := before-after, int64(0)
+	if freed < 0 {
+		grew, freed = -freed, 0
+	}
 	if jsonOut() {
 		return emitJSON(map[string]any{
-			"action": kind, "before_bytes": before, "after_bytes": after, "freed_bytes": before - after,
+			"action": kind, "before_bytes": before, "after_bytes": after,
+			"freed_bytes": freed, "grew_bytes": grew,
 		})
 	}
+	if grew > 0 {
+		fmt.Printf("ok: %s — %.2f MiB -> %.2f MiB (nothing to reclaim; the DB grew %.2f MiB)\n",
+			kind, mib(before), mib(after), mib(grew))
+		return nil
+	}
 	fmt.Printf("ok: %s — %.2f MiB -> %.2f MiB (freed %.2f MiB)\n",
-		kind, mib(before), mib(after), mib(before-after))
+		kind, mib(before), mib(after), mib(freed))
 	return nil
 }
 
@@ -1070,21 +1107,33 @@ func writeMsgJSON(w *bufio.Writer, msgs []*mqlite.Message, withToken bool) error
 	return err
 }
 
-// renewWhile keeps a received batch's Peek-Lock leases alive (best-effort) while fn runs,
-// then returns fn's error. It renews at roughly half the tightest remaining lease, so a
-// slow output sink can't let the reaper reclaim messages whose bodies were already emitted
-// (review 2026-07-12 P1). During normal fast output the ticker never fires.
-func renewWhile(ctx context.Context, msgs []*mqlite.Message, fn func() error) error {
+// renewer keeps a received batch's Peek-Lock leases alive (best-effort) in the background —
+// from the moment the batch is claimed until settlement has RETURNED. It renews at roughly
+// half the tightest remaining lease, so neither a slow output sink nor a slow CompleteBatch
+// can let the reaper reclaim messages whose bodies were already emitted (review 2026-07-12
+// P1; round-2 §3.2 — renewal used to stop before the settle RPC, leaving exactly that
+// window open on a high-latency link). During normal fast output the ticker never fires.
+type renewer struct {
+	stop chan struct{}
+	done chan struct{} // closed once the goroutine has exited and no Renew is in flight
+	once sync.Once
+}
+
+func startRenewer(ctx context.Context, msgs []*mqlite.Message) *renewer {
+	r := &renewer{stop: make(chan struct{}), done: make(chan struct{})}
 	if len(msgs) == 0 {
-		return fn()
+		close(r.done)
+		return r
 	}
-	done := make(chan struct{})
 	go func() {
+		defer close(r.done)
 		t := time.NewTicker(renewInterval(msgs))
 		defer t.Stop()
 		for {
 			select {
-			case <-done:
+			case <-r.stop:
+				return
+			case <-ctx.Done():
 				return
 			case <-t.C:
 				for _, m := range msgs {
@@ -1093,9 +1142,14 @@ func renewWhile(ctx context.Context, msgs []*mqlite.Message, fn func() error) er
 			}
 		}
 	}()
-	err := fn()
-	close(done)
-	return err
+	return r
+}
+
+// Stop halts renewal and WAITS for any in-flight Renew to finish, so the caller can close the
+// client without a request racing the shutdown. Safe to call more than once.
+func (r *renewer) Stop() {
+	r.once.Do(func() { close(r.stop) })
+	<-r.done
 }
 
 // renewInterval is about half the tightest remaining lease across the batch (min 1s), so a

@@ -140,6 +140,29 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
     while appearing bounded. Any positive duration now rounds **up** to 1 ms in the SDK
     (`Purge`/`Redrive`, so raw HTTP and embedded callers are covered), and the CLI rejects a
     positive sub-ms `--older-than` outright.
+- **`--output json` now emits the wire shape exactly** (MQLITE-96). The CLI had a parallel,
+  hand-copied schema that renamed `seq_number` to `seq` and dropped `visible_at_ms` /
+  `locked_until_ms` (peek) and `uptime_ms` / `auth` (status), and called `db_size_bytes`
+  `size_bytes`. A message in `--output json` is now literally the HTTP API's message object, so
+  the CLI and a raw POST agree key for key and a field added to the wire can't go missing from
+  the CLI. **Breaking for scripts** that read the old CLI-only keys: `seq` → `seq_number`,
+  `size_bytes` → `db_size_bytes`.
+- **A negative `scheduled_enqueue_time_ms` is rejected over raw HTTP** (MQLITE-96): it used to
+  fall past the `> 0` check and enqueue an *active* message with a 200, so raw HTTP disagreed
+  with embedded and the CLI, where the same value is refused.
+- **CLI strictness** (MQLITE-96): `create-queue`/`subscribe`/`peek`/`metrics`/`list`/`vacuum`
+  now require exact arity — a surplus positional is a typo (a misplaced flag, a value the shell
+  split), and silently ignoring it is how you purge the wrong queue. `purge-dlq --all` can no
+  longer be combined with `--max`/`--older-than` (they are alternatives, not a refinement).
+- **Peek-Lock leases are renewed through settlement, not just through output** (MQLITE-96): on
+  a high-latency link the `CompleteBatch` itself could outlast the lock, so a receive whose
+  output the caller had already seen would be reclaimed mid-settle and redelivered.
+- **`vacuum` no longer reports negative "freed" space** (MQLITE-96): a fresh DB materializes its
+  schema pages as it is opened and vacuumed, so it can end up *larger*; growth is now reported
+  as growth and reclaimed bytes never go below zero.
+- **The endpoint token boundary compares hosts, not strings** (MQLITE-96): `http://h:6754` and
+  `http://h:6754/` are the same broker, and re-passing your own endpoint with a trailing slash
+  no longer withholds `MQLITE_TOKEN` and hands you a 401.
 
 ## v0.2.0 — 2026-07-11
 

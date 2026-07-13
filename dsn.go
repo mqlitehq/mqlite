@@ -54,3 +54,31 @@ func parseDSN(dsn string) (endpoint, token string, err error) {
 	}
 	return scheme + "://" + host, token, nil
 }
+
+// EndpointAuthority returns the target an endpoint string actually resolves to —
+// `scheme://host:port`, lower-cased, credentials and path/trailing-slash noise removed.
+//
+// This is the boundary that matters when deciding whether two endpoints are the same broker:
+// `http://h:6754` and `http://h:6754/` are, and so are `mqlite://h` and `http://h:6754` (the
+// custom scheme supplies the product port). Comparing raw text instead would call them
+// different hosts. It is deliberately derived from parseDSN, so it can never drift from the
+// endpoint the client dials.
+func EndpointAuthority(dsn string) (string, error) {
+	ep, _, err := parseDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(ep)
+	if err != nil {
+		return "", fmt.Errorf("mqlite: bad connection string: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" { // plain http(s) keeps standard Web ports
+		port = "80"
+		if scheme == "https" {
+			port = "443"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port), nil
+}

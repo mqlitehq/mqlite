@@ -214,13 +214,15 @@ mqlite complete orders 42 <lock-token>           # settle a --no-ack message (al
 mqlite peek orders --state dead_lettered
 mqlite status                                    # backend / ping / counts
 mqlite list-subscriptions ; mqlite test-filter 'subject == "x"'
-mqlite metrics orders --output json              # every command takes --output text|json
+mqlite metrics orders --output json              # machine-readable: the same keys as the HTTP API
 mqlite redrive orders --max 100                  # DLQ → active
 mqlite purge-dlq orders --older-than 24h         # delete dead-lettered (unbounded needs --all)
 ```
 
-Every command takes the global flags `--endpoint <url>` / `--token <t>` (override the
-environment) and `--output text|json`. See the [CLI reference](docs/cli.md) for the full set.
+The data and admin commands take the global flags `--endpoint <url>` / `--token <t>` (override
+the environment) and `--output text|json` — `serve`, `version` and `help` don't, and `vacuum`
+is local-only. Under `--output json` a message **is** the HTTP API's message object, key for
+key. See the [CLI reference](docs/cli.md) for the full set.
 
 Connection is read from `--endpoint`/`--token`, or from the environment:
 
