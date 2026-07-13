@@ -279,27 +279,25 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 			delete(renewed, k)
 		}
 		return chunkPairs(rows, func(group []SettleItem, pairs string) error {
-			// The deadline is taken PER CHUNK, not once for the whole batch. A batch bigger than
-			// one chunk costs several round trips on a remote store, and a deadline frozen before
-			// the first of them can already be in the past by the time the last one commits — the
-			// transaction would then report Ok while handing the reaper leases that had expired
-			// while it ran. Each chunk gets a lease measured from when it is actually written.
+			// ONE statement per chunk: the write and the report of what it touched are the same
+			// UPDATE ... RETURNING. That is not a micro-optimization — it is what keeps the lease
+			// honest. Every statement is a separate round trip on a remote store, so any work
+			// between computing the deadline and committing it eats into the lease itself: with a
+			// separate follow-up SELECT, a short lock on a slow link could be ALREADY EXPIRED by
+			// the time the transaction became visible, while RenewBatch cheerfully reported Ok and
+			// the reaper reclaimed the messages immediately. The deadline is taken here, per chunk,
+			// immediately before the only write it has to survive.
 			args := pairArgs(queue, group)
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)`,
-				append([]any{e.now() + q.lockDurationMs}, args...)...); err != nil {
-				return err
-			}
-			// Which items actually matched? The same row-value set, so this reports exactly the
-			// rows the UPDATE touched; an item whose lock was lost or whose token is wrong is
-			// simply absent, and its Ok stays false.
 			sel, err := tx.QueryContext(ctx,
-				`SELECT id, lock_token FROM messages WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)`,
-				args...)
+				`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+				 RETURNING id, lock_token`,
+				append([]any{e.now() + q.lockDurationMs}, args...)...)
 			if err != nil {
 				return err
 			}
 			defer sel.Close()
+			// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
+			// absent from the RETURNING set and its Ok stays false. That is Renew's contract.
 			for sel.Next() {
 				var id int64
 				var tok string
