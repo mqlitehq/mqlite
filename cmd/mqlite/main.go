@@ -374,21 +374,21 @@ func resolveToken(ep, envEp string) string {
 	return ""
 }
 
-// sameEndpoint reports whether two endpoint strings reach the same broker over the same
-// transport. The token boundary is the AUTHORITY (scheme/host/effective port), not the raw
-// text: `http://h:6754` and `http://h:6754/` are one host, and re-passing the environment's
-// own endpoint with a trailing slash must not cost the caller their token (round-2 §3.5).
-// If either string can't be parsed we fall back to exact text — an unparseable endpoint never
-// WIDENS the boundary.
+// sameEndpoint reports whether two endpoint strings reach the same broker. The token boundary
+// is the canonical IDENTITY — scheme, host, effective port AND path (a reverse proxy routes
+// /prod and /dev to different backends) — not the raw text: `http://h:6754` and
+// `http://h:6754/` are one broker, and re-passing the environment's own endpoint with a
+// trailing slash must not cost the caller their token (round-2 §3.5). If either string can't
+// be parsed we report NOT-same — an unparseable endpoint may never widen the boundary.
 func sameEndpoint(a, b string) bool {
 	if a == b {
 		return true
 	}
-	na, err := mqlite.EndpointAuthority(a)
+	na, err := mqlite.EndpointIdentity(a)
 	if err != nil {
 		return false
 	}
-	nb, err := mqlite.EndpointAuthority(b)
+	nb, err := mqlite.EndpointIdentity(b)
 	if err != nil {
 		return false
 	}
@@ -1114,14 +1114,21 @@ func writeMsgJSON(w *bufio.Writer, msgs []*mqlite.Message, withToken bool) error
 // P1; round-2 §3.2 — renewal used to stop before the settle RPC, leaving exactly that
 // window open on a high-latency link). During normal fast output the ticker never fires.
 type renewer struct {
-	stop chan struct{}
-	done chan struct{} // closed once the goroutine has exited and no Renew is in flight
-	once sync.Once
+	cancel context.CancelFunc // aborts a Renew that is already in flight
+	stop   chan struct{}
+	done   chan struct{} // closed once the goroutine has exited and no Renew is in flight
+	once   sync.Once
 }
 
-func startRenewer(ctx context.Context, msgs []*mqlite.Message) *renewer {
-	r := &renewer{stop: make(chan struct{}), done: make(chan struct{})}
+func startRenewer(parent context.Context, msgs []*mqlite.Message) *renewer {
+	// Renewals run on a context WE can cancel. The CLI's own context never expires, so a Renew
+	// against a stalled broker would otherwise block in the goroutine forever — and Stop, which
+	// waits for it, would hang `receive` indefinitely even though the output and the settle had
+	// already succeeded.
+	ctx, cancel := context.WithCancel(parent)
+	r := &renewer{cancel: cancel, stop: make(chan struct{}), done: make(chan struct{})}
 	if len(msgs) == 0 {
+		cancel()
 		close(r.done)
 		return r
 	}
@@ -1145,10 +1152,15 @@ func startRenewer(ctx context.Context, msgs []*mqlite.Message) *renewer {
 	return r
 }
 
-// Stop halts renewal and WAITS for any in-flight Renew to finish, so the caller can close the
-// client without a request racing the shutdown. Safe to call more than once.
+// Stop ends renewal and waits for the goroutine to exit, so no Renew is still in flight when
+// the caller closes the client. It first CANCELS any renewal already running: by the time Stop
+// is called the batch is settled, so an outstanding Renew is worthless — and waiting on one
+// that is hung would hang the command. Safe to call more than once.
 func (r *renewer) Stop() {
-	r.once.Do(func() { close(r.stop) })
+	r.once.Do(func() {
+		close(r.stop)
+		r.cancel()
+	})
 	<-r.done
 }
 

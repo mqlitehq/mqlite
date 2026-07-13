@@ -55,15 +55,24 @@ func parseDSN(dsn string) (endpoint, token string, err error) {
 	return scheme + "://" + host, token, nil
 }
 
-// EndpointAuthority returns the target an endpoint string actually resolves to —
-// `scheme://host:port`, lower-cased, credentials and path/trailing-slash noise removed.
+// EndpointIdentity returns the broker an endpoint string actually resolves to, canonicalized:
+// `scheme://host:port[/path]`, lower-cased scheme/host, the default port supplied, credentials
+// removed, and an insignificant trailing slash dropped.
 //
-// This is the boundary that matters when deciding whether two endpoints are the same broker:
-// `http://h:6754` and `http://h:6754/` are, and so are `mqlite://h` and `http://h:6754` (the
-// custom scheme supplies the product port). Comparing raw text instead would call them
-// different hosts. It is deliberately derived from parseDSN, so it can never drift from the
-// endpoint the client dials.
-func EndpointAuthority(dsn string) (string, error) {
+// Use it to answer "are these two endpoints the same broker?" — the question that decides
+// whether an ambient token may be reused. Comparing raw text gets it wrong in both directions:
+// `http://h:6754` and `http://h:6754/` are one broker (and `mqlite://h` and `http://h:6754`
+// are too, since the custom scheme supplies the product port), so treating them as different
+// costs the caller their token for no reason.
+//
+// The PATH is part of the identity, not noise. A reverse proxy routes `https://gw/prod` and
+// `https://gw/dev` to different backends, and Client.post appends the RPC route to the
+// endpoint verbatim — so those are two brokers and a token must NOT cross between them.
+// Anything unrecognized is likewise kept, so an unfamiliar shape can only ever make two
+// endpoints look *more* distinct (withhold the token), never less.
+//
+// It is derived from parseDSN, so it cannot drift from the endpoint the client really dials.
+func EndpointIdentity(dsn string) (string, error) {
 	ep, _, err := parseDSN(dsn)
 	if err != nil {
 		return "", err
@@ -80,5 +89,10 @@ func EndpointAuthority(dsn string) (string, error) {
 			port = "443"
 		}
 	}
-	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port), nil
+	id := scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+	id += strings.TrimRight(u.Path, "/") // "/prod/" == "/prod"; root == ""
+	if u.RawQuery != "" {
+		id += "?" + u.RawQuery
+	}
+	return id, nil
 }

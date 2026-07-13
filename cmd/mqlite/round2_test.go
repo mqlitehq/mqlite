@@ -78,6 +78,7 @@ func TestSameEndpoint(t *testing.T) {
 		{"http://Host:6754", "http://host:6754"},            // host case
 		{"mqlites://h", "https://h:6754"},                   // TLS variant
 		{"mqlite://tok@h:6754", "http://h:6754"},            // an embedded credential is not part of the target
+		{"https://gw/prod", "https://gw/prod/"},             // only the trailing slash is noise
 	}
 	for _, p := range same {
 		if !sameEndpoint(p[0], p[1]) {
@@ -88,6 +89,11 @@ func TestSameEndpoint(t *testing.T) {
 		{"http://h:6754", "http://other:6754"}, // different host
 		{"http://h:6754", "http://h:9000"},     // different port
 		{"http://h:6754", "https://h:6754"},    // different transport — never send a token over a downgrade
+		// A reverse proxy routes these to DIFFERENT backends, and Client.post appends the RPC
+		// route to the endpoint verbatim — so the path is part of the broker's identity and a
+		// token must not cross between them (codex).
+		{"https://gw/prod", "https://gw/dev"},
+		{"https://gw/prod", "https://gw"},
 	}
 	for _, p := range diff {
 		if sameEndpoint(p[0], p[1]) {
@@ -208,5 +214,71 @@ func TestNegativeScheduleRejectedEverywhere(t *testing.T) {
 	past := mqlite.SendOpts{At: time.Now().Add(-time.Hour)}
 	if _, err := emb.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}, past); err == nil {
 		t.Error("embedded schedule in the past must be rejected")
+	}
+}
+
+// codex: a Renew that stalls must not hang the command. The renewer's goroutine runs on the
+// CLI's context, which never expires, so Stop() — which waits for it — would block forever on
+// an in-flight Renew against a wedged broker, even though the output and the settle had
+// already succeeded. Stop must cancel the renewal first: by then it is worthless anyway.
+func TestRenewerStopDoesNotHangOnStalledRenew(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	// A 2s lock so the renewer's ticker (half the lease, min 1s) fires while output is blocked.
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+
+	wedge := make(chan struct{}) // never closed: a Renew that reaches the broker hangs forever
+	renewing := make(chan struct{}, 1)
+	inner := server.New(eng, nil).Handler()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenew:
+			select {
+			case renewing <- struct{}{}: // record that a Renew really is in flight
+			default:
+			}
+			select {
+			case <-wedge:
+			case <-r.Context().Done(): // the client cancelling is the ONLY thing that frees us
+			}
+			return
+		case wire.PathCompleteBatch:
+			// Settle slowly, so the renewer's ticker (1s) fires and wedges a Renew WHILE the
+			// command is still running. Without that, Stop() would find nothing in flight and
+			// the test would prove nothing.
+			time.Sleep(2500 * time.Millisecond)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+	defer close(wedge) // LIFO: frees the wedged handler so proxy.Close() can drain
+
+	t.Setenv("MQLITE_ENDPOINT", proxy.URL)
+	t.Setenv("MQLITE_TOKEN", "")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := captureStdout(t, func() error { return cmdReceive(ctx, []string{"q", "--max", "1"}) })
+		done <- err
+	}()
+	select {
+	case <-done: // settled (or errored) — either way it RETURNED, which is the point
+	case <-time.After(30 * time.Second):
+		t.Fatal("receive hung: Stop() waited on a stalled Renew instead of cancelling it")
+	}
+	select {
+	case <-renewing:
+	default:
+		t.Fatal("no Renew was ever in flight — the test did not exercise the stalled-renew path")
 	}
 }
