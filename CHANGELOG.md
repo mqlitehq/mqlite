@@ -160,9 +160,14 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 - **`vacuum` no longer reports negative "freed" space** (MQLITE-96): a fresh DB materializes its
   schema pages as it is opened and vacuumed, so it can end up *larger*; growth is now reported
   as growth and reclaimed bytes never go below zero.
-- **The endpoint token boundary compares hosts, not strings** (MQLITE-96): `http://h:6754` and
-  `http://h:6754/` are the same broker, and re-passing your own endpoint with a trailing slash
-  no longer withholds `MQLITE_TOKEN` and hands you a 401.
+- **The endpoint token boundary is the endpoint the client actually dials** (MQLITE-96):
+  re-passing your own endpoint with a trailing slash no longer withholds `MQLITE_TOKEN` and
+  hands you a 401. Two endpoints count as the same broker exactly when the base URL the client
+  would dial is identical — deliberately *not* a canonicalized URL comparison, because deciding
+  which components (path, percent-escaping, query, fragment, IPv6 zone, host case) are
+  "insignificant" is how an ambient credential ends up at somebody else's backend. Anything
+  else is treated as a different broker: you get a warning and pass `--token`.
+  New SDK helper: `mqlite.EndpointIdentity`.
 
 ## v0.2.0 — 2026-07-11
 
