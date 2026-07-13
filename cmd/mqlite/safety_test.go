@@ -475,7 +475,11 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 				t.Errorf("settlement requests = %d, want exactly 1 CompleteBatch", s)
 			}
 			// The whole point: the batch is settled, not redelivered.
-			if m, err := eng.Stats(ctx, "q"); err != nil || m.Total != 0 {
+			m, serr := eng.Stats(ctx, "q")
+			if serr != nil {
+				t.Fatalf("stats: %v", serr)
+			}
+			if m.Total != 0 {
 				t.Fatalf("total=%d active=%d after settle, want 0 — leases were lost mid-renewal",
 					m.Total, m.Active)
 			}
