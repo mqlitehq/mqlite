@@ -346,6 +346,84 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 	return res, err
 }
 
+// execFresh / queryFresh are exec/query for a statement whose ARGUMENTS are time-sensitive:
+// buildArgs is called again for every attempt, and — crucially — only once a connection is
+// already in hand.
+//
+// Both halves matter. A remote retry backs off for up to hundreds of milliseconds, so arguments
+// computed once, before the loop, are stale by the time a later attempt lands. But `DB.Exec`
+// itself can also block waiting for a free connection and will transparently retry a bad
+// connection several times, REUSING the arguments it was given — so building them before that
+// call is not enough either. Each attempt therefore takes a *sql.Conn first, builds its arguments
+// against the clock at that moment, and runs the statement on that specific connection; a bad
+// connection surfaces to OUR loop, which retries with a fresh conn and fresh arguments.
+//
+// For a lock deadline (`locked_until = now + lockDuration`) this is not cosmetic: the write can
+// otherwise commit a lease that has ALREADY EXPIRED, while still reporting success, and the
+// reaper then reclaims the message immediately (MQLITE-97).
+func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any) (sql.Result, error) {
+	var res sql.Result
+	var err error
+	for i := 0; i < d.attempts(); i++ {
+		if i > 0 {
+			d.backoff(ctx, i)
+		}
+		var conn *sql.Conn
+		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
+		if err != nil {
+			if d.retryableWrite(err) {
+				continue
+			}
+			break
+		}
+		res, err = conn.ExecContext(ctx, query, buildArgs()...)
+		_ = conn.Close()
+		if err == nil || !d.retryableWrite(err) {
+			break
+		}
+	}
+	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
+		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
+	}
+	return res, err
+}
+
+// queryFresh hands its rows to scan rather than returning them, because the rows are bound to the
+// connection this attempt holds: the caller cannot be trusted to consume them before we release
+// it.
+func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	var err error
+	for i := 0; i < d.attempts(); i++ {
+		if i > 0 {
+			d.backoff(ctx, i)
+		}
+		var conn *sql.Conn
+		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
+		if err != nil {
+			if d.retryable(err) {
+				continue
+			}
+			return err
+		}
+		var rows *sql.Rows
+		rows, err = conn.QueryContext(ctx, query, buildArgs()...)
+		if err != nil {
+			_ = conn.Close()
+			if d.retryable(err) {
+				continue
+			}
+			return err
+		}
+		err = scan(rows)
+		_ = rows.Close()
+		_ = conn.Close()
+		if err == nil || !d.retryable(err) {
+			return err
+		}
+	}
+	return err
+}
+
 func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	var rows *sql.Rows
 	var err error

@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -217,5 +220,60 @@ func TestDLQRetentionPerQueueAge(t *testing.T) {
 	e.RunMaintenanceOnce(ctx) // per-queue age drops the 3 old; fresh one stays
 	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 1 {
 		t.Fatalf("per-queue age bound: want 1, got %d", mt.DeadLettered)
+	}
+}
+
+// Round-3 §3.2: a DLQ that is UNDER its cap has nothing to purge — the cutoff query returns
+// sql.ErrNoRows, which is the normal steady state, not a failure. It used to be logged as an
+// ERROR, so a perfectly healthy broker cried wolf every 60 seconds; with the default cap of a
+// million dead letters that is very nearly every broker.
+//
+// Captures the retention loop's log for BOTH bounds (count and bytes) and for both an empty and
+// a populated-but-under-cap DLQ, and requires silence.
+func TestDLQRetentionUnderCapLogsNoError(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name         string
+		count        int
+		maxBytes     int64
+		deadLettered int
+	}{
+		{"count bound, empty DLQ", 100, 0, 0},
+		{"count bound, under cap", 100, 0, 3},
+		{"bytes bound, empty DLQ", 0, 1 << 20, 0},
+		{"bytes bound, under cap", 0, 1 << 20, 3},
+		{"both bounds, under cap", 100, 1 << 20, 3},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var logbuf bytes.Buffer
+			var ms int64 = 1_700_000_000_000
+			e, err := Open(ctx, Options{
+				DB:                "file:" + filepath.Join(t.TempDir(), "mq.db"),
+				Now:               func() int64 { return atomic.LoadInt64(&ms) },
+				DisableBackground: true,
+				DLQMaxCount:       c.count,
+				DLQMaxBytes:       c.maxBytes,
+				Logger:            slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.Close() })
+			mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+			if c.deadLettered > 0 {
+				sendBodies(t, e, "q", c.deadLettered)
+				advance(&ms, 2*time.Second) // TTL dead-letters them
+			}
+
+			e.RunMaintenanceOnce(ctx)
+			e.RunMaintenanceOnce(ctx) // a second pass: the reviewer saw this repeat every minute
+
+			if m, _ := e.Stats(ctx, "q"); m.DeadLettered != int64(c.deadLettered) {
+				t.Errorf("an under-cap DLQ must not be purged: dead_lettered=%d, want %d", m.DeadLettered, c.deadLettered)
+			}
+			if out := logbuf.String(); strings.Contains(out, "level=ERROR") {
+				t.Errorf("an under-cap DLQ logged an ERROR (it has simply nothing to purge):\n%s", out)
+			}
+		})
 	}
 }

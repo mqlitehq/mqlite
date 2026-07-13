@@ -169,6 +169,39 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   else is treated as a different broker: you get a warning and pass `--token`.
   New SDK helper: `mqlite.EndpointIdentity`.
 
+- **Peek-Lock leases are renewed for the whole batch in one request** (MQLITE-97). Renewal was
+  per-message, so N messages cost N round trips — and on a slow link a renewal pass took *longer
+  than the lease it was renewing*: a 64-message batch at 50ms per call needs 3.2s against a 2s
+  lock, and most of the locks expired mid-pass and redelivered. New `RenewBatch` operation
+  (HTTP `/mqlite.v1.QueueService/RenewBatch`; `Client.RenewBatch` / `Embedded.RenewBatch`;
+  `Engine.RenewBatch`) renews a whole batch in one request and ONE statement, so a renewal pass is
+  one round trip no matter how big the batch. It renews at most `mqlite.MaxRenewBatch` (512)
+  messages per call — deliberately one statement's worth, because that is what lets it promise
+  that every `Ok` it returns means a *live* lease: across several statements the first batch's
+  lease can expire, and be reaped, while a later one is still running. Receive hands out at most
+  256 messages, so a consumer never meets the cap by accident. **Batch settlement and renewal are also
+  set-based inside the engine** — a fixed number of SQL statements rather than one (or two) per
+  message. On a remote Turso/libSQL store every statement is its own round trip, so the old
+  item-by-item loops made a 256-message settle ~512 remote round trips: the same O(N) latency,
+  one layer down, on the very RPC whose slowness lets the batch's own locks expire. The CLI's
+  CLI stays compatible with an **older broker**: one that predates `RenewBatch` answers 404, and
+  the CLI falls back to per-message `Renew` (what it used to do) rather than silently renewing
+  nothing. New `mqlite.ErrUnsupported` reports "this broker does not serve that operation",
+  distinct from `ErrNotFound` ("that queue/message does not exist"), which the same broker also
+  answers 404 for. The renewal interval is also a fraction of the lease now (a third) rather than
+  a fixed one-second floor — a queue whose lock
+  duration was one second or less previously had its first renewal scheduled at or *after* its
+  own expiry, so its lease could not be held at all.
+- **A DLQ under its retention cap no longer logs a false ERROR every minute** (MQLITE-97): the
+  cutoff query returns `sql.ErrNoRows` when there is nothing to purge — the normal steady state
+  — and that was being logged as a failure. With the default cap of a million dead letters, that
+  is very nearly every broker. Affected both the count and the byte bound.
+- **CLI strictness, round 2** (MQLITE-97): sequence numbers must be positive (`--seq 0,-1` was
+  accepted and quietly matched nothing); `version`, `help` and `serve` reject surplus arguments;
+  `purge-dlq --all --max 0` is now the same contradiction as `--all --max 10` (the check reads
+  whether the flag was *given*, not its value); and giving a body both as an argument and with
+  `--file` is an error instead of silently letting the file win.
+
 ## v0.2.0 — 2026-07-11
 
 ### Behavior changes

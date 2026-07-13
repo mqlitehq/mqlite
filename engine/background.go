@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -197,28 +198,42 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 		}
 
 		// count: the (maxCount+1)-th newest dead letter and everything older is surplus.
+		//
+		// A DLQ that is UNDER its cap has no such row, so the query returns sql.ErrNoRows. That
+		// is the normal steady state — "nothing to purge" — not a failure. Logging it as an
+		// ERROR made a healthy broker cry wolf every 60 seconds, and with the default cap of a
+		// million dead letters that is very nearly every broker (review round-3 §3.2).
 		if maxCount > 0 {
 			var cutoffID sql.NullInt64
-			if err := e.db.queryRowScan(ctx, []any{&cutoffID},
+			err := e.db.queryRowScan(ctx, []any{&cutoffID},
 				`SELECT id FROM messages WHERE queue=? AND state='dead_lettered'
-				 ORDER BY id DESC LIMIT 1 OFFSET ?`, q, maxCount); err != nil {
+				 ORDER BY id DESC LIMIT 1 OFFSET ?`, q, maxCount)
+			switch {
+			case errors.Is(err, sql.ErrNoRows): // under the cap: no surplus, no work
+			case err != nil:
 				e.log.Error("dlq-retention: count cutoff failed", "queue", q, "err", err)
-			} else if cutoffID.Valid {
+			}
+			if err == nil && cutoffID.Valid {
 				e.purgeDLQUpToID(ctx, q, cutoffID.Int64, batch, maxBatches, "count")
 			}
 		}
 
 		// bytes: newest->oldest, the first dead letter whose cumulative body bytes
-		// exceed the cap (and everything older) is surplus.
+		// exceed the cap (and everything older) is surplus. Same as count above: an
+		// under-cap DLQ has no such row, and that is a no-op, not an error.
 		if maxBytes > 0 {
 			var cutoffID sql.NullInt64
-			if err := e.db.queryRowScan(ctx, []any{&cutoffID},
+			err := e.db.queryRowScan(ctx, []any{&cutoffID},
 				`SELECT id FROM (
 				     SELECT id, SUM(length(body)) OVER (ORDER BY id DESC) AS cum
 				     FROM messages WHERE queue=? AND state='dead_lettered'
-				 ) WHERE cum > ? ORDER BY id DESC LIMIT 1`, q, maxBytes); err != nil {
+				 ) WHERE cum > ? ORDER BY id DESC LIMIT 1`, q, maxBytes)
+			switch {
+			case errors.Is(err, sql.ErrNoRows): // under the cap: no surplus, no work
+			case err != nil:
 				e.log.Error("dlq-retention: bytes cutoff failed", "queue", q, "err", err)
-			} else if cutoffID.Valid {
+			}
+			if err == nil && cutoffID.Valid {
 				e.purgeDLQUpToID(ctx, q, cutoffID.Int64, batch, maxBatches, "bytes")
 			}
 		}

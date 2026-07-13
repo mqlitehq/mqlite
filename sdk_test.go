@@ -679,7 +679,7 @@ func TestCreateQueueDocMatchesWireConfig(t *testing.T) {
 
 // TestStatusInfoMatchesWireStatus pins the SDK's StatusInfo to wire.StatusResponse field for
 // field. StatusInfo had quietly renamed db_size_bytes to size_bytes and dropped uptime_ms and
-// auth, so `mqlite status --output json` and a raw POST to /mqlite.v1.Admin/Status disagreed
+// auth, so `mqlite status --output json` and a raw POST to /mqlite.v1.AdminService/Status disagreed
 // (round-2 §3.4). Comparing the whole tag set — not just the field someone last touched —
 // makes ANY future divergence loud and forces a deliberate decision.
 func TestStatusInfoMatchesWireStatus(t *testing.T) {

@@ -13,6 +13,7 @@ package engine
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
 	"errors"
@@ -23,7 +24,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // netTimeout is a net.Error whose message contains none of isConnErr's substrings,
@@ -562,4 +565,229 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 	}
 	defer mem.Close()
 	mem.reclaimFreePages(ctx)
+}
+
+// ─── remote retry: time-sensitive statement arguments (MQLITE-97) ──────────────
+//
+// execFresh/queryFresh exist because a remote retry BACKS OFF: arguments computed once, before
+// the loop, are stale by the time a later attempt lands. For a lock deadline that is not
+// cosmetic — the write can commit a lease that has ALREADY EXPIRED, while still reporting
+// success, and the reaper reclaims the message immediately.
+//
+// A fake driver is the only way to see this: retries fire only on a remote store, and a real
+// Turso round trip cannot be made to fail on demand. It returns a busy error for the first N
+// calls — database/sql passes that straight through (unlike driver.ErrBadConn, which it retries
+// on its own), so OUR loop is the one doing the retrying.
+
+// ─── a driver that is busy for the first n calls ───────────────────────────────
+
+type busyConn struct{ st *busyState }
+
+type busyState struct {
+	failsLeft int
+	args      [][]driver.NamedValue // the args of every attempt, in order
+}
+
+func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
+func (c *busyConn) Close() error                        { return nil }
+func (c *busyConn) Begin() (driver.Tx, error)           { return nil, errors.New("begin unused") }
+
+func (c *busyConn) record(args []driver.NamedValue) bool {
+	c.st.args = append(c.st.args, args)
+	if c.st.failsLeft > 0 {
+		c.st.failsLeft--
+		return false
+	}
+	return true
+}
+
+func (c *busyConn) QueryContext(_ context.Context, _ string, args []driver.NamedValue) (driver.Rows, error) {
+	if !c.record(args) {
+		return nil, errors.New("database is locked") // isBusyErr => retryable
+	}
+	return emptyRows{}, nil
+}
+
+func (c *busyConn) ExecContext(_ context.Context, _ string, args []driver.NamedValue) (driver.Result, error) {
+	if !c.record(args) {
+		return nil, errors.New("database is locked")
+	}
+	return driver.RowsAffected(1), nil
+}
+
+type emptyRows struct{}
+
+func (emptyRows) Columns() []string         { return []string{"id"} }
+func (emptyRows) Close() error              { return nil }
+func (emptyRows) Next([]driver.Value) error { return io.EOF }
+
+type busyConnector struct{ st *busyState }
+
+func (c busyConnector) Connect(context.Context) (driver.Conn, error) { return &busyConn{st: c.st}, nil }
+func (c busyConnector) Driver() driver.Driver                        { return nil }
+
+// remoteDBFailingFirst builds a *db that looks remote (so the retry loop is armed) and whose
+// first n statements come back busy.
+func remoteDBFailingFirst(t *testing.T, n int) (*db, *busyState) {
+	t.Helper()
+	st := &busyState{failsLeft: n}
+	sdb := sql.OpenDB(busyConnector{st: st})
+	t.Cleanup(func() { _ = sdb.Close() })
+	return &db{sql: sdb, remote: true}, st
+}
+
+// ─── the contract ──────────────────────────────────────────────────────────────
+
+// queryFresh/execFresh must rebuild their arguments for EVERY attempt. If the args are built
+// once, the retry replays a stale deadline — and after a backoff that deadline can be in the
+// past, so the row commits an already-expired lease while reporting success.
+func TestFreshHelpersRebuildArgsPerAttempt(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		run  func(d *db, build func() []any) error
+	}{
+		{"queryFresh", func(d *db, build func() []any) error {
+			return d.queryFresh(ctx, "UPDATE t SET x=?", build, func(*sql.Rows) error { return nil })
+		}},
+		{"execFresh", func(d *db, build func() []any) error {
+			_, err := d.execFresh(ctx, "UPDATE t SET x=?", build)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, st := remoteDBFailingFirst(t, 2) // two busy failures, then success
+
+			// A "clock" that ticks on every read: each attempt must see a NEW value.
+			tick := int64(0)
+			build := func() []any {
+				tick++
+				return []any{tick}
+			}
+			if err := tc.run(d, build); err != nil {
+				t.Fatalf("after the retries the statement should succeed, got %v", err)
+			}
+			if len(st.args) != 3 {
+				t.Fatalf("attempts = %d, want 3 (two busy + one success)", len(st.args))
+			}
+			// The third attempt — the one that actually lands — must carry the value built AT
+			// THAT ATTEMPT, not the one computed before the loop backed off.
+			for i, got := range st.args {
+				want := int64(i + 1)
+				if len(got) != 1 || got[0].Value != want {
+					t.Errorf("attempt %d wrote %v, want %d — the args were not rebuilt for this attempt",
+						i+1, got, want)
+				}
+			}
+		})
+	}
+}
+
+// The plain (non-fresh) helpers keep their existing behavior: args are fixed, and a retry
+// replays them verbatim. That is correct for a statement whose arguments are not time-sensitive,
+// and it is what makes the distinction between the two worth having.
+func TestPlainHelpersReplayTheSameArgs(t *testing.T) {
+	d, st := remoteDBFailingFirst(t, 1)
+	if _, err := d.exec(context.Background(), "UPDATE t SET x=?", int64(7)); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if len(st.args) != 2 {
+		t.Fatalf("attempts = %d, want 2 (one busy + one success)", len(st.args))
+	}
+	for i, got := range st.args {
+		if got[0].Value != int64(7) {
+			t.Errorf("attempt %d wrote %v, want the same 7 on every replay", i+1, got)
+		}
+	}
+}
+
+// The arguments must be built only ONCE A CONNECTION IS IN HAND. Building them before the call is
+// not enough: DB.Exec/Query can BLOCK waiting for a free connection (and will transparently retry
+// a bad connection, reusing the arguments it was handed). A lock deadline computed before that
+// wait can therefore be committed already expired — reported as a successful renewal, and
+// reclaimed by the reaper at once (codex).
+//
+// Saturate the pool, and watch: while the helper is stuck waiting for a connection, it must not
+// have read the clock yet.
+func TestFreshHelpersBuildArgsAfterAcquiringAConn(t *testing.T) {
+	d, _ := remoteDBFailingFirst(t, 0)
+	d.sql.SetMaxOpenConns(1)
+
+	// Take the only connection and hold it.
+	held, err := d.sql.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var built atomic.Bool
+	done := make(chan error, 1)
+	go func() {
+		done <- d.queryFresh(context.Background(), "UPDATE t SET x=?",
+			func() []any { built.Store(true); return []any{int64(1)} },
+			func(*sql.Rows) error { return nil })
+	}()
+
+	// The helper is now blocked in Conn(). If it had built its arguments up front, the clock would
+	// already have been read — and by the time a connection frees up, that deadline is stale.
+	time.Sleep(150 * time.Millisecond)
+	if built.Load() {
+		t.Fatal("the arguments were built while still waiting for a connection — a deadline read there is stale by the time the statement runs")
+	}
+
+	_ = held.Close() // release the pool
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("queryFresh: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queryFresh never completed after the connection was released")
+	}
+	if !built.Load() {
+		t.Error("the arguments were never built")
+	}
+}
+
+// An in-memory database lives INSIDE its connection: discard the connection and the schema goes
+// with it. So the statement helpers must never hand a local connection back to the pool to be
+// dropped — a renewal that quietly destroys the database is a spectacular way to fail.
+//
+// This is not hypothetical: reserving a *sql.Conn per attempt (right for a remote store, where
+// retries and backoff live) made a `:memory:` engine intermittently come back with
+// "no such table: messages" on CI. Hammer the fresh-argument paths and require the database to
+// still be there.
+func TestMemoryDBSurvivesRepeatedFreshStatements(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.CreateQueue(ctx, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
+
+	for i := 0; i < 200; i++ {
+		if _, err := e.RenewBatch(ctx, "q", []SettleItem{item}); err != nil {
+			t.Fatalf("RenewBatch #%d: %v", i, err)
+		}
+		if err := e.Renew(ctx, "q", item.SeqNumber, item.LockToken); err != nil {
+			t.Fatalf("Renew #%d: %v", i, err)
+		}
+	}
+	// The database — and the message — must still be there.
+	if m, err := e.Stats(ctx, "q"); err != nil {
+		t.Fatalf("stats after 200 renewals: %v (the in-memory database was destroyed)", err)
+	} else if m.Locked != 1 {
+		t.Errorf("locked=%d after renewals, want 1", m.Locked)
+	}
 }

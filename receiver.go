@@ -86,7 +86,12 @@ func (r *Receiver) notify(err error) {
 func isPermanent(err error) bool {
 	return errors.Is(err, ErrUnauthenticated) ||
 		errors.Is(err, ErrNotFound) ||
-		errors.Is(err, ErrQueueNotFound)
+		errors.Is(err, ErrQueueNotFound) ||
+		// The broker does not serve this operation at all — an older broker, or a proxy that
+		// routes only part of the API. Retrying cannot make the route appear, so a receiver that
+		// treated this as transient would spin forever instead of reporting the incompatibility
+		// (MQLITE-97; this sentinel used to arrive as ErrNotFound, which WAS classified here).
+		errors.Is(err, ErrUnsupported)
 }
 
 // reserve blocks until at least one worker slot is free (ctx-aware), then greedily takes up

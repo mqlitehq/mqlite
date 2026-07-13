@@ -18,6 +18,12 @@ func TestNoStrayLegacyPort(t *testing.T) {
 
 	allow := map[string]bool{
 		filepath.FromSlash("CHANGELOG.md"): true, // documents the changed default + compat mapping
+		// The deploy guide must say which port the image you can actually PULL listens on:
+		// until v0.3.0 is tagged that is 0.2.x, and it is still the old port. Telling people to
+		// publish 6754 for an image that binds the legacy port is how you get a broker that
+		// silently answers nothing (review round-3 §3.1). This is migration documentation, the
+		// case this guard explicitly allows for — not a default creeping back.
+		filepath.FromSlash("docs/deployment.md"): true,
 	}
 	skipDir := map[string]bool{
 		".git": true, "node_modules": true, "bin": true, "testdata": true,

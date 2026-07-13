@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
@@ -78,6 +79,20 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 	if resp.StatusCode/100 != 2 {
 		var eb wire.ErrorBody
 		_ = json.NewDecoder(resp.Body).Decode(&eb)
+		// Did the broker say "I have no such ROUTE" — i.e. it is too old to serve this operation —
+		// rather than "that queue/message does not exist"? Both are 404s, and the difference
+		// decides whether a client may fall back to an older equivalent.
+		//
+		// The broker's catch-all answers an unknown path with a STRUCTURED body: code
+		// "not_found", message "no such path: <path>". (An earlier version of this check only
+		// recognized a bare, code-less 404 — which is what a dumb proxy emits, but NOT what the
+		// released broker does. It would therefore never have fired against the very brokers it
+		// exists for.) Accept both shapes: the structured no-such-path answer, and a code-less
+		// 404 from something in front of the broker.
+		if resp.StatusCode == http.StatusNotFound &&
+			(eb.Code == "" || strings.HasPrefix(eb.Message, "no such path")) {
+			return fmt.Errorf("%w: %s", ErrUnsupported, path)
+		}
 		return mapErr(eb)
 	}
 	if respOut != nil {
@@ -206,19 +221,35 @@ func (c *Client) Cancel(ctx context.Context, queue string, seq int64) error {
 	return c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: seq}, &wire.SettleResponse{})
 }
 
-// SettleResult is the per-message outcome of CompleteBatch (Ok=false = the lock was
+// SettleResult is the per-message outcome of a batch settle (Ok=false = the lock was
 // lost/expired for that message — not a fatal error for the batch).
 type SettleResult struct {
 	SequenceNumber int64
 	Ok             bool
+	// LockedUntil is the lease deadline a RenewBatch actually committed (zero for other
+	// operations). A renewing caller needs it to know when to renew next — without it, it can
+	// only guess, and would either hammer the broker or let the lock it just extended lapse.
+	//
+	// It is REPORTED, never written back onto the *Message: the caller may be reading those
+	// messages concurrently (the CLI renders them while a background renewer runs), and mutating
+	// a shared time.Time from another goroutine is a data race.
+	LockedUntil time.Time
 }
 
 func toSettleResults(rs []wire.SettleItemResult) []SettleResult {
 	out := make([]SettleResult, len(rs))
 	for i, r := range rs {
-		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok}
+		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok, LockedUntil: msFromEpoch(r.LockedUntilMs)}
 	}
 	return out
+}
+
+// msFromEpoch turns an epoch-ms deadline into a time, keeping the zero time for "not set".
+func msFromEpoch(ms int64) time.Time {
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
 }
 
 // CompleteBatch completes many received messages in one round-trip — the fix for the
@@ -241,6 +272,22 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Messa
 	}
 	var resp wire.CompleteBatchResponse
 	if err := c.post(ctx, wire.PathCompleteBatch, wire.CompleteBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
+		return nil, err
+	}
+	return toSettleResults(resp.Results), nil
+}
+
+// RenewBatch extends the lock lease of many messages in ONE request, returning a per-message
+// result. Renewing a batch with N separate Renew calls costs N round trips — on a slow link
+// that outlasts the very lease it is trying to save (a 64-message batch on a 50ms link needs
+// 3.2s of renewals against a 2s lease), so the locks expire mid-renewal.
+func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
+	items := make([]wire.SettleItem, len(msgs))
+	for i, m := range msgs {
+		items[i] = wire.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	}
+	var resp wire.RenewBatchResponse
+	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
 		return nil, err
 	}
 	return toSettleResults(resp.Results), nil

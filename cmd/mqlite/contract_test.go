@@ -6,6 +6,7 @@ package main
 // empty-collection [], past-schedule rejection, and top-level help completeness.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -34,11 +35,21 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 		t.Fatal(err)
 	}
 	os.Stdout = w
+
+	// Drain CONCURRENTLY. Reading only after fn returns deadlocks the moment fn writes more than
+	// the pipe's buffer — it blocks in write, forever, waiting for a reader that has not started.
+	// A 64-message receive fits; 256 does not, and the Windows buffer is smaller still, which is
+	// exactly how this hung the CI runner for ten minutes.
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+
 	runErr := fn()
 	_ = w.Close()
 	os.Stdout = old
-	out, _ := io.ReadAll(r)
-	return string(out), runErr
+	return <-done, runErr
 }
 
 func embeddedEnv(t *testing.T) {
@@ -185,7 +196,9 @@ func TestUsageListsAllCommands(t *testing.T) {
 
 // ─── arity, validation & reporting contract (review round-2 §3) ───
 
-// hides the mistake, and on a destructive command that is how you purge the wrong queue.
+// A non-body command takes an EXACT number of positionals. A surplus argument is a typo (a
+// misplaced flag, an unquoted value the shell split) — silently ignoring it and exiting 0 hides
+// the mistake, and on a destructive command that is how you purge the wrong queue.
 func TestExactArity(t *testing.T) {
 	resetGlobals(t)
 	t.Setenv("MQLITE_ENDPOINT", "")
@@ -271,13 +284,104 @@ func TestVacuumNewDBReportsNoNegativeFreed(t *testing.T) {
 		t.Errorf("vacuum reported negative freed space: %q", out)
 	}
 
+	// --output json must be passed as a FLAG: newFlags() re-registers --output and resets the
+	// global to "text", so setting gOutput directly never reached the JSON branch at all — the
+	// assertion below was running against text output and could not have failed (round-3 §3.4).
 	resetGlobals(t)
-	gOutput = "json"
-	out, err = captureStdout(t, func() error { return cmdVacuum(ctx0, nil) })
+	out, err = captureStdout(t, func() error { return cmdVacuum(ctx0, []string{"--output", "json"}) })
 	if err != nil {
 		t.Fatalf("vacuum --output json: %v", err)
 	}
-	if strings.Contains(out, `"freed_bytes": -`) {
-		t.Errorf("vacuum JSON reported negative freed_bytes: %q", out)
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("vacuum --output json did not emit JSON: %v\n%s", err, out)
+	}
+	freed, ok := got["freed_bytes"].(float64)
+	if !ok {
+		t.Fatalf("vacuum JSON has no freed_bytes: %v", got)
+	}
+	if freed < 0 {
+		t.Errorf("vacuum JSON reported negative freed_bytes: %v", freed)
+	}
+	if _, ok := got["grew_bytes"]; !ok {
+		t.Errorf("vacuum JSON must report growth separately: %v", got)
+	}
+}
+
+// Round-3 §3.4: the remaining contract gaps — arity on the meta commands, flag PRESENCE (not
+// value) for the destructive-mode conflict, strictly positive sequence numbers, and a body
+// given twice.
+func TestRound3ContractGaps(t *testing.T) {
+	embeddedEnv(t)
+	ctx := context.Background()
+
+	// A seq is a positive number: 0 and negatives are not messages. (A negative POSITIONAL is
+	// already rejected earlier, by the flag parser — it looks like a flag. The gap was the
+	// value reaching the backend, and the --seq list, where a negative is just a CSV field.)
+	if err := cmdSettle(ctx, "complete", []string{"q", "0", "tok"}); err == nil {
+		t.Error("complete with seq 0 must be rejected")
+	}
+	if err := cmdCancel(ctx, []string{"q", "0"}); err == nil {
+		t.Error("cancel with seq 0 must be rejected")
+	}
+	for _, bad := range []string{"0", "-1", "3,0", "3,-1"} {
+		if err := cmdReceiveDeferred(ctx, []string{"q", "--seq", bad}); err == nil {
+			t.Errorf("receive-deferred --seq %s must be rejected, not silently return []", bad)
+		}
+	}
+
+	// --all is "delete everything"; an explicit bound contradicts it even when the bound is 0.
+	// A value-only check sees 0 and waves it through.
+	for _, args := range [][]string{
+		{"q", "--all", "--max", "0"},
+		{"q", "--all", "--older-than", "0s"},
+	} {
+		if err := cmdPurgeDLQ(ctx, args); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+			t.Errorf("purge-dlq %v must be rejected as ambiguous, got %v", args, err)
+		}
+	}
+
+	// A body given twice is ambiguous — letting --file quietly win discards what was typed.
+	f := filepath.Join(t.TempDir(), "body.txt")
+	if err := os.WriteFile(f, []byte("from-file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSend(ctx, []string{"q", "typed-body", "--file", f}); err == nil {
+		t.Error("send with BOTH a positional body and --file must be rejected")
+	}
+
+	// Meta commands take no arguments.
+	for _, cmd := range []string{"version", "help"} {
+		if err := exactMeta(cmd, []string{"extra"}); err == nil {
+			t.Errorf("%s with a surplus argument must be rejected", cmd)
+		}
+		if err := exactMeta(cmd, nil); err != nil {
+			t.Errorf("%s with no arguments must be accepted, got %v", cmd, err)
+		}
+	}
+	if err := cmdServe(ctx, []string{"extra"}); err == nil {
+		t.Error("serve with a surplus positional must be rejected")
+	}
+}
+
+// captureStdout must drain the pipe while fn runs, not after it returns. Reading afterwards
+// deadlocks as soon as fn writes more than the pipe's buffer: the write blocks forever, waiting
+// for a reader that has not started. A 64-message receive fits in the buffer and a 256-message
+// one does not — and Windows' buffer is smaller still, which is how this hung a CI runner for
+// ten minutes and looked like a bug in the code under test.
+//
+// A payload larger than any plausible pipe buffer makes the guard platform-independent: on the
+// old helper this test hangs everywhere, not just on Windows.
+func TestCaptureStdoutDoesNotDeadlockOnLargeOutput(t *testing.T) {
+	const size = 4 << 20 // 4 MiB — far past every OS pipe buffer
+	out, err := captureStdout(t, func() error {
+		_, werr := os.Stdout.Write(bytes.Repeat([]byte("x"), size))
+		return werr
+	})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(out) != size {
+		t.Errorf("captured %d bytes, want %d", len(out), size)
 	}
 }

@@ -57,7 +57,7 @@ token **except** the open ones below. A missing/invalid token → `401 unauthent
 
 ```bash
 curl https://<host>/                 # what is this? (no auth)
-# → {"name":"mqlite","version":"0.3.0","description":"...","status":"ok",
+# → {"name":"mqlite","version":"<the broker's version>","description":"...","status":"ok",
 #    "auth":"bearer","docs":"https://github.com/mqlitehq/mqlite",
 #    "endpoints":["/mqlite.v1.QueueService/Send", ...every RPC route...],
 #    "health":"/healthz","metrics":"/metrics"}
@@ -155,6 +155,31 @@ a Complete-per-message N+1 (the cheap path for draining).
 - **Response** `CompleteBatchResponse`: `results` ([{`seq_number`, `ok`}]) — `ok=false`
   for a stale/expired lock on that item (not fatal to the batch). Each item is fenced +
   idempotent exactly like `Complete`.
+
+### RenewBatch
+
+Extend the lock lease of a whole received batch in **one round-trip**.
+
+Renewing message-by-message costs one request per message, so on a slow link a renewal pass can
+take **longer than the lease it is renewing** — a 64-message batch at 50 ms per call needs 3.2 s
+against a 2 s lock, and most of the locks expire mid-pass.
+
+- **Request** `RenewBatchRequest`: `queue`, `messages` ([{`seq_number`, `lock_token`}]).
+  **At most 512 messages per call** — more returns `400 invalid_argument`.
+- **Response** `RenewBatchResponse`: `results` ([{`seq_number`, `ok`, `locked_until_ms`}]).
+  `ok=false` for a stale/expired lock on that item (not fatal to the batch); each item is fenced
+  on its own `lock_token`, exactly like `Renew`.
+
+`locked_until_ms` is the deadline the broker actually committed — renew again before it. And
+`ok=true` means the lease is live **at the moment the broker answers**: if the write itself
+outlived the lock (a very short lease on a slow link), you get `ok=false` rather than a lock you
+do not really hold.
+
+> **Why 512?** Renewal is a claim about the *future* ("this lease is live"), and that claim is
+> only keepable within a single statement: across several, the first batch's lease can expire —
+> and be reaped — while a later one is still running. `Receive` hands out at most 256 messages,
+> so a consumer never meets the limit by accident. (`CompleteBatch` has no such limit, because
+> completion is terminal: it reports what already happened.)
 
 ### ReceiveDeferred
 

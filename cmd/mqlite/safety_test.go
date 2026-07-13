@@ -7,10 +7,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -358,9 +360,9 @@ func TestRenewerStopDoesNotHangOnStalledRenew(t *testing.T) {
 	inner := server.New(eng, nil).Handler()
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case wire.PathRenew:
+		case wire.PathRenew, wire.PathRenewBatch:
 			select {
-			case renewing <- struct{}{}: // record that a Renew really is in flight
+			case renewing <- struct{}{}: // record that a renewal really is in flight
 			default:
 			}
 			select {
@@ -396,5 +398,461 @@ func TestRenewerStopDoesNotHangOnStalledRenew(t *testing.T) {
 	case <-renewing:
 	default:
 		t.Fatal("no Renew was ever in flight — the test did not exercise the stalled-renew path")
+	}
+}
+
+// Round-3 P1: the supported-batch delayed-link requirement. Renewing message-by-message cost N
+// round trips, so on a slow link the renewal pass took LONGER than the lease it was saving —
+// 64 messages × 50ms = 3.2s against a 2s lock — and the reviewer watched 44 of 64 locks expire
+// mid-pass and redeliver. One RenewBatch per tick makes the pass one round trip regardless of
+// batch size.
+//
+// Reproduces the reviewer's setup exactly: short lease, per-Renew latency, a slow settle, and a
+// full-size batch. Asserts what they asked for — every message printed, exit 0, ONE batch
+// settlement, and an empty queue.
+func TestBatchRenewalUnderDelayedLink(t *testing.T) {
+	const (
+		lockMs      = 6000            // comfortably longer than a slow runner's receive
+		settleDelay = 9 * time.Second // > the lease: the batch survives only if renewal works
+	)
+	for _, n := range []int{64, 256} { // 256 is the engine's supported maximum receive
+		t.Run(fmt.Sprintf("%d messages", n), func(t *testing.T) {
+			resetGlobals(t)
+			ctx := context.Background()
+			// Background loops ON: the reaper is what reclaims an expired lock. A file DB with a
+			// ONE-transaction seed keeps the fixture cheap — 256 individually-committed sends is
+			// 256 fsyncs, which timed this test out on a slow Windows runner and told us nothing
+			// about renewal. (Not :memory:, which a cancelled query can destroy — see the note in
+			// the handover: that is a separate, pre-existing engine bug.)
+			eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eng.Close()
+			// The lease must outlast the RECEIVE itself — renewal cannot start before the batch is
+			// claimed, so a lock that expires while the messages are still being fetched is lost to
+			// physics, not to a bug. A slow CI runner needed several seconds just to deliver 256
+			// messages, which is what a 2s lock turned into "all 256 failed to settle". What the
+			// test actually needs is settleDelay > lockDuration, so that renewal — and only
+			// renewal — can carry the batch across the settle.
+			if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: lockMs}); err != nil {
+				t.Fatal(err)
+			}
+			seed := make([]engine.OutMessage, n)
+			for i := range seed {
+				seed[i] = engine.OutMessage{Body: []byte("m")}
+			}
+			if _, err := eng.Send(ctx, "q", seed...); err != nil {
+				t.Fatal(err)
+			}
+
+			var renews, settles atomic.Int64
+			inner := server.New(eng, nil).Handler()
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case wire.PathRenew, wire.PathRenewBatch:
+					renews.Add(1)
+					time.Sleep(50 * time.Millisecond) // per-renew link latency
+				case wire.PathCompleteBatch:
+					settles.Add(1)
+					time.Sleep(settleDelay) // deliberately longer than the lease: only renewal saves it
+				}
+				inner.ServeHTTP(w, r)
+			}))
+			defer proxy.Close()
+
+			t.Setenv("MQLITE_ENDPOINT", proxy.URL)
+			t.Setenv("MQLITE_TOKEN", "")
+			out, err := captureStdout(t, func() error {
+				return cmdReceive(ctx, []string{"q", "--max", strconv.Itoa(n)})
+			})
+			if err != nil {
+				t.Fatalf("receive of %d messages over a delayed link must settle cleanly: %v", n, err)
+			}
+			if got := strings.Count(out, "seq="); got != n {
+				t.Errorf("printed %d message lines, want %d", got, n)
+			}
+			if s := settles.Load(); s != 1 {
+				t.Errorf("settlement requests = %d, want exactly 1 CompleteBatch", s)
+			}
+			// The whole point: the batch is settled, not redelivered.
+			m, serr := eng.Stats(ctx, "q")
+			if serr != nil {
+				t.Fatalf("stats: %v", serr)
+			}
+			if m.Total != 0 {
+				t.Fatalf("total=%d active=%d after settle, want 0 — leases were lost mid-renewal",
+					m.Total, m.Active)
+			}
+			// And a renewal pass is ONE request, so it cannot outgrow the lease: with per-message
+			// renewal this batch needed n round trips per pass.
+			t.Logf("%d messages: %d renewal request(s), %d settlement request(s)", n, renews.Load(), settles.Load())
+		})
+	}
+}
+
+// A NEW CLI must keep working against an OLD broker. Released v0.2.x has no RenewBatch route and
+// answers 404; a renewer that discarded that error would silently stop renewing against a broker
+// the previous CLI renewed just fine — the locks would expire and the batch redeliver. So the
+// first "I don't know that operation" must downgrade to per-message Renew, which that broker does
+// serve (codex).
+func TestRenewalFallsBackOnOldBroker(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 6000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+
+	var batchTries, singleRenews atomic.Int64
+	inner := server.New(eng, nil).Handler()
+	// A broker that predates RenewBatch. It must answer the way the RELEASED broker really does:
+	// its own catch-all, with the structured `{"code":"not_found","message":"no such path: ..."}`
+	// body — NOT a bare http.NotFound. Modelling it with a hand-rolled 404 is how the first
+	// version of this fallback came to be tested against a server that does not exist, and would
+	// have shipped a downgrade path that never fires (codex).
+	//
+	// So: strip the route by rewriting the request to an unknown path and letting the REAL
+	// handler produce the REAL response.
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenewBatch:
+			batchTries.Add(1)
+			r.URL.Path = "/mqlite.v1.QueueService/RenewBatch" // unrouted on this broker
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/no-such-route-on-an-old-broker"
+			inner.ServeHTTP(w, r2)
+			return
+		case wire.PathRenew:
+			singleRenews.Add(1)
+		case wire.PathCompleteBatch:
+			time.Sleep(3 * time.Second) // slow settle: renewal has to carry the lease across it
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer old.Close()
+
+	t.Setenv("MQLITE_ENDPOINT", old.URL)
+	t.Setenv("MQLITE_TOKEN", "")
+	if _, err := captureStdout(t, func() error { return cmdReceive(ctx, []string{"q"}) }); err != nil {
+		t.Fatalf("receive against a pre-RenewBatch broker must still settle: %v", err)
+	}
+	if batchTries.Load() == 0 {
+		t.Error("the CLI should try RenewBatch first")
+	}
+	if singleRenews.Load() == 0 {
+		t.Error("after the 404 it must fall back to per-message Renew, not give up renewing")
+	}
+	if m, err := eng.Stats(ctx, "q"); err != nil || m.Total != 0 {
+		t.Fatalf("total=%d — the batch was not settled against the old broker", m.Total)
+	}
+}
+
+// A lease that is nearly spent when the batch arrives — a very short lock duration, or a slow
+// Receive — must be renewed IMMEDIATELY. Clamping the first tick up to the cadence floor
+// schedules it at or after locked_until, so the reaper takes the batch before the CLI ever asks
+// (codex).
+func TestRenewIntervalSaysRenewNowWhenLeaseNearlySpent(t *testing.T) {
+	now := time.Now()
+	nearlyGone := []*mqlite.Message{{LockedUntil: now.Add(30 * time.Millisecond)}}
+	if d := renewInterval(nearlyGone); d >= minRenewInterval {
+		t.Errorf("interval = %s for a 30ms lease; must be below the cadence floor so the caller renews NOW", d)
+	}
+	spent := []*mqlite.Message{{LockedUntil: now.Add(-time.Second)}} // already expired
+	if d := renewInterval(spent); d != 0 {
+		t.Errorf("interval = %s for a spent lease, want 0 (renew immediately)", d)
+	}
+	healthy := []*mqlite.Message{{LockedUntil: now.Add(30 * time.Second)}}
+	if d := renewInterval(healthy); d < 9*time.Second || d > 11*time.Second {
+		t.Errorf("interval = %s for a 30s lease, want about a third of it", d)
+	}
+}
+
+// A renewal must TELL the caller the deadline it committed — and must not write it onto the
+// message. The command renders those messages concurrently, so a background write to a shared
+// time.Time is a data race; and without the reported deadline the renewer has nothing to compute
+// a cadence from, so a lease that merely arrived nearly spent (a slow Receive) would pin the
+// cadence to the floor and renew twenty times a second for the rest of the batch's life (codex).
+func TestRenewalReportsTheDeadlineWithoutTouchingTheMessage(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(eng, nil).Handler())
+	defer ts.Close()
+
+	c, err := mqlite.Open(ctx, ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	before := msgs[0].LockedUntil
+	// Let the clock move, so a renewal genuinely commits a LATER deadline than the one the message
+	// arrived with — otherwise "did it mutate the message?" is unanswerable: both values would be
+	// the same millisecond and the check could not fail even if the SDK did write.
+	time.Sleep(20 * time.Millisecond)
+
+	res, err := c.RenewBatch(ctx, "q", msgs...)
+	if err != nil || !res[0].Ok {
+		t.Fatalf("RenewBatch: %v ok=%v", err, res[0].Ok)
+	}
+	if res[0].LockedUntil.IsZero() {
+		t.Fatal("RenewBatch did not report the deadline it committed — the caller cannot pace itself")
+	}
+	if !msgs[0].LockedUntil.Equal(before) {
+		t.Error("RenewBatch mutated the caller's message; the command renders those concurrently, so that is a data race")
+	}
+
+	// The renewer takes the reported deadline and paces itself by it: a third of the real 30s
+	// lease, not the floor.
+	renew := renewFunc(c, "q", msgs, 30*time.Second)
+	until := renew(ctx)
+	if until.IsZero() {
+		t.Fatal("renewFunc did not report a deadline")
+	}
+	if d := time.Until(until) / 3; d < 8*time.Second || d > 12*time.Second {
+		t.Errorf("cadence = %s, want about a third of the 30s lease — otherwise the CLI renews %d times a second forever",
+			d, time.Second/minRenewInterval)
+	}
+}
+
+// The legacy path renews per message, and an old broker reports no deadline — so the renewer must
+// INFER one from the lease the batch arrived with. Otherwise it has nothing to pace by, collapses
+// to the floor, and pelts a broker that predates RenewBatch with a full per-message renewal pass
+// every 50ms for the rest of a slow output (codex).
+func TestLegacyFallbackStillPacesItself(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	inner := server.New(eng, nil).Handler()
+	var singleRenews atomic.Int64
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenewBatch: // a broker that predates it: its catch-all answers
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/no-such-route-on-an-old-broker"
+			inner.ServeHTTP(w, r2)
+			return
+		case wire.PathRenew:
+			singleRenews.Add(1)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer old.Close()
+
+	c, err := mqlite.Open(ctx, old.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	renew := renewFunc(c, "q", msgs, 30*time.Second) // the lease this batch arrived with
+	until := renew(ctx)                              // downgrades to per-message Renew
+	if singleRenews.Load() == 0 {
+		t.Fatal("expected the per-message fallback to be used")
+	}
+	if until.IsZero() {
+		t.Fatal("the fallback reported no deadline — the renewer would collapse to the 50ms floor and hammer an old broker")
+	}
+	if d := time.Until(until) / 3; d < 8*time.Second || d > 12*time.Second {
+		t.Errorf("fallback cadence = %s, want about a third of the inferred 30s lease", d)
+	}
+}
+
+// pace() is the whole renewal cadence policy, so it is worth pinning exactly. The rule it must
+// never break: a renewal is never scheduled AT OR AFTER the deadline it exists to save. A cadence
+// floor is a spin guard, not a licence to sleep past the lock (codex).
+func TestPaceNeverSchedulesPastTheDeadline(t *testing.T) {
+	// No deadline to aim at (a failed renewal, or an old broker that never told us one): fall back
+	// to the calm retry — NOT to a value derived from a lease we do not have.
+	if d := pace(time.Time{}); d != renewRetryInterval {
+		t.Errorf("pace(unknown) = %s, want the retry cadence %s", d, renewRetryInterval)
+	}
+	// A spent lease: renew now.
+	if d := pace(time.Now().Add(-time.Second)); d != 0 {
+		t.Errorf("pace(spent) = %s, want 0 (renew immediately)", d)
+	}
+	// A healthy lease: a third of it.
+	if d := pace(time.Now().Add(30 * time.Second)); d < 9*time.Second || d > 11*time.Second {
+		t.Errorf("pace(30s) = %s, want about a third", d)
+	}
+	// Short leases — the case that used to be handed to the 1s failure backoff, letting a freshly
+	// renewed lock be reaped while we waited. Whatever the floor says, the tick must land BEFORE
+	// the deadline.
+	//
+	// The assertion is "0, or strictly less than what remains", and that is deliberate: a loaded
+	// runner can deschedule this goroutine between constructing the deadline and pace() reading the
+	// clock, at which point the lease really IS spent and 0 ("renew now") is the correct answer.
+	// Demanding a positive delay would make the test fail for being right (codex).
+	for _, remaining := range []time.Duration{
+		149 * time.Millisecond, 100 * time.Millisecond, 60 * time.Millisecond,
+		30 * time.Millisecond, 10 * time.Millisecond, 2 * time.Millisecond,
+		// Sub-millisecond headroom: the spin guard must NOT round the delay up past the deadline.
+		900 * time.Microsecond, 500 * time.Microsecond, 100 * time.Microsecond,
+	} {
+		d := pace(time.Now().Add(remaining))
+		if d != 0 && d >= remaining {
+			t.Errorf("pace(%s) = %s — the renewal would be scheduled at or AFTER the deadline it is meant to save",
+				remaining, d)
+		}
+	}
+	// A lease with real headroom must still be SCHEDULED, not renewed on the spot — otherwise the
+	// "0" answer above would be hiding a renewal storm.
+	if d := pace(time.Now().Add(5 * time.Second)); d <= 0 || d >= 5*time.Second {
+		t.Errorf("pace(5s) = %s, want a positive delay well inside the lease", d)
+	}
+}
+
+// The legacy path infers a deadline, and it must measure it from BEFORE the renewals — each lock
+// is really extended when its UPDATE runs on the server, so a slow response means the lease
+// started well before the reply came back. Reading the clock afterwards credits the batch with
+// time it never had: a 1s lease whose Renew takes 600ms would be reported as good for another
+// full second, and the next tick would fall after it had already died (codex).
+func TestLegacyInferredDeadlineIsMeasuredBeforeTheCall(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	inner := server.New(eng, nil).Handler()
+	slowOld := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenewBatch: // a broker that predates it
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/no-such-route-on-an-old-broker"
+			inner.ServeHTTP(w, r2)
+			return
+		case wire.PathRenew:
+			time.Sleep(600 * time.Millisecond) // a slow link: most of the 1s lease is already gone
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer slowOld.Close()
+
+	c, err := mqlite.Open(ctx, slowOld.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	renew := renewFunc(c, "q", msgs, time.Second) // the 1s lease this batch arrived with
+	until := renew(ctx)                           // downgrades, then renews slowly
+	if until.IsZero() {
+		t.Fatal("the fallback reported no deadline")
+	}
+	// The renewal took ~600ms of the 1s lease, so at most ~400ms may remain. Measuring the deadline
+	// after the call would report a full second.
+	if remaining := time.Until(until); remaining > 600*time.Millisecond {
+		t.Errorf("inferred %s of lease remaining after a 600ms renewal of a 1s lock — the deadline was measured AFTER the call, crediting time the lease never had",
+			remaining)
+	}
+}
+
+// A renewal that fails TRANSIENTLY must not throw away a lease that is still good. Replacing a
+// live deadline with "unknown" drops the renewer onto the unknown-deadline backoff, which can
+// easily outlast what the lease had left: a failed attempt a third of the way into a one-second
+// lock would put the next one 1.33s in — well after the reaper took it (codex).
+func TestFailedRenewalKeepsAStillValidLease(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	inner := server.New(eng, nil).Handler()
+	// A broker that fails every renewal with a transient 500 — the route exists, so this is NOT the
+	// "unsupported, downgrade" path: it is an ordinary, retryable failure.
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wire.PathRenewBatch || r.URL.Path == wire.PathRenew {
+			http.Error(w, `{"code":"internal","message":"transient"}`, http.StatusInternalServerError)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer flaky.Close()
+
+	c, err := mqlite.Open(ctx, flaky.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	renew := renewFunc(c, "q", msgs, 30*time.Second)
+	if got := renew(ctx); !got.IsZero() {
+		t.Fatalf("a failing renewal must report no deadline, got %v", got)
+	}
+	// The renewer keeps what it already knew: the 30s lease is still good, so the cadence must stay
+	// paced by IT, not collapse to the unknown-deadline retry.
+	held := msgs[0].LockedUntil
+	if d := pace(held); d < 8*time.Second || d > 11*time.Second {
+		t.Errorf("cadence after a failed renewal = %s, want about a third of the lease we still hold", d)
+	}
+	if pace(time.Time{}) != renewRetryInterval {
+		t.Fatal("sanity: an unknown deadline should use the retry cadence")
 	}
 }

@@ -31,6 +31,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -117,9 +118,15 @@ func main() {
 	case "vacuum":
 		err = cmdVacuum(ctx, args)
 	case "version", "-v", "--version":
-		fmt.Println("mqlite", version)
+		err = exactMeta(cmd, args)
+		if err == nil {
+			fmt.Println("mqlite", version)
+		}
 	case "help", "-h", "--help":
-		usage()
+		err = exactMeta(cmd, args)
+		if err == nil {
+			usage()
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command:", cmd)
 		usage()
@@ -129,6 +136,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// exactMeta rejects surplus arguments on the commands that take none. `mqlite version --json`
+// silently printing the plain version (and exiting 0) hides the caller's mistake — arity is a
+// contract on every command, not just the ones with positionals (round-3 §3.4).
+func exactMeta(cmd string, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("usage: mqlite %s   (takes no arguments, got %q)", cmd, strings.Join(args, " "))
+	}
+	return nil
 }
 
 func usage() {
@@ -179,6 +196,7 @@ type api interface {
 	Peek(ctx context.Context, queue string, opts ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error)
 	Message(queue string, seq int64, lockToken string) *mqlite.Message
 	CompleteBatch(ctx context.Context, queue string, msgs ...*mqlite.Message) ([]mqlite.SettleResult, error)
+	RenewBatch(ctx context.Context, queue string, msgs ...*mqlite.Message) ([]mqlite.SettleResult, error)
 	Cancel(ctx context.Context, queue string, seq int64) error
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
@@ -215,9 +233,13 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 		positionals = append(positionals, rest[0])
 		args = rest[1:]
 	}
-	// Note which global flags were explicitly given (Visit reports only set flags) so dial
-	// can honor `--token=` and isolate an ambient token from a changed endpoint (P1-5).
+	// Note which flags were explicitly given (Visit reports only set flags). Presence, not
+	// value: `--max 0` and "no --max at all" both parse to 0, so a conflict check that looks
+	// only at values accepts `purge-dlq --all --max 0` (round-3 §3.4). dial needs the same
+	// distinction to honor `--token=` and isolate an ambient token from a changed endpoint.
+	gFlagSeen = map[string]bool{}
 	fs.Visit(func(f *flag.Flag) {
+		gFlagSeen[f.Name] = true
 		switch f.Name {
 		case "endpoint":
 			gEndpointSet = true
@@ -321,6 +343,12 @@ func newFlags(name string) *flag.FlagSet {
 // jsonOut reports whether --output json was requested.
 func jsonOut() bool { return gOutput == "json" }
 
+// gFlagSeen records the flags explicitly passed on the command line (set by
+// parseInterspersed). A zero value is not the same as an absent flag.
+var gFlagSeen = map[string]bool{}
+
+func flagGiven(name string) bool { return gFlagSeen[name] }
+
 // emitJSON prints v as indented JSON (used when --output json). It writes to stdout in one
 // call and RETURNS the write error — a lost/closed stdout must be observable so a consumer
 // (e.g. receive) never settles a message whose output failed (review 2026-07-12 P1-1).
@@ -411,6 +439,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote", false, "allow a non-loopback bind while auth is disabled (MQLITE_TOKENS=off)")
 	_ = fs.Parse(args)
+	if fs.NArg() > 0 { // exact arity: serve takes flags only (round-3 §3.4)
+		return fmt.Errorf("usage: serve [--addr host:port] [--insecure-allow-remote]   (no positional arguments, got %q)",
+			strings.Join(fs.Args(), " "))
+	}
 
 	addrSet := false
 	fs.Visit(func(f *flag.Flag) {
@@ -751,7 +783,7 @@ func cmdReceive(ctx context.Context, args []string) error {
 		// reaper reclaim messages whose bodies were already emitted (round-2 §3.2). Registered
 		// after `defer c.Close()`, so it stops (and joins the goroutine) BEFORE the client is
 		// closed — no Renew races the shutdown.
-		defer startRenewer(ctx, msgs).Stop()
+		defer startRenewer(ctx, c, queue, msgs).Stop()
 	}
 	outErr := printMsgs(msgs, *noAck && !*del)
 	if *del || *noAck {
@@ -937,7 +969,7 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	// --all ("delete everything") and a bound are contradictory: the usage presents them as
 	// alternatives, so accepting `--all --max 10` and quietly honoring the bound is a trap
 	// (round-2 §3.3). Make the caller say which one they meant.
-	if *all && (*max > 0 || *older > 0) {
+	if *all && (flagGiven("max") || flagGiven("older-than")) {
 		return fmt.Errorf("--all deletes the entire DLQ and cannot be combined with --max/--older-than — pass one or the other")
 	}
 	c, err := dial(ctx)
@@ -1046,6 +1078,11 @@ func readCapped(r io.Reader, max int64) ([]byte, error) {
 
 func readBody(file string, rest []string) ([]byte, error) {
 	if file != "" {
+		// Ambiguous: the caller gave a body twice. Letting --file quietly win discards the
+		// text they typed (round-3 §3.4).
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("give the body either as an argument or with --file, not both")
+		}
 		return os.ReadFile(file)
 	}
 	if len(rest) == 0 {
@@ -1120,7 +1157,7 @@ type renewer struct {
 	once   sync.Once
 }
 
-func startRenewer(parent context.Context, msgs []*mqlite.Message) *renewer {
+func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Message) *renewer {
 	// Renewals run on a context WE can cancel. The CLI's own context never expires, so a Renew
 	// against a stalled broker would otherwise block in the goroutine forever — and Stop, which
 	// waits for it, would hang `receive` indefinitely even though the output and the settle had
@@ -1134,22 +1171,144 @@ func startRenewer(parent context.Context, msgs []*mqlite.Message) *renewer {
 	}
 	go func() {
 		defer close(r.done)
-		t := time.NewTicker(renewInterval(msgs))
+
+		// The lease is tracked HERE, privately, and never on the messages themselves: the command
+		// renders those concurrently, and writing a shared time.Time from this goroutine is a data
+		// race (codex). Read once, now, before any renewal happens.
+		until := tightestLease(msgs)
+
+		// leaseLen is how long a lease from this queue lasts, learned from the one this batch
+		// arrived with. It is only a guess for the legacy path (an old broker's Renew reports no
+		// deadline), and if the batch arrived with its lease ALREADY SPENT we never learned it —
+		// in which case we must not invent one. Assuming a comfortable 30s for a queue configured
+		// with a 2s lock would park the next renewal ten seconds out and let the reaper take the
+		// batch mid-settle (codex).
+		leaseLen := time.Until(until)
+		if leaseLen <= 0 {
+			leaseLen = 0 // unknown: renewFunc will report no deadline, and pace() stays cautious
+		}
+		renew := renewFunc(c, queue, msgs, leaseLen)
+
+		t := time.NewTimer(time.Hour)
+		if !t.Stop() {
+			<-t.C
+		}
 		defer t.Stop()
+		// keep records the outcome of a renewal without throwing away what we already knew. A
+		// transient failure reports no deadline — but the lease we HELD may still be perfectly
+		// good, and discarding it drops us onto the unknown-deadline backoff, which can easily be
+		// longer than the lease still has left: a failed attempt a third of the way into a 1s lock
+		// would put the next one 1.33s in, well after the reaper took it (codex).
+		keep := func(got time.Time) {
+			if !got.IsZero() {
+				until = got
+				return
+			}
+			if time.Until(until) <= 0 {
+				until = time.Time{} // what we knew is spent too: now we really are in the dark
+			}
+		}
+
 		for {
+			d := pace(until)
+			if d == 0 { // the lease is spent, or nearly: renew NOW rather than wait past its end
+				keep(renew(ctx))
+				if pace(until) == 0 {
+					// Renewed, and STILL nothing usable to aim at — the renewal failed, or the lock
+					// duration is so short that no cadence can hold it. Drop to the calm retry rather
+					// than spinning.
+					until = time.Time{}
+				}
+				continue
+			}
+			t.Reset(d)
 			select {
 			case <-r.stop:
 				return
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				for _, m := range msgs {
-					_ = m.Renew(ctx) // best-effort; a failed renew just risks a redelivery
-				}
+				keep(renew(ctx))
 			}
 		}
 	}()
 	return r
+}
+
+// renewFunc renews the whole batch in ONE request — renewing message-by-message cost N round
+// trips, so on a slow link a renewal pass outlasted the lease it was saving (review round-3).
+//
+// But an OLDER broker does not serve RenewBatch: released v0.2.x answers 404, and a renewer that
+// simply discarded that error would silently stop renewing against a broker the previous CLI
+// renewed just fine — locks would expire and messages redeliver. So the first time the broker
+// says it does not know the operation, fall back to per-message Renew for the rest of the batch's
+// life. Slower, but it is exactly what the old CLI did, and it is what that broker supports.
+//
+// Everything here is best-effort: a failed renew only risks a redelivery.
+func renewFunc(c api, queue string, msgs []*mqlite.Message, leaseLen time.Duration) func(context.Context) time.Time {
+	batched := true
+	return func(ctx context.Context) time.Time {
+		if batched {
+			// Renewal is capped at one statement's worth (mqlite.MaxRenewBatch) so the broker can
+			// promise every Ok means a live lease. Receive hands out at most 256, so a batch never
+			// exceeds it in practice — but renewing in groups anyway means an oversized batch can
+			// never silently renew NOTHING.
+			var (
+				err   error
+				until time.Time
+			)
+			for start := 0; start < len(msgs) && err == nil; start += mqlite.MaxRenewBatch {
+				end := start + mqlite.MaxRenewBatch
+				if end > len(msgs) {
+					end = len(msgs)
+				}
+				var res []mqlite.SettleResult
+				res, err = c.RenewBatch(ctx, queue, msgs[start:end]...)
+				for _, r := range res {
+					// The TIGHTEST lease in the batch governs the cadence — the batch is only as
+					// safe as its most exposed message.
+					if r.Ok && !r.LockedUntil.IsZero() && (until.IsZero() || r.LockedUntil.Before(until)) {
+						until = r.LockedUntil
+					}
+				}
+			}
+			if err == nil {
+				return until
+			}
+			if !errors.Is(err, mqlite.ErrUnsupported) {
+				return time.Time{} // a real failure — not a reason to downgrade forever
+			}
+			fmt.Fprintln(os.Stderr,
+				"warning: this broker does not support RenewBatch (it predates it); renewing one message at a time")
+			batched = false
+		}
+
+		// An older broker's Renew reports no deadline, so INFER one: it extends the lock by the
+		// queue's lock duration, and the lease this batch arrived with is that duration. Without
+		// the inference the caller would have nothing to pace by, fall back to the retry cadence,
+		// and pelt an old broker with a full per-message renewal pass for the rest of a slow
+		// output (codex).
+		//
+		// Measured from BEFORE the calls, not after: each lock is actually extended when its
+		// UPDATE runs on the server, so a slow response (or a long multi-message pass) means the
+		// earliest lease started well before the last reply came back. Reading the clock at the end
+		// would credit the batch with time it never had — a 3s lease whose Renew took 2.5s would be
+		// reported as good for another 3s, and the next tick would fall after it had already died.
+		//
+		// If we never learned the lock duration (the batch arrived with its lease already spent),
+		// we report NO deadline rather than invent one: pace() then stays on its cautious retry.
+		start := time.Now()
+		renewed := false
+		for _, m := range msgs {
+			if err := m.Renew(ctx); err == nil {
+				renewed = true
+			}
+		}
+		if !renewed || leaseLen <= 0 {
+			return time.Time{}
+		}
+		return start.Add(leaseLen)
+	}
 }
 
 // Stop ends renewal and waits for the goroutine to exit, so no Renew is still in flight when
@@ -1164,23 +1323,81 @@ func (r *renewer) Stop() {
 	<-r.done
 }
 
-// renewInterval is about half the tightest remaining lease across the batch (min 1s), so a
-// renew lands well before any lock expires.
-func renewInterval(msgs []*mqlite.Message) time.Duration {
-	now := time.Now()
-	tightest := time.Duration(0)
+// renewInterval is a third of the tightest remaining lease in the batch, so a renewal lands with
+// the lease still two-thirds alive and a missed tick is survivable.
+//
+// It is a FRACTION of the lease, never a fixed floor. The old version clamped to a minimum of one
+// second, so a queue whose lock duration was one second or less had its first renewal scheduled
+// at or after its own expiry — the lease could not be held at all (review round-3).
+//
+// It may legitimately return LESS than minRenewInterval: CreateQueue accepts any positive lock
+// duration, and a slow Receive can leave even a normal lease nearly spent. The caller treats that
+// as "renew immediately" rather than clamping the first tick past locked_until — which would hand
+// the batch to the reaper before we ever asked. minRenewInterval is only the steady-state cadence
+// floor, a spin guard, not a delay before the first renewal.
+const (
+	minRenewInterval   = 50 * time.Millisecond // steady-state cadence floor: a spin guard, no more
+	renewRetryInterval = time.Second           // when we have NO deadline to aim at
+)
+
+// pace says how long to wait before the next renewal, given the deadline we believe we hold.
+// Zero means "renew now".
+//
+// The one rule it must never break: never schedule a renewal AT OR AFTER the deadline it is
+// meant to save. A cadence floor is a spin guard, not a licence to sleep past the lock — so when
+// a third of the lease is under the floor, the tick is pulled back to half the remaining lease
+// rather than pushed out to the floor (codex).
+//
+// The retry cadence is for a different situation entirely: we have NO deadline to aim at, because
+// the renewal failed or because an old broker never told us one. Confusing "the lease is short"
+// with "we don't know the lease" is how a freshly renewed lock gets reaped while we wait out a
+// backoff meant for failures.
+func pace(until time.Time) time.Duration {
+	if until.IsZero() {
+		return renewRetryInterval
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		return 0 // spent: renew now
+	}
+	d := remaining / 3
+	if d < minRenewInterval {
+		d = minRenewInterval
+	}
+	if half := remaining / 2; d > half {
+		d = half // always land BEFORE the deadline, whatever the floor says
+	}
+	if d < time.Millisecond {
+		// Less than a millisecond of headroom. Raising the delay to a millisecond — the spin guard
+		// — would push it AT OR PAST the deadline, which is the one thing this function may never
+		// do (codex). There is nothing to wait for: renew now.
+		return 0
+	}
+	return d
+}
+
+// tightestLease is the soonest deadline in the batch — the batch is only as safe as its most
+// exposed message. A zero time means no message carries a usable lease.
+func tightestLease(msgs []*mqlite.Message) time.Time {
+	var tightest time.Time
 	for _, m := range msgs {
-		if d := m.LockedUntil.Sub(now); d > 0 && (tightest == 0 || d < tightest) {
-			tightest = d
+		if !m.LockedUntil.IsZero() && (tightest.IsZero() || m.LockedUntil.Before(tightest)) {
+			tightest = m.LockedUntil
 		}
 	}
-	if tightest <= 0 {
-		tightest = 30 * time.Second // the default lock duration
+	return tightest
+}
+
+func renewInterval(msgs []*mqlite.Message) time.Duration {
+	until := tightestLease(msgs)
+	if until.IsZero() {
+		return 0
 	}
-	if half := tightest / 2; half > time.Second {
-		return half
+	d := time.Until(until)
+	if d <= 0 {
+		return 0 // the lease is spent: renew now, do not wait
 	}
-	return time.Second
+	return d / 3
 }
 
 func formatMsg(m *mqlite.Message, withToken bool) string {

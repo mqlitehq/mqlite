@@ -377,3 +377,89 @@ func TestTursoConcurrent(t *testing.T) {
 	t.Logf("Turso concurrency OK in %s: dedup collapsed %d→1 under race; %d messages claimed exactly once by %d consumers",
 		time.Since(start).Round(time.Second), N, want, C)
 }
+
+// TestTursoBatchSettle exercises the batch settle path against a REAL remote libSQL DB, which is
+// the backend it exists for: RenewBatch/CompleteBatch are set-based precisely because every
+// statement on Hrana is its own network round trip. It also proves the SQL those two rely on —
+// a row-value `(id, lock_token) IN (VALUES ...)` set and `UPDATE ... RETURNING` — actually works
+// remotely, rather than only on the local pure-Go SQLite driver (MQLITE-97).
+//
+// Same gating as the other Turso tests: skipped unless MQLITE_TEST_DB is set.
+func TestTursoBatchSettle(t *testing.T) {
+	dsn := os.Getenv("MQLITE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set MQLITE_TEST_DB (and MQLITE_TEST_DB_AUTH_TOKEN) to run the Turso integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	e, err := Open(ctx, Options{DB: dsn, AuthToken: os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"), DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open remote: %v", err)
+	}
+	defer e.Close()
+
+	// A FIXED queue name, reused every run. A unique one would leave a queues row behind on the
+	// live database forever: Purge only deletes dead letters, never the queue metadata, and a
+	// t.Cleanup would run AFTER the deferred e.Close() anyway, so it could not issue the request.
+	// Reusing one queue leaks nothing; drain whatever a previous failed run may have left.
+	const q = "batch-settle-turso"
+	if err := e.CreateQueue(ctx, q, QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10}); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if _, err := e.Purge(ctx, q, RedriveOptions{}); err != nil { // any dead letters from a past run
+		t.Fatalf("purge: %v", err)
+	}
+	for { // and any live messages from a past run
+		leftover, err := e.Receive(ctx, q, ReceiveOptions{MaxMessages: 256, Mode: ReceiveAndDelete})
+		if err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+		if len(leftover) == 0 {
+			break
+		}
+	}
+
+	const n = 32 // enough to be a real batch; small enough to keep the remote run quick
+	seed := make([]OutMessage, n)
+	for i := range seed {
+		seed[i] = OutMessage{Body: []byte("m")}
+	}
+	if _, err := e.Send(ctx, q, seed...); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	msgs, err := e.Receive(ctx, q, ReceiveOptions{MaxMessages: n})
+	if err != nil || len(msgs) != n {
+		t.Fatalf("receive: got %d (err %v)", len(msgs), err)
+	}
+
+	items := make([]SettleItem, 0, n+1)
+	for _, m := range msgs {
+		items = append(items, SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken})
+	}
+	items = append(items, SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: "stale"}) // must not settle
+
+	// UPDATE ... RETURNING over a row-value set, remotely.
+	res, err := e.RenewBatch(ctx, q, items)
+	if err != nil {
+		t.Fatalf("RenewBatch on remote: %v", err)
+	}
+	for i, r := range res {
+		if want := i < n; r.Ok != want {
+			t.Errorf("RenewBatch item %d (seq %d): Ok=%v, want %v", i, r.SeqNumber, r.Ok, want)
+		}
+	}
+
+	res, err = e.CompleteBatch(ctx, q, items)
+	if err != nil {
+		t.Fatalf("CompleteBatch on remote: %v", err)
+	}
+	for i, r := range res {
+		if want := i < n; r.Ok != want {
+			t.Errorf("CompleteBatch item %d (seq %d): Ok=%v, want %v", i, r.SeqNumber, r.Ok, want)
+		}
+	}
+	if m, err := e.Stats(ctx, q); err != nil || m.Total != 0 {
+		t.Fatalf("total=%d after settling the batch remotely, want 0 (err %v)", m.Total, err)
+	}
+}

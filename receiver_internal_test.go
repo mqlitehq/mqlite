@@ -3,6 +3,7 @@ package mqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -291,5 +292,24 @@ func TestServeHTTPServerHardening(t *testing.T) {
 	}
 	if hs.WriteTimeout != 0 {
 		t.Fatal("WriteTimeout must stay 0: it would cap the response and break the 20s Receive long-poll")
+	}
+}
+
+// A broker that does not serve one of the receiver's operations is a PERMANENT incompatibility:
+// no amount of retrying makes the route appear. Before ErrUnsupported existed such a 404 arrived
+// as ErrNotFound, which isPermanent already caught — so introducing the new sentinel without
+// classifying it would have quietly turned a clean "this broker is too old" into an infinite
+// retry loop (codex).
+func TestUnsupportedIsPermanent(t *testing.T) {
+	if !isPermanent(ErrUnsupported) {
+		t.Error("ErrUnsupported must stop the receive loop: retrying cannot make the route exist")
+	}
+	// And it stays permanent when wrapped, which is how the client returns it.
+	if !isPermanent(fmt.Errorf("%w: /mqlite.v1.QueueService/RenewBatch", ErrUnsupported)) {
+		t.Error("a wrapped ErrUnsupported must still be permanent")
+	}
+	// Sanity: a transient failure is still transient.
+	if isPermanent(errors.New("connection reset")) {
+		t.Error("a transient error must not stop the loop")
 	}
 }

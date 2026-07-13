@@ -39,12 +39,16 @@ const (
 
 // Sentinel errors. The server maps these onto Connect/HTTP error codes.
 var (
-	ErrQueueNotFound         = errors.New("mqlite: queue not found")
-	ErrLockLost              = errors.New("mqlite: lock lost or already settled")
-	ErrUnauthenticated       = errors.New("mqlite: unauthenticated (bad or missing token)")
-	ErrOutcomeUnknown        = errors.New("mqlite: operation outcome unknown (remote commit lost its acknowledgement — it may or may not have applied; check by message_id/dedup before retrying)")
-	ErrDedupConflict         = errors.New("mqlite: dedup conflict (same id, different body)")
-	ErrNotFound              = errors.New("mqlite: not found")
+	ErrQueueNotFound   = errors.New("mqlite: queue not found")
+	ErrLockLost        = errors.New("mqlite: lock lost or already settled")
+	ErrUnauthenticated = errors.New("mqlite: unauthenticated (bad or missing token)")
+	ErrOutcomeUnknown  = errors.New("mqlite: operation outcome unknown (remote commit lost its acknowledgement — it may or may not have applied; check by message_id/dedup before retrying)")
+	ErrDedupConflict   = errors.New("mqlite: dedup conflict (same id, different body)")
+	ErrNotFound        = errors.New("mqlite: not found")
+	// ErrUnsupported: the BROKER does not serve this operation — an older broker that predates
+	// it. Distinct from ErrNotFound ("the queue/message does not exist"), which the same broker
+	// answers with a 404 too. A client can use it to fall back to an older equivalent.
+	ErrUnsupported           = errors.New("mqlite: operation not supported by this broker")
 	ErrClosed                = errors.New("mqlite: engine closed")
 	ErrMessageTooLarge       = errors.New("mqlite: message body exceeds max size")
 	ErrNameConflict          = errors.New("mqlite: name already in use by another queue or topic")
