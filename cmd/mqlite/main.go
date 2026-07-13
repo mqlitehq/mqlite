@@ -1214,9 +1214,22 @@ func renewFunc(c api, queue string, msgs []*mqlite.Message) func(context.Context
 	batched := true
 	return func(ctx context.Context) {
 		if batched {
-			if _, err := c.RenewBatch(ctx, queue, msgs...); err == nil {
+			// Renewal is capped at one statement's worth (mqlite.MaxRenewBatch) so the broker can
+			// promise every Ok means a live lease. Receive hands out at most 256, so a batch never
+			// exceeds it in practice — but renewing in groups anyway means an oversized batch can
+			// never silently renew NOTHING.
+			err := error(nil)
+			for start := 0; start < len(msgs) && err == nil; start += mqlite.MaxRenewBatch {
+				end := start + mqlite.MaxRenewBatch
+				if end > len(msgs) {
+					end = len(msgs)
+				}
+				_, err = c.RenewBatch(ctx, queue, msgs[start:end]...)
+			}
+			if err == nil {
 				return
-			} else if !errors.Is(err, mqlite.ErrUnsupported) {
+			}
+			if !errors.Is(err, mqlite.ErrUnsupported) {
 				return // a real failure (network, lost lock) — not a reason to downgrade forever
 			}
 			fmt.Fprintln(os.Stderr,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -262,7 +263,43 @@ func settleKey(seq int64, token string) string {
 //
 // Like Renew, an item whose lock was already lost simply comes back Ok=false; that is the
 // contract, not an error for the batch. Fencing is on LockToken, exactly as in CompleteBatch.
+// MaxRenewBatch is the most messages one RenewBatch call may renew.
+//
+// It is exactly one statement's worth, and that is a CONTRACT, not a tuning knob. RenewBatch
+// promises that every Ok it returns means a live lease at the moment it returns. Across several
+// statements that promise is unkeepable: the first chunk commits, later chunks run (each a
+// network round trip on a remote store), and with a short lock duration the first chunk's lease
+// can expire — and be reaped — before the call has even finished, while its result still says Ok.
+// Renewing in one statement is what makes the answer honest.
+//
+// It is also not a limit anyone meets by accident: Receive hands out at most 256 messages, so a
+// consumer holding a batch of leases never has more than that. A caller holding more should renew
+// in several calls, each of which then reports honestly about its own.
+const MaxRenewBatch = settleChunk
+
+// RenewBatch extends the lock lease of many messages in ONE statement, returning a per-item
+// result so the caller can see exactly which leases still hold.
+//
+// Renewing a batch message-by-message does not scale: over a network each Renew is a separate
+// round trip, so N messages × the link latency can easily exceed the lease itself and the locks
+// expire *while they are being renewed* — a 64-message batch on a 50ms link needs 3.2s of
+// renewals against a 2s lease and loses most of them (review round-3). One request, one statement,
+// one lease deadline for the whole batch.
+//
+// Deliberately NOT in a transaction. Renewal has no cross-item invariant to protect — each lease
+// stands or falls on its own token — so a transaction buys nothing and costs two real things: the
+// deadline would have to survive the COMMIT as well as the write, and `Tx.Commit` takes no
+// context (the pinned libSQL driver sends it on context.Background()), so a stalled commit is
+// UNCANCELLABLE — and `mqlite receive` waits for its renewal goroutine before closing the client,
+// which would hang the command despite cancelling it.
+//
+// Like Renew, an item whose lock was already lost simply comes back Ok=false; that is the
+// contract, not an error for the batch. Fencing is on LockToken, exactly as in CompleteBatch.
 func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleItem) ([]SettleResult, error) {
+	if len(items) > MaxRenewBatch {
+		return nil, fmt.Errorf("%w: renew at most %d messages per call (got %d) — a lease renewed by an earlier statement could expire before a later one finished, so a multi-statement renewal cannot honestly report which leases still hold",
+			ErrInvalidArgument, MaxRenewBatch, len(items))
+	}
 	out := make([]SettleResult, len(items))
 	for i, it := range items {
 		out[i] = SettleResult{SeqNumber: it.SeqNumber}
@@ -276,51 +313,34 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		return nil, err
 	}
 
-	// Deliberately NOT one transaction. Renewal has no cross-item invariant to protect — each
-	// lease stands or falls on its own token, and the per-item result already says which held —
-	// so wrapping the chunks in a transaction buys nothing and costs two real things:
-	//
-	//   - a deadline computed for chunk 1 has to survive every later chunk's round trips AND the
-	//     final COMMIT. On a remote store, a large batch with a short lock could commit leases
-	//     that had already expired while it ran, and still report Ok — the reaper then reclaims
-	//     them immediately, which is precisely the bug this whole change exists to prevent;
-	//   - `Tx.Commit` takes no context. The pinned libSQL driver sends COMMIT on
-	//     context.Background(), so a stalled commit is UNCANCELLABLE — and `mqlite receive` waits
-	//     for the renewal goroutine before closing the client, which would hang the command
-	//     despite its cancellation (the very hang we fixed in round 2).
-	//
-	// Each chunk is therefore its own self-committing statement, with its deadline taken
-	// immediately before the single write it has to survive. For any realistic batch — Receive
-	// caps at 256 — that is ONE context-bound statement and no transaction at all.
+	// ONE statement: the write and the report of what it touched are the same UPDATE ... RETURNING.
+	// A separate follow-up SELECT would put another round trip between the deadline and its commit,
+	// eating into the very lease it is trying to extend.
 	renewed := make(map[string]bool, len(rows))
-	err = chunkPairs(rows, func(group []SettleItem, pairs string) error {
-		// The write and the report of what it touched are the SAME statement: UPDATE ...
-		// RETURNING. A separate follow-up SELECT would put another round trip between the
-		// deadline and its commit, eating into the very lease it is trying to extend.
-		args := pairArgs(queue, group)
-		return e.db.queryFresh(ctx,
-			`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
-			 RETURNING id, lock_token`,
-			// The deadline is rebuilt for EVERY attempt, once a connection is already held — see
-			// queryFresh. Computed any earlier, a backoff (or a wait for a free connection) could
-			// leave it in the past by the time the successful attempt commits: the row would
-			// report Ok while the reaper reclaimed it at once.
-			func() []any { return append([]any{e.now() + q.lockDurationMs}, args...) },
-			func(sel *sql.Rows) error {
-				// An item whose lock was lost, or whose token is wrong, matches no row: it is
-				// simply absent from the RETURNING set and its Ok stays false. That is Renew's
-				// contract, not an error.
-				for sel.Next() {
-					var id int64
-					var tok string
-					if err := sel.Scan(&id, &tok); err != nil {
-						return err
-					}
-					renewed[settleKey(id, tok)] = true
+	pairs := strings.Repeat(",(?,?)", len(rows))[1:]
+	args := pairArgs(queue, rows)
+	err = e.db.queryFresh(ctx,
+		`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+		 RETURNING id, lock_token`,
+		// The deadline is built per ATTEMPT, once a connection is already held — see queryFresh.
+		// Computed any earlier, a backoff (or a wait for a free connection) could leave it in the
+		// past by the time the successful attempt commits: the row would report Ok while the reaper
+		// reclaimed it at once.
+		func() []any { return append([]any{e.now() + q.lockDurationMs}, args...) },
+		func(sel *sql.Rows) error {
+			// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
+			// absent from the RETURNING set and its Ok stays false. That is Renew's contract, not
+			// an error.
+			for sel.Next() {
+				var id int64
+				var tok string
+				if err := sel.Scan(&id, &tok); err != nil {
+					return err
 				}
-				return sel.Err()
-			})
-	})
+				renewed[settleKey(id, tok)] = true
+			}
+			return sel.Err()
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -342,15 +362,21 @@ type SettleResult struct {
 	Ok        bool // true = settled (or an idempotent replay of an already-settled token)
 }
 
-// CompleteBatch completes many messages in one transaction / one round-trip — the
-// broker-side fix for the drain N+1 (Receive returns a batch, but settling it
-// one-by-one is one HTTP call per message). Each item is fenced on its own
-// lock_token and recorded idempotently, exactly like Complete; a per-item failure
-// (expired/wrong token) returns Ok=false rather than failing the whole batch.
-// Like RenewBatch it is SET-BASED: a FIXED number of statements, not one (or two) per message.
-// Against a remote Turso/libSQL store every statement is its own Hrana round trip, so the old
-// item-by-item loop made a 256-message settle ~512 remote round trips — and this is the very
-// RPC whose latency lets the batch's own locks expire while it runs (review round-3).
+// CompleteBatch completes many messages in one transaction / one round-trip — the broker-side fix
+// for the drain N+1 (Receive returns a batch, but settling it one-by-one is one HTTP call per
+// message). Each item is fenced on its own lock_token and recorded idempotently, exactly like
+// Complete; a per-item failure (expired/wrong token) returns Ok=false rather than failing the
+// whole batch.
+//
+// Like RenewBatch it is SET-BASED — a fixed number of statements, not one (or two) per message.
+// Against a remote Turso/libSQL store every statement is its own round trip, so the old
+// item-by-item loop made a 256-message settle ~512 remote round trips, on the very RPC whose
+// latency lets the batch's own locks expire while it runs (review round-3).
+//
+// Unlike RenewBatch it may span several statements (it chunks), because completion is TERMINAL:
+// a message deleted by an earlier chunk cannot un-delete itself while a later chunk runs. Renewal
+// makes a claim about the future — "this lease is live" — which is why it must fit in one
+// statement; completion only reports what already happened.
 func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []SettleItem) ([]SettleResult, error) {
 	out := make([]SettleResult, len(items))
 	for i, it := range items {

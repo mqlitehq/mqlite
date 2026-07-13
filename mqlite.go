@@ -150,6 +150,12 @@ type StatusInfo struct {
 	Auth     bool  `json:"auth"`
 }
 
+// MaxRenewBatch is the most messages one RenewBatch call may renew. Renewal must fit in a single
+// statement to promise honestly that every Ok means a live lease at return — see
+// engine.MaxRenewBatch. Receive hands out at most 256 messages, so a consumer never meets it by
+// accident; a caller holding more renews in several calls.
+const MaxRenewBatch = engine.MaxRenewBatch
+
 // ── data-plane options ───────────────────────────────────────────────────────
 //
 // These are plain option structs passed as a trailing variadic argument: callers

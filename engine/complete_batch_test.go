@@ -335,16 +335,24 @@ func TestBatchSettleBeyondBindParameterLimit(t *testing.T) {
 		}
 	}
 
-	res, err := e.RenewBatch(ctx, "q", items)
+	// Renewal is capped at one statement (MaxRenewBatch): a lease renewed by an earlier statement
+	// could expire while a later one is still running, so a multi-statement renewal cannot honestly
+	// say which leases still hold. It refuses rather than lie.
+	if _, err := e.RenewBatch(ctx, "q", items); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("RenewBatch(%d) must be refused as over the cap, got %v", n, err)
+	}
+	// The first MaxRenewBatch of them renew fine in one call.
+	res, err := e.RenewBatch(ctx, "q", items[:MaxRenewBatch])
 	if err != nil {
-		t.Fatalf("RenewBatch(%d): %v", n, err)
+		t.Fatalf("RenewBatch(%d): %v", MaxRenewBatch, err)
 	}
 	for _, r := range res {
 		if !r.Ok {
-			t.Fatalf("seq %d was not renewed in an %d-item batch", r.SeqNumber, n)
+			t.Fatalf("seq %d was not renewed in a full-size renewal batch", r.SeqNumber)
 		}
 	}
 
+	// Completion is TERMINAL, so it may span statements — and must still handle the whole batch.
 	res, err = e.CompleteBatch(ctx, "q", items)
 	if err != nil {
 		t.Fatalf("CompleteBatch(%d): %v", n, err)
@@ -419,17 +427,18 @@ func TestBatchSettleBindLimitWithSyntheticItems(t *testing.T) {
 		items[i] = SettleItem{SeqNumber: int64(i + 1), LockToken: "tok-" + strconv.Itoa(i)}
 	}
 
-	res, err := e.RenewBatch(ctx, "q", items)
-	if err != nil {
-		t.Fatalf("RenewBatch(%d): %v", n, err)
+	// RenewBatch is capped at one statement, so it never reaches the bind limit at all — it
+	// refuses first, which is the honest answer (see MaxRenewBatch).
+	if _, err := e.RenewBatch(ctx, "q", items); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("RenewBatch(%d) must be refused as over the cap, got %v", n, err)
 	}
-	for _, r := range res {
-		if r.Ok {
-			t.Fatalf("seq %d: nothing exists to renew, so no item may report Ok", r.SeqNumber)
-		}
+	// At exactly the cap it is one full-width statement — the bind-limit edge that matters for it.
+	if _, err := e.RenewBatch(ctx, "q", items[:MaxRenewBatch]); err != nil {
+		t.Fatalf("RenewBatch at the cap (%d): %v", MaxRenewBatch, err)
 	}
 
-	res, err = e.CompleteBatch(ctx, "q", items)
+	// CompleteBatch chunks, so it must survive a batch far past ONE statement's bind budget.
+	res, err := e.CompleteBatch(ctx, "q", items)
 	if err != nil {
 		t.Fatalf("CompleteBatch(%d): %v", n, err)
 	}

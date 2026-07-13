@@ -174,8 +174,12 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   than the lease it was renewing*: a 64-message batch at 50ms per call needs 3.2s against a 2s
   lock, and most of the locks expired mid-pass and redelivered. New `RenewBatch` operation
   (HTTP `/mqlite.v1.QueueService/RenewBatch`; `Client.RenewBatch` / `Embedded.RenewBatch`;
-  `Engine.RenewBatch`) renews a whole batch in one request and one transaction, so a renewal
-  pass is one round trip no matter how big the batch. **Batch settlement and renewal are also
+  `Engine.RenewBatch`) renews a whole batch in one request and ONE statement, so a renewal pass is
+  one round trip no matter how big the batch. It renews at most `mqlite.MaxRenewBatch` (512)
+  messages per call — deliberately one statement's worth, because that is what lets it promise
+  that every `Ok` it returns means a *live* lease: across several statements the first batch's
+  lease can expire, and be reaped, while a later one is still running. Receive hands out at most
+  256 messages, so a consumer never meets the cap by accident. **Batch settlement and renewal are also
   set-based inside the engine** — a fixed number of SQL statements rather than one (or two) per
   message. On a remote Turso/libSQL store every statement is its own round trip, so the old
   item-by-item loops made a 256-message settle ~512 remote round trips: the same O(N) latency,
