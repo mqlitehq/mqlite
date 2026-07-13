@@ -298,29 +298,28 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		// RETURNING. A separate follow-up SELECT would put another round trip between the
 		// deadline and its commit, eating into the very lease it is trying to extend.
 		args := pairArgs(queue, group)
-		sel, err := e.db.queryFresh(ctx,
+		return e.db.queryFresh(ctx,
 			`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
 			 RETURNING id, lock_token`,
-			// The deadline is rebuilt for EVERY attempt. A remote retry backs off for up to
-			// hundreds of milliseconds, so one computed before the loop could be in the past by
-			// the time the successful attempt commits — the row would report Ok while the reaper
-			// reclaimed it at once.
-			func() []any { return append([]any{e.now() + q.lockDurationMs}, args...) })
-		if err != nil {
-			return err
-		}
-		defer sel.Close()
-		// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
-		// absent from the RETURNING set and its Ok stays false. That is Renew's contract.
-		for sel.Next() {
-			var id int64
-			var tok string
-			if err := sel.Scan(&id, &tok); err != nil {
-				return err
-			}
-			renewed[settleKey(id, tok)] = true
-		}
-		return sel.Err()
+			// The deadline is rebuilt for EVERY attempt, once a connection is already held — see
+			// queryFresh. Computed any earlier, a backoff (or a wait for a free connection) could
+			// leave it in the past by the time the successful attempt commits: the row would
+			// report Ok while the reaper reclaimed it at once.
+			func() []any { return append([]any{e.now() + q.lockDurationMs}, args...) },
+			func(sel *sql.Rows) error {
+				// An item whose lock was lost, or whose token is wrong, matches no row: it is
+				// simply absent from the RETURNING set and its Ok stays false. That is Renew's
+				// contract, not an error.
+				for sel.Next() {
+					var id int64
+					var tok string
+					if err := sel.Scan(&id, &tok); err != nil {
+						return err
+					}
+					renewed[settleKey(id, tok)] = true
+				}
+				return sel.Err()
+			})
 	})
 	if err != nil {
 		return nil, err

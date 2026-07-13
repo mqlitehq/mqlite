@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
@@ -78,11 +79,18 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 	if resp.StatusCode/100 != 2 {
 		var eb wire.ErrorBody
 		_ = json.NewDecoder(resp.Body).Decode(&eb)
-		// A 404 with no error code of ours is an UNROUTED path — a broker too old to serve this
-		// operation, not a missing queue (which answers 404 with code "not_found"). Telling the
-		// two apart lets a client fall back to an older equivalent instead of silently failing
-		// forever against a released broker (MQLITE-97).
-		if resp.StatusCode == http.StatusNotFound && eb.Code == "" {
+		// Did the broker say "I have no such ROUTE" — i.e. it is too old to serve this operation —
+		// rather than "that queue/message does not exist"? Both are 404s, and the difference
+		// decides whether a client may fall back to an older equivalent.
+		//
+		// The broker's catch-all answers an unknown path with a STRUCTURED body: code
+		// "not_found", message "no such path: <path>". (An earlier version of this check only
+		// recognized a bare, code-less 404 — which is what a dumb proxy emits, but NOT what the
+		// released broker does. It would therefore never have fired against the very brokers it
+		// exists for.) Accept both shapes: the structured no-such-path answer, and a code-less
+		// 404 from something in front of the broker.
+		if resp.StatusCode == http.StatusNotFound &&
+			(eb.Code == "" || strings.HasPrefix(eb.Message, "no such path")) {
 			return fmt.Errorf("%w: %s", ErrUnsupported, path)
 		}
 		return mapErr(eb)

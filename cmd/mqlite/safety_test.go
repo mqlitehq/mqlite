@@ -512,12 +512,22 @@ func TestRenewalFallsBackOnOldBroker(t *testing.T) {
 
 	var batchTries, singleRenews atomic.Int64
 	inner := server.New(eng, nil).Handler()
-	// A broker that predates RenewBatch: the route is simply not there.
+	// A broker that predates RenewBatch. It must answer the way the RELEASED broker really does:
+	// its own catch-all, with the structured `{"code":"not_found","message":"no such path: ..."}`
+	// body — NOT a bare http.NotFound. Modelling it with a hand-rolled 404 is how the first
+	// version of this fallback came to be tested against a server that does not exist, and would
+	// have shipped a downgrade path that never fires (codex).
+	//
+	// So: strip the route by rewriting the request to an unknown path and letting the REAL
+	// handler produce the REAL response.
 	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case wire.PathRenewBatch:
 			batchTries.Add(1)
-			http.NotFound(w, r) // exactly what an unrouted path returns
+			r.URL.Path = "/mqlite.v1.QueueService/RenewBatch" // unrouted on this broker
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/no-such-route-on-an-old-broker"
+			inner.ServeHTTP(w, r2)
 			return
 		case wire.PathRenew:
 			singleRenews.Add(1)

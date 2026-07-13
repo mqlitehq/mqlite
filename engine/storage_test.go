@@ -24,7 +24,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // netTimeout is a net.Error whose message contains none of isConnErr's substrings,
@@ -647,11 +649,7 @@ func TestFreshHelpersRebuildArgsPerAttempt(t *testing.T) {
 		run  func(d *db, build func() []any) error
 	}{
 		{"queryFresh", func(d *db, build func() []any) error {
-			rows, err := d.queryFresh(ctx, "UPDATE t SET x=?", build)
-			if rows != nil {
-				_ = rows.Close()
-			}
-			return err
+			return d.queryFresh(ctx, "UPDATE t SET x=?", build, func(*sql.Rows) error { return nil })
 		}},
 		{"execFresh", func(d *db, build func() []any) error {
 			_, err := d.execFresh(ctx, "UPDATE t SET x=?", build)
@@ -701,5 +699,52 @@ func TestPlainHelpersReplayTheSameArgs(t *testing.T) {
 		if got[0].Value != int64(7) {
 			t.Errorf("attempt %d wrote %v, want the same 7 on every replay", i+1, got)
 		}
+	}
+}
+
+// The arguments must be built only ONCE A CONNECTION IS IN HAND. Building them before the call is
+// not enough: DB.Exec/Query can BLOCK waiting for a free connection (and will transparently retry
+// a bad connection, reusing the arguments it was handed). A lock deadline computed before that
+// wait can therefore be committed already expired — reported as a successful renewal, and
+// reclaimed by the reaper at once (codex).
+//
+// Saturate the pool, and watch: while the helper is stuck waiting for a connection, it must not
+// have read the clock yet.
+func TestFreshHelpersBuildArgsAfterAcquiringAConn(t *testing.T) {
+	d, _ := remoteDBFailingFirst(t, 0)
+	d.sql.SetMaxOpenConns(1)
+
+	// Take the only connection and hold it.
+	held, err := d.sql.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var built atomic.Bool
+	done := make(chan error, 1)
+	go func() {
+		done <- d.queryFresh(context.Background(), "UPDATE t SET x=?",
+			func() []any { built.Store(true); return []any{int64(1)} },
+			func(*sql.Rows) error { return nil })
+	}()
+
+	// The helper is now blocked in Conn(). If it had built its arguments up front, the clock would
+	// already have been read — and by the time a connection frees up, that deadline is stale.
+	time.Sleep(150 * time.Millisecond)
+	if built.Load() {
+		t.Fatal("the arguments were built while still waiting for a connection — a deadline read there is stale by the time the statement runs")
+	}
+
+	_ = held.Close() // release the pool
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("queryFresh: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queryFresh never completed after the connection was released")
+	}
+	if !built.Load() {
+		t.Error("the arguments were never built")
 	}
 }
