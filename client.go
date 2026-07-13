@@ -78,6 +78,13 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 	if resp.StatusCode/100 != 2 {
 		var eb wire.ErrorBody
 		_ = json.NewDecoder(resp.Body).Decode(&eb)
+		// A 404 with no error code of ours is an UNROUTED path — a broker too old to serve this
+		// operation, not a missing queue (which answers 404 with code "not_found"). Telling the
+		// two apart lets a client fall back to an older equivalent instead of silently failing
+		// forever against a released broker (MQLITE-97).
+		if resp.StatusCode == http.StatusNotFound && eb.Code == "" {
+			return fmt.Errorf("%w: %s", ErrUnsupported, path)
+		}
 		return mapErr(eb)
 	}
 	if respOut != nil {

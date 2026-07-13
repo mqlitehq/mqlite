@@ -180,8 +180,12 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   message. On a remote Turso/libSQL store every statement is its own round trip, so the old
   item-by-item loops made a 256-message settle ~512 remote round trips: the same O(N) latency,
   one layer down, on the very RPC whose slowness lets the batch's own locks expire. The CLI's
-  renewal interval is also a fraction of the lease now (a third) rather than a fixed one-second
-  floor — a queue whose lock
+  CLI stays compatible with an **older broker**: one that predates `RenewBatch` answers 404, and
+  the CLI falls back to per-message `Renew` (what it used to do) rather than silently renewing
+  nothing. New `mqlite.ErrUnsupported` reports "this broker does not serve that operation",
+  distinct from `ErrNotFound` ("that queue/message does not exist"), which the same broker also
+  answers 404 for. The renewal interval is also a fraction of the lease now (a third) rather than
+  a fixed one-second floor — a queue whose lock
   duration was one second or less previously had its first renewal scheduled at or *after* its
   own expiry, so its lease could not be held at all.
 - **A DLQ under its retention cap no longer logs a false ERROR every minute** (MQLITE-97): the

@@ -485,3 +485,77 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 		})
 	}
 }
+
+// A NEW CLI must keep working against an OLD broker. Released v0.2.x has no RenewBatch route and
+// answers 404; a renewer that discarded that error would silently stop renewing against a broker
+// the previous CLI renewed just fine — the locks would expire and the batch redeliver. So the
+// first "I don't know that operation" must downgrade to per-message Renew, which that broker does
+// serve (codex).
+func TestRenewalFallsBackOnOldBroker(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 6000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+
+	var batchTries, singleRenews atomic.Int64
+	inner := server.New(eng, nil).Handler()
+	// A broker that predates RenewBatch: the route is simply not there.
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenewBatch:
+			batchTries.Add(1)
+			http.NotFound(w, r) // exactly what an unrouted path returns
+			return
+		case wire.PathRenew:
+			singleRenews.Add(1)
+		case wire.PathCompleteBatch:
+			time.Sleep(3 * time.Second) // slow settle: renewal has to carry the lease across it
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer old.Close()
+
+	t.Setenv("MQLITE_ENDPOINT", old.URL)
+	t.Setenv("MQLITE_TOKEN", "")
+	if _, err := captureStdout(t, func() error { return cmdReceive(ctx, []string{"q"}) }); err != nil {
+		t.Fatalf("receive against a pre-RenewBatch broker must still settle: %v", err)
+	}
+	if batchTries.Load() == 0 {
+		t.Error("the CLI should try RenewBatch first")
+	}
+	if singleRenews.Load() == 0 {
+		t.Error("after the 404 it must fall back to per-message Renew, not give up renewing")
+	}
+	if m, err := eng.Stats(ctx, "q"); err != nil || m.Total != 0 {
+		t.Fatalf("total=%d — the batch was not settled against the old broker", m.Total)
+	}
+}
+
+// A lease that is nearly spent when the batch arrives — a very short lock duration, or a slow
+// Receive — must be renewed IMMEDIATELY. Clamping the first tick up to the cadence floor
+// schedules it at or after locked_until, so the reaper takes the batch before the CLI ever asks
+// (codex).
+func TestRenewIntervalSaysRenewNowWhenLeaseNearlySpent(t *testing.T) {
+	now := time.Now()
+	nearlyGone := []*mqlite.Message{{LockedUntil: now.Add(30 * time.Millisecond)}}
+	if d := renewInterval(nearlyGone); d >= minRenewInterval {
+		t.Errorf("interval = %s for a 30ms lease; must be below the cadence floor so the caller renews NOW", d)
+	}
+	spent := []*mqlite.Message{{LockedUntil: now.Add(-time.Second)}} // already expired
+	if d := renewInterval(spent); d != 0 {
+		t.Errorf("interval = %s for a spent lease, want 0 (renew immediately)", d)
+	}
+	healthy := []*mqlite.Message{{LockedUntil: now.Add(30 * time.Second)}}
+	if d := renewInterval(healthy); d < 9*time.Second || d > 11*time.Second {
+		t.Errorf("interval = %s for a 30s lease, want about a third of it", d)
+	}
+}

@@ -31,6 +31,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -1170,7 +1171,20 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 	}
 	go func() {
 		defer close(r.done)
-		t := time.NewTicker(renewInterval(msgs))
+
+		renew := renewFunc(c, queue, msgs)
+
+		// If the lease is already nearly gone — a queue configured with a very short lock, or a
+		// Receive whose response was slow — waiting even one tick schedules the first renewal at
+		// or after locked_until, and the reaper takes the batch before we ever ask. Renew NOW and
+		// only then settle into a cadence.
+		d := renewInterval(msgs)
+		if d < minRenewInterval {
+			renew(ctx)
+			d = minRenewInterval
+		}
+
+		t := time.NewTicker(d)
 		defer t.Stop()
 		for {
 			select {
@@ -1179,15 +1193,40 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				// ONE request for the whole batch. Renewing message-by-message cost N round
-				// trips, so on a slow link the renewal pass outlasted the lease it was saving:
-				// 64 messages × 50ms = 3.2s against a 2s lock, and most locks expired mid-pass
-				// (review round-3). Best-effort — a failed renew only risks a redelivery.
-				_, _ = c.RenewBatch(ctx, queue, msgs...)
+				renew(ctx)
 			}
 		}
 	}()
 	return r
+}
+
+// renewFunc renews the whole batch in ONE request — renewing message-by-message cost N round
+// trips, so on a slow link a renewal pass outlasted the lease it was saving (review round-3).
+//
+// But an OLDER broker does not serve RenewBatch: released v0.2.x answers 404, and a renewer that
+// simply discarded that error would silently stop renewing against a broker the previous CLI
+// renewed just fine — locks would expire and messages redeliver. So the first time the broker
+// says it does not know the operation, fall back to per-message Renew for the rest of the batch's
+// life. Slower, but it is exactly what the old CLI did, and it is what that broker supports.
+//
+// Everything here is best-effort: a failed renew only risks a redelivery.
+func renewFunc(c api, queue string, msgs []*mqlite.Message) func(context.Context) {
+	batched := true
+	return func(ctx context.Context) {
+		if batched {
+			if _, err := c.RenewBatch(ctx, queue, msgs...); err == nil {
+				return
+			} else if !errors.Is(err, mqlite.ErrUnsupported) {
+				return // a real failure (network, lost lock) — not a reason to downgrade forever
+			}
+			fmt.Fprintln(os.Stderr,
+				"warning: this broker does not support RenewBatch (it predates it); renewing one message at a time")
+			batched = false
+		}
+		for _, m := range msgs {
+			_ = m.Renew(ctx)
+		}
+	}
 }
 
 // Stop ends renewal and waits for the goroutine to exit, so no Renew is still in flight when
@@ -1202,14 +1241,18 @@ func (r *renewer) Stop() {
 	<-r.done
 }
 
-// renewInterval is a third of the tightest remaining lease in the batch, so the first renew
-// lands with the lease still two-thirds alive and a missed tick is survivable.
+// renewInterval is a third of the tightest remaining lease in the batch, so a renewal lands with
+// the lease still two-thirds alive and a missed tick is survivable.
 //
-// It is a FRACTION of the lease, never a fixed floor. The old version clamped to a minimum of
-// one second, which meant a queue whose lock duration was one second or less had its first
-// renewal scheduled at or after its own expiry — the lease could not be held at all (review
-// round-3). The remaining floor is only a spin guard for a pathologically short lease; it is
-// well below any lock duration the engine will hand out.
+// It is a FRACTION of the lease, never a fixed floor. The old version clamped to a minimum of one
+// second, so a queue whose lock duration was one second or less had its first renewal scheduled
+// at or after its own expiry — the lease could not be held at all (review round-3).
+//
+// It may legitimately return LESS than minRenewInterval: CreateQueue accepts any positive lock
+// duration, and a slow Receive can leave even a normal lease nearly spent. The caller treats that
+// as "renew immediately" rather than clamping the first tick past locked_until — which would hand
+// the batch to the reaper before we ever asked. minRenewInterval is only the steady-state cadence
+// floor, a spin guard, not a delay before the first renewal.
 const minRenewInterval = 50 * time.Millisecond
 
 func renewInterval(msgs []*mqlite.Message) time.Duration {
@@ -1221,12 +1264,9 @@ func renewInterval(msgs []*mqlite.Message) time.Duration {
 		}
 	}
 	if tightest <= 0 {
-		tightest = 30 * time.Second // the default lock duration
+		return 0 // the lease is spent (or unknown): renew now, do not wait
 	}
-	if third := tightest / 3; third > minRenewInterval {
-		return third
-	}
-	return minRenewInterval
+	return tightest / 3
 }
 
 func formatMsg(m *mqlite.Message, withToken bool) string {

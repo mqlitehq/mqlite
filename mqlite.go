@@ -24,6 +24,7 @@ var (
 	ErrOutcomeUnknown  = engine.ErrOutcomeUnknown
 	ErrInvalidArgument = engine.ErrInvalidArgument
 	ErrNotFound        = engine.ErrNotFound
+	ErrUnsupported     = engine.ErrUnsupported
 	ErrQueueNotFound   = engine.ErrQueueNotFound
 	ErrDedupConflict   = engine.ErrDedupConflict
 	ErrMessageTooLarge = engine.ErrMessageTooLarge
