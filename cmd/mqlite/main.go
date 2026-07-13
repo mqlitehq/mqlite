@@ -1194,10 +1194,25 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 			<-t.C
 		}
 		defer t.Stop()
+		// keep records the outcome of a renewal without throwing away what we already knew. A
+		// transient failure reports no deadline — but the lease we HELD may still be perfectly
+		// good, and discarding it drops us onto the unknown-deadline backoff, which can easily be
+		// longer than the lease still has left: a failed attempt a third of the way into a 1s lock
+		// would put the next one 1.33s in, well after the reaper took it (codex).
+		keep := func(got time.Time) {
+			if !got.IsZero() {
+				until = got
+				return
+			}
+			if time.Until(until) <= 0 {
+				until = time.Time{} // what we knew is spent too: now we really are in the dark
+			}
+		}
+
 		for {
 			d := pace(until)
 			if d == 0 { // the lease is spent, or nearly: renew NOW rather than wait past its end
-				until = renew(ctx)
+				keep(renew(ctx))
 				if pace(until) == 0 {
 					// Renewed, and STILL nothing usable to aim at — the renewal failed, or the lock
 					// duration is so short that no cadence can hold it. Drop to the calm retry rather
@@ -1213,7 +1228,7 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				until = renew(ctx)
+				keep(renew(ctx))
 			}
 		}
 	}()
@@ -1353,7 +1368,10 @@ func pace(until time.Time) time.Duration {
 		d = half // always land BEFORE the deadline, whatever the floor says
 	}
 	if d < time.Millisecond {
-		d = time.Millisecond // a true spin guard
+		// Less than a millisecond of headroom. Raising the delay to a millisecond — the spin guard
+		// — would push it AT OR PAST the deadline, which is the one thing this function may never
+		// do (codex). There is nothing to wait for: renew now.
+		return 0
 	}
 	return d
 }

@@ -717,19 +717,27 @@ func TestPaceNeverSchedulesPastTheDeadline(t *testing.T) {
 	// Short leases — the case that used to be handed to the 1s failure backoff, letting a freshly
 	// renewed lock be reaped while we waited. Whatever the floor says, the tick must land BEFORE
 	// the deadline.
+	//
+	// The assertion is "0, or strictly less than what remains", and that is deliberate: a loaded
+	// runner can deschedule this goroutine between constructing the deadline and pace() reading the
+	// clock, at which point the lease really IS spent and 0 ("renew now") is the correct answer.
+	// Demanding a positive delay would make the test fail for being right (codex).
 	for _, remaining := range []time.Duration{
 		149 * time.Millisecond, 100 * time.Millisecond, 60 * time.Millisecond,
 		30 * time.Millisecond, 10 * time.Millisecond, 2 * time.Millisecond,
+		// Sub-millisecond headroom: the spin guard must NOT round the delay up past the deadline.
+		900 * time.Microsecond, 500 * time.Microsecond, 100 * time.Microsecond,
 	} {
 		d := pace(time.Now().Add(remaining))
-		if d <= 0 {
-			t.Errorf("pace(%s) = %s: a live lease must still be scheduled, not treated as spent", remaining, d)
-			continue
-		}
-		if d >= remaining {
+		if d != 0 && d >= remaining {
 			t.Errorf("pace(%s) = %s — the renewal would be scheduled at or AFTER the deadline it is meant to save",
 				remaining, d)
 		}
+	}
+	// A lease with real headroom must still be SCHEDULED, not renewed on the spot — otherwise the
+	// "0" answer above would be hiding a renewal storm.
+	if d := pace(time.Now().Add(5 * time.Second)); d <= 0 || d >= 5*time.Second {
+		t.Errorf("pace(5s) = %s, want a positive delay well inside the lease", d)
 	}
 }
 
@@ -789,5 +797,62 @@ func TestLegacyInferredDeadlineIsMeasuredBeforeTheCall(t *testing.T) {
 	if remaining := time.Until(until); remaining > 600*time.Millisecond {
 		t.Errorf("inferred %s of lease remaining after a 600ms renewal of a 1s lock — the deadline was measured AFTER the call, crediting time the lease never had",
 			remaining)
+	}
+}
+
+// A renewal that fails TRANSIENTLY must not throw away a lease that is still good. Replacing a
+// live deadline with "unknown" drops the renewer onto the unknown-deadline backoff, which can
+// easily outlast what the lease had left: a failed attempt a third of the way into a one-second
+// lock would put the next one 1.33s in — well after the reaper took it (codex).
+func TestFailedRenewalKeepsAStillValidLease(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	inner := server.New(eng, nil).Handler()
+	// A broker that fails every renewal with a transient 500 — the route exists, so this is NOT the
+	// "unsupported, downgrade" path: it is an ordinary, retryable failure.
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wire.PathRenewBatch || r.URL.Path == wire.PathRenew {
+			http.Error(w, `{"code":"internal","message":"transient"}`, http.StatusInternalServerError)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer flaky.Close()
+
+	c, err := mqlite.Open(ctx, flaky.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	renew := renewFunc(c, "q", msgs, 30*time.Second)
+	if got := renew(ctx); !got.IsZero() {
+		t.Fatalf("a failing renewal must report no deadline, got %v", got)
+	}
+	// The renewer keeps what it already knew: the 30s lease is still good, so the cadence must stay
+	// paced by IT, not collapse to the unknown-deadline retry.
+	held := msgs[0].LockedUntil
+	if d := pace(held); d < 8*time.Second || d > 11*time.Second {
+		t.Errorf("cadence after a failed renewal = %s, want about a third of the lease we still hold", d)
+	}
+	if pace(time.Time{}) != renewRetryInterval {
+		t.Fatal("sanity: an unknown deadline should use the retry cadence")
 	}
 }
