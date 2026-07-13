@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -435,6 +436,57 @@ func TestBatchSettleBindLimitWithSyntheticItems(t *testing.T) {
 	for _, r := range res {
 		if r.Ok {
 			t.Fatalf("seq %d: nothing exists to complete, so no item may report Ok", r.SeqNumber)
+		}
+	}
+}
+
+// The lease deadline must be measured against the clock of the write that ACTUALLY LANDS, not
+// computed once before a retry loop. A remote retry backs off for up to hundreds of
+// milliseconds, so a deadline fixed beforehand can commit a lock that has already expired —
+// while RETURNING still reports Ok, and the reaper reclaims the message at once (codex).
+//
+// The clock is advanced between the call and the write, standing in for that backoff: whatever
+// happens in between, the committed deadline must be in the future relative to the clock at
+// write time, for both Renew and RenewBatch.
+func TestRenewDeadlineMeasuredAtWriteTime(t *testing.T) {
+	ctx := context.Background()
+	e, ms := testEngine(t)
+	const lockMs = 30_000
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: lockMs, MaxDeliveryCount: 10})
+	for i := 0; i < 2; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 2})
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	// Stand in for a retry's backoff: time passes before the write lands.
+	advance(ms, 20*time.Second)
+	writeTime := atomic.LoadInt64(ms)
+
+	if err := e.Renew(ctx, "q", msgs[0].SeqNumber, msgs[0].LockToken); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	res, err := e.RenewBatch(ctx, "q", []SettleItem{{SeqNumber: msgs[1].SeqNumber, LockToken: msgs[1].LockToken}})
+	if err != nil || !res[0].Ok {
+		t.Fatalf("RenewBatch: %v ok=%v", err, res[0].Ok)
+	}
+
+	locked, err := e.Peek(ctx, "q", PeekOptions{State: StateLocked, Max: 10})
+	if err != nil || len(locked) != 2 {
+		t.Fatalf("peek locked: %v n=%d", err, len(locked))
+	}
+	for _, p := range locked {
+		// A deadline computed before the elapsed time would land at writeTime-20s+lockMs.
+		if want := writeTime + lockMs; p.LockedUntilMs != want {
+			t.Errorf("seq %d: locked_until=%d, want %d — the deadline was not measured at write time",
+				p.SeqNumber, p.LockedUntilMs, want)
+		}
+		if p.LockedUntilMs <= writeTime {
+			t.Errorf("seq %d: committed a lease already expired at write time", p.SeqNumber)
 		}
 	}
 }

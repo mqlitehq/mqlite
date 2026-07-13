@@ -346,6 +346,48 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 	return res, err
 }
 
+// execFresh / queryFresh are exec/query for a statement whose ARGUMENTS are time-sensitive:
+// buildArgs is called again for every attempt.
+//
+// A remote retry backs off for up to hundreds of milliseconds, so an argument computed once —
+// before the loop — is stale by the time a later attempt actually lands. For a lock deadline
+// (`locked_until = now + lockDuration`) that is not cosmetic: the write can commit a lease that
+// has ALREADY EXPIRED, while still reporting success, and the reaper then reclaims the message
+// immediately. The deadline has to be measured against the clock at the moment of the write that
+// really happens (MQLITE-97).
+func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any) (sql.Result, error) {
+	var res sql.Result
+	var err error
+	for i := 0; i < d.attempts(); i++ {
+		if i > 0 {
+			d.backoff(ctx, i)
+		}
+		res, err = d.sql.ExecContext(ctx, query, buildArgs()...)
+		if err == nil || !d.retryableWrite(err) {
+			break
+		}
+	}
+	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
+		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
+	}
+	return res, err
+}
+
+func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []any) (*sql.Rows, error) {
+	var rows *sql.Rows
+	var err error
+	for i := 0; i < d.attempts(); i++ {
+		if i > 0 {
+			d.backoff(ctx, i)
+		}
+		rows, err = d.sql.QueryContext(ctx, query, buildArgs()...)
+		if err == nil || !d.retryable(err) {
+			return rows, err
+		}
+	}
+	return rows, err
+}
+
 func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	var rows *sql.Rows
 	var err error

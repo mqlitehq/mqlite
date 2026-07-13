@@ -176,9 +176,12 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	if err != nil {
 		return err
 	}
-	res, err := e.db.exec(ctx,
+	// execFresh, not exec: a remote retry backs off, so a deadline computed once — before the
+	// loop — could commit a lease that has already expired by the time the write that actually
+	// lands runs (MQLITE-97). It is measured against the clock of each attempt.
+	res, err := e.db.execFresh(ctx,
 		`UPDATE messages SET locked_until=? WHERE id=? AND queue=? AND lock_token=?`,
-		e.now()+q.lockDurationMs, seq, queue, token)
+		func() []any { return []any{e.now() + q.lockDurationMs, seq, queue, token} })
 	if err != nil {
 		return err
 	}
@@ -295,10 +298,14 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		// RETURNING. A separate follow-up SELECT would put another round trip between the
 		// deadline and its commit, eating into the very lease it is trying to extend.
 		args := pairArgs(queue, group)
-		sel, err := e.db.query(ctx,
+		sel, err := e.db.queryFresh(ctx,
 			`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
 			 RETURNING id, lock_token`,
-			append([]any{e.now() + q.lockDurationMs}, args...)...)
+			// The deadline is rebuilt for EVERY attempt. A remote retry backs off for up to
+			// hundreds of milliseconds, so one computed before the loop could be in the past by
+			// the time the successful attempt commits — the row would report Ok while the reaper
+			// reclaimed it at once.
+			func() []any { return append([]any{e.now() + q.lockDurationMs}, args...) })
 		if err != nil {
 			return err
 		}
