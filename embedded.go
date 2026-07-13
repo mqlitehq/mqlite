@@ -208,8 +208,9 @@ func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Messag
 	}
 	out := make([]SettleResult, len(res))
 	for i, r := range res {
-		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok}
+		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok, LockedUntil: msFromEpoch(r.LockedUntilMs)}
 	}
+	applyRenewals(msgs, out)
 	return out, nil
 }
 

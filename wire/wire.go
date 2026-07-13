@@ -115,6 +115,9 @@ type CompleteBatchRequest struct {
 type SettleItemResult struct {
 	SeqNumber int64 `json:"seq_number"`
 	Ok        bool  `json:"ok"`
+	// LockedUntilMs: the deadline a RenewBatch committed (absent for other settle operations).
+	// A renewing client needs it to know when to renew next.
+	LockedUntilMs int64 `json:"locked_until_ms,omitempty"`
 }
 type CompleteBatchResponse struct {
 	Results []SettleItemResult `json:"results"`

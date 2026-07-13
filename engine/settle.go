@@ -319,6 +319,7 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 	// A separate follow-up SELECT would put another round trip between the deadline and its commit,
 	// eating into the very lease it is trying to extend.
 	renewed := make(map[string]bool, len(rows))
+	deadlines := make(map[string]int64, len(rows)) // the committed locked_until, per (seq, token)
 	pairs := strings.Repeat(",(?,?)", len(rows))[1:]
 	args := pairArgs(queue, rows)
 	err = e.db.queryFresh(ctx,
@@ -347,24 +348,47 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 			// write itself can take longer than a short lease, in which case the deadline we just
 			// committed is already spent and the reaper may take the message at any moment. Saying
 			// Ok there would be a lie, and the caller would settle a message it no longer holds.
-			now := e.now()
+			// Collect first, judge afterwards. Sampling the clock BEFORE draining the rows would
+			// be judging the lease against a moment that has already passed: SQLite does not even
+			// finalize the statement's implicit transaction until RETURNING reaches EOF, so the
+			// lease can expire while we are still reading the rows that announce it (codex).
+			type row struct {
+				key   string
+				until int64
+			}
+			var got []row
 			for sel.Next() {
 				var id, until int64
 				var tok string
 				if err := sel.Scan(&id, &tok, &until); err != nil {
 					return err
 				}
-				if until > now {
-					renewed[settleKey(id, tok)] = true
+				got = append(got, row{settleKey(id, tok), until})
+			}
+			if err := sel.Err(); err != nil {
+				return err
+			}
+			now := e.now() // AFTER EOF: the statement is done, so this is when the answer is true
+			for _, r := range got {
+				if r.until > now {
+					renewed[r.key] = true
+					deadlines[r.key] = r.until
 				}
 			}
-			return sel.Err()
+			return nil
 		})
 	if err != nil {
 		return nil, err
 	}
 	for i, it := range items {
-		out[i].Ok = it.LockToken != "" && renewed[settleKey(it.SeqNumber, it.LockToken)]
+		if it.LockToken == "" {
+			continue
+		}
+		k := settleKey(it.SeqNumber, it.LockToken)
+		if renewed[k] {
+			out[i].Ok = true
+			out[i].LockedUntilMs = deadlines[k]
+		}
 	}
 	return out, nil
 }
@@ -379,6 +403,10 @@ type SettleItem struct {
 type SettleResult struct {
 	SeqNumber int64
 	Ok        bool // true = settled (or an idempotent replay of an already-settled token)
+	// LockedUntilMs is the deadline a RenewBatch actually committed (0 for other operations). The
+	// caller needs it: without the new deadline it cannot know when to renew again, and would
+	// either hammer the broker or let the lease it just extended lapse.
+	LockedUntilMs int64
 }
 
 // CompleteBatch completes many messages in one transaction / one round-trip — the broker-side fix

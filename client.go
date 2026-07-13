@@ -221,19 +221,42 @@ func (c *Client) Cancel(ctx context.Context, queue string, seq int64) error {
 	return c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: seq}, &wire.SettleResponse{})
 }
 
-// SettleResult is the per-message outcome of CompleteBatch (Ok=false = the lock was
+// SettleResult is the per-message outcome of a batch settle (Ok=false = the lock was
 // lost/expired for that message — not a fatal error for the batch).
 type SettleResult struct {
 	SequenceNumber int64
 	Ok             bool
+	// LockedUntil is the lease deadline a RenewBatch actually committed (zero for other
+	// operations). RenewBatch also writes it back onto the *Message, so a renewing caller can see
+	// when the lock it just extended runs out.
+	LockedUntil time.Time
 }
 
 func toSettleResults(rs []wire.SettleItemResult) []SettleResult {
 	out := make([]SettleResult, len(rs))
 	for i, r := range rs {
-		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok}
+		out[i] = SettleResult{SequenceNumber: r.SeqNumber, Ok: r.Ok, LockedUntil: msFromEpoch(r.LockedUntilMs)}
 	}
 	return out
+}
+
+// msFromEpoch turns an epoch-ms deadline into a time, keeping the zero time for "not set".
+func msFromEpoch(ms int64) time.Time {
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
+}
+
+// applyRenewals writes each committed lease deadline back onto its message. Without it a renewing
+// caller has no idea when the lease it just extended runs out: it would either renew far more
+// often than needed (hammering the broker) or let the lock lapse (review round-3 / codex).
+func applyRenewals(msgs []*Message, res []SettleResult) {
+	for i, r := range res {
+		if i < len(msgs) && r.Ok && !r.LockedUntil.IsZero() {
+			msgs[i].LockedUntil = r.LockedUntil
+		}
+	}
 }
 
 // CompleteBatch completes many received messages in one round-trip — the fix for the
@@ -274,7 +297,9 @@ func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message)
 	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
 		return nil, err
 	}
-	return toSettleResults(resp.Results), nil
+	out := toSettleResults(resp.Results)
+	applyRenewals(msgs, out)
+	return out, nil
 }
 
 // ── receive ─────────────────────────────────────────────────────────────────

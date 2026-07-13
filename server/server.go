@@ -506,7 +506,9 @@ func (s *Server) handleRenewBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]wire.SettleItemResult, len(results))
 	for i, res := range results {
-		out[i] = wire.SettleItemResult{SeqNumber: res.SeqNumber, Ok: res.Ok}
+		out[i] = wire.SettleItemResult{
+			SeqNumber: res.SeqNumber, Ok: res.Ok, LockedUntilMs: res.LockedUntilMs,
+		}
 	}
 	writeJSON(w, wire.RenewBatchResponse{Results: out})
 }

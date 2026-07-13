@@ -1174,19 +1174,30 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 
 		renew := renewFunc(c, queue, msgs)
 
-		// If the lease is already nearly gone — a queue configured with a very short lock, or a
-		// Receive whose response was slow — waiting even one tick schedules the first renewal at
-		// or after locked_until, and the reaper takes the batch before we ever ask. Renew NOW and
-		// only then settle into a cadence.
-		d := renewInterval(msgs)
-		if d < minRenewInterval {
-			renew(ctx)
-			d = minRenewInterval
+		// The cadence is RECOMPUTED every round from the leases as they now stand — RenewBatch
+		// writes the deadline it committed back onto each message, so after a renewal the batch
+		// knows how long it has. Deriving it once would be wrong in both directions: a lease that
+		// was nearly spent on arrival (a slow Receive) would pin the cadence to the floor forever
+		// and hammer the broker with renewals it no longer needs, while a lease shorter than the
+		// floor would quietly expire between ticks (codex).
+		t := time.NewTimer(0)
+		if !t.Stop() {
+			<-t.C
 		}
-
-		t := time.NewTicker(d)
 		defer t.Stop()
 		for {
+			d := renewInterval(msgs)
+			if d < minRenewInterval {
+				// The lease is spent (or nearly): waiting even one tick would schedule the renewal
+				// at or after locked_until, and the reaper would take the batch before we asked.
+				// Renew NOW, then fall back to the floor as a spin guard.
+				renew(ctx)
+				d = renewInterval(msgs)
+				if d < minRenewInterval {
+					d = minRenewInterval
+				}
+			}
+			t.Reset(d)
 			select {
 			case <-r.stop:
 				return

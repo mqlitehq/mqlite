@@ -574,3 +574,64 @@ func TestRenewIntervalSaysRenewNowWhenLeaseNearlySpent(t *testing.T) {
 		t.Errorf("interval = %s for a 30s lease, want about a third of it", d)
 	}
 }
+
+// A renewal must tell the caller the deadline it committed, and the cadence must follow it.
+//
+// Otherwise a lease that arrives nearly spent (a slow Receive) renews immediately, its cadence
+// drops to the floor — and STAYS there, because LockedUntil never moved. The CLI would then renew
+// 20 times a second for the rest of the batch's life against a broker that gave it a 30-second
+// lease (codex).
+func TestRenewalUpdatesTheLeaseAndTheCadenceFollowsIt(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(eng, nil).Handler())
+	defer ts.Close()
+
+	c, err := mqlite.Open(ctx, ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	// Pretend the Receive was slow: the lease looks nearly spent, so the cadence is at the floor.
+	msgs[0].LockedUntil = time.Now().Add(10 * time.Millisecond)
+	if d := renewInterval(msgs); d >= minRenewInterval {
+		t.Fatalf("setup: interval %s should be below the floor for a nearly-spent lease", d)
+	}
+
+	res, err := c.RenewBatch(ctx, "q", msgs...)
+	if err != nil || !res[0].Ok {
+		t.Fatalf("RenewBatch: %v ok=%v", err, res[0].Ok)
+	}
+	if res[0].LockedUntil.IsZero() {
+		t.Fatal("RenewBatch did not report the deadline it committed")
+	}
+	// The message now carries the renewed lease...
+	if !msgs[0].LockedUntil.Equal(res[0].LockedUntil) {
+		t.Errorf("the renewed deadline was not written back onto the message: %v vs %v",
+			msgs[0].LockedUntil, res[0].LockedUntil)
+	}
+	// ...so the cadence recovers to a third of the FULL 30s lease instead of staying at the floor.
+	d := renewInterval(msgs)
+	if d < 8*time.Second || d > 12*time.Second {
+		t.Errorf("cadence after renewal = %s, want about a third of the 30s lease — the CLI would otherwise renew %d times a second forever",
+			d, time.Second/minRenewInterval)
+	}
+}
