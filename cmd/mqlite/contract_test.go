@@ -9,13 +9,18 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
 
@@ -175,5 +180,104 @@ func TestUsageListsAllCommands(t *testing.T) {
 		if !strings.Contains(out, cmd) {
 			t.Errorf("help is missing the %q command", cmd)
 		}
+	}
+}
+
+// ─── arity, validation & reporting contract (review round-2 §3) ───
+
+// hides the mistake, and on a destructive command that is how you purge the wrong queue.
+func TestExactArity(t *testing.T) {
+	resetGlobals(t)
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
+
+	surplus := []struct {
+		name string
+		fn   func(context.Context, []string) error
+		args []string
+	}{
+		{"create-queue", cmdCreateQueue, []string{"q", "extra"}},
+		{"subscribe", cmdCreateSubscription, []string{"topic", "sub", "extra"}},
+		{"peek", cmdPeek, []string{"q", "extra"}},
+		{"metrics", cmdMetrics, []string{"q", "extra"}},
+		{"list", cmdList, []string{"extra"}},
+		{"vacuum", cmdVacuum, []string{"extra"}},
+		{"redrive", cmdRedrive, []string{"q", "extra"}},
+		{"purge-dlq", cmdPurgeDLQ, []string{"q", "--all", "extra"}},
+	}
+	for _, c := range surplus {
+		resetGlobals(t)
+		if err := c.fn(ctx0, c.args); err == nil {
+			t.Errorf("%s: a surplus positional must be rejected, not ignored", c.name)
+		} else if !strings.Contains(err.Error(), "usage:") {
+			t.Errorf("%s: want a usage error, got %v", c.name, err)
+		}
+	}
+}
+
+// CLI, where the engine rejects it. All three must now reject it.
+func TestNegativeScheduleRejectedEverywhere(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(eng, nil).Handler())
+	defer ts.Close()
+
+	// Raw HTTP — the hole.
+	body := strings.NewReader(`{"queue":"q","messages":[{"body":"eA=="}],"scheduled_enqueue_time_ms":-1}`)
+	resp, err := http.Post(ts.URL+wire.PathSend, "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("raw HTTP send with scheduled_enqueue_time_ms=-1: status %d, want 400", resp.StatusCode)
+	}
+	if m, err := eng.Stats(ctx, "q"); err != nil || m.Total != 0 {
+		t.Fatalf("a rejected schedule must enqueue nothing (total=%d)", m.Total)
+	}
+
+	// Embedded SDK — the same value, the same verdict.
+	emb, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emb.Close()
+	if err := emb.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	past := mqlite.SendOpts{At: time.Now().Add(-time.Hour)}
+	if _, err := emb.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}, past); err == nil {
+		t.Error("embedded schedule in the past must be rejected")
+	}
+}
+
+// end up LARGER than it started. Reporting that as "freed -0.12 MiB" is nonsense.
+func TestVacuumNewDBReportsNoNegativeFreed(t *testing.T) {
+	resetGlobals(t)
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "fresh.db"))
+	out, err := captureStdout(t, func() error { return cmdVacuum(ctx0, nil) })
+	if err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	if strings.Contains(out, "freed -") {
+		t.Errorf("vacuum reported negative freed space: %q", out)
+	}
+
+	resetGlobals(t)
+	gOutput = "json"
+	out, err = captureStdout(t, func() error { return cmdVacuum(ctx0, nil) })
+	if err != nil {
+		t.Fatalf("vacuum --output json: %v", err)
+	}
+	if strings.Contains(out, `"freed_bytes": -`) {
+		t.Errorf("vacuum JSON reported negative freed_bytes: %q", out)
 	}
 }

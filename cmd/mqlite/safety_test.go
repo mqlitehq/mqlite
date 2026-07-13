@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mqlitehq/mqlite"
 	"github.com/mqlitehq/mqlite/engine"
@@ -226,5 +227,162 @@ func TestReceiveUsesCompleteBatch(t *testing.T) {
 	}
 	if b, c := batches.Load(), completes.Load(); b != 1 || c != 0 {
 		t.Errorf("settlement RPCs: CompleteBatch=%d Complete=%d, want 1/0", b, c)
+	}
+}
+
+// ─── credential boundary, destructive bounds & lease safety (review round-2 §3) ───
+
+// must.
+func TestSameEndpoint(t *testing.T) {
+	same := [][2]string{
+		{"http://127.0.0.1:6754", "http://127.0.0.1:6754/"}, // trailing slash (the reported bug)
+		{"http://127.0.0.1:6754", "http://127.0.0.1:6754"},  // identical
+		{"mqlite://h", "http://h:6754"},                     // custom scheme supplies the product port
+		{"http://Host:6754", "http://host:6754"},            // host case
+		{"mqlites://h", "https://h:6754"},                   // TLS variant
+		{"mqlite://tok@h:6754", "http://h:6754"},            // an embedded credential is not part of the target
+		{"https://gw/prod", "https://gw/prod/"},             // only the trailing slash is noise
+	}
+	for _, p := range same {
+		if !sameEndpoint(p[0], p[1]) {
+			t.Errorf("sameEndpoint(%q, %q) = false, want true (same broker)", p[0], p[1])
+		}
+	}
+	diff := [][2]string{
+		{"http://h:6754", "http://other:6754"}, // different host
+		{"http://h:6754", "http://h:9000"},     // different port
+		{"http://h:6754", "https://h:6754"},    // different transport — never send a token over a downgrade
+		// A reverse proxy routes these to DIFFERENT backends, and Client.post appends the RPC
+		// route to the endpoint verbatim — so the path is part of the broker's identity and a
+		// token must not cross between them (codex).
+		{"https://gw/prod", "https://gw/dev"},
+		{"https://gw/prod", "https://gw"},
+		// Path is percent-DECODED, so comparing it would collapse these two — but the client
+		// sends the endpoint verbatim and a proxy can route the escaped form elsewhere (codex).
+		{"https://gw/prod%2Fadmin", "https://gw/prod/admin"},
+	}
+	for _, p := range diff {
+		if sameEndpoint(p[0], p[1]) {
+			t.Errorf("sameEndpoint(%q, %q) = true, want false (different target)", p[0], p[1])
+		}
+	}
+}
+
+// them as alternatives, so accepting both and quietly honoring one is a trap.
+func TestPurgeAllRejectsBounds(t *testing.T) {
+	resetGlobals(t)
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	for _, args := range [][]string{
+		{"q", "--all", "--max", "10"},
+		{"q", "--all", "--older-than", "1h"},
+	} {
+		if err := cmdPurgeDLQ(ctx0, args); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+			t.Errorf("purge-dlq %v must be rejected as ambiguous, got %v", args, err)
+		}
+	}
+}
+
+// lock duration and require the settle to still succeed.
+func TestRenewalSpansSettlement(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	// Background loops ON: the reaper is what reclaims an expired lock.
+	eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("slow-link")}); err != nil {
+		t.Fatal(err)
+	}
+
+	inner := server.New(eng, nil).Handler()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wire.PathCompleteBatch {
+			time.Sleep(3 * time.Second) // > the 2s lock: renewal must carry the lease across it
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+
+	t.Setenv("MQLITE_ENDPOINT", proxy.URL)
+	t.Setenv("MQLITE_TOKEN", "")
+	out, err := captureStdout(t, func() error { return cmdReceive(ctx, []string{"q"}) })
+	if err != nil {
+		t.Errorf("receive over a slow link must still settle: %v", err)
+	}
+	if !strings.Contains(out, "slow-link") {
+		t.Errorf("body was not rendered; stdout=%q", out)
+	}
+	// Settled for real: the message is gone, not redelivered.
+	if m, err := eng.Stats(ctx, "q"); err != nil || m.Total != 0 {
+		t.Fatalf("message survived a successful settle (total=%d) — the lease was lost mid-CompleteBatch", m.Total)
+	}
+}
+
+// already succeeded. Stop must cancel the renewal first: by then it is worthless anyway.
+func TestRenewerStopDoesNotHangOnStalledRenew(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	// A 2s lock so the renewer's ticker (half the lease, min 1s) fires while output is blocked.
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+
+	wedge := make(chan struct{}) // never closed: a Renew that reaches the broker hangs forever
+	renewing := make(chan struct{}, 1)
+	inner := server.New(eng, nil).Handler()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenew:
+			select {
+			case renewing <- struct{}{}: // record that a Renew really is in flight
+			default:
+			}
+			select {
+			case <-wedge:
+			case <-r.Context().Done(): // the client cancelling is the ONLY thing that frees us
+			}
+			return
+		case wire.PathCompleteBatch:
+			// Settle slowly, so the renewer's ticker (1s) fires and wedges a Renew WHILE the
+			// command is still running. Without that, Stop() would find nothing in flight and
+			// the test would prove nothing.
+			time.Sleep(2500 * time.Millisecond)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+	defer close(wedge) // LIFO: frees the wedged handler so proxy.Close() can drain
+
+	t.Setenv("MQLITE_ENDPOINT", proxy.URL)
+	t.Setenv("MQLITE_TOKEN", "")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := captureStdout(t, func() error { return cmdReceive(ctx, []string{"q", "--max", "1"}) })
+		done <- err
+	}()
+	select {
+	case <-done: // settled (or errored) — either way it RETURNED, which is the point
+	case <-time.After(30 * time.Second):
+		t.Fatal("receive hung: Stop() waited on a stalled Renew instead of cancelling it")
+	}
+	select {
+	case <-renewing:
+	default:
+		t.Fatal("no Renew was ever in flight — the test did not exercise the stalled-renew path")
 	}
 }

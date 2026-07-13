@@ -90,7 +90,11 @@ func EndpointIdentity(dsn string) (string, error) {
 		}
 	}
 	id := scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
-	id += strings.TrimRight(u.Path, "/") // "/prod/" == "/prod"; root == ""
+	// EscapedPath, not Path: Path is already percent-DECODED, so `/prod%2Fadmin` and
+	// `/prod/admin` would collapse to one identity — while Client.post sends the endpoint
+	// string verbatim, so a proxy that distinguishes the escaped form routes them to different
+	// backends. Comparing the raw form keeps the boundary where the proxy draws it.
+	id += strings.TrimRight(u.EscapedPath(), "/") // "/prod/" == "/prod"; root == ""
 	if u.RawQuery != "" {
 		id += "?" + u.RawQuery
 	}
