@@ -298,3 +298,61 @@ func TestCompleteBatchSetBasedAndFenced(t *testing.T) {
 		}
 	}
 }
+
+// A batch far larger than one statement's bind-parameter budget must still work. The pinned
+// SQLite build caps a statement at 32,766 parameters and a (seq, token) pair costs two, so an
+// unchunked set-based settle hard-fails somewhere above ~16k items — on batches the previous
+// item-by-item loop handled fine, and which sit well inside the HTTP body limit. 8,192 items is
+// the size codex flagged; it also crosses the 512-item chunk boundary many times over.
+func TestBatchSettleBeyondBindParameterLimit(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+
+	const n = 8192
+	seed := make([]OutMessage, n)
+	for i := range seed {
+		seed[i] = OutMessage{Body: []byte("m")}
+	}
+	if _, err := e.Send(ctx, "q", seed...); err != nil { // one transaction: the fixture is not the test
+		t.Fatal(err)
+	}
+
+	// Receive caps at 256 per call, so claim the batch in rounds and settle it all at once.
+	items := make([]SettleItem, 0, n)
+	for len(items) < n {
+		msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 256})
+		if err != nil {
+			t.Fatalf("receive: %v", err)
+		}
+		if len(msgs) == 0 {
+			t.Fatalf("receive returned nothing at %d/%d claimed", len(items), n)
+		}
+		for _, m := range msgs {
+			items = append(items, SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken})
+		}
+	}
+
+	res, err := e.RenewBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("RenewBatch(%d): %v", n, err)
+	}
+	for _, r := range res {
+		if !r.Ok {
+			t.Fatalf("seq %d was not renewed in an %d-item batch", r.SeqNumber, n)
+		}
+	}
+
+	res, err = e.CompleteBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("CompleteBatch(%d): %v", n, err)
+	}
+	for _, r := range res {
+		if !r.Ok {
+			t.Fatalf("seq %d was not completed in an %d-item batch", r.SeqNumber, n)
+		}
+	}
+	if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+		t.Errorf("total=%d after settling every message, want 0", m.Total)
+	}
+}
