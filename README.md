@@ -136,6 +136,12 @@ eng.Tx(ctx, func(tx *engine.EngineTx) error {
 })
 ```
 
+> **Keep the callback transaction-bound.** On a **remote** (Turso/libSQL) store the callback may
+> run **more than once**: a transaction that fails on a retryable connection/busy error is replayed
+> from the start. The SQL rolls back, so your *data* stays correct — but anything that is not part
+> of the transaction (an HTTP call, a charge, a counter in memory) will have happened twice. Local
+> file and `:memory:` stores never retry, so the callback runs exactly once there.
+
 > Outgrow a single process? The *same* engine upgrades to a network broker with one
 > call — `eng.Serve(ctx, ":6754")` — and remote clients speak the same semantics
 > over HTTP (§2–§4). Embedded and broker are not two products; they are one engine.

@@ -385,3 +385,51 @@ func TestCaptureStdoutDoesNotDeadlockOnLargeOutput(t *testing.T) {
 		t.Errorf("captured %d bytes, want %d", len(out), size)
 	}
 }
+
+// viewFields records, for EVERY field of wire.Message, what the CLI's hand-written conversions do
+// with it. Returning the wire type guarantees canonical NAMES; it does not guarantee that a field
+// added to the wire is actually populated — an unconverted field is emitted as a silent zero,
+// which is a quieter kind of wrong than a renamed key (round-4 §5.1).
+//
+// So every field must be a deliberate decision here. Add one to the wire and this list no longer
+// covers it: the test fails, and someone has to choose.
+var viewFields = map[string]string{
+	"seq_number":              "both",
+	"body":                    "both",
+	"message_id":              "both",
+	"group_id":                "both",
+	"correlation_id":          "both",
+	"reply_to":                "both",
+	"subject":                 "both",
+	"content_type":            "both",
+	"properties":              "both",
+	"delivery_count":          "both",
+	"enqueued_at_ms":          "both",
+	"locked_until_ms":         "both",
+	"expires_at_ms":           "peek only: a delivered message's TTL is not part of the lock",
+	"visible_at_ms":           "peek only: a delivered message is by definition visible",
+	"state":                   "peek only: a delivered message is, necessarily, locked",
+	"dead_letter_reason":      "peek only: DLQ triage; a received message is not dead-lettered",
+	"dead_letter_description": "peek only: as above",
+	"lock_token":              "receive only, and only with --no-ack: settle-later needs it; an auto-acked batch is already gone",
+}
+
+func TestCLIViewsCoverEveryWireField(t *testing.T) {
+	rt := reflect.TypeOf(wire.Message{})
+	for i := 0; i < rt.NumField(); i++ {
+		tag, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		if _, ok := viewFields[tag]; !ok {
+			t.Errorf("wire.Message has a field %q that the CLI's conversions say nothing about — it would be emitted as a silent zero. Copy it in viewMsg/viewPeeked, or record here why it does not apply.", tag)
+		}
+	}
+	// And the list must not rot in the other direction either.
+	wireTags := jsonTagsOf(rt)
+	for tag := range viewFields {
+		if !wireTags[tag] {
+			t.Errorf("viewFields mentions %q, which is not a wire.Message field any more", tag)
+		}
+	}
+}

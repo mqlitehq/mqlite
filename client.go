@@ -281,6 +281,11 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Messa
 // result. Renewing a batch with N separate Renew calls costs N round trips — on a slow link
 // that outlasts the very lease it is trying to save (a 64-message batch on a 50ms link needs
 // 3.2s of renewals against a 2s lease), so the locks expire mid-renewal.
+//
+// SettleResult.LockedUntil is the deadline the broker committed, and it — not Ok — is the fact to
+// pace yourself by. Ok says the lease was live when the broker's STATEMENT finished; the response
+// still has to travel back to you, so on a very short lease it can lapse on the way. Compare
+// LockedUntil against your own clock.
 func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]wire.SettleItem, len(msgs))
 	for i, m := range msgs {

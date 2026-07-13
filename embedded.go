@@ -195,8 +195,13 @@ func (e *Embedded) CompleteBatch(ctx context.Context, queue string, msgs ...*Mes
 	return out, nil
 }
 
-// RenewBatch extends the lock lease of many messages in one transaction (the embedded twin of
-// Client.RenewBatch), returning a per-message result.
+// RenewBatch extends the lock lease of many messages in ONE STATEMENT — deliberately not a
+// transaction (the embedded twin of Client.RenewBatch), returning a per-message result.
+//
+// SettleResult.LockedUntil is the deadline the broker actually committed, and it — not Ok — is the
+// fact to pace yourself by. Ok says the lease was live when the STATEMENT finished; the result
+// still has to be mapped, encoded and delivered to you, so on a very short lease it can lapse in
+// the meantime. Compare LockedUntil against your own clock rather than trusting Ok to still hold.
 func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]engine.SettleItem, len(msgs))
 	for i, m := range msgs {
@@ -213,7 +218,16 @@ func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Messag
 	return out, nil
 }
 
-// Tx runs business writes and enqueues in one transaction (§4.5, embedded-only).
+// Tx runs business writes and enqueues in one transaction (§4.5, embedded-only): business success
+// ⇔ message enqueued, with no dual-write window.
+//
+// ON A REMOTE (Turso/libSQL) STORE, fn MAY RUN MORE THAN ONCE. A transaction that fails on a
+// retryable connection or busy error is replayed from the start — the database work rolls back, so
+// the DATA stays correct, but anything else fn did will have happened twice. Keep fn to
+// transaction-bound work: SQL through the provided handle, and nothing else. A charge, an email, a
+// counter in memory, an HTTP call — none of those roll back with the transaction, and a replay will
+// repeat them (round-4 §5.2). Local file and :memory: stores never retry, so fn runs at most once
+// there.
 func (e *Embedded) Tx(ctx context.Context, fn func(*engine.EngineTx) error) error {
 	return e.eng.Tx(ctx, fn)
 }

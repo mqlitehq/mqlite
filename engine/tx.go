@@ -57,10 +57,16 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 
 // Tx runs fn inside one transaction. If fn returns nil the transaction commits
 // (and long-poll waiters for any written queue are notified); otherwise it rolls back.
+//
+// fn MAY RUN MORE THAN ONCE on a remote store. inTx replays the whole closure when a transaction
+// fails on a retryable connection/busy error — the database work of the failed attempt rolled
+// back, so the DATA is correct either way, but anything fn did OUTSIDE the transaction happened
+// twice. That is the contract, and it is not hypothetical: an HTTP call, a charge, a counter in
+// memory does not roll back with a SQL transaction (round-4 §5.2). Keep fn to transaction-bound
+// work.
+//
+// Local file and :memory: stores never retry, so there fn runs exactly once.
 func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
-	// Tx is embedded-only (local file / single libSQL connection), so inTx runs
-	// the closure exactly once for local stores — the user's business writes are
-	// never re-executed.
 	var woke map[string]bool
 	err := e.inTx(ctx, func(tx *sql.Tx) error {
 		et := &EngineTx{e: e, tx: tx, ctx: ctx, now: e.now(), woke: map[string]bool{}}

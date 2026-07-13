@@ -46,11 +46,22 @@ func (e *Engine) settleOp(ctx context.Context, token, op string, do func(tx *sql
 			return err
 		}
 		if n == 0 {
+			// A receipt vouches for the VERB THAT WROTE IT, not merely for the token.
+			//
+			// Receipts exist so a settle whose response was lost can be replayed: the same verb,
+			// with the same token, reports the same success. They are NOT a licence for a DIFFERENT
+			// verb to claim that success. Without `operation=?`, an Abandon(T) — which returns the
+			// message to `active` — leaves a receipt that a later Complete(T) happily reads as
+			// "already completed": the caller is told the message is gone while it sits in the
+			// queue, waiting to be handed to somebody else. That is a false success, and
+			// at-least-once does not licence it (round-4 §3; the defect predates MQLITE-97 and ships
+			// in the released v0.2.0).
 			var one int
 			err := tx.QueryRowContext(ctx,
-				`SELECT 1 FROM settlement_receipts WHERE lock_token=? AND expires_at>?`, token, now).Scan(&one)
+				`SELECT 1 FROM settlement_receipts WHERE lock_token=? AND operation=? AND expires_at>?`,
+				token, op, now).Scan(&one)
 			if err == nil {
-				return nil // idempotent replay of an already-settled token
+				return nil // idempotent replay of the SAME verb on an already-settled token
 			}
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrLockLost
@@ -507,13 +518,17 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 				end = len(rows)
 			}
 			group := rows[start:end]
-			args := make([]any, 0, 1+len(group))
-			args = append(args, now)
+			args := make([]any, 0, 2+len(group))
+			args = append(args, now, "completed")
 			for _, it := range group {
 				args = append(args, it.LockToken)
 			}
+			// operation='completed' — only a COMPLETION may vouch for a completion. A token
+			// abandoned, rejected or deferred earlier must come back ok=false here, not a false
+			// success for a message that is still sitting in the queue (round-4 §3).
 			rec, err := tx.QueryContext(ctx,
-				`SELECT lock_token FROM settlement_receipts WHERE expires_at>? AND lock_token IN (`+
+				`SELECT lock_token FROM settlement_receipts
+				   WHERE expires_at>? AND operation=? AND lock_token IN (`+
 					strings.Repeat(",?", len(group))[1:]+`)`, args...)
 			if err != nil {
 				return err

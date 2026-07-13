@@ -183,8 +183,8 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   set-based inside the engine** — a fixed number of SQL statements rather than one (or two) per
   message. On a remote Turso/libSQL store every statement is its own round trip, so the old
   item-by-item loops made a 256-message settle ~512 remote round trips: the same O(N) latency,
-  one layer down, on the very RPC whose slowness lets the batch's own locks expire. The CLI's
-  CLI stays compatible with an **older broker**: one that predates `RenewBatch` answers 404, and
+  one layer down, on the very RPC whose slowness lets the batch's own locks expire. The CLI stays
+  compatible with an **older broker**: one that predates `RenewBatch` answers 404, and
   the CLI falls back to per-message `Renew` (what it used to do) rather than silently renewing
   nothing. New `mqlite.ErrUnsupported` reports "this broker does not serve that operation",
   distinct from `ErrNotFound` ("that queue/message does not exist"), which the same broker also
@@ -201,6 +201,21 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   `purge-dlq --all --max 0` is now the same contradiction as `--all --max 10` (the check reads
   whether the flag was *given*, not its value); and giving a body both as an argument and with
   `--file` is an error instead of silently letting the file win.
+
+- **A settlement receipt now vouches only for the VERB THAT WROTE IT** (MQLITE-99). Receipts make a
+  settle whose response was lost replayable — the same verb, same token, same success. They were
+  not checking the verb, so `Abandon(T)` (which returns the message to `active`) left a receipt
+  that a later `Complete(T)` read as "already completed": **the caller was told the message was
+  gone while it sat in the queue, waiting to be handed to somebody else.** `CompleteBatch` reported
+  the same false `ok`. Every cross-verb combination now fails with `ErrLockLost` / `ok=false` and
+  leaves the message where it was; a same-verb replay is still an idempotent success. **This defect
+  predates the batch work and ships in the released v0.2.0.**
+- **`Engine.Tx` / `Embedded.Tx`: the callback may run more than once on a REMOTE store** (MQLITE-99,
+  documentation). A transaction that fails on a retryable connection/busy error is replayed from
+  the start. The SQL rolls back, so your data stays correct — but anything the callback does
+  *outside* the transaction (an HTTP call, a charge, a counter) will have happened twice. Keep the
+  callback transaction-bound. Local file and `:memory:` stores never retry, so it runs exactly once
+  there.
 
 ## v0.2.0 — 2026-07-11
 
