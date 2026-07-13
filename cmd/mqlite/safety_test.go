@@ -696,3 +696,98 @@ func TestLegacyFallbackStillPacesItself(t *testing.T) {
 		t.Errorf("fallback cadence = %s, want about a third of the inferred 30s lease", d)
 	}
 }
+
+// pace() is the whole renewal cadence policy, so it is worth pinning exactly. The rule it must
+// never break: a renewal is never scheduled AT OR AFTER the deadline it exists to save. A cadence
+// floor is a spin guard, not a licence to sleep past the lock (codex).
+func TestPaceNeverSchedulesPastTheDeadline(t *testing.T) {
+	// No deadline to aim at (a failed renewal, or an old broker that never told us one): fall back
+	// to the calm retry — NOT to a value derived from a lease we do not have.
+	if d := pace(time.Time{}); d != renewRetryInterval {
+		t.Errorf("pace(unknown) = %s, want the retry cadence %s", d, renewRetryInterval)
+	}
+	// A spent lease: renew now.
+	if d := pace(time.Now().Add(-time.Second)); d != 0 {
+		t.Errorf("pace(spent) = %s, want 0 (renew immediately)", d)
+	}
+	// A healthy lease: a third of it.
+	if d := pace(time.Now().Add(30 * time.Second)); d < 9*time.Second || d > 11*time.Second {
+		t.Errorf("pace(30s) = %s, want about a third", d)
+	}
+	// Short leases — the case that used to be handed to the 1s failure backoff, letting a freshly
+	// renewed lock be reaped while we waited. Whatever the floor says, the tick must land BEFORE
+	// the deadline.
+	for _, remaining := range []time.Duration{
+		149 * time.Millisecond, 100 * time.Millisecond, 60 * time.Millisecond,
+		30 * time.Millisecond, 10 * time.Millisecond, 2 * time.Millisecond,
+	} {
+		d := pace(time.Now().Add(remaining))
+		if d <= 0 {
+			t.Errorf("pace(%s) = %s: a live lease must still be scheduled, not treated as spent", remaining, d)
+			continue
+		}
+		if d >= remaining {
+			t.Errorf("pace(%s) = %s — the renewal would be scheduled at or AFTER the deadline it is meant to save",
+				remaining, d)
+		}
+	}
+}
+
+// The legacy path infers a deadline, and it must measure it from BEFORE the renewals — each lock
+// is really extended when its UPDATE runs on the server, so a slow response means the lease
+// started well before the reply came back. Reading the clock afterwards credits the batch with
+// time it never had: a 1s lease whose Renew takes 600ms would be reported as good for another
+// full second, and the next tick would fall after it had already died (codex).
+func TestLegacyInferredDeadlineIsMeasuredBeforeTheCall(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	inner := server.New(eng, nil).Handler()
+	slowOld := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenewBatch: // a broker that predates it
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/no-such-route-on-an-old-broker"
+			inner.ServeHTTP(w, r2)
+			return
+		case wire.PathRenew:
+			time.Sleep(600 * time.Millisecond) // a slow link: most of the 1s lease is already gone
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer slowOld.Close()
+
+	c, err := mqlite.Open(ctx, slowOld.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	renew := renewFunc(c, "q", msgs, time.Second) // the 1s lease this batch arrived with
+	until := renew(ctx)                           // downgrades, then renews slowly
+	if until.IsZero() {
+		t.Fatal("the fallback reported no deadline")
+	}
+	// The renewal took ~600ms of the 1s lease, so at most ~400ms may remain. Measuring the deadline
+	// after the call would report a full second.
+	if remaining := time.Until(until); remaining > 600*time.Millisecond {
+		t.Errorf("inferred %s of lease remaining after a 600ms renewal of a 1s lock — the deadline was measured AFTER the call, crediting time the lease never had",
+			remaining)
+	}
+}

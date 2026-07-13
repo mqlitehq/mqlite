@@ -1176,9 +1176,16 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 		// renders those concurrently, and writing a shared time.Time from this goroutine is a data
 		// race (codex). Read once, now, before any renewal happens.
 		until := tightestLease(msgs)
+
+		// leaseLen is how long a lease from this queue lasts, learned from the one this batch
+		// arrived with. It is only a guess for the legacy path (an old broker's Renew reports no
+		// deadline), and if the batch arrived with its lease ALREADY SPENT we never learned it —
+		// in which case we must not invent one. Assuming a comfortable 30s for a queue configured
+		// with a 2s lock would park the next renewal ten seconds out and let the reaper take the
+		// batch mid-settle (codex).
 		leaseLen := time.Until(until)
 		if leaseLen <= 0 {
-			leaseLen = defaultLease
+			leaseLen = 0 // unknown: renewFunc will report no deadline, and pace() stays cautious
 		}
 		renew := renewFunc(c, queue, msgs, leaseLen)
 
@@ -1188,22 +1195,16 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 		}
 		defer t.Stop()
 		for {
-			// The cadence follows the lease as it now stands. Deriving it once would be wrong in
-			// both directions: a lease that arrived nearly spent (a slow Receive) would pin the
-			// cadence to the floor forever and hammer the broker with renewals it no longer needs,
-			// while a lease shorter than the floor would quietly expire between ticks.
-			d := time.Until(until) / 3
-			if d < minRenewInterval {
-				// The lease is spent, or nearly. Waiting even one tick would schedule the renewal
-				// at or after locked_until, and the reaper would take the batch before we asked.
-				if got := renew(ctx); !got.IsZero() {
-					until = got
+			d := pace(until)
+			if d == 0 { // the lease is spent, or nearly: renew NOW rather than wait past its end
+				until = renew(ctx)
+				if pace(until) == 0 {
+					// Renewed, and STILL nothing usable to aim at — the renewal failed, or the lock
+					// duration is so short that no cadence can hold it. Drop to the calm retry rather
+					// than spinning.
+					until = time.Time{}
 				}
-				if d = time.Until(until) / 3; d < minRenewInterval {
-					// Still nothing to work with — either the lock duration really is that short, or
-					// the renewal failed. Retry on a calm cadence rather than spinning on the floor.
-					d = renewRetryInterval
-				}
+				continue
 			}
 			t.Reset(d)
 			select {
@@ -1212,9 +1213,7 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if got := renew(ctx); !got.IsZero() {
-					until = got
-				}
+				until = renew(ctx)
 			}
 		}
 	}()
@@ -1271,19 +1270,29 @@ func renewFunc(c api, queue string, msgs []*mqlite.Message, leaseLen time.Durati
 
 		// An older broker's Renew reports no deadline, so INFER one: it extends the lock by the
 		// queue's lock duration, and the lease this batch arrived with is that duration. Without
-		// the inference the caller would have nothing to compute a cadence from, fall back to the
-		// floor, and pelt an old broker with a full per-message renewal pass every 50ms for the
-		// rest of a slow output (codex).
+		// the inference the caller would have nothing to pace by, fall back to the retry cadence,
+		// and pelt an old broker with a full per-message renewal pass for the rest of a slow
+		// output (codex).
+		//
+		// Measured from BEFORE the calls, not after: each lock is actually extended when its
+		// UPDATE runs on the server, so a slow response (or a long multi-message pass) means the
+		// earliest lease started well before the last reply came back. Reading the clock at the end
+		// would credit the batch with time it never had — a 3s lease whose Renew took 2.5s would be
+		// reported as good for another 3s, and the next tick would fall after it had already died.
+		//
+		// If we never learned the lock duration (the batch arrived with its lease already spent),
+		// we report NO deadline rather than invent one: pace() then stays on its cautious retry.
+		start := time.Now()
 		renewed := false
 		for _, m := range msgs {
 			if err := m.Renew(ctx); err == nil {
 				renewed = true
 			}
 		}
-		if !renewed {
+		if !renewed || leaseLen <= 0 {
 			return time.Time{}
 		}
-		return time.Now().Add(leaseLen)
+		return start.Add(leaseLen)
 	}
 }
 
@@ -1312,10 +1321,42 @@ func (r *renewer) Stop() {
 // the batch to the reaper before we ever asked. minRenewInterval is only the steady-state cadence
 // floor, a spin guard, not a delay before the first renewal.
 const (
-	minRenewInterval   = 50 * time.Millisecond
-	renewRetryInterval = time.Second      // a calm retry when we have no usable lease to aim at
-	defaultLease       = 30 * time.Second // the engine's default lock duration
+	minRenewInterval   = 50 * time.Millisecond // steady-state cadence floor: a spin guard, no more
+	renewRetryInterval = time.Second           // when we have NO deadline to aim at
 )
+
+// pace says how long to wait before the next renewal, given the deadline we believe we hold.
+// Zero means "renew now".
+//
+// The one rule it must never break: never schedule a renewal AT OR AFTER the deadline it is
+// meant to save. A cadence floor is a spin guard, not a licence to sleep past the lock — so when
+// a third of the lease is under the floor, the tick is pulled back to half the remaining lease
+// rather than pushed out to the floor (codex).
+//
+// The retry cadence is for a different situation entirely: we have NO deadline to aim at, because
+// the renewal failed or because an old broker never told us one. Confusing "the lease is short"
+// with "we don't know the lease" is how a freshly renewed lock gets reaped while we wait out a
+// backoff meant for failures.
+func pace(until time.Time) time.Duration {
+	if until.IsZero() {
+		return renewRetryInterval
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		return 0 // spent: renew now
+	}
+	d := remaining / 3
+	if d < minRenewInterval {
+		d = minRenewInterval
+	}
+	if half := remaining / 2; d > half {
+		d = half // always land BEFORE the deadline, whatever the floor says
+	}
+	if d < time.Millisecond {
+		d = time.Millisecond // a true spin guard
+	}
+	return d
+}
 
 // tightestLease is the soonest deadline in the batch — the batch is only as safe as its most
 // exposed message. A zero time means no message carries a usable lease.
