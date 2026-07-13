@@ -17,15 +17,18 @@ import (
 // naive port of the Unix check would declare every ordinary terminal and every piped run
 // undeliverable and make `mqlite receive` refuse to work at all.
 //
-// So classify the handle, and be conservative: only the null device is undeliverable.
+// So classify the handle, and only ever refuse for the null device itself:
 //
-//	disk file / pipe          -> delivers
-//	character device + console-> delivers (a real terminal)
-//	character device, named   -> delivers UNLESS it is the null device; COM1 and LPT1 are
-//	                             console-less character devices that really do accept output
-//	unclassifiable            -> assumed to deliver; a dead handle still surfaces as a write
-//	                             error before any message is acknowledged, so guessing "fine"
-//	                             costs nothing while guessing "broken" would break normal use
+//	disk file / pipe             -> delivers
+//	character device + console   -> delivers (a real terminal)
+//	character device, `\Device\Null` -> DOES NOT deliver
+//	character device, other      -> delivers; COM1 and LPT1 are console-less character
+//	                                devices that really do accept output, so they must not be
+//	                                lumped in with NUL just for having no console mode
+//	unclassifiable               -> assumed to deliver; a dead handle still surfaces as a write
+//	                                error before any message is acknowledged, so guessing
+//	                                "fine" costs nothing while guessing "broken" breaks
+//	                                ordinary use
 func stdoutUndeliverable(f *os.File) bool {
 	h := windows.Handle(f.Fd())
 	if h == windows.InvalidHandle {
@@ -39,29 +42,31 @@ func stdoutUndeliverable(f *os.File) bool {
 	if windows.GetConsoleMode(h, &mode) == nil {
 		return false // a real console
 	}
-	return isNullDevice(h)
+	return strings.EqualFold(ntObjectName(h), `\Device\Null`)
 }
 
-// isNullDevice asks the handle for its device name and reports whether it is the null device
-// (`\Device\Null`). Every other console-less character device — COM1, LPT1 — is a real sink
-// that delivers, so it must NOT be lumped in with NUL just because it has no console mode.
-// If the name can't be read we answer false: unsure means deliverable (see above).
-func isNullDevice(h windows.Handle) bool {
-	// FILE_NAME_INFO: a uint32 length in bytes followed by a UTF-16 name (not NUL-terminated).
-	var buf [4 + 2*windows.MAX_PATH]byte
-	if err := windows.GetFileInformationByHandleEx(h, windows.FileNameInfo, &buf[0], uint32(len(buf))); err != nil {
-		return false
+var procNtQueryObject = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryObject")
+
+// ntObjectName returns the NT object name behind a handle (`\Device\Null` for NUL,
+// `\Device\Serial0` for COM1), or "" if it can't be read.
+//
+// The obvious API — GetFileInformationByHandleEx(FileNameInfo) — is a dead end here: it is
+// filesystem-only and fails with ERROR_NOACCESS on the null device (confirmed on the Windows
+// CI runner), so it can neither name NUL nor tell it apart from a serial port. The object name
+// is the one identifier every device handle has.
+func ntObjectName(h windows.Handle) string {
+	const objectNameInformation = 1
+	var buf [2048]byte // UNICODE_STRING header + the name
+	var n uint32
+	// NtQueryObject returns an NTSTATUS; anything non-zero is a failure (unsure -> deliverable).
+	st, _, _ := procNtQueryObject.Call(uintptr(h), objectNameInformation,
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), uintptr(unsafe.Pointer(&n)))
+	if st != 0 {
+		return ""
 	}
-	n := *(*uint32)(unsafe.Pointer(&buf[0])) / 2 // bytes -> UTF-16 code units
-	if n == 0 || int(n) > (len(buf)-4)/2 {
-		return false
+	us := (*windows.NTUnicodeString)(unsafe.Pointer(&buf[0]))
+	if us.Buffer == nil || us.Length == 0 {
+		return ""
 	}
-	name := windows.UTF16ToString(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[4])), n))
-	// The name comes back device-qualified or not depending on how stdout was opened
-	// (`\Device\Null`, `\Null`, `NUL`), so match on the last element rather than the whole
-	// string. Only character devices reach here, so a disk file called "null" can't collide.
-	if i := strings.LastIndexByte(name, '\\'); i >= 0 {
-		name = name[i+1:]
-	}
-	return strings.EqualFold(name, "Null") || strings.EqualFold(name, "NUL")
+	return windows.UTF16ToString(unsafe.Slice(us.Buffer, us.Length/2)) // Length is in bytes
 }

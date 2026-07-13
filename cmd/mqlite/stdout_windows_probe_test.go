@@ -2,14 +2,13 @@
 
 package main
 
-// TEMPORARY probe: report what Windows actually says about a handle to the null device, so the
-// NUL detection is written against facts instead of a guess. Removed once stdout_windows.go is
-// correct.
+// TEMPORARY probe (MQLITE-96): if the null-device guard is still wrong on this runner, report
+// exactly what Windows says about the handle, so the next fix is written against facts rather
+// than another guess. Silent when the guard is right. Deleted once CI is green.
 
 import (
 	"os"
 	"testing"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -20,26 +19,12 @@ func TestProbeNulHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	h := windows.Handle(f.Fd())
-	t.Errorf("PROBE os.DevNull=%q handle=%v invalid=%v", os.DevNull, h, h == windows.InvalidHandle)
-
-	ft, ferr := windows.GetFileType(h)
-	t.Errorf("PROBE GetFileType=%d err=%v (CHAR=%d DISK=%d PIPE=%d)", ft, ferr,
-		windows.FILE_TYPE_CHAR, windows.FILE_TYPE_DISK, windows.FILE_TYPE_PIPE)
-
-	var mode uint32
-	t.Errorf("PROBE GetConsoleMode err=%v", windows.GetConsoleMode(h, &mode))
-
-	var buf [4 + 2*windows.MAX_PATH]byte
-	nerr := windows.GetFileInformationByHandleEx(h, windows.FileNameInfo, &buf[0], uint32(len(buf)))
-	if nerr != nil {
-		t.Errorf("PROBE GetFileInformationByHandleEx(FileNameInfo) err=%v", nerr)
-	} else {
-		n := *(*uint32)(unsafe.Pointer(&buf[0])) / 2
-		name := windows.UTF16ToString(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[4])), n))
-		t.Errorf("PROBE FileNameInfo len=%d name=%q", n, name)
+	if stdoutUndeliverable(f) {
+		return // the guard works — nothing to report
 	}
-
-	// And what the guard currently concludes.
-	t.Errorf("PROBE stdoutUndeliverable(NUL)=%v", stdoutUndeliverable(f))
+	h := windows.Handle(f.Fd())
+	ft, ferr := windows.GetFileType(h)
+	var mode uint32
+	t.Errorf("PROBE the null device was NOT detected: DevNull=%q handle=%v type=%d (CHAR=%d) typeErr=%v consoleModeErr=%v ntObjectName=%q",
+		os.DevNull, h, ft, windows.FILE_TYPE_CHAR, ferr, windows.GetConsoleMode(h, &mode), ntObjectName(h))
 }
