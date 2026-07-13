@@ -128,6 +128,18 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   is covered too, and an unbounded `purge-dlq` now requires an explicit `--all`. The `--`
   terminator is honored (a message body keeps its flag-looking words). `--token=` sends no
   token, and `--endpoint` to a different host no longer forwards an ambient `MQLITE_TOKEN`.
+- **Two data-loss holes closed** (MQLITE-96, round-2 review):
+  - **`receive` refuses to auto-ack when stdout cannot deliver.** Closing fd 1 at exec
+    (`mqlite receive q 1>&-`) does not fail a write — the Go runtime silently reopens the
+    descriptor to the null device before `main`, so every "successful" write went to a black
+    hole and the messages were Completed and deleted. `receive` now detects an
+    undeliverable stdout (closed at exec, or `/dev/null`) and exits non-zero **before**
+    claiming anything. `--delete` (explicit at-most-once drain) and `--no-ack` still work.
+  - **A sub-millisecond age bound no longer means "no bound".** `purge-dlq --older-than 1ns`
+    truncated to `0` ms, which the engine reads as *unbounded* — it deleted the entire DLQ
+    while appearing bounded. Any positive duration now rounds **up** to 1 ms in the SDK
+    (`Purge`/`Redrive`, so raw HTTP and embedded callers are covered), and the CLI rejects a
+    positive sub-ms `--older-than` outright.
 
 ## v0.2.0 — 2026-07-11
 

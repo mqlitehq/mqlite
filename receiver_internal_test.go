@@ -10,6 +10,30 @@ import (
 	"github.com/mqlitehq/mqlite/engine"
 )
 
+// A positive age bound must NEVER convert to 0 ms (which the engine reads as unbounded) —
+// only an exact zero (no bound) does. Guards the sub-millisecond truncation that let
+// `purge-dlq --older-than 1ns` delete everything (review 2026-07-12 round-2 B2).
+func TestOlderThanMs(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want int64
+	}{
+		{0, 0},
+		{-time.Nanosecond, -1},
+		{-time.Hour, -1},
+		{time.Nanosecond, 1},
+		{999999 * time.Nanosecond, 1},
+		{time.Millisecond, 1},
+		{1500 * time.Microsecond, 1},
+		{time.Second, 1000},
+	}
+	for _, c := range cases {
+		if got := olderThanMs(c.d); got != c.want {
+			t.Errorf("olderThanMs(%s) = %d, want %d", c.d, got, c.want)
+		}
+	}
+}
+
 // fakeSource is a receiveSource that records the attempt id of every receiveOne
 // call and can fail the first failN calls, to exercise the Receiver's same-id retry.
 type fakeSource struct {

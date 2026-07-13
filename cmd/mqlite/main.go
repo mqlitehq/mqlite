@@ -53,7 +53,34 @@ import (
 
 const version = ver.Version
 
+// stdoutInvalid is set when the process was started with stdout (fd 1) closed. A consumer
+// like `receive` must then refuse to acknowledge messages whose output can't reach the
+// caller (review 2026-07-12 round-2 B1).
+var stdoutInvalid bool
+
+// sanitizeStdout detects when the CLI's stdout cannot deliver output to the caller — either
+// fd 1 was closed at exec (`mqlite receive q 1>&-`, which the Go runtime silently reopens to
+// the null device before main, so writes then "succeed" into a black hole) or it was
+// redirected to the null device outright (`>/dev/null`). In both cases a data-plane command
+// like `receive` must NOT acknowledge messages whose bodies vanish; we record the condition
+// so it can refuse before claiming. (A truly closed fd is also reopened to /dev/null so a
+// later open can't reuse descriptor 1 and corrupt a data file with stray stdout writes.)
+func sanitizeStdout() {
+	so, err := os.Stdout.Stat()
+	if err != nil {
+		stdoutInvalid = true
+		if f, e := os.OpenFile(os.DevNull, os.O_WRONLY, 0); e == nil {
+			os.Stdout = f
+		}
+		return
+	}
+	if nul, nerr := os.Stat(os.DevNull); nerr == nil && os.SameFile(nul, so) {
+		stdoutInvalid = true // stdout is the null device — output would be discarded
+	}
+}
+
 func main() {
+	sanitizeStdout()
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -685,6 +712,13 @@ func cmdReceive(ctx context.Context, args []string) error {
 	if *del && *noAck { // mutually exclusive — don't silently let one win
 		return fmt.Errorf("--delete and --no-ack are mutually exclusive")
 	}
+	// If stdout can't deliver output (closed at exec, or the null device), auto-ack would
+	// acknowledge messages whose bodies the caller never sees. Refuse BEFORE claiming, so
+	// nothing is locked or deleted (round-2 B1). --delete (explicit at-most-once drain) and
+	// --no-ack (nothing settled) stay usable.
+	if stdoutInvalid && !*del && !*noAck {
+		return fmt.Errorf("stdout is not writable (closed or /dev/null) — refusing to auto-acknowledge messages whose output would be discarded; use --delete to drain explicitly, or --no-ack")
+	}
 	queue := pos[0]
 	c, err := dial(ctx)
 	if err != nil {
@@ -849,6 +883,9 @@ func cmdRedrive(ctx context.Context, args []string) error {
 	if *max < 0 || *older < 0 {
 		return fmt.Errorf("--max and --older-than must be >= 0")
 	}
+	if *older > 0 && *older < time.Millisecond { // sub-ms truncates to 0 = unbounded (round-2 B2)
+		return fmt.Errorf("--older-than must be at least 1ms (got %s)", *older)
+	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
@@ -875,6 +912,9 @@ func cmdPurgeDLQ(ctx context.Context, args []string) error {
 	}
 	if *max < 0 || *older < 0 { // a negative bound would otherwise slip past the --all guard
 		return fmt.Errorf("--max and --older-than must be >= 0")
+	}
+	if *older > 0 && *older < time.Millisecond { // sub-ms truncates to 0 = unbounded (round-2 B2)
+		return fmt.Errorf("--older-than must be at least 1ms (got %s)", *older)
 	}
 	// Guard an unbounded destructive purge behind an explicit --all (review 2026-07-12 P1-2).
 	if *max == 0 && *older == 0 && !*all {

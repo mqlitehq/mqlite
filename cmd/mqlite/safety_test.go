@@ -97,11 +97,17 @@ func TestCLIRejectsNegativeDuration(t *testing.T) {
 	resetGlobals(t)
 	t.Setenv("MQLITE_ENDPOINT", "")
 	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
-	if err := cmdPurgeDLQ(ctx0, []string{"q", "--older-than", "-1ns"}); err == nil {
-		t.Error("purge-dlq --older-than=-1ns must be rejected")
+	for _, bad := range []string{"-1ns", "1ns", "999999ns"} { // negative + positive sub-ms
+		if err := cmdPurgeDLQ(ctx0, []string{"q", "--older-than", bad}); err == nil {
+			t.Errorf("purge-dlq --older-than=%s must be rejected (truncates to unbounded)", bad)
+		}
+		if err := cmdRedrive(ctx0, []string{"q", "--older-than", bad}); err == nil {
+			t.Errorf("redrive --older-than=%s must be rejected", bad)
+		}
 	}
-	if err := cmdRedrive(ctx0, []string{"q", "--older-than", "-1ns"}); err == nil {
-		t.Error("redrive --older-than=-1ns must be rejected")
+	// A >= 1ms bound is accepted (dials embedded; fails later for a missing queue, not on the bound).
+	if err := cmdPurgeDLQ(ctx0, []string{"q", "--older-than", "1ms"}); err != nil && strings.Contains(err.Error(), "older-than") {
+		t.Errorf("purge-dlq --older-than=1ms must be accepted, got %v", err)
 	}
 }
 

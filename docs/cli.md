@@ -118,6 +118,12 @@ mqlite receive orders --max 10 --wait 5s
 | `--no-ack` | false | leave messages locked (don't Complete) |
 | `--delete` | false | receive-and-delete (at-most-once, no lock) |
 
+**Auto-ack never acknowledges output you can't see.** A message is only Completed *after* its
+body is written to stdout successfully. If the write fails (broken pipe) the message is left
+locked and redelivered; if stdout cannot deliver at all (closed at exec, or `/dev/null`) the
+command refuses up front — nothing is claimed. Use `--delete` to drain explicitly, or
+`--no-ack` if you only want the lock tokens.
+
 ### `peek <queue>` — browse without locking
 ```bash
 mqlite peek orders --state dead_lettered --max 20
@@ -164,7 +170,7 @@ mqlite purge-dlq orders --all               # delete the entire DLQ (explicit)
 | Flag | Default | |
 |---|---|---|
 | `--max` | 0 | max messages to delete (0 = unbounded → `--all` required) |
-| `--older-than` | 0 | only delete messages older than this |
+| `--older-than` | 0 | only delete messages older than this (**minimum 1ms** — a sub-millisecond value would round to "no bound") |
 | `--all` | false | delete the entire DLQ (required to run unbounded) |
 
 ### `vacuum` — reclaim free DB pages to the OS
