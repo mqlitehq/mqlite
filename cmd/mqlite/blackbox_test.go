@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -110,6 +111,33 @@ func TestBlackboxReceiveBrokenPipe(t *testing.T) {
 	// The message must survive — locked and redeliverable, not deleted.
 	if m, err := eng.Stats(ctx, "q"); err != nil || m.Total == 0 {
 		t.Fatalf("message was lost after a broken-pipe receive (total=%d) — Peek-Lock must not become at-most-once", m.Total)
+	}
+}
+
+// Round-2 B1: a process started with fd 1 already CLOSED (`1>&-`, distinct from a broken
+// pipe) must exit non-zero and must NOT acknowledge/delete the message — the fd-reuse trap
+// where a later open acquires descriptor 1 and writes appear to succeed against the DB.
+func TestBlackboxReceiveClosedFd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("1>&- is a POSIX shell redirection")
+	}
+	ctx := context.Background()
+	url, eng := bbBroker(t, "tok")
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("important")}); err != nil {
+		t.Fatal(err)
+	}
+	// The shell closes fd 1 for the exec'd binary — exactly the reviewer's `receive q 1>&-`.
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("exec %q receive q 1>&-", mqliteBin))
+	cmd.Env = append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN=tok")
+	code, se := exitCode(cmd)
+	if code == 0 {
+		t.Fatalf("receive with fd 1 closed must exit non-zero; stderr=%q", se)
+	}
+	if m, err := eng.Stats(ctx, "q"); err != nil || m.Total == 0 {
+		t.Fatalf("message was deleted after a closed-fd receive (total=%d) — data loss", m.Total)
 	}
 }
 

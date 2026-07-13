@@ -128,6 +128,46 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   is covered too, and an unbounded `purge-dlq` now requires an explicit `--all`. The `--`
   terminator is honored (a message body keeps its flag-looking words). `--token=` sends no
   token, and `--endpoint` to a different host no longer forwards an ambient `MQLITE_TOKEN`.
+- **Two data-loss holes closed** (MQLITE-96, round-2 review):
+  - **`receive` refuses to auto-ack when stdout cannot deliver.** Closing fd 1 at exec
+    (`mqlite receive q 1>&-`) does not fail a write — the Go runtime silently reopens the
+    descriptor to the null device before `main`, so every "successful" write went to a black
+    hole and the messages were Completed and deleted. `receive` now detects an
+    undeliverable stdout (closed at exec, or `/dev/null`) and exits non-zero **before**
+    claiming anything. `--delete` (explicit at-most-once drain) and `--no-ack` still work.
+  - **A sub-millisecond age bound no longer means "no bound".** `purge-dlq --older-than 1ns`
+    truncated to `0` ms, which the engine reads as *unbounded* — it deleted the entire DLQ
+    while appearing bounded. Any positive duration now rounds **up** to 1 ms in the SDK
+    (`Purge`/`Redrive`, so raw HTTP and embedded callers are covered), and the CLI rejects a
+    positive sub-ms `--older-than` outright.
+- **`--output json` now emits the wire shape exactly** (MQLITE-96). The CLI had a parallel,
+  hand-copied schema that renamed `seq_number` to `seq` and dropped `visible_at_ms` /
+  `locked_until_ms` (peek) and `uptime_ms` / `auth` (status), and called `db_size_bytes`
+  `size_bytes`. A message in `--output json` is now literally the HTTP API's message object, so
+  the CLI and a raw POST agree key for key and a field added to the wire can't go missing from
+  the CLI. **Breaking for scripts** that read the old CLI-only keys: `seq` → `seq_number`,
+  `size_bytes` → `db_size_bytes`.
+- **A negative `scheduled_enqueue_time_ms` is rejected over raw HTTP** (MQLITE-96): it used to
+  fall past the `> 0` check and enqueue an *active* message with a 200, so raw HTTP disagreed
+  with embedded and the CLI, where the same value is refused.
+- **CLI strictness** (MQLITE-96): `create-queue`/`subscribe`/`peek`/`metrics`/`list`/`vacuum`
+  now require exact arity — a surplus positional is a typo (a misplaced flag, a value the shell
+  split), and silently ignoring it is how you purge the wrong queue. `purge-dlq --all` can no
+  longer be combined with `--max`/`--older-than` (they are alternatives, not a refinement).
+- **Peek-Lock leases are renewed through settlement, not just through output** (MQLITE-96): on
+  a high-latency link the `CompleteBatch` itself could outlast the lock, so a receive whose
+  output the caller had already seen would be reclaimed mid-settle and redelivered.
+- **`vacuum` no longer reports negative "freed" space** (MQLITE-96): a fresh DB materializes its
+  schema pages as it is opened and vacuumed, so it can end up *larger*; growth is now reported
+  as growth and reclaimed bytes never go below zero.
+- **The endpoint token boundary is the endpoint the client actually dials** (MQLITE-96):
+  re-passing your own endpoint with a trailing slash no longer withholds `MQLITE_TOKEN` and
+  hands you a 401. Two endpoints count as the same broker exactly when the base URL the client
+  would dial is identical — deliberately *not* a canonicalized URL comparison, because deciding
+  which components (path, percent-escaping, query, fragment, IPv6 zone, host case) are
+  "insignificant" is how an ambient credential ends up at somebody else's backend. Anything
+  else is treated as a different broker: you get a warning and pass `--token`.
+  New SDK helper: `mqlite.EndpointIdentity`.
 
 ## v0.2.0 — 2026-07-11
 

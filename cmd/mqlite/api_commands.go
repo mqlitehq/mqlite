@@ -3,59 +3,30 @@ package main
 // The data-plane / admin commands that make the CLI a high-value first-party client for the
 // common broker operations (MQLITE-92): settlement by lock token, schedule/cancel, deferred
 // receive, status, test-filter, list-subscriptions. Each works in client and embedded mode
-// via the shared `api` interface, and honors --output text|json. It is NOT a lossless view
-// of every wire field — for the full HTTP contract see docs/api-reference.md.
+// via the shared `api` interface, and honors --output text|json. Under --output json a message
+// IS a wire.Message — the same struct, and therefore the same keys, the HTTP API returns.
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
-// msgView is the JSON shape for a delivered message (--output json). Body is base64, the
-// same lossless encoding the HTTP wire uses; timestamps are epoch-ms (0 = unset, omitted).
-// LockToken is included only where the caller needs it to settle later (receive --no-ack,
-// receive-deferred). Keys mirror the wire (review 2026-07-12 P2-2).
-type msgView struct {
-	Seq           int64             `json:"seq"`
-	DeliveryCount int               `json:"delivery_count,omitempty"`
-	MessageID     string            `json:"message_id,omitempty"`
-	GroupID       string            `json:"group_id,omitempty"`
-	CorrelationID string            `json:"correlation_id,omitempty"`
-	Subject       string            `json:"subject,omitempty"`
-	ReplyTo       string            `json:"reply_to,omitempty"`
-	ContentType   string            `json:"content_type,omitempty"`
-	Body          string            `json:"body"`
-	Properties    map[string]string `json:"properties,omitempty"`
-	EnqueuedAtMs  int64             `json:"enqueued_at_ms,omitempty"`
-	LockedUntilMs int64             `json:"locked_until_ms,omitempty"`
-	LockToken     string            `json:"lock_token,omitempty"`
-}
-
-// peekView is the JSON shape for a browsed (peeked) message — no lock token (peek never
-// locks). Body is base64; DLQ reason/description are set for dead-lettered messages.
-type peekView struct {
-	Seq                   int64             `json:"seq"`
-	State                 string            `json:"state"`
-	DeliveryCount         int               `json:"delivery_count,omitempty"`
-	MessageID             string            `json:"message_id,omitempty"`
-	GroupID               string            `json:"group_id,omitempty"`
-	CorrelationID         string            `json:"correlation_id,omitempty"`
-	Subject               string            `json:"subject,omitempty"`
-	ReplyTo               string            `json:"reply_to,omitempty"`
-	ContentType           string            `json:"content_type,omitempty"`
-	Body                  string            `json:"body"`
-	Properties            map[string]string `json:"properties,omitempty"`
-	EnqueuedAtMs          int64             `json:"enqueued_at_ms,omitempty"`
-	ExpiresAtMs           int64             `json:"expires_at_ms,omitempty"`
-	DeadLetterReason      string            `json:"dead_letter_reason,omitempty"`
-	DeadLetterDescription string            `json:"dead_letter_description,omitempty"`
-}
+// A message in --output json IS a wire.Message — the exact struct the HTTP API returns, not a
+// CLI-specific lookalike. Emitting the canonical type (rather than a hand-copied view that
+// renamed seq_number to seq and quietly dropped visible_at_ms/locked_until_ms) means
+// `mqlite receive --output json` and a raw POST to /mqlite.v1.Queue/Receive produce the same
+// keys, and a field added to the wire can never silently go missing from the CLI. Bodies are
+// base64 and timestamps epoch-ms because that is what the wire does. Pinned by
+// TestCLIJSONIsWireShape (round-2 §3.4).
+//
+// The lock token is emitted only where the caller needs it to settle later (receive --no-ack,
+// receive-deferred); peek never locks, so it has none.
 
 // msIfSet returns t as epoch-ms, or 0 for the zero time (so omitempty drops it).
 func msIfSet(t time.Time) int64 {
@@ -65,27 +36,28 @@ func msIfSet(t time.Time) int64 {
 	return t.UnixMilli()
 }
 
-func viewPeeked(ms []*mqlite.PeekedMessage) []peekView {
-	out := make([]peekView, len(ms))
+func viewPeeked(ms []*mqlite.PeekedMessage) []wire.Message {
+	out := make([]wire.Message, len(ms))
 	for i, m := range ms {
-		out[i] = peekView{
-			Seq: m.SequenceNumber, State: string(m.State), DeliveryCount: m.DeliveryCount,
+		out[i] = wire.Message{
+			SeqNumber: m.SequenceNumber, State: string(m.State), DeliveryCount: m.DeliveryCount,
 			MessageID: m.MessageID, GroupID: m.GroupID, CorrelationID: m.CorrelationID,
 			Subject: m.Subject, ReplyTo: m.ReplyTo, ContentType: m.ContentType,
-			Body: base64.StdEncoding.EncodeToString(m.Body), Properties: m.Properties,
-			EnqueuedAtMs: msIfSet(m.EnqueuedAt), ExpiresAtMs: msIfSet(m.ExpiresAt),
+			Body: m.Body, Properties: m.Properties,
+			EnqueuedAtMs: msIfSet(m.EnqueuedAt), VisibleAtMs: msIfSet(m.VisibleAt),
+			ExpiresAtMs: msIfSet(m.ExpiresAt), LockedUntilMs: msIfSet(m.LockedUntil),
 			DeadLetterReason: m.DeadLetterReason, DeadLetterDescription: m.DeadLetterDescription,
 		}
 	}
 	return out
 }
 
-func viewMsg(m *mqlite.Message, withToken bool) msgView {
-	v := msgView{
-		Seq: m.SequenceNumber, DeliveryCount: m.DeliveryCount, MessageID: m.MessageID,
+func viewMsg(m *mqlite.Message, withToken bool) wire.Message {
+	v := wire.Message{
+		SeqNumber: m.SequenceNumber, DeliveryCount: m.DeliveryCount, MessageID: m.MessageID,
 		GroupID: m.GroupID, CorrelationID: m.CorrelationID, Subject: m.Subject,
 		ReplyTo: m.ReplyTo, ContentType: m.ContentType,
-		Body: base64.StdEncoding.EncodeToString(m.Body), Properties: m.Properties,
+		Body: m.Body, Properties: m.Properties,
 		EnqueuedAtMs: msIfSet(m.EnqueuedAt), LockedUntilMs: msIfSet(m.LockedUntil),
 	}
 	if withToken {
@@ -318,10 +290,14 @@ func cmdStatus(ctx context.Context, args []string) error {
 	fmt.Printf("schema:        %s\n", s.SchemaVersion)
 	fmt.Printf("ping:          %d ms\n", s.PingMs)
 	if !s.Remote {
-		fmt.Printf("size:          %d bytes\n", s.SizeBytes)
+		fmt.Printf("size:          %d bytes\n", s.DBSizeBytes)
 	}
 	fmt.Printf("queues:        %d\n", s.Queues)
 	fmt.Printf("subscriptions: %d\n", s.Subscriptions)
+	if s.UptimeMs > 0 { // broker only — an embedded engine has no process uptime
+		fmt.Printf("uptime:        %s\n", (time.Duration(s.UptimeMs) * time.Millisecond).Round(time.Second))
+		fmt.Printf("auth:          %t\n", s.Auth)
+	}
 	return nil
 }
 

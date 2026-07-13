@@ -141,9 +141,12 @@ type StatusInfo struct {
 	Location      string `json:"location"`
 	SchemaVersion string `json:"schema_version"`
 	PingMs        int64  `json:"ping_ms"`
-	SizeBytes     int64  `json:"size_bytes"`
+	DBSizeBytes   int64  `json:"db_size_bytes"` // local on-disk footprint; 0 for memory/remote
 	Queues        int    `json:"queues"`
 	Subscriptions int    `json:"subscriptions"`
+	// Broker-only facts: zero/false in embedded mode, which has no process uptime and no auth.
+	UptimeMs int64 `json:"uptime_ms"`
+	Auth     bool  `json:"auth"`
 }
 
 // ── data-plane options ───────────────────────────────────────────────────────
@@ -212,15 +215,22 @@ type RedriveOpts struct {
 	Rate      int           // throughput limit per second
 }
 
-// olderThanMs converts a duration to ms while PRESERVING the sign of a negative value: a
-// sub-millisecond negative (e.g. -1ns) would otherwise truncate to 0 and slip past the
-// engine's non-negative validation, letting a bounded purge/redrive delete everything
-// (review 2026-07-12). A real negative maps to -1 so validation rejects it.
+// olderThanMs converts an age bound to ms without ever letting a NON-ZERO duration become 0
+// (which the engine reads as "no bound" — an unrestricted destructive op). A negative maps
+// to -1 so validation rejects it; a positive value under 1 ms rounds UP to 1 ms so it stays
+// a real bound; only an exact zero (no bound requested) stays 0 (review 2026-07-12 round-2).
 func olderThanMs(d time.Duration) int64 {
-	if d < 0 {
+	switch {
+	case d == 0:
+		return 0
+	case d < 0:
 		return -1
+	default:
+		if ms := d.Milliseconds(); ms > 0 {
+			return ms
+		}
+		return 1 // positive but sub-millisecond — round up so it never means "unbounded"
 	}
-	return d.Milliseconds()
 }
 
 func (o RedriveOpts) toEngine() engine.RedriveOptions {

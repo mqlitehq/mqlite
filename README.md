@@ -214,13 +214,15 @@ mqlite complete orders 42 <lock-token>           # settle a --no-ack message (al
 mqlite peek orders --state dead_lettered
 mqlite status                                    # backend / ping / counts
 mqlite list-subscriptions ; mqlite test-filter 'subject == "x"'
-mqlite metrics orders --output json              # every command takes --output text|json
+mqlite metrics orders --output json              # machine-readable: the same keys as the HTTP API
 mqlite redrive orders --max 100                  # DLQ → active
 mqlite purge-dlq orders --older-than 24h         # delete dead-lettered (unbounded needs --all)
 ```
 
-Every command takes the global flags `--endpoint <url>` / `--token <t>` (override the
-environment) and `--output text|json`. See the [CLI reference](docs/cli.md) for the full set.
+The data and admin commands take the global flags `--endpoint <url>` / `--token <t>` (override
+the environment) and `--output text|json` — `serve`, `version` and `help` don't, and `vacuum`
+is local-only. Under `--output json` a message **is** the HTTP API's message object, key for
+key. See the [CLI reference](docs/cli.md) for the full set.
 
 Connection is read from `--endpoint`/`--token`, or from the environment:
 
@@ -351,11 +353,13 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-v0.1.x is released ([tagged releases](https://github.com/mqlitehq/mqlite/releases)
-with binaries and a GHCR image); the v0.2.0 correctness wave is staged on main —
-see [CHANGELOG.md](CHANGELOG.md). Hermetic unit + invariant (TCK-style) tests
-run in CI on every push, and live Turso/libSQL round-trips run in the nightly
-workflow.
+**v0.2.0 is the current release** ([tagged releases](https://github.com/mqlitehq/mqlite/releases)
+carry binaries and a GHCR image). The next wave — the default-port move to 6754, the CLI/API
+parity work, and the fixes listed under *Unreleased* in [CHANGELOG.md](CHANGELOG.md) — is on
+main and **not yet tagged**, so docs that pin a `0.3.0` image describe that upcoming release,
+not something you can pull today; use the latest tagged image until then. Hermetic unit +
+invariant (TCK-style) tests run in CI on every push, and live Turso/libSQL round-trips run in
+the nightly workflow.
 
 ## License
 

@@ -281,12 +281,13 @@ func (e *Embedded) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (
 }
 
 // Status returns a desensitized snapshot of the local backend (the embedded twin of
-// Client.Status). Version is empty (no broker); queue/subscription counts are live.
+// Client.Status). Version is empty and UptimeMs/Auth are zero-valued — an in-process engine
+// has no broker build stamp, no process uptime and no auth; queue/subscription counts are live.
 func (e *Embedded) Status(ctx context.Context) (StatusInfo, error) {
 	s := e.eng.Status(ctx)
 	info := StatusInfo{
 		Backend: s.Backend, Remote: s.Remote, Location: s.Location,
-		SchemaVersion: s.SchemaVersion, PingMs: s.PingMs, SizeBytes: s.SizeBytes,
+		SchemaVersion: s.SchemaVersion, PingMs: s.PingMs, DBSizeBytes: s.SizeBytes,
 	}
 	if qs, err := e.eng.ListQueues(ctx); err == nil {
 		// Exclude subscription backing queues from the queue count so embedded status

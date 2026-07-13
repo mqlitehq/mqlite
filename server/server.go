@@ -329,6 +329,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 		outs[i] = o
 	}
+	// A negative scheduled_enqueue_time_ms is not a valid instant. It used to fall through the
+	// `> 0` test into the plain-send branch and enqueue the message ACTIVE with a 200 — raw
+	// HTTP silently disagreeing with embedded/CLI, where the engine rejects it (round-2 §3.1).
+	// Zero still means "not scheduled" (the field is omitempty).
+	if req.ScheduledEnqueueTimeMs < 0 {
+		s.fail(w, fmt.Errorf("%w: scheduled_enqueue_time_ms must be a future epoch-ms instant (got %d)", engine.ErrInvalidArgument, req.ScheduledEnqueueTimeMs))
+		return
+	}
 	var seqs []int64
 	var err error
 	if req.ScheduledEnqueueTimeMs > 0 {

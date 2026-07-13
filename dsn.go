@@ -54,3 +54,28 @@ func parseDSN(dsn string) (endpoint, token string, err error) {
 	}
 	return scheme + "://" + host, token, nil
 }
+
+// EndpointIdentity returns the identity of the broker an endpoint string addresses: it is
+// literally the base URL the client would dial, i.e. the string Client.post concatenates the
+// RPC route onto. Two endpoints reach the same broker exactly when this value is equal.
+//
+// Use it to answer "are these two endpoints the same broker?" — the question that decides
+// whether an ambient token may be reused for an endpoint the caller overrode.
+//
+// It deliberately does NOT try to canonicalize a URL. Deciding which parts of a URL are
+// "insignificant" is a losing game — the path, percent-escaping, a query, a fragment, an IPv6
+// zone id and host case all change (or fail to change) where a reverse proxy actually routes
+// the request, and every component you normalize away is a chance to call two different
+// brokers the same and hand one of them the other's credential. Comparing the dialed string
+// itself cannot make that mistake: if the bytes we send differ, we treat it as a different
+// broker and withhold the token. The failure mode is a warning and an explicit --token, never
+// a leak.
+//
+// What it does normalize is only what parseDSN already normalizes to build the dial target —
+// an insignificant trailing slash (the reported bug: `http://h:6754/` cost the caller their
+// token), the product default port for the custom schemes, and a credential embedded in an
+// `mqlite://token@host` DSN (which is not part of the target).
+func EndpointIdentity(dsn string) (string, error) {
+	ep, _, err := parseDSN(dsn) // exactly the base URL the client dials
+	return ep, err
+}
