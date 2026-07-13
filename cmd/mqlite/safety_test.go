@@ -234,11 +234,11 @@ func TestReceiveUsesCompleteBatch(t *testing.T) {
 
 // must.
 func TestSameEndpoint(t *testing.T) {
+	// Same broker: identical after the ONLY normalization the dial path itself performs.
 	same := [][2]string{
 		{"http://127.0.0.1:6754", "http://127.0.0.1:6754/"}, // trailing slash (the reported bug)
 		{"http://127.0.0.1:6754", "http://127.0.0.1:6754"},  // identical
 		{"mqlite://h", "http://h:6754"},                     // custom scheme supplies the product port
-		{"http://Host:6754", "http://host:6754"},            // host case
 		{"mqlites://h", "https://h:6754"},                   // TLS variant
 		{"mqlite://tok@h:6754", "http://h:6754"},            // an embedded credential is not part of the target
 		{"https://gw/prod", "https://gw/prod/"},             // only the trailing slash is noise
@@ -248,18 +248,29 @@ func TestSameEndpoint(t *testing.T) {
 			t.Errorf("sameEndpoint(%q, %q) = false, want true (same broker)", p[0], p[1])
 		}
 	}
+	// Different broker — or, when in doubt, TREATED as different. The identity is the exact
+	// base URL the client dials, so anything that changes the bytes we send is a different
+	// target and the ambient token is withheld. That is fail-closed on purpose: canonicalizing
+	// a URL means deciding which components are "insignificant", and every such decision is a
+	// chance to hand one broker another's credential. Worst case here is a warning and an
+	// explicit --token; the worst case the other way is a leak.
 	diff := [][2]string{
 		{"http://h:6754", "http://other:6754"}, // different host
 		{"http://h:6754", "http://h:9000"},     // different port
 		{"http://h:6754", "https://h:6754"},    // different transport — never send a token over a downgrade
 		// A reverse proxy routes these to DIFFERENT backends, and Client.post appends the RPC
-		// route to the endpoint verbatim — so the path is part of the broker's identity and a
-		// token must not cross between them (codex).
+		// route to the endpoint verbatim — so the path is part of the broker's identity.
 		{"https://gw/prod", "https://gw/dev"},
 		{"https://gw/prod", "https://gw"},
-		// Path is percent-DECODED, so comparing it would collapse these two — but the client
-		// sends the endpoint verbatim and a proxy can route the escaped form elsewhere (codex).
+		// Each of these was a separate hole while the identity was a hand-canonicalized URL:
+		// a decoded path collapsed the first pair, an ignored query/fragment the next two, and
+		// a lower-cased IPv6 zone id the last. Comparing the dialed string closes all of them
+		// at once, and closes the ones nobody has thought of yet.
 		{"https://gw/prod%2Fadmin", "https://gw/prod/admin"},
+		{"https://gw/prod", "https://gw/prod?"},
+		{"https://gw/prod", "https://gw/prod#x"},
+		{"http://[fe80::1%25Eth0]:6754", "http://[fe80::1%25eth0]:6754"},
+		{"http://Host:6754", "http://host:6754"}, // host case: conservatively distinct
 	}
 	for _, p := range diff {
 		if sameEndpoint(p[0], p[1]) {
@@ -268,6 +279,7 @@ func TestSameEndpoint(t *testing.T) {
 	}
 }
 
+// §3.3: --all means "delete everything" and a bound means "delete some" — the usage presents
 // them as alternatives, so accepting both and quietly honoring one is a trap.
 func TestPurgeAllRejectsBounds(t *testing.T) {
 	resetGlobals(t)
