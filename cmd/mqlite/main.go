@@ -1172,29 +1172,37 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 	go func() {
 		defer close(r.done)
 
-		renew := renewFunc(c, queue, msgs)
+		// The lease is tracked HERE, privately, and never on the messages themselves: the command
+		// renders those concurrently, and writing a shared time.Time from this goroutine is a data
+		// race (codex). Read once, now, before any renewal happens.
+		until := tightestLease(msgs)
+		leaseLen := time.Until(until)
+		if leaseLen <= 0 {
+			leaseLen = defaultLease
+		}
+		renew := renewFunc(c, queue, msgs, leaseLen)
 
-		// The cadence is RECOMPUTED every round from the leases as they now stand — RenewBatch
-		// writes the deadline it committed back onto each message, so after a renewal the batch
-		// knows how long it has. Deriving it once would be wrong in both directions: a lease that
-		// was nearly spent on arrival (a slow Receive) would pin the cadence to the floor forever
-		// and hammer the broker with renewals it no longer needs, while a lease shorter than the
-		// floor would quietly expire between ticks (codex).
-		t := time.NewTimer(0)
+		t := time.NewTimer(time.Hour)
 		if !t.Stop() {
 			<-t.C
 		}
 		defer t.Stop()
 		for {
-			d := renewInterval(msgs)
+			// The cadence follows the lease as it now stands. Deriving it once would be wrong in
+			// both directions: a lease that arrived nearly spent (a slow Receive) would pin the
+			// cadence to the floor forever and hammer the broker with renewals it no longer needs,
+			// while a lease shorter than the floor would quietly expire between ticks.
+			d := time.Until(until) / 3
 			if d < minRenewInterval {
-				// The lease is spent (or nearly): waiting even one tick would schedule the renewal
+				// The lease is spent, or nearly. Waiting even one tick would schedule the renewal
 				// at or after locked_until, and the reaper would take the batch before we asked.
-				// Renew NOW, then fall back to the floor as a spin guard.
-				renew(ctx)
-				d = renewInterval(msgs)
-				if d < minRenewInterval {
-					d = minRenewInterval
+				if got := renew(ctx); !got.IsZero() {
+					until = got
+				}
+				if d = time.Until(until) / 3; d < minRenewInterval {
+					// Still nothing to work with — either the lock duration really is that short, or
+					// the renewal failed. Retry on a calm cadence rather than spinning on the floor.
+					d = renewRetryInterval
 				}
 			}
 			t.Reset(d)
@@ -1204,7 +1212,9 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				renew(ctx)
+				if got := renew(ctx); !got.IsZero() {
+					until = got
+				}
 			}
 		}
 	}()
@@ -1221,35 +1231,59 @@ func startRenewer(parent context.Context, c api, queue string, msgs []*mqlite.Me
 // life. Slower, but it is exactly what the old CLI did, and it is what that broker supports.
 //
 // Everything here is best-effort: a failed renew only risks a redelivery.
-func renewFunc(c api, queue string, msgs []*mqlite.Message) func(context.Context) {
+func renewFunc(c api, queue string, msgs []*mqlite.Message, leaseLen time.Duration) func(context.Context) time.Time {
 	batched := true
-	return func(ctx context.Context) {
+	return func(ctx context.Context) time.Time {
 		if batched {
 			// Renewal is capped at one statement's worth (mqlite.MaxRenewBatch) so the broker can
 			// promise every Ok means a live lease. Receive hands out at most 256, so a batch never
 			// exceeds it in practice — but renewing in groups anyway means an oversized batch can
 			// never silently renew NOTHING.
-			err := error(nil)
+			var (
+				err   error
+				until time.Time
+			)
 			for start := 0; start < len(msgs) && err == nil; start += mqlite.MaxRenewBatch {
 				end := start + mqlite.MaxRenewBatch
 				if end > len(msgs) {
 					end = len(msgs)
 				}
-				_, err = c.RenewBatch(ctx, queue, msgs[start:end]...)
+				var res []mqlite.SettleResult
+				res, err = c.RenewBatch(ctx, queue, msgs[start:end]...)
+				for _, r := range res {
+					// The TIGHTEST lease in the batch governs the cadence — the batch is only as
+					// safe as its most exposed message.
+					if r.Ok && !r.LockedUntil.IsZero() && (until.IsZero() || r.LockedUntil.Before(until)) {
+						until = r.LockedUntil
+					}
+				}
 			}
 			if err == nil {
-				return
+				return until
 			}
 			if !errors.Is(err, mqlite.ErrUnsupported) {
-				return // a real failure (network, lost lock) — not a reason to downgrade forever
+				return time.Time{} // a real failure — not a reason to downgrade forever
 			}
 			fmt.Fprintln(os.Stderr,
 				"warning: this broker does not support RenewBatch (it predates it); renewing one message at a time")
 			batched = false
 		}
+
+		// An older broker's Renew reports no deadline, so INFER one: it extends the lock by the
+		// queue's lock duration, and the lease this batch arrived with is that duration. Without
+		// the inference the caller would have nothing to compute a cadence from, fall back to the
+		// floor, and pelt an old broker with a full per-message renewal pass every 50ms for the
+		// rest of a slow output (codex).
+		renewed := false
 		for _, m := range msgs {
-			_ = m.Renew(ctx)
+			if err := m.Renew(ctx); err == nil {
+				renewed = true
+			}
 		}
+		if !renewed {
+			return time.Time{}
+		}
+		return time.Now().Add(leaseLen)
 	}
 }
 
@@ -1277,20 +1311,34 @@ func (r *renewer) Stop() {
 // as "renew immediately" rather than clamping the first tick past locked_until — which would hand
 // the batch to the reaper before we ever asked. minRenewInterval is only the steady-state cadence
 // floor, a spin guard, not a delay before the first renewal.
-const minRenewInterval = 50 * time.Millisecond
+const (
+	minRenewInterval   = 50 * time.Millisecond
+	renewRetryInterval = time.Second      // a calm retry when we have no usable lease to aim at
+	defaultLease       = 30 * time.Second // the engine's default lock duration
+)
 
-func renewInterval(msgs []*mqlite.Message) time.Duration {
-	now := time.Now()
-	tightest := time.Duration(0)
+// tightestLease is the soonest deadline in the batch — the batch is only as safe as its most
+// exposed message. A zero time means no message carries a usable lease.
+func tightestLease(msgs []*mqlite.Message) time.Time {
+	var tightest time.Time
 	for _, m := range msgs {
-		if d := m.LockedUntil.Sub(now); d > 0 && (tightest == 0 || d < tightest) {
-			tightest = d
+		if !m.LockedUntil.IsZero() && (tightest.IsZero() || m.LockedUntil.Before(tightest)) {
+			tightest = m.LockedUntil
 		}
 	}
-	if tightest <= 0 {
-		return 0 // the lease is spent (or unknown): renew now, do not wait
+	return tightest
+}
+
+func renewInterval(msgs []*mqlite.Message) time.Duration {
+	until := tightestLease(msgs)
+	if until.IsZero() {
+		return 0
 	}
-	return tightest / 3
+	d := time.Until(until)
+	if d <= 0 {
+		return 0 // the lease is spent: renew now, do not wait
+	}
+	return d / 3
 }
 
 func formatMsg(m *mqlite.Message, withToken bool) string {

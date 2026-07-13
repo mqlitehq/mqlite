@@ -575,13 +575,12 @@ func TestRenewIntervalSaysRenewNowWhenLeaseNearlySpent(t *testing.T) {
 	}
 }
 
-// A renewal must tell the caller the deadline it committed, and the cadence must follow it.
-//
-// Otherwise a lease that arrives nearly spent (a slow Receive) renews immediately, its cadence
-// drops to the floor — and STAYS there, because LockedUntil never moved. The CLI would then renew
-// 20 times a second for the rest of the batch's life against a broker that gave it a 30-second
-// lease (codex).
-func TestRenewalUpdatesTheLeaseAndTheCadenceFollowsIt(t *testing.T) {
+// A renewal must TELL the caller the deadline it committed — and must not write it onto the
+// message. The command renders those messages concurrently, so a background write to a shared
+// time.Time is a data race; and without the reported deadline the renewer has nothing to compute
+// a cadence from, so a lease that merely arrived nearly spent (a slow Receive) would pin the
+// cadence to the floor and renew twenty times a second for the rest of the batch's life (codex).
+func TestRenewalReportsTheDeadlineWithoutTouchingTheMessage(t *testing.T) {
 	resetGlobals(t)
 	ctx := context.Background()
 	eng, err := engine.Open(ctx, engine.Options{
@@ -609,29 +608,91 @@ func TestRenewalUpdatesTheLeaseAndTheCadenceFollowsIt(t *testing.T) {
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("receive: %v n=%d", err, len(msgs))
 	}
-
-	// Pretend the Receive was slow: the lease looks nearly spent, so the cadence is at the floor.
-	msgs[0].LockedUntil = time.Now().Add(10 * time.Millisecond)
-	if d := renewInterval(msgs); d >= minRenewInterval {
-		t.Fatalf("setup: interval %s should be below the floor for a nearly-spent lease", d)
-	}
+	before := msgs[0].LockedUntil
+	// Let the clock move, so a renewal genuinely commits a LATER deadline than the one the message
+	// arrived with — otherwise "did it mutate the message?" is unanswerable: both values would be
+	// the same millisecond and the check could not fail even if the SDK did write.
+	time.Sleep(20 * time.Millisecond)
 
 	res, err := c.RenewBatch(ctx, "q", msgs...)
 	if err != nil || !res[0].Ok {
 		t.Fatalf("RenewBatch: %v ok=%v", err, res[0].Ok)
 	}
 	if res[0].LockedUntil.IsZero() {
-		t.Fatal("RenewBatch did not report the deadline it committed")
+		t.Fatal("RenewBatch did not report the deadline it committed — the caller cannot pace itself")
 	}
-	// The message now carries the renewed lease...
-	if !msgs[0].LockedUntil.Equal(res[0].LockedUntil) {
-		t.Errorf("the renewed deadline was not written back onto the message: %v vs %v",
-			msgs[0].LockedUntil, res[0].LockedUntil)
+	if !msgs[0].LockedUntil.Equal(before) {
+		t.Error("RenewBatch mutated the caller's message; the command renders those concurrently, so that is a data race")
 	}
-	// ...so the cadence recovers to a third of the FULL 30s lease instead of staying at the floor.
-	d := renewInterval(msgs)
-	if d < 8*time.Second || d > 12*time.Second {
-		t.Errorf("cadence after renewal = %s, want about a third of the 30s lease — the CLI would otherwise renew %d times a second forever",
+
+	// The renewer takes the reported deadline and paces itself by it: a third of the real 30s
+	// lease, not the floor.
+	renew := renewFunc(c, "q", msgs, 30*time.Second)
+	until := renew(ctx)
+	if until.IsZero() {
+		t.Fatal("renewFunc did not report a deadline")
+	}
+	if d := time.Until(until) / 3; d < 8*time.Second || d > 12*time.Second {
+		t.Errorf("cadence = %s, want about a third of the 30s lease — otherwise the CLI renews %d times a second forever",
 			d, time.Second/minRenewInterval)
+	}
+}
+
+// The legacy path renews per message, and an old broker reports no deadline — so the renewer must
+// INFER one from the lease the batch arrived with. Otherwise it has nothing to pace by, collapses
+// to the floor, and pelts a broker that predates RenewBatch with a full per-message renewal pass
+// every 50ms for the rest of a slow output (codex).
+func TestLegacyFallbackStillPacesItself(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{
+		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	inner := server.New(eng, nil).Handler()
+	var singleRenews atomic.Int64
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathRenewBatch: // a broker that predates it: its catch-all answers
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/no-such-route-on-an-old-broker"
+			inner.ServeHTTP(w, r2)
+			return
+		case wire.PathRenew:
+			singleRenews.Add(1)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer old.Close()
+
+	c, err := mqlite.Open(ctx, old.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+
+	renew := renewFunc(c, "q", msgs, 30*time.Second) // the lease this batch arrived with
+	until := renew(ctx)                              // downgrades to per-message Renew
+	if singleRenews.Load() == 0 {
+		t.Fatal("expected the per-message fallback to be used")
+	}
+	if until.IsZero() {
+		t.Fatal("the fallback reported no deadline — the renewer would collapse to the 50ms floor and hammer an old broker")
+	}
+	if d := time.Until(until) / 3; d < 8*time.Second || d > 12*time.Second {
+		t.Errorf("fallback cadence = %s, want about a third of the inferred 30s lease", d)
 	}
 }

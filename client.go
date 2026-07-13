@@ -227,8 +227,12 @@ type SettleResult struct {
 	SequenceNumber int64
 	Ok             bool
 	// LockedUntil is the lease deadline a RenewBatch actually committed (zero for other
-	// operations). RenewBatch also writes it back onto the *Message, so a renewing caller can see
-	// when the lock it just extended runs out.
+	// operations). A renewing caller needs it to know when to renew next — without it, it can
+	// only guess, and would either hammer the broker or let the lock it just extended lapse.
+	//
+	// It is REPORTED, never written back onto the *Message: the caller may be reading those
+	// messages concurrently (the CLI renders them while a background renewer runs), and mutating
+	// a shared time.Time from another goroutine is a data race.
 	LockedUntil time.Time
 }
 
@@ -246,17 +250,6 @@ func msFromEpoch(ms int64) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMilli(ms)
-}
-
-// applyRenewals writes each committed lease deadline back onto its message. Without it a renewing
-// caller has no idea when the lease it just extended runs out: it would either renew far more
-// often than needed (hammering the broker) or let the lock lapse (review round-3 / codex).
-func applyRenewals(msgs []*Message, res []SettleResult) {
-	for i, r := range res {
-		if i < len(msgs) && r.Ok && !r.LockedUntil.IsZero() {
-			msgs[i].LockedUntil = r.LockedUntil
-		}
-	}
 }
 
 // CompleteBatch completes many received messages in one round-trip — the fix for the
@@ -297,9 +290,7 @@ func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message)
 	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
 		return nil, err
 	}
-	out := toSettleResults(resp.Results)
-	applyRenewals(msgs, out)
-	return out, nil
+	return toSettleResults(resp.Results), nil
 }
 
 // ── receive ─────────────────────────────────────────────────────────────────
