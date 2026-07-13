@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/mqlitehq/mqlite/wire"
@@ -144,5 +145,41 @@ func TestDocsCiteOnlyRealRPCPaths(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no RPC paths found in the docs — the regex or the paths moved; this guard is not guarding")
+	}
+}
+
+// The reverse guard: every route the broker SERVES must be documented in the HTTP reference.
+//
+// TestDocsCiteOnlyRealRPCPaths stops the docs inventing a route that does not exist. This stops
+// the opposite drift — shipping a route nobody can find. RenewBatch was added to the wire, the
+// server, the SDK and the CLI, and the api-reference simply skipped it: raw-HTTP users could only
+// discover it by reading Go source (codex). A guard in one direction is not a guard.
+func TestEveryRPCPathIsDocumented(t *testing.T) {
+	card, _ := getCard(t, consoleServer(t, false, nil).URL+"/")
+
+	b, err := os.ReadFile(filepath.Join("..", "docs", "api-reference.md"))
+	if err != nil {
+		t.Fatalf("read api-reference.md: %v", err)
+	}
+	doc := string(b)
+
+	// The reference documents operations under `###` headings, and related verbs may share one
+	// (`### Complete / Abandon / Reject / Defer / Renew`), so collect every name any heading covers.
+	documented := map[string]bool{}
+	for _, line := range strings.Split(doc, "\n") {
+		if !strings.HasPrefix(line, "### ") {
+			continue
+		}
+		for _, part := range strings.Split(strings.TrimPrefix(line, "### "), "/") {
+			documented[strings.TrimSpace(part)] = true
+		}
+	}
+
+	for _, p := range card.Endpoints {
+		name := p[strings.LastIndexByte(p, '/')+1:] // the operation is the last element of the route
+		if !documented[name] {
+			t.Errorf("the broker serves %s but docs/api-reference.md documents no %q operation — a raw-HTTP user cannot find it",
+				p, name)
+		}
 	}
 }
