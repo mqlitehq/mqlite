@@ -353,11 +353,13 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-v0.1.x is released ([tagged releases](https://github.com/mqlitehq/mqlite/releases)
-with binaries and a GHCR image); the v0.2.0 correctness wave is staged on main —
-see [CHANGELOG.md](CHANGELOG.md). Hermetic unit + invariant (TCK-style) tests
-run in CI on every push, and live Turso/libSQL round-trips run in the nightly
-workflow.
+**v0.2.0 is the current release** ([tagged releases](https://github.com/mqlitehq/mqlite/releases)
+carry binaries and a GHCR image). The next wave — the default-port move to 6754, the CLI/API
+parity work, and the fixes listed under *Unreleased* in [CHANGELOG.md](CHANGELOG.md) — is on
+main and **not yet tagged**, so docs that pin a `0.3.0` image describe that upcoming release,
+not something you can pull today; use the latest tagged image until then. Hermetic unit +
+invariant (TCK-style) tests run in CI on every push, and live Turso/libSQL round-trips run in
+the nightly workflow.
 
 ## License
 
