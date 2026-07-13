@@ -278,12 +278,16 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		for k := range renewed { // the remote inTx may replay the closure — never inherit results
 			delete(renewed, k)
 		}
-		until := e.now() + q.lockDurationMs
 		return chunkPairs(rows, func(group []SettleItem, pairs string) error {
+			// The deadline is taken PER CHUNK, not once for the whole batch. A batch bigger than
+			// one chunk costs several round trips on a remote store, and a deadline frozen before
+			// the first of them can already be in the past by the time the last one commits — the
+			// transaction would then report Ok while handing the reaper leases that had expired
+			// while it ran. Each chunk gets a lease measured from when it is actually written.
 			args := pairArgs(queue, group)
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE messages SET locked_until=? WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)`,
-				append([]any{until}, args...)...); err != nil {
+				append([]any{e.now() + q.lockDurationMs}, args...)...); err != nil {
 				return err
 			}
 			// Which items actually matched? The same row-value set, so this reports exactly the
@@ -362,70 +366,16 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 			delete(replayed, k)
 		}
 
-		err := chunkPairs(rows, func(group []SettleItem, pairs string) error {
-			args := pairArgs(queue, group)
-
-			// 1. Which items still hold their lock? Reading BEFORE the delete is what tells the
-			//    two zero-row cases apart per item — deleted-just-now vs already-gone — which the
-			//    old loop learned from each single DELETE's RowsAffected.
-			sel, err := tx.QueryContext(ctx,
-				`SELECT id, lock_token FROM messages WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)`,
-				args...)
-			if err != nil {
-				return err
-			}
-			present := make([]SettleItem, 0, len(group))
-			for sel.Next() {
-				var id int64
-				var tok string
-				if err := sel.Scan(&id, &tok); err != nil {
-					sel.Close()
-					return err
-				}
-				settled[settleKey(id, tok)] = true
-				present = append(present, SettleItem{SeqNumber: id, LockToken: tok})
-			}
-			if err := sel.Err(); err != nil {
-				sel.Close()
-				return err
-			}
-			sel.Close()
-			if len(present) == 0 {
-				return nil
-			}
-
-			// 2. Delete exactly those, in one statement.
-			res, err := tx.ExecContext(ctx,
-				`DELETE FROM messages WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)`, args...)
-			if err != nil {
-				return err
-			}
-			n, _ := res.RowsAffected()
-			removed += n
-
-			// 3. One receipt per settled token, in one statement — this is what makes a
-			//    re-Complete with the SAME token an idempotent success instead of ErrLockLost.
-			recArgs := make([]any, 0, 4*len(present))
-			var vals strings.Builder
-			for _, it := range present {
-				if vals.Len() > 0 {
-					vals.WriteByte(',')
-				}
-				vals.WriteString("(?,?,?,?)")
-				recArgs = append(recArgs, it.LockToken, "completed", now, now+settlementTTLMs)
-			}
-			_, err = tx.ExecContext(ctx,
-				`INSERT OR REPLACE INTO settlement_receipts(lock_token,operation,created_at,expires_at)
-				 VALUES `+vals.String(), recArgs...)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-
-		// 4. The items that matched no row: a live receipt means this is a replay of a settle
-		//    whose response was lost (idempotent success); no receipt means the lock is lost.
-		//    Chunked on the same budget — one bind parameter per token here, not two.
+		// 1. Which tokens ALREADY had a live receipt, before this batch touches anything? A
+		//    receipt means an earlier settle of that token succeeded but its response was lost,
+		//    so a re-Complete is an idempotent success rather than ErrLockLost.
+		//
+		//    This must run BEFORE step 4 inserts receipts of its own. Reading afterwards is a
+		//    fencing hole: a batch carrying (wrongSeq, T) alongside the valid (liveSeq, T) would
+		//    see the receipt THIS batch just wrote for T and report Ok for the wrong pair too —
+		//    claiming a message settled that matched no row at all. Receipts are keyed by token,
+		//    so only a pre-existing one may vouch for a pair. Chunked on the same budget — one
+		//    bind parameter per token here, not two.
 		for start := 0; start < len(rows); start += settleChunk {
 			end := start + settleChunk
 			if end > len(rows) {
@@ -456,6 +406,67 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 				return err
 			}
 			rec.Close()
+		}
+
+		err := chunkPairs(rows, func(group []SettleItem, pairs string) error {
+			args := pairArgs(queue, group)
+
+			// 2. Which items still hold their lock? Reading BEFORE the delete is what tells the
+			//    two zero-row cases apart per item — deleted-just-now vs already-gone — which the
+			//    old loop learned from each single DELETE's RowsAffected.
+			sel, err := tx.QueryContext(ctx,
+				`SELECT id, lock_token FROM messages WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)`,
+				args...)
+			if err != nil {
+				return err
+			}
+			present := make([]SettleItem, 0, len(group))
+			for sel.Next() {
+				var id int64
+				var tok string
+				if err := sel.Scan(&id, &tok); err != nil {
+					sel.Close()
+					return err
+				}
+				settled[settleKey(id, tok)] = true
+				present = append(present, SettleItem{SeqNumber: id, LockToken: tok})
+			}
+			if err := sel.Err(); err != nil {
+				sel.Close()
+				return err
+			}
+			sel.Close()
+			if len(present) == 0 {
+				return nil
+			}
+
+			// 3. Delete exactly those, in one statement.
+			res, err := tx.ExecContext(ctx,
+				`DELETE FROM messages WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)`, args...)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			removed += n
+
+			// 4. One receipt per settled token, in one statement — this is what makes a
+			//    re-Complete with the SAME token an idempotent success instead of ErrLockLost.
+			recArgs := make([]any, 0, 4*len(present))
+			var vals strings.Builder
+			for _, it := range present {
+				if vals.Len() > 0 {
+					vals.WriteByte(',')
+				}
+				vals.WriteString("(?,?,?,?)")
+				recArgs = append(recArgs, it.LockToken, "completed", now, now+settlementTTLMs)
+			}
+			_, err = tx.ExecContext(ctx,
+				`INSERT OR REPLACE INTO settlement_receipts(lock_token,operation,created_at,expires_at)
+				 VALUES `+vals.String(), recArgs...)
+			return err
+		})
+		if err != nil {
+			return err
 		}
 		return nil
 	})

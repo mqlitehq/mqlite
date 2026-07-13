@@ -411,6 +411,10 @@ func TestRenewerStopDoesNotHangOnStalledRenew(t *testing.T) {
 // full-size batch. Asserts what they asked for — every message printed, exit 0, ONE batch
 // settlement, and an empty queue.
 func TestBatchRenewalUnderDelayedLink(t *testing.T) {
+	const (
+		lockMs      = 6000            // comfortably longer than a slow runner's receive
+		settleDelay = 9 * time.Second // > the lease: the batch survives only if renewal works
+	)
 	for _, n := range []int{64, 256} { // 256 is the engine's supported maximum receive
 		t.Run(fmt.Sprintf("%d messages", n), func(t *testing.T) {
 			resetGlobals(t)
@@ -424,7 +428,13 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer eng.Close()
-			if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 2000}); err != nil {
+			// The lease must outlast the RECEIVE itself — renewal cannot start before the batch is
+			// claimed, so a lock that expires while the messages are still being fetched is lost to
+			// physics, not to a bug. A slow CI runner needed several seconds just to deliver 256
+			// messages, which is what a 2s lock turned into "all 256 failed to settle". What the
+			// test actually needs is settleDelay > lockDuration, so that renewal — and only
+			// renewal — can carry the batch across the settle.
+			if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: lockMs}); err != nil {
 				t.Fatal(err)
 			}
 			seed := make([]engine.OutMessage, n)
@@ -444,7 +454,7 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 					time.Sleep(50 * time.Millisecond) // per-renew link latency
 				case wire.PathCompleteBatch:
 					settles.Add(1)
-					time.Sleep(3 * time.Second) // a slow settle, longer than the 2s lease
+					time.Sleep(settleDelay) // deliberately longer than the lease: only renewal saves it
 				}
 				inner.ServeHTTP(w, r)
 			}))

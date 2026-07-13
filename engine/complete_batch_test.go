@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -354,5 +355,86 @@ func TestBatchSettleBeyondBindParameterLimit(t *testing.T) {
 	}
 	if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
 		t.Errorf("total=%d after settling every message, want 0", m.Total)
+	}
+}
+
+// A receipt vouches for a TOKEN, so replay detection must only consider receipts that existed
+// BEFORE this batch ran. If the lookup happens after the batch writes its own receipts, then a
+// batch carrying (wrongSeq, T) alongside the valid (liveSeq, T) sees the receipt it just wrote
+// for T and reports Ok for the wrong pair too — claiming a message settled that matched no row
+// at all. Same fencing hole as keying results by seq alone, one level over (codex).
+func TestCompleteBatchDoesNotVouchForAPairWithItsOwnReceipt(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+	for i := 0; i < 2; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 2})
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	live, other := msgs[0], msgs[1]
+
+	// (other.seq, live.token) is a mismatched pair: that token does not fence that row.
+	items := []SettleItem{
+		{SeqNumber: other.SeqNumber, LockToken: live.LockToken}, // must NOT settle
+		{SeqNumber: live.SeqNumber, LockToken: live.LockToken},  // settles, writing a receipt for the token
+	}
+	res, err := e.CompleteBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("CompleteBatch: %v", err)
+	}
+	if res[0].Ok {
+		t.Error("a (seq, token) pair that matched no row was reported settled — the batch's own receipt vouched for it")
+	}
+	if !res[1].Ok {
+		t.Error("the valid pair should have settled")
+	}
+	// And the mismatched item's message is untouched: still there, still locked.
+	if m, _ := e.Stats(ctx, "q"); m.Total != 1 || m.Locked != 1 {
+		t.Errorf("total=%d locked=%d, want 1/1 — only the valid pair may be deleted", m.Total, m.Locked)
+	}
+}
+
+// Both batch operations must survive a batch far past a single statement's bind-parameter
+// budget. The 8,192-message test above only trips CompleteBatch: its receipt INSERT binds four
+// parameters per row, while RenewBatch binds two per pair and so stays under the 32,766 cap
+// until ~16k items — meaning RenewBatch's chunking was NOT actually pinned (codex).
+//
+// A synthetic item list is the cheap way to pin it: the rows need not exist. Nothing matches, so
+// every item is correctly Ok=false — but the statements are still built and executed at full
+// width, which is exactly what the bind limit cares about.
+func TestBatchSettleBindLimitWithSyntheticItems(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+
+	const n = 20_000 // > 16,382 pairs: unchunked, RenewBatch alone would exceed the limit
+	items := make([]SettleItem, n)
+	for i := range items {
+		items[i] = SettleItem{SeqNumber: int64(i + 1), LockToken: "tok-" + strconv.Itoa(i)}
+	}
+
+	res, err := e.RenewBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("RenewBatch(%d): %v", n, err)
+	}
+	for _, r := range res {
+		if r.Ok {
+			t.Fatalf("seq %d: nothing exists to renew, so no item may report Ok", r.SeqNumber)
+		}
+	}
+
+	res, err = e.CompleteBatch(ctx, "q", items)
+	if err != nil {
+		t.Fatalf("CompleteBatch(%d): %v", n, err)
+	}
+	for _, r := range res {
+		if r.Ok {
+			t.Fatalf("seq %d: nothing exists to complete, so no item may report Ok", r.SeqNumber)
+		}
 	}
 }
