@@ -228,6 +228,24 @@ changelog, because a caller can observe every one of them.
 - **13.6** Follows from 13.3: a lost response never means "it did not happen". Cancellation
   does not change the at-least-once contract — reconcile, do not assume.
 
+## 14 · Concurrency invariants
+
+The properties a user cannot work around, asserted under real parallelism rather than by asking the
+engine to grade itself — an engine with a bug reports that everything is fine.
+
+- **14.1 Exclusive delivery.** While a consumer holds a **live** lock on a message, that message
+  MUST NOT be delivered to anyone else. Exclusivity *is* the lease: past `locked_until` the holder
+  owns nothing, and a redelivery then is the at-least-once contract working, not a violation.
+  *(engine/concurrency_test.go: TestConcurrentConsumersNeverShareAMessage)*
+- **14.2 The fence must fence.** When a lock expires and the message is reassigned, a settle from
+  the OLD holder MUST be refused (`ErrLockLost`) and the new holder's MUST succeed. "Exactly one
+  winner" is not sufficient — the winner must be the holder of the live lock.
+  *(engine/concurrency_test.go: TestConcurrentSettlementPicksExactlyOneWinner)*
+- **14.3 No zombie delivery.** A completed message MUST NOT be delivered again.
+  *(engine/concurrency_test.go)*
+- **14.4 No loss.** Every message sent is eventually completed — not most of them.
+  *(engine/concurrency_test.go)*
+
 ---
 
 *This spec is the contract a non-SQLite storage backend (see the Store-interface
