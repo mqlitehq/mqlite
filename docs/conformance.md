@@ -64,8 +64,9 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   `queue + seq_number + lock_token + operation + effect-bearing arguments`; a call that
   differs in ANY of them is not a replay and MUST return `ErrLockLost`, never a success
   that silently keeps the first call's effect.
-  *(engine/ga_fixes_test.go, engine/complete_batch_test.go: TestReceiptsAreBoundTo*,
-  engine/model_test.go)*
+  *(engine/ga_fixes_test.go; engine/complete_batch_test.go: TestReceiptsAreBoundToTheirMessage,
+  TestReceiptsAreBoundToTheirArguments, TestSettlementReceiptsAreVerbSpecific;
+  engine/model_test.go: TestEngineMatchesTheModel)*
 - **3.3** A `Receive` retried with the same `AttemptID` MUST replay the same batch /
   same lock tokens, not double-deliver. *(engine/ga_fixes_test.go)*
 - **3.4** No message loss + no content corruption: a contiguous `1..N` sequence with
