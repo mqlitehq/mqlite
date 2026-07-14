@@ -35,13 +35,17 @@ func affected(res sql.Result) error {
 //
 // This is the difference between "I already Completed this, the completion just
 // got lost" (success) and "my lock expired and someone else has the message" (lost).
-func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, op string, do func(tx *sql.Tx) (int64, error)) error {
+func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, op string, do func(ctx context.Context, tx *sql.Tx) (int64, error)) error {
 	if token == "" {
 		return ErrLockLost
 	}
 	now := e.now()
 	return e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		n, err := do(tx)
+		// `ctx` here is the one inTx hands us — protected on a local store. Passing it to `do` is
+		// what keeps the fenced settle WRITE from being interrupted: an interrupted local write
+		// leaks the connection and wedges (or erases) the database. The do-closures used to capture
+		// the CALLER's context and were interruptible after all (codex).
+		n, err := do(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -105,7 +109,7 @@ func (e *Engine) CompletedCounts() map[string]uint64 {
 // Complete removes a successfully-processed message (fencing on lock_token).
 func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token string) error {
 	var removed int64
-	err := e.settleOp(ctx, queue, seq, token, "completed", func(tx *sql.Tx) (int64, error) {
+	err := e.settleOp(ctx, queue, seq, token, "completed", func(ctx context.Context, tx *sql.Tx) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=?`, seq, queue, token)
 		if err != nil {
@@ -127,7 +131,7 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 // re-visibility when requeued.
 func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
 	now := e.now()
-	err := e.settleOp(ctx, queue, seq, token, "abandoned", func(tx *sql.Tx) (int64, error) {
+	err := e.settleOp(ctx, queue, seq, token, "abandoned", func(ctx context.Context, tx *sql.Tx) (int64, error) {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET
 			    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
@@ -157,7 +161,7 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 	if reason == "" {
 		reason = ReasonAppRequested
 	}
-	return e.settleOp(ctx, queue, seq, token, "dead_lettered", func(tx *sql.Tx) (int64, error) {
+	return e.settleOp(ctx, queue, seq, token, "dead_lettered", func(ctx context.Context, tx *sql.Tx) (int64, error) {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET state='dead_lettered', locked_until=0, lock_token=NULL,
 			    dead_letter_reason=?, dead_letter_description=?
@@ -172,7 +176,7 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 
 // Defer sets a message aside; it is later retrieved by seq via ReceiveDeferred.
 func (e *Engine) Defer(ctx context.Context, queue string, seq int64, token string) error {
-	return e.settleOp(ctx, queue, seq, token, "deferred", func(tx *sql.Tx) (int64, error) {
+	return e.settleOp(ctx, queue, seq, token, "deferred", func(ctx context.Context, tx *sql.Tx) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE messages SET state='deferred', locked_until=0, lock_token=NULL
 			   WHERE id=? AND queue=? AND lock_token=?`, seq, queue, token)

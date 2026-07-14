@@ -615,6 +615,16 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *sql.Tx) err
 				_ = tx.Rollback()
 				return ferr
 			}
+			// The statements are protected from interruption; the TRANSACTION is not. A callback
+			// that spans several statements can be cancelled BETWEEN them — an Engine.Tx callback
+			// that pauses, a large multi-message Send mid-loop — and committing then would persist
+			// work the caller had already abandoned. The contract is "a statement already executing
+			// finishes", not "a transaction already begun commits" (codex). Check the CALLER's
+			// context, not the protected one.
+			if cerr := ctx.Err(); cerr != nil {
+				_ = tx.Rollback()
+				return cerr
+			}
 			return tx.Commit()
 		})
 	}

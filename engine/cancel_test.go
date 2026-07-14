@@ -161,3 +161,85 @@ func TestMemoryEnginesStayIsolated(t *testing.T) {
 		t.Error("a queue created in one :memory: engine is visible in another")
 	}
 }
+
+// A transaction cancelled BETWEEN its statements must roll back. The statements are protected from
+// interruption; the transaction is not. Committing here would persist work the caller had already
+// abandoned — "a statement already executing finishes" is not "a transaction already begun
+// commits" (codex, round-5 follow-up).
+func TestTxCancelledBetweenStatementsRollsBack(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		err = e.Tx(cctx, func(tx *EngineTx) error {
+			if _, err := tx.SendOne("q", OutMessage{Body: []byte("first")}); err != nil {
+				return err
+			}
+			cancel() // the caller gives up, mid-callback, between statements
+			if _, err := tx.SendOne("q", OutMessage{Body: []byte("second")}); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err == nil {
+			t.Error("a transaction cancelled mid-callback reported success")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+			t.Errorf("a cancelled transaction committed %d message(s) — it must roll back", m.Total)
+		}
+	})
+}
+
+// The storm above completes the same message over and over, so after the first success every later
+// Complete is a no-op and its WRITE is never actually interrupted — a hole codex found in my own
+// acceptance test. This one gives every iteration a fresh, genuinely-locked message, so the fenced
+// settle write is the thing being cancelled.
+func TestCancelledSettleWritesLeaveTheDatabaseUsable(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 100})
+
+		for i := 0; i < 150; i++ {
+			if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+				t.Fatalf("send %d: %v", i, err)
+			}
+			msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("receive %d: %v n=%d", i, err, len(msgs))
+			}
+			m := msgs[0]
+
+			// Cancel while the fenced settle write is in flight. Each verb, in turn.
+			cctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%4)*80*time.Microsecond)
+			switch i % 4 {
+			case 0:
+				_ = e.Complete(cctx, "q", m.SeqNumber, m.LockToken)
+			case 1:
+				_ = e.Abandon(cctx, "q", m.SeqNumber, m.LockToken, 0)
+			case 2:
+				_ = e.Reject(cctx, "q", m.SeqNumber, m.LockToken, ReasonAppRequested, "")
+			case 3:
+				_ = e.Defer(cctx, "q", m.SeqNumber, m.LockToken)
+			}
+			cancel()
+		}
+
+		if _, err := e.Stats(ctx, "q"); err != nil {
+			t.Fatalf("the database is unusable after cancelled settle writes: %v", err)
+		}
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("cannot write after cancelled settles: %v", err)
+		}
+	})
+}
