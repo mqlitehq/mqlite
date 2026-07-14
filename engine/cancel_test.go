@@ -360,3 +360,100 @@ func TestCancelledTransactionStopsIssuingStatements(t *testing.T) {
 		}
 	})
 }
+
+// A panicking transaction callback must not take the writer down with it.
+//
+// Engine.Tx runs USER code. If it panics, unwinding hits withConn's `defer conn.Close()` — and
+// Close BLOCKS while the transaction is still open. Without a deferred rollback the panic never
+// even reaches the caller: the goroutine parks inside Close, and the process's one local writer is
+// wedged for good (codex, round-6). Deadlocks do not announce themselves, so this test is written
+// to fail by TIMING OUT rather than to hang the suite.
+func TestPanickingTransactionDoesNotWedgeTheWriter(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		panicked := make(chan any, 1)
+		go func() {
+			defer func() { panicked <- recover() }()
+			_ = e.inTx(ctx, func(ec context.Context, tx *txn) error {
+				if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('boom','1')`); err != nil {
+					t.Errorf("setup statement: %v", err)
+				}
+				panic("the callback blew up")
+			})
+		}()
+
+		select {
+		case got := <-panicked:
+			if got != "the callback blew up" {
+				t.Fatalf("the panic must reach the caller unchanged, got %v", got)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the panic never surfaced: the connection is still held by an open transaction " +
+				"and Close is blocked on it — the single writer is wedged")
+		}
+
+		// The writer survived, and the panicking transaction committed nothing.
+		done := make(chan error, 1)
+		go func() {
+			_, serr := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")})
+			done <- serr
+		}()
+		select {
+		case serr := <-done:
+			if serr != nil {
+				t.Fatalf("the store is unusable after a panicking transaction: %v", serr)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the writer is wedged after a panicking transaction")
+		}
+
+		var n int
+		if err := e.db.queryRowScan(context.Background(), []any{&n},
+			`SELECT COUNT(*) FROM meta WHERE key='boom'`); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("a panicking transaction committed its work (%d row(s)) — it must roll back", n)
+		}
+	})
+}
+
+// Reclamation is a multi-statement sequence pinned to one connection, so the per-statement rule has
+// to hold there too: a cancelled Compact must stop starting SQL rather than run the vacuum and a
+// second checkpoint for a caller who has gone (codex, round-6).
+func TestCancelledReclaimStopsStartingStatements(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		// Cancel with the sequence ALREADY RUNNING — after the first checkpoint. Cancelling sooner
+		// proves nothing: withConn's pre-start check would refuse the whole callback and the guards
+		// under test would never be reached.
+		afterFirstCheckpoint = func() { cancel() }
+		defer func() { afterFirstCheckpoint = nil }()
+
+		if err := e.reclaimPages(cctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("a reclaim cancelled mid-sequence must stop starting statements, not run the\n"+
+				"vacuum and a second checkpoint anyway; got err=%v", err)
+		}
+		afterFirstCheckpoint = nil
+
+		// Nothing was interrupted, so nothing leaked: the store still works.
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable after a cancelled reclaim: %v", err)
+		}
+	})
+}

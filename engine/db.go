@@ -674,8 +674,13 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 			if berr != nil {
 				return berr
 			}
+			// Deferred, not just on the error path: an Engine.Tx callback is USER code and it can
+			// PANIC. Unwinding would otherwise reach withConn's `defer conn.Close()` with the
+			// transaction still open — and Close blocks on it forever, so the panic never reaches
+			// the caller and the process's one writer is wedged for good (codex). Rollback after a
+			// successful Commit is a no-op (ErrTxDone).
+			defer func() { _ = tx.Rollback() }()
 			if ferr := fn(ec, &txn{tx: tx, caller: ctx, exec: ec}); ferr != nil {
-				_ = tx.Rollback()
 				return ferr
 			}
 			// The statements are protected from interruption; the TRANSACTION is not. A callback
@@ -685,8 +690,7 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 			// finishes", not "a transaction already begun commits" (codex). Check the CALLER's
 			// context, not the protected one.
 			if cerr := ctx.Err(); cerr != nil {
-				_ = tx.Rollback()
-				return cerr
+				return cerr // the deferred rollback undoes it
 			}
 			return tx.Commit()
 		})
@@ -704,16 +708,32 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 			}
 			return err
 		}
-		err = fn(e.db.stmtCtx(ctx), &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx)})
-		if err != nil {
-			_ = tx.Rollback()
+		// The rollback is deferred across BOTH the callback and the commit — scoped to the
+		// callback alone it would fire on the success path too, BEFORE Commit, silently rolling
+		// back every remote transaction (TestRemoteTxClosureCanBeReplayed caught exactly that).
+		// After a successful Commit it is a no-op (ErrTxDone); after a PANIC in fn it is what
+		// stops the transaction from being abandoned open.
+		//
+		// The two errors stay separate because they are not retryable on the same terms: a failed
+		// statement retries on any connection error (retryable), a failed COMMIT only when the
+		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
+		// replayable statement failures into ErrOutcomeUnknown.
+		var ferr, cerr error
+		func() {
+			defer func() { _ = tx.Rollback() }()
+			if ferr = fn(e.db.stmtCtx(ctx), &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx)}); ferr != nil {
+				return
+			}
+			cerr = tx.Commit()
+		}()
+		if ferr != nil {
+			err = ferr
 			if e.db.retryable(err) {
 				continue
 			}
 			return err
 		}
-		err = tx.Commit()
-		if err != nil {
+		if err = cerr; err != nil {
 			if e.db.retryableWrite(err) {
 				continue // ErrBadConn / busy: the commit provably didn't land, safe to replay
 			}
