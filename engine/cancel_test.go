@@ -457,3 +457,65 @@ func TestCancelledReclaimStopsStartingStatements(t *testing.T) {
 		}
 	})
 }
+
+// The last two windows where work could still BEGIN for a caller who had already gone. Both are
+// after withConn's checks have passed, so both need a look of their own (codex, round-6).
+func TestNothingBeginsInTheLastWindowBeforeAStatement(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		// 1. While buildArgs runs. It reads the clock, so it can be preempted — and a renewer that
+		//    has been told to stop must not go on to extend the lease it was about to renew.
+		t.Run("while the arguments are being built", func(t *testing.T) {
+			cctx, cancel := context.WithCancel(context.Background())
+			_, err := e.db.execFresh(cctx, `INSERT INTO meta(key,value) VALUES (?,?)`, func() []any {
+				cancel() // the caller gives up exactly here
+				return []any{"fresh", "1"}
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("a statement whose caller gave up while its arguments were being built must\n"+
+					"not run; got err=%v", err)
+			}
+			var n int
+			if err := e.db.queryRowScan(context.Background(), []any{&n},
+				`SELECT COUNT(*) FROM meta WHERE key='fresh'`); err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Fatal("it ran anyway")
+			}
+		})
+
+		// 2. Between BeginTx and the callback. fn is PUBLIC code — an Engine.Tx callback — and once
+		//    it starts it holds the single writer until it returns.
+		t.Run("between BeginTx and the callback", func(t *testing.T) {
+			cctx, cancel := context.WithCancel(context.Background())
+			afterBeginTx = func() { cancel() }
+			defer func() { afterBeginTx = nil }()
+
+			ran := false
+			err := e.inTx(cctx, func(ec context.Context, tx *txn) error {
+				ran = true
+				return nil
+			})
+			afterBeginTx = nil
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("inTx must surface the cancellation, got %v", err)
+			}
+			if ran {
+				t.Fatal("the callback ran for a caller who had already given up — and it holds the\n" +
+					"single writer for as long as it wants to")
+			}
+		})
+
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable afterwards: %v", err)
+		}
+	})
+}

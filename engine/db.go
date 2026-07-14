@@ -335,6 +335,10 @@ func (d *db) stmtCtx(ctx context.Context) context.Context {
 	return context.WithoutCancel(ctx)
 }
 
+// afterBeginTx runs between BeginTx and the callback — the one window a test cannot reach through
+// any public seam. nil in production.
+var afterBeginTx func()
+
 // afterConnAcquired runs between acquiring the connection and starting the statement. It exists so
 // a test can cancel a caller precisely in that window — the window the recheck below defends, and
 // one that is otherwise almost impossible to hit on purpose. nil in production.
@@ -445,8 +449,15 @@ func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any
 	if !d.remote { // local: one attempt; the wait is cancellable, the running statement is not
 		var res sql.Result
 		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			// buildArgs reads the clock and can be preempted, so the caller may give up WHILE it
+			// runs — after withConn's check and before the SQL exists. Materialize the arguments,
+			// then look again: a stopped renewer must not extend a lease (codex).
+			args := buildArgs()
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
 			var e error
-			res, e = c.ExecContext(ec, query, buildArgs()...)
+			res, e = c.ExecContext(ec, query, args...)
 			return e
 		})
 		return res, err
@@ -483,7 +494,11 @@ func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any
 func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
-			rows, qerr := c.QueryContext(ec, query, buildArgs()...)
+			args := buildArgs() // then look again — see execFresh
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
+			rows, qerr := c.QueryContext(ec, query, args...)
 			if qerr != nil {
 				return qerr
 			}
@@ -673,6 +688,17 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 			tx, berr := c.BeginTx(ec, nil)
 			if berr != nil {
 				return berr
+			}
+			if afterBeginTx != nil { // test seam: cancel with the transaction open, before fn
+				afterBeginTx()
+			}
+			// BeginTx itself runs on the protected context, so the caller can give up WHILE it
+			// runs. fn is public code — an Engine.Tx callback — and once it starts it holds the
+			// single writer until it returns. Nothing BEGINS for a caller who has given up, and
+			// that includes the callback (codex).
+			if cerr := ctx.Err(); cerr != nil {
+				_ = tx.Rollback()
+				return cerr
 			}
 			// Deferred, not just on the error path: an Engine.Tx callback is USER code and it can
 			// PANIC. Unwinding would otherwise reach withConn's `defer conn.Close()` with the
