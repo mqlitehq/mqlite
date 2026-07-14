@@ -5,7 +5,7 @@ package engine
 // whose recorded version differs is refused with ErrSchemaVersionMismatch (see db.go)
 // rather than running today's DDL against a layout it doesn't match. Change the token
 // whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
-const schemaVersion = "3"
+const schemaVersion = "5"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc
@@ -118,15 +118,28 @@ var schemaStmts = []string{
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_dedup_seen ON dedup(seen_at)`,
 
-	// settlement receipts make settle (Complete/Abandon/DeadLetter/Defer) idempotent
-	// under client RPC retries: a dropped settle response that the client retries
-	// finds the receipt and returns success instead of a spurious LockLost. Keyed
-	// by lock_token (unique per claim); expires_at bounds growth (janitor sweeps it).
+	// settlement receipts make settle (Complete/Abandon/Reject/Defer) idempotent under client RPC
+	// retries: a dropped settle response that the client retries finds the receipt and returns
+	// success instead of a spurious LockLost.
+	//
+	// A receipt identifies the REQUEST it vouches for, not merely the token: queue + seq_number +
+	// lock_token + operation. Every one of those is load-bearing, and each was learned the hard way.
+	// A receipt that recorded only the token let ANY verb claim ANY other verb's success —
+	// Abandon(T) then Complete(T) returned "completed" while the message sat in the queue. Adding
+	// the operation fixed that verb, and left the deeper hole: `Complete(seqB, tokenA)` still found
+	// tokenA's completion receipt and reported success for a message it never touched — even across
+	// queues. A settle is a claim about ONE message, so its receipt must be too (round-5 §3).
+	//
+	// expires_at bounds growth (the janitor sweeps it).
 	`CREATE TABLE IF NOT EXISTS settlement_receipts (
-	    lock_token  TEXT PRIMARY KEY,
+	    lock_token  TEXT NOT NULL,
+	    queue       TEXT NOT NULL,
+	    seq_number  INTEGER NOT NULL,
 	    operation   TEXT NOT NULL,
+	    args        TEXT NOT NULL,
 	    created_at  INTEGER NOT NULL,
-	    expires_at  INTEGER NOT NULL
+	    expires_at  INTEGER NOT NULL,
+	    PRIMARY KEY (queue, seq_number, lock_token, operation, args)
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_settlement_expire ON settlement_receipts(expires_at)`,
 

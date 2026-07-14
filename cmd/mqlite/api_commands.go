@@ -21,8 +21,13 @@ import (
 // CLI-specific lookalike. Emitting the canonical type (rather than a hand-copied view that
 // renamed seq_number to seq and quietly dropped visible_at_ms/locked_until_ms) means every
 // field the CLI prints carries its canonical wire name and encoding — base64 bodies, epoch-ms
-// timestamps — and a field added to the wire can never silently go missing from the CLI.
-// Pinned by TestCLIJSONIsWireShape (round-2 §3.4).
+// timestamps.
+//
+// The conversion is by hand, so returning the wire type does NOT by itself guarantee that a field
+// added to the wire is POPULATED here — it would simply be emitted zero, which is a quieter kind
+// of wrong (round-4 §5.1). TestCLIViewsCoverEveryWireField exists for exactly that: it pins every
+// wire.Message field to a deliberate decision — copied here, or explicitly not applicable — so a
+// new field cannot slip through as a silent zero. TestCLIJSONIsWireShape pins the type.
 //
 // That is a claim about the FIELDS, not about the whole response: the CLI prints a bare array
 // where wire.ReceiveResponse has a {"messages":[...]} envelope, and it emits the lock token

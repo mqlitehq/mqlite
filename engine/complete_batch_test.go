@@ -597,3 +597,309 @@ func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
 		t.Error("RenewBatch claimed Ok for a lease that was already expired when the write completed — the caller would settle a message it no longer holds")
 	}
 }
+
+// ─── settlement receipts are VERB-SPECIFIC (round-4 §3) ────────────────────────
+
+// A receipt vouches for the verb that WROTE it, not merely for the token.
+//
+// Receipts make a lost settle response replayable: the same verb, same token, same success. They
+// are not a licence for a DIFFERENT verb to claim that success. Abandon(T) returns a message to
+// `active` — and used to leave a receipt that a later Complete(T) read as "already completed",
+// telling the caller the message was gone while it sat in the queue waiting for somebody else.
+// At-least-once permits redelivery; it does not permit a successful Complete for a message
+// Complete never removed.
+//
+// The full 4×4: only the diagonal — the same verb replayed — may succeed, and every cell asserts
+// the message's ACTUAL state, not just the return value.
+func TestSettlementReceiptsAreVerbSpecific(t *testing.T) {
+	type verb struct {
+		name  string
+		call  func(e *Engine, ctx context.Context, seq int64, tok string) error
+		state State // where this verb leaves the message
+	}
+	verbs := []verb{
+		{"Complete", func(e *Engine, ctx context.Context, s int64, tk string) error {
+			return e.Complete(ctx, "q", s, tk)
+		}, ""}, // gone
+		{"Abandon", func(e *Engine, ctx context.Context, s int64, tk string) error {
+			return e.Abandon(ctx, "q", s, tk, 0)
+		}, StateActive},
+		{"Reject", func(e *Engine, ctx context.Context, s int64, tk string) error {
+			return e.Reject(ctx, "q", s, tk, ReasonAppRequested, "")
+		}, StateDeadLettered},
+		{"Defer", func(e *Engine, ctx context.Context, s int64, tk string) error {
+			return e.Defer(ctx, "q", s, tk)
+		}, StateDeferred},
+	}
+
+	for _, first := range verbs {
+		for _, second := range verbs {
+			t.Run(first.name+"_then_"+second.name, func(t *testing.T) {
+				ctx := context.Background()
+				e, _ := testEngine(t)
+				mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+				if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+					t.Fatal(err)
+				}
+				msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+				if err != nil || len(msgs) != 1 {
+					t.Fatalf("receive: %v n=%d", err, len(msgs))
+				}
+				seq, tok := msgs[0].SeqNumber, msgs[0].LockToken
+
+				if err := first.call(e, ctx, seq, tok); err != nil {
+					t.Fatalf("%s: %v", first.name, err)
+				}
+
+				err = second.call(e, ctx, seq, tok)
+				same := first.name == second.name
+				if same && err != nil {
+					t.Errorf("replaying %s with the same token must be an idempotent success, got %v",
+						second.name, err)
+				}
+				if !same && !errors.Is(err, ErrLockLost) {
+					t.Errorf("%s after %s returned %v — a receipt written by %s must not vouch for %s; the message is still %q",
+						second.name, first.name, err, first.name, second.name, first.state)
+				}
+
+				// Whatever was returned, the message must still be where the FIRST verb left it.
+				m, err := e.Stats(ctx, "q")
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := map[State]int64{
+					StateActive: m.Active, StateDeadLettered: m.DeadLettered, StateDeferred: m.Deferred,
+				}
+				if first.state == "" { // Complete removed it
+					if m.Total != 0 {
+						t.Errorf("total=%d after %s+%s, want 0 — the message must stay completed", m.Total, first.name, second.name)
+					}
+					return
+				}
+				if got[first.state] != 1 || m.Total != 1 {
+					t.Errorf("after %s+%s the message is not %s (total=%d active=%d dead=%d deferred=%d)",
+						first.name, second.name, first.state, m.Total, m.Active, m.DeadLettered, m.Deferred)
+				}
+			})
+		}
+	}
+}
+
+// CompleteBatch carries the same rule: only a COMPLETION may vouch for a completion. A token
+// abandoned earlier must come back ok=false, not a false success for a message still in the queue.
+func TestCompleteBatchReceiptIsVerbSpecific(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	seq, tok := msgs[0].SeqNumber, msgs[0].LockToken
+
+	if err := e.Abandon(ctx, "q", seq, tok, 0); err != nil { // back to active, receipt "abandoned"
+		t.Fatal(err)
+	}
+	res, err := e.CompleteBatch(ctx, "q", []SettleItem{{SeqNumber: seq, LockToken: tok}})
+	if err != nil {
+		t.Fatalf("CompleteBatch: %v", err)
+	}
+	if res[0].Ok {
+		t.Error("CompleteBatch reported ok for a token that was ABANDONED — the message is still in the queue, waiting to be handed to somebody else")
+	}
+	if m, _ := e.Stats(ctx, "q"); m.Active != 1 || m.Total != 1 {
+		t.Errorf("active=%d total=%d, want 1/1 — the abandoned message must still be there", m.Active, m.Total)
+	}
+
+	// And a genuine completion still replays as an idempotent success.
+	msgs, err = e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("re-receive: %v n=%d", err, len(msgs))
+	}
+	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
+	if res, err := e.CompleteBatch(ctx, "q", []SettleItem{item}); err != nil || !res[0].Ok {
+		t.Fatalf("CompleteBatch: %v ok=%v", err, res[0].Ok)
+	}
+	if res, err := e.CompleteBatch(ctx, "q", []SettleItem{item}); err != nil || !res[0].Ok {
+		t.Fatalf("replaying the SAME completion must stay an idempotent success: %v ok=%v", err, res[0].Ok)
+	}
+}
+
+// A receipt vouches for ONE REQUEST — this queue, this seq, this token, this verb. Not for a token.
+//
+// Binding the verb (round-4) closed Abandon(T)→Complete(T). It left the deeper hole: the receipt
+// still said nothing about WHICH MESSAGE it settled, so `Complete(seqB, tokenA)` found tokenA's
+// completion receipt and reported success for a message it never touched — in the same queue, in
+// the batch path, and even across queues. A settle is a claim about one message; its receipt must
+// be too (round-5 §3).
+func TestReceiptsAreBoundToTheirMessage(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+	mustQueue(t, e, "other", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+
+	for i := 0; i < 2; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.SendOne(ctx, "other", OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 2})
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	elsewhere, err := e.Receive(ctx, "other", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(elsewhere) != 1 {
+		t.Fatalf("receive other: %v n=%d", err, len(elsewhere))
+	}
+	a, b := msgs[0], msgs[1]
+
+	// A is completed for real: that writes a receipt for (q, seqA, tokenA, completed).
+	if err := e.Complete(ctx, "q", a.SeqNumber, a.LockToken); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. A's receipt must not settle B.
+	if err := e.Complete(ctx, "q", b.SeqNumber, a.LockToken); !errors.Is(err, ErrLockLost) {
+		t.Errorf("Complete(seqB, tokenA) = %v, want ErrLockLost — A's receipt says nothing about B", err)
+	}
+	// 2. Nor through the batch path.
+	res, err := e.CompleteBatch(ctx, "q", []SettleItem{{SeqNumber: b.SeqNumber, LockToken: a.LockToken}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].Ok {
+		t.Error("CompleteBatch(seqB, tokenA) reported ok — B was never touched and is still locked")
+	}
+	// 3. Nor in another queue.
+	if err := e.Complete(ctx, "other", elsewhere[0].SeqNumber, a.LockToken); !errors.Is(err, ErrLockLost) {
+		t.Errorf("Complete(otherQueue, tokenA) = %v, want ErrLockLost", err)
+	}
+
+	// B and the other queue's message are untouched — still locked, still there.
+	if m, _ := e.Stats(ctx, "q"); m.Locked != 1 || m.Total != 1 {
+		t.Errorf("queue q: locked=%d total=%d, want 1/1 — B must be exactly where it was", m.Locked, m.Total)
+	}
+	if m, _ := e.Stats(ctx, "other"); m.Locked != 1 || m.Total != 1 {
+		t.Errorf("queue other: locked=%d total=%d, want 1/1", m.Locked, m.Total)
+	}
+
+	// And the genuine replay — the SAME request — is still an idempotent success.
+	if err := e.Complete(ctx, "q", a.SeqNumber, a.LockToken); err != nil {
+		t.Errorf("replaying the same Complete must stay an idempotent success, got %v", err)
+	}
+}
+
+// ─── receipt identity: the ARGUMENTS ──────────────────────────────────────────
+
+// A receipt vouches for a REQUEST. Same message, same token, same verb — but a different delay or
+// a different dead-letter reason is a DIFFERENT request, and it must not inherit the first one's
+// success. It used to: Abandon(T, 60s) after Abandon(T, 5s) returned nil while the message quietly
+// kept the 5s delay, so a client's backoff was silently discarded and the message came back early
+// (round-6 §3). Reject's reason/description had the same hole — the operator would read the wrong
+// text out of the DLQ and be told the write had succeeded.
+func TestReceiptsAreBoundToTheirArguments(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+	lock := func() *Message {
+		t.Helper()
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("receive: %v (%d)", err, len(got))
+		}
+		return got[0]
+	}
+
+	t.Run("abandon delay", func(t *testing.T) {
+		m := lock()
+		if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 5_000); err != nil {
+			t.Fatalf("first abandon: %v", err)
+		}
+		// The SAME request, replayed (a lost response): idempotent success.
+		if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 5_000); err != nil {
+			t.Fatalf("replaying the same Abandon must be an idempotent success, got %v", err)
+		}
+		// A DIFFERENT delay is a different request on a message this caller no longer holds.
+		err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 60_000)
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("Abandon with a CHANGED delay must be ErrLockLost — it cannot report success while\n"+
+				"keeping the first call's 5s delay. got err=%v", err)
+		}
+		// And the message really does still carry the delay the first call asked for.
+		p, err := e.Peek(ctx, "q", PeekOptions{FromSeq: m.SeqNumber, Max: 1})
+		if err != nil || len(p) != 1 {
+			t.Fatalf("peek: %v", err)
+		}
+		if want := m.EnqueuedAtMs; p[0].VisibleAtMs > want+30_000 {
+			t.Fatalf("visible_at moved to the second call's delay — the false success wrote through")
+		}
+	})
+
+	t.Run("reject reason and description", func(t *testing.T) {
+		for _, tc := range []struct{ name, reason, desc string }{
+			{"changed reason", "OtherReason", "boom"},
+			{"changed description", "PoisonMessage", "something else"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				m := lock()
+				if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "PoisonMessage", "boom"); err != nil {
+					t.Fatalf("first reject: %v", err)
+				}
+				if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "PoisonMessage", "boom"); err != nil {
+					t.Fatalf("replaying the same Reject must be an idempotent success, got %v", err)
+				}
+				if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, tc.reason, tc.desc); !errors.Is(err, ErrLockLost) {
+					t.Fatalf("Reject with a CHANGED %s must be ErrLockLost, not a success that keeps the\n"+
+						"original text in the DLQ. got err=%v", tc.name, err)
+				}
+				p, err := e.Peek(ctx, "q", PeekOptions{FromSeq: m.SeqNumber, Max: 1})
+				if err != nil || len(p) != 1 {
+					t.Fatalf("peek: %v", err)
+				}
+				if p[0].DeadLetterReason != "PoisonMessage" || p[0].DeadLetterDescription != "boom" {
+					t.Fatalf("the DLQ text changed under a call that was supposed to fail: reason=%q desc=%q",
+						p[0].DeadLetterReason, p[0].DeadLetterDescription)
+				}
+			})
+		}
+	})
+
+	// Reject defaults an empty reason to ReasonAppRequested BEFORE the receipt is keyed, so the two
+	// spellings of the same request stay the same request.
+	t.Run("the default reason is not a different request", func(t *testing.T) {
+		m := lock()
+		if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "", ""); err != nil {
+			t.Fatalf("first reject: %v", err)
+		}
+		if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, ReasonAppRequested, ""); err != nil {
+			t.Fatalf("Reject(\"\") and Reject(ReasonAppRequested) are the SAME request; the replay must\n"+
+				"succeed. got %v", err)
+		}
+	})
+
+	// Complete and Defer take no arguments that change what they do, so nothing about them may be
+	// argument-sensitive — their receipts stay plain replays.
+	t.Run("argument-free verbs still replay", func(t *testing.T) {
+		m := lock()
+		if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+			t.Fatalf("replaying Complete must stay an idempotent success, got %v", err)
+		}
+	})
+}

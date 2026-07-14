@@ -23,7 +23,7 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 	}
 	now := e.now()
 	var out []*Message
-	err := e.inTx(ctx, func(tx *sql.Tx) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		if msgs, ok, err := lookupAttempt(ctx, tx, q.name, attemptID, now); err != nil {
 			return err
 		} else if ok {
@@ -52,7 +52,7 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 	return out, nil
 }
 
-func lookupAttempt(ctx context.Context, tx *sql.Tx, queue, attemptID string, now int64) ([]*Message, bool, error) {
+func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, now int64) ([]*Message, bool, error) {
 	var blob string
 	err := tx.QueryRowContext(ctx,
 		`SELECT response FROM receive_attempts WHERE queue=? AND attempt_id=? AND expires_at>?`,
@@ -70,7 +70,7 @@ func lookupAttempt(ctx context.Context, tx *sql.Tx, queue, attemptID string, now
 	return msgs, true, nil
 }
 
-func storeAttempt(ctx context.Context, tx *sql.Tx, queue, attemptID string, msgs []*Message, now, expires int64) error {
+func storeAttempt(ctx context.Context, tx *txn, queue, attemptID string, msgs []*Message, now, expires int64) error {
 	blob, err := json.Marshal(msgs)
 	if err != nil {
 		return err
@@ -82,7 +82,7 @@ func storeAttempt(ctx context.Context, tx *sql.Tx, queue, attemptID string, msgs
 }
 
 // claimUpToTx is claimUpTo bound to an explicit transaction (idempotent receive).
-func (e *Engine) claimUpToTx(ctx context.Context, tx *sql.Tx, q queueRow, max int, mode ReceiveMode, now int64) ([]*Message, error) {
+func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, mode ReceiveMode, now int64) ([]*Message, error) {
 	var out []*Message
 	var bytes int64
 	for i := 0; i < max; i++ {
@@ -112,7 +112,7 @@ func (e *Engine) claimUpToTx(ctx context.Context, tx *sql.Tx, q queueRow, max in
 	return out, nil
 }
 
-func (e *Engine) claimOneTx(ctx context.Context, tx *sql.Tx, q queueRow, now int64) (*Message, error) {
+func (e *Engine) claimOneTx(ctx context.Context, tx *txn, q queueRow, now int64) (*Message, error) {
 	token := randToken()
 	lockUntil := now + q.lockDurationMs
 	var (

@@ -1,0 +1,521 @@
+package engine
+
+// Cancellation acceptance suite (round-5 §2.4). Two properties must hold TOGETHER, and every
+// earlier attempt at this bug sacrificed one to get the other:
+//
+//   1. a cancelled caller stops waiting and creates NO post-timeout mutation;
+//   2. cancelling an in-flight operation does not erase or wedge the database.
+//
+// Both are asserted on a file store AND on `:memory:`, because they failed differently on each.
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func eachLocalStore(t *testing.T, fn func(t *testing.T, dsn string)) {
+	t.Helper()
+	for _, dsn := range []string{":memory:", "file:" + filepath.Join(t.TempDir(), "mq.db")} {
+		name := "memory"
+		if dsn != ":memory:" {
+			name = "file"
+		}
+		t.Run(name, func(t *testing.T) { fn(t, dsn) })
+	}
+}
+
+// A caller who has ALREADY given up must not start work: nothing runs, so nothing can commit.
+func TestPreCancelledNeverExecutes(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+
+		dead, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := e.SendOne(dead, "q", OutMessage{Body: []byte("must-not-exist")}); err == nil {
+			t.Error("a pre-cancelled Send returned success")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+			t.Errorf("a pre-cancelled Send wrote %d message(s)", m.Total)
+		}
+	})
+}
+
+// A caller WAITING for the single writer must honour its own deadline — and must not commit after
+// it. This is the regression the round-4 review caught in the first attempt at this fix (a write
+// that waited out the holder and committed 500ms after the client had gone). It must never return.
+func TestCancelWhileWaitingWritesNothing(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+
+		held := make(chan struct{})
+		go func() {
+			_ = e.Tx(ctx, func(tx *EngineTx) error {
+				close(held)
+				time.Sleep(500 * time.Millisecond) // occupy the single writer
+				return nil
+			})
+		}()
+		<-held
+
+		start := time.Now()
+		short, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		_, err = e.SendOne(short, "q", OutMessage{Body: []byte("must-not-commit")})
+		took := time.Since(start)
+		cancel()
+
+		if err == nil {
+			t.Error("a Send that timed out while queued returned success")
+		}
+		if took > 300*time.Millisecond {
+			t.Errorf("a queued Send ignored its 80ms deadline (took %s)", took)
+		}
+		time.Sleep(600 * time.Millisecond) // the holder finishes; nothing may appear afterwards
+		if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+			t.Errorf("the timed-out Send committed LATE (total=%d)", m.Total)
+		}
+	})
+}
+
+// Cancelling EXECUTING statements — the renewer does this by design on every receive — must leave
+// the database usable. Interrupting a local statement leaks the connection: the file then stays
+// locked (SQLITE_BUSY, permanently) and `:memory:` is destroyed outright ("no such table:
+// messages"). Both were reproducible; ~40% of runs before the fix.
+func TestCancelStormLeavesTheDatabaseUsable(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000})
+		seed := make([]OutMessage, 64)
+		for i := range seed {
+			seed[i] = OutMessage{Body: []byte("m")}
+		}
+		if _, err := e.Send(ctx, "q", seed...); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 64})
+		if err != nil || len(msgs) != 64 {
+			t.Fatalf("receive: %v n=%d", err, len(msgs))
+		}
+		items := make([]SettleItem, len(msgs))
+		for i, m := range msgs {
+			items[i] = SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+		}
+
+		// Reads, writes, batches and transactions, all interrupted mid-flight.
+		for i := 0; i < 200; i++ {
+			cctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%5)*100*time.Microsecond)
+			_, _ = e.RenewBatch(cctx, "q", items)                             // set-based write
+			_, _ = e.SendOne(cctx, "q", OutMessage{Body: []byte("x")})        // transaction
+			_ = e.Complete(cctx, "q", items[0].SeqNumber, items[0].LockToken) // settle
+			_, _ = e.Peek(cctx, "q", PeekOptions{Max: 10})                    // read
+			_ = e.Tx(cctx, func(tx *EngineTx) error { _, e := tx.SendOne("q", OutMessage{Body: []byte("t")}); return e })
+			cancel()
+		}
+
+		if _, err := e.Stats(ctx, "q"); err != nil {
+			t.Fatalf("the database is unusable after cancellations: %v", err)
+		}
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("cannot write after cancellations: %v", err)
+		}
+		if _, err := e.Peek(ctx, "q", PeekOptions{Max: 1}); err != nil {
+			t.Fatalf("cannot read after cancellations: %v", err)
+		}
+	})
+}
+
+// Two `:memory:` engines are still two separate databases.
+func TestMemoryEnginesStayIsolated(t *testing.T) {
+	ctx := context.Background()
+	a, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	mustQueue(t, a, "only-in-a", QueueConfig{})
+	if _, err := b.Stats(ctx, "only-in-a"); err == nil {
+		t.Error("a queue created in one :memory: engine is visible in another")
+	}
+}
+
+// A transaction cancelled BETWEEN its statements must roll back. The statements are protected from
+// interruption; the transaction is not. Committing here would persist work the caller had already
+// abandoned — "a statement already executing finishes" is not "a transaction already begun
+// commits" (codex, round-5 follow-up).
+func TestTxCancelledBetweenStatementsRollsBack(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		err = e.Tx(cctx, func(tx *EngineTx) error {
+			if _, err := tx.SendOne("q", OutMessage{Body: []byte("first")}); err != nil {
+				return err
+			}
+			cancel() // the caller gives up, mid-callback, between statements
+			if _, err := tx.SendOne("q", OutMessage{Body: []byte("second")}); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err == nil {
+			t.Error("a transaction cancelled mid-callback reported success")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+			t.Errorf("a cancelled transaction committed %d message(s) — it must roll back", m.Total)
+		}
+	})
+}
+
+// The storm above completes the same message over and over, so after the first success every later
+// Complete is a no-op and its WRITE is never actually interrupted — a hole codex found in my own
+// acceptance test. This one gives every iteration a fresh, genuinely-locked message, so the fenced
+// settle write is the thing being cancelled.
+func TestCancelledSettleWritesLeaveTheDatabaseUsable(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 100})
+
+		for i := 0; i < 150; i++ {
+			if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+				t.Fatalf("send %d: %v", i, err)
+			}
+			msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("receive %d: %v n=%d", i, err, len(msgs))
+			}
+			m := msgs[0]
+
+			// Cancel while the fenced settle write is in flight. Each verb, in turn.
+			cctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%4)*80*time.Microsecond)
+			switch i % 4 {
+			case 0:
+				_ = e.Complete(cctx, "q", m.SeqNumber, m.LockToken)
+			case 1:
+				_ = e.Abandon(cctx, "q", m.SeqNumber, m.LockToken, 0)
+			case 2:
+				_ = e.Reject(cctx, "q", m.SeqNumber, m.LockToken, ReasonAppRequested, "")
+			case 3:
+				_ = e.Defer(cctx, "q", m.SeqNumber, m.LockToken)
+			}
+			cancel()
+		}
+
+		if _, err := e.Stats(ctx, "q"); err != nil {
+			t.Fatalf("the database is unusable after cancelled settle writes: %v", err)
+		}
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("cannot write after cancelled settles: %v", err)
+		}
+	})
+}
+
+// The window between "the wait returned" and "the statement starts" is real: past that point
+// cancellation is deliberately gone, so a caller who gives up THERE would otherwise have a
+// destructive operation run on its behalf anyway. Nothing may BEGIN for a caller who has given up
+// (codex, round-5 follow-up).
+//
+// Cancel the caller while it is queued behind the writer, then let the writer go: the operation
+// must not run, whatever the scheduling.
+func TestCancelInTheHandoffWindowStartsNothing(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("keep-me")}); err != nil {
+			t.Fatal(err)
+		}
+		msgs, _ := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+		if len(msgs) != 1 {
+			t.Fatal("receive")
+		}
+		if err := e.Reject(ctx, "q", msgs[0].SeqNumber, msgs[0].LockToken, ReasonAppRequested, ""); err != nil {
+			t.Fatal(err) // one dead letter to purge
+		}
+
+		// Hold the writer, queue a destructive Purge behind it, and cancel that caller while it waits.
+		release := make(chan struct{})
+		held := make(chan struct{})
+		go func() {
+			_ = e.Tx(ctx, func(tx *EngineTx) error {
+				close(held)
+				<-release
+				return nil
+			})
+		}()
+		<-held
+
+		cctx, cancel := context.WithCancel(context.Background())
+
+		// Cancel the caller EXACTLY in the handoff window: the connection is in hand, the statement
+		// has not started. Cancelling any earlier is uninteresting — the wait itself would fail.
+		afterConnAcquired = func() { cancel() }
+		defer func() { afterConnAcquired = nil }()
+
+		done := make(chan error, 1)
+		go func() {
+			_, perr := e.Purge(cctx, "q", RedriveOptions{})
+			done <- perr
+		}()
+		time.Sleep(50 * time.Millisecond) // queued behind the writer
+		close(release)                    // the writer lets go; the purge acquires the conn, then dies
+
+		if err := <-done; err == nil {
+			t.Error("a Purge whose caller had given up ran anyway")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.DeadLettered != 1 {
+			t.Errorf("dead_lettered=%d — the cancelled Purge destroyed data on behalf of a caller who was gone", m.DeadLettered)
+		}
+	})
+}
+
+// A transaction whose caller has given up must stop ISSUING statements — not grind through the
+// rest of the closure and roll back at the end.
+//
+// The statements inside a local transaction deliberately run on an uninterruptible context, which
+// is what keeps an in-flight write from wedging the database. The trap is that "uninterruptible"
+// used to mean the closure kept going: a cancelled caller's 256-message Send still executed all
+// 256 inserts, and an Engine.Tx callback held the process's one writer for its full duration with
+// no way to stop it (codex, round-6). The rule is per-statement, and *txn enforces it: a statement
+// already executing finishes; the next one does not begin.
+func TestCancelledTransactionStopsIssuingStatements(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		var second error
+		txErr := e.inTx(cctx, func(ec context.Context, tx *txn) error {
+			if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe','1')`); err != nil {
+				t.Fatalf("the FIRST statement runs normally: %v", err)
+			}
+			cancel() // the caller gives up, mid-transaction
+			_, second = tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe2','1')`)
+			return second
+		})
+		if !errors.Is(second, context.Canceled) {
+			t.Fatalf("the statement AFTER the cancellation must not be issued at all; got err=%v", second)
+		}
+		if !errors.Is(txErr, context.Canceled) {
+			t.Fatalf("inTx must surface the cancellation, got %v", txErr)
+		}
+
+		// ...and the transaction rolled back, so not even the first statement survives.
+		var n int
+		if err := e.db.queryRowScan(context.Background(), []any{&n},
+			`SELECT COUNT(*) FROM meta WHERE key IN ('probe','probe2')`); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("a cancelled transaction committed %d row(s) — it must roll back entirely", n)
+		}
+
+		// The database is still perfectly usable: nothing was interrupted, so nothing leaked.
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable after a cancelled transaction: %v", err)
+		}
+	})
+}
+
+// A panicking transaction callback must not take the writer down with it.
+//
+// Engine.Tx runs USER code. If it panics, unwinding hits withConn's `defer conn.Close()` — and
+// Close BLOCKS while the transaction is still open. Without a deferred rollback the panic never
+// even reaches the caller: the goroutine parks inside Close, and the process's one local writer is
+// wedged for good (codex, round-6). Deadlocks do not announce themselves, so this test is written
+// to fail by TIMING OUT rather than to hang the suite.
+func TestPanickingTransactionDoesNotWedgeTheWriter(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		panicked := make(chan any, 1)
+		go func() {
+			defer func() { panicked <- recover() }()
+			_ = e.inTx(ctx, func(ec context.Context, tx *txn) error {
+				if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('boom','1')`); err != nil {
+					t.Errorf("setup statement: %v", err)
+				}
+				panic("the callback blew up")
+			})
+		}()
+
+		select {
+		case got := <-panicked:
+			if got != "the callback blew up" {
+				t.Fatalf("the panic must reach the caller unchanged, got %v", got)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the panic never surfaced: the connection is still held by an open transaction " +
+				"and Close is blocked on it — the single writer is wedged")
+		}
+
+		// The writer survived, and the panicking transaction committed nothing.
+		done := make(chan error, 1)
+		go func() {
+			_, serr := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")})
+			done <- serr
+		}()
+		select {
+		case serr := <-done:
+			if serr != nil {
+				t.Fatalf("the store is unusable after a panicking transaction: %v", serr)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the writer is wedged after a panicking transaction")
+		}
+
+		var n int
+		if err := e.db.queryRowScan(context.Background(), []any{&n},
+			`SELECT COUNT(*) FROM meta WHERE key='boom'`); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("a panicking transaction committed its work (%d row(s)) — it must roll back", n)
+		}
+	})
+}
+
+// Reclamation is a multi-statement sequence pinned to one connection, so the per-statement rule has
+// to hold there too: a cancelled Compact must stop starting SQL rather than run the vacuum and a
+// second checkpoint for a caller who has gone (codex, round-6).
+func TestCancelledReclaimStopsStartingStatements(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		// Cancel with the sequence ALREADY RUNNING — after the first checkpoint. Cancelling sooner
+		// proves nothing: withConn's pre-start check would refuse the whole callback and the guards
+		// under test would never be reached.
+		afterFirstCheckpoint = func() { cancel() }
+		defer func() { afterFirstCheckpoint = nil }()
+
+		if err := e.reclaimPages(cctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("a reclaim cancelled mid-sequence must stop starting statements, not run the\n"+
+				"vacuum and a second checkpoint anyway; got err=%v", err)
+		}
+		afterFirstCheckpoint = nil
+
+		// Nothing was interrupted, so nothing leaked: the store still works.
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable after a cancelled reclaim: %v", err)
+		}
+	})
+}
+
+// The last two windows where work could still BEGIN for a caller who had already gone. Both are
+// after withConn's checks have passed, so both need a look of their own (codex, round-6).
+func TestNothingBeginsInTheLastWindowBeforeAStatement(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		// 1. While buildArgs runs. It reads the clock, so it can be preempted — and a renewer that
+		//    has been told to stop must not go on to extend the lease it was about to renew.
+		t.Run("while the arguments are being built", func(t *testing.T) {
+			cctx, cancel := context.WithCancel(context.Background())
+			_, err := e.db.execFresh(cctx, `INSERT INTO meta(key,value) VALUES (?,?)`, func() []any {
+				cancel() // the caller gives up exactly here
+				return []any{"fresh", "1"}
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("a statement whose caller gave up while its arguments were being built must\n"+
+					"not run; got err=%v", err)
+			}
+			var n int
+			if err := e.db.queryRowScan(context.Background(), []any{&n},
+				`SELECT COUNT(*) FROM meta WHERE key='fresh'`); err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Fatal("it ran anyway")
+			}
+		})
+
+		// 2. Between BeginTx and the callback. fn is PUBLIC code — an Engine.Tx callback — and once
+		//    it starts it holds the single writer until it returns.
+		t.Run("between BeginTx and the callback", func(t *testing.T) {
+			cctx, cancel := context.WithCancel(context.Background())
+			afterBeginTx = func() { cancel() }
+			defer func() { afterBeginTx = nil }()
+
+			ran := false
+			err := e.inTx(cctx, func(ec context.Context, tx *txn) error {
+				ran = true
+				return nil
+			})
+			afterBeginTx = nil
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("inTx must surface the cancellation, got %v", err)
+			}
+			if ran {
+				t.Fatal("the callback ran for a caller who had already given up — and it holds the\n" +
+					"single writer for as long as it wants to")
+			}
+		})
+
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable afterwards: %v", err)
+		}
+	})
+}

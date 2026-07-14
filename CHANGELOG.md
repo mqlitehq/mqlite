@@ -10,16 +10,21 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 
 ## Unreleased
 
+> **Schema: this release is `schemaVersion = 5`.** mqlite keeps ONE canonical schema and never
+> migrates (pre-1.0), so an existing DB from any earlier release is refused with
+> `ErrSchemaVersionMismatch` and must be recreated. **Before upgrading, stop all writers and back
+> up** (`VACUUM INTO`, or copy the file with the broker stopped), then start on a fresh DB — mqlite
+> never deletes your data for you. Two changes below are what made the schema incompatible:
+> `seq_number` allocation and the settlement-receipt key.
+
 ### Behavior changes
 
-- **Schema v3: `seq_number` is now allocated with `AUTOINCREMENT` and never reused**
+- **`seq_number` is now allocated with `AUTOINCREMENT` and never reused**
   (MQLITE-71). Previously SQLite could recycle the highest `id` after its row was deleted,
   so a stale `Cancel` (which is fenced only by `seq_number`) could delete a *later* message
   that reused that id — real message loss. Sequence numbers are now strictly increasing and
-  never reused (they may gap); a settled/cancelled seq is gone for good. **Schema-breaking:**
-  pre-1.0, an existing DB is refused with `ErrSchemaVersionMismatch` and must be recreated —
-  **before upgrading, stop all writers and back up** (`VACUUM INTO` or a stopped-broker copy),
-  then start on a fresh DB. The broker never deletes your data automatically.
+  never reused (they may gap); a settled/cancelled seq is gone for good. Schema-breaking — see the
+  note above.
 - **Scheduled multi-message `Send` is now atomic** (MQLITE-72): a mid-batch failure (e.g. a
   `group_fifo` item missing its `group_id`) rolls back the whole batch instead of leaving
   earlier items scheduled. A single scheduled message still distinguishes a dedup conflict
@@ -183,8 +188,8 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   set-based inside the engine** — a fixed number of SQL statements rather than one (or two) per
   message. On a remote Turso/libSQL store every statement is its own round trip, so the old
   item-by-item loops made a 256-message settle ~512 remote round trips: the same O(N) latency,
-  one layer down, on the very RPC whose slowness lets the batch's own locks expire. The CLI's
-  CLI stays compatible with an **older broker**: one that predates `RenewBatch` answers 404, and
+  one layer down, on the very RPC whose slowness lets the batch's own locks expire. The CLI stays
+  compatible with an **older broker**: one that predates `RenewBatch` answers 404, and
   the CLI falls back to per-message `Renew` (what it used to do) rather than silently renewing
   nothing. New `mqlite.ErrUnsupported` reports "this broker does not serve that operation",
   distinct from `ErrNotFound` ("that queue/message does not exist"), which the same broker also
@@ -201,6 +206,57 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   `purge-dlq --all --max 0` is now the same contradiction as `--all --max 10` (the check reads
   whether the flag was *given*, not its value); and giving a body both as an argument and with
   `--file` is an error instead of silently letting the file win.
+
+- **A settlement receipt now vouches only for the VERB THAT WROTE IT** (MQLITE-99). Receipts make a
+  settle whose response was lost replayable — the same verb, same token, same success. They were
+  not checking the verb, so `Abandon(T)` (which returns the message to `active`) left a receipt
+  that a later `Complete(T)` read as "already completed": **the caller was told the message was
+  gone while it sat in the queue, waiting to be handed to somebody else.** `CompleteBatch` reported
+  the same false `ok`. Every cross-verb combination now fails with `ErrLockLost` / `ok=false` and
+  leaves the message where it was; a same-verb replay is still an idempotent success. **This defect
+  predates the batch work and ships in the released v0.2.0.**
+- **`Engine.Tx` / `Embedded.Tx`: the callback may run more than once on a REMOTE store** (MQLITE-99,
+  documentation). A transaction that fails on a retryable connection/busy error is replayed from
+  the start. The SQL rolls back, so your data stays correct — but anything the callback does
+  *outside* the transaction (an HTTP call, a charge, a counter) will have happened twice. Keep the
+  callback transaction-bound. Local file and `:memory:` stores never retry, so it runs exactly once
+  there.
+
+- **Cancelling a request can no longer wedge or erase a local database** (MQLITE-98/100).
+  Interrupting an in-flight statement on a local SQLite store LEAKS the connection: the pool then
+  reports zero open connections while the file stays locked, and every later statement fails with
+  `SQLITE_BUSY` — permanently. On `:memory:` the same event destroys the database outright, since
+  it lives inside that connection ("no such table: messages"). One root cause, two faces; ~40% of
+  runs in a 200-cancellation storm. **Reachable from ordinary code**: a timed-out HTTP request is
+  enough, and the CLI's renewer cancels an in-flight renewal *by design* on every receive.
+  A statement that is already EXECUTING on a local store is therefore no longer interrupted. The
+  contract stays narrow, and cancellation keeps its meaning: an already-cancelled caller never
+  starts a statement, and a caller waiting for the single writer keeps its own deadline and mutates
+  nothing. Only a statement already running is allowed to finish, and the next one in a transaction
+  does not begin. **Be clear about what this costs**: a local statement that has started cannot be
+  cancelled, and there is no upper bound on how long it runs — `EngineTx.SQL()` executes arbitrary
+  user SQL, a full `VACUUM` rewrites the file, a large `Purge` is a big `DELETE`. A write can
+  therefore commit *after* its caller has given up, so keep treating a lost response as
+  at-least-once and reconcile. **Remote (Turso) stores are unchanged**: their statements can
+  genuinely block, so they keep real cancellation, and a discarded connection there holds no local
+  lock. New `EngineTx.Context()` is the context your own statements inside `Engine.Tx` should use;
+  the full contract is in `docs/conformance.md`.
+- **Settlement receipts identify the REQUEST, not just the token** (MQLITE-100). Schema-breaking —
+  see the note above. A receipt now records
+  `queue + seq_number + lock_token + operation + args`, and every part is load-bearing — each one
+  was a false success in its own right:
+
+  - **the message.** Matching the token alone meant `Complete(seqB, tokenA)` found A's receipt and
+    reported success for a message it never touched — in the same queue, through `CompleteBatch`,
+    and even across queues. The message stayed locked while the caller was told it was gone.
+  - **the verb.** An `Abandon(T)` — which returns the message to the queue — left a receipt a
+    later `Complete(T)` read as "already completed".
+  - **the arguments that change the effect.** `Abandon`'s `delay_ms` and `Reject`'s
+    `reason`/`description`. `Abandon(T, 60s)` after `Abandon(T, 5s)` returned success while
+    silently keeping the 5s delay: your backoff was discarded and the message came back early.
+
+  A replay is the SAME request, and only that. Anything else, on a message you no longer hold, is
+  `ErrLockLost` — which is the truth.
 
 ## v0.2.0 — 2026-07-11
 

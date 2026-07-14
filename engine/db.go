@@ -300,6 +300,81 @@ func (d *db) backoff(ctx context.Context, attempt int) {
 	}
 }
 
+// ─── cancellation on a LOCAL store ────────────────────────────────────────────
+//
+// Interrupting an in-flight statement on a local SQLite store LEAKS THE CONNECTION. The pool then
+// reports zero open connections while the file stays locked, and every later statement fails with
+// SQLITE_BUSY — permanently, because the leaked handle is no longer reachable from Go. On a
+// `:memory:` store the same event destroys the database outright: it lives inside that connection,
+// so afterwards every call answers "no such table: messages" (MQLITE-98). One root cause, two
+// faces. Measured on a 200-cancellation storm: ~40% of runs wedge; with no interrupt, 0 of 8.
+//
+// So a local statement, once RUNNING, is not interrupted. That is a deliberate contract, and it is
+// narrow:
+//
+//   - a caller who is ALREADY cancelled never starts a statement at all (checkCtx below);
+//   - a caller WAITING for the single writer keeps its own context, so it walks away on cancel and
+//     mutates nothing — that wait is the only place a local caller can actually be stuck;
+//   - only a statement that is already EXECUTING runs to completion. There is NO upper bound on how
+//     long that takes: EngineTx.SQL() runs arbitrary user SQL, a full VACUUM rewrites the file, and a
+//     large Purge or Redrive is a big DELETE. "Microseconds" described the common case and was quietly
+//     read as a guarantee (round-6 §2.3) — it is not one. Cancellation is not a latency knob here,
+//     since it does no network I/O.
+//
+// What we buy: cancelling a request can never destroy or wedge the database. What we pay: a write
+// already in flight when the caller gives up may still commit. The caller must already tolerate
+// that — mqlite is at-least-once and hands you `message_id` for exactly this — whereas a wedged or
+// erased database is unrecoverable and takes everything with it.
+//
+// REMOTE stores keep full cancellation: their statements can genuinely block on the network, a
+// discarded connection holds no local lock, and the Turso primary is the one enforcing serialization.
+func (d *db) stmtCtx(ctx context.Context) context.Context {
+	if d.remote {
+		return ctx
+	}
+	return context.WithoutCancel(ctx)
+}
+
+// afterBeginTx runs between BeginTx and the callback — the one window a test cannot reach through
+// any public seam. nil in production.
+var afterBeginTx func()
+
+// afterConnAcquired runs between acquiring the connection and starting the statement. It exists so
+// a test can cancel a caller precisely in that window — the window the recheck below defends, and
+// one that is otherwise almost impossible to hit on purpose. nil in production.
+var afterConnAcquired func()
+
+// checkCtx refuses to begin work for a caller who has already given up. It is what keeps the
+// contract above narrow: nothing is started, so nothing can commit late.
+func checkCtx(ctx context.Context) error { return ctx.Err() }
+
+// withConn acquires the connection with the CALLER's context — so waiting for the single writer
+// stays cancellable and a queued caller mutates nothing — and then runs fn with the execution
+// context from stmtCtx.
+func (d *db) withConn(ctx context.Context, fn func(execCtx context.Context, c *sql.Conn) error) error {
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	conn, err := d.sql.Conn(ctx) // cancellable WAIT
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if afterConnAcquired != nil { // test seam: lets a test cancel EXACTLY in the handoff window
+		afterConnAcquired()
+	}
+	// And AGAIN, now that we hold the connection. The caller can give up in the window between the
+	// wait returning and the statement starting — a handoff that races the deadline, a descheduled
+	// goroutine — and past this point cancellation is deliberately gone. Without this recheck a
+	// destructive operation (Purge, Cancel, ReceiveDeferred) could mutate the database on behalf of
+	// a caller who had already timed out and never started it (codex). The rule is: nothing BEGINS
+	// for a caller who has given up.
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	return fn(d.stmtCtx(ctx), conn)
+}
+
 func (d *db) attempts() int {
 	if d.remote {
 		return maxConnAttempts
@@ -322,6 +397,15 @@ func (d *db) retryableWrite(err error) bool {
 }
 
 func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if !d.remote { // local: no retries; the wait is cancellable, the running statement is not
+		var res sql.Result
+		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			var e error
+			res, e = c.ExecContext(ec, query, args...)
+			return e
+		})
+		return res, err
+	}
 	var res sql.Result
 	var err error
 	for i := 0; i < d.attempts(); i++ {
@@ -362,6 +446,22 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 // otherwise commit a lease that has ALREADY EXPIRED, while still reporting success, and the
 // reaper then reclaims the message immediately (MQLITE-97).
 func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any) (sql.Result, error) {
+	if !d.remote { // local: one attempt; the wait is cancellable, the running statement is not
+		var res sql.Result
+		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			// buildArgs reads the clock and can be preempted, so the caller may give up WHILE it
+			// runs — after withConn's check and before the SQL exists. Materialize the arguments,
+			// then look again: a stopped renewer must not extend a lease (codex).
+			args := buildArgs()
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
+			var e error
+			res, e = c.ExecContext(ec, query, args...)
+			return e
+		})
+		return res, err
+	}
 	var res sql.Result
 	var err error
 	for i := 0; i < d.attempts(); i++ {
@@ -392,6 +492,21 @@ func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any
 // connection this attempt holds: the caller cannot be trusted to consume them before we release
 // it.
 func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	if !d.remote {
+		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			args := buildArgs() // then look again — see execFresh
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
+			rows, qerr := c.QueryContext(ec, query, args...)
+			if qerr != nil {
+				return qerr
+			}
+			serr := scan(rows)
+			_ = rows.Close()
+			return serr
+		})
+	}
 	var err error
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
@@ -424,6 +539,28 @@ func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []an
 	return err
 }
 
+// queryRows is query for a LOCAL store: the rows are consumed inside scan, which is what lets the
+// connection be reserved — a cancellable wait, then an uninterruptible statement (see stmtCtx).
+// Returning *sql.Rows cannot do that: the rows would outlive the reservation.
+func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
+	if d.remote {
+		rows, err := d.query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		return scan(rows)
+	}
+	return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+		rows, err := c.QueryContext(ec, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		return scan(rows)
+	})
+}
+
 func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	var rows *sql.Rows
 	var err error
@@ -442,6 +579,22 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 // queryRowScan runs a single-row query and scans it, retrying connection errors.
 // Returns sql.ErrNoRows when there is no row.
 func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ...any) error {
+	if !d.remote {
+		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			rows, qerr := c.QueryContext(ec, query, args...)
+			if qerr != nil {
+				return qerr
+			}
+			defer rows.Close()
+			if !rows.Next() {
+				if cerr := rows.Err(); cerr != nil {
+					return cerr
+				}
+				return sql.ErrNoRows
+			}
+			return rows.Scan(dest...)
+		})
+	}
 	var err error
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
@@ -477,9 +630,97 @@ func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ..
 	return err
 }
 
+// txn is the ONLY way engine code issues a statement inside a transaction, and it exists because
+// three review rounds running found a fresh path that had quietly skipped the cancellation rules.
+// A guard you have to remember to apply is a guard that gets forgotten, so this one is structural:
+// the closures are handed a *txn instead of a *sql.Tx, and every statement they can issue goes
+// through it.
+//
+// It enforces both halves of the contract at once, per statement:
+//
+//   - the caller is still waiting → run on the PROTECTED context. A statement already executing
+//     is never interrupted: on a local store that leaks the driver connection and wedges the file
+//     (SQLITE_BUSY forever) or erases a :memory: database outright.
+//   - the caller has given up → hand database/sql the caller's already-cancelled context. It fails
+//     the statement before it reaches the driver, so nothing begins and nothing is interrupted —
+//     and fn unwinds into the rollback below instead of grinding through the rest of a transaction
+//     nobody is waiting for (codex, round-6).
+//
+// The methods mirror *sql.Tx's signatures — including the ctx parameter they deliberately ignore —
+// so the 28 statement sites read exactly as they did, and so a future one cannot pick the wrong
+// context even by trying.
+type txn struct {
+	tx     *sql.Tx
+	caller context.Context // may be cancelled
+	exec   context.Context // protected on a local store; the caller's on a remote one
+}
+
+func (t *txn) ctx() context.Context {
+	if t.caller.Err() != nil {
+		return t.caller // cancelled: database/sql refuses it before the driver ever sees it
+	}
+	return t.exec
+}
+
+func (t *txn) ExecContext(_ context.Context, q string, args ...any) (sql.Result, error) {
+	return t.tx.ExecContext(t.ctx(), q, args...)
+}
+func (t *txn) QueryContext(_ context.Context, q string, args ...any) (*sql.Rows, error) {
+	return t.tx.QueryContext(t.ctx(), q, args...)
+}
+func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) *sql.Row {
+	return t.tx.QueryRowContext(t.ctx(), q, args...)
+}
+
+// SQL exposes the raw transaction for the one caller that needs it: Embedded.Tx, whose user
+// callback runs its own business writes. Statements issued through it are the USER's, and mqlite
+// cannot see their boundaries — so they are not guarded. EngineTx documents this.
+func (t *txn) SQL() *sql.Tx { return t.tx }
+
 // inTx runs fn inside a transaction, retrying the whole transaction on a
 // connection error (the aborted tx leaves nothing committed, so retry is safe).
-func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
+func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error) error {
+	if !e.db.remote {
+		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
+		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
+		// still honours the caller's context, and an already-cancelled caller never begins at all.
+		return e.db.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			tx, berr := c.BeginTx(ec, nil)
+			if berr != nil {
+				return berr
+			}
+			if afterBeginTx != nil { // test seam: cancel with the transaction open, before fn
+				afterBeginTx()
+			}
+			// BeginTx itself runs on the protected context, so the caller can give up WHILE it
+			// runs. fn is public code — an Engine.Tx callback — and once it starts it holds the
+			// single writer until it returns. Nothing BEGINS for a caller who has given up, and
+			// that includes the callback (codex).
+			if cerr := ctx.Err(); cerr != nil {
+				_ = tx.Rollback()
+				return cerr
+			}
+			// Deferred, not just on the error path: an Engine.Tx callback is USER code and it can
+			// PANIC. Unwinding would otherwise reach withConn's `defer conn.Close()` with the
+			// transaction still open — and Close blocks on it forever, so the panic never reaches
+			// the caller and the process's one writer is wedged for good (codex). Rollback after a
+			// successful Commit is a no-op (ErrTxDone).
+			defer func() { _ = tx.Rollback() }()
+			if ferr := fn(ec, &txn{tx: tx, caller: ctx, exec: ec}); ferr != nil {
+				return ferr
+			}
+			// The statements are protected from interruption; the TRANSACTION is not. A callback
+			// that spans several statements can be cancelled BETWEEN them — an Engine.Tx callback
+			// that pauses, a large multi-message Send mid-loop — and committing then would persist
+			// work the caller had already abandoned. The contract is "a statement already executing
+			// finishes", not "a transaction already begun commits" (codex). Check the CALLER's
+			// context, not the protected one.
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr // the deferred rollback undoes it
+			}
+			return tx.Commit()
+		})
+	}
 	var err error
 	for i := 0; i < e.db.attempts(); i++ {
 		if i > 0 {
@@ -493,16 +734,32 @@ func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 			}
 			return err
 		}
-		err = fn(tx)
-		if err != nil {
-			_ = tx.Rollback()
+		// The rollback is deferred across BOTH the callback and the commit — scoped to the
+		// callback alone it would fire on the success path too, BEFORE Commit, silently rolling
+		// back every remote transaction (TestRemoteTxClosureCanBeReplayed caught exactly that).
+		// After a successful Commit it is a no-op (ErrTxDone); after a PANIC in fn it is what
+		// stops the transaction from being abandoned open.
+		//
+		// The two errors stay separate because they are not retryable on the same terms: a failed
+		// statement retries on any connection error (retryable), a failed COMMIT only when the
+		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
+		// replayable statement failures into ErrOutcomeUnknown.
+		var ferr, cerr error
+		func() {
+			defer func() { _ = tx.Rollback() }()
+			if ferr = fn(e.db.stmtCtx(ctx), &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx)}); ferr != nil {
+				return
+			}
+			cerr = tx.Commit()
+		}()
+		if ferr != nil {
+			err = ferr
 			if e.db.retryable(err) {
 				continue
 			}
 			return err
 		}
-		err = tx.Commit()
-		if err != nil {
+		if err = cerr; err != nil {
 			if e.db.retryableWrite(err) {
 				continue // ErrBadConn / busy: the commit provably didn't land, safe to replay
 			}

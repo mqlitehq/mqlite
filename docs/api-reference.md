@@ -38,6 +38,29 @@ reasonable (they count toward the JSON request you send, not toward the body cap
 | `Peek` `max` | 32 default, 1000 max | request field |
 | filter `expr` source | capped length + AST node count | internal (see [concepts.md](concepts.md#subscription-filters-expr)) |
 
+## The base URL
+
+Every example below is written against `$BASE_URL`, because the port is the one thing a
+reader cannot guess — and guessing it wrong is the whole reason the examples say it out
+loud now.
+
+```bash
+# Talking to the broker directly. mqlite serves JSON-over-HTTP on TCP 6754 and terminates
+# no TLS of its own, so this is plain http.
+BASE_URL=http://127.0.0.1:6754
+
+# Behind a reverse proxy. Public HTTPS on 443 (which the URL omits, as usual) terminates at
+# the proxy, which forwards to the broker's internal http://…:6754.
+BASE_URL=https://mq.example.com
+```
+
+6754 is **not** a second, binary protocol — there is no binary protocol. It is the port the
+same JSON-over-HTTP API listens on when nothing is proxying for you.
+
+The discovery card's `endpoints` are route **paths**, deliberately relative: they resolve
+against the origin that served the card, so they inherit its scheme, host and port. Fetch the
+card from `$BASE_URL` and the paths are usable as-is.
+
 ## Auth
 
 Bearer token via `Authorization: Bearer <token>`. The broker accepts the tokens in
@@ -56,12 +79,12 @@ token **except** the open ones below. A missing/invalid token → `401 unauthent
 | `GET` | `/ui` | Embedded admin console (when enabled — see below) |
 
 ```bash
-curl https://<host>/                 # what is this? (no auth)
+curl "$BASE_URL/"                    # what is this? (no auth)
 # → {"name":"mqlite","version":"<the broker's version>","description":"...","status":"ok",
 #    "auth":"bearer","docs":"https://github.com/mqlitehq/mqlite",
 #    "endpoints":["/mqlite.v1.QueueService/Send", ...every RPC route...],
 #    "health":"/healthz","metrics":"/metrics"}
-curl https://<host>/healthz          # ok
+curl "$BASE_URL/healthz"             # ok
 ```
 
 The card's `auth` is `"bearer"` when RPCs require a token or `"none"` when auth is off,
@@ -98,7 +121,7 @@ Enqueue one or more messages in one transaction.
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   --data "{\"queue\":\"orders\",\"messages\":[{\"body\":\"$(printf hi|base64)\"}]}" \
-  https://<host>/mqlite.v1.QueueService/Send
+  "$BASE_URL/mqlite.v1.QueueService/Send"
 ```
 
 ### Receive
@@ -115,7 +138,7 @@ Peek-Lock (default) or Receive-and-Delete; long-polls up to `wait_time_ms`.
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   --data '{"queue":"orders","max_messages":1,"wait_time_ms":5000}' \
-  https://<host>/mqlite.v1.QueueService/Receive
+  "$BASE_URL/mqlite.v1.QueueService/Receive"
 # → {"messages":[{
 #      "seq_number":42,"lock_token":"lt_9f3a…","delivery_count":1,
 #      "body":"aGk=","message_id":"order-42","group_id":"cust-7",
@@ -171,9 +194,11 @@ against a 2 s lock, and most of the locks expire mid-pass.
   on its own `lock_token`, exactly like `Renew`.
 
 `locked_until_ms` is the deadline the broker actually committed — renew again before it. And
-`ok=true` means the lease is live **at the moment the broker answers**: if the write itself
-outlived the lock (a very short lease on a slow link), you get `ok=false` rather than a lock you
-do not really hold.
+`ok=true` means the lease was live **when the broker's statement finished** — not when the answer
+reaches you. The result still has to be mapped, encoded and travel back, so on a very short lease
+it can lapse on the way. **`locked_until_ms` is the authoritative fact: compare it against your own
+clock.** (If the write itself outlived the lock, you get `ok=false` rather than a lock you never
+really held.)
 
 > **Why 512?** Renewal is a claim about the *future* ("this lease is live"), and that claim is
 > only keepable within a single statement: across several, the first batch's lease can expire —
@@ -264,7 +289,7 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
             "dedup_window_ms":300000,
             "ordering_mode":"group_fifo"
           }}' \
-  https://<host>/mqlite.v1.AdminService/CreateQueue
+  "$BASE_URL/mqlite.v1.AdminService/CreateQueue"
 # → {}
 ```
 

@@ -45,18 +45,19 @@ func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(cont
 }
 
 func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) []string {
-	rows, err := e.db.query(ctx, `SELECT DISTINCT queue FROM messages WHERE `+where, args...)
-	if err != nil {
+	var qs []string
+	if err := e.db.queryRows(ctx, `SELECT DISTINCT queue FROM messages WHERE `+where,
+		func(rows *sql.Rows) error {
+			for rows.Next() {
+				var q string
+				if rows.Scan(&q) == nil {
+					qs = append(qs, q)
+				}
+			}
+			return rows.Err()
+		}, args...); err != nil {
 		e.log.Error("background: list affected queues failed", "err", err)
 		return nil
-	}
-	defer rows.Close()
-	var qs []string
-	for rows.Next() {
-		var q string
-		if rows.Scan(&q) == nil {
-			qs = append(qs, q)
-		}
 	}
 	return qs
 }
@@ -288,6 +289,12 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 	}
 }
 
+// afterFirstCheckpoint runs once the reclaim sequence is already under way. A test that cancels any
+// earlier is stopped by withConn's own pre-start check and never reaches the guards below — which
+// is exactly how the first version of the test for this passed while the guards were removed. nil
+// in production.
+var afterFirstCheckpoint func()
+
 // reclaimPages returns free pages to the OS on a pinned connection so the steps share
 // session state (splitting them across pooled exec() calls reclaims almost nothing). The
 // sequence: (1) a TRUNCATE checkpoint flushes the WAL's freed pages onto the main-DB
@@ -296,29 +303,51 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 // exactly one page); (3) a second TRUNCATE checkpoint hands the truncated tail back to the OS
 // (in WAL mode the file only shrinks at a checkpoint). Single writer, so neither blocks.
 // Shared by the background janitor and Compact(false) (MQLITE-78).
+//
+// It goes through withConn like everything else: a checkpoint/vacuum interrupted mid-statement
+// leaks the local connection and wedges the database exactly as a settle would, and this one runs
+// unattended on the janitor's clock (round-6 §4).
 func (e *Engine) reclaimPages(ctx context.Context) error {
-	conn, err := e.db.sql.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return err
-	}
-	rows, err := conn.QueryContext(ctx, `PRAGMA incremental_vacuum`)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		// each step frees one more page; iterating reclaims the whole freelist
-	}
-	if cerr := rows.Err(); cerr != nil {
+	// caller is the context that may be cancelled; ec is the protected one the statements run on.
+	// The rule is the same one *txn enforces inside a transaction, and it has to be applied by hand
+	// here because this is a multi-statement sequence pinned to a connection: the statement already
+	// executing finishes, THE NEXT ONE DOES NOT BEGIN. Without the checks, cancelling a Compact
+	// while the first checkpoint ran still went on to incremental_vacuum and a second checkpoint —
+	// occupying the single writer for an unbounded time on a large freelist, for a caller who had
+	// already gone (codex, round-6).
+	caller := ctx
+	return e.db.withConn(ctx, func(ec context.Context, conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ec, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			return err
+		}
+		if afterFirstCheckpoint != nil { // test seam: cancel with the sequence already under way
+			afterFirstCheckpoint()
+		}
+		if err := checkCtx(caller); err != nil {
+			return err
+		}
+		rows, err := conn.QueryContext(ec, `PRAGMA incremental_vacuum`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			// each step frees one more page; iterating reclaims the whole freelist. A cancelled
+			// caller stops stepping: the freelist is simply reclaimed on the next pass.
+			if caller.Err() != nil {
+				break
+			}
+		}
+		if cerr := rows.Err(); cerr != nil {
+			_ = rows.Close()
+			return cerr
+		}
 		_ = rows.Close()
-		return cerr
-	}
-	_ = rows.Close()
-	_, err = conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
-	return err
+		if err := checkCtx(caller); err != nil {
+			return err
+		}
+		_, err = conn.ExecContext(ec, `PRAGMA wal_checkpoint(TRUNCATE)`)
+		return err
+	})
 }
 
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with

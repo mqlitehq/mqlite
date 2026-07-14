@@ -151,8 +151,10 @@ type StatusInfo struct {
 }
 
 // MaxRenewBatch is the most messages one RenewBatch call may renew. Renewal must fit in a single
-// statement to promise honestly that every Ok means a live lease at return — see
-// engine.MaxRenewBatch. Receive hands out at most 256 messages, so a consumer never meets it by
+// statement so that every Ok is decided against ONE clock reading rather than drifting across a
+// chunked write — see engine.MaxRenewBatch. Ok does not promise the lease is still live when you
+// read it; SettleResult.LockedUntil is the deadline that was committed, and that is what to pace
+// yourself by. Receive hands out at most 256 messages, so a consumer never meets this cap by
 // accident; a caller holding more renews in several calls.
 const MaxRenewBatch = engine.MaxRenewBatch
 

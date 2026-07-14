@@ -126,8 +126,8 @@ func TestSchemaVersionGuard(t *testing.T) {
 // the statements are the contract).
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
-		wantVersion = "3"
-		wantHash    = "9cde8ede1b6c3a2018ea57491a0a4f8441bf4c0a9ddfc59156bede68624ddf0f"
+		wantVersion = "5"
+		wantHash    = "9dcb13ddf1fbf11179a690e70d357dcfa1b87fa6f135a85db02164185d5854e6"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -590,7 +590,22 @@ type busyState struct {
 
 func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
 func (c *busyConn) Close() error                        { return nil }
-func (c *busyConn) Begin() (driver.Tx, error)           { return nil, errors.New("begin unused") }
+
+// Begin always succeeds; the COMMIT is what fails while failsLeft > 0. That is the interesting
+// fault: it lands AFTER the closure has run, so replaying the transaction replays the closure —
+// which is the whole contract being pinned. A failure at Begin would prove nothing.
+func (c *busyConn) Begin() (driver.Tx, error) { return &busyTx{st: c.st}, nil }
+
+type busyTx struct{ st *busyState }
+
+func (t *busyTx) Commit() error {
+	if t.st.failsLeft > 0 {
+		t.st.failsLeft--
+		return errors.New("database is locked") // busy: the commit provably did not land
+	}
+	return nil
+}
+func (t *busyTx) Rollback() error { return nil }
 
 func (c *busyConn) record(args []driver.NamedValue) bool {
 	c.st.args = append(c.st.args, args)
@@ -789,5 +804,42 @@ func TestMemoryDBSurvivesRepeatedFreshStatements(t *testing.T) {
 		t.Fatalf("stats after 200 renewals: %v (the in-memory database was destroyed)", err)
 	} else if m.Locked != 1 {
 		t.Errorf("locked=%d after renewals, want 1", m.Locked)
+	}
+}
+
+// On a remote store, a transaction that fails on a retryable connection/busy error is replayed
+// from the start — so the closure handed to inTx (and therefore to the PUBLIC Engine.Tx, which is
+// how the transactional outbox is written) MAY RUN MORE THAN ONCE.
+//
+// The database work of the failed attempt rolled back, so the data stays correct. But anything the
+// closure did outside the transaction — an HTTP call, a charge, a counter — happened twice, and no
+// rollback undoes it. That is now the documented contract (round-4 §5.2); this pins it, so it
+// cannot quietly become untrue in either direction.
+func TestRemoteTxClosureCanBeReplayed(t *testing.T) {
+	d, _ := remoteDBFailingFirst(t, 2) // two retryable failures, then success
+	e := &Engine{db: d}
+
+	runs := 0
+	if err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+		runs++
+		return nil
+	}); err != nil {
+		t.Fatalf("inTx: %v", err)
+	}
+	if runs != 3 {
+		t.Fatalf("the closure ran %d time(s); a remote store replays it on a retryable failure (want 3: two busy + one success)", runs)
+	}
+
+	// Local stores never retry: exactly once, which is what the embedded outbox relies on.
+	local, _ := testEngine(t)
+	runs = 0
+	if err := local.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+		runs++
+		return nil
+	}); err != nil {
+		t.Fatalf("local inTx: %v", err)
+	}
+	if runs != 1 {
+		t.Errorf("a local transaction ran its closure %d times, want exactly 1 — the outbox depends on it", runs)
 	}
 }
