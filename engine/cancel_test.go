@@ -243,3 +243,66 @@ func TestCancelledSettleWritesLeaveTheDatabaseUsable(t *testing.T) {
 		}
 	})
 }
+
+// The window between "the wait returned" and "the statement starts" is real: past that point
+// cancellation is deliberately gone, so a caller who gives up THERE would otherwise have a
+// destructive operation run on its behalf anyway. Nothing may BEGIN for a caller who has given up
+// (codex, round-5 follow-up).
+//
+// Cancel the caller while it is queued behind the writer, then let the writer go: the operation
+// must not run, whatever the scheduling.
+func TestCancelInTheHandoffWindowStartsNothing(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("keep-me")}); err != nil {
+			t.Fatal(err)
+		}
+		msgs, _ := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+		if len(msgs) != 1 {
+			t.Fatal("receive")
+		}
+		if err := e.Reject(ctx, "q", msgs[0].SeqNumber, msgs[0].LockToken, ReasonAppRequested, ""); err != nil {
+			t.Fatal(err) // one dead letter to purge
+		}
+
+		// Hold the writer, queue a destructive Purge behind it, and cancel that caller while it waits.
+		release := make(chan struct{})
+		held := make(chan struct{})
+		go func() {
+			_ = e.Tx(ctx, func(tx *EngineTx) error {
+				close(held)
+				<-release
+				return nil
+			})
+		}()
+		<-held
+
+		cctx, cancel := context.WithCancel(context.Background())
+
+		// Cancel the caller EXACTLY in the handoff window: the connection is in hand, the statement
+		// has not started. Cancelling any earlier is uninteresting — the wait itself would fail.
+		afterConnAcquired = func() { cancel() }
+		defer func() { afterConnAcquired = nil }()
+
+		done := make(chan error, 1)
+		go func() {
+			_, perr := e.Purge(cctx, "q", RedriveOptions{})
+			done <- perr
+		}()
+		time.Sleep(50 * time.Millisecond) // queued behind the writer
+		close(release)                    // the writer lets go; the purge acquires the conn, then dies
+
+		if err := <-done; err == nil {
+			t.Error("a Purge whose caller had given up ran anyway")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.DeadLettered != 1 {
+			t.Errorf("dead_lettered=%d — the cancelled Purge destroyed data on behalf of a caller who was gone", m.DeadLettered)
+		}
+	})
+}

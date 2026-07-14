@@ -332,6 +332,11 @@ func (d *db) stmtCtx(ctx context.Context) context.Context {
 	return context.WithoutCancel(ctx)
 }
 
+// afterConnAcquired runs between acquiring the connection and starting the statement. It exists so
+// a test can cancel a caller precisely in that window — the window the recheck below defends, and
+// one that is otherwise almost impossible to hit on purpose. nil in production.
+var afterConnAcquired func()
+
 // checkCtx refuses to begin work for a caller who has already given up. It is what keeps the
 // contract above narrow: nothing is started, so nothing can commit late.
 func checkCtx(ctx context.Context) error { return ctx.Err() }
@@ -348,6 +353,18 @@ func (d *db) withConn(ctx context.Context, fn func(execCtx context.Context, c *s
 		return err
 	}
 	defer conn.Close()
+	if afterConnAcquired != nil { // test seam: lets a test cancel EXACTLY in the handoff window
+		afterConnAcquired()
+	}
+	// And AGAIN, now that we hold the connection. The caller can give up in the window between the
+	// wait returning and the statement starting — a handoff that races the deadline, a descheduled
+	// goroutine — and past this point cancellation is deliberately gone. Without this recheck a
+	// destructive operation (Purge, Cancel, ReceiveDeferred) could mutate the database on behalf of
+	// a caller who had already timed out and never started it (codex). The rule is: nothing BEGINS
+	// for a caller who has given up.
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
 	return fn(d.stmtCtx(ctx), conn)
 }
 
