@@ -433,3 +433,51 @@ func TestCLIViewsCoverEveryWireField(t *testing.T) {
 		}
 	}
 }
+
+// viewFields records the DECISION for each wire field; this proves the decision was actually
+// carried out. Registering a field in that map and forgetting to copy it in viewMsg/viewPeeked
+// would leave it a silent zero — the very failure the map exists to prevent (round-5 §4).
+//
+// Build a peeked message with every field set to a non-zero value, convert it, and require every
+// field marked "both" or "peek" to survive.
+func TestPeekViewActuallyCopiesTheFieldsItClaims(t *testing.T) {
+	src := &mqlite.PeekedMessage{
+		SequenceNumber: 7,
+		State:          mqlite.State("dead_lettered"),
+		Body:           []byte("b"),
+		MessageID:      "mid",
+		GroupID:        "gid",
+		CorrelationID:  "cid",
+		ReplyTo:        "rt",
+		Subject:        "subj",
+		ContentType:    "ct",
+		Properties:     map[string]string{"k": "v"},
+		DeliveryCount:  3,
+		EnqueuedAt:     time.Unix(1, 0),
+		VisibleAt:      time.Unix(2, 0),
+		ExpiresAt:      time.Unix(3, 0),
+		LockedUntil:    time.Unix(4, 0),
+
+		DeadLetterReason:      "why",
+		DeadLetterDescription: "detail",
+	}
+	got := viewPeeked([]*mqlite.PeekedMessage{src})[0]
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for tag, decision := range viewFields {
+		if strings.HasPrefix(decision, "receive only") {
+			continue // peek never locks, so it has no lock token
+		}
+		if _, ok := m[tag]; !ok {
+			t.Errorf("viewFields says peek carries %q (%s), but the conversion left it zero — it is absent from the JSON",
+				tag, decision)
+		}
+	}
+}

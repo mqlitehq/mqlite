@@ -44,10 +44,12 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   fencing + idempotency; a stale token yields `ok=false`, never failing the batch.
   *(engine/complete_batch_test.go)*
 - **2.8 RenewBatch** extends a whole batch's leases in ONE statement, fenced per item on its own
-  `lock_token`, and reports the deadline it committed. `ok=true` means the lease is live when the
-  broker answers: a renewal whose write outlived the lock reports `ok=false` rather than handing
-  back a lock the caller does not hold, and a renewal never *shortens* a lease. Capped at 512
-  messages — a claim about a live lease is only keepable within a single statement.
+  `lock_token`, and reports the deadline it committed. `ok=true` means the lease was live when the
+  broker's STATEMENT finished — the answer still has to travel, so `locked_until_ms` is the
+  authoritative fact and the caller compares it against its own clock. A renewal whose write
+  outlived the lock reports `ok=false` rather than handing back a lock the caller never held, and a
+  renewal never *shortens* a lease. Capped at 512 messages — a claim about a live lease is only
+  keepable within a single statement.
   *(engine/complete_batch_test.go)*
 
 ## 3 · Idempotency & at-least-once

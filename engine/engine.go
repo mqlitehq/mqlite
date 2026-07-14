@@ -187,7 +187,7 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	if err := validateQueueConfig(name, cfg); err != nil {
 		return err
 	}
-	if err := e.inTx(ctx, func(tx *sql.Tx) error {
+	if err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		return e.createQueueTx(ctx, tx, name, cfg, true)
 	}); err != nil {
 		return err
@@ -332,7 +332,7 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 	// Guards + backing-queue upsert + mapping upsert run in ONE transaction so a
 	// concurrent CreateQueue/Subscribe can't slip between check and insert (the
 	// local single connection serializes anyway; the remote pool does not).
-	if err := e.inTx(ctx, func(tx *sql.Tx) error {
+	if err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		var topicKind string
 		err := tx.QueryRowContext(ctx,
 			`SELECT kind FROM queues WHERE name=?`, topic).Scan(&topicKind)
@@ -396,29 +396,28 @@ type SubscriptionInfo struct {
 // ordered by topic then name. (ListQueues shows the backing queues; this exposes the
 // topic membership + filter that ListQueues does not.)
 func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
-	rows, err := e.db.query(ctx,
-		`SELECT topic, subscription, filter_json FROM subscriptions ORDER BY topic, subscription`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []SubscriptionInfo
-	for rows.Next() {
-		var topic, sub string
-		var fj sql.NullString
-		if err := rows.Scan(&topic, &sub, &fj); err != nil {
-			return nil, err
-		}
-		s := SubscriptionInfo{Topic: topic, Name: sub}
-		if fj.Valid && fj.String != "" {
-			var f Filter
-			if json.Unmarshal([]byte(fj.String), &f) == nil {
-				s.Expr = f.Expr
+	err := e.db.queryRows(ctx,
+		`SELECT topic, subscription, filter_json FROM subscriptions ORDER BY topic, subscription`,
+		func(rows *sql.Rows) error {
+			for rows.Next() {
+				var topic, sub string
+				var fj sql.NullString
+				if err := rows.Scan(&topic, &sub, &fj); err != nil {
+					return err
+				}
+				s := SubscriptionInfo{Topic: topic, Name: sub}
+				if fj.Valid && fj.String != "" {
+					var f Filter
+					if json.Unmarshal([]byte(fj.String), &f) == nil {
+						s.Expr = f.Expr
+					}
+				}
+				out = append(out, s)
 			}
-		}
-		out = append(out, s)
-	}
-	return out, rows.Err()
+			return rows.Err()
+		})
+	return out, err
 }
 
 func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
@@ -451,23 +450,22 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 
 // ListQueues lists all queues/subscriptions.
 func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
-	rows, err := e.db.query(ctx, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms
-		FROM queues ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []QueueInfo
-	for rows.Next() {
-		var qi QueueInfo
-		if err := rows.Scan(&qi.Name, &qi.Kind, &qi.LockDurationMs, &qi.MaxDeliveryCount,
-			&qi.DefaultTTLMs, &qi.DedupWindowMs); err != nil {
-			return nil, err
-		}
-		out = append(out, qi)
-	}
-	return out, rows.Err()
+	err := e.db.queryRows(ctx, `
+		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms
+		FROM queues ORDER BY name`,
+		func(rows *sql.Rows) error {
+			for rows.Next() {
+				var qi QueueInfo
+				if err := rows.Scan(&qi.Name, &qi.Kind, &qi.LockDurationMs, &qi.MaxDeliveryCount,
+					&qi.DefaultTTLMs, &qi.DedupWindowMs); err != nil {
+					return err
+				}
+				out = append(out, qi)
+			}
+			return rows.Err()
+		})
+	return out, err
 }
 
 // ── send / schedule ─────────────────────────────────────────────────────────
@@ -603,7 +601,7 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 	conflicts := make([]bool, len(ms))
 	woke := map[string]bool{}
 
-	err = e.inTx(ctx, func(tx *sql.Tx) error {
+	err = e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		// reset per-attempt accumulators (inTx may retry the whole closure).
 		for i := range seqs {
 			seqs[i] = 0
@@ -677,22 +675,20 @@ func (e *Engine) targetFor(sub string, fj sql.NullString) target {
 
 // resolveTargets expands a topic to its subscriptions, else validates the queue.
 func (e *Engine) resolveTargets(ctx context.Context, name string) ([]target, error) {
-	rows, err := e.db.query(ctx,
-		`SELECT subscription, filter_json FROM subscriptions WHERE topic=? ORDER BY subscription`, name)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var subs []target
-	for rows.Next() {
-		var s string
-		var fj sql.NullString
-		if err := rows.Scan(&s, &fj); err != nil {
-			return nil, err
-		}
-		subs = append(subs, e.targetFor(s, fj))
-	}
-	if err := rows.Err(); err != nil {
+	if err := e.db.queryRows(ctx,
+		`SELECT subscription, filter_json FROM subscriptions WHERE topic=? ORDER BY subscription`,
+		func(rows *sql.Rows) error {
+			for rows.Next() {
+				var s string
+				var fj sql.NullString
+				if err := rows.Scan(&s, &fj); err != nil {
+					return err
+				}
+				subs = append(subs, e.targetFor(s, fj))
+			}
+			return rows.Err()
+		}, name); err != nil {
 		return nil, err
 	}
 	if len(subs) > 0 {

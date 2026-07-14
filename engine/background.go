@@ -45,18 +45,19 @@ func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(cont
 }
 
 func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) []string {
-	rows, err := e.db.query(ctx, `SELECT DISTINCT queue FROM messages WHERE `+where, args...)
-	if err != nil {
+	var qs []string
+	if err := e.db.queryRows(ctx, `SELECT DISTINCT queue FROM messages WHERE `+where,
+		func(rows *sql.Rows) error {
+			for rows.Next() {
+				var q string
+				if rows.Scan(&q) == nil {
+					qs = append(qs, q)
+				}
+			}
+			return rows.Err()
+		}, args...); err != nil {
 		e.log.Error("background: list affected queues failed", "err", err)
 		return nil
-	}
-	defer rows.Close()
-	var qs []string
-	for rows.Next() {
-		var q string
-		if rows.Scan(&q) == nil {
-			qs = append(qs, q)
-		}
 	}
 	return qs
 }

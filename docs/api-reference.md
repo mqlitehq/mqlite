@@ -171,9 +171,11 @@ against a 2 s lock, and most of the locks expire mid-pass.
   on its own `lock_token`, exactly like `Renew`.
 
 `locked_until_ms` is the deadline the broker actually committed — renew again before it. And
-`ok=true` means the lease is live **at the moment the broker answers**: if the write itself
-outlived the lock (a very short lease on a slow link), you get `ok=false` rather than a lock you
-do not really hold.
+`ok=true` means the lease was live **when the broker's statement finished** — not when the answer
+reaches you. The result still has to be mapped, encoded and travel back, so on a very short lease
+it can lapse on the way. **`locked_until_ms` is the authoritative fact: compare it against your own
+clock.** (If the write itself outlived the lock, you get `ok=false` rather than a lock you never
+really held.)
 
 > **Why 512?** Renewal is a claim about the *future* ("this lease is live"), and that claim is
 > only keepable within a single statement: across several, the first batch's lease can expire —

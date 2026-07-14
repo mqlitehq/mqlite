@@ -71,22 +71,18 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 	// Select the candidate set up front (single writer → the set is stable).
 	selQuery := "SELECT id,body,message_id,correlation_id,reply_to,group_id,content_type,subject,properties" +
 		" FROM messages WHERE " + where + " ORDER BY id" + limit
-	rows, err := e.db.query(ctx, selQuery, args...)
-	if err != nil {
-		return 0, err
-	}
 	var recs []dlqRec
-	for rows.Next() {
-		var r dlqRec
-		if err := rows.Scan(&r.id, &r.body, &r.messageID, &r.correlationID, &r.replyTo, &r.groupID,
-			&r.ctype, &r.subject, &r.props); err != nil {
-			rows.Close()
-			return 0, err
+	if err := e.db.queryRows(ctx, selQuery, func(rows *sql.Rows) error {
+		for rows.Next() {
+			var r dlqRec
+			if err := rows.Scan(&r.id, &r.body, &r.messageID, &r.correlationID, &r.replyTo, &r.groupID,
+				&r.ctype, &r.subject, &r.props); err != nil {
+				return err
+			}
+			recs = append(recs, r)
 		}
-		recs = append(recs, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return rows.Err()
+	}, args...); err != nil {
 		return 0, err
 	}
 	if len(recs) == 0 {
@@ -131,7 +127,7 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 	}
 	inClause := "(" + strings.Join(ph, ",") + ")"
 
-	return e.inTx(ctx, func(tx *sql.Tx) error {
+	return e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		if !crossQueue {
 			_, err := tx.ExecContext(ctx, `
 				UPDATE messages SET state='active', delivery_count=0, lock_token=NULL,

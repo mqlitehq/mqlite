@@ -130,7 +130,10 @@ no lost events: either both commit or neither does.
 
 ```go
 eng.Tx(ctx, func(tx *engine.EngineTx) error {
-    tx.SQL().ExecContext(ctx, `INSERT INTO orders_tbl(id) VALUES (1)`)
+    // tx.Context(), not the outer ctx: see the note below.
+    if _, err := tx.SQL().ExecContext(tx.Context(), `INSERT INTO orders_tbl(id) VALUES (1)`); err != nil {
+        return err // your business write failed — roll back the message too
+    }
     _, err := tx.SendOne("orders", engine.OutMessage{Body: []byte("order-created")})
     return err // commit both, or roll back both
 })

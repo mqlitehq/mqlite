@@ -300,6 +300,57 @@ func (d *db) backoff(ctx context.Context, attempt int) {
 	}
 }
 
+// ─── cancellation on a LOCAL store ────────────────────────────────────────────
+//
+// Interrupting an in-flight statement on a local SQLite store LEAKS THE CONNECTION. The pool then
+// reports zero open connections while the file stays locked, and every later statement fails with
+// SQLITE_BUSY — permanently, because the leaked handle is no longer reachable from Go. On a
+// `:memory:` store the same event destroys the database outright: it lives inside that connection,
+// so afterwards every call answers "no such table: messages" (MQLITE-98). One root cause, two
+// faces. Measured on a 200-cancellation storm: ~40% of runs wedge; with no interrupt, 0 of 8.
+//
+// So a local statement, once RUNNING, is not interrupted. That is a deliberate contract, and it is
+// narrow:
+//
+//   - a caller who is ALREADY cancelled never starts a statement at all (checkCtx below);
+//   - a caller WAITING for the single writer keeps its own context, so it walks away on cancel and
+//     mutates nothing — that wait is the only place a local caller can actually be stuck;
+//   - only a statement that is already EXECUTING runs to completion — microseconds on a local store,
+//     since it does no network I/O.
+//
+// What we buy: cancelling a request can never destroy or wedge the database. What we pay: a write
+// already in flight when the caller gives up may still commit. The caller must already tolerate
+// that — mqlite is at-least-once and hands you `message_id` for exactly this — whereas a wedged or
+// erased database is unrecoverable and takes everything with it.
+//
+// REMOTE stores keep full cancellation: their statements can genuinely block on the network, a
+// discarded connection holds no local lock, and the Turso primary is the one enforcing serialization.
+func (d *db) stmtCtx(ctx context.Context) context.Context {
+	if d.remote {
+		return ctx
+	}
+	return context.WithoutCancel(ctx)
+}
+
+// checkCtx refuses to begin work for a caller who has already given up. It is what keeps the
+// contract above narrow: nothing is started, so nothing can commit late.
+func checkCtx(ctx context.Context) error { return ctx.Err() }
+
+// withConn acquires the connection with the CALLER's context — so waiting for the single writer
+// stays cancellable and a queued caller mutates nothing — and then runs fn with the execution
+// context from stmtCtx.
+func (d *db) withConn(ctx context.Context, fn func(execCtx context.Context, c *sql.Conn) error) error {
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	conn, err := d.sql.Conn(ctx) // cancellable WAIT
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return fn(d.stmtCtx(ctx), conn)
+}
+
 func (d *db) attempts() int {
 	if d.remote {
 		return maxConnAttempts
@@ -322,6 +373,15 @@ func (d *db) retryableWrite(err error) bool {
 }
 
 func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if !d.remote { // local: no retries; the wait is cancellable, the running statement is not
+		var res sql.Result
+		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			var e error
+			res, e = c.ExecContext(ec, query, args...)
+			return e
+		})
+		return res, err
+	}
 	var res sql.Result
 	var err error
 	for i := 0; i < d.attempts(); i++ {
@@ -362,6 +422,15 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 // otherwise commit a lease that has ALREADY EXPIRED, while still reporting success, and the
 // reaper then reclaims the message immediately (MQLITE-97).
 func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any) (sql.Result, error) {
+	if !d.remote { // local: one attempt; the wait is cancellable, the running statement is not
+		var res sql.Result
+		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			var e error
+			res, e = c.ExecContext(ec, query, buildArgs()...)
+			return e
+		})
+		return res, err
+	}
 	var res sql.Result
 	var err error
 	for i := 0; i < d.attempts(); i++ {
@@ -392,6 +461,17 @@ func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any
 // connection this attempt holds: the caller cannot be trusted to consume them before we release
 // it.
 func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	if !d.remote {
+		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			rows, qerr := c.QueryContext(ec, query, buildArgs()...)
+			if qerr != nil {
+				return qerr
+			}
+			serr := scan(rows)
+			_ = rows.Close()
+			return serr
+		})
+	}
 	var err error
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
@@ -424,6 +504,28 @@ func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []an
 	return err
 }
 
+// queryRows is query for a LOCAL store: the rows are consumed inside scan, which is what lets the
+// connection be reserved — a cancellable wait, then an uninterruptible statement (see stmtCtx).
+// Returning *sql.Rows cannot do that: the rows would outlive the reservation.
+func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
+	if d.remote {
+		rows, err := d.query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		return scan(rows)
+	}
+	return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+		rows, err := c.QueryContext(ec, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		return scan(rows)
+	})
+}
+
 func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	var rows *sql.Rows
 	var err error
@@ -442,6 +544,22 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 // queryRowScan runs a single-row query and scans it, retrying connection errors.
 // Returns sql.ErrNoRows when there is no row.
 func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ...any) error {
+	if !d.remote {
+		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			rows, qerr := c.QueryContext(ec, query, args...)
+			if qerr != nil {
+				return qerr
+			}
+			defer rows.Close()
+			if !rows.Next() {
+				if cerr := rows.Err(); cerr != nil {
+					return cerr
+				}
+				return sql.ErrNoRows
+			}
+			return rows.Scan(dest...)
+		})
+	}
 	var err error
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
@@ -479,7 +597,27 @@ func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ..
 
 // inTx runs fn inside a transaction, retrying the whole transaction on a
 // connection error (the aborted tx leaves nothing committed, so retry is safe).
-func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
+// fn is handed the context ITS STATEMENTS must use — not the caller's. On a local store that is an
+// uninterruptible one (see stmtCtx): a statement interrupted inside a transaction leaks the
+// connection and wedges the database. Taking it as a parameter means the closures cannot get this
+// wrong by accident — the `ctx` in scope inside fn is always the right one.
+func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *sql.Tx) error) error {
+	if !e.db.remote {
+		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
+		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
+		// still honours the caller's context, and an already-cancelled caller never begins at all.
+		return e.db.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			tx, berr := c.BeginTx(ec, nil)
+			if berr != nil {
+				return berr
+			}
+			if ferr := fn(ec, tx); ferr != nil {
+				_ = tx.Rollback()
+				return ferr
+			}
+			return tx.Commit()
+		})
+	}
 	var err error
 	for i := 0; i < e.db.attempts(); i++ {
 		if i > 0 {
@@ -493,7 +631,7 @@ func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 			}
 			return err
 		}
-		err = fn(tx)
+		err = fn(e.db.stmtCtx(ctx), tx)
 		if err != nil {
 			_ = tx.Rollback()
 			if e.db.retryable(err) {

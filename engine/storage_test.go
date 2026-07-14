@@ -126,8 +126,8 @@ func TestSchemaVersionGuard(t *testing.T) {
 // the statements are the contract).
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
-		wantVersion = "3"
-		wantHash    = "9cde8ede1b6c3a2018ea57491a0a4f8441bf4c0a9ddfc59156bede68624ddf0f"
+		wantVersion = "4"
+		wantHash    = "53647b73fd94418109ae284a440f2719a6e3db1754f22b52c0305b669bba5bc7"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -820,7 +820,7 @@ func TestRemoteTxClosureCanBeReplayed(t *testing.T) {
 	e := &Engine{db: d}
 
 	runs := 0
-	if err := e.inTx(context.Background(), func(tx *sql.Tx) error {
+	if err := e.inTx(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
 		runs++
 		return nil
 	}); err != nil {
@@ -833,7 +833,7 @@ func TestRemoteTxClosureCanBeReplayed(t *testing.T) {
 	// Local stores never retry: exactly once, which is what the embedded outbox relies on.
 	local, _ := testEngine(t)
 	runs = 0
-	if err := local.inTx(context.Background(), func(tx *sql.Tx) error {
+	if err := local.inTx(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
 		runs++
 		return nil
 	}); err != nil {

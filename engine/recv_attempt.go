@@ -23,7 +23,7 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 	}
 	now := e.now()
 	var out []*Message
-	err := e.inTx(ctx, func(tx *sql.Tx) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		if msgs, ok, err := lookupAttempt(ctx, tx, q.name, attemptID, now); err != nil {
 			return err
 		} else if ok {

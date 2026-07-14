@@ -727,3 +727,70 @@ func TestCompleteBatchReceiptIsVerbSpecific(t *testing.T) {
 		t.Fatalf("replaying the SAME completion must stay an idempotent success: %v ok=%v", err, res[0].Ok)
 	}
 }
+
+// A receipt vouches for ONE REQUEST — this queue, this seq, this token, this verb. Not for a token.
+//
+// Binding the verb (round-4) closed Abandon(T)→Complete(T). It left the deeper hole: the receipt
+// still said nothing about WHICH MESSAGE it settled, so `Complete(seqB, tokenA)` found tokenA's
+// completion receipt and reported success for a message it never touched — in the same queue, in
+// the batch path, and even across queues. A settle is a claim about one message; its receipt must
+// be too (round-5 §3).
+func TestReceiptsAreBoundToTheirMessage(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+	mustQueue(t, e, "other", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+
+	for i := 0; i < 2; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.SendOne(ctx, "other", OutMessage{Body: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 2})
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("receive: %v n=%d", err, len(msgs))
+	}
+	elsewhere, err := e.Receive(ctx, "other", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(elsewhere) != 1 {
+		t.Fatalf("receive other: %v n=%d", err, len(elsewhere))
+	}
+	a, b := msgs[0], msgs[1]
+
+	// A is completed for real: that writes a receipt for (q, seqA, tokenA, completed).
+	if err := e.Complete(ctx, "q", a.SeqNumber, a.LockToken); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. A's receipt must not settle B.
+	if err := e.Complete(ctx, "q", b.SeqNumber, a.LockToken); !errors.Is(err, ErrLockLost) {
+		t.Errorf("Complete(seqB, tokenA) = %v, want ErrLockLost — A's receipt says nothing about B", err)
+	}
+	// 2. Nor through the batch path.
+	res, err := e.CompleteBatch(ctx, "q", []SettleItem{{SeqNumber: b.SeqNumber, LockToken: a.LockToken}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].Ok {
+		t.Error("CompleteBatch(seqB, tokenA) reported ok — B was never touched and is still locked")
+	}
+	// 3. Nor in another queue.
+	if err := e.Complete(ctx, "other", elsewhere[0].SeqNumber, a.LockToken); !errors.Is(err, ErrLockLost) {
+		t.Errorf("Complete(otherQueue, tokenA) = %v, want ErrLockLost", err)
+	}
+
+	// B and the other queue's message are untouched — still locked, still there.
+	if m, _ := e.Stats(ctx, "q"); m.Locked != 1 || m.Total != 1 {
+		t.Errorf("queue q: locked=%d total=%d, want 1/1 — B must be exactly where it was", m.Locked, m.Total)
+	}
+	if m, _ := e.Stats(ctx, "other"); m.Locked != 1 || m.Total != 1 {
+		t.Errorf("queue other: locked=%d total=%d, want 1/1", m.Locked, m.Total)
+	}
+
+	// And the genuine replay — the SAME request — is still an idempotent success.
+	if err := e.Complete(ctx, "q", a.SeqNumber, a.LockToken); err != nil {
+		t.Errorf("replaying the same Complete must stay an idempotent success, got %v", err)
+	}
+}

@@ -22,6 +22,18 @@ type EngineTx struct {
 // in the same transaction as the enqueue.
 func (t *EngineTx) SQL() *sql.Tx { return t.tx }
 
+// Context is the context your own statements inside this transaction should use:
+//
+//	tx.SQL().ExecContext(tx.Context(), `INSERT INTO orders_tbl(id) VALUES (1)`)
+//
+// Use it instead of the context you passed to Tx. On a LOCAL store it is deliberately not
+// cancellable: interrupting a statement mid-transaction leaks the SQLite connection, which leaves
+// the database locked (SQLITE_BUSY, permanently) — or, for `:memory:`, destroys it outright. The
+// wait to enter the transaction still honours your context, and an already-cancelled caller never
+// enters at all; only a statement that is already running is allowed to finish, which on a local
+// store takes microseconds. On a remote store it IS your context, unchanged.
+func (t *EngineTx) Context() context.Context { return t.ctx }
+
 // SendOne enqueues a message inside the open transaction.
 func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 	if int64(len(m.Body)) > t.e.maxMsgBytes {
@@ -68,7 +80,7 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 // Local file and :memory: stores never retry, so there fn runs exactly once.
 func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
 	var woke map[string]bool
-	err := e.inTx(ctx, func(tx *sql.Tx) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		et := &EngineTx{e: e, tx: tx, ctx: ctx, now: e.now(), woke: map[string]bool{}}
 		if err := fn(et); err != nil {
 			return err

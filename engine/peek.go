@@ -29,45 +29,43 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 		args = append(args, string(opts.State))
 	}
 	args = append(args, max)
-	rows, err := e.db.query(ctx, `
+	var out []*PeekedMessage
+	var bytes int64
+	err := e.db.queryRows(ctx, `
 		SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
 		       properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
 		       dead_letter_reason,dead_letter_description
 		FROM messages WHERE queue=? AND id>=?`+stateClause+`
-		ORDER BY id ASC LIMIT ?`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []*PeekedMessage
-	var bytes int64
-	for rows.Next() {
-		var p PeekedMessage
-		var st string
-		var messageID, groupID, correlationID, replyTo, subject, ctype, props, dlr, dld sql.NullString
-		if err := rows.Scan(&p.SeqNumber, &st, &p.Body, &messageID, &groupID, &correlationID,
-			&replyTo, &subject, &ctype, &props, &p.DeliveryCount, &p.EnqueuedAtMs, &p.VisibleAtMs, &p.ExpiresAtMs, &p.LockedUntilMs,
-			&dlr, &dld); err != nil {
-			return nil, err
+		ORDER BY id ASC LIMIT ?`, func(rows *sql.Rows) error {
+		for rows.Next() {
+			var p PeekedMessage
+			var st string
+			var messageID, groupID, correlationID, replyTo, subject, ctype, props, dlr, dld sql.NullString
+			if err := rows.Scan(&p.SeqNumber, &st, &p.Body, &messageID, &groupID, &correlationID,
+				&replyTo, &subject, &ctype, &props, &p.DeliveryCount, &p.EnqueuedAtMs, &p.VisibleAtMs, &p.ExpiresAtMs, &p.LockedUntilMs,
+				&dlr, &dld); err != nil {
+				return err
+			}
+			p.State = State(st)
+			p.MessageID = messageID.String
+			p.GroupID = groupID.String
+			p.CorrelationID = correlationID.String
+			p.ReplyTo = replyTo.String
+			p.Subject = subject.String
+			p.ContentType = ctype.String
+			p.Properties = parseProps(props)
+			p.DeadLetterReason = dlr.String
+			p.DeadLetterDescription = dld.String
+			out = append(out, &p)
+			// Bound the response size; page past this with FromSeq (MQLITE-80).
+			bytes += int64(len(p.Body))
+			if bytes >= maxResponseBytes {
+				break
+			}
 		}
-		p.State = State(st)
-		p.MessageID = messageID.String
-		p.GroupID = groupID.String
-		p.CorrelationID = correlationID.String
-		p.ReplyTo = replyTo.String
-		p.Subject = subject.String
-		p.ContentType = ctype.String
-		p.Properties = parseProps(props)
-		p.DeadLetterReason = dlr.String
-		p.DeadLetterDescription = dld.String
-		out = append(out, &p)
-		// Bound the response size; page past this with FromSeq (MQLITE-80).
-		bytes += int64(len(p.Body))
-		if bytes >= maxResponseBytes {
-			break
-		}
-	}
-	return out, rows.Err()
+		return rows.Err()
+	}, args...)
+	return out, err
 }
 
 // Stats returns pgmq-style counters for a queue (§7.3).

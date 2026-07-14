@@ -217,6 +217,28 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   callback transaction-bound. Local file and `:memory:` stores never retry, so it runs exactly once
   there.
 
+- **Cancelling a request can no longer wedge or erase a local database** (MQLITE-98/100).
+  Interrupting an in-flight statement on a local SQLite store LEAKS the connection: the pool then
+  reports zero open connections while the file stays locked, and every later statement fails with
+  `SQLITE_BUSY` — permanently. On `:memory:` the same event destroys the database outright, since
+  it lives inside that connection ("no such table: messages"). One root cause, two faces; ~40% of
+  runs in a 200-cancellation storm. **Reachable from ordinary code**: a timed-out HTTP request is
+  enough, and the CLI's renewer cancels an in-flight renewal *by design* on every receive.
+  A statement that is already EXECUTING on a local store is therefore no longer interrupted. The
+  contract stays narrow, and cancellation keeps its meaning: an already-cancelled caller never
+  starts a statement, and a caller waiting for the single writer keeps its own deadline and mutates
+  nothing. Only a statement already running is allowed to finish — microseconds, on a store that
+  does no network I/O. **Remote (Turso) stores are unchanged**: their statements can genuinely
+  block, and a discarded connection there holds no local lock. New `EngineTx.Context()` is the
+  context your own statements inside `Engine.Tx` should use.
+- **Settlement receipts identify the REQUEST, not just the token** (MQLITE-100). **Schema v4** —
+  pre-1.0, an existing DB is refused (`ErrSchemaVersionMismatch`) and must be recreated. A receipt
+  now records `queue + seq_number + lock_token + operation`, and every part is load-bearing:
+  matching the token alone meant `Complete(seqB, tokenA)` found A's completion receipt and reported
+  **success for a message it never touched** — in the same queue, through `CompleteBatch`, and even
+  across queues. The message stayed locked in the queue while the caller was told it was gone.
+  A same-request replay is still an idempotent success.
+
 ## v0.2.0 — 2026-07-11
 
 ### Behavior changes
