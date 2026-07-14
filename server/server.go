@@ -439,8 +439,9 @@ func (s *Server) handleReceiveDeferred(w http.ResponseWriter, r *http.Request) {
 
 // settleOK runs a settle action. A lost/expired lock is a distinct, typed error
 // (HTTP 409 "lock_lost") — not a 200 with {ok:false}, which a status-only client
-// would mistake for success. Idempotent replays of an already-settled token
-// return success (the engine consults the settlement-receipt table).
+// would mistake for success. Replaying the SAME request returns success (the engine
+// consults the settlement-receipt table); a request that differs in the message, the
+// verb, or an effect-bearing argument is not a replay and gets lock_lost.
 func (s *Server) settleOK(w http.ResponseWriter, err error) {
 	if err == nil {
 		writeJSON(w, wire.SettleResponse{Ok: true})
@@ -486,8 +487,11 @@ func (s *Server) handleCompleteBatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, wire.CompleteBatchResponse{Results: out})
 }
 
-// handleRenewBatch extends many leases in one request/transaction. N separate Renew calls cost
-// N round trips, which on a slow link takes longer than the lease they are meant to save.
+// handleRenewBatch extends many leases in ONE request and ONE statement — not a transaction; the
+// single statement is what lets every Ok be decided against one clock reading. N separate Renew
+// calls cost N round trips, which on a slow link takes longer than the lease they are meant to
+// save. Ok reports the lease was live when that statement finished; the deadline the caller should
+// pace against is locked_until in the per-item result.
 func (s *Server) handleRenewBatch(w http.ResponseWriter, r *http.Request) {
 	var req wire.RenewBatchRequest
 	if err := decode(r, &req); err != nil {

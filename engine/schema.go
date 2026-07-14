@@ -5,7 +5,7 @@ package engine
 // whose recorded version differs is refused with ErrSchemaVersionMismatch (see db.go)
 // rather than running today's DDL against a layout it doesn't match. Change the token
 // whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
-const schemaVersion = "4"
+const schemaVersion = "5"
 
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc
@@ -136,9 +136,10 @@ var schemaStmts = []string{
 	    queue       TEXT NOT NULL,
 	    seq_number  INTEGER NOT NULL,
 	    operation   TEXT NOT NULL,
+	    args        TEXT NOT NULL,
 	    created_at  INTEGER NOT NULL,
 	    expires_at  INTEGER NOT NULL,
-	    PRIMARY KEY (queue, seq_number, lock_token, operation)
+	    PRIMARY KEY (queue, seq_number, lock_token, operation, args)
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_settlement_expire ON settlement_receipts(expires_at)`,
 

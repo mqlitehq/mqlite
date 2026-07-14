@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -35,12 +37,28 @@ func affected(res sql.Result) error {
 //
 // This is the difference between "I already Completed this, the completion just
 // got lost" (success) and "my lock expired and someone else has the message" (lost).
-func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, op string, do func(ctx context.Context, tx *sql.Tx) (int64, error)) error {
+// settleArgs canonically encodes the arguments that CHANGE WHAT A SETTLE DOES, so they can join
+// the receipt's identity. Length-prefixed (so ("a","bc") and ("ab","c") differ) and hashed, which
+// keeps the key bounded no matter how long a dead-letter description runs. No effect-bearing
+// arguments — Complete, Defer — encode as the empty string.
+func settleArgs(parts ...string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	for _, p := range parts {
+		fmt.Fprintf(h, "%d:", len(p))
+		h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, op, args string, do func(ctx context.Context, tx *txn) (int64, error)) error {
 	if token == "" {
 		return ErrLockLost
 	}
 	now := e.now()
-	return e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// `ctx` here is the one inTx hands us — protected on a local store. Passing it to `do` is
 		// what keeps the fenced settle WRITE from being interrupted: an interrupted local write
 		// leaks the connection and wedges (or erases) the database. The do-closures used to capture
@@ -50,21 +68,31 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 			return err
 		}
 		if n == 0 {
-			// A receipt vouches for the VERB THAT WROTE IT, not merely for the token.
+			// A receipt vouches for THE REQUEST THAT WROTE IT — not for the token, not merely for
+			// the verb.
 			//
-			// Receipts exist so a settle whose response was lost can be replayed: the same verb,
-			// with the same token, reports the same success. They are NOT a licence for a DIFFERENT
-			// verb to claim that success. Without `operation=?`, an Abandon(T) — which returns the
-			// message to `active` — leaves a receipt that a later Complete(T) happily reads as
-			// "already completed": the caller is told the message is gone while it sits in the
-			// queue, waiting to be handed to somebody else. That is a false success, and
-			// at-least-once does not licence it (round-4 §3; the defect predates MQLITE-97 and ships
-			// in the released v0.2.0).
+			// Receipts exist so a settle whose response was lost can be replayed: the SAME request,
+			// resent, reports the same success. They are not a licence for a DIFFERENT request to
+			// claim that success. Three things have to match, and each was a false success in turn:
+			//
+			//   - the message (queue, seq_number). Keyed on the token alone, Complete(seqB, tokenA)
+			//     succeeded for a message the caller had never touched (round-5 §2).
+			//   - the verb (operation). An Abandon(T) — which returns the message to `active` —
+			//     left a receipt a later Complete(T) read as "already completed": the caller is told
+			//     the message is gone while it sits in the queue waiting for somebody else
+			//     (round-4 §3).
+			//   - the ARGUMENTS that change the effect (args). Abandon's delay and Reject's
+			//     reason/description do. Abandon(T, 60s) after Abandon(T, 5s) reported success while
+			//     silently keeping the 5s delay — the caller's backoff was quietly discarded
+			//     (round-6 §3).
+			//
+			// The rule, stated once: a replay is the same request. Anything else, on a message you
+			// no longer hold, is ErrLockLost — which is the truth.
 			var one int
 			err := tx.QueryRowContext(ctx,
 				`SELECT 1 FROM settlement_receipts
-				   WHERE queue=? AND seq_number=? AND lock_token=? AND operation=? AND expires_at>?`,
-				queue, seq, token, op, now).Scan(&one)
+				   WHERE queue=? AND seq_number=? AND lock_token=? AND operation=? AND args=? AND expires_at>?`,
+				queue, seq, token, op, args, now).Scan(&one)
 			if err == nil {
 				return nil // idempotent replay of the SAME verb on an already-settled token
 			}
@@ -74,8 +102,8 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 			return err
 		}
 		_, err = tx.ExecContext(ctx,
-			`INSERT OR REPLACE INTO settlement_receipts(lock_token,queue,seq_number,operation,created_at,expires_at)
-			 VALUES (?,?,?,?,?,?)`, token, queue, seq, op, now, now+settlementTTLMs)
+			`INSERT OR REPLACE INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at)
+			 VALUES (?,?,?,?,?,?,?)`, token, queue, seq, op, args, now, now+settlementTTLMs)
 		return err
 	})
 }
@@ -109,7 +137,7 @@ func (e *Engine) CompletedCounts() map[string]uint64 {
 // Complete removes a successfully-processed message (fencing on lock_token).
 func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token string) error {
 	var removed int64
-	err := e.settleOp(ctx, queue, seq, token, "completed", func(ctx context.Context, tx *sql.Tx) (int64, error) {
+	err := e.settleOp(ctx, queue, seq, token, "completed", "", func(ctx context.Context, tx *txn) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=?`, seq, queue, token)
 		if err != nil {
@@ -131,7 +159,9 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 // re-visibility when requeued.
 func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
 	now := e.now()
-	err := e.settleOp(ctx, queue, seq, token, "abandoned", func(ctx context.Context, tx *sql.Tx) (int64, error) {
+	// The delay is part of the request's identity: replaying Abandon with a DIFFERENT delay is a
+	// different request, not a lost-response retry, and must not inherit the first one's success.
+	err := e.settleOp(ctx, queue, seq, token, "abandoned", settleArgs(strconv.FormatInt(delayMs, 10)), func(ctx context.Context, tx *txn) (int64, error) {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET
 			    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
@@ -161,7 +191,11 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 	if reason == "" {
 		reason = ReasonAppRequested
 	}
-	return e.settleOp(ctx, queue, seq, token, "dead_lettered", func(ctx context.Context, tx *sql.Tx) (int64, error) {
+	// reason/description are part of the request's identity — they are what the operator reads out
+	// of the DLQ, and a replay that changed them would report success while keeping the old text.
+	// Encoded AFTER the default is applied, so Reject(…, "") and Reject(…, ReasonAppRequested) are
+	// correctly the same request.
+	return e.settleOp(ctx, queue, seq, token, "dead_lettered", settleArgs(reason, desc), func(ctx context.Context, tx *txn) (int64, error) {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET state='dead_lettered', locked_until=0, lock_token=NULL,
 			    dead_letter_reason=?, dead_letter_description=?
@@ -176,7 +210,7 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 
 // Defer sets a message aside; it is later retrieved by seq via ReceiveDeferred.
 func (e *Engine) Defer(ctx context.Context, queue string, seq int64, token string) error {
-	return e.settleOp(ctx, queue, seq, token, "deferred", func(ctx context.Context, tx *sql.Tx) (int64, error) {
+	return e.settleOp(ctx, queue, seq, token, "deferred", "", func(ctx context.Context, tx *txn) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE messages SET state='deferred', locked_until=0, lock_token=NULL
 			   WHERE id=? AND queue=? AND lock_token=?`, seq, queue, token)
@@ -264,8 +298,10 @@ func settleKey(seq int64, token string) string {
 	return strconv.FormatInt(seq, 10) + ":" + strconv.Itoa(len(token)) + ":" + token
 }
 
-// RenewBatch extends the lock lease of many messages in ONE transaction, returning a per-item
-// result so the caller can see exactly which leases still hold.
+// RenewBatch extends the lock lease of many messages in ONE STATEMENT — deliberately not a
+// transaction — returning a per-item result so the caller can see exactly which leases still held
+// when that statement finished. One statement means one clock reading: Ok cannot mean "live" for
+// some items and "stale" for others in the same call.
 //
 // Renewing a batch message-by-message does not scale: over a network each Renew is a separate
 // round trip, so N messages × the link latency can easily exceed the lease itself and the locks
@@ -455,7 +491,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 	replayed := make(map[string]bool, len(rows)) // (seq, token) pairs with a live receipt from an earlier settle
 	var removed int64
 
-	err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// The remote inTx may replay this closure — never inherit a previous attempt's results.
 		removed = 0
 		for k := range settled {
@@ -518,6 +554,10 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		//      - (queue, seq_number, lock_token): and it must be THIS message. Matching the token
 		//        alone let CompleteBatch(seqB, tokenA) find tokenA's receipt and report ok for a
 		//        message it never touched — even in another queue (round-5 §3).
+		//      - args='': Complete takes no arguments that change its effect, so its receipts
+		//        carry the empty key. Writing it explicitly (rather than leaving args out of the
+		//        query) is what keeps a batch completion from matching an Abandon's receipt when a
+		//        future verb starts sharing this path.
 		//
 		//    It must also run BEFORE step 3 writes receipts of its own, or a batch carrying
 		//    (wrongSeq, T) beside the valid (liveSeq, T) would see the receipt THIS batch just
@@ -528,14 +568,14 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 				end = len(rows)
 			}
 			group := rows[start:end]
-			args := make([]any, 0, 3+2*len(group))
-			args = append(args, now, "completed", queue)
+			args := make([]any, 0, 4+2*len(group))
+			args = append(args, now, "completed", "", queue)
 			for _, it := range group {
 				args = append(args, it.SeqNumber, it.LockToken)
 			}
 			rec, err := tx.QueryContext(ctx,
 				`SELECT seq_number, lock_token FROM settlement_receipts
-				   WHERE expires_at>? AND operation=? AND queue=?
+				   WHERE expires_at>? AND operation=? AND args=? AND queue=?
 				     AND (seq_number, lock_token) IN (VALUES `+
 					strings.Repeat(",(?,?)", len(group))[1:]+`)`, args...)
 			if err != nil {
@@ -560,7 +600,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		// 3. One receipt per token this call settled — what makes a re-Complete with the SAME token
 		//    an idempotent success instead of ErrLockLost.
 		return chunkPairs(rows, func(group []SettleItem, _ string) error {
-			recArgs := make([]any, 0, 6*len(group))
+			recArgs := make([]any, 0, 7*len(group))
 			var vals strings.Builder
 			for _, it := range group {
 				if !settled[settleKey(it.SeqNumber, it.LockToken)] {
@@ -569,15 +609,15 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 				if vals.Len() > 0 {
 					vals.WriteByte(',')
 				}
-				vals.WriteString("(?,?,?,?,?,?)")
+				vals.WriteString("(?,?,?,?,?,?,?)")
 				recArgs = append(recArgs,
-					it.LockToken, queue, it.SeqNumber, "completed", now, now+settlementTTLMs)
+					it.LockToken, queue, it.SeqNumber, "completed", "", now, now+settlementTTLMs)
 			}
 			if vals.Len() == 0 {
 				return nil
 			}
 			_, err := tx.ExecContext(ctx,
-				`INSERT OR REPLACE INTO settlement_receipts(lock_token,queue,seq_number,operation,created_at,expires_at)
+				`INSERT OR REPLACE INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at)
 				 VALUES `+vals.String(), recArgs...)
 			return err
 		})

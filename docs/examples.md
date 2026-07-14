@@ -82,8 +82,10 @@ func main() {
 
 	// Your app tables live in the same DB. Tx gives you that transaction.
 	err = mq.Tx(ctx, func(tx *engine.EngineTx) error {
-		// 1) the business write, on the SAME transaction:
-		if _, err := tx.SQL().ExecContext(ctx,
+		// 1) the business write, on the SAME transaction. Use tx.Context(), NOT the ctx you
+		//    passed to Tx: on a local store, cancelling a statement mid-transaction leaks the
+		//    SQLite connection and wedges the database.
+		if _, err := tx.SQL().ExecContext(tx.Context(),
 			`INSERT INTO orders(id, total) VALUES(?, ?)`, 42, 1999); err != nil {
 			return err // rollback: nothing enqueued
 		}

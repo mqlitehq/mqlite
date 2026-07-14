@@ -16,7 +16,7 @@ func sha256hex(b []byte) string {
 // insertOne inserts a single message inside tx, applying dedup gating (§8.6).
 // Returns (seq, deduped). When deduped==true the message was silently dropped
 // and seq is the original message's seq_number.
-func (e *Engine) insertOne(ctx context.Context, tx *sql.Tx, q queueRow, m OutMessage, atMs int64, forced State, now int64) (int64, bool, error) {
+func (e *Engine) insertOne(ctx context.Context, tx *txn, q queueRow, m OutMessage, atMs int64, forced State, now int64) (int64, bool, error) {
 	visibleAt := now
 	if forced == StateScheduled {
 		visibleAt = atMs
@@ -81,7 +81,7 @@ func (e *Engine) insertOne(ctx context.Context, tx *sql.Tx, q queueRow, m OutMes
 	return seq, false, err
 }
 
-func (e *Engine) rawInsert(ctx context.Context, tx *sql.Tx, queue string, m OutMessage, visibleAt, expiresAt int64, forced State, now int64) (int64, error) {
+func (e *Engine) rawInsert(ctx context.Context, tx *txn, queue string, m OutMessage, visibleAt, expiresAt int64, forced State, now int64) (int64, error) {
 	props, err := propsJSON(m.Properties)
 	if err != nil {
 		return 0, err

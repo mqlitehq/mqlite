@@ -11,7 +11,7 @@ import (
 
 func randToken() string {
 	b := make([]byte, 16)
-	// Lock tokens fence settlement and key the idempotency receipts — everything
+	// Lock tokens fence settlement and are part of the idempotency receipts' key — everything
 	// downstream assumes they are unique. If the system CSPRNG fails there is no
 	// safe fallback (an all-zero token would let any caller settle any claim), so
 	// crash loudly instead of degrading silently (MQLITE-63 / review F12).
@@ -176,7 +176,7 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 func (e *Engine) claimUpTo(ctx context.Context, q queueRow, max int, mode ReceiveMode) ([]*Message, error) {
 	now := e.now()
 	var out []*Message
-	err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		var err error
 		out, err = e.claimUpToTx(ctx, tx, q, max, mode, now)
 		return err

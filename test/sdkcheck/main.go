@@ -297,10 +297,12 @@ func embeddedTx(ctx context.Context) {
 
 	// commit: business write + enqueue together
 	err = emb.Tx(ctx, func(tx *engine.EngineTx) error {
-		if _, e := tx.SQL().ExecContext(ctx, `CREATE TABLE IF NOT EXISTS biz(id INTEGER PRIMARY KEY)`); e != nil {
+		// tx.Context(), not the outer ctx — see EngineTx.Context. The SDK's own smoke check has to
+		// model the contract it documents.
+		if _, e := tx.SQL().ExecContext(tx.Context(), `CREATE TABLE IF NOT EXISTS biz(id INTEGER PRIMARY KEY)`); e != nil {
 			return e
 		}
-		if _, e := tx.SQL().ExecContext(ctx, `INSERT INTO biz(id) VALUES (1)`); e != nil {
+		if _, e := tx.SQL().ExecContext(tx.Context(), `INSERT INTO biz(id) VALUES (1)`); e != nil {
 			return e
 		}
 		_, e := tx.SendOne("q", engine.OutMessage{Body: []byte("evt")})

@@ -794,3 +794,112 @@ func TestReceiptsAreBoundToTheirMessage(t *testing.T) {
 		t.Errorf("replaying the same Complete must stay an idempotent success, got %v", err)
 	}
 }
+
+// ─── receipt identity: the ARGUMENTS ──────────────────────────────────────────
+
+// A receipt vouches for a REQUEST. Same message, same token, same verb — but a different delay or
+// a different dead-letter reason is a DIFFERENT request, and it must not inherit the first one's
+// success. It used to: Abandon(T, 60s) after Abandon(T, 5s) returned nil while the message quietly
+// kept the 5s delay, so a client's backoff was silently discarded and the message came back early
+// (round-6 §3). Reject's reason/description had the same hole — the operator would read the wrong
+// text out of the DLQ and be told the write had succeeded.
+func TestReceiptsAreBoundToTheirArguments(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+	lock := func() *Message {
+		t.Helper()
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("receive: %v (%d)", err, len(got))
+		}
+		return got[0]
+	}
+
+	t.Run("abandon delay", func(t *testing.T) {
+		m := lock()
+		if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 5_000); err != nil {
+			t.Fatalf("first abandon: %v", err)
+		}
+		// The SAME request, replayed (a lost response): idempotent success.
+		if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 5_000); err != nil {
+			t.Fatalf("replaying the same Abandon must be an idempotent success, got %v", err)
+		}
+		// A DIFFERENT delay is a different request on a message this caller no longer holds.
+		err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 60_000)
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("Abandon with a CHANGED delay must be ErrLockLost — it cannot report success while\n"+
+				"keeping the first call's 5s delay. got err=%v", err)
+		}
+		// And the message really does still carry the delay the first call asked for.
+		p, err := e.Peek(ctx, "q", PeekOptions{FromSeq: m.SeqNumber, Max: 1})
+		if err != nil || len(p) != 1 {
+			t.Fatalf("peek: %v", err)
+		}
+		if want := m.EnqueuedAtMs; p[0].VisibleAtMs > want+30_000 {
+			t.Fatalf("visible_at moved to the second call's delay — the false success wrote through")
+		}
+	})
+
+	t.Run("reject reason and description", func(t *testing.T) {
+		for _, tc := range []struct{ name, reason, desc string }{
+			{"changed reason", "OtherReason", "boom"},
+			{"changed description", "PoisonMessage", "something else"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				m := lock()
+				if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "PoisonMessage", "boom"); err != nil {
+					t.Fatalf("first reject: %v", err)
+				}
+				if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "PoisonMessage", "boom"); err != nil {
+					t.Fatalf("replaying the same Reject must be an idempotent success, got %v", err)
+				}
+				if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, tc.reason, tc.desc); !errors.Is(err, ErrLockLost) {
+					t.Fatalf("Reject with a CHANGED %s must be ErrLockLost, not a success that keeps the\n"+
+						"original text in the DLQ. got err=%v", tc.name, err)
+				}
+				p, err := e.Peek(ctx, "q", PeekOptions{FromSeq: m.SeqNumber, Max: 1})
+				if err != nil || len(p) != 1 {
+					t.Fatalf("peek: %v", err)
+				}
+				if p[0].DeadLetterReason != "PoisonMessage" || p[0].DeadLetterDescription != "boom" {
+					t.Fatalf("the DLQ text changed under a call that was supposed to fail: reason=%q desc=%q",
+						p[0].DeadLetterReason, p[0].DeadLetterDescription)
+				}
+			})
+		}
+	})
+
+	// Reject defaults an empty reason to ReasonAppRequested BEFORE the receipt is keyed, so the two
+	// spellings of the same request stay the same request.
+	t.Run("the default reason is not a different request", func(t *testing.T) {
+		m := lock()
+		if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "", ""); err != nil {
+			t.Fatalf("first reject: %v", err)
+		}
+		if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, ReasonAppRequested, ""); err != nil {
+			t.Fatalf("Reject(\"\") and Reject(ReasonAppRequested) are the SAME request; the replay must\n"+
+				"succeed. got %v", err)
+		}
+	})
+
+	// Complete and Defer take no arguments that change what they do, so nothing about them may be
+	// argument-sensitive — their receipts stay plain replays.
+	t.Run("argument-free verbs still replay", func(t *testing.T) {
+		m := lock()
+		if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+			t.Fatalf("replaying Complete must stay an idempotent success, got %v", err)
+		}
+	})
+}

@@ -187,7 +187,7 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	if err := validateQueueConfig(name, cfg); err != nil {
 		return err
 	}
-	if err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		return e.createQueueTx(ctx, tx, name, cfg, true)
 	}); err != nil {
 		return err
@@ -216,7 +216,7 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 // overwrite=false only ensures the row exists and never touches an existing queue's config:
 // Subscribe uses it so re-subscribing (a filter update) can't reset the backing queue's
 // lock/delivery/TTL/dedup/ordering/DLQ settings (MQLITE-73). The name guards run either way.
-func (e *Engine) createQueueTx(ctx context.Context, tx *sql.Tx, name string, cfg QueueConfig, overwrite bool) error {
+func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg QueueConfig, overwrite bool) error {
 	// Central guard: also runs for Subscribe's backing-queue creation, so a bad name
 	// or enum can't reach the INSERT and CHECK-fault into a 500 (MQLITE-86).
 	if err := validateQueueConfig(name, cfg); err != nil {
@@ -332,7 +332,7 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 	// Guards + backing-queue upsert + mapping upsert run in ONE transaction so a
 	// concurrent CreateQueue/Subscribe can't slip between check and insert (the
 	// local single connection serializes anyway; the remote pool does not).
-	if err := e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		var topicKind string
 		err := tx.QueryRowContext(ctx,
 			`SELECT kind FROM queues WHERE name=?`, topic).Scan(&topicKind)
@@ -601,7 +601,7 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 	conflicts := make([]bool, len(ms))
 	woke := map[string]bool{}
 
-	err = e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	err = e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// reset per-attempt accumulators (inTx may retry the whole closure).
 		for i := range seqs {
 			seqs[i] = 0
@@ -701,7 +701,7 @@ func (e *Engine) resolveTargets(ctx context.Context, name string) ([]target, err
 	return []target{{name: name}}, nil
 }
 
-func (e *Engine) loadQueueTx(ctx context.Context, tx *sql.Tx, name string) (queueRow, error) {
+func (e *Engine) loadQueueTx(ctx context.Context, tx *txn, name string) (queueRow, error) {
 	e.qmu.RLock()
 	q, ok := e.qcache[name]
 	e.qmu.RUnlock()

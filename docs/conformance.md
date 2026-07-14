@@ -59,8 +59,13 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   `dead_lettered` (`MaxDeliveryCountExceeded`) once `delivery_count >=
   max_delivery_count` — a crash never buys an extra delivery.
   *(engine/engine_test.go: TestCrashRecoveryRespectsMaxDelivery)*
-- **3.2** A settle whose response was lost MUST replay as success, not `ErrLockLost`
-  (`settlement_receipts`, fenced on `lock_token`). *(engine/ga_fixes_test.go)*
+- **3.2** A settle whose response was lost MUST replay as success, not `ErrLockLost` —
+  and ONLY when it is the same request. A `settlement_receipt` identifies
+  `queue + seq_number + lock_token + operation + effect-bearing arguments`; a call that
+  differs in ANY of them is not a replay and MUST return `ErrLockLost`, never a success
+  that silently keeps the first call's effect.
+  *(engine/ga_fixes_test.go, engine/complete_batch_test.go: TestReceiptsAreBoundTo*,
+  engine/model_test.go)*
 - **3.3** A `Receive` retried with the same `AttemptID` MUST replay the same batch /
   same lock tokens, not double-deliver. *(engine/ga_fixes_test.go)*
 - **3.4** No message loss + no content corruption: a contiguous `1..N` sequence with
@@ -190,6 +195,38 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   queue, else `ErrQueueNotFound`) is **unambiguous** — a `Send` can never be silently
   rerouted between a queue and a same-named topic.
   *(engine/functional_test.go: TestTopicQueueNamespaceDisjoint)*
+
+## 13 · Cancellation (context deadlines)
+
+Cancelling a call is not a way to *undo* it, and on a local store it is not a latency knob
+either. The rules below are the whole contract; they are stated here, and not only in the
+changelog, because a caller can observe every one of them.
+
+- **13.1** A caller whose context is already cancelled MUST NOT execute anything. This holds
+  at both boundaries — before the wait for the writer, and again after the connection is in
+  hand. *(engine/cancel_test.go: TestPreCancelledNeverExecutes,
+  TestCancelInTheHandoffWindowStartsNothing)*
+- **13.2** A caller waiting for the single writer keeps its own deadline: cancelling while
+  queued MUST return promptly and MUST mutate nothing.
+  *(engine/cancel_test.go: TestCancelWhileWaitingWritesNothing)*
+- **13.3** On a **local** store (file or `:memory:`), a statement that has already begun
+  executing MUST be allowed to finish. It is not interrupted, and **there is no upper bound on
+  how long it takes** — `EngineTx.SQL()` runs arbitrary user SQL, a full `VACUUM` rewrites the
+  file, a large `Purge` is a big `DELETE`. A write can therefore commit *after* its caller has
+  given up. This is deliberate: interrupting a local statement leaks the driver connection,
+  which leaves a file DB locked (`SQLITE_BUSY`, permanently) or destroys a `:memory:` DB
+  outright. *(engine/cancel_test.go: TestCancelStormLeavesTheDatabaseUsable,
+  TestCancelledSettleWritesLeaveTheDatabaseUsable)*
+- **13.4** Inside a transaction the rule is **per statement**: the one already running finishes,
+  and the next one MUST NOT begin. A local transaction whose caller cancels MUST roll back —
+  it MUST NOT commit work the caller abandoned, and it MUST NOT grind through the rest of the
+  closure first. *(engine/cancel_test.go: TestCancelledTransactionStopsIssuingStatements,
+  TestTxCancelledBetweenStatementsRollsBack)*
+- **13.5** On a **remote** (Turso/libSQL) store, statement cancellation is real and unchanged:
+  those statements can genuinely block on the network, and a discarded connection there holds
+  no local lock.
+- **13.6** Follows from 13.3: a lost response never means "it did not happen". Cancellation
+  does not change the at-least-once contract — reconcile, do not assume.
 
 ---
 

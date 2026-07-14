@@ -297,29 +297,30 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 // exactly one page); (3) a second TRUNCATE checkpoint hands the truncated tail back to the OS
 // (in WAL mode the file only shrinks at a checkpoint). Single writer, so neither blocks.
 // Shared by the background janitor and Compact(false) (MQLITE-78).
+//
+// It goes through withConn like everything else: a checkpoint/vacuum interrupted mid-statement
+// leaks the local connection and wedges the database exactly as a settle would, and this one runs
+// unattended on the janitor's clock (round-6 §4).
 func (e *Engine) reclaimPages(ctx context.Context) error {
-	conn, err := e.db.sql.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return err
-	}
-	rows, err := conn.QueryContext(ctx, `PRAGMA incremental_vacuum`)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		// each step frees one more page; iterating reclaims the whole freelist
-	}
-	if cerr := rows.Err(); cerr != nil {
+	return e.db.withConn(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			return err
+		}
+		rows, err := conn.QueryContext(ctx, `PRAGMA incremental_vacuum`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			// each step frees one more page; iterating reclaims the whole freelist
+		}
+		if cerr := rows.Err(); cerr != nil {
+			_ = rows.Close()
+			return cerr
+		}
 		_ = rows.Close()
-		return cerr
-	}
-	_ = rows.Close()
-	_, err = conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
-	return err
+		_, err = conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+		return err
+	})
 }
 
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with

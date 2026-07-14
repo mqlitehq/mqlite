@@ -235,10 +235,19 @@ loud — **delivery is at-least-once; make handlers idempotent** — and then wo
 to make the *window* small and the *retries* safe:
 
 - **`settlement_receipts`** — when a settle (Complete/Abandon/Reject/Defer)
-  succeeds, a receipt keyed by the lock token is written *in the same
-  transaction* (kept ~30 minutes). If the client's response got lost and it
-  retries, the settle matches zero rows — but finds the receipt, and returns
-  success instead of a spurious `lock_lost`. Acknowledgements are idempotent.
+  succeeds, a receipt for the *request* is written *in the same transaction*
+  (kept ~30 minutes). If the client's response got lost and it retries, the
+  settle matches zero rows — but finds the receipt, and returns success instead
+  of a spurious `lock_lost`. Acknowledgements are idempotent.
+
+  A receipt is keyed by the whole request — `queue`, `seq_number`, `lock_token`,
+  `operation`, and the arguments that change what the settle *does* (Abandon's
+  delay; Reject's reason/description) — because a replay is the same request and
+  nothing else. Keyed more loosely, a receipt vouches for a call that never
+  happened: a token vouching for another message, an Abandon vouching for a
+  Complete, or a changed backoff reported as applied when it was not. Any of
+  those is a false success, and at-least-once does not licence it. A call that
+  differs in any of those fields gets `lock_lost`.
 - **`receive_attempts`** — a client may tag `Receive` with an `attempt_id`. The
   claimed batch is recorded under that id (same transaction again); a retry of
   the same attempt **replays the exact same messages and lock tokens** instead of
@@ -260,7 +269,9 @@ external broker can offer:
 
 ```go
 err := mq.Tx(ctx, func(tx *engine.EngineTx) error {
-    if _, err := tx.SQL().ExecContext(ctx,
+    // tx.Context(), not the outer ctx: on a local store an interrupted statement
+    // inside the transaction leaks the connection and wedges the database.
+    if _, err := tx.SQL().ExecContext(tx.Context(),
         `INSERT INTO orders(id, total) VALUES(?, ?)`, 42, 1999); err != nil {
         return err            // rollback: no order, no event
     }

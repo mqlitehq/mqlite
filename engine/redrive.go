@@ -127,7 +127,7 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 	}
 	inClause := "(" + strings.Join(ph, ",") + ")"
 
-	return e.inTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		if !crossQueue {
 			_, err := tx.ExecContext(ctx, `
 				UPDATE messages SET state='active', delivery_count=0, lock_token=NULL,

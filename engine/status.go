@@ -43,7 +43,10 @@ func (e *Engine) Status(ctx context.Context) Status {
 
 	t0 := time.Now()
 	var one int
-	if err := e.db.sql.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+	// queryRowScan, not e.db.sql: Status is reachable from an HTTP handler, so its ctx carries the
+	// request deadline — and the one thing that must never happen on a local store is a statement
+	// cut off in flight (round-6 §4).
+	if err := e.db.queryRowScan(ctx, []any{&one}, "SELECT 1"); err != nil {
 		s.PingMs = -1
 	} else {
 		s.PingMs = time.Since(t0).Milliseconds()

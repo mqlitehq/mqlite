@@ -10,6 +10,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -303,6 +304,59 @@ func TestCancelInTheHandoffWindowStartsNothing(t *testing.T) {
 		}
 		if m, _ := e.Stats(ctx, "q"); m.DeadLettered != 1 {
 			t.Errorf("dead_lettered=%d — the cancelled Purge destroyed data on behalf of a caller who was gone", m.DeadLettered)
+		}
+	})
+}
+
+// A transaction whose caller has given up must stop ISSUING statements — not grind through the
+// rest of the closure and roll back at the end.
+//
+// The statements inside a local transaction deliberately run on an uninterruptible context, which
+// is what keeps an in-flight write from wedging the database. The trap is that "uninterruptible"
+// used to mean the closure kept going: a cancelled caller's 256-message Send still executed all
+// 256 inserts, and an Engine.Tx callback held the process's one writer for its full duration with
+// no way to stop it (codex, round-6). The rule is per-statement, and *txn enforces it: a statement
+// already executing finishes; the next one does not begin.
+func TestCancelledTransactionStopsIssuingStatements(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		var second error
+		txErr := e.inTx(cctx, func(ec context.Context, tx *txn) error {
+			if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe','1')`); err != nil {
+				t.Fatalf("the FIRST statement runs normally: %v", err)
+			}
+			cancel() // the caller gives up, mid-transaction
+			_, second = tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe2','1')`)
+			return second
+		})
+		if !errors.Is(second, context.Canceled) {
+			t.Fatalf("the statement AFTER the cancellation must not be issued at all; got err=%v", second)
+		}
+		if !errors.Is(txErr, context.Canceled) {
+			t.Fatalf("inTx must surface the cancellation, got %v", txErr)
+		}
+
+		// ...and the transaction rolled back, so not even the first statement survives.
+		var n int
+		if err := e.db.queryRowScan(context.Background(), []any{&n},
+			`SELECT COUNT(*) FROM meta WHERE key IN ('probe','probe2')`); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("a cancelled transaction committed %d row(s) — it must roll back entirely", n)
+		}
+
+		// The database is still perfectly usable: nothing was interrupted, so nothing leaked.
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable after a cancelled transaction: %v", err)
 		}
 	})
 }

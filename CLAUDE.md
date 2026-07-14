@@ -162,9 +162,13 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 - **Crash recovery** (`engine.Open`): on startup every orphaned `locked` row is reset
   to `active` (single-broker assumption). delivery_count was already bumped at claim.
 - **`settlement_receipts`** table makes Complete/Abandon/Reject/Defer idempotent:
-  a settle that affects 0 rows but finds a live receipt for the lock_token returns
-  success (lost-response replay) instead of a spurious `ErrLockLost`. See
-  `settleOp` in `engine/settle.go`. Settlement is **fenced on `lock_token`**.
+  a settle that affects 0 rows but finds a live receipt **for that exact request**
+  returns success (lost-response replay) instead of a spurious `ErrLockLost`. The
+  receipt is keyed by `queue + seq_number + lock_token + operation + args` — the
+  message, the verb, and the arguments that change the effect — because a replay is
+  the same request and nothing else. Key it any looser and it vouches for a call that
+  never happened. See `settleOp` in `engine/settle.go`. Settlement is **fenced on
+  `lock_token`**.
 - **`receive_attempts`** table makes Receive idempotent when the client passes an
   `AttemptID` (a retry replays the same batch / same lock tokens; `engine/recv_attempt.go`).
 

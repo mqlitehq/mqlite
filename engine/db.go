@@ -315,7 +315,10 @@ func (d *db) backoff(ctx context.Context, attempt int) {
 //   - a caller who is ALREADY cancelled never starts a statement at all (checkCtx below);
 //   - a caller WAITING for the single writer keeps its own context, so it walks away on cancel and
 //     mutates nothing — that wait is the only place a local caller can actually be stuck;
-//   - only a statement that is already EXECUTING runs to completion — microseconds on a local store,
+//   - only a statement that is already EXECUTING runs to completion. There is NO upper bound on how
+//     long that takes: EngineTx.SQL() runs arbitrary user SQL, a full VACUUM rewrites the file, and a
+//     large Purge or Redrive is a big DELETE. "Microseconds" described the common case and was quietly
+//     read as a guarantee (round-6 §2.3) — it is not one. Cancellation is not a latency knob here,
 //     since it does no network I/O.
 //
 // What we buy: cancelling a request can never destroy or wedge the database. What we pay: a write
@@ -612,13 +615,56 @@ func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ..
 	return err
 }
 
+// txn is the ONLY way engine code issues a statement inside a transaction, and it exists because
+// three review rounds running found a fresh path that had quietly skipped the cancellation rules.
+// A guard you have to remember to apply is a guard that gets forgotten, so this one is structural:
+// the closures are handed a *txn instead of a *sql.Tx, and every statement they can issue goes
+// through it.
+//
+// It enforces both halves of the contract at once, per statement:
+//
+//   - the caller is still waiting → run on the PROTECTED context. A statement already executing
+//     is never interrupted: on a local store that leaks the driver connection and wedges the file
+//     (SQLITE_BUSY forever) or erases a :memory: database outright.
+//   - the caller has given up → hand database/sql the caller's already-cancelled context. It fails
+//     the statement before it reaches the driver, so nothing begins and nothing is interrupted —
+//     and fn unwinds into the rollback below instead of grinding through the rest of a transaction
+//     nobody is waiting for (codex, round-6).
+//
+// The methods mirror *sql.Tx's signatures — including the ctx parameter they deliberately ignore —
+// so the 28 statement sites read exactly as they did, and so a future one cannot pick the wrong
+// context even by trying.
+type txn struct {
+	tx     *sql.Tx
+	caller context.Context // may be cancelled
+	exec   context.Context // protected on a local store; the caller's on a remote one
+}
+
+func (t *txn) ctx() context.Context {
+	if t.caller.Err() != nil {
+		return t.caller // cancelled: database/sql refuses it before the driver ever sees it
+	}
+	return t.exec
+}
+
+func (t *txn) ExecContext(_ context.Context, q string, args ...any) (sql.Result, error) {
+	return t.tx.ExecContext(t.ctx(), q, args...)
+}
+func (t *txn) QueryContext(_ context.Context, q string, args ...any) (*sql.Rows, error) {
+	return t.tx.QueryContext(t.ctx(), q, args...)
+}
+func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) *sql.Row {
+	return t.tx.QueryRowContext(t.ctx(), q, args...)
+}
+
+// SQL exposes the raw transaction for the one caller that needs it: Embedded.Tx, whose user
+// callback runs its own business writes. Statements issued through it are the USER's, and mqlite
+// cannot see their boundaries — so they are not guarded. EngineTx documents this.
+func (t *txn) SQL() *sql.Tx { return t.tx }
+
 // inTx runs fn inside a transaction, retrying the whole transaction on a
 // connection error (the aborted tx leaves nothing committed, so retry is safe).
-// fn is handed the context ITS STATEMENTS must use — not the caller's. On a local store that is an
-// uninterruptible one (see stmtCtx): a statement interrupted inside a transaction leaks the
-// connection and wedges the database. Taking it as a parameter means the closures cannot get this
-// wrong by accident — the `ctx` in scope inside fn is always the right one.
-func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *sql.Tx) error) error {
+func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error) error {
 	if !e.db.remote {
 		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
 		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
@@ -628,7 +674,7 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *sql.Tx) err
 			if berr != nil {
 				return berr
 			}
-			if ferr := fn(ec, tx); ferr != nil {
+			if ferr := fn(ec, &txn{tx: tx, caller: ctx, exec: ec}); ferr != nil {
 				_ = tx.Rollback()
 				return ferr
 			}
@@ -658,7 +704,7 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *sql.Tx) err
 			}
 			return err
 		}
-		err = fn(e.db.stmtCtx(ctx), tx)
+		err = fn(e.db.stmtCtx(ctx), &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx)})
 		if err != nil {
 			_ = tx.Rollback()
 			if e.db.retryable(err) {
