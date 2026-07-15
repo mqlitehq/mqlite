@@ -4,7 +4,7 @@
 
 BIN := bin
 
-.PHONY: help build test e2e bench clean clean-docker distclean
+.PHONY: help build test e2e crash bench clean clean-docker distclean
 
 help: ## show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -24,6 +24,9 @@ test: ## run unit + invariant tests (uses auto-cleaned temp dirs)
 
 e2e: ## run end-to-end suites against an ephemeral local broker
 	./test/run.sh
+
+crash: ## run the crash-injection layer (re-execs + hard-kills a worker; tag-gated, off the default suite)
+	go test -race -tags crash_injection -count=1 ./test/crash/
 
 bench: ## run the Docker stress matrix (regenerates test/bench/out/)
 	./test/bench/run-bench.sh

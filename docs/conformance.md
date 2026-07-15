@@ -247,6 +247,27 @@ engine to grade itself — an engine with a bug reports that everything is fine.
 - **14.4 No loss.** Every message sent is eventually completed — not most of them.
   *(engine/concurrency_test.go)*
 
+## 15 · Crash recovery (process death)
+
+Asserted by killing a real process hard (SIGKILL / TerminateProcess — no cleanup, no flush) while it
+is mid-transaction, restarting, and checking what survived. This covers process death, NOT power
+loss: a hard kill does not lose data the OS already accepted, so it exercises application-level
+recovery, not filesystem durability.
+
+- **15.1 Outbox atomicity across a crash.** A transaction that writes a business row AND enqueues a
+  message commits both or neither — even when killed mid-commit. After recovery the set of business
+  rows equals the set of messages exactly: never an order without its message, never a message
+  without its order. *(test/crash/crash_test.go: TestCrashOutboxAtomicity)*
+- **15.2 Orphaned locks reset on restart.** After a crash while messages are `locked`, `Open` reclaims
+  every orphaned lock — to `active`, or to `dead_lettered` with `MaxDeliveryCountExceeded` if the
+  message was already on its last permitted delivery (the same rule the reaper applies, §3.1). Either
+  way nothing is stranded `locked`. *(test/crash/crash_test.go: TestCrashRecoveryResetsOrphanedLocks;
+  the seeded set uses a high MaxDeliveryCount, so it exercises the reset-to-active path.)*
+- **15.3 No loss across recovery.** A message committed before the crash is still present after it —
+  a crash never silently drops a message. *(test/crash/crash_test.go)*
+
+Run: `make crash` (tag-gated; not in the default `-race` matrix — see the testing-layers note).
+
 ---
 
 *This spec is the contract a non-SQLite storage backend (see the Store-interface
