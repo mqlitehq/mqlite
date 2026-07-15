@@ -258,8 +258,11 @@ recovery, not filesystem durability.
   message commits both or neither — even when killed mid-commit. After recovery the set of business
   rows equals the set of messages exactly: never an order without its message, never a message
   without its order. *(test/crash/crash_test.go: TestCrashOutboxAtomicity)*
-- **15.2 Orphaned locks reset on restart.** After a crash while messages are `locked`, `Open` resets
-  every orphaned lock to `active` (single-broker recovery), so nothing is stranded. *(test/crash/crash_test.go: TestCrashRecoveryResetsOrphanedLocks)*
+- **15.2 Orphaned locks reset on restart.** After a crash while messages are `locked`, `Open` reclaims
+  every orphaned lock — to `active`, or to `dead_lettered` with `MaxDeliveryCountExceeded` if the
+  message was already on its last permitted delivery (the same rule the reaper applies, §3.1). Either
+  way nothing is stranded `locked`. *(test/crash/crash_test.go: TestCrashRecoveryResetsOrphanedLocks;
+  the seeded set uses a high MaxDeliveryCount, so it exercises the reset-to-active path.)*
 - **15.3 No loss across recovery.** A message committed before the crash is still present after it —
   a crash never silently drops a message. *(test/crash/crash_test.go)*
 
