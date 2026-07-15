@@ -177,3 +177,18 @@ jobs:
           go-version: stable
       - name: blackbox suites (test/run.sh)
         run: ./test/run.sh
+
+  crash:
+    # The crash-injection layer: re-exec a worker, hard-kill it mid-transaction, restart, and check
+    # what survived (outbox atomicity across the kill; orphaned locks reset on recovery). Gated by a
+    # build tag and run only here — it spawns and SIGKILLs subprocesses, which is deterministic on
+    # Linux but needlessly flaky to matrix across Windows/macOS. Race-instrumented.
+    name: crash injection (recovery invariants)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: crash-recovery suite
+        run: go test -race -tags crash_injection -count=1 ./test/crash/

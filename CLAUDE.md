@@ -226,6 +226,7 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 | Unit + invariant (TCK-style) | `*_test.go`, `engine/*_test.go` | Hermetic, temp dirs; CI runs with `-race`. `engine/main_test.go` is the harness. |
 | Blackbox e2e | `test/run.sh` + `test/api_curl.sh`, `api_tests.py`, `sdkcheck/` | Boots a real broker; catches HTTP API drift the in-process tests can't. |
 | Live Turso | `engine/turso_test.go` (gated by `MQLITE_TEST_DB`) | Skipped unless env set; runs in `turso-nightly.yml`. |
+| Crash injection | `test/crash/` (`make crash`) | Re-execs + hard-kills a worker mid-transaction; asserts outbox atomicity + orphaned-lock recovery. Build-tag `crash_injection`, own CI job (Linux), NOT in the default `-race` matrix. |
 | Stress/bench | `test/bench/` (`make bench`) | Docker matrix. |
 
 `make clean` removes every generated artifact (DBs, binaries, bench output, smoke
