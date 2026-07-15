@@ -58,6 +58,7 @@ func parseAck(line string) (string, bool) {
 const (
 	roleEnv = "MQLITE_CRASH_ROLE"
 	dbEnv   = "MQLITE_CRASH_DB"
+	holdEnv = "MQLITE_CRASH_HOLD" // "1" switches the producer to the coordinated in-tx kill mode
 )
 
 // TestCrashWorkerEntrypoint is the re-exec target. Run normally (no role in the env) it is a no-op
@@ -86,11 +87,13 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 	}
 }
 
-// runProducer tests the transactional outbox across a crash. It first commits a run of ordinary
-// transactions — each writing a business row AND its message together — so there is durable,
-// acknowledged state for the no-loss oracle. Then it opens ONE more transaction, writes only the
-// order half, and HOLDS it open while announcing inTxMarker, so the harness can kill it at the exact
-// instant the atomicity guarantee is on the line: order written, message not, process dying.
+// runProducer tests the transactional outbox across a crash, in one of two modes (holdEnv):
+//
+//   - default (random): commit full order+message transactions in a tight loop and let the harness
+//     kill on a timer, so the crash lands at an unsynchronised point — including around a commit.
+//   - HOLD=1 (coordinated): commit a run of full transactions, then hold ONE open between its two
+//     writes and announce inTxMarker, so the harness kills with the order written and the message
+//     not. This is the deterministic proof that a torn callback rolls back whole.
 //
 // Order identity is a per-PROCESS nonce (this process's start time + a counter), not a value derived
 // from the database like MAX(oid)+1. That matters for the no-loss check: if a crash lost a whole
@@ -110,9 +113,9 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 	counter := 0
 	nextNonce := func() string { counter++; return prefix + "-" + strconv.Itoa(counter) }
 
-	// A run of ordinary committed transactions: durable state, and acks the oracle will require to
-	// survive the crash.
-	for n := 0; n < 40; n++ {
+	// commit does ONE full outbox transaction — order row + its message together — and announces the
+	// nonce as durably committed once e.Tx returns nil.
+	commit := func() string {
 		nonce := nextNonce()
 		if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
 			if _, err := tx.SQL().ExecContext(tx.Context(),
@@ -127,25 +130,47 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 			// ctx or closes this engine, so any error is a real defect (codex).
 			fail("producer tx", err)
 		}
-		fmt.Println(ackPrefix, nonce) // this nonce is durably committed
+		fmt.Println(ackPrefix, nonce)
+		return nonce
 	}
 
-	// Now the coordinated kill point: open a transaction, write the order, and hold it OPEN. The
-	// message write and commit never run — the harness kills us here. If the outbox is one
-	// transaction, recovery rolls back BOTH halves; a dual-write would leave the order behind.
-	held := nextNonce()
-	_ = e.Tx(ctx, func(tx *engine.EngineTx) error {
-		if _, err := tx.SQL().ExecContext(tx.Context(),
-			`INSERT INTO orders(nonce) VALUES(?)`, held); err != nil {
-			return err
+	if os.Getenv(holdEnv) == "1" {
+		// COORDINATED kill (deterministic): a run of full commits for durable state, then open ONE
+		// transaction, write the order half, and HOLD it open. The message write and commit never
+		// run — the harness kills here. This proves a callback torn between its two writes rolls
+		// back whole, catching an implementation that writes the order and the message in SEPARATE
+		// transactions.
+		for n := 0; n < 40; n++ {
+			commit()
 		}
-		fmt.Println(inTxMarker) // order written, message NOT yet — kill me now
-		_ = os.Stdout.Sync()
-		time.Sleep(60 * time.Second) // hold the transaction open until the harness kills the process
-		_, err := tx.SendOne("q", engine.OutMessage{Body: []byte(held)})
-		return err
-	})
-	fail("producer was not killed while holding a transaction open", errors.New("still alive"))
+		held := nextNonce()
+		_ = e.Tx(ctx, func(tx *engine.EngineTx) error {
+			if _, err := tx.SQL().ExecContext(tx.Context(),
+				`INSERT INTO orders(nonce) VALUES(?)`, held); err != nil {
+				return err
+			}
+			fmt.Println(inTxMarker) // order written, message NOT yet — kill me now
+			_ = os.Stdout.Sync()
+			time.Sleep(60 * time.Second) // hold the transaction open until the harness kills us
+			_, err := tx.SendOne("q", engine.OutMessage{Body: []byte(held)})
+			return err
+		})
+		fail("producer was not killed while holding a transaction open", errors.New("still alive"))
+	}
+
+	// RANDOM kill (probabilistic): commit full transactions as fast as we can and let the harness
+	// kill on a timer, so the crash lands at an unpredictable point in the stream — INCLUDING around
+	// a commit. The held-tx case above cannot reach that window (a crash inside the callback has
+	// committed nothing either way); this is what would catch an implementation that persisted the
+	// business row and the enqueue across two commits with a gap between them (codex).
+	first := true
+	for {
+		commit()
+		if first {
+			first = false
+			ready()
+		}
+	}
 }
 
 // runLocker receives messages (short leases, reaper OFF) and mostly just holds them, so it is killed
@@ -196,7 +221,14 @@ func ready() {
 // must still be there.
 func TestCrashOutboxAtomicity(t *testing.T) {
 	db := dbPath(t)
-	acked := killLoop(t, db, "producer", inTxMarker, 8) // nonces the producer said it committed
+	// Two kinds of crash, because the outbox can break in two ways. Random-timed kills during rapid
+	// full commits land unsynchronised — including around a commit — and catch a split that persists
+	// the row and the enqueue across two commits with a gap. Coordinated kills (HOLD=1) crash with a
+	// transaction held open between its two writes, catching a split into two separate transactions.
+	acked := killLoop(t, db, "producer", readyMarker, false, 4)
+	for k, v := range killLoop(t, db, "producer", inTxMarker, true, 4, holdEnv+"=1") {
+		acked[k] = v
+	}
 
 	ctx := context.Background()
 	e := openWithRetry(ctx, db)
@@ -254,7 +286,7 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 	if len(acked) == 0 {
 		t.Fatal("the producer acknowledged no commits — the harness is not exercising the code")
 	}
-	t.Logf("outbox intact across 8 in-transaction crashes: %d orders in bijection with their messages; all %d acked commits survived",
+	t.Logf("outbox intact across 8 crashes (4 random, 4 in-transaction): %d orders in bijection with their messages; all %d acked commits survived",
 		len(orders), len(acked))
 }
 
@@ -282,7 +314,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 		}
 	}()
 
-	_ = killLoop(t, db, "locker", readyMarker, 6) // the locker emits no acks
+	_ = killLoop(t, db, "locker", readyMarker, false, 6) // the locker emits no acks
 
 	// Reopen and check the recovery contract.
 	e := openWithRetry(ctx, db)
@@ -343,7 +375,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // The classification afterwards gives the suite its teeth: only the SIGKILL we injected counts. A
 // worker that panics, trips the race detector, exits on its own, or dies from some other signal is a
 // hard failure, never a crash cycle counted as success.
-func killLoop(t *testing.T, db, role, killOn string, cycles int) map[string]bool {
+func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) map[string]bool {
 	t.Helper()
 	acked := map[string]bool{}
 	for i := 0; i < cycles; i++ {
@@ -353,6 +385,7 @@ func killLoop(t *testing.T, db, role, killOn string, cycles int) map[string]bool
 			// dies; a kill landing in that window would look like our SIGKILL and mask an unexpected
 			// clean return. Zero it so a clean exit is immediate and gets caught by Success() below.
 			"GORACE=atexit_sleep_ms=0")
+		cmd.Env = append(cmd.Env, extraEnv...)
 
 		// One pipe carries both streams; a goroutine drains it into `out`, records acks, and flags
 		// the kill signal. The parent closes its write end after Start so the reader EOFs once the
@@ -402,6 +435,11 @@ func killLoop(t *testing.T, db, role, killOn string, cycles int) map[string]bool
 				i, killOn, role, snapshot(&mu, &out))
 		}
 
+		if !immediate {
+			// Let the worker run on past the marker so the crash lands at a varying, unsynchronised
+			// point in its stream — including, for the producer, around a commit.
+			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
+		}
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait() // reap it, so its advisory file lock is released before the next open
 		<-drained      // all of the worker's output is now in `out`
@@ -456,7 +494,12 @@ func ensureQueue(ctx context.Context, e *mqlite.Embedded, name string) {
 			return
 		}
 	}
-	if err := e.CreateQueue(ctx, name, mqlite.QueueConfig{LockDuration: 500 * time.Millisecond, MaxDeliveryCount: 1000}); err != nil {
+	// A LONG lease, deliberately. The recovery test needs its orphaned locks to be demonstrably LIVE
+	// (unexpired) when Open runs — otherwise a broken recovery that only reclaims expired locks
+	// (locked_until <= now, the reaper's condition) would clear them anyway on a slow restart and
+	// pass without ever proving that Open reclaims a live orphan (codex). An hour outlasts any
+	// restart. The reaper is off (WithoutBackground), so the long lease never gets in the way.
+	if err := e.CreateQueue(ctx, name, mqlite.QueueConfig{LockDuration: time.Hour, MaxDeliveryCount: 1000}); err != nil {
 		fail("create queue", err)
 	}
 }
