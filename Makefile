@@ -4,7 +4,7 @@
 
 BIN := bin
 
-.PHONY: help build test e2e bench clean clean-docker distclean
+.PHONY: help build test e2e crash bench clean clean-docker distclean
 
 help: ## show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \

@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +41,23 @@ import (
 // killing, so a slow CI runner can never let the kill land before any real work started (which would
 // pass the recovery assertions vacuously). It is a line on its own so a bufio.Scanner sees it whole.
 const readyMarker = "CRASH-WORKER-READY"
+
+// ackPrefix begins the line a producer prints for every committed order id. The harness collects
+// these across all cycles and requires every acknowledged id to survive recovery (conformance 15.3).
+const ackPrefix = "CRASH-WORKER-ACK"
+
+// parseAck reads the id out of an "CRASH-WORKER-ACK <n>" line.
+func parseAck(line string) (int64, bool) {
+	rest, ok := strings.CutPrefix(line, ackPrefix+" ")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
 
 // The worker role and the DB path are handed to the re-exec'd child through the environment.
 const (
@@ -89,8 +105,8 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 	}
 	committed := false
 	for {
+		var next int64
 		if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
-			var next int64
 			if err := tx.SQL().QueryRowContext(tx.Context(),
 				`SELECT COALESCE(MAX(oid),0)+1 FROM orders`).Scan(&next); err != nil {
 				return err
@@ -104,12 +120,15 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 			_, err := tx.SendOne("q", engine.OutMessage{Body: []byte(strconv.FormatInt(next, 10))})
 			return err
 		}); err != nil {
-			// A kill lands as a closed DB / cancelled ctx; anything else is a real defect.
-			if isShutdown(err) {
-				return
-			}
+			// There is NO benign error here. SIGKILL cannot surface as a Go error — it stops the
+			// process dead — and nothing else cancels this ctx or closes this engine. So any error
+			// is a real defect, not a shutdown to swallow (codex).
 			fail("producer tx", err)
 		}
+		// The transaction returned nil: order `next` is durably committed. Announce it, so the
+		// oracle can require every acknowledged id to still be there after recovery — that is what
+		// tests conformance 15.3 for RECENT commits, not just the surviving set as a whole.
+		fmt.Println(ackPrefix, next)
 		if !committed { // one real commit is on disk — safe to be killed now
 			committed = true
 			ready()
@@ -126,16 +145,12 @@ func runLocker(ctx context.Context, e *mqlite.Embedded) {
 	for {
 		msgs, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 5, Wait: 100 * time.Millisecond})
 		if err != nil {
-			if isShutdown(err) {
-				return
-			}
-			fail("locker receive", err)
+			fail("locker receive", err) // no benign error — see runProducer
 		}
 		for _, m := range msgs {
 			// Occasionally give one back; otherwise hold it and let the kill catch us mid-lease.
 			if m.SequenceNumber%3 == 0 {
-				if err := m.Abandon(ctx); err != nil &&
-					!errors.Is(err, mqlite.ErrLockLost) && !isShutdown(err) {
+				if err := m.Abandon(ctx); err != nil && !errors.Is(err, mqlite.ErrLockLost) {
 					fail("locker abandon", err)
 				}
 			} else {
@@ -170,7 +185,7 @@ func ready() {
 // enqueue, tested at the one moment it is hardest to keep.
 func TestCrashOutboxAtomicity(t *testing.T) {
 	db := dbPath(t)
-	killLoop(t, db, "producer", 8)
+	acked := killLoop(t, db, "producer", 8) // every id the producer said it durably committed
 
 	ctx := context.Background()
 	e := openWithRetry(ctx, db)
@@ -211,7 +226,26 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 			"  a transaction torn by the kill committed one write without the other — the outbox is not atomic.",
 			len(orders), total, trim(ordersNoMsg), trim(ordersDupMsg), trim(msgNoOrder))
 	}
-	t.Logf("outbox intact across 8 crashes: %d orders, each with exactly one message", len(orders))
+	// No loss of an ACKNOWLEDGED commit (conformance 15.3). The bijection above only proves orders
+	// and messages agree with EACH OTHER — if process death dropped a whole transaction after e.Tx
+	// returned success, both halves vanish together and the two sets stay equal. The producer's
+	// acks are the external witness: every id it was told committed must still be here.
+	var lostAcked []int64
+	for id := range acked {
+		if !orders[id] {
+			lostAcked = append(lostAcked, id)
+		}
+	}
+	if len(lostAcked) > 0 {
+		t.Fatalf("MESSAGE LOSS across crash recovery: %d of %d acknowledged commits vanished after a "+
+			"restart (first few: %v). A transaction that returned success must survive the process dying.",
+			len(lostAcked), len(acked), trim(lostAcked))
+	}
+	if len(acked) == 0 {
+		t.Fatal("the producer acknowledged no commits — the harness is not exercising the code")
+	}
+	t.Logf("outbox intact across 8 crashes: %d orders, each with exactly one message; all %d acked commits survived",
+		len(orders), len(acked))
 }
 
 // TestCrashRecoveryResetsOrphanedLocks seeds a fixed set of messages, then kills a consumer that is
@@ -237,7 +271,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 		}
 	}()
 
-	killLoop(t, db, "locker", 6)
+	_ = killLoop(t, db, "locker", 6) // the locker emits no acks
 
 	// Reopen and check the recovery contract.
 	e := openWithRetry(ctx, db)
@@ -253,19 +287,38 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 			"orphaned locks, so they are stranded until their lease expires (or forever, if the reaper "+
 			"is off).", m.Locked)
 	}
-	// Nothing completed, so nothing may be gone: every seeded message is still here.
-	if int(m.Total) != seeded {
-		t.Fatalf("MESSAGE LOSS across crash recovery: %d of %d messages remain "+
-			"(active=%d locked=%d deferred=%d dead=%d). Nothing was ever completed; none should be gone.",
-			m.Total, seeded, m.Active, m.Locked, m.Deferred, m.DeadLettered)
-	}
-	// And they are usable: a clean receive of the whole set still works after everything.
+	// Nothing completed, so nothing may be gone. But a bare count can be fooled: losing body N while
+	// duplicating body M keeps the total at 200. The seed bodies are exactly 0..199, so check the
+	// IDENTITIES and their multiplicities, not just how many there are (codex).
 	got, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: seeded})
 	if err != nil {
 		t.Fatalf("the queue is unusable after crash recovery: %v", err)
 	}
-	if len(got) != seeded {
-		t.Fatalf("expected to receive all %d recovered messages, got %d", seeded, len(got))
+	seen := map[int64]int{}
+	for _, msg := range got {
+		n, perr := strconv.ParseInt(string(msg.Body), 10, 64)
+		if perr != nil {
+			t.Fatalf("recovered a message whose body %q is not a seed id: %v", msg.Body, perr)
+		}
+		seen[n]++
+	}
+	var missing, duped []int64
+	for i := int64(0); i < seeded; i++ {
+		switch seen[i] {
+		case 1:
+		case 0:
+			missing = append(missing, i)
+		default:
+			duped = append(duped, i)
+		}
+	}
+	if len(missing) > 0 || len(duped) > 0 || int(m.Total) != seeded || len(got) != seeded {
+		t.Fatalf("crash recovery did not preserve the seeded set exactly (received %d, Stats.Total %d, "+
+			"of %d seeded):\n"+
+			"  missing bodies:    %v\n"+
+			"  duplicated bodies: %v\n"+
+			"  nothing was ever completed, so every seed id 0..%d must come back exactly once.",
+			len(got), m.Total, seeded, trim(missing), trim(duped), seeded-1)
 	}
 }
 
@@ -280,8 +333,9 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // trips the race detector, or exits nonzero on its own must be a hard failure, not a crash cycle
 // counted as success. Ignoring the kill/Wait error (they look identical) would let exactly those go
 // unnoticed (codex).
-func killLoop(t *testing.T, db, role string, cycles int) {
+func killLoop(t *testing.T, db, role string, cycles int) map[int64]bool {
 	t.Helper()
+	acked := map[int64]bool{}
 	for i := 0; i < cycles; i++ {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestCrashWorkerEntrypoint$", "-test.v=false")
 		cmd.Env = append(os.Environ(), roleEnv+"="+role, dbEnv+"="+db)
@@ -310,6 +364,9 @@ func killLoop(t *testing.T, db, role string, cycles int) {
 				mu.Lock()
 				out.WriteString(line)
 				out.WriteByte('\n')
+				if id, ok := parseAck(line); ok {
+					acked[id] = true // this id was durably committed before the crash
+				}
 				mu.Unlock()
 				if !readyClosed && strings.Contains(line, readyMarker) {
 					readyClosed = true
@@ -333,8 +390,8 @@ func killLoop(t *testing.T, db, role string, cycles int) {
 		// different points in the transaction stream, then crash it.
 		time.Sleep(time.Duration(30+30*i) * time.Millisecond)
 		_ = cmd.Process.Kill()
-		waitErr := cmd.Wait() // reap it, so its advisory file lock is released before the next open
-		<-drained             // all of the worker's output is now in `out`
+		_ = cmd.Wait() // reap it, so its advisory file lock is released before the next open
+		<-drained      // all of the worker's output is now in `out`
 
 		body := snapshot(&mu, &out)
 		switch {
@@ -342,14 +399,16 @@ func killLoop(t *testing.T, db, role string, cycles int) {
 			t.Fatalf("cycle %d: the worker reported a defect before we killed it:\n%s", i, body)
 		case strings.Contains(body, "panic:") || strings.Contains(body, "DATA RACE") || strings.Contains(body, "race detected"):
 			t.Fatalf("cycle %d: the worker panicked or tripped the race detector:\n%s", i, body)
-		case waitErr == nil:
+		case cmd.ProcessState != nil && cmd.ProcessState.Success():
 			t.Fatalf("cycle %d: worker exited 0 on its own; it must loop until the harness kills it.\n%s", i, body)
-		case exitedOnItsOwn(cmd.ProcessState):
-			// A killed process is signalled (unix) or has the terminate exit code (windows). Any
-			// other nonzero exit means the worker died on its own without a marker — surface it.
-			t.Fatalf("cycle %d: worker exited on its own (%v) instead of being killed:\n%s", i, cmd.ProcessState, body)
+		case !killedByUs(cmd.ProcessState):
+			// Not our SIGKILL: a real SIGSEGV/SIGABRT or a nonzero self-exit without a marker. Any
+			// signal makes Exited()==false, so "it was signalled" is NOT enough — it must be OURS.
+			t.Fatalf("cycle %d: worker did not die from the injected kill (%v) — it crashed on its own:\n%s",
+				i, cmd.ProcessState, body)
 		}
 	}
+	return acked
 }
 
 // openWithRetry opens the embedded engine, retrying briefly on ErrDBLocked: a just-killed worker's
@@ -357,7 +416,10 @@ func killLoop(t *testing.T, db, role string, cycles int) {
 func openWithRetry(ctx context.Context, db string) *mqlite.Embedded {
 	var last error
 	for i := 0; i < 50; i++ {
-		e, err := mqlite.OpenEmbedded(ctx, "file:"+db)
+		// WithoutBackground: the reaper (1s tick) must NOT run. With short leases it could clear an
+		// orphaned lock before the kill or before the oracle reads it, letting the recovery test
+		// pass even if Open's crash recovery is broken — so only Open may reset a lock here (codex).
+		e, err := mqlite.OpenEmbedded(ctx, "file:"+db, mqlite.WithoutBackground())
 		if err == nil {
 			return e
 		}
@@ -448,30 +510,6 @@ func snapshot(mu *sync.Mutex, out *strings.Builder) string {
 	mu.Lock()
 	defer mu.Unlock()
 	return out.String()
-}
-
-// exitedOnItsOwn reports whether the process terminated other than by our kill. A killed process is
-// signalled on unix (Exited()==false); on Windows TerminateProcess yields exit code 1. Anything else
-// that "Exited" is a self-inflicted death (a panic is 2; the worker's own fail() is 3).
-func exitedOnItsOwn(ps *os.ProcessState) bool {
-	if ps == nil || !ps.Exited() {
-		return false // signalled → we killed it
-	}
-	if runtime.GOOS == "windows" && ps.ExitCode() == 1 {
-		return false // TerminateProcess
-	}
-	return true
-}
-
-func isShutdown(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) {
-		return true
-	}
-	s := err.Error()
-	return strings.Contains(s, "closed") || strings.Contains(s, "closing")
 }
 
 // fail is how a worker reports a defect: a marker the harness greps for, then a nonzero exit. It
