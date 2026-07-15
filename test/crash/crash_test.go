@@ -20,19 +20,28 @@
 package crash
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mqlitehq/mqlite"
 	"github.com/mqlitehq/mqlite/engine"
 )
+
+// readyMarker is printed by a worker once it is doing the thing the kill is meant to interrupt — the
+// producer after its first commit, the locker once it holds a lock. The harness waits for it before
+// killing, so a slow CI runner can never let the kill land before any real work started (which would
+// pass the recovery assertions vacuously). It is a line on its own so a bufio.Scanner sees it whole.
+const readyMarker = "CRASH-WORKER-READY"
 
 // The worker role and the DB path are handed to the re-exec'd child through the environment.
 const (
@@ -78,6 +87,7 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 	}); err != nil {
 		fail("create orders", err)
 	}
+	committed := false
 	for {
 		if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
 			var next int64
@@ -100,6 +110,10 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 			}
 			fail("producer tx", err)
 		}
+		if !committed { // one real commit is on disk — safe to be killed now
+			committed = true
+			ready()
+		}
 	}
 }
 
@@ -108,6 +122,7 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 // leaves the queue, which makes the recovery oracle exact — after a restart the queue must still
 // hold every message, and none may be stuck `locked` (Open resets orphaned locks to active).
 func runLocker(ctx context.Context, e *mqlite.Embedded) {
+	holding := 0
 	for {
 		msgs, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 5, Wait: 100 * time.Millisecond})
 		if err != nil {
@@ -123,10 +138,27 @@ func runLocker(ctx context.Context, e *mqlite.Embedded) {
 					!errors.Is(err, mqlite.ErrLockLost) && !isShutdown(err) {
 					fail("locker abandon", err)
 				}
+			} else {
+				holding++
 			}
+		}
+		if holding > 0 { // at least one lock is held — killing us now actually exercises recovery
+			ready()
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// ready announces, exactly once, that the worker is now doing the thing the kill is meant to
+// interrupt. The harness blocks on this line before it kills, so a slow start can never make the
+// recovery assertions pass without any work having happened.
+var readyOnce sync.Once
+
+func ready() {
+	readyOnce.Do(func() {
+		fmt.Println(readyMarker)
+		_ = os.Stdout.Sync()
+	})
 }
 
 // ─── the crash oracle ─────────────────────────────────────────────────────────
@@ -145,31 +177,41 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 	defer e.Close()
 
 	orders := readOrders(t, e)
-	msgs := readMessageBodies(t, e, "q")
+	msgs := readMessageBodies(t, e, "q") // body -> how many messages carry it
 
 	if len(orders) == 0 {
 		t.Fatal("no orders survived — the producer never committed anything; the harness is not exercising the code")
 	}
-	// Every order has its message and vice versa. Report the asymmetry, not just the count.
-	var ordersNoMsg, msgNoOrder []int64
+	// The invariant is a BIJECTION, and multiplicity is load-bearing: because a rolled-back order
+	// frees its id, a message-only torn commit followed by id reuse produces order N with TWO
+	// messages N. Counting distinct bodies would collapse those two and hide the very tear this test
+	// exists to catch (codex), so the message side is a count, and every order must have exactly one.
+	var ordersNoMsg, ordersDupMsg, msgNoOrder []int64
 	for oid := range orders {
-		if !msgs[oid] {
+		switch msgs[oid] {
+		case 1: // the healthy case
+		case 0:
 			ordersNoMsg = append(ordersNoMsg, oid)
+		default:
+			ordersDupMsg = append(ordersDupMsg, oid) // a second message for a reused id
 		}
 	}
-	for body := range msgs {
+	total := 0
+	for body, n := range msgs {
+		total += n
 		if !orders[body] {
 			msgNoOrder = append(msgNoOrder, body)
 		}
 	}
-	if len(ordersNoMsg) > 0 || len(msgNoOrder) > 0 {
+	if len(ordersNoMsg) > 0 || len(ordersDupMsg) > 0 || len(msgNoOrder) > 0 {
 		t.Fatalf("OUTBOX ATOMICITY VIOLATED after crash recovery (%d orders, %d messages):\n"+
-			"  orders whose message is missing: %v\n"+
-			"  messages whose order is missing: %v\n"+
+			"  orders whose message is missing:    %v\n"+
+			"  orders with MORE THAN ONE message:  %v  (an id was reused after a message-only torn commit)\n"+
+			"  messages whose order is missing:    %v\n"+
 			"  a transaction torn by the kill committed one write without the other — the outbox is not atomic.",
-			len(orders), len(msgs), trim(ordersNoMsg), trim(msgNoOrder))
+			len(orders), total, trim(ordersNoMsg), trim(ordersDupMsg), trim(msgNoOrder))
 	}
-	t.Logf("outbox intact across 8 crashes: %d orders, each with exactly its message", len(orders))
+	t.Logf("outbox intact across 8 crashes: %d orders, each with exactly one message", len(orders))
 }
 
 // TestCrashRecoveryResetsOrphanedLocks seeds a fixed set of messages, then kills a consumer that is
@@ -229,31 +271,83 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 
 // ─── harness plumbing ─────────────────────────────────────────────────────────
 
-// killLoop runs `cycles` rounds of: launch a worker (a re-exec of this test binary), let it run a
-// short, randomised while so the kill lands mid-flight, then KILL it hard and reap it. Process.Kill
-// is a hard kill on every platform (SIGKILL on unix, TerminateProcess on Windows) — no signal
-// handler, no deferred Close, exactly a crash.
+// killLoop runs `cycles` rounds of: launch a worker (a re-exec of this test binary), WAIT until it
+// signals it is really doing work, let it run a little longer so the kill lands at a varying point,
+// then KILL it hard and reap it. Process.Kill is a hard kill on every platform (SIGKILL on unix,
+// TerminateProcess on Windows) — no signal handler, no deferred Close, exactly a crash.
+//
+// The classification at the end is the part that gives the whole suite teeth: a worker that PANICS,
+// trips the race detector, or exits nonzero on its own must be a hard failure, not a crash cycle
+// counted as success. Ignoring the kill/Wait error (they look identical) would let exactly those go
+// unnoticed (codex).
 func killLoop(t *testing.T, db, role string, cycles int) {
 	t.Helper()
 	for i := 0; i < cycles; i++ {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestCrashWorkerEntrypoint$", "-test.v=false")
 		cmd.Env = append(os.Environ(), roleEnv+"="+role, dbEnv+"="+db)
-		var out strings.Builder
-		cmd.Stdout, cmd.Stderr = &out, &out
+
+		// One pipe carries both streams; a goroutine drains it into `out` and flags readiness. The
+		// parent closes its write end after Start so the reader sees EOF once the child is gone.
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("cycle %d: pipe: %v", i, err)
+		}
+		cmd.Stdout, cmd.Stderr = pw, pw
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("cycle %d: start worker: %v", i, err)
 		}
-		// Vary the uptime so kills land at different points in the transaction stream. No
-		// Math.rand needed: derive it from the cycle index, which is enough spread here.
-		time.Sleep(time.Duration(60+40*i) * time.Millisecond)
-		_ = cmd.Process.Kill()
-		err := cmd.Wait() // reap it, so its advisory file lock is released before the next open
-		if err == nil {
-			// A worker that exits 0 on its own never got killed — it should loop until we kill it.
-			t.Fatalf("cycle %d: worker exited cleanly; it was meant to be killed mid-work.\n%s", i, out.String())
+		_ = pw.Close()
+
+		ready := make(chan struct{})
+		drained := make(chan struct{})
+		var mu sync.Mutex
+		var out strings.Builder
+		go func() {
+			sc := bufio.NewScanner(pr)
+			readyClosed := false
+			for sc.Scan() {
+				line := sc.Text()
+				mu.Lock()
+				out.WriteString(line)
+				out.WriteByte('\n')
+				mu.Unlock()
+				if !readyClosed && strings.Contains(line, readyMarker) {
+					readyClosed = true
+					close(ready)
+				}
+			}
+			close(drained)
+		}()
+
+		select {
+		case <-ready:
+		case <-time.After(20 * time.Second):
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			<-drained
+			t.Fatalf("cycle %d: worker never signalled it was doing work (role %q). The kill would land\n"+
+				"before any real work started, so recovery would be tested vacuously.\n%s", i, role, snapshot(&mu, &out))
 		}
-		if body := out.String(); strings.Contains(body, "CRASH-WORKER-FAIL") {
+
+		// It is genuinely working now. Let it run a little longer, varying by cycle so kills land at
+		// different points in the transaction stream, then crash it.
+		time.Sleep(time.Duration(30+30*i) * time.Millisecond)
+		_ = cmd.Process.Kill()
+		waitErr := cmd.Wait() // reap it, so its advisory file lock is released before the next open
+		<-drained             // all of the worker's output is now in `out`
+
+		body := snapshot(&mu, &out)
+		switch {
+		case strings.Contains(body, "CRASH-WORKER-FAIL"):
 			t.Fatalf("cycle %d: the worker reported a defect before we killed it:\n%s", i, body)
+		case strings.Contains(body, "panic:") || strings.Contains(body, "DATA RACE") || strings.Contains(body, "race detected"):
+			t.Fatalf("cycle %d: the worker panicked or tripped the race detector:\n%s", i, body)
+		case waitErr == nil:
+			t.Fatalf("cycle %d: worker exited 0 on its own; it must loop until the harness kills it.\n%s", i, body)
+		case exitedOnItsOwn(cmd.ProcessState):
+			// A killed process is signalled (unix) or has the terminate exit code (windows). Any
+			// other nonzero exit means the worker died on its own without a marker — surface it.
+			t.Fatalf("cycle %d: worker exited on its own (%v) instead of being killed:\n%s", i, cmd.ProcessState, body)
 		}
 	}
 }
@@ -317,9 +411,11 @@ func readOrders(t *testing.T, e *mqlite.Embedded) map[int64]bool {
 	return ids
 }
 
-func readMessageBodies(t *testing.T, e *mqlite.Embedded, queue string) map[int64]bool {
+// readMessageBodies returns body-id -> count. The count matters: two messages with the same body is
+// itself an atomicity violation the caller must be able to see (see TestCrashOutboxAtomicity).
+func readMessageBodies(t *testing.T, e *mqlite.Embedded, queue string) map[int64]int {
 	t.Helper()
-	bodies := map[int64]bool{}
+	bodies := map[int64]int{}
 	var from int64
 	for {
 		page, err := e.Peek(context.Background(), queue, mqlite.PeekOpts{From: from, Max: 1000})
@@ -334,7 +430,7 @@ func readMessageBodies(t *testing.T, e *mqlite.Embedded, queue string) map[int64
 			if err != nil {
 				t.Fatalf("message body %q is not an order id: %v", p.Body, err)
 			}
-			bodies[n] = true
+			bodies[n]++
 			if p.SequenceNumber >= from {
 				from = p.SequenceNumber + 1
 			}
@@ -346,6 +442,25 @@ func readMessageBodies(t *testing.T, e *mqlite.Embedded, queue string) map[int64
 func dbPath(t *testing.T) string {
 	t.Helper()
 	return t.TempDir() + "/crash.db"
+}
+
+func snapshot(mu *sync.Mutex, out *strings.Builder) string {
+	mu.Lock()
+	defer mu.Unlock()
+	return out.String()
+}
+
+// exitedOnItsOwn reports whether the process terminated other than by our kill. A killed process is
+// signalled on unix (Exited()==false); on Windows TerminateProcess yields exit code 1. Anything else
+// that "Exited" is a self-inflicted death (a panic is 2; the worker's own fail() is 3).
+func exitedOnItsOwn(ps *os.ProcessState) bool {
+	if ps == nil || !ps.Exited() {
+		return false // signalled → we killed it
+	}
+	if runtime.GOOS == "windows" && ps.ExitCode() == 1 {
+		return false // TerminateProcess
+	}
+	return true
 }
 
 func isShutdown(err error) bool {
