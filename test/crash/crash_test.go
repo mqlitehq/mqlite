@@ -524,8 +524,19 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 		// Prove the worker is alive and processing RIGHT NOW with a challenge/response: send a unique
 		// nonce and wait for the worker to echo exactly it. Only a live worker that READ the nonce
 		// (after we sent it) can produce that line — a frozen worker never reads it, and a dead
-		// worker's buffered output cannot contain a nonce it never wrote. This is causally fresh, so
-		// there is no check-then-act race for a self-kill to slip through (codex).
+		// worker's buffered output cannot contain a nonce it never wrote. Any self-SIGKILL kills the
+		// responder goroutine too, so it stops echoing and the wait fails (drained/timeout).
+		//
+		// The honest limit: this proves the worker was alive microseconds ago, not at the exact
+		// instant of the kill below. Perfect attribution of a SIGKILL to its sender is IMPOSSIBLE from
+		// user space — SIGKILL is uncatchable, so the victim can't observe who sent it, and wait4
+		// reports the child's own pid, not the signaller's. The only race-free alternative,
+		// SIGSTOP→confirm-frozen→SIGKILL, is unreliable across platforms (darwin's wait4 does not
+		// report the stop, and it deadlocks against a Go child) and needs ptrace to be portable —
+		// disproportionate for a harness whose worker never self-kills. The residual is therefore a
+		// worker that self-SIGKILLs in the microsecond window after echoing this nonce; a fixed-point
+		// self-kill mutation (the realistic case) still stops the echoes and is caught. Documented,
+		// not hidden.
 		challenge := "PING-" + strconv.Itoa(i)
 		_, _ = cw.WriteString(challenge + "\n") // a write to a dead worker's stdin just errors; the waits below catch death
 		alive := false
