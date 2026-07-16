@@ -47,22 +47,23 @@ const (
 	// ackPrefix begins the line for every committed order nonce. The harness collects these and
 	// requires every acknowledged nonce to survive recovery (conformance 15.3).
 	ackPrefix = "CRASH-WORKER-ACK"
-	// heartbeatMarker is printed on a steady cadence by a worker whose real work is not itself a
-	// stream of lines (the coordinated producer parked in a held transaction; the locker). It lets
-	// the harness prove the worker is alive at the instant of the kill. The random producer needs
-	// none — its commit acks already serve as beats.
-	heartbeatMarker = "CRASH-WORKER-BEAT"
+	// pongPrefix begins the worker's echo of a liveness challenge. Only a live worker that READ the
+	// parent's challenge (sent right before the kill) can produce it, so an echo is causally fresh:
+	// a frozen worker never reads it, and a dead worker's buffered output can't contain a nonce it
+	// never wrote. This is what makes liveness/attribution race-free — a sampled beat could not (a
+	// worker that died with output buffered might still deliver a stale beat after the check; codex).
+	pongPrefix = "CRASH-WORKER-PONG"
 )
 
-// heartbeat starts printing heartbeatMarker on a steady cadence until the process dies. A worker
-// calls it once it has reached the state the harness will kill it in, so the harness can block for a
-// fresh beat and know the crash landed on a live process (round-8).
-func heartbeat() {
+// respond echoes every line the harness sends on stdin back on stdout, prefixed. It runs for the
+// worker's whole life so the harness can, at any moment, prove the worker is still alive and
+// processing by sending a unique challenge and waiting for exactly that nonce to come back.
+func respond() {
 	go func() {
-		for {
-			fmt.Println(heartbeatMarker)
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			fmt.Println(pongPrefix, sc.Text())
 			_ = os.Stdout.Sync()
-			time.Sleep(5 * time.Millisecond)
 		}
 	}()
 }
@@ -89,6 +90,8 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 	}
 	db := os.Getenv(dbEnv)
 	ctx := context.Background()
+
+	respond() // answer the harness's liveness challenges for this worker's whole life
 
 	e := openWithRetry(ctx, db) // the previous worker's advisory lock releases as it dies
 	defer e.Close()
@@ -162,7 +165,6 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 			commit()
 		}
 		held := nextNonce()
-		heartbeat() // parked in the held transaction below, so beat separately to prove liveness
 		_ = e.Tx(ctx, func(tx *engine.EngineTx) error {
 			if _, err := tx.SQL().ExecContext(tx.Context(),
 				`INSERT INTO orders(nonce) VALUES(?)`, held); err != nil {
@@ -203,7 +205,6 @@ const lockerReadyAt = 250
 // anything: no message leaves the queue, so after a restart every message must still be there and
 // none may be stuck `locked` (Open reclaims orphaned locks).
 func runLocker(ctx context.Context, e *mqlite.Embedded) {
-	heartbeat() // steady liveness signal; the harness waits for readyMarker before it looks for beats
 	holding := 0
 	for {
 		msgs, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 256, Wait: 100 * time.Millisecond})
@@ -252,8 +253,8 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 	// full commits land unsynchronised — including around a commit — and catch a split that persists
 	// the row and the enqueue across two commits with a gap. Coordinated kills (HOLD=1) crash with a
 	// transaction held open between its two writes, catching a split into two separate transactions.
-	acked := killLoop(t, db, "producer", readyMarker, false, 4)
-	for k, v := range killLoop(t, db, "producer", inTxMarker, true, 4, holdEnv+"=1") {
+	acked := killLoop(t, db, "producer", readyMarker, false, true, 4)
+	for k, v := range killLoop(t, db, "producer", inTxMarker, true, false, 4, holdEnv+"=1") {
 		acked[k] = v
 	}
 
@@ -343,7 +344,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 		}
 	}()
 
-	_ = killLoop(t, db, "locker", readyMarker, false, 6) // beats via heartbeat, not acks
+	_ = killLoop(t, db, "locker", readyMarker, false, false, 6) // liveness via challenge/response
 
 	// Reopen and check the recovery contract.
 	e := openWithRetry(ctx, db)
@@ -419,7 +420,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // ended on its own (a self-SIGKILL, indistinguishable by exit status) stops beating, so the wait
 // times out and fails. Blocking on a fresh beat is race-free — unlike a check-then-act on
 // asynchronous pipe EOF, which a self-kill right at the marker could slip past (round-8, codex).
-func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) map[string]bool {
+func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool, cycles int, extraEnv ...string) map[string]bool {
 	t.Helper()
 	acked := map[string]bool{}
 	for i := 0; i < cycles; i++ {
@@ -431,24 +432,31 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 			"GORACE=atexit_sleep_ms=0")
 		cmd.Env = append(cmd.Env, extraEnv...)
 
-		// One pipe carries both streams; a goroutine drains it into `out`, records acks, and flags
-		// the kill signal. The parent closes its write end after Start so the reader EOFs once the
-		// child is gone.
+		// One pipe carries both of the worker's output streams into `out`; a second pipe carries the
+		// harness's liveness challenges INTO the worker's stdin. The parent closes its copies of the
+		// child ends after Start so EOF propagates when the child dies.
 		pr, pw, err := os.Pipe()
 		if err != nil {
 			t.Fatalf("cycle %d: pipe: %v", i, err)
 		}
-		cmd.Stdout, cmd.Stderr = pw, pw
+		cr, cw, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("cycle %d: challenge pipe: %v", i, err)
+		}
+		cmd.Stdout, cmd.Stderr, cmd.Stdin = pw, pw, cr
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("cycle %d: start worker: %v", i, err)
 		}
 		_ = pw.Close()
+		_ = cr.Close()
 
 		signal := make(chan struct{})
 		drained := make(chan struct{})
-		beats := make(chan struct{}, 1) // a fresh line proving the worker is alive + working
+		pong := make(chan string, 16) // the worker's echoes of our liveness challenges
 		var mu sync.Mutex
 		var out strings.Builder
+		ackCount := 0
+		acksNow := func() int { mu.Lock(); defer mu.Unlock(); return ackCount }
 		go func() {
 			sc := bufio.NewScanner(pr)
 			signalled := false
@@ -460,11 +468,12 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				nonce, isAck := parseAck(line)
 				if isAck {
 					acked[nonce] = true // this nonce was durably committed before the crash
+					ackCount++
 				}
 				mu.Unlock()
-				if isAck || strings.Contains(line, heartbeatMarker) {
-					select { // a beat: the worker was alive and working when it wrote this
-					case beats <- struct{}{}:
+				if echo, ok := strings.CutPrefix(line, pongPrefix+" "); ok {
+					select {
+					case pong <- echo:
 					default:
 					}
 				}
@@ -489,32 +498,59 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 
 		if !immediate {
 			// Let the worker run on past the marker so the crash lands at a varying, unsynchronised
-			// point in its stream — including, for the producer, around a commit.
+			// point in its stream — including, for the producer, around a commit. The kill timing is a
+			// plain timer, INDEPENDENT of the worker's acks, so it does not synchronise to commit
+			// boundaries and can land with a transaction in flight (codex).
 			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
 		}
-		// Block for a FRESH beat produced after this point: proof the worker is alive and doing its
-		// work at the instant we kill. Drop one possibly-stale beat first, then wait for the next. A
-		// frozen or self-ended worker stops beating and trips the timeout — and because we BLOCK on
-		// the next beat rather than sampling, there is no check-then-act race for a self-kill to slip
-		// through (codex).
-		select {
-		case <-beats:
-		default:
+		if wantCommits {
+			// The challenge below proves the process is ALIVE, but respond() answers from its own
+			// goroutine even if the work loop has frozen — so for the random producer, separately
+			// require fresh commits in a short TERMINAL window right before the kill. A producer that
+			// acked early and then hung produces none here (aggregating over the whole window would
+			// have missed it — codex).
+			before := acksNow()
+			time.Sleep(20 * time.Millisecond)
+			if acksNow() == before {
+				_ = cw.Close()
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				<-drained
+				t.Fatalf("cycle %d: the producer committed nothing in the 20ms before the kill — it was "+
+					"not actively committing, so the crash would not land amid commit traffic.\n%s",
+					i, snapshot(&mu, &out))
+			}
 		}
-		select {
-		case <-beats:
-		case <-drained:
-			_ = cmd.Wait()
-			t.Fatalf("cycle %d: the worker's output ended before the harness killed it — it exited on "+
-				"its own (role %q), so this is not a crash we injected.\n%s", i, role, snapshot(&mu, &out))
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			<-drained
-			t.Fatalf("cycle %d: no fresh beat from the worker in the 5s before the kill (role %q) — it was "+
-				"frozen or not doing its work, so the crash would not land on live activity.\n%s",
-				i, role, snapshot(&mu, &out))
+		// Prove the worker is alive and processing RIGHT NOW with a challenge/response: send a unique
+		// nonce and wait for the worker to echo exactly it. Only a live worker that READ the nonce
+		// (after we sent it) can produce that line — a frozen worker never reads it, and a dead
+		// worker's buffered output cannot contain a nonce it never wrote. This is causally fresh, so
+		// there is no check-then-act race for a self-kill to slip through (codex).
+		challenge := "PING-" + strconv.Itoa(i)
+		_, _ = cw.WriteString(challenge + "\n") // a write to a dead worker's stdin just errors; the waits below catch death
+		alive := false
+		deadline := time.After(5 * time.Second)
+		for !alive {
+			select {
+			case echo := <-pong:
+				alive = echo == challenge // ignore any stale echo; only OUR nonce counts
+			case <-drained:
+				_ = cw.Close()
+				_ = cmd.Wait()
+				t.Fatalf("cycle %d: the worker's output ended before it answered the liveness challenge — "+
+					"it exited on its own (role %q), so this is not a crash we injected.\n%s",
+					i, role, snapshot(&mu, &out))
+			case <-deadline:
+				_ = cw.Close()
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				<-drained
+				t.Fatalf("cycle %d: the worker did not answer the liveness challenge within 5s (role %q) — "+
+					"it was frozen or dead, so the crash would not land on a live process.\n%s",
+					i, role, snapshot(&mu, &out))
+			}
 		}
+		_ = cw.Close()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait() // reap it, so its advisory file lock is released before the next open
 		<-drained      // all of the worker's output is now in `out`
