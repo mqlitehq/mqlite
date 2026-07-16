@@ -28,15 +28,34 @@ type db struct {
 	dsn    string    // the user-facing DB string (no auth token — that's only in the conn string)
 	lock   io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
 
-	// closeMu gates every local database operation against Close. Each op that touches the store
-	// holds it for READ for its whole duration (see withConn); Close takes it for WRITE, so it
-	// cannot release the single-writer file lock — nor close the pool — until every in-flight
-	// operation, INCLUDING a transaction that is still committing, has finished. Without this,
-	// Close returned while a write was in flight and released the advisory lock, letting a SECOND
-	// process open the same file, run crash recovery, and re-deliver still-held locked rows while
-	// the first writer's transaction was still committing (round-8 P1).
-	closeMu sync.RWMutex
-	closed  bool
+	// The close gate serializes every local operation against Close so Close cannot release the
+	// single-writer file lock — nor close the pool — while a write is still in flight. Without it,
+	// Close returned while a transaction was still committing and dropped the advisory lock, letting
+	// a SECOND process open the same file, run crash recovery, and re-deliver still-held locked rows
+	// (round-8 P1).
+	//
+	// It is a fail-fast admission gate, NOT a lock held for the operation's duration: a new op checks
+	// the flag under `closeMu` and, if closing, returns ErrClosed IMMEDIATELY — it never blocks. That
+	// keeps a deadline-bound caller from hanging (an RWMutex would give a pending Close priority and
+	// make new RLocks wait, uncancellably, behind arbitrary in-flight user SQL — round-8 P2). Close
+	// flips the flag, then waits on the WaitGroup for the ops admitted before it to finish. The flag
+	// check and the WaitGroup Add happen under the same mutex, so no op can be admitted after Close
+	// has begun waiting.
+	closeMu  sync.Mutex
+	closing  bool
+	inFlight sync.WaitGroup
+}
+
+// enter admits a local operation, or reports that the store is closing so the caller fails fast.
+// A successful enter must be paired with exactly one inFlight.Done() (see withConn).
+func (d *db) enter() bool {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	if d.closing {
+		return false
+	}
+	d.inFlight.Add(1) // under closeMu, so it can never race Close's Wait
+	return true
 }
 
 // resolveDSN turns the user-facing DB string + optional auth token into a
@@ -228,15 +247,20 @@ func isNoSuchTable(err error) bool {
 }
 
 func (d *db) close() error {
-	// Take the gate for WRITE: this blocks until every in-flight local operation has returned — a
-	// statement still executing, a transaction still committing — so we never release the file lock
-	// out from under a write. New operations see d.closed and fail fast with ErrClosed.
+	// Flip the flag under the mutex so no operation can be admitted from here on (enter sees closing
+	// and fails fast), then release the mutex and wait for the ops already in flight to finish — a
+	// statement still executing, a transaction still committing. Only then close the pool and release
+	// the file lock, so it is never dropped out from under a live write. The Add in enter happens
+	// under the same mutex, so every in-flight op is counted before this Wait observes the total.
 	d.closeMu.Lock()
-	defer d.closeMu.Unlock()
-	if d.closed {
+	if d.closing {
+		d.closeMu.Unlock()
 		return nil
 	}
-	d.closed = true
+	d.closing = true
+	d.closeMu.Unlock()
+	d.inFlight.Wait()
+
 	err := d.sql.Close()
 	if d.lock != nil {
 		if e := d.lock.Close(); e != nil && err == nil {
@@ -375,17 +399,16 @@ func (d *db) withConn(ctx context.Context, fn func(execCtx context.Context, c *s
 	if err := checkCtx(ctx); err != nil {
 		return err
 	}
-	// Hold the close gate for READ for the whole operation — the wait for the connection, the
-	// statement, and (for inTx, whose entire transaction runs inside this closure) the commit. Close
-	// blocks on the WRITE side until this returns, so the file lock is never released mid-write. All
-	// local access funnels through withConn, and withConn never nests, so this is the one gate that
-	// covers every local operation without deadlocking on itself.
-	d.closeMu.RLock()
-	if d.closed {
-		d.closeMu.RUnlock()
+	// Admit this operation, or fail fast if the store is closing. enter never blocks, so a
+	// deadline-bound caller is never stuck behind a pending Close. The op stays "in flight" for its
+	// whole duration — the wait for the connection, the statement, and (for inTx, whose entire
+	// transaction runs inside this closure) the commit — so Close waits for all of it before
+	// releasing the lock. All local access funnels through withConn, and withConn never nests, so
+	// this one gate covers every local operation.
+	if !d.enter() {
 		return ErrClosed
 	}
-	defer d.closeMu.RUnlock()
+	defer d.inFlight.Done()
 	conn, err := d.sql.Conn(ctx) // cancellable WAIT
 	if err != nil {
 		return err

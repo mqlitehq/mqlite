@@ -927,3 +927,55 @@ func TestCloseWaitsForInFlightWritesBeforeReleasingTheLock(t *testing.T) {
 		t.Fatalf("an operation after Close should be refused, got %v", err)
 	}
 }
+
+// TestOperationsFailFastWhileClosing pins the round-8 P2: a new operation that arrives while Close is
+// waiting for an in-flight write must FAIL FAST with ErrClosed, not block. An RWMutex gate would give
+// the pending Close writer-priority and make every later operation wait — uncancellably, behind
+// arbitrary in-flight user SQL — so a deadline-bound caller could hang and then get the wrong error.
+func TestOperationsFailFastWhileClosing(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "q", QueueConfig{})
+
+	inTx := make(chan struct{})
+	release := make(chan struct{})
+	txDone := make(chan error, 1)
+	go func() {
+		txDone <- e.inTx(ctx, func(ec context.Context, tx *txn) error {
+			close(inTx)
+			<-release // hold the writer (and the in-flight count) open
+			return nil
+		})
+	}()
+	<-inTx
+
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	time.Sleep(100 * time.Millisecond) // let Close flip the closing flag and start waiting
+
+	// A new operation must now return promptly with ErrClosed — it must NOT block behind the pending
+	// Close (which is itself blocked on the held transaction).
+	opDone := make(chan error, 1)
+	go func() { _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); opDone <- err }()
+	select {
+	case err := <-opDone:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("an operation arriving while closing must fail fast with ErrClosed, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("an operation blocked behind a pending Close instead of failing fast — the close gate " +
+			"is not cancellation-safe")
+	}
+
+	close(release)
+	if err := <-txDone; err != nil {
+		t.Fatalf("tx: %v", err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
