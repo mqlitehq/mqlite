@@ -149,6 +149,11 @@ func (e *Engine) Close() error {
 		if e.bgCancel != nil {
 			e.bgCancel()
 		}
+		// Shut the admission gate BEFORE draining the background workers: that drain can be slow (a
+		// maintenance pass may be inside an uninterruptible vacuum or a large retention delete), and
+		// an external Send/Tx arriving during it must fail fast with ErrClosed, not be admitted and
+		// left to keep Close waiting (round-8 P2). db.close() then waits for the ops already in flight.
+		e.db.beginClosing()
 		e.bgWG.Wait()
 		close(e.closed)
 		err = e.db.close()

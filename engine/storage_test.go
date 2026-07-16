@@ -999,3 +999,31 @@ func TestOperationsFailFastWhileClosing(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 }
+
+// TestCloseGateCoversRemoteAndFailsFastBeforeTeardown pins two round-8 P2 follow-ups:
+//   - beginClosing shuts the admission gate BEFORE the pool is torn down, so a new op is refused the
+//     moment Close starts (Engine.Close flips it before draining background workers, which can be
+//     slow), not only once the pool is closed;
+//   - the REMOTE code paths (which bypass withConn) are gated too, so a remote op after close returns
+//     the typed ErrClosed and remote work is counted in the in-flight set.
+func TestCloseGateCoversRemoteAndFailsFastBeforeTeardown(t *testing.T) {
+	// A "remote" db over the fake driver — its exec/query/inTx take the remote branch.
+	d, _ := remoteDBFailingFirst(t, 0)
+
+	// Before closing, the remote path works (admitted).
+	if _, err := d.exec(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("remote exec before close: %v", err)
+	}
+
+	// beginClosing alone — no pool teardown yet — must already refuse new work.
+	d.beginClosing()
+	if d.enter() {
+		t.Fatal("enter admitted an operation after beginClosing, before teardown")
+	}
+	if _, err := d.exec(context.Background(), "SELECT 1"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("a remote exec after beginClosing must be ErrClosed, got %v", err)
+	}
+	if err := d.queryRowScan(context.Background(), []any{new(int)}, "SELECT 1"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("a remote queryRowScan after beginClosing must be ErrClosed, got %v", err)
+	}
+}

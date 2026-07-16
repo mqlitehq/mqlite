@@ -42,7 +42,8 @@ type db struct {
 	// check and the WaitGroup Add happen under the same mutex, so no op can be admitted after Close
 	// has begun waiting.
 	closeMu  sync.Mutex
-	closing  bool
+	closing  bool // admission gate: enter() refuses new ops once set
+	torn     bool // teardown-once guard for close()
 	inFlight sync.WaitGroup
 }
 
@@ -246,17 +247,29 @@ func isNoSuchTable(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no such table")
 }
 
-func (d *db) close() error {
-	// Flip the flag under the mutex so no operation can be admitted from here on (enter sees closing
-	// and fails fast), then release the mutex and wait for the ops already in flight to finish — a
-	// statement still executing, a transaction still committing. Only then close the pool and release
-	// the file lock, so it is never dropped out from under a live write. The Add in enter happens
-	// under the same mutex, so every in-flight op is counted before this Wait observes the total.
+// beginClosing shuts the admission gate: from here on enter() refuses new operations, so they fail
+// fast with ErrClosed. Engine.Close calls this BEFORE it drains the background workers, so an
+// external Send/Tx arriving during that drain (which can be slow — a maintenance pass may be inside
+// an uninterruptible vacuum or a large retention delete) is refused rather than admitted (round-8).
+// Idempotent; the pool/lock teardown happens later, in close().
+func (d *db) beginClosing() {
 	d.closeMu.Lock()
-	if d.closing {
+	d.closing = true
+	d.closeMu.Unlock()
+}
+
+func (d *db) close() error {
+	// Shut the gate (idempotent) so nothing new is admitted, then wait for the ops already in flight
+	// to finish — a statement still executing, a transaction still committing — before closing the
+	// pool and releasing the file lock, so it is never dropped out from under a live write. The Add
+	// in enter happens under the same mutex as the flag, so every in-flight op is counted before this
+	// Wait observes the total.
+	d.closeMu.Lock()
+	if d.torn {
 		d.closeMu.Unlock()
 		return nil
 	}
+	d.torn = true
 	d.closing = true
 	d.closeMu.Unlock()
 	d.inFlight.Wait()
@@ -462,6 +475,11 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 	}
 	var res sql.Result
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return nil, ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -518,6 +536,11 @@ func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any
 	}
 	var res sql.Result
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return nil, ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -562,6 +585,11 @@ func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []an
 		})
 	}
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -618,6 +646,11 @@ func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error
 func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	var rows *sql.Rows
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return nil, ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -650,6 +683,11 @@ func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ..
 		})
 	}
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -776,6 +814,11 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 		})
 	}
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !e.db.enter() {
+		return ErrClosed
+	}
+	defer e.db.inFlight.Done()
 	for i := 0; i < e.db.attempts(); i++ {
 		if i > 0 {
 			e.db.backoff(ctx, i)
