@@ -500,13 +500,6 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 				i, killOn, role, snapshot(&mu, &out))
 		}
 
-		if !immediate {
-			// Let the worker run on past the marker so the crash lands at a varying, unsynchronised
-			// point in its stream — including, for the producer, around a commit. The kill timing is a
-			// plain timer, INDEPENDENT of the worker's acks, so it does not synchronise to commit
-			// boundaries and can land with a transaction in flight (codex).
-			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
-		}
 		// Prove the worker is alive and — for the random producer — actively COMMITTING, with a
 		// challenge/response. probe sends a unique nonce and waits for the worker to echo exactly it,
 		// together with its current commit count. Only a live worker that READ the nonce (after we
@@ -555,24 +548,28 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 				}
 			}
 		}
-		c1 := probe(fmt.Sprintf("PING-%d-0", i))
+		c1 := probe(fmt.Sprintf("PING-%d-a", i)) // liveness + a causally-fresh commit-count baseline
+
+		if !immediate {
+			// The kill window: let the worker run on past the marker so the crash lands at a varying,
+			// unsynchronised point in its stream. The kill below is TIMER-driven — it fires right after
+			// this sleep, NOT when a transaction completes — so for the random producer it can land in
+			// the GAP of a split-commit regression, which is the whole point of this mode (codex).
+			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
+		}
 		if wantCommits {
-			// The commit count must ADVANCE — proving the producer is committing right now, not merely
-			// alive (respond() answers even if the work loop froze). Each count comes from the worker
-			// AFTER it reads our nonce, so a lagging pipe reader cannot fabricate progress. POLL for the
-			// advance rather than assume a fixed throughput: a valid transaction under -race can outlast
-			// any single sleep, so a fixed wait would flake on a healthy worker (codex).
-			deadline := time.Now().Add(5 * time.Second)
-			for probeN := 1; probe(fmt.Sprintf("PING-%d-%d", i, probeN)) <= c1; probeN++ {
-				if time.Now().After(deadline) {
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					<-drained
-					t.Fatalf("cycle %d: the producer's commit count did not advance past %d within 5s — it "+
-						"was not committing, so the crash would not land amid commit traffic.\n%s",
-						i, c1, snapshot(&mu, &out))
-				}
-				time.Sleep(2 * time.Millisecond)
+			// The commit count must have ADVANCED across the window — proving the producer was actively
+			// committing during it, not merely alive (respond() answers even if the work loop froze).
+			// Both counts are causally fresh (each comes from the worker after it read our nonce), so a
+			// lagging pipe reader can neither fabricate nor hide progress. Crucially this samples ACROSS
+			// the window; it does not wait for a post-window commit, so the kill stays timer-driven.
+			if c2 := probe(fmt.Sprintf("PING-%d-b", i)); c2 <= c1 {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				<-drained
+				t.Fatalf("cycle %d: the producer's commit count did not advance across the kill window "+
+					"(%d -> %d) — it was not actively committing, so the crash would not land amid commit "+
+					"traffic.\n%s", i, c1, c2, snapshot(&mu, &out))
 			}
 		}
 		_ = cw.Close()
