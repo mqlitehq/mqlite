@@ -173,20 +173,27 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 	}
 }
 
-// runLocker receives messages (short leases, reaper OFF) and mostly just holds them, so it is killed
-// WHILE holding locks. It never completes anything: no message ever leaves the queue, which makes
-// the recovery oracle exact — after a restart the queue must still hold every message, and none may
-// be stuck `locked` (Open resets orphaned locks).
+// lockerReadyAt is how many locks the locker must hold before it announces readiness. It is
+// deliberately LARGE: recovery must reclaim MANY orphaned locks at once, so a bug that only reclaims
+// the first N (a stray LIMIT, a capped batch) is caught. Held at a handful, the recovery test passed
+// even with a LIMIT 25 injected — nothing ever exercised the volume (round-8).
+const lockerReadyAt = 250
+
+// runLocker claims messages in big batches and HOLDS them — hundreds at once — so that when it is
+// killed there are far more orphaned locks than any plausible recovery cap. It never completes
+// anything: no message leaves the queue, so after a restart every message must still be there and
+// none may be stuck `locked` (Open reclaims orphaned locks).
 func runLocker(ctx context.Context, e *mqlite.Embedded) {
 	holding := 0
 	for {
-		msgs, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 5, Wait: 100 * time.Millisecond})
+		msgs, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 256, Wait: 100 * time.Millisecond})
 		if err != nil {
 			fail("locker receive", err) // no benign error — see runProducer
 		}
 		for _, m := range msgs {
-			// Occasionally give one back; otherwise hold it and let the kill catch us mid-lease.
-			if m.SequenceNumber%3 == 0 {
+			// Give a few back for realism (redelivery churn), but hold the vast majority so the
+			// orphaned-lock count at the kill is high.
+			if m.SequenceNumber%13 == 0 {
 				if err := m.Abandon(ctx); err != nil && !errors.Is(err, mqlite.ErrLockLost) {
 					fail("locker abandon", err)
 				}
@@ -194,10 +201,10 @@ func runLocker(ctx context.Context, e *mqlite.Embedded) {
 				holding++
 			}
 		}
-		if holding > 0 { // at least one lock is held — killing us now actually exercises recovery
+		if holding >= lockerReadyAt { // hundreds of live locks are held — recovery has real volume to reclaim
 			ready()
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -225,8 +232,8 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 	// full commits land unsynchronised — including around a commit — and catch a split that persists
 	// the row and the enqueue across two commits with a gap. Coordinated kills (HOLD=1) crash with a
 	// transaction held open between its two writes, catching a split into two separate transactions.
-	acked := killLoop(t, db, "producer", readyMarker, false, 4)
-	for k, v := range killLoop(t, db, "producer", inTxMarker, true, 4, holdEnv+"=1") {
+	acked := killLoop(t, db, "producer", readyMarker, false, 3, 4)
+	for k, v := range killLoop(t, db, "producer", inTxMarker, true, 0, 4, holdEnv+"=1") {
 		acked[k] = v
 	}
 
@@ -295,7 +302,9 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 // `active`, or to `dead_lettered` if it was on its last permitted delivery — the reaper's rule), and
 // — because the consumer never completes anything — not one of the seeded messages may be lost.
 func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
-	const seeded = 200
+	// Seed well above lockerReadyAt so the locker can hold hundreds of locks at the kill — recovery
+	// then has real volume to reclaim, and a bug that only reclaims the first N is caught.
+	const seeded = 400
 	db := dbPath(t)
 
 	ctx := context.Background()
@@ -314,7 +323,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 		}
 	}()
 
-	_ = killLoop(t, db, "locker", readyMarker, false, 6) // the locker emits no acks
+	_ = killLoop(t, db, "locker", readyMarker, false, 0, 6) // the locker emits no acks
 
 	// Reopen and check the recovery contract.
 	e := openWithRetry(ctx, db)
@@ -330,20 +339,27 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 			"orphaned locks, so they are stranded until their lease expires (or forever, the reaper is off).", m.Locked)
 	}
 	// Nothing completed, so nothing may be gone. A bare count can be fooled — losing body N while
-	// duplicating body M keeps the total at 200 — so check the IDENTITIES and multiplicities. The
-	// seed bodies are exactly 0..199 and none were dead-lettered (high MaxDeliveryCount), so every
-	// one must come back active exactly once (codex).
-	got, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: seeded})
-	if err != nil {
-		t.Fatalf("the queue is unusable after crash recovery: %v", err)
-	}
+	// duplicating body M keeps the total the same — so check the IDENTITIES and multiplicities. The
+	// seed bodies are exactly 0..seeded-1 and none were dead-lettered (high MaxDeliveryCount), so
+	// every one must come back active exactly once (codex). Receive caps at 256, so drain in a loop.
 	seen := map[int64]int{}
-	for _, msg := range got {
-		n, perr := strconv.ParseInt(string(msg.Body), 10, 64)
-		if perr != nil {
-			t.Fatalf("recovered a message whose body %q is not a seed id: %v", msg.Body, perr)
+	total := 0
+	for {
+		got, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 256})
+		if err != nil {
+			t.Fatalf("the queue is unusable after crash recovery: %v", err)
 		}
-		seen[n]++
+		if len(got) == 0 {
+			break
+		}
+		total += len(got)
+		for _, msg := range got {
+			n, perr := strconv.ParseInt(string(msg.Body), 10, 64)
+			if perr != nil {
+				t.Fatalf("recovered a message whose body %q is not a seed id: %v", msg.Body, perr)
+			}
+			seen[n]++
+		}
 	}
 	var missing, duped []int64
 	for i := int64(0); i < seeded; i++ {
@@ -355,13 +371,13 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 			duped = append(duped, i)
 		}
 	}
-	if len(missing) > 0 || len(duped) > 0 || int(m.Total) != seeded || len(got) != seeded {
+	if len(missing) > 0 || len(duped) > 0 || int(m.Total) != seeded || total != seeded {
 		t.Fatalf("crash recovery did not preserve the seeded set exactly (received %d, Stats.Total %d, "+
 			"of %d seeded):\n"+
 			"  missing bodies:    %v\n"+
 			"  duplicated bodies: %v\n"+
 			"  nothing was ever completed, so every seed id 0..%d must come back exactly once.",
-			len(got), m.Total, seeded, trim(missing), trim(duped), seeded-1)
+			total, m.Total, seeded, trim(missing), trim(duped), seeded-1)
 	}
 }
 
@@ -375,7 +391,11 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // The classification afterwards gives the suite its teeth: only the SIGKILL we injected counts. A
 // worker that panics, trips the race detector, exits on its own, or dies from some other signal is a
 // hard failure, never a crash cycle counted as success.
-func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) map[string]bool {
+// minProgress, when > 0, requires the worker to emit at least that many acks DURING the window
+// between reaching its kill point and being killed — i.e. that it was actively committing right up
+// to the crash. Without it, a producer frozen after a few commits would pass, and the crash would
+// never actually land amid commit traffic (round-8). 0 disables the check (the locker acks nothing).
+func killLoop(t *testing.T, db, role, killOn string, immediate bool, minProgress, cycles int, extraEnv ...string) map[string]bool {
 	t.Helper()
 	acked := map[string]bool{}
 	for i := 0; i < cycles; i++ {
@@ -404,6 +424,8 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 		drained := make(chan struct{})
 		var mu sync.Mutex
 		var out strings.Builder
+		ackCount := 0 // acks seen this cycle, under mu — used to measure commit progress before the kill
+		acksNow := func() int { mu.Lock(); defer mu.Unlock(); return ackCount }
 		go func() {
 			sc := bufio.NewScanner(pr)
 			signalled := false
@@ -414,6 +436,7 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				out.WriteByte('\n')
 				if nonce, ok := parseAck(line); ok {
 					acked[nonce] = true // this nonce was durably committed before the crash
+					ackCount++
 				}
 				mu.Unlock()
 				if !signalled && strings.Contains(line, killOn) {
@@ -435,10 +458,38 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				i, killOn, role, snapshot(&mu, &out))
 		}
 
-		if !immediate {
+		if immediate {
+			// A small window even here, so the liveness check below can actually observe a worker
+			// that ended on its own right at the marker (otherwise the parent's kill races it). The
+			// worker is parked (holding a transaction open), so this changes nothing it does.
+			time.Sleep(15 * time.Millisecond)
+		} else {
 			// Let the worker run on past the marker so the crash lands at a varying, unsynchronised
 			// point in its stream — including, for the producer, around a commit.
+			before := acksNow()
 			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
+			if got := acksNow() - before; minProgress > 0 && got < minProgress {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				<-drained
+				t.Fatalf("cycle %d: the worker committed only %d transaction(s) in the window before the "+
+					"kill (wanted >= %d). It was not actively committing, so the crash did not land amid "+
+					"commit traffic — the mid-commit guarantee is untested.\n%s",
+					i, got, minProgress, snapshot(&mu, &out))
+			}
+		}
+		// OUR kill must be the cause of death. A worker that ended on its own — including by
+		// self-SIGKILL, whose exit status is indistinguishable from ours — closes its stdout, so the
+		// drain goroutine reaches EOF and `drained` closes. If that has already happened, the worker
+		// was gone before we killed it: a failure, not a cycle we take credit for. (A liveness signal
+		// can't tell this: a self-killed, not-yet-reaped worker is a zombie, and kill(pid,0) still
+		// succeeds on a zombie — round-8.)
+		select {
+		case <-drained:
+			_ = cmd.Wait()
+			t.Fatalf("cycle %d: the worker's output stream ended before the harness killed it — it "+
+				"exited on its own, so this is not a crash we injected.\n%s", i, snapshot(&mu, &out))
+		default:
 		}
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait() // reap it, so its advisory file lock is released before the next open
