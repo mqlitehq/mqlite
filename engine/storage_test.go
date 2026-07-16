@@ -879,11 +879,14 @@ func TestCloseWaitsForInFlightWritesBeforeReleasingTheLock(t *testing.T) {
 	closed := make(chan error, 1)
 	go func() { closed <- e.Close() }()
 
+	// Deterministically wait until Close has begun (flipped closing, now blocked on the in-flight
+	// transaction), then confirm it has NOT returned — no scheduler-timing guess (round-8, codex).
+	awaitClosing(t, e)
 	select {
 	case <-closed:
 		t.Fatal("Close returned while a transaction was still open — it released the writer/lock early")
-	case <-time.After(200 * time.Millisecond):
-		// Good: Close is blocked on the in-flight transaction.
+	default:
+		// Good: Close has begun but is blocked on the in-flight transaction.
 	}
 
 	// While Close is blocked, the file lock is still held, so a second open must be refused.
@@ -928,6 +931,23 @@ func TestCloseWaitsForInFlightWritesBeforeReleasingTheLock(t *testing.T) {
 	}
 }
 
+// awaitClosing blocks until db.close has flipped the closing flag — a deterministic substitute for
+// sleeping, so a slow scheduler cannot make the close-gate tests race (round-8, codex).
+func awaitClosing(t *testing.T, e *Engine) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		e.db.closeMu.Lock()
+		closing := e.db.closing
+		e.db.closeMu.Unlock()
+		if closing {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Close never reached its waiting state (closing flag not set)")
+}
+
 // TestOperationsFailFastWhileClosing pins the round-8 P2: a new operation that arrives while Close is
 // waiting for an in-flight write must FAIL FAST with ErrClosed, not block. An RWMutex gate would give
 // the pending Close writer-priority and make every later operation wait — uncancellably, behind
@@ -955,7 +975,7 @@ func TestOperationsFailFastWhileClosing(t *testing.T) {
 
 	closed := make(chan error, 1)
 	go func() { closed <- e.Close() }()
-	time.Sleep(100 * time.Millisecond) // let Close flip the closing flag and start waiting
+	awaitClosing(t, e) // deterministically wait until Close has flipped the closing flag
 
 	// A new operation must now return promptly with ErrClosed — it must NOT block behind the pending
 	// Close (which is itself blocked on the held transaction).

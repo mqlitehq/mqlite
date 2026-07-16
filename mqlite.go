@@ -33,6 +33,9 @@ var (
 	// ErrDBLocked is returned by OpenEmbedded when the local file DB is already open
 	// in another process: embedded mode is single-process, single-writer (MQLITE-6).
 	ErrDBLocked = engine.ErrDBLocked
+	// ErrClosed is returned by an operation that starts during or after Close: once Close begins,
+	// new work is refused immediately rather than racing a store being torn down (round-8).
+	ErrClosed = engine.ErrClosed
 )
 
 // OrderingMode mirrors engine.OrderingMode for queue-level delivery ordering.

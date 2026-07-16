@@ -782,3 +782,24 @@ func TestSubMsOlderThanIsBounded(t *testing.T) {
 		})
 	}
 }
+
+// TestEmbeddedErrClosedThroughSDK is the SDK-boundary check for the round-8 close contract: an
+// operation on a closed embedded engine surfaces mqlite.ErrClosed through the PUBLIC package, so a
+// caller can errors.Is against it without reaching into engine.
+func TestEmbeddedErrClosedThroughSDK(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := mqlite.OpenEmbedded(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); !errors.Is(err, mqlite.ErrClosed) {
+		t.Fatalf("an operation on a closed embedded engine must be mqlite.ErrClosed, got %v", err)
+	}
+}
