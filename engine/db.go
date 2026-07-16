@@ -626,6 +626,13 @@ func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []an
 // Returning *sql.Rows cannot do that: the rows would outlive the reservation.
 func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
 	if d.remote {
+		// Gate the WHOLE read — the query, the scan, and Rows.Close — not just the query call: the
+		// rows outlive d.query, so releasing the admission when query returns would let Close tear
+		// the pool down mid-scan (round-8 P2). withConn does the same for the local branch below.
+		if !d.enter() {
+			return ErrClosed
+		}
+		defer d.inFlight.Done()
 		rows, err := d.query(ctx, q, args...)
 		if err != nil {
 			return err
@@ -646,11 +653,8 @@ func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error
 func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	var rows *sql.Rows
 	var err error
-	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
-	if !d.enter() {
-		return nil, ErrClosed
-	}
-	defer d.inFlight.Done()
+	// No admission gate here: query only ever runs inside queryRows's remote branch, which holds the
+	// admission across the scan (the rows outlive this call, so gating here would release too early).
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)

@@ -1027,3 +1027,40 @@ func TestCloseGateCoversRemoteAndFailsFastBeforeTeardown(t *testing.T) {
 		t.Fatalf("a remote queryRowScan after beginClosing must be ErrClosed, got %v", err)
 	}
 }
+
+// TestRemoteQueryRowsHoldsAdmissionThroughScan pins the round-8 P2: on a remote store, queryRows must
+// keep its admission registered for the whole read — query, scan, and Rows.Close — not just the query
+// call. Otherwise Close's inFlight.Wait could return and tear the pool down while a slow scan is still
+// reading rows.
+func TestRemoteQueryRowsHoldsAdmissionThroughScan(t *testing.T) {
+	d, _ := remoteDBFailingFirst(t, 0)
+
+	inScan := make(chan struct{})
+	release := make(chan struct{})
+	qDone := make(chan error, 1)
+	go func() {
+		qDone <- d.queryRows(context.Background(), "SELECT 1", func(*sql.Rows) error {
+			close(inScan)
+			<-release // hold the scan open
+			return nil
+		})
+	}()
+	<-inScan
+
+	// A Close arriving now must wait for the scan: its inFlight.Wait must not return yet.
+	d.beginClosing()
+	waitDone := make(chan struct{})
+	go func() { d.inFlight.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+		t.Fatal("inFlight.Wait returned while a remote scan was still active — Close could tear the pool down mid-scan")
+	case <-time.After(150 * time.Millisecond):
+		// Good: the scan still holds the admission.
+	}
+
+	close(release)
+	if err := <-qDone; err != nil {
+		t.Fatalf("queryRows: %v", err)
+	}
+	<-waitDone // now the wait completes
+}
