@@ -91,7 +91,11 @@ func isPermanent(err error) bool {
 		// routes only part of the API. Retrying cannot make the route appear, so a receiver that
 		// treated this as transient would spin forever instead of reporting the incompatibility
 		// (MQLITE-97; this sentinel used to arrive as ErrNotFound, which WAS classified here).
-		errors.Is(err, ErrUnsupported)
+		errors.Is(err, ErrUnsupported) ||
+		// The embedded engine has been closed (another goroutine called Embedded.Close). No amount
+		// of retrying brings it back, so Run must return instead of hammering the error handler
+		// every 500ms forever (round-8).
+		errors.Is(err, ErrClosed)
 }
 
 // reserve blocks until at least one worker slot is free (ctx-aware), then greedily takes up

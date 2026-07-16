@@ -313,3 +313,23 @@ func TestUnsupportedIsPermanent(t *testing.T) {
 		t.Error("a transient error must not stop the loop")
 	}
 }
+
+// A closed embedded engine surfaces ErrClosed from Receive. Run must treat it as permanent and
+// return, not retry the error handler every 500ms forever after Embedded.Close (round-8).
+func TestReceiverReturnsOnEngineClosed(t *testing.T) {
+	if !isPermanent(ErrClosed) {
+		t.Fatal("ErrClosed must be classified permanent so Run stops on engine shutdown")
+	}
+	f := &fakeSource{recvErr: ErrClosed}
+	var observed error
+	r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(e error) { observed = e })})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := r.Run(ctx, func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("Run must return ErrClosed once the engine is closed, got %v", err)
+	}
+	if !errors.Is(observed, ErrClosed) {
+		t.Fatalf("error handler must see ErrClosed, got %v", observed)
+	}
+}
