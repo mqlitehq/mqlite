@@ -158,8 +158,8 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 			// ctx or closes this engine, so any error is a real defect (codex).
 			fail("producer tx", err)
 		}
+		committedCount.Add(1) // count the commit before any stdout I/O that could block (codex)
 		fmt.Println(ackPrefix, nonce)
-		committedCount.Add(1)
 		return nonce
 	}
 
@@ -555,21 +555,24 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 				}
 			}
 		}
-		c1 := probe("PING-" + strconv.Itoa(i) + "-a")
+		c1 := probe(fmt.Sprintf("PING-%d-0", i))
 		if wantCommits {
-			time.Sleep(15 * time.Millisecond) // a healthy producer commits many in this window; a frozen one, none
-			// A second causally-fresh probe: the commit count must have ADVANCED between the two, so
-			// the producer is provably committing right now — not merely alive (respond() answers even
-			// if the work loop has frozen). Both counts come from the worker AFTER reading our nonce,
-			// so a lagging pipe reader cannot fabricate progress (codex).
-			c2 := probe("PING-" + strconv.Itoa(i) + "-b")
-			if c2 <= c1 {
-				_ = cmd.Process.Kill()
-				_ = cmd.Wait()
-				<-drained
-				t.Fatalf("cycle %d: the producer's commit count did not advance between two probes "+
-					"(%d -> %d) — it was not actively committing, so the crash would not land amid commit "+
-					"traffic.\n%s", i, c1, c2, snapshot(&mu, &out))
+			// The commit count must ADVANCE — proving the producer is committing right now, not merely
+			// alive (respond() answers even if the work loop froze). Each count comes from the worker
+			// AFTER it reads our nonce, so a lagging pipe reader cannot fabricate progress. POLL for the
+			// advance rather than assume a fixed throughput: a valid transaction under -race can outlast
+			// any single sleep, so a fixed wait would flake on a healthy worker (codex).
+			deadline := time.Now().Add(5 * time.Second)
+			for probeN := 1; probe(fmt.Sprintf("PING-%d-%d", i, probeN)) <= c1; probeN++ {
+				if time.Now().After(deadline) {
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+					<-drained
+					t.Fatalf("cycle %d: the producer's commit count did not advance past %d within 5s — it "+
+						"was not committing, so the crash would not land amid commit traffic.\n%s",
+						i, c1, snapshot(&mu, &out))
+				}
+				time.Sleep(2 * time.Millisecond)
 			}
 		}
 		_ = cw.Close()
