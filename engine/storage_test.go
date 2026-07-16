@@ -843,3 +843,87 @@ func TestRemoteTxClosureCanBeReplayed(t *testing.T) {
 		t.Errorf("a local transaction ran its closure %d times, want exactly 1 — the outbox depends on it", runs)
 	}
 }
+
+// TestCloseWaitsForInFlightWritesBeforeReleasingTheLock pins the round-8 P1: Close must not release
+// the single-writer file lock — nor let its transaction be abandoned open — while a write is still
+// in flight. Before the fix, db.close() called sql.DB.Close() (which does NOT wait for a checked-out
+// connection) and then dropped the advisory lock, so a SECOND opener could take the file and run
+// crash recovery while the first writer's transaction was still committing.
+func TestCloseWaitsForInFlightWritesBeforeReleasingTheLock(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	inTx := make(chan struct{})
+	txDone := make(chan error, 1)
+
+	// A transaction that has begun and is holding the single writer, parked until we release it.
+	go func() {
+		txDone <- e.inTx(ctx, func(ec context.Context, tx *txn) error {
+			if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('k','v')`); err != nil {
+				return err
+			}
+			close(inTx)
+			<-release // hold the transaction open
+			return nil
+		})
+	}()
+
+	<-inTx // the transaction is open and holds the writer
+
+	// Close in the background: it MUST block until the transaction finishes.
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a transaction was still open — it released the writer/lock early")
+	case <-time.After(200 * time.Millisecond):
+		// Good: Close is blocked on the in-flight transaction.
+	}
+
+	// While Close is blocked, the file lock is still held, so a second open must be refused.
+	if e2, err := Open(ctx, Options{DB: dsn, DisableBackground: true}); !errors.Is(err, ErrDBLocked) {
+		if e2 != nil {
+			_ = e2.Close()
+		}
+		t.Fatalf("a second open during an in-flight-then-closing engine must get ErrDBLocked, got %v", err)
+	}
+
+	close(release) // let the transaction commit and return
+
+	if err := <-txDone; err != nil {
+		t.Fatalf("transaction: %v", err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the transaction finished")
+	}
+
+	// Now — and only now — the file can be reopened, and the write is durably there.
+	e2, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+	if err != nil {
+		t.Fatalf("reopen after a clean close: %v", err)
+	}
+	defer e2.Close()
+	var got string
+	if err := e2.db.queryRowScan(ctx, []any{&got}, `SELECT value FROM meta WHERE key='k'`); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != "v" {
+		t.Fatalf("the committed write is missing after reopen: got %q", got)
+	}
+
+	// And once closed, further operations fail fast rather than racing a torn-down store.
+	if err := e.Complete(ctx, "q", 1, "tok"); !errors.Is(err, ErrClosed) && !errors.Is(err, ErrLockLost) {
+		t.Fatalf("an operation after Close should be refused, got %v", err)
+	}
+}

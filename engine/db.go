@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	// Pure-Go drivers, no CGO (design D2 default + L-Turso remote).
@@ -26,6 +27,16 @@ type db struct {
 	remote bool
 	dsn    string    // the user-facing DB string (no auth token — that's only in the conn string)
 	lock   io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
+
+	// closeMu gates every local database operation against Close. Each op that touches the store
+	// holds it for READ for its whole duration (see withConn); Close takes it for WRITE, so it
+	// cannot release the single-writer file lock — nor close the pool — until every in-flight
+	// operation, INCLUDING a transaction that is still committing, has finished. Without this,
+	// Close returned while a write was in flight and released the advisory lock, letting a SECOND
+	// process open the same file, run crash recovery, and re-deliver still-held locked rows while
+	// the first writer's transaction was still committing (round-8 P1).
+	closeMu sync.RWMutex
+	closed  bool
 }
 
 // resolveDSN turns the user-facing DB string + optional auth token into a
@@ -217,6 +228,15 @@ func isNoSuchTable(err error) bool {
 }
 
 func (d *db) close() error {
+	// Take the gate for WRITE: this blocks until every in-flight local operation has returned — a
+	// statement still executing, a transaction still committing — so we never release the file lock
+	// out from under a write. New operations see d.closed and fail fast with ErrClosed.
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	if d.closed {
+		return nil
+	}
+	d.closed = true
 	err := d.sql.Close()
 	if d.lock != nil {
 		if e := d.lock.Close(); e != nil && err == nil {
@@ -355,6 +375,17 @@ func (d *db) withConn(ctx context.Context, fn func(execCtx context.Context, c *s
 	if err := checkCtx(ctx); err != nil {
 		return err
 	}
+	// Hold the close gate for READ for the whole operation — the wait for the connection, the
+	// statement, and (for inTx, whose entire transaction runs inside this closure) the commit. Close
+	// blocks on the WRITE side until this returns, so the file lock is never released mid-write. All
+	// local access funnels through withConn, and withConn never nests, so this is the one gate that
+	// covers every local operation without deadlocking on itself.
+	d.closeMu.RLock()
+	if d.closed {
+		d.closeMu.RUnlock()
+		return ErrClosed
+	}
+	defer d.closeMu.RUnlock()
 	conn, err := d.sql.Conn(ctx) // cancellable WAIT
 	if err != nil {
 		return err
