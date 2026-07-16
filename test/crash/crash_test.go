@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,14 +56,20 @@ const (
 	pongPrefix = "CRASH-WORKER-PONG"
 )
 
-// respond echoes every line the harness sends on stdin back on stdout, prefixed. It runs for the
-// worker's whole life so the harness can, at any moment, prove the worker is still alive and
-// processing by sending a unique challenge and waiting for exactly that nonce to come back.
+// committedCount is the number of full outbox transactions this worker has committed. respond()
+// reports it in every challenge echo, so the harness can prove commit ACTIVITY causally — two
+// echoes whose counts differ mean commits happened between them — instead of timing when the pipe
+// reader happens to consume ACK lines (which a lagging reader makes meaningless; codex).
+var committedCount atomic.Int64
+
+// respond echoes every challenge the harness sends on stdin, together with the current commit count,
+// so the harness can prove — from a reply that only a live worker could produce AFTER reading the
+// challenge — both that the worker is alive and (by comparing counts) that it is still committing.
 func respond() {
 	go func() {
 		sc := bufio.NewScanner(os.Stdin)
 		for sc.Scan() {
-			fmt.Println(pongPrefix, sc.Text())
+			fmt.Println(pongPrefix, sc.Text(), committedCount.Load())
 			_ = os.Stdout.Sync()
 		}
 	}()
@@ -152,6 +159,7 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 			fail("producer tx", err)
 		}
 		fmt.Println(ackPrefix, nonce)
+		committedCount.Add(1)
 		return nonce
 	}
 
@@ -455,8 +463,6 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 		pong := make(chan string, 16) // the worker's echoes of our liveness challenges
 		var mu sync.Mutex
 		var out strings.Builder
-		ackCount := 0
-		acksNow := func() int { mu.Lock(); defer mu.Unlock(); return ackCount }
 		go func() {
 			sc := bufio.NewScanner(pr)
 			signalled := false
@@ -465,15 +471,13 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 				mu.Lock()
 				out.WriteString(line)
 				out.WriteByte('\n')
-				nonce, isAck := parseAck(line)
-				if isAck {
+				if nonce, isAck := parseAck(line); isAck {
 					acked[nonce] = true // this nonce was durably committed before the crash
-					ackCount++
 				}
 				mu.Unlock()
 				if echo, ok := strings.CutPrefix(line, pongPrefix+" "); ok {
 					select {
-					case pong <- echo:
+					case pong <- echo: // "<challenge> <commitCount>"
 					default:
 					}
 				}
@@ -503,29 +507,13 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 			// boundaries and can land with a transaction in flight (codex).
 			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
 		}
-		if wantCommits {
-			// The challenge below proves the process is ALIVE, but respond() answers from its own
-			// goroutine even if the work loop has frozen — so for the random producer, separately
-			// require fresh commits in a short TERMINAL window right before the kill. A producer that
-			// acked early and then hung produces none here (aggregating over the whole window would
-			// have missed it — codex).
-			before := acksNow()
-			time.Sleep(20 * time.Millisecond)
-			if acksNow() == before {
-				_ = cw.Close()
-				_ = cmd.Process.Kill()
-				_ = cmd.Wait()
-				<-drained
-				t.Fatalf("cycle %d: the producer committed nothing in the 20ms before the kill — it was "+
-					"not actively committing, so the crash would not land amid commit traffic.\n%s",
-					i, snapshot(&mu, &out))
-			}
-		}
-		// Prove the worker is alive and processing RIGHT NOW with a challenge/response: send a unique
-		// nonce and wait for the worker to echo exactly it. Only a live worker that READ the nonce
-		// (after we sent it) can produce that line — a frozen worker never reads it, and a dead
-		// worker's buffered output cannot contain a nonce it never wrote. Any self-SIGKILL kills the
-		// responder goroutine too, so it stops echoing and the wait fails (drained/timeout).
+		// Prove the worker is alive and — for the random producer — actively COMMITTING, with a
+		// challenge/response. probe sends a unique nonce and waits for the worker to echo exactly it,
+		// together with its current commit count. Only a live worker that READ the nonce (after we
+		// sent it) can produce that line — a frozen worker never reads it, a dead worker's buffered
+		// output cannot contain a nonce it never wrote — so the reply, and the count it carries, are
+		// causally fresh no matter when the pipe reader happens to consume them (codex). Any
+		// self-SIGKILL kills the responder too, so it stops echoing and probe fails.
 		//
 		// The honest limit: this proves the worker was alive microseconds ago, not at the exact
 		// instant of the kill below. Perfect attribution of a SIGKILL to its sender is IMPOSSIBLE from
@@ -533,32 +521,55 @@ func killLoop(t *testing.T, db, role, killOn string, immediate, wantCommits bool
 		// reports the child's own pid, not the signaller's. The only race-free alternative,
 		// SIGSTOP→confirm-frozen→SIGKILL, is unreliable across platforms (darwin's wait4 does not
 		// report the stop, and it deadlocks against a Go child) and needs ptrace to be portable —
-		// disproportionate for a harness whose worker never self-kills. The residual is therefore a
-		// worker that self-SIGKILLs in the microsecond window after echoing this nonce; a fixed-point
-		// self-kill mutation (the realistic case) still stops the echoes and is caught. Documented,
-		// not hidden.
-		challenge := "PING-" + strconv.Itoa(i)
-		_, _ = cw.WriteString(challenge + "\n") // a write to a dead worker's stdin just errors; the waits below catch death
-		alive := false
-		deadline := time.After(5 * time.Second)
-		for !alive {
-			select {
-			case echo := <-pong:
-				alive = echo == challenge // ignore any stale echo; only OUR nonce counts
-			case <-drained:
-				_ = cw.Close()
+		// disproportionate for a harness whose worker never self-kills. The residual is a worker that
+		// self-SIGKILLs in the microsecond window after echoing; a fixed-point self-kill mutation (the
+		// realistic case) still stops the echoes and is caught. Documented, not hidden.
+		probe := func(nonce string) int64 {
+			if _, err := cw.WriteString(nonce + "\n"); err != nil {
 				_ = cmd.Wait()
-				t.Fatalf("cycle %d: the worker's output ended before it answered the liveness challenge — "+
-					"it exited on its own (role %q), so this is not a crash we injected.\n%s",
-					i, role, snapshot(&mu, &out))
-			case <-deadline:
-				_ = cw.Close()
+				<-drained
+				t.Fatalf("cycle %d (role %q): the worker's stdin was closed before it answered — it exited "+
+					"on its own, so this is not a crash we injected.\n%s", i, role, snapshot(&mu, &out))
+			}
+			deadline := time.After(5 * time.Second)
+			for {
+				select {
+				case echo := <-pong:
+					f := strings.Fields(echo)
+					if len(f) == 2 && f[0] == nonce { // OUR nonce; f[1] is the commit count
+						n, _ := strconv.ParseInt(f[1], 10, 64)
+						return n
+					}
+				case <-drained:
+					_ = cmd.Wait()
+					t.Fatalf("cycle %d: the worker's output ended before it answered the liveness challenge "+
+						"— it exited on its own (role %q), so this is not a crash we injected.\n%s",
+						i, role, snapshot(&mu, &out))
+				case <-deadline:
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+					<-drained
+					t.Fatalf("cycle %d: the worker did not answer the liveness challenge within 5s (role %q) "+
+						"— it was frozen or dead, so the crash would not land on a live process.\n%s",
+						i, role, snapshot(&mu, &out))
+				}
+			}
+		}
+		c1 := probe("PING-" + strconv.Itoa(i) + "-a")
+		if wantCommits {
+			time.Sleep(15 * time.Millisecond) // a healthy producer commits many in this window; a frozen one, none
+			// A second causally-fresh probe: the commit count must have ADVANCED between the two, so
+			// the producer is provably committing right now — not merely alive (respond() answers even
+			// if the work loop has frozen). Both counts come from the worker AFTER reading our nonce,
+			// so a lagging pipe reader cannot fabricate progress (codex).
+			c2 := probe("PING-" + strconv.Itoa(i) + "-b")
+			if c2 <= c1 {
 				_ = cmd.Process.Kill()
 				_ = cmd.Wait()
 				<-drained
-				t.Fatalf("cycle %d: the worker did not answer the liveness challenge within 5s (role %q) — "+
-					"it was frozen or dead, so the crash would not land on a live process.\n%s",
-					i, role, snapshot(&mu, &out))
+				t.Fatalf("cycle %d: the producer's commit count did not advance between two probes "+
+					"(%d -> %d) — it was not actively committing, so the crash would not land amid commit "+
+					"traffic.\n%s", i, c1, c2, snapshot(&mu, &out))
 			}
 		}
 		_ = cw.Close()
