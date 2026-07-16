@@ -45,6 +45,8 @@ nothing that lands in the repository or on GitHub does.)
 make build          # → bin/mqlite + bin/mqlite-bench
 make test           # go test ./...   (hermetic unit + invariant tests)
 make e2e            # ./test/run.sh — boots an ephemeral broker, runs curl+python+SDK blackbox suites
+make crash          # crash-injection layer: re-execs + hard-kills a worker mid-transaction, checks
+                    #   recovery. Build-tag `crash_injection`, Linux; not in the default -race matrix.
 make bench          # Docker stress matrix → test/bench/out/
 make clean          # delete ALL generated data (*.db, bin/, bench out, smoke dirs)
 
