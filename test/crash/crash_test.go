@@ -426,13 +426,14 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // worker that panics, trips the race detector, exits on its own, or dies from some other signal is a
 // hard failure, never a crash cycle counted as success.
 //
-// Right before the kill the harness BLOCKS for a fresh "beat" from the worker — a line proving it is
-// alive and doing its work at that instant. For the producer's random mode the beat is a commit ack,
-// so this is also the mid-commit-activity guarantee: the crash lands amid commit traffic, not after
-// a freeze. For the coordinated producer and the locker it is a heartbeat. A worker that froze or
-// ended on its own (a self-SIGKILL, indistinguishable by exit status) stops beating, so the wait
-// times out and fails. Blocking on a fresh beat is race-free — unlike a check-then-act on
-// asynchronous pipe EOF, which a self-kill right at the marker could slip past (round-8, codex).
+// Once the worker reaches killOn, the harness sends ONE liveness challenge and waits for the worker
+// to echo it (respond() answers from an independent stdin goroutine) — proof the worker reached its
+// kill point alive. That check runs BEFORE the timer window, so it does not perturb the kill: for the
+// random producer the window then elapses and the kill fires purely on the timer, landing at an
+// unsynchronised point that can fall in a split-commit gap. The challenge proves LIVENESS, not that
+// the work loop is committing — that (non-vacuity) is checked in aggregate by the caller, decoupled
+// from timing, because gating it here would either flake on a slow -race host or prove nothing
+// (round-8, codex). A self-kill before the marker gives no marker; one at the marker gives no echo.
 func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) map[string]bool {
 	t.Helper()
 	acked := map[string]bool{}
