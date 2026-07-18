@@ -22,6 +22,8 @@ package crash
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -67,6 +69,18 @@ func respond() {
 			_ = os.Stdout.Sync()
 		}
 	}()
+}
+
+// randomNonce returns an unguessable liveness-challenge nonce. It MUST be unpredictable: with a
+// fixed "PING-<i>" a worker could print the matching pong line before ever reading stdin, and the
+// echo would prove nothing about being alive after the challenge was sent (round-8).
+func randomNonce(t *testing.T) string {
+	t.Helper()
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatalf("crypto/rand: %v", err)
+	}
+	return hex.EncodeToString(b)
 }
 
 // parseAck reads the nonce out of a "CRASH-WORKER-ACK <nonce>" line.
@@ -254,25 +268,38 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 	// full commits land unsynchronised — including around a commit — and catch a split that persists
 	// the row and the enqueue across two commits with a gap. Coordinated kills (HOLD=1) crash with a
 	// transaction held open between its two writes, catching a split into two separate transactions.
-	acked := killLoop(t, db, "producer", readyMarker, false, 4)
-	for k, v := range killLoop(t, db, "producer", inTxMarker, true, 4, holdEnv+"=1") {
+	acked, postPong := killLoop(t, db, "producer", readyMarker, false, 4)
+	coordAcked, _ := killLoop(t, db, "producer", inTxMarker, true, 4, holdEnv+"=1")
+	for k, v := range coordAcked {
 		acked[k] = v
 	}
 
-	// The DETERMINISTIC guarantee this test enforces is the COORDINATED mode: four crashes each land,
-	// by construction, with a transaction held open between its two writes, so a torn-callback / split
-	// into separate transactions is caught every run (see the atomicity oracle below and its mutation
-	// test). The RANDOM mode is supplementary, probabilistic coverage of a crash landing in a
-	// two-commit gap — valuable but not guaranteed on any given run, and deliberately NOT gated on a
-	// commit-throughput floor: a floor high enough to prove "actively committing" flakes on a slow
-	// -race CI host, and a floor low enough not to flake proves nothing (codex). So the count is
-	// logged, not asserted; the hard gates are the atomicity bijection, no-loss, and recovery below,
-	// none of which depend on how fast the producer ran.
+	// What each mode PROVES, stated exactly (round-8):
+	//
+	//   - COORDINATED (deterministic): four crashes each land, by construction, with a transaction
+	//     held open between its two writes — a torn callback / split-into-two-transactions outbox is
+	//     caught every run (the atomicity oracle below, mutation-tested).
+	//   - RANDOM (activity deterministic, placement probabilistic): the post-pong ACK count below is
+	//     STREAM-ORDER evidence that the work loop was really committing during the kill windows — a
+	//     frozen loop yields exactly zero, every run, however the scheduler behaves. WHERE each kill
+	//     lands within that live commit stream remains probabilistic; that placement is this mode's
+	//     supplementary value (a crash inside a two-commit gap), not its guarantee.
+	//
+	// The >=1 bound is deliberately the weakest deterministic one: it asserts "the loop was running",
+	// not a throughput — a real producer writes hundreds of post-pong ACKs across the ~300ms of
+	// combined windows, and a host too slow to commit ONCE in 300ms would already be tripping the
+	// suite's 5s/20s liveness timeouts (codex: any real throughput floor either flakes or proves
+	// nothing; stream order is neither racy nor a floor).
+	if postPong < 1 {
+		t.Fatalf("no commit ACK appeared after the liveness echo in ANY random-mode window: the "+
+			"producer's work loop was not running when the kills landed, so the crashes hit an idle "+
+			"process, not live commit traffic (post-pong acks=%d)", postPong)
+	}
 	if len(acked) == 0 {
 		t.Fatal("the producer acknowledged no commits at all — the harness is not exercising the code")
 	}
-	t.Logf("producer acknowledged %d commits across 8 crashes (coordinated mode guarantees >=160; the "+
-		"rest is random-mode probabilistic coverage)", len(acked))
+	t.Logf("producer acknowledged %d commits across 8 crashes; %d were stream-order-provably made "+
+		"during the random kill windows", len(acked), postPong)
 
 	ctx := context.Background()
 	e := openWithRetry(ctx, db)
@@ -357,7 +384,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 		}
 	}()
 
-	_ = killLoop(t, db, "locker", readyMarker, false, 6) // liveness via challenge/response
+	_, _ = killLoop(t, db, "locker", readyMarker, false, 6) // liveness via challenge/response
 
 	// Reopen and check the recovery contract.
 	e := openWithRetry(ctx, db)
@@ -426,17 +453,26 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // worker that panics, trips the race detector, exits on its own, or dies from some other signal is a
 // hard failure, never a crash cycle counted as success.
 //
-// Once the worker reaches killOn, the harness sends ONE liveness challenge and waits for the worker
-// to echo it (respond() answers from an independent stdin goroutine) — proof the worker reached its
-// kill point alive. That check runs BEFORE the timer window, so it does not perturb the kill: for the
-// random producer the window then elapses and the kill fires purely on the timer, landing at an
-// unsynchronised point that can fall in a split-commit gap. The challenge proves LIVENESS, not that
-// the work loop is committing — that (non-vacuity) is checked in aggregate by the caller, decoupled
-// from timing, because gating it here would either flake on a slow -race host or prove nothing
-// (round-8, codex). A self-kill before the marker gives no marker; one at the marker gives no echo.
-func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) map[string]bool {
+// Once the worker reaches killOn, the harness sends ONE liveness challenge — an UNPREDICTABLE
+// random nonce, so the pong cannot be pre-printed (round-8) — and waits for the worker to echo it
+// (respond() answers from an independent stdin goroutine): proof the worker reached its kill point
+// alive. That check runs BEFORE the timer window, so it does not perturb the kill: the window then
+// elapses and the kill fires purely on the timer, landing at an unsynchronised point that can fall
+// in a split-commit gap.
+//
+// The challenge proves LIVENESS, not that the work loop is committing. That second fact is measured
+// by STREAM ORDER, which no scheduler can fake or hide: the pipe is a FIFO, so an ACK line that
+// appears AFTER the pong in the output stream was written after the worker answered the challenge —
+// i.e. during the kill window. killLoop returns how many such post-pong ACKs arrived across all
+// cycles; the caller asserts on it. A work loop frozen at the marker writes exactly ZERO post-pong
+// ACKs, deterministically, no matter how the reader is scheduled (round-8: a wall-clock activity
+// check was either racy or a throughput floor; stream position is neither).
+//
+// A self-kill before the marker gives no marker; one at the marker gives no echo.
+func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) (map[string]bool, int) {
 	t.Helper()
 	acked := map[string]bool{}
+	postPongAcks := 0
 	for i := 0; i < cycles; i++ {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestCrashWorkerEntrypoint$", "-test.v=false")
 		cmd.Env = append(os.Environ(), roleEnv+"="+role, dbEnv+"="+db,
@@ -467,8 +503,11 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 		signal := make(chan struct{})
 		drained := make(chan struct{})
 		pong := make(chan string, 16) // the worker's echoes of our liveness challenges
+		nonce := randomNonce(t)       // unguessable — a pong carrying it cannot pre-date the challenge
 		var mu sync.Mutex
 		var out strings.Builder
+		ackN := 0       // ACK lines seen this cycle, in stream order
+		ackAtPong := -1 // ackN at the moment OUR pong appeared in the stream (-1: not yet)
 		go func() {
 			sc := bufio.NewScanner(pr)
 			signalled := false
@@ -477,13 +516,19 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				mu.Lock()
 				out.WriteString(line)
 				out.WriteByte('\n')
-				if nonce, isAck := parseAck(line); isAck {
-					acked[nonce] = true // this nonce was durably committed before the crash
+				if n, isAck := parseAck(line); isAck {
+					acked[n] = true // this nonce was durably committed before the crash
+					ackN++
+				}
+				if line == pongPrefix+" "+nonce && ackAtPong < 0 {
+					// Stream position of the echo: every ACK counted past this point was written
+					// AFTER the worker answered the challenge — pipe FIFO order, immune to reader lag.
+					ackAtPong = ackN
 				}
 				mu.Unlock()
 				if echo, ok := strings.CutPrefix(line, pongPrefix+" "); ok {
 					select {
-					case pong <- echo: // "<challenge> <commitCount>"
+					case pong <- echo:
 					default:
 					}
 				}
@@ -523,7 +568,6 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 		// alive when checked, not at the exact instant of the kill; a self-kill in the window below is
 		// the documented residual. A realistic fixed-point self-kill still stops the echoes / EOFs the
 		// pipe and is caught.
-		nonce := fmt.Sprintf("PING-%d", i)
 		if _, err := cw.WriteString(nonce + "\n"); err != nil {
 			_ = cmd.Wait()
 			<-drained
@@ -562,6 +606,12 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 		_ = cmd.Wait() // reap it, so its advisory file lock is released before the next open
 		<-drained      // all of the worker's output is now in `out`
 
+		mu.Lock()
+		if ackAtPong >= 0 {
+			postPongAcks += ackN - ackAtPong // commits provably made AFTER the liveness echo
+		}
+		mu.Unlock()
+
 		body := snapshot(&mu, &out)
 		switch {
 		case strings.Contains(body, "CRASH-WORKER-FAIL"):
@@ -577,7 +627,7 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				i, cmd.ProcessState, body)
 		}
 	}
-	return acked
+	return acked, postPongAcks
 }
 
 // openWithRetry opens the embedded engine, retrying briefly on ErrDBLocked: a just-killed worker's
