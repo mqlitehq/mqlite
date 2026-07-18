@@ -127,7 +127,15 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		batch = r.cfg.concurrency
 	}
 	sem := make(chan struct{}, r.cfg.concurrency)
-	fatal := make(chan error, 1)
+	// fatalRec carries the first permanent error PLUS the shutdown ordering at the moment it was
+	// captured. The ordering must be recorded here, at capture, not read later in done(): by the
+	// time done() runs, the caller may have cancelled AFTER a genuine engine-close failure was
+	// recorded, and a late ctx check would misfile that failure as "just cancellation" (codex).
+	type fatalRec struct {
+		err         error
+		afterCancel bool // the caller had ALREADY cancelled when this error was captured
+	}
+	fatal := make(chan fatalRec, 1)
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -135,7 +143,7 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 	// fail records the first permanent error and stops the loop + all workers.
 	fail := func(err error) {
 		select {
-		case fatal <- err:
+		case fatal <- fatalRec{err: err, afterCancel: ctx.Err() != nil}:
 		default:
 		}
 		cancel()
@@ -145,16 +153,18 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 	done := func() error {
 		wg.Wait()
 		select {
-		case err := <-fatal:
-			// Graceful-shutdown ordering (round-8, codex): when the CALLER cancelled Run and then
-			// closed the engine, an in-flight worker's cleanup settle hits the closed engine and
-			// records ErrClosed — but the caller's story is "I cancelled", and Run must say so, not
-			// surface an artifact of its own shutdown. ErrClosed stays fatal for a receiver whose
-			// context is live (the engine was closed under it externally).
-			if ctx.Err() != nil && errors.Is(err, ErrClosed) {
+		case rec := <-fatal:
+			// Graceful-shutdown ordering (round-8, codex): when the CALLER cancelled Run first and
+			// the engine was closed afterwards, an in-flight worker's cleanup settle hits the closed
+			// engine and records ErrClosed — an artifact of the receiver's own shutdown, not
+			// information, so Run reports the caller's own context.Canceled. But an ErrClosed
+			// captured while the context was LIVE (the engine was closed under a running receiver)
+			// keeps precedence even if the caller cancels later, which is why the ordering is part
+			// of the record, not a late ctx check.
+			if rec.afterCancel && errors.Is(rec.err, ErrClosed) {
 				return ctx.Err()
 			}
-			return err
+			return rec.err
 		default:
 			return ctx.Err()
 		}
