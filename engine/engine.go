@@ -161,8 +161,12 @@ func (e *Engine) Close() error {
 		// an external Send/Tx arriving during it must fail fast with ErrClosed, not be admitted and
 		// left to keep Close waiting (round-8 P2). db.close() then waits for the ops already in flight.
 		e.db.beginClosing()
-		e.bgWG.Wait()
+		// Wake the long-poll waiters NOW, not after the background drain: a Receive parked on the
+		// notifier holds no admission (deliberately — Close must not wait 20s for it), so nothing
+		// else would ever wake it and it would sleep out its full window against a closed engine
+		// (round-8).
 		close(e.closed)
+		e.bgWG.Wait()
 		err = e.db.close()
 	})
 	return err

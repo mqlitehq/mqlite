@@ -1064,3 +1064,52 @@ func TestRemoteQueryRowsHoldsAdmissionThroughScan(t *testing.T) {
 	}
 	<-waitDone // now the wait completes
 }
+
+// TestCloseWakesLongPollWaiters pins the round-8 follow-up: a Receive long-polling an EMPTY queue
+// parks on the notifier, outside the admission gate (deliberately — Close must not wait 20s for it).
+// Nothing else ever wakes that waiter, so before the fix Close() returned while the Receive slept
+// out its full window — up to 20 seconds — against an engine that was already torn down (the
+// reviewer's race probe reproduced 10/10). Close now closes e.closed, and the long-poll select has
+// an arm for it: every parked waiter returns ErrClosed promptly.
+func TestCloseWakesLongPollWaiters(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "q", QueueConfig{})
+
+	const waiters = 4
+	done := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			// A 10s long-poll on an empty queue: with the bug, this outlives Close by ~10s.
+			msgs, rerr := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, WaitMs: 10_000})
+			if rerr == nil && len(msgs) > 0 {
+				done <- fmt.Errorf("received %d messages from an empty queue", len(msgs))
+				return
+			}
+			done <- rerr
+		}()
+	}
+	time.Sleep(150 * time.Millisecond) // let the waiters park on the notifier
+
+	start := time.Now()
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	for i := 0; i < waiters; i++ {
+		select {
+		case rerr := <-done:
+			// ErrClosed is the woken-by-Close path. A nil (empty result) is tolerated only if the
+			// waiter returned BEFORE Close got to it — but never late.
+			if rerr != nil && !errors.Is(rerr, ErrClosed) {
+				t.Fatalf("waiter returned %v, want ErrClosed", rerr)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("a long-poll waiter was still parked %.1fs after Close returned — Close must wake "+
+				"every waiter, not leave it to sleep out its window against a torn-down engine",
+				time.Since(start).Seconds())
+		}
+	}
+}

@@ -803,3 +803,37 @@ func TestEmbeddedErrClosedThroughSDK(t *testing.T) {
 		t.Fatalf("an operation on a closed embedded engine must be mqlite.ErrClosed, got %v", err)
 	}
 }
+
+// TestEmbeddedCloseStopsRunPromptly is the end-to-end twin of the engine-level long-poll-wake test
+// (round-8): a Receiver.Run long-polling an EMPTY embedded queue must return promptly when another
+// goroutine calls Close — not sleep out its ~20s poll window against a torn-down engine. The
+// fake-source receiver test cannot see this; only a real engine with a real parked waiter can.
+func TestEmbeddedCloseStopsRunPromptly(t *testing.T) {
+	ctx := context.Background()
+	e, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- e.Receiver("q").Run(ctx, func(context.Context, *mqlite.Message) error { return nil })
+	}()
+	time.Sleep(150 * time.Millisecond) // let Run park in its long-poll
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, mqlite.ErrClosed) {
+			t.Fatalf("Run returned %v, want mqlite.ErrClosed", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Receiver.Run was still blocked 3s after Close returned — the long-poll waiter was " +
+			"not woken (it would sleep out its full poll window)")
+	}
+}
