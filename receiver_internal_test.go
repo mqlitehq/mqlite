@@ -369,3 +369,23 @@ func TestErrClosedCapturedBeforeCancelKeepsPrecedence(t *testing.T) {
 			"cancellation; got %v", err)
 	}
 }
+
+// The tightest version of the ordering hole (round-8, codex): between OBSERVING a permanent
+// ErrClosed and recording it, Run used to pass through notify — and the user's error handler may
+// itself cancel the context. Sampling the ordering inside fail() then read "after cancel" and Run
+// reported context.Canceled for an engine-close that provably came first. The ordering is now
+// sampled at observation, before notify, so a cancellation FROM the error handler cannot rewrite
+// it. Fully deterministic: the cancel happens synchronously inside the handler.
+func TestErrorHandlerCancelDoesNotRewriteOrdering(t *testing.T) {
+	f := &fakeSource{recvErr: ErrClosed} // every receive: the engine is closed, context live
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := newReceiver(f, "q", []ReceiverOption{
+		WithErrorHandler(func(error) { cancel() }), // the observer reacts by cancelling Run
+	}).Run(ctx, func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("ErrClosed was observed while the context was live; a cancellation issued BY the "+
+			"error handler must not rewrite that ordering. got %v", err)
+	}
+}
