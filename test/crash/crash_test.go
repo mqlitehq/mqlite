@@ -279,27 +279,37 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 	//   - COORDINATED (deterministic): four crashes each land, by construction, with a transaction
 	//     held open between its two writes — a torn callback / split-into-two-transactions outbox is
 	//     caught every run (the atomicity oracle below, mutation-tested).
-	//   - RANDOM (activity deterministic, placement probabilistic): the post-pong ACK count below is
-	//     STREAM-ORDER evidence that the work loop was really committing during the kill windows — a
-	//     frozen loop yields exactly zero, every run, however the scheduler behaves. WHERE each kill
-	//     lands within that live commit stream remains probabilistic; that placement is this mode's
-	//     supplementary value (a crash inside a two-commit gap), not its guarantee.
+	//   - RANDOM (activity deterministic for AT LEAST ONE window; placement probabilistic): the
+	//     discounted post-pong ACK count below is STREAM-ORDER evidence that the work loop really
+	//     committed after the challenge in at least one kill window (in practice: all of them — the
+	//     per-cycle counts are logged). WHERE each kill lands within that live commit stream remains
+	//     probabilistic; that placement is this mode's supplementary value, not its guarantee.
 	//
-	// The >=1 bound is deliberately the weakest deterministic one: it asserts "the loop was running",
-	// not a throughput — a real producer writes hundreds of post-pong ACKs across the ~300ms of
-	// combined windows, and a host too slow to commit ONCE in 300ms would already be tripping the
-	// suite's 5s/20s liveness timeouts (codex: any real throughput floor either flakes or proves
-	// nothing; stream order is neither racy nor a floor).
-	if postPong < 1 {
-		t.Fatalf("no commit ACK appeared after the liveness echo in ANY random-mode window: the "+
-			"producer's work loop was not running when the kills landed, so the crashes hit an idle "+
-			"process, not live commit traffic (post-pong acks=%d)", postPong)
+	// The discount: the commit loop is sequential, so when the responder answers the challenge, at
+	// most ONE commit can be "done but its ACK not yet printed" — that straggler's ACK lands after
+	// the pong although its commit may pre-date the challenge (codex). Discounting one ACK per cycle
+	// removes exactly that ambiguity: everything counted below was provably committed AFTER the
+	// challenge. A frozen loop contributes zero; even the adversarial freeze-after-one-straggler
+	// contributes zero. A real producer contributes hundreds (measured ~70 per window under -race),
+	// so the >=1 aggregate bound is not a practical throughput floor — a host too slow to commit
+	// twice in ANY of four 30-120ms windows is already tripping the suite's liveness timeouts.
+	fresh := 0
+	for _, c := range postPong {
+		if c > 1 {
+			fresh += c - 1
+		}
+	}
+	if fresh < 1 {
+		t.Fatalf("no commit was provably made after the liveness challenge in ANY random-mode window "+
+			"(per-cycle post-pong acks %v, one discounted each as a possible pre-challenge straggler): "+
+			"the producer's work loop was not running when the kills landed — the crashes hit an idle "+
+			"process, not live commit traffic", postPong)
 	}
 	if len(acked) == 0 {
 		t.Fatal("the producer acknowledged no commits at all — the harness is not exercising the code")
 	}
-	t.Logf("producer acknowledged %d commits across 8 crashes; %d were stream-order-provably made "+
-		"during the random kill windows", len(acked), postPong)
+	t.Logf("producer acknowledged %d commits across 8 crashes; per-window post-challenge commit "+
+		"evidence (discounted): %v", len(acked), postPong)
 
 	ctx := context.Background()
 	e := openWithRetry(ctx, db)
@@ -463,16 +473,19 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // The challenge proves LIVENESS, not that the work loop is committing. That second fact is measured
 // by STREAM ORDER, which no scheduler can fake or hide: the pipe is a FIFO, so an ACK line that
 // appears AFTER the pong in the output stream was written after the worker answered the challenge —
-// i.e. during the kill window. killLoop returns how many such post-pong ACKs arrived across all
-// cycles; the caller asserts on it. A work loop frozen at the marker writes exactly ZERO post-pong
-// ACKs, deterministically, no matter how the reader is scheduled (round-8: a wall-clock activity
-// check was either racy or a throughput floor; stream position is neither).
+// i.e. during the kill window. killLoop returns the PER-CYCLE counts of such post-pong ACKs; the
+// caller discounts one per cycle (the commit loop is sequential, so at most ONE commit can be "done
+// but not yet printed" when the challenge is answered — that single straggler's commit may pre-date
+// the challenge) and asserts on the rest, each of which was provably committed after it. A work
+// loop frozen at the marker contributes zero, deterministically, however the reader is scheduled
+// (round-8: a wall-clock activity check was either racy or a throughput floor; stream position is
+// neither — codex).
 //
 // A self-kill before the marker gives no marker; one at the marker gives no echo.
-func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) (map[string]bool, int) {
+func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) (map[string]bool, []int) {
 	t.Helper()
 	acked := map[string]bool{}
-	postPongAcks := 0
+	postPongAcks := make([]int, 0, cycles)
 	for i := 0; i < cycles; i++ {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestCrashWorkerEntrypoint$", "-test.v=false")
 		cmd.Env = append(os.Environ(), roleEnv+"="+role, dbEnv+"="+db,
@@ -608,7 +621,9 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 
 		mu.Lock()
 		if ackAtPong >= 0 {
-			postPongAcks += ackN - ackAtPong // commits provably made AFTER the liveness echo
+			postPongAcks = append(postPongAcks, ackN-ackAtPong)
+		} else {
+			postPongAcks = append(postPongAcks, 0)
 		}
 		mu.Unlock()
 
