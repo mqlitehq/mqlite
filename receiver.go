@@ -146,6 +146,14 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		wg.Wait()
 		select {
 		case err := <-fatal:
+			// Graceful-shutdown ordering (round-8, codex): when the CALLER cancelled Run and then
+			// closed the engine, an in-flight worker's cleanup settle hits the closed engine and
+			// records ErrClosed — but the caller's story is "I cancelled", and Run must say so, not
+			// surface an artifact of its own shutdown. ErrClosed stays fatal for a receiver whose
+			// context is live (the engine was closed under it externally).
+			if ctx.Err() != nil && errors.Is(err, ErrClosed) {
+				return ctx.Err()
+			}
 			return err
 		default:
 			return ctx.Err()

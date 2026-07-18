@@ -837,3 +837,52 @@ func TestEmbeddedCloseStopsRunPromptly(t *testing.T) {
 			"not woken (it would sleep out its full poll window)")
 	}
 }
+
+// TestRunCancelledThenClosedReturnsCanceled pins the graceful-shutdown ordering (round-8, codex):
+// the caller cancels Run's context while a handler is active, then closes the engine. The worker's
+// cleanup settle hits the closed engine and reports ErrClosed — an artifact of the shutdown itself,
+// which must NOT displace the caller's own story: Run returns context.Canceled. (ErrClosed stays the
+// answer when the engine is closed under a receiver whose context is live —
+// TestEmbeddedCloseStopsRunPromptly.)
+func TestRunCancelledThenClosedReturnsCanceled(t *testing.T) {
+	ctx := context.Background()
+	e, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+
+	rctx, cancel := context.WithCancel(ctx)
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- e.Receiver("q").Run(rctx, func(context.Context, *mqlite.Message) error {
+			close(inHandler)
+			<-release // hold the handler until cancel AND Close have both happened
+			return nil
+		})
+	}()
+	<-inHandler
+
+	cancel()                          // 1. the caller cancels…
+	if err := e.Close(); err != nil { // 2. …then tears the engine down
+		t.Fatalf("close: %v", err)
+	}
+	close(release) // 3. the handler finishes; its cleanup settle hits the closed engine
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run after cancel-then-Close returned %v — the caller cancelled first, so Run "+
+				"must report context.Canceled, not an ErrClosed artifact of its own shutdown", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancel + Close + handler completion")
+	}
+}
