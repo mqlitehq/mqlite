@@ -91,7 +91,11 @@ func isPermanent(err error) bool {
 		// routes only part of the API. Retrying cannot make the route appear, so a receiver that
 		// treated this as transient would spin forever instead of reporting the incompatibility
 		// (MQLITE-97; this sentinel used to arrive as ErrNotFound, which WAS classified here).
-		errors.Is(err, ErrUnsupported)
+		errors.Is(err, ErrUnsupported) ||
+		// The embedded engine has been closed (another goroutine called Embedded.Close). No amount
+		// of retrying brings it back, so Run must return instead of hammering the error handler
+		// every 500ms forever (round-8).
+		errors.Is(err, ErrClosed)
 }
 
 // reserve blocks until at least one worker slot is free (ctx-aware), then greedily takes up
@@ -123,26 +127,50 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		batch = r.cfg.concurrency
 	}
 	sem := make(chan struct{}, r.cfg.concurrency)
-	fatal := make(chan error, 1)
+	// fatalRec carries the first permanent error PLUS the shutdown ordering at the moment it was
+	// captured. The ordering must be recorded here, at capture, not read later in done(): by the
+	// time done() runs, the caller may have cancelled AFTER a genuine engine-close failure was
+	// recorded, and a late ctx check would misfile that failure as "just cancellation" (codex).
+	type fatalRec struct {
+		err         error
+		afterCancel bool // the caller had ALREADY cancelled when this error was captured
+	}
+	fatal := make(chan fatalRec, 1)
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
 
-	// fail records the first permanent error and stops the loop + all workers.
-	fail := func(err error) {
+	// fail records the first permanent error and stops the loop + all workers. afterCancel is
+	// SAMPLED BY THE CALLER at the moment the error was first observed — not here. Between
+	// observation and this call sit the transient retry and r.notify (whose user callback may
+	// itself cancel the context), so sampling here would let a later cancellation rewrite the
+	// ordering of an earlier ErrClosed (codex).
+	fail := func(err error, afterCancel bool) {
 		select {
-		case fatal <- err:
+		case fatal <- fatalRec{err: err, afterCancel: afterCancel}:
 		default:
 		}
 		cancel()
 	}
+	// cancelled samples the CALLER's context — the ordering fact workers record with a fatal.
+	cancelled := func() bool { return ctx.Err() != nil }
 	// done drains in-flight workers and returns the fatal error if one was recorded, else
 	// the context error (normal cancellation).
 	done := func() error {
 		wg.Wait()
 		select {
-		case err := <-fatal:
-			return err
+		case rec := <-fatal:
+			// Graceful-shutdown ordering (round-8, codex): when the CALLER cancelled Run first and
+			// the engine was closed afterwards, an in-flight worker's cleanup settle hits the closed
+			// engine and records ErrClosed — an artifact of the receiver's own shutdown, not
+			// information, so Run reports the caller's own context.Canceled. But an ErrClosed
+			// captured while the context was LIVE (the engine was closed under a running receiver)
+			// keeps precedence even if the caller cancels later, which is why the ordering is part
+			// of the record, not a late ctx check.
+			if rec.afterCancel && errors.Is(rec.err, ErrClosed) {
+				return ctx.Err()
+			}
+			return rec.err
 		default:
 			return ctx.Err()
 		}
@@ -164,8 +192,15 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		// claiming new messages.
 		attemptID := newAttemptID()
 		msgs, err := r.src.receiveOne(rctx, r.queue, n, 20000, engine.PeekLock, attemptID) // 20s long-poll
-		if err != nil && rctx.Err() == nil {
+		// Sample the shutdown ordering the moment the error is observed — before the retry and
+		// before notify, either of which can span a caller cancellation (codex).
+		errAfterCancel := err != nil && cancelled()
+		if err != nil && !isPermanent(err) && rctx.Err() == nil {
+			// ONE transient retry, same attempt id (a lost response replays the same batch). A
+			// permanent error is, by definition, not helped by retrying — and retrying it opened
+			// a window in which a later cancellation could displace the error's ordering.
 			msgs, err = r.src.receiveOne(rctx, r.queue, n, 20000, engine.PeekLock, attemptID)
+			errAfterCancel = err != nil && cancelled()
 		}
 		if err != nil {
 			// Release ALL reserved slots and drop any returned messages (their locks expire
@@ -174,14 +209,15 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			for i := 0; i < n; i++ {
 				<-sem
 			}
+			if isPermanent(err) {
+				r.notify(err)
+				fail(err, errAfterCancel)
+				return done()
+			}
 			if rctx.Err() != nil {
 				return done()
 			}
 			r.notify(err)
-			if isPermanent(err) {
-				fail(err)
-				return done()
-			}
 			select {
 			case <-rctx.Done():
 				return done()
@@ -198,17 +234,17 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			go func(m *Message) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				r.process(rctx, m, handler, fail)
+				r.process(rctx, m, handler, cancelled, fail)
 			}(m)
 		}
 	}
 }
 
-func (r *Receiver) process(ctx context.Context, m *Message, handler func(context.Context, *Message) error, fail func(error)) {
+func (r *Receiver) process(ctx context.Context, m *Message, handler func(context.Context, *Message) error, cancelled func() bool, fail func(error, bool)) {
 	if r.cfg.autoRenew {
 		rctx, cancel := context.WithCancel(ctx)
 		defer cancel()
-		go r.renewLoop(rctx, m, fail)
+		go r.renewLoop(rctx, m, cancelled, fail)
 	}
 	herr := handler(ctx, m)
 
@@ -216,26 +252,29 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if herr != nil {
-		r.settleErr(m.Abandon(sctx), fail)
+		r.settleErr(m.Abandon(sctx), cancelled, fail)
 		return
 	}
-	r.settleErr(m.Complete(sctx), fail)
+	r.settleErr(m.Complete(sctx), cancelled, fail)
 }
 
 // settleErr surfaces a settle/renew failure: an expected ErrLockLost (the message was
 // redelivered) or a transient error goes to the observer only; a permanent one (bad token,
 // missing queue) is also fatal and stops Run.
-func (r *Receiver) settleErr(err error, fail func(error)) {
+func (r *Receiver) settleErr(err error, cancelled func() bool, fail func(error, bool)) {
 	if err == nil {
 		return
 	}
+	// Ordering is sampled at OBSERVATION, before notify: the user's error handler may cancel the
+	// context, and that later cancellation must not rewrite whether this error preceded it (codex).
+	afterCancel := cancelled()
 	r.notify(err)
 	if isPermanent(err) {
-		fail(err)
+		fail(err, afterCancel)
 	}
 }
 
-func (r *Receiver) renewLoop(ctx context.Context, m *Message, fail func(error)) {
+func (r *Receiver) renewLoop(ctx context.Context, m *Message, cancelled func() bool, fail func(error, bool)) {
 	interval := 10 * time.Second
 	if d := time.Until(m.LockedUntil); d > 0 {
 		interval = d / 2
@@ -252,7 +291,7 @@ func (r *Receiver) renewLoop(ctx context.Context, m *Message, fail func(error)) 
 		case <-t.C:
 			if err := m.Renew(ctx); err != nil {
 				if ctx.Err() == nil { // ignore shutdown; surface a real renew failure
-					r.settleErr(err, fail)
+					r.settleErr(err, cancelled, fail)
 				}
 				return
 			}

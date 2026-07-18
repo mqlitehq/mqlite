@@ -38,14 +38,15 @@ func TestOlderThanMs(t *testing.T) {
 // fakeSource is a receiveSource that records the attempt id of every receiveOne
 // call and can fail the first failN calls, to exercise the Receiver's same-id retry.
 type fakeSource struct {
-	mu          sync.Mutex
-	attempts    []string
-	calls       int
-	failN       int
-	batch       []*Message
-	recvErr     error // if set, receiveOne always returns this (permanent-error test)
-	completeErr error // if set, complete returns this (settle-error test)
-	unlimited   bool  // if set, every receiveOne returns a fresh single-message batch
+	mu                sync.Mutex
+	attempts          []string
+	calls             int
+	failN             int
+	batch             []*Message
+	recvErr           error // if set, receiveOne always returns this (permanent-error test)
+	recvErrAfterBatch error // if set, the receive AFTER the batch returns this instead of quiescing
+	completeErr       error // if set, complete returns this (settle-error test)
+	unlimited         bool  // if set, every receiveOne returns a fresh single-message batch
 }
 
 func (f *fakeSource) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
@@ -63,6 +64,9 @@ func (f *fakeSource) receiveOne(ctx context.Context, queue string, max int, wait
 		return nil, errors.New("simulated transient receive error")
 	case n == f.failN+1:
 		return f.batch, nil
+	case n >= f.failN+2 && f.recvErrAfterBatch != nil:
+		// every receive after the batch — including the loop's one transient retry — fails
+		return nil, f.recvErrAfterBatch
 	default:
 		<-ctx.Done() // quiesce after the batch is delivered; no busy-spin
 		return nil, ctx.Err()
@@ -311,5 +315,77 @@ func TestUnsupportedIsPermanent(t *testing.T) {
 	// Sanity: a transient failure is still transient.
 	if isPermanent(errors.New("connection reset")) {
 		t.Error("a transient error must not stop the loop")
+	}
+}
+
+// A closed embedded engine surfaces ErrClosed from Receive. Run must treat it as permanent and
+// return, not retry the error handler every 500ms forever after Embedded.Close (round-8).
+func TestReceiverReturnsOnEngineClosed(t *testing.T) {
+	if !isPermanent(ErrClosed) {
+		t.Fatal("ErrClosed must be classified permanent so Run stops on engine shutdown")
+	}
+	f := &fakeSource{recvErr: ErrClosed}
+	var observed error
+	r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(e error) { observed = e })})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := r.Run(ctx, func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("Run must return ErrClosed once the engine is closed, got %v", err)
+	}
+	if !errors.Is(observed, ErrClosed) {
+		t.Fatalf("error handler must see ErrClosed, got %v", observed)
+	}
+}
+
+// The other side of the shutdown-ordering coin (round-8, codex): an ErrClosed captured while the
+// Run context was LIVE — the engine was closed under a running receiver — must keep precedence even
+// if the caller cancels AFTERWARDS, while a worker still holds wg.Wait open. A late ctx check in
+// done() would misfile that genuine engine-close as "just cancellation"; the ordering is therefore
+// recorded at capture time, and this test pins it.
+//
+// The sequencing is deterministic, no sleeps: receive #1 delivers a message (the handler parks on
+// its own ctx); receive #2 returns ErrClosed → fail() captures it with the caller context LIVE and
+// cancels the run context — which is the handler's own ctx, so the handler wakes ONLY after the
+// capture is complete, cancels the caller, and returns. done() then reads a record that says
+// "captured before cancellation" and must report ErrClosed.
+func TestErrClosedCapturedBeforeCancelKeepsPrecedence(t *testing.T) {
+	f := &fakeSource{
+		batch:             []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q"}},
+		recvErrAfterBatch: ErrClosed,
+	}
+	f.batch[0].s = f
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := newReceiver(f, "q", []ReceiverOption{WithConcurrency(2)}).
+		Run(ctx, func(hctx context.Context, _ *Message) error {
+			<-hctx.Done() // wakes when fail() cancels the run ctx — strictly AFTER the capture
+			cancel()      // NOW the caller cancels — after the ErrClosed was already recorded
+			return nil
+		})
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("an ErrClosed captured while the context was live must keep precedence over a LATER "+
+			"cancellation; got %v", err)
+	}
+}
+
+// The tightest version of the ordering hole (round-8, codex): between OBSERVING a permanent
+// ErrClosed and recording it, Run used to pass through notify — and the user's error handler may
+// itself cancel the context. Sampling the ordering inside fail() then read "after cancel" and Run
+// reported context.Canceled for an engine-close that provably came first. The ordering is now
+// sampled at observation, before notify, so a cancellation FROM the error handler cannot rewrite
+// it. Fully deterministic: the cancel happens synchronously inside the handler.
+func TestErrorHandlerCancelDoesNotRewriteOrdering(t *testing.T) {
+	f := &fakeSource{recvErr: ErrClosed} // every receive: the engine is closed, context live
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := newReceiver(f, "q", []ReceiverOption{
+		WithErrorHandler(func(error) { cancel() }), // the observer reacts by cancelling Run
+	}).Run(ctx, func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("ErrClosed was observed while the context was live; a cancellation issued BY the "+
+			"error handler must not rewrite that ordering. got %v", err)
 	}
 }

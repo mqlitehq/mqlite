@@ -229,6 +229,9 @@ func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Messag
 // counter in memory, an HTTP call — none of those roll back with the transaction, and a replay will
 // repeat them (round-4 §5.2). Local file and :memory: stores never retry, so fn runs at most once
 // there.
+//
+// fn MUST NOT call Close: Close waits for the open transaction to finish before tearing the engine
+// down, and fn cannot finish until it returns, so it would deadlock. Close from outside the callback.
 func (e *Embedded) Tx(ctx context.Context, fn func(*engine.EngineTx) error) error {
 	return e.eng.Tx(ctx, fn)
 }

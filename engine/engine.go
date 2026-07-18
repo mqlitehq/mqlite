@@ -143,14 +143,30 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	return e, nil
 }
 
+// Close stops the background workers and shuts the store down. It refuses new operations immediately
+// (they get ErrClosed) and then waits for the operations already in flight — a statement executing, a
+// transaction committing — to finish before releasing the single-writer file lock, so the lock is
+// never dropped out from under a live write.
+//
+// Because it waits for in-flight work, Close MUST NOT be called from inside an operation it would
+// wait for — in particular, not from within an Engine.Tx callback (see Tx). Doing so deadlocks.
 func (e *Engine) Close() error {
 	var err error
 	e.closeOnce.Do(func() {
 		if e.bgCancel != nil {
 			e.bgCancel()
 		}
-		e.bgWG.Wait()
+		// Shut the admission gate BEFORE draining the background workers: that drain can be slow (a
+		// maintenance pass may be inside an uninterruptible vacuum or a large retention delete), and
+		// an external Send/Tx arriving during it must fail fast with ErrClosed, not be admitted and
+		// left to keep Close waiting (round-8 P2). db.close() then waits for the ops already in flight.
+		e.db.beginClosing()
+		// Wake the long-poll waiters NOW, not after the background drain: a Receive parked on the
+		// notifier holds no admission (deliberately — Close must not wait 20s for it), so nothing
+		// else would ever wake it and it would sleep out its full window against a closed engine
+		// (round-8).
 		close(e.closed)
+		e.bgWG.Wait()
 		err = e.db.close()
 	})
 	return err

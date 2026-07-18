@@ -843,3 +843,273 @@ func TestRemoteTxClosureCanBeReplayed(t *testing.T) {
 		t.Errorf("a local transaction ran its closure %d times, want exactly 1 — the outbox depends on it", runs)
 	}
 }
+
+// TestCloseWaitsForInFlightWritesBeforeReleasingTheLock pins the round-8 P1: Close must not release
+// the single-writer file lock — nor let its transaction be abandoned open — while a write is still
+// in flight. Before the fix, db.close() called sql.DB.Close() (which does NOT wait for a checked-out
+// connection) and then dropped the advisory lock, so a SECOND opener could take the file and run
+// crash recovery while the first writer's transaction was still committing.
+func TestCloseWaitsForInFlightWritesBeforeReleasingTheLock(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	inTx := make(chan struct{})
+	txDone := make(chan error, 1)
+
+	// A transaction that has begun and is holding the single writer, parked until we release it.
+	go func() {
+		txDone <- e.inTx(ctx, func(ec context.Context, tx *txn) error {
+			if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('k','v')`); err != nil {
+				return err
+			}
+			close(inTx)
+			<-release // hold the transaction open
+			return nil
+		})
+	}()
+
+	<-inTx // the transaction is open and holds the writer
+
+	// Close in the background: it MUST block until the transaction finishes.
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+
+	// Deterministically wait until Close has begun (flipped closing, now blocked on the in-flight
+	// transaction), then confirm it has NOT returned — no scheduler-timing guess (round-8, codex).
+	awaitClosing(t, e)
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a transaction was still open — it released the writer/lock early")
+	default:
+		// Good: Close has begun but is blocked on the in-flight transaction.
+	}
+
+	// While Close is blocked, the file lock is still held, so a second open must be refused.
+	if e2, err := Open(ctx, Options{DB: dsn, DisableBackground: true}); !errors.Is(err, ErrDBLocked) {
+		if e2 != nil {
+			_ = e2.Close()
+		}
+		t.Fatalf("a second open during an in-flight-then-closing engine must get ErrDBLocked, got %v", err)
+	}
+
+	close(release) // let the transaction commit and return
+
+	if err := <-txDone; err != nil {
+		t.Fatalf("transaction: %v", err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the transaction finished")
+	}
+
+	// Now — and only now — the file can be reopened, and the write is durably there.
+	e2, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+	if err != nil {
+		t.Fatalf("reopen after a clean close: %v", err)
+	}
+	defer e2.Close()
+	var got string
+	if err := e2.db.queryRowScan(ctx, []any{&got}, `SELECT value FROM meta WHERE key='k'`); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != "v" {
+		t.Fatalf("the committed write is missing after reopen: got %q", got)
+	}
+
+	// And once closed, further operations fail fast rather than racing a torn-down store.
+	if err := e.Complete(ctx, "q", 1, "tok"); !errors.Is(err, ErrClosed) && !errors.Is(err, ErrLockLost) {
+		t.Fatalf("an operation after Close should be refused, got %v", err)
+	}
+}
+
+// awaitClosing blocks until db.close has flipped the closing flag — a deterministic substitute for
+// sleeping, so a slow scheduler cannot make the close-gate tests race (round-8, codex).
+func awaitClosing(t *testing.T, e *Engine) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		e.db.closeMu.Lock()
+		closing := e.db.closing
+		e.db.closeMu.Unlock()
+		if closing {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Close never reached its waiting state (closing flag not set)")
+}
+
+// TestOperationsFailFastWhileClosing pins the round-8 P2: a new operation that arrives while Close is
+// waiting for an in-flight write must FAIL FAST with ErrClosed, not block. An RWMutex gate would give
+// the pending Close writer-priority and make every later operation wait — uncancellably, behind
+// arbitrary in-flight user SQL — so a deadline-bound caller could hang and then get the wrong error.
+func TestOperationsFailFastWhileClosing(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "q", QueueConfig{})
+
+	inTx := make(chan struct{})
+	release := make(chan struct{})
+	txDone := make(chan error, 1)
+	go func() {
+		txDone <- e.inTx(ctx, func(ec context.Context, tx *txn) error {
+			close(inTx)
+			<-release // hold the writer (and the in-flight count) open
+			return nil
+		})
+	}()
+	<-inTx
+
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e) // deterministically wait until Close has flipped the closing flag
+
+	// A new operation must now return promptly with ErrClosed — it must NOT block behind the pending
+	// Close (which is itself blocked on the held transaction).
+	opDone := make(chan error, 1)
+	go func() { _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); opDone <- err }()
+	select {
+	case err := <-opDone:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("an operation arriving while closing must fail fast with ErrClosed, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("an operation blocked behind a pending Close instead of failing fast — the close gate " +
+			"is not cancellation-safe")
+	}
+
+	close(release)
+	if err := <-txDone; err != nil {
+		t.Fatalf("tx: %v", err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestCloseGateCoversRemoteAndFailsFastBeforeTeardown pins two round-8 P2 follow-ups:
+//   - beginClosing shuts the admission gate BEFORE the pool is torn down, so a new op is refused the
+//     moment Close starts (Engine.Close flips it before draining background workers, which can be
+//     slow), not only once the pool is closed;
+//   - the REMOTE code paths (which bypass withConn) are gated too, so a remote op after close returns
+//     the typed ErrClosed and remote work is counted in the in-flight set.
+func TestCloseGateCoversRemoteAndFailsFastBeforeTeardown(t *testing.T) {
+	// A "remote" db over the fake driver — its exec/query/inTx take the remote branch.
+	d, _ := remoteDBFailingFirst(t, 0)
+
+	// Before closing, the remote path works (admitted).
+	if _, err := d.exec(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("remote exec before close: %v", err)
+	}
+
+	// beginClosing alone — no pool teardown yet — must already refuse new work.
+	d.beginClosing()
+	if d.enter() {
+		t.Fatal("enter admitted an operation after beginClosing, before teardown")
+	}
+	if _, err := d.exec(context.Background(), "SELECT 1"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("a remote exec after beginClosing must be ErrClosed, got %v", err)
+	}
+	if err := d.queryRowScan(context.Background(), []any{new(int)}, "SELECT 1"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("a remote queryRowScan after beginClosing must be ErrClosed, got %v", err)
+	}
+}
+
+// TestRemoteQueryRowsHoldsAdmissionThroughScan pins the round-8 P2: on a remote store, queryRows must
+// keep its admission registered for the whole read — query, scan, and Rows.Close — not just the query
+// call. Otherwise Close's inFlight.Wait could return and tear the pool down while a slow scan is still
+// reading rows.
+func TestRemoteQueryRowsHoldsAdmissionThroughScan(t *testing.T) {
+	d, _ := remoteDBFailingFirst(t, 0)
+
+	inScan := make(chan struct{})
+	release := make(chan struct{})
+	qDone := make(chan error, 1)
+	go func() {
+		qDone <- d.queryRows(context.Background(), "SELECT 1", func(*sql.Rows) error {
+			close(inScan)
+			<-release // hold the scan open
+			return nil
+		})
+	}()
+	<-inScan
+
+	// A Close arriving now must wait for the scan: its inFlight.Wait must not return yet.
+	d.beginClosing()
+	waitDone := make(chan struct{})
+	go func() { d.inFlight.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+		t.Fatal("inFlight.Wait returned while a remote scan was still active — Close could tear the pool down mid-scan")
+	case <-time.After(150 * time.Millisecond):
+		// Good: the scan still holds the admission.
+	}
+
+	close(release)
+	if err := <-qDone; err != nil {
+		t.Fatalf("queryRows: %v", err)
+	}
+	<-waitDone // now the wait completes
+}
+
+// TestCloseWakesLongPollWaiters pins the round-8 follow-up: a Receive long-polling an EMPTY queue
+// parks on the notifier, outside the admission gate (deliberately — Close must not wait 20s for it).
+// Nothing else ever wakes that waiter, so before the fix Close() returned while the Receive slept
+// out its full window — up to 20 seconds — against an engine that was already torn down (the
+// reviewer's race probe reproduced 10/10). Close now closes e.closed, and the long-poll select has
+// an arm for it: every parked waiter returns ErrClosed promptly.
+func TestCloseWakesLongPollWaiters(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "q", QueueConfig{})
+
+	const waiters = 4
+	done := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			// A 10s long-poll on an empty queue: with the bug, this outlives Close by ~10s.
+			msgs, rerr := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, WaitMs: 10_000})
+			if rerr == nil && len(msgs) > 0 {
+				done <- fmt.Errorf("received %d messages from an empty queue", len(msgs))
+				return
+			}
+			done <- rerr
+		}()
+	}
+	time.Sleep(150 * time.Millisecond) // let the waiters park on the notifier
+
+	start := time.Now()
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	for i := 0; i < waiters; i++ {
+		select {
+		case rerr := <-done:
+			// ErrClosed is the woken-by-Close path. A nil (empty result) is tolerated only if the
+			// waiter returned BEFORE Close got to it — but never late.
+			if rerr != nil && !errors.Is(rerr, ErrClosed) {
+				t.Fatalf("waiter returned %v, want ErrClosed", rerr)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("a long-poll waiter was still parked %.1fs after Close returned — Close must wake "+
+				"every waiter, not leave it to sleep out its window against a torn-down engine",
+				time.Since(start).Seconds())
+		}
+	}
+}

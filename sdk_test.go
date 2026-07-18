@@ -782,3 +782,107 @@ func TestSubMsOlderThanIsBounded(t *testing.T) {
 		})
 	}
 }
+
+// TestEmbeddedErrClosedThroughSDK is the SDK-boundary check for the round-8 close contract: an
+// operation on a closed embedded engine surfaces mqlite.ErrClosed through the PUBLIC package, so a
+// caller can errors.Is against it without reaching into engine.
+func TestEmbeddedErrClosedThroughSDK(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := mqlite.OpenEmbedded(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); !errors.Is(err, mqlite.ErrClosed) {
+		t.Fatalf("an operation on a closed embedded engine must be mqlite.ErrClosed, got %v", err)
+	}
+}
+
+// TestEmbeddedCloseStopsRunPromptly is the end-to-end twin of the engine-level long-poll-wake test
+// (round-8): a Receiver.Run long-polling an EMPTY embedded queue must return promptly when another
+// goroutine calls Close — not sleep out its ~20s poll window against a torn-down engine. The
+// fake-source receiver test cannot see this; only a real engine with a real parked waiter can.
+func TestEmbeddedCloseStopsRunPromptly(t *testing.T) {
+	ctx := context.Background()
+	e, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- e.Receiver("q").Run(ctx, func(context.Context, *mqlite.Message) error { return nil })
+	}()
+	time.Sleep(150 * time.Millisecond) // let Run park in its long-poll
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, mqlite.ErrClosed) {
+			t.Fatalf("Run returned %v, want mqlite.ErrClosed", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Receiver.Run was still blocked 3s after Close returned — the long-poll waiter was " +
+			"not woken (it would sleep out its full poll window)")
+	}
+}
+
+// TestRunCancelledThenClosedReturnsCanceled pins the graceful-shutdown ordering (round-8, codex):
+// the caller cancels Run's context while a handler is active, then closes the engine. The worker's
+// cleanup settle hits the closed engine and reports ErrClosed — an artifact of the shutdown itself,
+// which must NOT displace the caller's own story: Run returns context.Canceled. (ErrClosed stays the
+// answer when the engine is closed under a receiver whose context is live —
+// TestEmbeddedCloseStopsRunPromptly.)
+func TestRunCancelledThenClosedReturnsCanceled(t *testing.T) {
+	ctx := context.Background()
+	e, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+
+	rctx, cancel := context.WithCancel(ctx)
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- e.Receiver("q").Run(rctx, func(context.Context, *mqlite.Message) error {
+			close(inHandler)
+			<-release // hold the handler until cancel AND Close have both happened
+			return nil
+		})
+	}()
+	<-inHandler
+
+	cancel()                          // 1. the caller cancels…
+	if err := e.Close(); err != nil { // 2. …then tears the engine down
+		t.Fatalf("close: %v", err)
+	}
+	close(release) // 3. the handler finishes; its cleanup settle hits the closed engine
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run after cancel-then-Close returned %v — the caller cancelled first, so Run "+
+				"must report context.Canceled, not an ErrClosed artifact of its own shutdown", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancel + Close + handler completion")
+	}
+}

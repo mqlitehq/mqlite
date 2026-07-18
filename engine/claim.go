@@ -162,6 +162,13 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		case <-ctx.Done():
 			timer.Stop()
 			return nil, ctx.Err()
+		case <-e.closed:
+			// Close() wakes every long-poll waiter. Without this arm the waiter slept out its
+			// full window — up to 20s — AFTER Close returned, against an engine that was already
+			// torn down (round-8). The claim rounds themselves are covered by the admission gate;
+			// this covers the one place a Receive parks outside it.
+			timer.Stop()
+			return nil, ErrClosed
 		}
 	}
 }
