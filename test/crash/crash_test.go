@@ -474,7 +474,10 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // 30-120ms window under -race), so the kill stays purely timer-driven in practice — able to land
 // in a split-commit gap. On a starved host the harness WAITS for the evidence instead of failing a
 // correct implementation: a fixed window would otherwise be a throughput floor (a correct worker
-// that commits once per window would fail every cycle — codex, round-8 followup). A work loop
+// that commits once per window would fail every cycle — codex, round-8 followup). Evidence that
+// arrives LATE wakes the harness in sync with an ACK — a completed-transaction boundary — so the
+// kill is then decoupled from it by a varying delay, keeping the crash point unsynchronised even
+// on the hosts that take the slow path (codex). A work loop
 // frozen at the marker never produces the evidence and fails deterministically after a generous
 // deadline, however the reader is scheduled. killLoop returns the per-cycle post-pong counts (each
 // >= 2 by construction) so the caller can log them and pin the gate with a golden re-check.
@@ -627,24 +630,37 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				// sub-ms — it is a frozen work loop, and that is a deterministic failure.
 				select {
 				case <-evidence:
-				case <-drained:
-					// The worker's output ended inside the window: it died on its own. Fall through —
-					// the classification below attributes the death and fails the cycle.
-				case <-time.After(15 * time.Second):
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					<-drained
-					mu.Lock()
-					post := 0
-					if ackAtPong >= 0 {
-						post = ackN - ackAtPong
+					// Already satisfied when the timer expired — the kill below fires now, purely
+					// timer-driven. This is the only path a normally-loaded host ever takes.
+				default:
+					select {
+					case <-evidence:
+						// LATE evidence: this wake-up is synchronised with the 2nd post-pong ACK — a
+						// completed transaction boundary. Killing right here would consistently miss
+						// the split-commit gap this mode exists to sample, exactly on the starved
+						// hosts that take this path. Re-randomise: a varying delay decouples the kill
+						// from the ACK that released the gate; the worker keeps committing, so the
+						// evidence only grows (codex).
+						time.Sleep(time.Duration(5+7*i) * time.Millisecond)
+					case <-drained:
+						// The worker's output ended inside the window: it died on its own. Fall
+						// through — the classification below attributes the death and fails the cycle.
+					case <-time.After(15 * time.Second):
+						_ = cmd.Process.Kill()
+						_ = cmd.Wait()
+						<-drained
+						mu.Lock()
+						post := 0
+						if ackAtPong >= 0 {
+							post = ackN - ackAtPong
+						}
+						mu.Unlock()
+						t.Fatalf("cycle %d: the worker answered the liveness challenge but its commit loop "+
+							"produced no provably fresh commit in 15s (%d post-pong ACK(s); the first may be a "+
+							"pre-challenge straggler, so >=2 are required) — the work loop is frozen, and the "+
+							"kill would land on an idle process, not live commit traffic.\n%s",
+							i, post, snapshot(&mu, &out))
 					}
-					mu.Unlock()
-					t.Fatalf("cycle %d: the worker answered the liveness challenge but its commit loop "+
-						"produced no provably fresh commit in 15s (%d post-pong ACK(s); the first may be a "+
-						"pre-challenge straggler, so >=2 are required) — the work loop is frozen, and the "+
-						"kill would land on an idle process, not live commit traffic.\n%s",
-						i, post, snapshot(&mu, &out))
 				}
 			}
 		}
