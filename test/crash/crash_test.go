@@ -59,8 +59,8 @@ const (
 
 // respond echoes every challenge the harness sends on stdin, so the harness can prove — from a reply
 // that only a live worker could produce AFTER reading the challenge — that the worker is alive at the
-// point it is checked. Commit ACTIVITY is proven separately, in aggregate, so the kill can stay
-// purely timer-driven (codex).
+// point it is checked. Commit ACTIVITY is proven separately, per window by stream order (killLoop's
+// evidence gate), so on a normal host the kill stays purely timer-driven (codex).
 func respond() {
 	go func() {
 		sc := bufio.NewScanner(os.Stdin)
@@ -274,36 +274,28 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 		acked[k] = v
 	}
 
-	// What each mode PROVES, stated exactly (round-8):
+	// What each mode PROVES, stated exactly (round-8 followup):
 	//
 	//   - COORDINATED (deterministic): four crashes each land, by construction, with a transaction
 	//     held open between its two writes — a torn callback / split-into-two-transactions outbox is
 	//     caught every run (the atomicity oracle below, mutation-tested).
-	//   - RANDOM (activity deterministic for AT LEAST ONE window; placement probabilistic): the
-	//     discounted post-pong ACK count below is STREAM-ORDER evidence that the work loop really
-	//     committed after the challenge in at least one kill window (in practice: all of them — the
-	//     per-cycle counts are logged). WHERE each kill lands within that live commit stream remains
-	//     probabilistic; that placement is this mode's supplementary value, not its guarantee.
+	//   - RANDOM (activity deterministic for EVERY window; placement probabilistic): killLoop holds
+	//     each kill until STREAM-ORDER evidence — two post-pong ACKs, one discounted as the possible
+	//     pre-challenge straggler — proves the work loop committed after the challenge, so every
+	//     count below is >= 2 by construction on ANY host: the evidence is a gate on the kill, not a
+	//     throughput floor a slow runner could trip (codex). WHERE each kill lands within that live
+	//     commit stream remains probabilistic; that placement is this mode's supplementary value,
+	//     not its guarantee.
 	//
-	// The discount: the commit loop is sequential, so when the responder answers the challenge, at
-	// most ONE commit can be "done but its ACK not yet printed" — that straggler's ACK lands after
-	// the pong although its commit may pre-date the challenge (codex). Discounting one ACK per cycle
-	// removes exactly that ambiguity: everything counted below was provably committed AFTER the
-	// challenge. A frozen loop contributes zero; even the adversarial freeze-after-one-straggler
-	// contributes zero. A real producer contributes hundreds (measured ~70 per window under -race),
-	// so the >=1 aggregate bound is not a practical throughput floor — a host too slow to commit
-	// twice in ANY of four 30-120ms windows is already tripping the suite's liveness timeouts.
-	fresh := 0
-	for _, c := range postPong {
-		if c > 1 {
-			fresh += c - 1
+	// The re-check below is a golden pin on that gate: it can only fire if killLoop's evidence gate
+	// regresses (killing on the bare timer again), and then it fires loudly instead of letting the
+	// suite drift back to crashing possibly-idle processes.
+	for w, c := range postPong {
+		if c < 2 {
+			t.Fatalf("random-mode window %d closed with %d post-pong ACK(s) — killLoop must hold the "+
+				"kill until there are >= 2 (one discounted as a possible pre-challenge straggler), so "+
+				"its evidence gate has regressed (per-window counts: %v)", w, c, postPong)
 		}
-	}
-	if fresh < 1 {
-		t.Fatalf("no commit was provably made after the liveness challenge in ANY random-mode window "+
-			"(per-cycle post-pong acks %v, one discounted each as a possible pre-challenge straggler): "+
-			"the producer's work loop was not running when the kills landed — the crashes hit an idle "+
-			"process, not live commit traffic", postPong)
 	}
 	if len(acked) == 0 {
 		t.Fatal("the producer acknowledged no commits at all — the harness is not exercising the code")
@@ -466,20 +458,26 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // Once the worker reaches killOn, the harness sends ONE liveness challenge — an UNPREDICTABLE
 // random nonce, so the pong cannot be pre-printed (round-8) — and waits for the worker to echo it
 // (respond() answers from an independent stdin goroutine): proof the worker reached its kill point
-// alive. That check runs BEFORE the timer window, so it does not perturb the kill: the window then
-// elapses and the kill fires purely on the timer, landing at an unsynchronised point that can fall
-// in a split-commit gap.
+// alive. That check runs BEFORE the timer window, so it does not perturb the kill.
 //
 // The challenge proves LIVENESS, not that the work loop is committing. That second fact is measured
 // by STREAM ORDER, which no scheduler can fake or hide: the pipe is a FIFO, so an ACK line that
-// appears AFTER the pong in the output stream was written after the worker answered the challenge —
-// i.e. during the kill window. killLoop returns the PER-CYCLE counts of such post-pong ACKs; the
-// caller discounts one per cycle (the commit loop is sequential, so at most ONE commit can be "done
-// but not yet printed" when the challenge is answered — that single straggler's commit may pre-date
-// the challenge) and asserts on the rest, each of which was provably committed after it. A work
-// loop frozen at the marker contributes zero, deterministically, however the reader is scheduled
-// (round-8: a wall-clock activity check was either racy or a throughput floor; stream position is
-// neither — codex).
+// appears AFTER the pong in the output stream was written after the worker answered the challenge.
+// The commit loop is sequential, so at most ONE commit can be "done but its ACK not yet printed"
+// when the challenge is answered — that single straggler's ACK lands post-pong although its commit
+// may pre-date the challenge. TWO post-pong ACKs therefore prove at least one commit BEGAN AND
+// COMMITTED after the challenge was answered, whatever the scheduler did.
+//
+// For the random producer that proof is a GATE on the kill, not an assertion on a fixed window:
+// the kill fires at the LATER of the timer and the evidence (two post-pong ACKs). On any
+// normally-loaded host the evidence exists long before the timer expires (measured ~70 ACKs per
+// 30-120ms window under -race), so the kill stays purely timer-driven in practice — able to land
+// in a split-commit gap. On a starved host the harness WAITS for the evidence instead of failing a
+// correct implementation: a fixed window would otherwise be a throughput floor (a correct worker
+// that commits once per window would fail every cycle — codex, round-8 followup). A work loop
+// frozen at the marker never produces the evidence and fails deterministically after a generous
+// deadline, however the reader is scheduled. killLoop returns the per-cycle post-pong counts (each
+// >= 2 by construction) so the caller can log them and pin the gate with a golden re-check.
 //
 // A self-kill before the marker gives no marker; one at the marker gives no echo.
 func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) (map[string]bool, []int) {
@@ -515,15 +513,16 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 
 		signal := make(chan struct{})
 		drained := make(chan struct{})
-		pong := make(chan string, 16) // the worker's echoes of our liveness challenges
-		nonce := randomNonce(t)       // unguessable — a pong carrying it cannot pre-date the challenge
+		evidence := make(chan struct{}) // closed at the 2nd post-pong ACK: >=1 provably fresh commit
+		pong := make(chan string, 16)   // the worker's echoes of our liveness challenges
+		nonce := randomNonce(t)         // unguessable — a pong carrying it cannot pre-date the challenge
 		var mu sync.Mutex
 		var out strings.Builder
 		ackN := 0       // ACK lines seen this cycle, in stream order
 		ackAtPong := -1 // ackN at the moment OUR pong appeared in the stream (-1: not yet)
 		go func() {
 			sc := bufio.NewScanner(pr)
-			signalled := false
+			signalled, evidenced := false, false
 			for sc.Scan() {
 				line := sc.Text()
 				mu.Lock()
@@ -537,6 +536,12 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 					// Stream position of the echo: every ACK counted past this point was written
 					// AFTER the worker answered the challenge — pipe FIFO order, immune to reader lag.
 					ackAtPong = ackN
+				}
+				if !evidenced && ackAtPong >= 0 && ackN-ackAtPong >= 2 {
+					// One post-pong ACK may be the pre-challenge straggler; the SECOND proves a
+					// commit that began after the challenge was answered. The kill gate waits on this.
+					evidenced = true
+					close(evidence)
 				}
 				mu.Unlock()
 				if echo, ok := strings.CutPrefix(line, pongPrefix+" "); ok {
@@ -610,10 +615,38 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 
 		if !immediate {
 			// The kill window: let the worker run on past the liveness check so the crash lands at a
-			// varying, unsynchronised point in its stream. The kill below is purely TIMER-driven —
-			// nothing runs between this sleep and Process.Kill — so for the random producer it can land
-			// in the GAP of a split-commit regression, which is the whole point of this mode (codex).
+			// varying, unsynchronised point in its stream — for the random producer it can land in
+			// the GAP of a split-commit regression, which is the whole point of this mode (codex).
 			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
+			if role == "producer" {
+				// Evidence gate: do not kill until the stream PROVES the work loop committed after
+				// the challenge (two post-pong ACKs — see the doc comment). On a normal host this is
+				// long since satisfied and the kill fires right here, purely timer-driven; on a
+				// starved host we wait rather than fail a correct worker on a throughput floor
+				// (codex, round-8 followup). No evidence within 15s is not slowness — commits are
+				// sub-ms — it is a frozen work loop, and that is a deterministic failure.
+				select {
+				case <-evidence:
+				case <-drained:
+					// The worker's output ended inside the window: it died on its own. Fall through —
+					// the classification below attributes the death and fails the cycle.
+				case <-time.After(15 * time.Second):
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+					<-drained
+					mu.Lock()
+					post := 0
+					if ackAtPong >= 0 {
+						post = ackN - ackAtPong
+					}
+					mu.Unlock()
+					t.Fatalf("cycle %d: the worker answered the liveness challenge but its commit loop "+
+						"produced no provably fresh commit in 15s (%d post-pong ACK(s); the first may be a "+
+						"pre-challenge straggler, so >=2 are required) — the work loop is frozen, and the "+
+						"kill would land on an idle process, not live commit traffic.\n%s",
+						i, post, snapshot(&mu, &out))
+				}
+			}
 		}
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait() // reap it, so its advisory file lock is released before the next open

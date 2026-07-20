@@ -261,13 +261,15 @@ recovery, not filesystem durability.
   - *Coordinated mode (deterministic):* every run crashes the producer with a transaction held open
     **between its two writes**, so a torn callback — or an outbox split into two transactions — is
     caught on every run.
-  - *Random mode (activity deterministic, placement probabilistic):* stream-order evidence — with
-    one ACK per window discounted as a possible pre-challenge straggler — proves the producer
-    really committed after the liveness challenge in **at least one** timer-driven kill window per
-    run (in practice every window; the per-window counts are logged). A frozen work loop yields
-    zero, deterministically. **Where** each kill lands within that live stream is probabilistic, so
-    a crash falling exactly inside a hypothetical two-*commit* gap is supplementary coverage, not a
-    per-run guarantee.
+  - *Random mode (activity deterministic, placement probabilistic):* each kill is **gated** on
+    stream-order evidence — two post-challenge ACKs, one discounted as a possible pre-challenge
+    straggler — so **every** kill window provably contains a commit made after the liveness
+    challenge, on any host: the evidence is a wait condition on the kill, not a throughput floor a
+    slow runner could trip (per-window counts are logged). On a normally loaded host the evidence
+    exists long before the kill timer expires, so the kill stays purely timer-driven. A frozen work
+    loop never produces the evidence and fails deterministically. **Where** each kill lands within
+    that live stream is probabilistic, so a crash falling exactly inside a hypothetical
+    two-*commit* gap is supplementary coverage, not a per-run guarantee.
 
   *(test/crash/crash_test.go: TestCrashOutboxAtomicity)*
 - **15.2 Orphaned locks reset on restart.** After a crash while messages are `locked`, `Open` reclaims
