@@ -255,9 +255,23 @@ loss: a hard kill does not lose data the OS already accepted, so it exercises ap
 recovery, not filesystem durability.
 
 - **15.1 Outbox atomicity across a crash.** A transaction that writes a business row AND enqueues a
-  message commits both or neither — even when killed mid-commit. After recovery the set of business
-  rows equals the set of messages exactly: never an order without its message, never a message
-  without its order. *(test/crash/crash_test.go: TestCrashOutboxAtomicity)*
+  message commits both or neither. After recovery the set of business rows equals the set of
+  messages exactly: never an order without its message, never a message without its order.
+  What each crash mode establishes, stated exactly:
+  - *Coordinated mode (deterministic):* every run crashes the producer with a transaction held open
+    **between its two writes**, so a torn callback — or an outbox split into two transactions — is
+    caught on every run.
+  - *Random mode (activity deterministic, placement probabilistic):* each kill is **gated** on
+    stream-order evidence — two post-challenge ACKs, one discounted as a possible pre-challenge
+    straggler — so **every** kill window provably contains a commit made after the liveness
+    challenge, on any host: the evidence is a wait condition on the kill, not a throughput floor a
+    slow runner could trip (per-window counts are logged). On a normally loaded host the evidence
+    exists long before the kill timer expires, so the kill stays purely timer-driven. A frozen work
+    loop never produces the evidence and fails deterministically. **Where** each kill lands within
+    that live stream is probabilistic, so a crash falling exactly inside a hypothetical
+    two-*commit* gap is supplementary coverage, not a per-run guarantee.
+
+  *(test/crash/crash_test.go: TestCrashOutboxAtomicity)*
 - **15.2 Orphaned locks reset on restart.** After a crash while messages are `locked`, `Open` reclaims
   every orphaned lock — to `active`, or to `dead_lettered` with `MaxDeliveryCountExceeded` if the
   message was already on its last permitted delivery (the same rule the reaper applies, §3.1). Either

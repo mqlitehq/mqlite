@@ -303,6 +303,12 @@ Every claim in this document is enforced by something that fails loudly:
 - **An integrity sweep** — a randomized send/receive/crash workload asserting
   every message arrives (no loss), arrives intact (content hash), and never
   exceeds its delivery bound.
+- **A crash-injection layer** — a real worker process, hard-killed (`SIGKILL`)
+  mid-transaction and restarted, proving the outbox is atomic across the crash
+  and that `Open` reclaims every orphaned lock. It re-execs the test binary, so
+  it is gated behind the `crash_injection` build tag and run on Linux in its own
+  CI job: `make crash` (it is deliberately kept out of the default `-race`
+  matrix). This tests *process* death, not power loss.
 
 ## 10 · What this design refuses to do
 
