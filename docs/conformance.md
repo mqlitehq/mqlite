@@ -27,7 +27,11 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 
 - **2.1 Complete** removes the message. *(engine/functional_test.go)*
 - **2.2 Abandon** returns it to `active` for redelivery (or `dead_lettered` if over
-  max); `delay_ms` re-hides it for backoff. *(engine/engine_test.go)*
+  max). With `delay_ms > 0` it parks in `scheduled` until the backoff lapses
+  (scheduler re-activates it); on an **ordered** queue the parked head holds
+  head-of-line exactly like a scheduled send — successors cannot overtake it
+  (§5.5). *(engine/engine_test.go; engine/functional_test.go:
+  TestAbandonDelayHoldsGroupOrder)*
 - **2.3 Reject** moves it to `dead_lettered` with a reason. *(engine/functional_test.go)*
 - **2.4 Defer** sets it aside; it is retrieved later by seq via `ReceiveDeferred`.
   Normal `Receive` never returns a deferred message. In an **ordered** queue a deferred
@@ -98,6 +102,12 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   redelivered first, in id order (or dead-lettered at `count ≥ max`, which unblocks
   the group). The accepted cost is a group stall of up to one reaper interval on a
   consumer timeout. *(engine/functional_test.go: TestFIFOHoldsAcrossLockExpiry)*
+- **5.5** Head-of-line MUST survive an explicit backoff: `Abandon` with `delay_ms > 0`
+  parks the head in `scheduled` — a state the head-of-line probe covers — so
+  successors are never delivered ahead of a backing-off head; when the backoff lapses
+  the scheduler re-activates it and it is redelivered first. Other groups (other
+  queues' worth of work under `standard`/`group_fifo`) proceed during the backoff.
+  *(engine/functional_test.go: TestAbandonDelayHoldsGroupOrder)*
 
 ## 6 · Dead-letter queue
 
@@ -109,8 +119,10 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 ## 7 · Scheduling, deferral & TTL
 
 - **7.1 Schedule** keeps a message hidden (`scheduled`, `visible_at` in the future)
-  until its time, then the scheduler activates it; `Cancel` deletes a not-yet-active
-  scheduled message. *(engine/functional_test.go)*
+  until its time, then the scheduler activates it; `Cancel` deletes a scheduled
+  message that has never been delivered (`delivery_count=0`) — a backoff-parked
+  redelivery (§2.2) is NOT cancellable and stays under the retry/DLQ discipline.
+  *(engine/functional_test.go; TestAbandonDelayHoldsGroupOrder)*
 - **7.2 TTL** — an expired message (`expires_at`) MUST move to the DLQ when the queue
   has `dead_letter_on_expire`, else be discarded. The two branches cover the **same
   state set** — every non-terminal state including `scheduled`: a row the scheduler
