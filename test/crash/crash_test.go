@@ -22,6 +22,8 @@ package crash
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -47,7 +49,39 @@ const (
 	// ackPrefix begins the line for every committed order nonce. The harness collects these and
 	// requires every acknowledged nonce to survive recovery (conformance 15.3).
 	ackPrefix = "CRASH-WORKER-ACK"
+	// pongPrefix begins the worker's echo of a liveness challenge. Only a live worker that READ the
+	// parent's challenge (sent right before the kill) can produce it, so an echo is causally fresh:
+	// a frozen worker never reads it, and a dead worker's buffered output can't contain a nonce it
+	// never wrote. This is what makes liveness/attribution race-free — a sampled beat could not (a
+	// worker that died with output buffered might still deliver a stale beat after the check; codex).
+	pongPrefix = "CRASH-WORKER-PONG"
 )
+
+// respond echoes every challenge the harness sends on stdin, so the harness can prove — from a reply
+// that only a live worker could produce AFTER reading the challenge — that the worker is alive at the
+// point it is checked. Commit ACTIVITY is proven separately, per window by stream order (killLoop's
+// evidence gate), so on a normal host the kill stays purely timer-driven (codex).
+func respond() {
+	go func() {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			fmt.Println(pongPrefix, sc.Text())
+			_ = os.Stdout.Sync()
+		}
+	}()
+}
+
+// randomNonce returns an unguessable liveness-challenge nonce. It MUST be unpredictable: with a
+// fixed "PING-<i>" a worker could print the matching pong line before ever reading stdin, and the
+// echo would prove nothing about being alive after the challenge was sent (round-8).
+func randomNonce(t *testing.T) string {
+	t.Helper()
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatalf("crypto/rand: %v", err)
+	}
+	return hex.EncodeToString(b)
+}
 
 // parseAck reads the nonce out of a "CRASH-WORKER-ACK <nonce>" line.
 func parseAck(line string) (string, bool) {
@@ -71,6 +105,8 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 	}
 	db := os.Getenv(dbEnv)
 	ctx := context.Background()
+
+	respond() // answer the harness's liveness challenges for this worker's whole life
 
 	e := openWithRetry(ctx, db) // the previous worker's advisory lock releases as it dies
 	defer e.Close()
@@ -173,20 +209,27 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 	}
 }
 
-// runLocker receives messages (short leases, reaper OFF) and mostly just holds them, so it is killed
-// WHILE holding locks. It never completes anything: no message ever leaves the queue, which makes
-// the recovery oracle exact — after a restart the queue must still hold every message, and none may
-// be stuck `locked` (Open resets orphaned locks).
+// lockerReadyAt is how many locks the locker must hold before it announces readiness. It is
+// deliberately LARGE: recovery must reclaim MANY orphaned locks at once, so a bug that only reclaims
+// the first N (a stray LIMIT, a capped batch) is caught. Held at a handful, the recovery test passed
+// even with a LIMIT 25 injected — nothing ever exercised the volume (round-8).
+const lockerReadyAt = 250
+
+// runLocker claims messages in big batches and HOLDS them — hundreds at once — so that when it is
+// killed there are far more orphaned locks than any plausible recovery cap. It never completes
+// anything: no message leaves the queue, so after a restart every message must still be there and
+// none may be stuck `locked` (Open reclaims orphaned locks).
 func runLocker(ctx context.Context, e *mqlite.Embedded) {
 	holding := 0
 	for {
-		msgs, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 5, Wait: 100 * time.Millisecond})
+		msgs, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 256, Wait: 100 * time.Millisecond})
 		if err != nil {
 			fail("locker receive", err) // no benign error — see runProducer
 		}
 		for _, m := range msgs {
-			// Occasionally give one back; otherwise hold it and let the kill catch us mid-lease.
-			if m.SequenceNumber%3 == 0 {
+			// Give a few back for realism (redelivery churn), but hold the vast majority so the
+			// orphaned-lock count at the kill is high.
+			if m.SequenceNumber%13 == 0 {
 				if err := m.Abandon(ctx); err != nil && !errors.Is(err, mqlite.ErrLockLost) {
 					fail("locker abandon", err)
 				}
@@ -194,10 +237,10 @@ func runLocker(ctx context.Context, e *mqlite.Embedded) {
 				holding++
 			}
 		}
-		if holding > 0 { // at least one lock is held — killing us now actually exercises recovery
+		if holding >= lockerReadyAt { // hundreds of live locks are held — recovery has real volume to reclaim
 			ready()
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -225,10 +268,40 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 	// full commits land unsynchronised — including around a commit — and catch a split that persists
 	// the row and the enqueue across two commits with a gap. Coordinated kills (HOLD=1) crash with a
 	// transaction held open between its two writes, catching a split into two separate transactions.
-	acked := killLoop(t, db, "producer", readyMarker, false, 4)
-	for k, v := range killLoop(t, db, "producer", inTxMarker, true, 4, holdEnv+"=1") {
+	acked, postPong := killLoop(t, db, "producer", readyMarker, false, 4)
+	coordAcked, _ := killLoop(t, db, "producer", inTxMarker, true, 4, holdEnv+"=1")
+	for k, v := range coordAcked {
 		acked[k] = v
 	}
+
+	// What each mode PROVES, stated exactly (round-8 followup):
+	//
+	//   - COORDINATED (deterministic): four crashes each land, by construction, with a transaction
+	//     held open between its two writes — a torn callback / split-into-two-transactions outbox is
+	//     caught every run (the atomicity oracle below, mutation-tested).
+	//   - RANDOM (activity deterministic for EVERY window; placement probabilistic): killLoop holds
+	//     each kill until STREAM-ORDER evidence — two post-pong ACKs, one discounted as the possible
+	//     pre-challenge straggler — proves the work loop committed after the challenge, so every
+	//     count below is >= 2 by construction on ANY host: the evidence is a gate on the kill, not a
+	//     throughput floor a slow runner could trip (codex). WHERE each kill lands within that live
+	//     commit stream remains probabilistic; that placement is this mode's supplementary value,
+	//     not its guarantee.
+	//
+	// The re-check below is a golden pin on that gate: it can only fire if killLoop's evidence gate
+	// regresses (killing on the bare timer again), and then it fires loudly instead of letting the
+	// suite drift back to crashing possibly-idle processes.
+	for w, c := range postPong {
+		if c < 2 {
+			t.Fatalf("random-mode window %d closed with %d post-pong ACK(s) — killLoop must hold the "+
+				"kill until there are >= 2 (one discounted as a possible pre-challenge straggler), so "+
+				"its evidence gate has regressed (per-window counts: %v)", w, c, postPong)
+		}
+	}
+	if len(acked) == 0 {
+		t.Fatal("the producer acknowledged no commits at all — the harness is not exercising the code")
+	}
+	t.Logf("producer acknowledged %d commits across 8 crashes; per-window post-challenge commit "+
+		"evidence (discounted): %v", len(acked), postPong)
 
 	ctx := context.Background()
 	e := openWithRetry(ctx, db)
@@ -283,9 +356,6 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 			"restart (first few: %v). A transaction that returned success must survive the process dying.",
 			len(lostAcked), len(acked), trim(lostAcked))
 	}
-	if len(acked) == 0 {
-		t.Fatal("the producer acknowledged no commits — the harness is not exercising the code")
-	}
 	t.Logf("outbox intact across 8 crashes (4 random, 4 in-transaction): %d orders in bijection with their messages; all %d acked commits survived",
 		len(orders), len(acked))
 }
@@ -295,7 +365,9 @@ func TestCrashOutboxAtomicity(t *testing.T) {
 // `active`, or to `dead_lettered` if it was on its last permitted delivery — the reaper's rule), and
 // — because the consumer never completes anything — not one of the seeded messages may be lost.
 func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
-	const seeded = 200
+	// Seed well above lockerReadyAt so the locker can hold hundreds of locks at the kill — recovery
+	// then has real volume to reclaim, and a bug that only reclaims the first N is caught.
+	const seeded = 400
 	db := dbPath(t)
 
 	ctx := context.Background()
@@ -314,7 +386,7 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 		}
 	}()
 
-	_ = killLoop(t, db, "locker", readyMarker, false, 6) // the locker emits no acks
+	_, _ = killLoop(t, db, "locker", readyMarker, false, 6) // liveness via challenge/response
 
 	// Reopen and check the recovery contract.
 	e := openWithRetry(ctx, db)
@@ -330,20 +402,27 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 			"orphaned locks, so they are stranded until their lease expires (or forever, the reaper is off).", m.Locked)
 	}
 	// Nothing completed, so nothing may be gone. A bare count can be fooled — losing body N while
-	// duplicating body M keeps the total at 200 — so check the IDENTITIES and multiplicities. The
-	// seed bodies are exactly 0..199 and none were dead-lettered (high MaxDeliveryCount), so every
-	// one must come back active exactly once (codex).
-	got, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: seeded})
-	if err != nil {
-		t.Fatalf("the queue is unusable after crash recovery: %v", err)
-	}
+	// duplicating body M keeps the total the same — so check the IDENTITIES and multiplicities. The
+	// seed bodies are exactly 0..seeded-1 and none were dead-lettered (high MaxDeliveryCount), so
+	// every one must come back active exactly once (codex). Receive caps at 256, so drain in a loop.
 	seen := map[int64]int{}
-	for _, msg := range got {
-		n, perr := strconv.ParseInt(string(msg.Body), 10, 64)
-		if perr != nil {
-			t.Fatalf("recovered a message whose body %q is not a seed id: %v", msg.Body, perr)
+	total := 0
+	for {
+		got, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 256})
+		if err != nil {
+			t.Fatalf("the queue is unusable after crash recovery: %v", err)
 		}
-		seen[n]++
+		if len(got) == 0 {
+			break
+		}
+		total += len(got)
+		for _, msg := range got {
+			n, perr := strconv.ParseInt(string(msg.Body), 10, 64)
+			if perr != nil {
+				t.Fatalf("recovered a message whose body %q is not a seed id: %v", msg.Body, perr)
+			}
+			seen[n]++
+		}
 	}
 	var missing, duped []int64
 	for i := int64(0); i < seeded; i++ {
@@ -355,13 +434,13 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 			duped = append(duped, i)
 		}
 	}
-	if len(missing) > 0 || len(duped) > 0 || int(m.Total) != seeded || len(got) != seeded {
+	if len(missing) > 0 || len(duped) > 0 || int(m.Total) != seeded || total != seeded {
 		t.Fatalf("crash recovery did not preserve the seeded set exactly (received %d, Stats.Total %d, "+
 			"of %d seeded):\n"+
 			"  missing bodies:    %v\n"+
 			"  duplicated bodies: %v\n"+
 			"  nothing was ever completed, so every seed id 0..%d must come back exactly once.",
-			len(got), m.Total, seeded, trim(missing), trim(duped), seeded-1)
+			total, m.Total, seeded, trim(missing), trim(duped), seeded-1)
 	}
 }
 
@@ -375,9 +454,39 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 // The classification afterwards gives the suite its teeth: only the SIGKILL we injected counts. A
 // worker that panics, trips the race detector, exits on its own, or dies from some other signal is a
 // hard failure, never a crash cycle counted as success.
-func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) map[string]bool {
+//
+// Once the worker reaches killOn, the harness sends ONE liveness challenge — an UNPREDICTABLE
+// random nonce, so the pong cannot be pre-printed (round-8) — and waits for the worker to echo it
+// (respond() answers from an independent stdin goroutine): proof the worker reached its kill point
+// alive. That check runs BEFORE the timer window, so it does not perturb the kill.
+//
+// The challenge proves LIVENESS, not that the work loop is committing. That second fact is measured
+// by STREAM ORDER, which no scheduler can fake or hide: the pipe is a FIFO, so an ACK line that
+// appears AFTER the pong in the output stream was written after the worker answered the challenge.
+// The commit loop is sequential, so at most ONE commit can be "done but its ACK not yet printed"
+// when the challenge is answered — that single straggler's ACK lands post-pong although its commit
+// may pre-date the challenge. TWO post-pong ACKs therefore prove at least one commit BEGAN AND
+// COMMITTED after the challenge was answered, whatever the scheduler did.
+//
+// For the random producer that proof is a GATE on the kill, not an assertion on a fixed window:
+// the kill fires at the LATER of the timer and the evidence (two post-pong ACKs). On any
+// normally-loaded host the evidence exists long before the timer expires (measured ~70 ACKs per
+// 30-120ms window under -race), so the kill stays purely timer-driven in practice — able to land
+// in a split-commit gap. On a starved host the harness WAITS for the evidence instead of failing a
+// correct implementation: a fixed window would otherwise be a throughput floor (a correct worker
+// that commits once per window would fail every cycle — codex, round-8 followup). Evidence that
+// arrives LATE wakes the harness in sync with an ACK — a completed-transaction boundary — so the
+// kill is then decoupled from it by a varying delay, keeping the crash point unsynchronised even
+// on the hosts that take the slow path (codex). A work loop
+// frozen at the marker never produces the evidence and fails deterministically after a generous
+// deadline, however the reader is scheduled. killLoop returns the per-cycle post-pong counts (each
+// >= 2 by construction) so the caller can log them and pin the gate with a golden re-check.
+//
+// A self-kill before the marker gives no marker; one at the marker gives no echo.
+func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int, extraEnv ...string) (map[string]bool, []int) {
 	t.Helper()
 	acked := map[string]bool{}
+	postPongAcks := make([]int, 0, cycles)
 	for i := 0; i < cycles; i++ {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestCrashWorkerEntrypoint$", "-test.v=false")
 		cmd.Env = append(os.Environ(), roleEnv+"="+role, dbEnv+"="+db,
@@ -387,35 +496,63 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 			"GORACE=atexit_sleep_ms=0")
 		cmd.Env = append(cmd.Env, extraEnv...)
 
-		// One pipe carries both streams; a goroutine drains it into `out`, records acks, and flags
-		// the kill signal. The parent closes its write end after Start so the reader EOFs once the
-		// child is gone.
+		// One pipe carries both of the worker's output streams into `out`; a second pipe carries the
+		// harness's liveness challenges INTO the worker's stdin. The parent closes its copies of the
+		// child ends after Start so EOF propagates when the child dies.
 		pr, pw, err := os.Pipe()
 		if err != nil {
 			t.Fatalf("cycle %d: pipe: %v", i, err)
 		}
-		cmd.Stdout, cmd.Stderr = pw, pw
+		cr, cw, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("cycle %d: challenge pipe: %v", i, err)
+		}
+		cmd.Stdout, cmd.Stderr, cmd.Stdin = pw, pw, cr
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("cycle %d: start worker: %v", i, err)
 		}
 		_ = pw.Close()
+		_ = cr.Close()
 
 		signal := make(chan struct{})
 		drained := make(chan struct{})
+		evidence := make(chan struct{}) // closed at the 2nd post-pong ACK: >=1 provably fresh commit
+		pong := make(chan string, 16)   // the worker's echoes of our liveness challenges
+		nonce := randomNonce(t)         // unguessable — a pong carrying it cannot pre-date the challenge
 		var mu sync.Mutex
 		var out strings.Builder
+		ackN := 0       // ACK lines seen this cycle, in stream order
+		ackAtPong := -1 // ackN at the moment OUR pong appeared in the stream (-1: not yet)
 		go func() {
 			sc := bufio.NewScanner(pr)
-			signalled := false
+			signalled, evidenced := false, false
 			for sc.Scan() {
 				line := sc.Text()
 				mu.Lock()
 				out.WriteString(line)
 				out.WriteByte('\n')
-				if nonce, ok := parseAck(line); ok {
-					acked[nonce] = true // this nonce was durably committed before the crash
+				if n, isAck := parseAck(line); isAck {
+					acked[n] = true // this nonce was durably committed before the crash
+					ackN++
+				}
+				if line == pongPrefix+" "+nonce && ackAtPong < 0 {
+					// Stream position of the echo: every ACK counted past this point was written
+					// AFTER the worker answered the challenge — pipe FIFO order, immune to reader lag.
+					ackAtPong = ackN
+				}
+				if !evidenced && ackAtPong >= 0 && ackN-ackAtPong >= 2 {
+					// One post-pong ACK may be the pre-challenge straggler; the SECOND proves a
+					// commit that began after the challenge was answered. The kill gate waits on this.
+					evidenced = true
+					close(evidence)
 				}
 				mu.Unlock()
+				if echo, ok := strings.CutPrefix(line, pongPrefix+" "); ok {
+					select {
+					case pong <- echo:
+					default:
+					}
+				}
 				if !signalled && strings.Contains(line, killOn) {
 					signalled = true
 					close(signal)
@@ -435,14 +572,109 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				i, killOn, role, snapshot(&mu, &out))
 		}
 
+		// Liveness/attribution, BEFORE the kill window so it does not perturb the timer-driven kill.
+		// Send a unique nonce and require the worker to echo exactly it: only a live worker that READ
+		// the nonce (after we sent it) can produce that line — a frozen reader never does, a dead
+		// worker's buffered output cannot contain a nonce it never wrote. So this proves the worker
+		// reached its kill point ALIVE. Commit ACTIVITY (that the work loop, not just respond(), is
+		// running) is proven separately, in aggregate after all cycles — decoupled from the kill so
+		// the crash stays timer-driven and can land in a split-commit gap (codex).
+		//
+		// The honest limit: perfect attribution of a SIGKILL to its sender is IMPOSSIBLE from user
+		// space — SIGKILL is uncatchable, so the victim can't observe who sent it, and wait4 reports
+		// the child's own pid, not the signaller's. The one race-free alternative,
+		// SIGSTOP→confirm-frozen→SIGKILL, is unreliable across platforms (darwin's wait4 does not
+		// report the stop for a Go child and deadlocks) and needs ptrace to be portable —
+		// disproportionate for a harness whose worker never self-kills. So this proves the worker was
+		// alive when checked, not at the exact instant of the kill; a self-kill in the window below is
+		// the documented residual. A realistic fixed-point self-kill still stops the echoes / EOFs the
+		// pipe and is caught.
+		if _, err := cw.WriteString(nonce + "\n"); err != nil {
+			_ = cmd.Wait()
+			<-drained
+			t.Fatalf("cycle %d (role %q): the worker's stdin was closed before it answered — it exited on "+
+				"its own, so this is not a crash we injected.\n%s", i, role, snapshot(&mu, &out))
+		}
+		answered, deadline := false, time.After(5*time.Second)
+		for !answered {
+			select {
+			case echo := <-pong:
+				answered = echo == nonce // our nonce; ignore any stale echo
+			case <-drained:
+				_ = cmd.Wait()
+				t.Fatalf("cycle %d: the worker's output ended before it answered the liveness challenge — "+
+					"it exited on its own (role %q), so this is not a crash we injected.\n%s",
+					i, role, snapshot(&mu, &out))
+			case <-deadline:
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				<-drained
+				t.Fatalf("cycle %d: the worker did not answer the liveness challenge within 5s (role %q) — "+
+					"it was frozen or dead, so the crash would not land on a live process.\n%s",
+					i, role, snapshot(&mu, &out))
+			}
+		}
+		_ = cw.Close()
+
 		if !immediate {
-			// Let the worker run on past the marker so the crash lands at a varying, unsynchronised
-			// point in its stream — including, for the producer, around a commit.
+			// The kill window: let the worker run on past the liveness check so the crash lands at a
+			// varying, unsynchronised point in its stream — for the random producer it can land in
+			// the GAP of a split-commit regression, which is the whole point of this mode (codex).
 			time.Sleep(time.Duration(30+30*i) * time.Millisecond)
+			if role == "producer" {
+				// Evidence gate: do not kill until the stream PROVES the work loop committed after
+				// the challenge (two post-pong ACKs — see the doc comment). On a normal host this is
+				// long since satisfied and the kill fires right here, purely timer-driven; on a
+				// starved host we wait rather than fail a correct worker on a throughput floor
+				// (codex, round-8 followup). No evidence within 15s is not slowness — commits are
+				// sub-ms — it is a frozen work loop, and that is a deterministic failure.
+				select {
+				case <-evidence:
+					// Already satisfied when the timer expired — the kill below fires now, purely
+					// timer-driven. This is the only path a normally-loaded host ever takes.
+				default:
+					select {
+					case <-evidence:
+						// LATE evidence: this wake-up is synchronised with the 2nd post-pong ACK — a
+						// completed transaction boundary. Killing right here would consistently miss
+						// the split-commit gap this mode exists to sample, exactly on the starved
+						// hosts that take this path. Re-randomise: a varying delay decouples the kill
+						// from the ACK that released the gate; the worker keeps committing, so the
+						// evidence only grows (codex).
+						time.Sleep(time.Duration(5+7*i) * time.Millisecond)
+					case <-drained:
+						// The worker's output ended inside the window: it died on its own. Fall
+						// through — the classification below attributes the death and fails the cycle.
+					case <-time.After(15 * time.Second):
+						_ = cmd.Process.Kill()
+						_ = cmd.Wait()
+						<-drained
+						mu.Lock()
+						post := 0
+						if ackAtPong >= 0 {
+							post = ackN - ackAtPong
+						}
+						mu.Unlock()
+						t.Fatalf("cycle %d: the worker answered the liveness challenge but its commit loop "+
+							"produced no provably fresh commit in 15s (%d post-pong ACK(s); the first may be a "+
+							"pre-challenge straggler, so >=2 are required) — the work loop is frozen, and the "+
+							"kill would land on an idle process, not live commit traffic.\n%s",
+							i, post, snapshot(&mu, &out))
+					}
+				}
+			}
 		}
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait() // reap it, so its advisory file lock is released before the next open
 		<-drained      // all of the worker's output is now in `out`
+
+		mu.Lock()
+		if ackAtPong >= 0 {
+			postPongAcks = append(postPongAcks, ackN-ackAtPong)
+		} else {
+			postPongAcks = append(postPongAcks, 0)
+		}
+		mu.Unlock()
 
 		body := snapshot(&mu, &out)
 		switch {
@@ -459,7 +691,7 @@ func killLoop(t *testing.T, db, role, killOn string, immediate bool, cycles int,
 				i, cmd.ProcessState, body)
 		}
 	}
-	return acked
+	return acked, postPongAcks
 }
 
 // openWithRetry opens the embedded engine, retrying briefly on ErrDBLocked: a just-killed worker's

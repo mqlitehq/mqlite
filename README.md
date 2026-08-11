@@ -352,6 +352,8 @@ MQLITE_INTEGRITY_N=500000 go test ./engine -run TestMessageIntegrity  # large sw
 # live remote round-trip against your own Turso DB:
 MQLITE_TEST_DB=libsql://<db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
   go test ./engine -run TestTursoIntegration -v
+# crash-injection: hard-kill a worker mid-transaction and check recovery (Linux; tag-gated):
+make crash                    # = go test -race -tags crash_injection -count=1 ./test/crash/
 ```
 
 A contiguous `1..N` sequence is sent with random bodies (each hashed into a
