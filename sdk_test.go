@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
@@ -884,5 +885,104 @@ func TestRunCancelledThenClosedReturnsCanceled(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after cancel + Close + handler completion")
+	}
+}
+
+// TestEmbeddedCloseWaitsForPublicTx is the round-7 P1 regression pinned on the PUBLIC API surface
+// (the white-box twin lives in engine/storage_test.go): while a public Tx is open and holding the
+// single writer, Close must block until the Tx commits, keep the file lock held the whole time (a
+// second Open gets ErrDBLocked), and only then release it. Nothing below the SDK is touched here,
+// so a future refactor of the internal gate cannot hide this failure. Every wait is gated on an
+// observable state change, never on a fixed sleep — the round-8 rule for this layer.
+func TestEmbeddedCloseWaitsForPublicTx(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := mqlite.OpenEmbedded(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	inTx := make(chan struct{})
+	closeReturned := make(chan struct{})
+	txDone := make(chan error, 1)
+
+	// A public transaction that has enqueued and now holds the single writer, parked.
+	go func() {
+		txDone <- e.Tx(ctx, func(tx *engine.EngineTx) error {
+			if _, err := tx.SendOne("q", engine.OutMessage{Body: []byte("close-tx")}); err != nil {
+				return err
+			}
+			close(inTx)
+			<-release // hold the transaction open
+			// Deterministic ordering proof at the moment the callback resumes: if Close has
+			// ALREADY returned, the file lock was released while this Tx was still open —
+			// exactly the round-7 P1.
+			select {
+			case <-closeReturned:
+				return fmt.Errorf("Close returned while a public Tx was still open")
+			default:
+			}
+			return nil
+		})
+	}()
+	<-inTx // the transaction is open and holds the writer
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- e.Close()
+		close(closeReturned)
+	}()
+
+	// Deterministic signals while the Tx is still open — none of them may touch the DB conn
+	// (the Tx holds the single writer, so any DB op would queue behind it and deadlock the
+	// test). The second-Open probe is safe: it is a sidecar file-lock attempt, not a DB op.
+	//
+	// 1. Close must not have returned: the Tx has not committed yet.
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while a public Tx was still open (err=%v) — it released the "+
+			"writer/file lock early", err)
+	default:
+		// good: Close is blocked on the transaction
+	}
+	// 2. The file lock must still be held: a second engine on the same file is refused.
+	if e2, err := mqlite.OpenEmbedded(ctx, dsn); !errors.Is(err, mqlite.ErrDBLocked) {
+		if e2 != nil {
+			_ = e2.Close()
+		}
+		t.Fatalf("a second Open during an in-flight public Tx + pending Close must get "+
+			"ErrDBLocked, got %v", err)
+	}
+
+	close(release) // let the transaction commit and return
+
+	if err := <-txDone; err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the transaction committed")
+	}
+
+	// Now — and only now — the file can be reopened, and the Tx's enqueue is durable.
+	e3, err := mqlite.OpenEmbedded(ctx, dsn)
+	if err != nil {
+		t.Fatalf("reopen after a clean close: %v", err)
+	}
+	defer e3.Close()
+	msgs, err := e3.Peek(ctx, "q")
+	if err != nil {
+		t.Fatalf("peek after reopen: %v", err)
+	}
+	if len(msgs) != 1 || string(msgs[0].Body) != "close-tx" {
+		t.Fatalf("the Tx's enqueue is not durable after reopen: got %d message(s)", len(msgs))
 	}
 }
