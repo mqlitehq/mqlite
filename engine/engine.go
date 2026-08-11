@@ -552,10 +552,14 @@ func validateScheduleTime(atMs, nowMs int64) error {
 	return nil
 }
 
-// Cancel deletes a not-yet-activated scheduled message by seq.
+// Cancel deletes a scheduled message that has never been delivered (delivery_count=0)
+// — the delayed-Send case. An over-max redelivery or a delayed-Abandon backoff can also
+// sit in 'scheduled', but those rows have already been delivered and stay under the
+// retry/DLQ discipline (max_delivery_count, Reject); Cancel must not silently remove
+// them (MQLITE-66).
 func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
 	res, err := e.db.exec(ctx,
-		`DELETE FROM messages WHERE id=? AND queue=? AND state='scheduled'`, seq, queue)
+		`DELETE FROM messages WHERE id=? AND queue=? AND state='scheduled' AND delivery_count=0`, seq, queue)
 	if err != nil {
 		return err
 	}

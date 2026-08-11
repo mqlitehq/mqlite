@@ -60,7 +60,7 @@ func rkey(queue string, seq int64, token, verb, args string) string {
 // different request and gets no receipt. The model was blind to this bug for three rounds for one
 // reason — it always passed the same delay and the same reason, so the arguments never varied and
 // the spec was never exercised. A model only finds what its generator is willing to say.
-func (m *model) settle(queue string, seq int64, token, verb, args string) (ok bool) {
+func (m *model) settle(queue string, seq int64, token, verb, args string, delay int64) (ok bool) {
 	msg := m.msgs[seq]
 	if msg != nil && msg.queue == queue && msg.state == StateLocked && msg.token == token {
 		switch verb {
@@ -70,6 +70,12 @@ func (m *model) settle(queue string, seq int64, token, verb, args string) (ok bo
 			msg.delivs++
 			if msg.delivs >= m.maxDeliv {
 				msg.state = StateDeadLettered
+			} else if delay > 0 {
+				// MQLITE-66: a backoff parks the message in 'scheduled' until the scheduler
+				// re-activates it. This run uses DisableBackground, so the scheduler never
+				// runs and the parking is permanent for the model's horizon — exactly what
+				// the engine does.
+				msg.state = StateScheduled
 			} else {
 				msg.state = StateActive
 			}
@@ -86,7 +92,7 @@ func (m *model) settle(queue string, seq int64, token, verb, args string) (ok bo
 	return m.receipts[rkey(queue, seq, token, verb, args)]
 }
 
-func (m *model) counts(queue string) (active, locked, dead, deferred, total int64) {
+func (m *model) counts(queue string) (active, locked, dead, deferred, scheduled, total int64) {
 	for _, msg := range m.msgs {
 		if msg.queue != queue || msg.state == "" {
 			continue
@@ -101,6 +107,8 @@ func (m *model) counts(queue string) (active, locked, dead, deferred, total int6
 			dead++
 		case StateDeferred:
 			deferred++
+		case StateScheduled:
+			scheduled++
 		}
 	}
 	return
@@ -260,7 +268,7 @@ func runModel(t *testing.T, seed int64) {
 					t.Fatalf("round %d: CompleteBatch: %v", i, err)
 				}
 				for k, r := range res {
-					want := m.settle(q, items[k].SeqNumber, items[k].LockToken, "completed", "")
+					want := m.settle(q, items[k].SeqNumber, items[k].LockToken, "completed", "", 0)
 					if r.Ok != want {
 						t.Fatalf(`round %d: BATCH SETTLE DISAGREEMENT
   item   : seq=%d token=%s in queue %s
@@ -319,7 +327,7 @@ func runModel(t *testing.T, seed int64) {
 				args = fmt.Sprintf("reason=%s|desc=%s", reason[0], reason[1])
 			}
 
-			want := m.settle(tq, seq, token, verb, args)
+			want := m.settle(tq, seq, token, verb, args, delay)
 			err := settleEngine(tq, seq, token, verb, delay, reason)
 			got := err == nil
 
@@ -339,17 +347,17 @@ func runModel(t *testing.T, seed int64) {
 
 		// After every operation, the engine's view of the world must match the model's.
 		for _, cq := range qs {
-			wa, wl, wd, wdef, wt := m.counts(cq)
+			wa, wl, wd, wdef, wsch, wt := m.counts(cq)
 			st, err := e.Stats(ctx, cq)
 			if err != nil {
 				t.Fatalf("round %d: stats: %v", i, err)
 			}
-			if st.Active != wa || st.Locked != wl || st.DeadLettered != wd || st.Deferred != wdef || st.Total != wt {
+			if st.Active != wa || st.Locked != wl || st.DeadLettered != wd || st.Deferred != wdef || st.Scheduled != wsch || st.Total != wt {
 				t.Fatalf(`round %d: STATE DIVERGENCE in %s
-  engine: active=%d locked=%d dead=%d deferred=%d total=%d
-  model : active=%d locked=%d dead=%d deferred=%d total=%d`,
-					i, cq, st.Active, st.Locked, st.DeadLettered, st.Deferred, st.Total,
-					wa, wl, wd, wdef, wt)
+  engine: active=%d locked=%d dead=%d deferred=%d scheduled=%d total=%d
+  model : active=%d locked=%d dead=%d deferred=%d scheduled=%d total=%d`,
+					i, cq, st.Active, st.Locked, st.DeadLettered, st.Deferred, st.Scheduled, st.Total,
+					wa, wl, wd, wdef, wsch, wt)
 			}
 		}
 	}

@@ -155,7 +155,7 @@ an expired or wrong `lock_token` → `409 lock_lost`.
 | Method | Extra fields | Effect |
 |---|---|---|
 | `Complete` | — | delete the message (done) |
-| `Abandon` | `delay_ms` (int, optional) | release the lock → redelivered after `delay_ms` |
+| `Abandon` | `delay_ms` (int, optional) | release the lock → redelivered after `delay_ms`; with a delay the head keeps holding its group's line on ordered queues |
 | `Reject` | `dead_letter_reason`, `dead_letter_description` (optional) | move to the DLQ |
 | `Defer` | — | set aside; retrieve later by seq via `ReceiveDeferred` |
 | `Renew` | — | extend the lock by the queue's lock duration |
@@ -168,6 +168,11 @@ an expired or wrong `lock_token` → `409 lock_lost`.
 > via `ReceiveDeferred` and settled (other groups proceed). Normal `Receive` never
 > returns a deferred message, and with no TTL there is no auto-recovery, so recover a
 > lost `seq_number` via `Peek` with `state=deferred`.
+
+> **Abandon + ordering.** With `delay_ms > 0` the message parks as `scheduled` until the
+> backoff lapses and — like a deferred head — holds its head-of-line position on ordered
+> queues: its group (the whole queue under `strict_fifo`) is not delivered ahead of it.
+> With no delay it is redelivered immediately.
 
 ### CompleteBatch
 
