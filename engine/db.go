@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	// Pure-Go drivers, no CGO (design D2 default + L-Turso remote).
@@ -26,6 +27,36 @@ type db struct {
 	remote bool
 	dsn    string    // the user-facing DB string (no auth token — that's only in the conn string)
 	lock   io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
+
+	// The close gate serializes every local operation against Close so Close cannot release the
+	// single-writer file lock — nor close the pool — while a write is still in flight. Without it,
+	// Close returned while a transaction was still committing and dropped the advisory lock, letting
+	// a SECOND process open the same file, run crash recovery, and re-deliver still-held locked rows
+	// (round-8 P1).
+	//
+	// It is a fail-fast admission gate, NOT a lock held for the operation's duration: a new op checks
+	// the flag under `closeMu` and, if closing, returns ErrClosed IMMEDIATELY — it never blocks. That
+	// keeps a deadline-bound caller from hanging (an RWMutex would give a pending Close priority and
+	// make new RLocks wait, uncancellably, behind arbitrary in-flight user SQL — round-8 P2). Close
+	// flips the flag, then waits on the WaitGroup for the ops admitted before it to finish. The flag
+	// check and the WaitGroup Add happen under the same mutex, so no op can be admitted after Close
+	// has begun waiting.
+	closeMu  sync.Mutex
+	closing  bool // admission gate: enter() refuses new ops once set
+	torn     bool // teardown-once guard for close()
+	inFlight sync.WaitGroup
+}
+
+// enter admits a local operation, or reports that the store is closing so the caller fails fast.
+// A successful enter must be paired with exactly one inFlight.Done() (see withConn).
+func (d *db) enter() bool {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	if d.closing {
+		return false
+	}
+	d.inFlight.Add(1) // under closeMu, so it can never race Close's Wait
+	return true
 }
 
 // resolveDSN turns the user-facing DB string + optional auth token into a
@@ -216,7 +247,33 @@ func isNoSuchTable(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no such table")
 }
 
+// beginClosing shuts the admission gate: from here on enter() refuses new operations, so they fail
+// fast with ErrClosed. Engine.Close calls this BEFORE it drains the background workers, so an
+// external Send/Tx arriving during that drain (which can be slow — a maintenance pass may be inside
+// an uninterruptible vacuum or a large retention delete) is refused rather than admitted (round-8).
+// Idempotent; the pool/lock teardown happens later, in close().
+func (d *db) beginClosing() {
+	d.closeMu.Lock()
+	d.closing = true
+	d.closeMu.Unlock()
+}
+
 func (d *db) close() error {
+	// Shut the gate (idempotent) so nothing new is admitted, then wait for the ops already in flight
+	// to finish — a statement still executing, a transaction still committing — before closing the
+	// pool and releasing the file lock, so it is never dropped out from under a live write. The Add
+	// in enter happens under the same mutex as the flag, so every in-flight op is counted before this
+	// Wait observes the total.
+	d.closeMu.Lock()
+	if d.torn {
+		d.closeMu.Unlock()
+		return nil
+	}
+	d.torn = true
+	d.closing = true
+	d.closeMu.Unlock()
+	d.inFlight.Wait()
+
 	err := d.sql.Close()
 	if d.lock != nil {
 		if e := d.lock.Close(); e != nil && err == nil {
@@ -355,6 +412,16 @@ func (d *db) withConn(ctx context.Context, fn func(execCtx context.Context, c *s
 	if err := checkCtx(ctx); err != nil {
 		return err
 	}
+	// Admit this operation, or fail fast if the store is closing. enter never blocks, so a
+	// deadline-bound caller is never stuck behind a pending Close. The op stays "in flight" for its
+	// whole duration — the wait for the connection, the statement, and (for inTx, whose entire
+	// transaction runs inside this closure) the commit — so Close waits for all of it before
+	// releasing the lock. All local access funnels through withConn, and withConn never nests, so
+	// this one gate covers every local operation.
+	if !d.enter() {
+		return ErrClosed
+	}
+	defer d.inFlight.Done()
 	conn, err := d.sql.Conn(ctx) // cancellable WAIT
 	if err != nil {
 		return err
@@ -408,6 +475,11 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 	}
 	var res sql.Result
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return nil, ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -464,6 +536,11 @@ func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any
 	}
 	var res sql.Result
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return nil, ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -508,6 +585,11 @@ func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []an
 		})
 	}
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -544,6 +626,13 @@ func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []an
 // Returning *sql.Rows cannot do that: the rows would outlive the reservation.
 func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
 	if d.remote {
+		// Gate the WHOLE read — the query, the scan, and Rows.Close — not just the query call: the
+		// rows outlive d.query, so releasing the admission when query returns would let Close tear
+		// the pool down mid-scan (round-8 P2). withConn does the same for the local branch below.
+		if !d.enter() {
+			return ErrClosed
+		}
+		defer d.inFlight.Done()
 		rows, err := d.query(ctx, q, args...)
 		if err != nil {
 			return err
@@ -564,6 +653,8 @@ func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error
 func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	var rows *sql.Rows
 	var err error
+	// No admission gate here: query only ever runs inside queryRows's remote branch, which holds the
+	// admission across the scan (the rows outlive this call, so gating here would release too early).
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -596,6 +687,11 @@ func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ..
 		})
 	}
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !d.enter() {
+		return ErrClosed
+	}
+	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
 		if i > 0 {
 			d.backoff(ctx, i)
@@ -722,6 +818,11 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 		})
 	}
 	var err error
+	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	if !e.db.enter() {
+		return ErrClosed
+	}
+	defer e.db.inFlight.Done()
 	for i := 0; i < e.db.attempts(); i++ {
 		if i > 0 {
 			e.db.backoff(ctx, i)

@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
@@ -780,5 +781,208 @@ func TestSubMsOlderThanIsBounded(t *testing.T) {
 				t.Errorf("dead=%d active=%d after a bounded redrive, want 1/1", m.DeadLettered, m.Active)
 			}
 		})
+	}
+}
+
+// TestEmbeddedErrClosedThroughSDK is the SDK-boundary check for the round-8 close contract: an
+// operation on a closed embedded engine surfaces mqlite.ErrClosed through the PUBLIC package, so a
+// caller can errors.Is against it without reaching into engine.
+func TestEmbeddedErrClosedThroughSDK(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := mqlite.OpenEmbedded(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); !errors.Is(err, mqlite.ErrClosed) {
+		t.Fatalf("an operation on a closed embedded engine must be mqlite.ErrClosed, got %v", err)
+	}
+}
+
+// TestEmbeddedCloseStopsRunPromptly is the end-to-end twin of the engine-level long-poll-wake test
+// (round-8): a Receiver.Run long-polling an EMPTY embedded queue must return promptly when another
+// goroutine calls Close — not sleep out its ~20s poll window against a torn-down engine. The
+// fake-source receiver test cannot see this; only a real engine with a real parked waiter can.
+func TestEmbeddedCloseStopsRunPromptly(t *testing.T) {
+	ctx := context.Background()
+	e, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- e.Receiver("q").Run(ctx, func(context.Context, *mqlite.Message) error { return nil })
+	}()
+	time.Sleep(150 * time.Millisecond) // let Run park in its long-poll
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, mqlite.ErrClosed) {
+			t.Fatalf("Run returned %v, want mqlite.ErrClosed", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Receiver.Run was still blocked 3s after Close returned — the long-poll waiter was " +
+			"not woken (it would sleep out its full poll window)")
+	}
+}
+
+// TestRunCancelledThenClosedReturnsCanceled pins the graceful-shutdown ordering (round-8, codex):
+// the caller cancels Run's context while a handler is active, then closes the engine. The worker's
+// cleanup settle hits the closed engine and reports ErrClosed — an artifact of the shutdown itself,
+// which must NOT displace the caller's own story: Run returns context.Canceled. (ErrClosed stays the
+// answer when the engine is closed under a receiver whose context is live —
+// TestEmbeddedCloseStopsRunPromptly.)
+func TestRunCancelledThenClosedReturnsCanceled(t *testing.T) {
+	ctx := context.Background()
+	e, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+
+	rctx, cancel := context.WithCancel(ctx)
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- e.Receiver("q").Run(rctx, func(context.Context, *mqlite.Message) error {
+			close(inHandler)
+			<-release // hold the handler until cancel AND Close have both happened
+			return nil
+		})
+	}()
+	<-inHandler
+
+	cancel()                          // 1. the caller cancels…
+	if err := e.Close(); err != nil { // 2. …then tears the engine down
+		t.Fatalf("close: %v", err)
+	}
+	close(release) // 3. the handler finishes; its cleanup settle hits the closed engine
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run after cancel-then-Close returned %v — the caller cancelled first, so Run "+
+				"must report context.Canceled, not an ErrClosed artifact of its own shutdown", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancel + Close + handler completion")
+	}
+}
+
+// TestEmbeddedCloseWaitsForPublicTx is the round-7 P1 regression pinned on the PUBLIC API surface
+// (the white-box twin lives in engine/storage_test.go): while a public Tx is open and holding the
+// single writer, Close must block until the Tx commits, keep the file lock held the whole time (a
+// second Open gets ErrDBLocked), and only then release it. Nothing below the SDK is touched here,
+// so a future refactor of the internal gate cannot hide this failure. Every wait is gated on an
+// observable state change, never on a fixed sleep — the round-8 rule for this layer.
+func TestEmbeddedCloseWaitsForPublicTx(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	e, err := mqlite.OpenEmbedded(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	inTx := make(chan struct{})
+	closeReturned := make(chan struct{})
+	txDone := make(chan error, 1)
+
+	// A public transaction that has enqueued and now holds the single writer, parked.
+	go func() {
+		txDone <- e.Tx(ctx, func(tx *engine.EngineTx) error {
+			if _, err := tx.SendOne("q", engine.OutMessage{Body: []byte("close-tx")}); err != nil {
+				return err
+			}
+			close(inTx)
+			<-release // hold the transaction open
+			// Deterministic ordering proof at the moment the callback resumes: if Close has
+			// ALREADY returned, the file lock was released while this Tx was still open —
+			// exactly the round-7 P1.
+			select {
+			case <-closeReturned:
+				return fmt.Errorf("Close returned while a public Tx was still open")
+			default:
+			}
+			return nil
+		})
+	}()
+	<-inTx // the transaction is open and holds the writer
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- e.Close()
+		close(closeReturned)
+	}()
+
+	// Deterministic signals while the Tx is still open — none of them may touch the DB conn
+	// (the Tx holds the single writer, so any DB op would queue behind it and deadlock the
+	// test). The second-Open probe is safe: it is a sidecar file-lock attempt, not a DB op.
+	//
+	// 1. Close must not have returned: the Tx has not committed yet.
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while a public Tx was still open (err=%v) — it released the "+
+			"writer/file lock early", err)
+	default:
+		// good: Close is blocked on the transaction
+	}
+	// 2. The file lock must still be held: a second engine on the same file is refused.
+	if e2, err := mqlite.OpenEmbedded(ctx, dsn); !errors.Is(err, mqlite.ErrDBLocked) {
+		if e2 != nil {
+			_ = e2.Close()
+		}
+		t.Fatalf("a second Open during an in-flight public Tx + pending Close must get "+
+			"ErrDBLocked, got %v", err)
+	}
+
+	close(release) // let the transaction commit and return
+
+	if err := <-txDone; err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the transaction committed")
+	}
+
+	// Now — and only now — the file can be reopened, and the Tx's enqueue is durable.
+	e3, err := mqlite.OpenEmbedded(ctx, dsn)
+	if err != nil {
+		t.Fatalf("reopen after a clean close: %v", err)
+	}
+	defer e3.Close()
+	msgs, err := e3.Peek(ctx, "q")
+	if err != nil {
+		t.Fatalf("peek after reopen: %v", err)
+	}
+	if len(msgs) != 1 || string(msgs[0].Body) != "close-tx" {
+		t.Fatalf("the Tx's enqueue is not durable after reopen: got %d message(s)", len(msgs))
 	}
 }

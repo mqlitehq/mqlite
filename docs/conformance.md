@@ -246,6 +246,15 @@ engine to grade itself — an engine with a bug reports that everything is fine.
   *(engine/concurrency_test.go)*
 - **14.4 No loss.** Every message sent is eventually completed — not most of them.
   *(engine/concurrency_test.go)*
+- **14.5 Shutdown fences the store.** `Close` closes admission before anything else: DB work
+  that begins after shutdown starts MUST fail fast with `ErrClosed`; work already admitted —
+  a statement, row scan, transaction callback, or commit in flight — MUST complete before the
+  file lock is released, and a second `Open` on the same file during that window MUST be
+  refused (`ErrDBLocked`); an empty long-poll `Receive` MUST be woken with `ErrClosed` rather
+  than sleeping out its poll window against a closed engine. `Close` MUST NOT be called from
+  inside a `Tx` callback — it waits for the callback, so that deadlocks.
+  *(sdk_test.go: TestEmbeddedCloseWaitsForPublicTx · engine/storage_test.go:
+  TestCloseWaitsForInFlightWritesBeforeReleasingTheLock, TestCloseWakesLongPollWaiters)*
 
 ## 15 · Crash recovery (process death)
 

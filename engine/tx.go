@@ -91,6 +91,11 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 //
 // Local file and :memory: stores never retry, so there fn runs zero or one time — zero when the
 // caller was already cancelled before the transaction began.
+//
+// fn MUST NOT call Close (directly or transitively). The transaction is a live operation that Close
+// waits to finish before it tears the engine down, and fn cannot finish until it returns — so a
+// Close from inside fn deadlocks, the same way locking a sync.Mutex you already hold does. Close the
+// engine from outside its transactions.
 func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
 	var woke map[string]bool
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {

@@ -33,6 +33,16 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   (MQLITE-73): re-subscribing changes only the mapping/filter; lock duration, delivery
   count, TTL, dedup, ordering and DLQ settings previously configured on the backing queue
   now survive (they were silently reset to defaults on every filter update).
+- **`Close()` is now a fenced lifecycle shutdown** (round-7/8 review campaign, MQLITE-101):
+  `Close` shuts the admission gate first — any DB operation that starts after shutdown
+  begins fails fast with `ErrClosed` — wakes empty long-poll `Receive`s with `ErrClosed`
+  instead of letting them sleep out their poll window, and **waits for in-flight writes and
+  transactions to finish before releasing the file lock**. Previously `Close` released the
+  file lock immediately even while a foreground transaction was still writing: a second
+  `Open` on the same file could succeed mid-shutdown and both engines could write at once
+  (a double-writer window). Pinned by public-`Tx` and engine-level regression tests.
+  Note: `Close` MUST NOT be called from inside a `Tx` callback — it waits for the callback,
+  so that deadlocks; this is documented on `Tx` and `Close`.
 - **Malformed `MQLITE_TOKENS` now fails startup instead of silently disabling auth**
   (MQLITE-69): a value that is non-blank but parses to no token (e.g. `","`, `" , "`) used
   to log "auth enabled" while running fully open. Only the exact `off` disables auth.

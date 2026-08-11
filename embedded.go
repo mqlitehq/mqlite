@@ -114,7 +114,14 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 // Engine exposes the underlying engine (advanced/embedded use).
 func (e *Embedded) Engine() *engine.Engine { return e.eng }
 
-// Close stops background loops and closes the DB.
+// Close shuts the engine down safely: it stops the background loops, closes the admission
+// gate (any DB operation that starts after shutdown begins fails fast with ErrClosed), wakes
+// empty long-poll Receives with ErrClosed, waits for already-admitted writes and
+// transactions to finish, and only then closes the DB and releases the file lock. Returns
+// the teardown error, if any.
+//
+// Because it waits for in-flight work, Close MUST NOT be called from inside an operation it
+// would wait for — in particular, not from within a Tx callback (see Tx). Doing so deadlocks.
 func (e *Embedded) Close() error { return e.eng.Close() }
 
 // Compact reclaims free DB pages to the OS: `PRAGMA incremental_vacuum` (no global
@@ -229,6 +236,9 @@ func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Messag
 // counter in memory, an HTTP call — none of those roll back with the transaction, and a replay will
 // repeat them (round-4 §5.2). Local file and :memory: stores never retry, so fn runs at most once
 // there.
+//
+// fn MUST NOT call Close: Close waits for the open transaction to finish before tearing the engine
+// down, and fn cannot finish until it returns, so it would deadlock. Close from outside the callback.
 func (e *Embedded) Tx(ctx context.Context, fn func(*engine.EngineTx) error) error {
 	return e.eng.Tx(ctx, fn)
 }
