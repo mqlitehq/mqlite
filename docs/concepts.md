@@ -52,7 +52,8 @@ is deleted from the database:
 ```
                    ┌───────────┐
   Send(scheduled)  │ scheduled │   scheduler, when due ─► active
-  ───────────────► └─────┬─────┘   cancel ─► ✗ removed
+  ───────────────► └─────┬─────┘   cancel ─► ✗ removed (never-delivered only)
+  Abandon(delay_ms>0) ───┘  (backoff parking: holds its group on ordered queues)
                          │
                          ▼
   Send             ┌──────────┐ ◄── requeue: abandon / lock-expiry, count < max  (reaper)
@@ -80,10 +81,11 @@ Every transition, with its trigger and the condition under which it fires:
 | _(new)_ | `Send` | active | delivered immediately |
 | _(new)_ | `Send` scheduled | scheduled | enqueue time is in the future |
 | scheduled | scheduler loop | active | enqueue time reached |
-| scheduled | `Cancel` | ✗ removed | cancel before it activates |
+| scheduled | `Cancel` | ✗ removed | cancel before it activates; never-delivered rows only (`delivery_count=0`) |
 | active | `Receive` / claim | locked | `count`++; lock acquired |
 | locked | `Complete` | ✗ removed | fenced on `lock_token` |
-| locked | `Abandon` | active | `count < max`; optional backoff delay |
+| locked | `Abandon` | active | `count < max`, no backoff delay (immediate redelivery) |
+| locked | `Abandon` | scheduled | `count < max` with `delay_ms > 0`: backoff parking — auto-reactivated when due, holds its group on ordered queues |
 | locked | `Abandon` | dead_lettered | `count ≥ max` |
 | locked | lock expiry (reaper) | active | `count < max`; auto-redelivered |
 | locked | lock expiry (reaper) | dead_lettered | `count ≥ max` (`MaxDeliveryCountExceeded`) |
@@ -113,10 +115,10 @@ Every transition, with its trigger and the condition under which it fires:
   has exhausted `max_delivery_count`, which also unblocks the group. The cost is that
   a consumer timeout stalls its group for up to one reaper interval (~1s) — the same
   trade SQS FIFO makes. A slow-but-alive consumer should `Renew` its lock rather than
-  let it lapse. An explicit `Abandon` releases the head immediately; note that
-  `Abandon` with a `delay_ms` re-hides the head **without** holding its group, so
-  successors can overtake it during the backoff — use `Defer` when order must hold
-  across a backoff.
+  let it lapse. An explicit `Abandon` releases the head immediately; with a
+  `delay_ms` backoff the head parks in `scheduled` until the backoff lapses and —
+  like a scheduled send — keeps blocking its group (strict: the whole queue) until
+  it is redelivered first, so order holds across a backoff (MQLITE-66).
 - You can have any number of independent plain queues.
 
 ### Topic

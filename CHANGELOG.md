@@ -43,6 +43,15 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   (a double-writer window). Pinned by public-`Tx` and engine-level regression tests.
   Note: `Close` MUST NOT be called from inside a `Tx` callback — it waits for the callback,
   so that deadlocks; this is documented on `Tx` and `Close`.
+- **`Abandon` with a backoff delay now holds the group's line** (MQLITE-66): on an
+  ordered queue (`group_fifo`/`strict_fifo`, or grouped messages on `standard`),
+  `Abandon` with `delay_ms > 0` used to requeue the head as `active` with a future
+  `visible_at` — invisible to the head-of-line probe — so successors overtook the
+  backing-off head during the backoff (out-of-order delivery). The head now parks in
+  `scheduled` until the backoff lapses (the scheduler re-activates it), exactly like a
+  delayed send, and the group stays blocked behind it. `Cancel` correspondingly only
+  deletes scheduled messages that were never delivered (`delivery_count=0`) — a
+  backoff-parked redelivery is not cancellable and stays under the retry/DLQ discipline.
 - **Malformed `MQLITE_TOKENS` now fails startup instead of silently disabling auth**
   (MQLITE-69): a value that is non-blank but parses to no token (e.g. `","`, `" , "`) used
   to log "auth enabled" while running fully open. Only the exact `off` disables auth.

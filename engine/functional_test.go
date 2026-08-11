@@ -121,7 +121,8 @@ func TestMaxMessageSize(t *testing.T) {
 	}
 }
 
-// Abandon with a delay re-hides the message until the delay elapses (backoff).
+// Abandon with a delay parks the message in 'scheduled' until the backoff lapses — invisible
+// during the backoff, reactivated by the scheduler pass once it is over (MQLITE-66).
 func TestAbandonWithDelay(t *testing.T) {
 	ctx := context.Background()
 	e, msp := testEngine(t)
@@ -135,6 +136,7 @@ func TestAbandonWithDelay(t *testing.T) {
 		t.Fatal("message should be hidden during backoff delay")
 	}
 	advance(msp, 3*time.Second)
+	e.RunMaintenanceOnce(ctx) // the scheduler pass reactivates the parked message (in prod: ~1s tick)
 	if got := recvOne(t, e, "q"); got == nil {
 		t.Fatal("message should reappear after backoff delay")
 	}
@@ -1162,6 +1164,143 @@ func TestFIFOHoldsAcrossLockExpiry(t *testing.T) {
 		}
 		if m2 := recvOne(t, e, "q"); m2 == nil || string(m2.Body) != "m2" {
 			t.Fatalf("m2 follows once the head settles, got %+v", m2)
+		}
+	})
+}
+
+// TestAbandonDelayHoldsGroupOrder pins MQLITE-66: Abandon with delay_ms>0 used to requeue
+// the head as 'active' with a future visible_at — invisible to the head-of-line probe
+// (which covers deferred/scheduled/locked only) — so successors overtook the group head
+// during the backoff. The fix parks a delayed-abandon head in 'scheduled' (probe-covered)
+// until the scheduler re-activates it, mirroring what delayed sends already do.
+func TestAbandonDelayHoldsGroupOrder(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("group_fifo: backing-off head holds its group, others proceed", func(t *testing.T) {
+		e, ms := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderGroupFIFO})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g1a"), GroupID: "G1"})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g1b"), GroupID: "G1"})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("g2a"), GroupID: "G2"})
+
+		head := recvOne(t, e, "q")
+		if head == nil || string(head.Body) != "g1a" {
+			t.Fatalf("expected g1a first, got %+v", head)
+		}
+		if err := e.Abandon(ctx, "q", head.SeqNumber, head.LockToken, 10_000); err != nil {
+			t.Fatalf("abandon with delay: %v", err)
+		}
+
+		// During the backoff: G1 is frozen behind its parked head...
+		if got := recvOne(t, e, "q"); got == nil || got.GroupID != "G2" {
+			t.Fatalf("only G2 may proceed while G1's head backs off, got %+v", got)
+		}
+		if blocked := recvOne(t, e, "q"); blocked != nil {
+			t.Fatalf("g1b must not overtake a backing-off head, got %q", blocked.Body)
+		}
+
+		// ...until the backoff lapses and the scheduler re-activates the head,
+		// which is then redelivered BEFORE its successors.
+		advance(ms, 11*time.Second)
+		e.RunMaintenanceOnce(ctx)
+		redelivered := recvOne(t, e, "q")
+		if redelivered == nil || string(redelivered.Body) != "g1a" {
+			t.Fatalf("the backing-off head must be redelivered before its successors, got %+v", redelivered)
+		}
+		if redelivered.DeliveryCount != 2 {
+			t.Fatalf("redelivery must bump delivery_count to 2, got %d", redelivered.DeliveryCount)
+		}
+		if err := e.Complete(ctx, "q", redelivered.SeqNumber, redelivered.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if next := recvOne(t, e, "q"); next == nil || string(next.Body) != "g1b" {
+			t.Fatalf("after the head settles, G1 advances to g1b, got %+v", next)
+		}
+	})
+
+	t.Run("strict_fifo: backing-off head stalls the whole queue", func(t *testing.T) {
+		e, ms := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderStrictFIFO})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("m1")})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("m2")})
+
+		m1 := recvOne(t, e, "q")
+		if m1 == nil || string(m1.Body) != "m1" {
+			t.Fatalf("expected m1 first, got %+v", m1)
+		}
+		if err := e.Abandon(ctx, "q", m1.SeqNumber, m1.LockToken, 10_000); err != nil {
+			t.Fatalf("abandon with delay: %v", err)
+		}
+		if blocked := recvOne(t, e, "q"); blocked != nil {
+			t.Fatalf("m2 must not overtake a backing-off head, got %q", blocked.Body)
+		}
+		advance(ms, 11*time.Second)
+		e.RunMaintenanceOnce(ctx)
+		redelivered := recvOne(t, e, "q")
+		if redelivered == nil || string(redelivered.Body) != "m1" {
+			t.Fatalf("the backing-off head must be redelivered first, got %+v", redelivered)
+		}
+		if err := e.Complete(ctx, "q", redelivered.SeqNumber, redelivered.LockToken); err != nil {
+			t.Fatal(err)
+		}
+		if m2 := recvOne(t, e, "q"); m2 == nil || string(m2.Body) != "m2" {
+			t.Fatalf("m2 follows once the head settles, got %+v", m2)
+		}
+	})
+
+	t.Run("zero delay redelivers immediately, still in order", func(t *testing.T) {
+		e, _ := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderGroupFIFO})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("a"), GroupID: "G"})
+		e.SendOne(ctx, "q", OutMessage{Body: []byte("b"), GroupID: "G"})
+
+		head := recvOne(t, e, "q")
+		if head == nil || string(head.Body) != "a" {
+			t.Fatalf("expected a first, got %+v", head)
+		}
+		if err := e.Abandon(ctx, "q", head.SeqNumber, head.LockToken, 0); err != nil {
+			t.Fatalf("abandon: %v", err)
+		}
+		again := recvOne(t, e, "q")
+		if again == nil || string(again.Body) != "a" {
+			t.Fatalf("zero-delay abandon must redeliver the head immediately, got %+v", again)
+		}
+	})
+
+	t.Run("a backoff-parked message is not cancellable", func(t *testing.T) {
+		e, ms := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{})
+
+		// A genuine scheduled send is still cancellable (never delivered).
+		sseq, err := e.Schedule(ctx, "q", OutMessage{Body: []byte("later")}, atomic.LoadInt64(ms)+60_000)
+		if err != nil {
+			t.Fatalf("schedule: %v", err)
+		}
+		if err := e.Cancel(ctx, "q", sseq); err != nil {
+			t.Fatalf("a not-yet-delivered scheduled send must stay cancellable, got %v", err)
+		}
+
+		// A delayed-abandon backoff parks in 'scheduled' too, but it has been delivered
+		// (delivery_count=1): Cancel must not silently remove it from the retry discipline.
+		seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := recvOne(t, e, "q")
+		if m == nil {
+			t.Fatal("expected the message")
+		}
+		if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 60_000); err != nil {
+			t.Fatalf("abandon with delay: %v", err)
+		}
+		if err := e.Cancel(ctx, "q", seq); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Cancel on a backoff-parked (already-delivered) message must be ErrNotFound, got %v", err)
+		}
+		// And it still comes back after the backoff — it was not lost.
+		advance(ms, 61*time.Second)
+		e.RunMaintenanceOnce(ctx)
+		if back := recvOne(t, e, "q"); back == nil || string(back.Body) != "x" {
+			t.Fatalf("the parked message must be redelivered after its backoff, got %+v", back)
 		}
 	})
 }

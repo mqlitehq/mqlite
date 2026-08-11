@@ -156,7 +156,11 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 
 // Abandon releases the lock and redelivers, or dead-letters if delivery_count
 // has reached the queue's max (§8.5). delayMs applies exponential-backoff style
-// re-visibility when requeued.
+// re-visibility when requeued: with delayMs>0 the message parks in 'scheduled'
+// (not 'active' with a future visible_at) until the backoff lapses — the
+// head-of-line probe covers 'scheduled', so on an ordered queue the backing-off
+// head keeps blocking its group and successors cannot overtake it (MQLITE-66);
+// the scheduler re-activates it at visible_at. delayMs=0 redelivers immediately.
 func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
 	now := e.now()
 	// The delay is part of the request's identity: replaying Abandon with a DIFFERENT delay is a
@@ -165,7 +169,9 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET
 			    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
-			                 THEN 'dead_lettered' ELSE 'active' END,
+			                 THEN 'dead_lettered'
+			                 WHEN ? > 0 THEN 'scheduled'
+			                 ELSE 'active' END,
 			    locked_until = 0,
 			    lock_token   = NULL,
 			    visible_at = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
@@ -173,7 +179,7 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 			    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 			                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
 			 WHERE id=? AND queue=? AND lock_token=?`,
-			now+delayMs, seq, queue, token)
+			delayMs, now+delayMs, seq, queue, token)
 		if err != nil {
 			return 0, err
 		}
