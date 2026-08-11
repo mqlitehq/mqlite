@@ -122,7 +122,7 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   until its time, then the scheduler activates it; `Cancel` deletes a scheduled
   message that has never been delivered (`delivery_count=0`) — a backoff-parked
   redelivery (§2.2) is NOT cancellable and stays under the retry/DLQ discipline.
-  *(engine/functional_test.go; TestAbandonDelayHoldsGroupOrder)*
+  *(engine/functional_test.go: TestAbandonDelayHoldsGroupOrder)*
 - **7.2 TTL** — an expired message (`expires_at`) MUST move to the DLQ when the queue
   has `dead_letter_on_expire`, else be discarded. The two branches cover the **same
   state set** — every non-terminal state including `scheduled`: a row the scheduler
