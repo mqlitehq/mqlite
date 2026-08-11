@@ -28,7 +28,7 @@ jobs:
             echo "internal/version/version.go does not declare Version = \"${base}\" for tag ${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - uses: goreleaser/goreleaser-action@v7
