@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual escape hatch: trigger the full matrix on any branch from the Actions
+  # UI / `gh workflow run ci.yml --ref <branch>` — used when pull_request event
+  # delivery is unavailable (2026-08-11 incident, PR #157).
+  workflow_dispatch:
 
 permissions:
   contents: read
