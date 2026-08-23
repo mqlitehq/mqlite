@@ -203,7 +203,7 @@ func wireShape(t reflect.Type) []string {
 	out := []string{}
 	var walk func(rt reflect.Type, prefix string)
 	walk = func(rt reflect.Type, prefix string) {
-		for rt.Kind() == reflect.Ptr {
+		for rt.Kind() == reflect.Pointer {
 			rt = rt.Elem()
 		}
 		if rt.Kind() != reflect.Struct {
@@ -219,7 +219,7 @@ func wireShape(t reflect.Type) []string {
 				continue
 			}
 			ft := f.Type
-			for ft.Kind() == reflect.Ptr {
+			for ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
 			switch {
