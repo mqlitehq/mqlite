@@ -248,6 +248,7 @@ func runModel(t *testing.T, seed int64) {
 			}
 			n := 1 + rng.Intn(4)
 			items := make([]SettleItem, n)
+			complete := rng.Intn(2) == 0
 			for k := range items {
 				// Same generator, same point: the pairs are often deliberately wrong. And every so
 				// often a pair is REPEATED inside one batch — the same request twice in the same
@@ -261,8 +262,31 @@ func runModel(t *testing.T, seed int64) {
 					SeqNumber: seenSeqs[rng.Intn(len(seenSeqs))],
 					LockToken: seenTokens[rng.Intn(len(seenTokens))],
 				}
+				// Include live pairs so batch settlements also create receipts for later replay.
+				if mm := m.msgs[items[k].SeqNumber]; mm.queue == q && mm.state == StateLocked && rng.Intn(3) == 0 {
+					items[k].LockToken = mm.token
+				}
 			}
-			if rng.Intn(2) == 0 {
+			if complete {
+				// MQLITE-104: deliberate single/batch-to-batch replays, including receipts for
+				// other verbs and one-field identity mutations. Random pairs almost never hit one.
+				if len(history) > 0 && rng.Intn(3) == 0 {
+					h := history[rng.Intn(len(history))]
+					q = h.q
+					items[0] = SettleItem{SeqNumber: h.seq, LockToken: h.token}
+					switch rng.Intn(4) {
+					case 1:
+						if q == qs[0] {
+							q = qs[1]
+						} else {
+							q = qs[0]
+						}
+					case 2:
+						items[0].SeqNumber++
+					case 3:
+						items[0].LockToken += "-wrong"
+					}
+				}
 				res, err := e.CompleteBatch(ctx, q, items)
 				if err != nil {
 					t.Fatalf("round %d: CompleteBatch: %v", i, err)
@@ -274,6 +298,9 @@ func runModel(t *testing.T, seed int64) {
   item   : seq=%d token=%s in queue %s
   engine : ok=%v
   model  : ok=%v`, i, items[k].SeqNumber, items[k].LockToken, q, r.Ok, want)
+					}
+					if r.Ok {
+						history = append(history, issued{q: q, seq: items[k].SeqNumber, token: items[k].LockToken, verb: "completed"})
 					}
 				}
 			} else {

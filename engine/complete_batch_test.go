@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -796,6 +797,120 @@ func TestReceiptsAreBoundToTheirMessage(t *testing.T) {
 }
 
 // ─── receipt identity: the ARGUMENTS ──────────────────────────────────────────
+
+// MQLITE-104: cross every receipt writer with every reader and vary each identity
+// field independently. In particular, changing only the queue preserves the seq
+// and token needed to expose a missing queue predicate in the batch receipt lookup.
+func TestSettlementReceiptIdentityMatrix(t *testing.T) {
+	type operation struct {
+		name, verb, reason, desc string
+		delay                    int64
+		batch                    bool
+	}
+	ops := []operation{
+		{name: "Complete", verb: "completed"},
+		{name: "CompleteBatch", verb: "completed", batch: true},
+		{name: "Abandon", verb: "abandoned"},
+		{name: "AbandonDelayed", verb: "abandoned", delay: 5_000},
+		{name: "Reject", verb: "dead_lettered", reason: "PoisonMessage", desc: "first failure"},
+		{name: "RejectOtherReason", verb: "dead_lettered", reason: "OtherReason", desc: "first failure"},
+		{name: "RejectOtherDescription", verb: "dead_lettered", reason: "PoisonMessage", desc: "other failure"},
+		{name: "Defer", verb: "deferred"},
+	}
+	ctx := context.Background()
+	for _, first := range ops {
+		t.Run(first.name, func(t *testing.T) {
+			e, _ := testEngine(t)
+			for _, q := range []string{"q", "other"} {
+				mustQueue(t, e, q, QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
+				for i := 0; i < 2; i++ {
+					if _, err := e.SendOne(ctx, q, OutMessage{Body: []byte("m")}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 2})
+			if err != nil || len(msgs) != 2 {
+				t.Fatalf("receive: n=%d err=%v", len(msgs), err)
+			}
+			if other, err := e.Receive(ctx, "other", ReceiveOptions{MaxMessages: 2}); err != nil || len(other) != 2 {
+				t.Fatalf("receive other: n=%d err=%v", len(other), err)
+			}
+			a, b := msgs[0], msgs[1]
+			call := func(t *testing.T, op operation, q string, seq int64, token string) bool {
+				t.Helper()
+				if op.batch {
+					res, err := e.CompleteBatch(ctx, q, []SettleItem{{SeqNumber: seq, LockToken: token}})
+					if err != nil || len(res) != 1 {
+						t.Fatalf("CompleteBatch: results=%v err=%v", res, err)
+					}
+					if res[0].SeqNumber != seq || res[0].LockedUntilMs != 0 {
+						t.Fatalf("unexpected batch result: %+v", res[0])
+					}
+					return res[0].Ok
+				}
+				var err error
+				switch op.verb {
+				case "completed":
+					err = e.Complete(ctx, q, seq, token)
+				case "abandoned":
+					err = e.Abandon(ctx, q, seq, token, op.delay)
+				case "dead_lettered":
+					err = e.Reject(ctx, q, seq, token, op.reason, op.desc)
+				case "deferred":
+					err = e.Defer(ctx, q, seq, token)
+				}
+				if err != nil && !errors.Is(err, ErrLockLost) {
+					t.Fatalf("%s: %v", op.name, err)
+				}
+				return err == nil
+			}
+			if !call(t, first, "q", a.SeqNumber, a.LockToken) {
+				t.Fatal("initial settlement lost its live lock")
+			}
+			snapshot := func(t *testing.T) map[string][]*PeekedMessage {
+				t.Helper()
+				out := make(map[string][]*PeekedMessage)
+				for _, q := range []string{"q", "other"} {
+					var err error
+					out[q], err = e.Peek(ctx, q, PeekOptions{Max: 10})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				return out
+			}
+			before, completed := snapshot(t), e.CompletedCounts()
+			identities := []struct {
+				name, queue, token string
+				seq                int64
+			}{
+				{"exact", "q", a.LockToken, a.SeqNumber},
+				{"wrong_queue", "other", a.LockToken, a.SeqNumber},
+				{"wrong_seq", "q", a.LockToken, b.SeqNumber},
+				{"wrong_token", "q", b.LockToken, a.SeqNumber},
+				{"empty_token", "q", "", a.SeqNumber},
+			}
+			for _, second := range ops {
+				for _, id := range identities {
+					t.Run(second.name+"/"+id.name, func(t *testing.T) {
+						want := id.name == "exact" && first.verb == second.verb &&
+							first.delay == second.delay && first.reason == second.reason && first.desc == second.desc
+						if got := call(t, second, id.queue, id.seq, id.token); got != want {
+							t.Errorf("receipt replay ok=%v, want %v", got, want)
+						}
+						if after := snapshot(t); !reflect.DeepEqual(after, before) {
+							t.Errorf("receipt replay changed messages: before=%+v after=%+v", before, after)
+						}
+						if after := e.CompletedCounts(); !reflect.DeepEqual(after, completed) {
+							t.Errorf("receipt replay changed completed counts: before=%v after=%v", completed, after)
+						}
+					})
+				}
+			}
+		})
+	}
+}
 
 // A receipt vouches for a REQUEST. Same message, same token, same verb — but a different delay or
 // a different dead-letter reason is a DIFFERENT request, and it must not inherit the first one's
