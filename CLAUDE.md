@@ -78,14 +78,40 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
   maintainer's explicit go-ahead. Default version bumps are **patch** (semver)
   unless told otherwise.
 - **Pre-tag checklist:** bump `internal/version/version.go` (the single version
-  source both binaries report; release.yml refuses a tag that doesn't match it),
+  source both binaries report; both release workflows refuse a mismatched tag),
   update `CHANGELOG.md`, sync the docs' pinned version examples
   (README/deployment/api-reference), and — if mqlite-web changed — refresh the
   embedded console dist under `server/web/`. A `vX.Y.Z-rc.N` tag runs the full
-  pipeline without touching `:latest` (prerelease auto-detected) — cheap dress
+  pipeline with only its full image tag (no minor or `:latest` alias) — a
   rehearsal before the real tag. Delete the rc release + tag before promoting
   (GORELEASER_CURRENT_TAG pins the build to the pushed tag either way, but a
   dangling rc release invites confusion).
+- **Release CI gate:** `.github/scripts/release_guard.py` is shared by the binary
+  and image workflows. The real tag must resolve locally and remotely to the
+  same commit and match that commit's version constant. The latest eligible
+  `push` or `workflow_dispatch` CI run for that exact commit must have completed
+  successfully with all 12 expected jobs successful in the same run attempt;
+  skipped, missing, failed, or pending jobs block publishing. A PR merge-ref run
+  does not qualify. Rerun **all jobs** after a failure, or dispatch `ci.yml` on the
+  intended source ref, and wait for completion before requesting tag approval.
+  Manual image releases require an existing version tag and check out its
+  verified SHA, even when dispatched from a different branch. Workflow/CI changes
+  require reviewing the full contract goldens in `test/release_guard_test.py`.
+- **Every archive binary is scanned:** the existing `govulncheck` CI job also
+  runs `goreleaser build --snapshot --clean`, which uses the release configuration
+  and its post-build binary scan for both commands on all six OS/architecture
+  pairs. The same hooks scan the actual files during release before packaging;
+  a source scan on Linux alone does not cover Windows/macOS dependencies.
+  Release builds remove DWARF data with `-w` but retain symbols: `-s` would make
+  binary analysis fall back to conservative module-level matches.
+- **Container verification:** Docker builds scan the actual compiled binary with
+  `govulncheck -mode=binary` before copying it to the runtime image. CI builds
+  `linux/amd64` with current base images and checks OCI version/revision labels,
+  authentication, send/receive/complete, and recovery after recreating the
+  container with the same persistent volume (`test/release_image_smoke.py`).
+  For an RC, the OCI version is the full `X.Y.Z-rc.N`; binaries report the source
+  constant's base `X.Y.Z`. The smoke accepts the full expected image version and
+  checks both forms.
 - **One ticket → one PR**; CI must be green before merge (the `gh pr checks` exit
   code is the gate); reference the Backlog id (`MQLITE-N`) in the commit/PR.
 - **The `go 1.21` floor is deliberate** — it is the embedding-compatibility floor,
@@ -94,7 +120,7 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
   `TestGoModFloorStaysAt121` (in `sdk_test.go`) + Dependabot ignore rules and
   explained in `docs/dependencies.md`; `govulncheck`
   stays green at the pins. Release **binaries are built with the latest patched Go**
-  (Docker `golang:1.25`, CI `stable`) so the shipped artifact carries current stdlib
+  (Docker `golang:1.27-alpine3.24`, CI `stable`) so the shipped artifact carries current stdlib
   security fixes — the low floor governs who can *import* the SDK, not what compiles
   the release.
 - Longer design notes that don't fit in code live in `docs/`: `dependencies.md`,

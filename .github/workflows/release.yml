@@ -1,14 +1,14 @@
 name: release
 
-# On a v* tag: build cross-platform binary archives and publish the GitHub Release
-# (changelog + checksums) with GoReleaser. The container image is built in parallel by
-# release-image.yml (GHCR).
+# Publishing requires explicit maintainer approval to create the tag. Both release
+# workflows verify the tag's source and the same complete CI run before building.
 on:
   push:
     tags: ['v*']
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   goreleaser:
@@ -16,21 +16,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # full history so the changelog can diff from the previous tag
-      # The version constant is the single source every binary self-reports
-      # (internal/version). Refuse to ship a tag the binaries would contradict;
-      # a pre-release tag (v0.2.0-rc.1) is checked against its base version.
-      - name: verify version constant matches the tag
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          base="${tag%%-*}"
-          if ! grep -q "Version = \"${base}\"" internal/version/version.go; then
-            echo "internal/version/version.go does not declare Version = \"${base}\" for tag ${GITHUB_REF_NAME}" >&2
-            exit 1
-          fi
+          fetch-depth: 0
+      - name: verify release tag and complete CI
+        id: release
+        run: python3 .github/scripts/release_guard.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          fetch-depth: 0
+      - name: verify build checkout
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
       - uses: actions/setup-go@v7
         with:
           go-version: stable
+          check-latest: true
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
@@ -38,9 +41,5 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Pin GoReleaser to THE tag that triggered this run. With two tags on
-          # one commit (an rc and its promotion) GoReleaser's own tag discovery
-          # picked the rc, rebuilt rc-named artifacts and failed uploading them
-          # to the existing rc release (v0.2.0, 2026-07-11). The ref name is
-          # always the pushed tag here (workflow triggers on tags only).
-          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+          # Pin the approved tag even when an RC and stable tag share a commit.
+          GORELEASER_CURRENT_TAG: ${{ steps.release.outputs.tag }}

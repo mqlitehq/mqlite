@@ -1,7 +1,7 @@
 # Bench image: builds the load generator + bundles system-monitoring tools.
-# Built at NATIVE arch (no --platform) so CPU/throughput reflect real hardware,
-# not qemu emulation. Build context = module root:  docker build -f test/bench/Dockerfile .
-FROM golang:1.25-bookworm
+# Build context = module root:
+# docker build --platform linux/amd64 -f test/bench/Dockerfile -t mqlite-bench:latest .
+FROM golang:1.27-trixie
 RUN apt-get update && apt-get install -y --no-install-recommends \
       sysstat procps coreutils && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
