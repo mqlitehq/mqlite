@@ -9,7 +9,7 @@ import (
 
 // TestNoStrayLegacyPort guards the 6754 migration (MQLITE-84): the previous default broker
 // port must not reappear as a casual default anywhere in the tracked source or docs. The
-// only place allowed to name it is deliberate upgrade/compat documentation (CHANGELOG.md).
+// only places allowed to name it are deliberate upgrade/compat documents below.
 // Any new occurrence fails loudly so the old port can't quietly creep back as a default.
 //
 // The needle is assembled at runtime so this guard never matches itself.
@@ -24,6 +24,8 @@ func TestNoStrayLegacyPort(t *testing.T) {
 		// silently answers nothing (review round-3 §3.1). This is migration documentation, the
 		// case this guard explicitly allows for — not a default creeping back.
 		filepath.FromSlash("docs/deployment.md"): true,
+		// The operations runbook explicitly rehearses the old-to-new port/schema cutover.
+		filepath.FromSlash("docs/operations.md"): true,
 	}
 	skipDir := map[string]bool{
 		".git": true, "node_modules": true, "bin": true, "testdata": true,

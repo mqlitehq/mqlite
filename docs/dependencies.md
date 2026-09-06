@@ -22,11 +22,26 @@ to the same floor; the CI matrix is the backstop if a future version raises it.
 
 ## Security posture
 
-Freezing means we forgo upstream *non-security* fixes from later releases. The
-compensating control is **`govulncheck` in CI** (the `govulncheck` job), which
-fails the build if a known vulnerability is reachable at the pinned versions. It is
-green today. If a CVE ever lands against `modernc.org/sqlite` v1.36.1 specifically,
-that forces the decision below — security wins over the embedding floor.
+Freezing requires checking upstream defects as well as running scanners. CI runs
+`govulncheck` on source and uses the GoReleaser release matrix to scan both actual
+binaries on all six OS/architecture pairs. Release hooks repeat those binary scans;
+Docker scans its actual output too. Artifacts retain symbols so the scanner can
+identify linked code instead of falling back to module-level matches. No advisory
+is excluded. A reachable vulnerability requires a fix or a deliberate change to
+the compatibility floor; the floor does not override security.
+
+For example, [GO-2026-5024](https://pkg.go.dev/vuln/GO-2026-5024) affects an
+`x/sys/windows` function that the current MQLite binaries do not call. Both Windows
+source analysis and symbol-preserving binary scans confirm that boundary. The
+binary gates must continue to pass if a later code/dependency change adds a call.
+
+Go vulnerability scanning does not cover every native SQLite defect. SQLite's
+[WAL-reset issue](https://www.sqlite.org/wal.html#the_wal_reset_bug) affects older
+SQLite versions when multiple connections concurrently write/checkpoint one WAL
+database. MQLite serializes local operations on one SQL connection; keep external
+backup connections read-only and never run another writer/checkpointer against the
+live file. The [operations runbook](operations.md#consistent-backups) preserves that
+restriction. Review native engine advisories before changing this connection model.
 
 ## How the freeze is enforced
 

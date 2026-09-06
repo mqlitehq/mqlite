@@ -248,7 +248,8 @@ Browse without locking or settling (triage; recover a deferred seq).
 
 - **Request** `MetricsRequest`: `queue`.
 - **Response** `MetricsResponse`: `queue`, `active`, `locked`, `deferred`,
-  `scheduled`, `dead_lettered`, `total`, `oldest_message_age_ms`.
+  `scheduled`, `dead_lettered`, `total`, `oldest_message_age_ms`. The age is measured
+  from the oldest active or locked message; it is zero when neither state is present.
 
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \

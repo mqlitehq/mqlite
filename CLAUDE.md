@@ -192,8 +192,10 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
 
 mqlite is honestly **at-least-once** — handlers must be idempotent. Three mechanisms:
 
-- **Crash recovery** (`engine.Open`): on startup every orphaned `locked` row is reset
-  to `active` (single-broker assumption). delivery_count was already bumped at claim.
+- **Crash recovery** (`engine.Open`): startup reclaims every orphaned `locked` row
+  (single-broker assumption). Below the delivery limit it returns to `active`; at
+  the limit it enters the DLQ. The old token is invalidated and delivery_count,
+  which was already bumped at claim, is preserved.
 - **`settlement_receipts`** table makes Complete/Abandon/Reject/Defer idempotent:
   a settle that affects 0 rows but finds a live receipt **for that exact request**
   returns success (lost-response replay) instead of a spurious `ErrLockLost`. The

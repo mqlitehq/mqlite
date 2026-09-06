@@ -277,6 +277,7 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 
 **Operate it:**
 [Deployment](docs/deployment.md) (Docker/Fly/systemd/Turso) ·
+[Production operations](docs/operations.md) (backup/restore/upgrade) ·
 [Observability](docs/observability.md) (Prometheus/Grafana) ·
 [Retention](docs/retention.md) ·
 [Turso](docs/turso.md)
