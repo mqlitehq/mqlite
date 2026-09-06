@@ -1,7 +1,8 @@
 # Observability
 
 The broker exposes Prometheus metrics at **`GET /metrics`** (behind Bearer auth, like
-the RPCs — a scraper passes the token; only `/` and `/healthz` are open). This guide
+the RPCs — a scraper passes the token; `/`, `/healthz` and the enabled static `/ui`
+console are open, while its API calls still require authentication). This guide
 wires `/metrics` into Prometheus + Grafana and suggests alerts.
 
 ## Metrics
@@ -13,7 +14,7 @@ Prometheus text format (`text/plain; version=0.0.4`). Per-queue **gauges**
 |---|---|---|---|
 | `mqlite_queue_messages` | gauge | `queue`, `state` | messages by state: `active`, `locked`, `deferred`, `scheduled`, `dead_lettered` |
 | `mqlite_queue_total` | gauge | `queue` | total messages in the queue |
-| `mqlite_queue_oldest_message_age_ms` | gauge | `queue` | age of the oldest message (ms) |
+| `mqlite_queue_oldest_message_age_ms` | gauge | `queue` | age of the oldest active or locked message (ms); 0 when neither exists |
 | `mqlite_messages_completed_total` | counter | `queue` | messages successfully completed, cumulative since broker start |
 | `mqlite_rpc_duration_seconds` | histogram | `rpc`, `le` | RPC handler latency by method (`_bucket` + `_sum` + `_count`) |
 
@@ -36,8 +37,9 @@ mqlite_rpc_duration_seconds_count{rpc="QueueService/Receive"} 84
 `mqlite_messages_completed_total` is a **lifetime count of processed (Completed)
 messages** — it keeps growing after the message row is deleted, so you can answer "how
 many were handled" even on an empty queue. It is **in-process and resets on broker
-restart** (no durable counter); `rate()` / `increase()` absorb the reset, so processed
-throughput stays correct across restarts:
+restart** (no durable counter); `rate()` / `increase()` handle observed resets, so they estimate processed
+throughput across restarts. Completions between the last scrape and a restart can
+be missed; this counter is not a durable business ledger:
 ```promql
 sum(rate(mqlite_messages_completed_total[5m])) by (queue)   # processed msg/s
 increase(mqlite_messages_completed_total[1h])               # processed in the last hour
@@ -47,8 +49,10 @@ The histogram makes a **slow dequeue visible** — e.g. p99 receive latency in G
 ```promql
 histogram_quantile(0.99, sum by (le) (rate(mqlite_rpc_duration_seconds_bucket{rpc="QueueService/Receive"}[5m])))
 ```
-A rising `Receive` / `CompleteBatch` tail is the signature of dequeue contention (the
-claim path serialising on the single writer). The `rpc` label is the shortened RPC name
+A rising `CompleteBatch` tail can indicate writer contention or slow storage.
+`Receive` duration also includes normal long-poll waiting (`wait_time_ms`), including
+empty results; a high receive p99 alone does not establish contention. Correlate it
+with nonempty request logs, backlog and completion latency. The `rpc` label is the shortened RPC name
 (`/mqlite.v1.QueueService/Send` → `QueueService/Send`); only RPCs are timed, not
 `/metrics` / `/healthz` / `/ui`.
 
@@ -113,15 +117,23 @@ mqlite_queue_messages{state="dead_lettered"}
 # in-flight (locked) right now
 mqlite_queue_messages{state="locked"}
 
-# oldest message age in seconds (is anything stuck?)
+# oldest active/locked message age in seconds (is anything stuck?)
 mqlite_queue_oldest_message_age_ms / 1000
 
-# total enqueue rate (msgs/s) over 5m
-sum(rate(mqlite_queue_total[5m])) by (queue)
+# observed completion rate (msgs/s) over 5m — a counter
+sum by (queue) (rate(mqlite_messages_completed_total[5m]))
 
-# is the DLQ growing? (per-minute increase)
-increase(mqlite_queue_messages{state="dead_lettered"}[5m])
+# net change in retained DLQ depth over 5m — a gauge, not failure throughput
+delta(mqlite_queue_messages{state="dead_lettered"}[5m])
 ```
+
+Queue totals and per-state depths are **gauges**. Do not apply `rate()` or
+`increase()` to them as enqueue/failure counters. `delta()` describes net depth
+change over the selected interval; retention, redrive and purge can reduce that
+depth even while new failures arrive. There is no enqueue-message counter in this
+release. RPC counts measure calls, which may contain batches or fail, so they are
+not a substitute for message ingress counts. Use producer-side acknowledgement
+metrics when that rate is needed.
 
 ## Grafana
 
@@ -141,15 +153,20 @@ Use a `queue` template variable: `label_values(mqlite_queue_total, queue)`.
 groups:
   - name: mqlite
     rules:
-      - alert: MqliteDLQGrowing
-        expr: increase(mqlite_queue_messages{state="dead_lettered"}[15m]) > 0
-        for: 15m
-        annotations: { summary: "DLQ on {{ $labels.queue }} is growing (poison messages)" }
+      - alert: MqliteDLQPresent
+        expr: mqlite_queue_messages{state="dead_lettered"} > 0
+        for: 5m
+        annotations: { summary: "Retained dead letters on {{ $labels.queue }} need review" }
+
+      - alert: MqliteScrapeUnavailable
+        expr: up{job="mqlite"} == 0
+        for: 2m
+        annotations: { summary: "MQLite metrics scrape is unavailable; check process, network and credentials" }
 
       - alert: MqliteBacklogStuck
         expr: mqlite_queue_oldest_message_age_ms > 300000   # 5 min
         for: 5m
-        annotations: { summary: "Oldest message on {{ $labels.queue }} is >5m old — consumers behind?" }
+        annotations: { summary: "Oldest active/locked message on {{ $labels.queue }} is >5m old — consumers behind?" }
 
       - alert: MqliteBacklogHigh
         expr: mqlite_queue_messages{state="active"} > 10000
@@ -158,6 +175,26 @@ groups:
 ```
 
 Tune thresholds to your throughput (see [benchmark.md](benchmark.md) for real numbers).
-The DLQ is the one sink that grows unbounded if you don't act — it's bounded by
-default ([retention.md](retention.md)), but a growing DLQ still means messages are
-failing and worth an alert.
+The broker bounds retained dead letters by default ([retention.md](retention.md)).
+A nonempty or growing DLQ still needs review; a flat depth may mean retention is
+evicting failures as quickly as new ones arrive.
+
+
+## Readiness and operational signals
+
+`/healthz` is open and reports process liveness only. The authenticated
+`AdminService/Status` response includes `ping_ms` (`-1` means its storage read
+failed); HTTP 200 alone is not a readiness verdict. A dedicated send/receive/complete
+canary checks writes and consumption. Keep its queue separate from application
+traffic and compare the returned identity and full body with what it sent.
+
+Collect free disk, memory, OOM/restart counts, log errors and backup age with your
+existing host/container monitoring. The metrics listed above do not expose those
+signals. Set disk alerts before space is exhausted, leaving room for the largest
+expected backlog, WAL growth and a backup. Alert thresholds and restore targets
+belong to the application; tune the example rules to its retention and schedule.
+
+For a full disk, repeated crash, failed restore or growing DLQ, follow the
+[incident actions](operations.md#incident-actions) and verify a canary before
+resuming producers. See the [Prometheus function reference](https://prometheus.io/docs/prometheus/latest/querying/functions/)
+for gauge and counter query semantics.

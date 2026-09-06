@@ -8,6 +8,7 @@ this guide covers the broker (`mqlite serve`). Pick a target:
 - [Fly.io](#flyio-minimal-cost) — a minimal-cost, scale-to-zero recipe.
 - [systemd](#systemd-bare-metal) — a single binary on a VM.
 - [Turso](#turso-remote-libsql) — remote replicated storage instead of a local volume.
+- [Production operations](operations.md) — backups, restoration, upgrades and incident actions.
 
 ## Configuration (all targets)
 
@@ -58,6 +59,7 @@ docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
+  -e MQLITE_SYNC=FULL \
   ghcr.io/mqlitehq/mqlite:0.3.0
 ```
 
@@ -83,6 +85,7 @@ primary_region = "sin"            # pick a region near you
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
+  MQLITE_SYNC = "FULL"                      # sync every acknowledged local commit
 
 [[mounts]]
   source      = "data"                       # the volume created below
@@ -136,7 +139,7 @@ After=network.target
 ExecStart=/usr/local/bin/mqlite serve --addr 127.0.0.1:6754
 Environment=MQLITE_DB=file:/var/lib/mqlite/mq.db
 Environment=MQLITE_TOKENS=mqk_prod_CHANGEME
-Environment=MQLITE_SYNC=NORMAL
+Environment=MQLITE_SYNC=FULL
 Restart=on-failure
 DynamicUser=yes
 StateDirectory=mqlite          # creates/owns /var/lib/mqlite
@@ -155,24 +158,16 @@ connects to the broker on `127.0.0.1:6754`, which is the only interface the brok
 above — so the proxy (with TLS + whatever access control you add) is the single entry
 point, not a bypassable layer over an all-interfaces socket.
 
-## Backup & restore
+## Backup, restore and upgrades
 
-The queue lives in one SQLite file — but a **live** broker also holds `-wal`/`-shm`
-sidecars, so a bare `cp` of the main file mid-write can capture a torn state. Take a
-consistent backup one of two ways:
+Follow the [production runbook](operations.md#consistent-backups) for read-only
+online snapshots, offline directory copies, isolated restore validation and rollback.
+Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
-- **Hot (broker running)** — one consistent snapshot, no downtime:
-  ```bash
-  sqlite3 /var/lib/mqlite/mq.db "VACUUM INTO '/backup/mq-$(date +%F).db'"
-  ```
-  (The file is standard SQLite, so the `sqlite3` CLI works on it even though mqlite
-  itself is pure-Go.)
-- **Cold (broker stopped)** — `systemctl stop mqlite`, then copy **all** of `mq.db`,
-  `mq.db-wal`, `mq.db-shm` (or checkpoint first so the WAL folds into `mq.db` and you can
-  copy just that one file), then start again.
-
-Restore: stop the broker, put the backup at `MQLITE_DB`'s path, start it. Never restore
-onto a running broker. On Turso, durability and backups are the server's responsibility.
+**v0.2.0 databases use schema 2; the v0.3.0 candidate uses schema 5.** There is no
+in-place migration. Before the upgrade, account for retained work in every state,
+keep the old binary/database pair, and create the candidate database separately.
+See [upgrade and rollback](operations.md#upgrade-and-rollback).
 
 ## Turso (remote libSQL)
 
@@ -211,5 +206,9 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
       background janitor returns freed pages to the OS (`incremental_vacuum`) so it shrinks
       back gradually as the queue drains ([retention.md](retention.md)).
 - [ ] DLQ retention left on (default) or tuned for your volume.
-- [ ] Pinned image/binary version.
-- [ ] Scrape `/metrics` (Prometheus) for queue depths — see [api-reference.md](api-reference.md).
+- [ ] Pinned image/binary version and recorded checksum/digest.
+- [ ] `MQLITE_SYNC=FULL` for acknowledged local commits that must survive power loss.
+- [ ] One active broker per database; no overlapping replacement.
+- [ ] Verified backup and rehearsed restore meet the application's RPO/RTO.
+- [ ] Free-disk, restart/error and queue-age alerts; an authenticated write/consume canary.
+- [ ] Scrape `/metrics` (Prometheus) for queue depths — see [observability.md](observability.md).

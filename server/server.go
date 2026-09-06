@@ -182,7 +182,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, st := range stats {
 		fmt.Fprintf(&b, "mqlite_queue_total{queue=%q} %d\n", st.name, st.m.Total)
 	}
-	b.WriteString("# HELP mqlite_queue_oldest_message_age_ms Age of the oldest message in a queue, in milliseconds.\n")
+	b.WriteString("# HELP mqlite_queue_oldest_message_age_ms Age of the oldest active or locked message in a queue, in milliseconds.\n")
 	b.WriteString("# TYPE mqlite_queue_oldest_message_age_ms gauge\n")
 	for _, st := range stats {
 		fmt.Fprintf(&b, "mqlite_queue_oldest_message_age_ms{queue=%q} %d\n", st.name, st.m.OldestMessageAgeMs)

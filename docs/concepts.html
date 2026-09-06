@@ -118,9 +118,12 @@
     <p class="sub">One SQLite file is the entire message broker. The model sits closest
     to Azure Service Bus, but is simplified from first principles. This page explains how
     it works, and how it compares to the equivalents on Azure / AWS / GCP.</p>
+    <p class="sub">This interactive overview describes <b>main (unreleased v0.3.0)</b>.
+      The <a href="concepts.md">canonical concepts and lifecycle contract</a> and
+      <a href="operations.md">production runbook</a> contain the complete operational rules.</p>
     <div class="adv">
       <span>One <b>SQLite file</b> · no cluster</span>
-      <span><b>Embeddable</b> in-process · zero-ops</span>
+      <span><b>Embeddable</b> in-process · one owner</span>
       <span><b>Service Bus</b>-flavored API</span>
       <span><b>Agent-native</b> · ships an MCP server</span>
       <span><b>At-least-once</b> · DLQ · dedup</span>
@@ -225,9 +228,20 @@
         <div class="badge b-q">Q</div>
         <div>
           <h3 style="margin-top:0">Queue</h3>
-          <p>A named container, the only place messages live. State machine:
-            <code>active → locked →</code> deleted on complete; <code>abandon</code>/timeout
-            returns to active; <code>reject</code> or delivery-count overflow goes to <b>DLQ</b>.</p>
+          <p>A named container, the only place messages live. A receive moves
+            <code>active → locked</code> and increments <code>delivery_count</code>.
+            Complete deletes the row. Below the delivery limit, immediate Abandon or
+            lock expiry returns it to active; Abandon with a delay parks it in
+            <code>scheduled</code>. At the limit, Abandon, lock expiry or startup
+            recovery moves it to <b>DLQ</b> with <code>MaxDeliveryCountExceeded</code>.</p>
+          <p>Delayed retries retain head-of-line ordering. Defer parks a message in
+            <code>deferred</code> for <code>ReceiveDeferred</code> by sequence number.
+            Cancel only removes a scheduled row that has never been delivered
+            (<code>delivery_count=0</code>). TTL applies before every claim, including
+            deferred receives; expired rows are dead-lettered or discarded by policy.</p>
+          <p>Settlement is fenced by the current lock token. A lost-response replay
+            succeeds only for the exact queue, sequence, token, operation and
+            effect-bearing arguments recorded in a live receipt.</p>
           <p><b>The DLQ is not another queue</b> — it is the same queue's
             <code>state='dead_lettered'</code> sub-state, worked with
             <code>peek</code> / <code>redrive</code> / <code>purge</code>.</p>
@@ -299,8 +313,9 @@
     Subscribe(topic, sub, filter) -> auto-creates backing queue=sub + attaches to topic
                                      (the topic comes into being as a side effect)
 
-  Name resolution (send / receive / ... all address by name):
-    name has subscription rows -> topic, fan out  ·  else -> existing queue  ·  else -> error</pre>
+  Send target resolution:
+    name has subscription rows -> topic, fan out  ·  else -> existing queue  ·  else -> error
+  Receive / settle / Stats address a plain queue or subscription by its own name.</pre>
     <div class="callout"><div class="i">🧭</div><div>
       Difference from ASB: in ASB both the Topic and the Subscription are created explicitly;
       MQLite makes "create topic" implicit and "create the subscription's queue" automatic —
@@ -338,8 +353,8 @@
     <div class="qa">
       <div class="q">Q: A message fans out to two subscriptions — same ID?</div>
       <div class="a"><code>message_id</code> is <b>the same</b> (copied verbatim);
-        <code>seq_number</code> is <b>different</b> (each backing queue assigns its own
-        globally-monotonic id). Independent rows, settled separately.</div>
+        <code>seq_number</code> is <b>different</b> (the broker allocates each copy an id from one
+        database-wide monotonic sequence). Independent rows, settled separately.</div>
     </div>
 
     <div class="qa">
@@ -391,7 +406,7 @@
         <tr><td>No matching subscriber</td><td>dropped</td><td>dropped</td><td>dropped</td><td>dropped</td><td class="yes">stays in log</td></tr>
         <tr><td>Fan-out copies independent</td><td class="yes">✓ own seq+DLQ</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="warnx">⚠ many groups</td></tr>
         <tr><td>Deployment shape</td><td class="yes">single SQLite file / embeddable</td><td>managed cluster</td><td>managed</td><td>managed</td><td>cluster</td></tr>
-        <tr><td>Ordering model</td><td>group_id FIFO (optional)</td><td>Session</td><td>FIFO queue</td><td>Ordering Key</td><td>per-partition</td></tr>
+        <tr><td>Ordering model</td><td>standard, group_fifo, strict_fifo; ordered heads remain blocked during backoff/defer</td><td>Session</td><td>FIFO queue</td><td>Ordering Key</td><td>per-partition</td></tr>
       </tbody>
     </table>
 
@@ -410,7 +425,7 @@
     </div>
     <div class="callout"><div class="i">🧭</div><div>
       <b>MQLite's own trade-off:</b> the whole broker is a single SQLite file — embeddable
-      in-process, zero-ops, agent-friendly (ships an MCP server). The price is exactly the
+      in-process, with one active owner and a small operational footprint (ships an MCP server). The price is exactly the
       "no replay / no topic retention" simplifications above — a deliberate first-principles
       design, not a gap.
     </div></div>
@@ -664,7 +679,7 @@ body_text contains "urgent"</span>
 </section>
 
 <footer><div class="wrap">
-  MQLite · concepts &amp; subscription filters · same source as <span class="kbd">docs/concepts.md</span> ·
+  MQLite · concepts &amp; subscription filters · reviewed companion to <a href="concepts.md">docs/concepts.md</a> ·
   behavior per <span class="kbd">engine/engine.go</span>
   <span class="kbd">sendTracked</span> / <span class="kbd">resolveTargets</span>.
 </div></footer>

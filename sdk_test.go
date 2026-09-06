@@ -13,6 +13,7 @@ package mqlite_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -623,6 +624,29 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 		}
 	}
 	t.Fatal("no `go 1.x` directive found in go.mod")
+}
+
+// TestConceptsCompanionReview requires deliberate review of the complete concepts
+// pair. The HTML contains hand-written interactive examples, so it is not generated
+// from Markdown. Review both files together before updating these hashes (MQLITE-110).
+func TestConceptsCompanionReview(t *testing.T) {
+	want := map[string]string{
+		"concepts.md":   "197c8cf32b7820a2ceadd8c8f285680e2c88a55cc47e8fb8f9998d587b5c0da4",
+		"concepts.html": "a522a802baa96cb402006ebb70a4a86d119f413ad24ecbf54be6ea231392f7b4",
+	}
+	for name, digest := range want {
+		t.Run(name, func(t *testing.T) {
+			body, err := os.ReadFile(filepath.Join("docs", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Git may check text out with CRLF on Windows; content is the contract.
+			canonical := strings.ReplaceAll(string(body), "\r\n", "\n")
+			if got := fmt.Sprintf("%x", sha256.Sum256([]byte(canonical))); got != digest {
+				t.Fatalf("%s changed: review the full Markdown/interactive HTML pair, then update the golden (%s)", name, got)
+			}
+		})
+	}
 }
 
 // TestCreateQueueDocMatchesWireConfig keeps docs/api-reference.md honest: the

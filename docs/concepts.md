@@ -56,7 +56,7 @@ is deleted from the database:
   Abandon(delay_ms>0) ───┘  (backoff parking: holds its group on ordered queues)
                          │
                          ▼
-  Send             ┌──────────┐ ◄── requeue: abandon / lock-expiry, count < max  (reaper)
+  Send             ┌──────────┐ ◄── requeue: immediate abandon / lock expiry, count < max
   ───────────────► │  active  │ ◄── redrive: from dead_lettered (count → 0)
                    └────┬─────┘
                         │ receive / claim (count++)
@@ -199,7 +199,7 @@ You only ever do two kinds of "create":
 
 **Q: A message fans out to two subscriptions — are the IDs the same?**
 The `message_id` is **the same** (copied verbatim); the `seq_number` is **different**
-(each backing queue assigns its own globally-monotonic id). The two are fully
+(the broker allocates each copy a distinct id from one database-wide monotonic sequence). The two are fully
 independent rows, settled separately with their own `seq_number` + `lock_token`.
 
 **Q: I add a filtered subscription under a topic — do historical messages get routed to

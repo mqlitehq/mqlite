@@ -16,7 +16,7 @@ the maintainer approves tagging and publishing.
 > **Schema: this release is `schemaVersion = 5`.** mqlite keeps ONE canonical schema and never
 > migrates (pre-1.0), so an existing DB from any earlier release is refused with
 > `ErrSchemaVersionMismatch` and must be recreated. **Before upgrading, stop all writers and back
-> up** (`VACUUM INTO`, or copy the file with the broker stopped), then start on a fresh DB — mqlite
+> up** (`VACUUM INTO`, or copy the complete data directory with the broker stopped), then start on a fresh DB — mqlite
 > never deletes your data for you. Two changes below are what made the schema incompatible:
 > `seq_number` allocation and the settlement-receipt key.
 
@@ -301,6 +301,13 @@ the maintainer approves tagging and publishing.
 
 ### Validation and contract documentation
 
+- **Production operation and restore procedures are explicit** (MQLITE-110):
+  read-only online backups, complete offline copies, fresh-directory restores,
+  matching binary/schema rollback, single-owner replacement and `FULL` production
+  examples. Monitoring distinguishes backlog gauges, observed completion counters
+  and write readiness; the interactive concepts companion is reviewed with its
+  Markdown source. The restore drill verifies complete logical snapshots and both
+  directions of real v0.2.0/schema-2 compatibility refusal.
 - **Raw transaction cancellation is documented at the public API boundary** (MQLITE-103).
   On local stores, business SQL must use the protected `tx.Context()` and callers must check
   the original context between their own statements. Raw `tx.SQL()` bypasses mqlite's statement
