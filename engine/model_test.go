@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -30,18 +30,25 @@ import (
 // ─── the model: what a queue MEANS ────────────────────────────────────────────
 
 type modelMsg struct {
-	seq    int64
-	state  State  // active | locked | dead_lettered | deferred  ("" = gone)
-	token  string // the live lock token, when locked
-	queue  string
-	delivs int
+	seq         int64
+	state       State  // active | locked | dead_lettered | deferred | scheduled ("" = gone)
+	token       string // retained until settlement/reaping, even after the lease expires
+	queue       string
+	delivs      int
+	lockedUntil int64
 }
+
+// The documented replay window belongs to the specification, not the engine's
+// implementation constant. A mutation to either deadline must cause disagreement.
+const modelReceiptTTL = int64(30 * 60 * 1000)
 
 type model struct {
 	msgs map[int64]*modelMsg // by seq
 	// receipts: what a settle promised, keyed by the REQUEST it settled.
-	receipts map[modelReceipt]bool
+	receipts map[modelReceipt]int64 // exclusive expiry; replay does not extend it
 	maxDeliv int
+	now      int64
+	lockMs   int64
 }
 
 // MQLITE-105: keep fields separate, independent of the engine's receipt encoding.
@@ -70,8 +77,8 @@ func modelReceiptKey(queue string, seq int64, token, verb string, delay int64, r
 // settle returns what the ENGINE is expected to answer for this exact request.
 //
 // This is the entire specification of settlement, and it is three lines: you may settle a message
-// you currently hold the lock on; replaying the SAME request that already succeeded is an
-// idempotent success; everything else is a lost lock.
+// you currently hold an unexpired lock on; replaying the SAME request that already succeeded
+// within its receipt's lifetime is an idempotent success; everything else is a lost lock.
 //
 // Note what is NOT here — nothing says a token vouches for a different message, that one verb
 // inherits another's receipt, or that a request may keep its success when its ARGUMENTS change.
@@ -83,12 +90,11 @@ func modelReceiptKey(queue string, seq int64, token, verb string, delay int64, r
 func (m *model) settle(queue string, seq int64, token, verb string, delay int64, reason [2]string) (ok bool) {
 	key := modelReceiptKey(queue, seq, token, verb, delay, reason)
 	msg := m.msgs[seq]
-	if msg != nil && msg.queue == queue && msg.state == StateLocked && msg.token == token {
+	if m.holds(queue, seq, token) {
 		switch verb {
 		case "completed":
 			msg.state = "" // gone
 		case "abandoned":
-			msg.delivs++
 			if msg.delivs >= m.maxDeliv {
 				msg.state = StateDeadLettered
 			} else if delay > 0 {
@@ -106,11 +112,29 @@ func (m *model) settle(queue string, seq int64, token, verb string, delay int64,
 			msg.state = StateDeferred
 		}
 		msg.token = ""
-		m.receipts[key] = true
+		msg.lockedUntil = 0
+		m.receipts[key] = m.now + modelReceiptTTL
 		return true
 	}
-	// A replay of the SAME request that already succeeded.
-	return m.receipts[key]
+	// Expired rows may still exist: neither lease nor receipt validity waits for a janitor.
+	return m.receipts[key] > m.now
+}
+
+func (m *model) holds(queue string, seq int64, token string) bool {
+	msg := m.msgs[seq]
+	return token != "" && msg != nil && msg.queue == queue && msg.state == StateLocked &&
+		msg.token == token && msg.lockedUntil > m.now
+}
+
+func (m *model) renew(queue string, seq int64, token string) bool {
+	if !m.holds(queue, seq, token) {
+		return false
+	}
+	msg := m.msgs[seq]
+	if until := m.now + m.lockMs; until > msg.lockedUntil {
+		msg.lockedUntil = until
+	}
+	return true
 }
 
 // Both directions of the old delimiter collision must be rejected by the model
@@ -127,7 +151,7 @@ func TestModelRejectReceiptArguments(t *testing.T) {
 	for i, first := range reasons {
 		for j, second := range reasons {
 			t.Run(fmt.Sprintf("%d_to_%d", i, j), func(t *testing.T) {
-				e, _ := testEngine(t)
+				e, clock := testEngine(t)
 				mustQueue(t, e, "q", QueueConfig{})
 				if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
 					t.Fatal(err)
@@ -136,8 +160,9 @@ func TestModelRejectReceiptArguments(t *testing.T) {
 				m := &model{
 					msgs: map[int64]*modelMsg{msg.SeqNumber: {
 						seq: msg.SeqNumber, queue: "q", state: StateLocked, token: msg.LockToken,
+						lockedUntil: msg.LockedUntilMs,
 					}},
-					receipts: map[modelReceipt]bool{},
+					receipts: map[modelReceipt]int64{}, now: atomic.LoadInt64(clock),
 				}
 				if !m.settle("q", msg.SeqNumber, msg.LockToken, "dead_lettered", 0, first) {
 					t.Fatal("model rejected initial settlement")
@@ -193,10 +218,9 @@ func TestEngineMatchesTheModel(t *testing.T) {
 	// up is replayable by pinning MQLITE_MODEL_SEED.
 	seeds := []int64{1, 2, 3}
 	if raceEnabled {
-		// -race makes every SQLite call ~10x dearer and the package shares one 10m budget. The
-		// model's value is in the mutations it CATCHES, and it catches them in the first few
-		// hundred rounds (removing args from the receipt key fails at round 29/48/803), so a
-		// shorter race run loses no signal — the long run happens on every non-race CI leg.
+		// -race makes every SQLite call ~10x dearer and the package shares one 10m budget.
+		// Keep shorter reproducible and random walks here; every non-race CI leg runs the full
+		// horizon. The missing lease fence itself fails at round 66 with seed 1.
 		seeds = []int64{1, 2}
 	}
 	if env := os.Getenv("MQLITE_MODEL_SEED"); env != "" {
@@ -220,25 +244,23 @@ func runModel(t *testing.T, seed int64) {
 	const (
 		queues   = 2
 		maxDeliv = 3
+		lockMs   = 60_000
 	)
 	rounds := 4000
 	if raceEnabled {
 		rounds = 1200
 	}
 	ctx := context.Background()
-	e, err := Open(ctx, Options{
-		DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer e.Close()
+	e, clock := testEngine(t)
 
 	qs := []string{"q0", "q1"}
 	for _, q := range qs {
-		mustQueue(t, e, q, QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: maxDeliv})
+		mustQueue(t, e, q, QueueConfig{LockDurationMs: lockMs, MaxDeliveryCount: maxDeliv})
 	}
-	m := &model{msgs: map[int64]*modelMsg{}, receipts: map[modelReceipt]bool{}, maxDeliv: maxDeliv}
+	m := &model{
+		msgs: map[int64]*modelMsg{}, receipts: map[modelReceipt]int64{}, maxDeliv: maxDeliv,
+		now: atomic.LoadInt64(clock), lockMs: lockMs,
+	}
 
 	rng := rand.New(rand.NewSource(seed))
 	verbs := []string{"completed", "abandoned", "dead_lettered", "deferred"}
@@ -253,8 +275,8 @@ func runModel(t *testing.T, seed int64) {
 	// pairs for three rounds and still never exercised the receipt path it was supposed to guard.
 	// So replays are now DELIBERATE: re-issue a request that ALREADY SUCCEEDED — only those leave a
 	// receipt, and a receipt is the whole thing under test — sometimes verbatim (it must still
-	// succeed) and sometimes with its arguments changed (it must NOT inherit the first one's
-	// success).
+	// succeed while its receipt is live) and sometimes with its arguments changed (it must NOT
+	// inherit the first one's success).
 	type issued struct {
 		q, token, verb string
 		seq            int64
@@ -262,6 +284,30 @@ func runModel(t *testing.T, seed int64) {
 		reason         [2]string
 	}
 	var history []issued
+	advanceTo := func(now int64) {
+		if now > m.now {
+			m.now = now
+			atomic.StoreInt64(clock, now)
+		}
+	}
+	// Select retained lock rows independently of engine state. Half the selections favor recent
+	// claims, so advancing time cannot drown every valid operation in old expired tokens.
+	lockedPair := func(queue string) *modelMsg {
+		var locked []*modelMsg
+		for _, seq := range seenSeqs {
+			if msg := m.msgs[seq]; msg.queue == queue && msg.state == StateLocked {
+				locked = append(locked, msg)
+			}
+		}
+		if len(locked) == 0 {
+			return nil
+		}
+		if len(locked) > 8 && rng.Intn(2) == 0 {
+			locked = locked[len(locked)-8:]
+		}
+		return locked[rng.Intn(len(locked))]
+	}
+	var expiredLocks, liveReplays, expiredReplays, renewals int
 
 	// The argument sets a settle may be replayed with, so a replay can differ from the
 	// original in exactly the way a real client's would: same message, same token, same verb, a
@@ -310,6 +356,12 @@ func runModel(t *testing.T, seed int64) {
 				}
 				mm.state = StateLocked
 				mm.token = got.LockToken
+				mm.lockedUntil = m.now + m.lockMs
+				mm.delivs++
+				if got.LockedUntilMs != mm.lockedUntil || got.DeliveryCount != mm.delivs {
+					t.Fatalf("round %d: receive seq %d deadline/count=(%d,%d), model=(%d,%d)",
+						i, got.SeqNumber, got.LockedUntilMs, got.DeliveryCount, mm.lockedUntil, mm.delivs)
+				}
 				seenTokens = append(seenTokens, got.LockToken)
 			}
 
@@ -333,9 +385,9 @@ func runModel(t *testing.T, seed int64) {
 					SeqNumber: seenSeqs[rng.Intn(len(seenSeqs))],
 					LockToken: seenTokens[rng.Intn(len(seenTokens))],
 				}
-				// Include live pairs so batch settlements also create receipts for later replay.
-				if mm := m.msgs[items[k].SeqNumber]; mm.queue == q && mm.state == StateLocked && rng.Intn(3) == 0 {
-					items[k].LockToken = mm.token
+				// Include matching pairs: live ones create receipts, expired ones must be refused.
+				if mm := lockedPair(q); mm != nil && rng.Intn(3) == 0 {
+					items[k] = SettleItem{SeqNumber: mm.seq, LockToken: mm.token}
 				}
 			}
 			if complete {
@@ -362,9 +414,12 @@ func runModel(t *testing.T, seed int64) {
 				if err != nil {
 					t.Fatalf("round %d: CompleteBatch: %v", i, err)
 				}
+				if len(res) != len(items) {
+					t.Fatalf("round %d: CompleteBatch returned %d results for %d items", i, len(res), len(items))
+				}
 				for k, r := range res {
 					want := m.settle(q, items[k].SeqNumber, items[k].LockToken, "completed", 0, [2]string{})
-					if r.Ok != want {
+					if r.Ok != want || r.SeqNumber != items[k].SeqNumber || r.LockedUntilMs != 0 {
 						t.Fatalf(`round %d: BATCH SETTLE DISAGREEMENT
   item   : seq=%d token=%s in queue %s
   engine : ok=%v
@@ -379,17 +434,70 @@ func runModel(t *testing.T, seed int64) {
 				if err != nil {
 					t.Fatalf("round %d: RenewBatch: %v", i, err)
 				}
+				if len(res) != len(items) {
+					t.Fatalf("round %d: RenewBatch returned %d results for %d items", i, len(res), len(items))
+				}
 				for k, r := range res {
-					// Renewal changes no state; ok means "you really hold this lock".
-					mm := m.msgs[items[k].SeqNumber]
-					want := mm != nil && mm.queue == q && mm.state == StateLocked && mm.token == items[k].LockToken
-					if r.Ok != want {
+					want := m.renew(q, items[k].SeqNumber, items[k].LockToken)
+					var until int64
+					if want {
+						until = m.msgs[items[k].SeqNumber].lockedUntil
+						renewals++
+					}
+					if r.Ok != want || r.SeqNumber != items[k].SeqNumber || r.LockedUntilMs != until {
 						t.Fatalf(`round %d: RENEW DISAGREEMENT
   item   : seq=%d token=%s in queue %s
   engine : ok=%v  (a renewal may only succeed for a lock you actually hold)
   model  : ok=%v`, i, items[k].SeqNumber, items[k].LockToken, q, r.Ok, want)
 					}
 				}
+			}
+
+		case 34, 35, 36, 37: // Single Renew must extend a live lease and refuse an expired one.
+			mm := lockedPair(q)
+			if mm == nil {
+				continue
+			}
+			if rng.Intn(2) == 0 {
+				advanceTo(mm.lockedUntil + int64(rng.Intn(3)-1))
+			}
+			want := m.renew(q, mm.seq, mm.token)
+			err := e.Renew(ctx, q, mm.seq, mm.token)
+			if (err == nil) != want || (err != nil && !errors.Is(err, ErrLockLost)) {
+				t.Fatalf("round %d: Renew(seq=%d now=%d): err=%v, model ok=%v", i, mm.seq, m.now, err, want)
+			}
+			if want {
+				renewals++
+			}
+			rows, err := e.Peek(ctx, q, PeekOptions{FromSeq: mm.seq, Max: 1})
+			if err != nil || len(rows) != 1 || rows[0].SeqNumber != mm.seq || rows[0].LockedUntilMs != mm.lockedUntil {
+				t.Fatalf("round %d: Renew persisted deadline: rows=%+v err=%v, model=%d", i, rows, err, mm.lockedUntil)
+			}
+
+		case 38, 39, 40, 41: // Expire leases WITHOUT maintenance; rows and tokens stay present.
+			if mm := lockedPair(q); mm != nil {
+				advanceTo(mm.lockedUntil + int64(rng.Intn(3)-1))
+			} else {
+				advanceTo(m.now + 1)
+			}
+
+		case 42, 43, 44, 45: // Deliberately replay at both sides of the receipt's expiry.
+			if len(history) == 0 {
+				continue
+			}
+			h := history[rng.Intn(len(history))]
+			key := modelReceiptKey(h.q, h.seq, h.token, h.verb, h.delay, h.reason)
+			advanceTo(m.receipts[key] + int64(rng.Intn(3)-1))
+			want := m.settle(h.q, h.seq, h.token, h.verb, h.delay, h.reason)
+			err := settleEngine(h.q, h.seq, h.token, h.verb, h.delay, h.reason)
+			if (err == nil) != want || (err != nil && !errors.Is(err, ErrLockLost)) {
+				t.Fatalf("round %d: receipt replay at %d (expires %d): err=%v, model ok=%v",
+					i, m.now, m.receipts[key], err, want)
+			}
+			if want {
+				liveReplays++
+			} else {
+				expiredReplays++
 			}
 
 		default: // settle — and here is the point: the arguments are often WRONG on purpose.
@@ -402,6 +510,9 @@ func runModel(t *testing.T, seed int64) {
 			tq := qs[rng.Intn(queues)]                     // maybe the wrong queue entirely
 			delay := delays[rng.Intn(len(delays))]         // and maybe not the delay the first call used
 			reason := reasons[rng.Intn(len(reasons))]      // nor the reason
+			if mm := lockedPair(tq); mm != nil && rng.Intn(3) == 0 {
+				seq, token = mm.seq, mm.token
+			}
 
 			// A third of the time, replay a request this run already made — the only way the
 			// receipt path gets walked at all. Half of those replays mutate the arguments.
@@ -414,19 +525,23 @@ func runModel(t *testing.T, seed int64) {
 					reason = reasons[rng.Intn(len(reasons))]
 				}
 			}
+			if mm := m.msgs[seq]; mm != nil && mm.queue == tq && mm.state == StateLocked &&
+				mm.token == token && mm.lockedUntil <= m.now {
+				expiredLocks++
+			}
 
 			want := m.settle(tq, seq, token, verb, delay, reason)
 			err := settleEngine(tq, seq, token, verb, delay, reason)
 			got := err == nil
 
-			if got != want {
+			if got != want || (err != nil && !errors.Is(err, ErrLockLost)) {
 				t.Fatalf(`round %d: SETTLE DISAGREEMENT
-  request: %s(queue=%s seq=%d token=%s delay=%d reason=%q)
+  request: %s(queue=%s seq=%d token=%s delay=%d reason=%q) at %d
   engine : ok=%v (err=%v)
   model  : ok=%v
-  the model is the specification: a settle succeeds only for a message you hold the lock on, or as
-  an idempotent replay of that exact request — SAME message, SAME verb, SAME arguments.`,
-					i, verb, tq, seq, token, delay, reason, got, err, want)
+  the model requires an unexpired lease or a live receipt for the exact request
+  — SAME message, SAME verb, SAME arguments.`,
+					i, verb, tq, seq, token, delay, reason, m.now, got, err, want)
 			}
 			if got { // it left a receipt — so it is worth replaying
 				history = append(history, issued{q: tq, seq: seq, token: token, verb: verb, delay: delay, reason: reason})
@@ -449,7 +564,8 @@ func runModel(t *testing.T, seed int64) {
 			}
 		}
 	}
-	t.Logf("%d operations, engine and model agreed at every step", rounds)
+	t.Logf("%d operations agreed: %d expired-lock requests, %d live and %d expired receipt replays, %d live renewals",
+		rounds, expiredLocks, liveReplays, expiredReplays, renewals)
 }
 
 func stateOf(m *modelMsg) State {

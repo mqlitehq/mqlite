@@ -202,8 +202,10 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   receipt is keyed by `queue + seq_number + lock_token + operation + args` — the
   message, the verb, and the arguments that change the effect — because a replay is
   the same request and nothing else. Key it any looser and it vouches for a call that
-  never happened. See `settleOp` in `engine/settle.go`. Settlement is **fenced on
-  `lock_token`**.
+  never happened. See `settleOp` in `engine/settle.go`. New settlement effects are **fenced on
+  `lock_token` and an unexpired lease (`locked_until > now`)**. This applies before
+  the reaper runs too; only a live exact-request receipt can replay a prior effect
+  after its original lease expires. Renew and RenewBatch never revive expired leases.
 - **`receive_attempts`** table makes Receive idempotent when the client passes an
   `AttemptID` (a retry replays the same batch / same lock tokens; `engine/recv_attempt.go`).
 

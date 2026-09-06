@@ -328,9 +328,9 @@ class WorkflowContractTests(unittest.TestCase):
         # continue-on-error, alternate publish step, matrix entry, or checkout is
         # security-relevant. Review any change before updating these goldens.
         expected = {
-            "ci.yml": "e06af37bb8d71bfc574a798fe33cef9ff0b1dd30b36f7fc6f2a7dbe3657f7d3d",
+            "ci.yml": "a84deed806aa3ec88bea55ceff3c9564282a17b062a764380e129656c9a27147",
             "release.yml": "badec32ab2c9e80b37e732ae0e4418ceebabb3de80b4a396d87dd0c799ab4ed4",
-            "release-image.yml": "f98ab64299cd08bbe2d0984896c943f4ef5cbc357d7f237db11d80dc1cffd624",
+            "release-image.yml": "a7e7ab66172d60f82b9d493ed0429005f5556f890a029ce686bc2c8a6935cffb",
         }
         self.assertEqual({p.name for p in (ROOT / ".github/workflows").iterdir()},
                          {"ci.yml", "release.yml", "release-image.yml", "turso-nightly.yml", "integrity-weekly.yml"})
@@ -338,6 +338,8 @@ class WorkflowContractTests(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertEqual(hashlib.sha256((ROOT / ".github/workflows" / name).read_bytes()).hexdigest(), digest,
                                  "Review the entire release/CI contract, then update its golden")
+        self.assertEqual(hashlib.sha256((ROOT / "Dockerfile").read_bytes()).hexdigest(), "80390edb5646664e9dead97bb0b1dac0e91835e81066b858182c7cecdef3a497",
+                         "Review runtime APK upgrades, stage names, and artifact scans before updating the golden")
         self.assertEqual(hashlib.sha256((ROOT / ".goreleaser.yaml").read_bytes()).hexdigest(), "57a16550597eab93319f89e89f93299ca3853fbccdb4873b922335ff952dc67a",
                          "Review every release build target, flag, and binary scan hook before updating the golden")
 

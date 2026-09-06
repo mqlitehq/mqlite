@@ -145,15 +145,22 @@ not a connection, not a heartbeat — so a dead consumer's lock simply *expires*
 acknowledgement must present it:
 
 ```sql
-DELETE FROM messages WHERE id = :seq AND queue = :q AND lock_token = :token;
+DELETE FROM messages
+WHERE id = :seq AND queue = :q AND lock_token = :token
+  AND state = 'locked' AND locked_until > :now;
 ```
 
-If the lock expired and the message was redelivered to someone else, the old
-token no longer matches — the stale consumer's `Complete`/`Abandon` affects zero
-rows and comes back `lock_lost`, instead of silently acknowledging *someone
-else's* in-flight delivery. That `WHERE lock_token = ?` clause is the entire
-fencing mechanism. (`Renew` is the same trick: one token-guarded UPDATE that
-extends `locked_until`.)
+The current token and an unexpired lease are both required. Equality at the deadline
+is already expired, including before the background reaper runs. The broker samples
+time after local writer admission and afresh for every settlement statement and remote
+retry. A stale consumer's new settlement affects zero rows and returns `lock_lost`.
+After redelivery, the changed token also fences the previous owner. `Renew` and
+`RenewBatch` require the same live lease and never revive an expired one. A live
+exact-request receipt can replay an already committed settlement (§7).
+
+Receive-and-delete removes the claimed row in the same transaction. It grants no
+lease: both its token and deadline are cleared before the response or attempt record
+is created. The SDK therefore returns a zero `LockedUntil` time in that mode.
 
 ## 5 · Staying fast: partial indexes and an O(n²) war story
 
@@ -231,13 +238,13 @@ bounds (age/count/bytes) so an unattended broker doesn't grow forever.
 Exactly-once delivery across crashes is not a thing anyone can sell you: after a
 crash, "did my acknowledgement land before the power died?" is unanswerable, so
 someone must retry, so somebody may see a message twice. mqlite says this out
-loud — **delivery is at-least-once; make handlers idempotent** — and then works
+loud — **default Peek-Lock delivery is at-least-once; make handlers idempotent** — and then works
 to make the *window* small and the *retries* safe:
 
 - **`settlement_receipts`** — when a settle (Complete/Abandon/Reject/Defer)
   succeeds, a receipt for the *request* is written *in the same transaction*
   (kept ~30 minutes). If the client's response got lost and it retries, the
-  settle matches zero rows — but finds the receipt, and returns success instead
+  settle matches zero rows — but finds an unexpired receipt, and returns success instead
   of a spurious `lock_lost`. Acknowledgements are idempotent.
 
   A receipt is keyed by the whole request — `queue`, `seq_number`, `lock_token`,
@@ -247,7 +254,10 @@ to make the *window* small and the *retries* safe:
   happened: a token vouching for another message, an Abandon vouching for a
   Complete, or a changed backoff reported as applied when it was not. Any of
   those is a false success, and at-least-once does not licence it. A call that
-  differs in any of those fields gets `lock_lost`.
+  differs in any of those fields gets `lock_lost`. Expiry is checked at fresh statement
+  time; a receipt merely retained until the next janitor sweep cannot replay. A live
+  receipt can replay the original effect after the original lease expires, but cannot
+  grant a new effect or renew that expired lease.
 - **`receive_attempts`** — a client may tag `Receive` with an `attempt_id`. The
   claimed batch is recorded under that id (same transaction again); a retry of
   the same attempt **replays the exact same messages and lock tokens** instead of
@@ -361,7 +371,8 @@ your store signs. Each item maps back to the section that depends on it.
 
 **Four more that this document's fine print implies** — easy to miss, fatal to skip:
 
-- **Conditional writes (CAS).** Every settlement is `... WHERE lock_token = ?`
+- **Conditional writes (CAS).** Every new settlement requires the current token,
+  a locked row and `locked_until > now`
   (§4). The store needs an atomic compare-on-field update, or fencing collapses
   and a stale consumer can acknowledge someone else's delivery.
 - **A serialization story for the claim path.** mqlite gets atomicity by
