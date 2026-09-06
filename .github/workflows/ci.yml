@@ -168,11 +168,35 @@ jobs:
       - name: build image
         run: |
           version=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' internal/version/version.go)
-          docker build --pull --platform linux/amd64 --build-arg VERSION="$version" --build-arg REVISION="$GITHUB_SHA" -t mqlite:ci .
+          docker build --pull --no-cache-filter runtime --platform linux/amd64 --build-arg VERSION="$version" --build-arg REVISION="$GITHUB_SHA" -t mqlite:ci .
       - name: authenticated message flow and persistent volume restart
         run: |
           version=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' internal/version/version.go)
           python3 test/release_image_smoke.py mqlite:ci --expected-version "$version" --expected-revision "$GITHUB_SHA"
+      - name: scan actual image OS packages
+        run: |
+          set -euo pipefail
+          scan_dir="$RUNNER_TEMP/mqlite-os-scan"
+          mkdir -p "$scan_dir"
+          # Official immutable release; review the version and checksum together.
+          curl --fail --location --retry 3 --output "$scan_dir/trivy.tar.gz" \
+            https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz
+          printf '%s  %s\n' 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a "$scan_dir/trivy.tar.gz" | sha256sum --check -
+          tar -xzf "$scan_dir/trivy.tar.gz" -C "$scan_dir" trivy
+          printf '{}\n' > "$scan_dir/config.yaml"
+          : > "$scan_dir/empty-ignore"
+          docker save --output "$scan_dir/image.tar" mqlite:ci
+          "$scan_dir/trivy" image --input "$scan_dir/image.tar" --platform linux/amd64 \
+            --config "$scan_dir/config.yaml" --ignorefile "$scan_dir/empty-ignore" \
+            --cache-dir "$scan_dir/cache" --db-repository ghcr.io/aquasecurity/trivy-db:2 \
+            --scanners vuln --pkg-types os --severity HIGH,CRITICAL --exit-code 1 --exit-on-eol 1 \
+            --skip-java-db-update --no-progress --format json --output "$scan_dir/report.json"
+      - name: upload OS scan report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-os-vulnerabilities
+          path: ${{ runner.temp }}/mqlite-os-scan/report.json
 
   e2e:
     # Black-box end-to-end: builds mqlite, boots an ephemeral broker, and runs the

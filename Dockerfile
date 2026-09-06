@@ -20,7 +20,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -trimpath -ldflags "-w" -o /out/mqlite ./cmd/mqlite
 RUN go run golang.org/x/vuln/cmd/govulncheck@latest -mode=binary /out/mqlite
 
-FROM alpine:3.24
+FROM alpine:3.24 AS runtime
 ARG VERSION=dev
 ARG REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/mqlitehq/mqlite" \
@@ -29,7 +29,8 @@ LABEL org.opencontainers.image.source="https://github.com/mqlitehq/mqlite" \
 # ca-certificates: TLS to a remote Turso/libSQL DSN (x509 verification).
 # tzdata: named time zones for TZ / expr date(...,tz) — core mqlite is epoch-ms UTC,
 # so this is only for correctness when a non-UTC zone is actually used.
-RUN apk add --no-cache ca-certificates tzdata && mkdir -p /data
+# A supported base tag can still contain older APKs; patch the installed set too.
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tzdata && mkdir -p /data
 COPY --from=build /out/mqlite /usr/local/bin/mqlite
 EXPOSE 6754
 # Default to a local file DB on the /data volume. Override MQLITE_DB with a
