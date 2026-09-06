@@ -229,6 +229,12 @@ func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Messag
 // Tx runs business writes and enqueues in one transaction (§4.5, embedded-only): business success
 // ⇔ message enqueued, with no dual-write window.
 //
+// On a local store, use tx.Context() for raw tx.SQL() statements and check the original ctx between
+// them. Raw SQL bypasses mqlite's per-statement cancellation guards and can still execute after ctx
+// is cancelled. The callback must return before the writer is released; cancellation observed before
+// commit rolls back the whole transaction, even if the callback returns nil. An already-cancelled
+// caller never enters the callback. See engine.EngineTx.SQL and engine.EngineTx.Context.
+//
 // ON A REMOTE (Turso/libSQL) STORE, fn MAY RUN MORE THAN ONCE. A transaction that fails on a
 // retryable connection or busy error is replayed from the start — the database work rolls back, so
 // the DATA stays correct, but anything else fn did will have happened twice. Keep fn to

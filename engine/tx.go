@@ -27,9 +27,11 @@ type EngineTx struct {
 //
 //   - Run them with Context(), never with the context you passed to Tx. Cancelling a statement
 //     mid-flight is what wedges the database.
-//   - Return promptly. The writer is blocked for as long as your callback runs, and cancelling
-//     your context does not — cannot — cut that short. Do slow work (an HTTP call, a long compute)
-//     BEFORE opening the transaction, not inside it.
+//   - Check the original caller context between your statements and return promptly on cancellation.
+//     SQL() bypasses mqlite's per-statement guards: statements using Context() can still execute
+//     after the caller cancels. If cancellation is observed before commit, Tx rolls back all writes
+//     after the callback returns, even if it returned nil. The callback holds the single writer
+//     until it returns; do slow work before opening the transaction.
 func (t *EngineTx) SQL() *sql.Tx { return t.tx.SQL() }
 
 // Context is the context your own statements inside this transaction should use:
@@ -40,7 +42,9 @@ func (t *EngineTx) SQL() *sql.Tx { return t.tx.SQL() }
 // cancellable: interrupting a statement mid-transaction leaks the SQLite connection, which leaves
 // the database locked (SQLITE_BUSY, permanently) — or, for `:memory:`, destroys it outright. The
 // wait to enter the transaction still honours your context, and an already-cancelled caller never
-// enters at all; a statement already running is allowed to finish, and the next one does not begin.
+// enters at all. A running statement is allowed to finish. Mqlite-owned statements (including
+// SendOne) check the caller before each statement; raw SQL() calls do not. Check the original caller
+// context between your own statements (see SQL).
 //
 // There is no upper bound on how long "finish" takes — it is YOUR statement. On a remote store this
 // IS your context, unchanged, and real statement cancellation still applies.
@@ -79,8 +83,10 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 	return last, nil
 }
 
-// Tx runs fn inside one transaction. If fn returns nil the transaction commits
-// (and long-poll waiters for any written queue are notified); otherwise it rolls back.
+// Tx runs fn inside one transaction. A callback error or cancellation observed before commit rolls
+// back the transaction. Otherwise Tx commits and notifies long-poll waiters for any written queue.
+// Cancellation cannot interrupt a local callback: see SQL and Context for how callers should run
+// their own statements and stop issuing them promptly.
 //
 // fn MAY RUN MORE THAN ONCE on a remote store. inTx replays the whole closure when a transaction
 // fails on a retryable connection/busy error — the database work of the failed attempt rolled

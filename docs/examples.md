@@ -100,6 +100,13 @@ func main() {
 }
 ```
 
+For local transactions, `tx.Context()` is deliberately not cancellable. Raw `tx.SQL()`
+statements can still execute after the original caller cancels: check `ctx.Err()` between
+business statements and return promptly. Mqlite-owned statements such as `tx.SendOne` have
+their own checks. Cancellation observed before commit rolls back all the transaction's
+writes, even if the callback returns nil. See the
+[cancellation contract](conformance.md#13--cancellation-context-deadlines).
+
 ## 3. Remote client + hands-off consumer
 
 Talk to a running broker over HTTP. The `Receiver` runs a managed consume loop:
