@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1303,4 +1304,379 @@ func TestAbandonDelayHoldsGroupOrder(t *testing.T) {
 			t.Fatalf("the parked message must be redelivered after its backoff, got %+v", back)
 		}
 	})
+}
+
+// ─── claim time and TTL eligibility (MQLITE-108) ───────────────────────────────
+
+// Hold the sole connection until the public call is observably queued for it.
+// Unlike a fixed sleep, WaitCount proves the admission wait actually happened.
+func claimAfterWriterWait(t *testing.T, e *Engine, advanceClock func(), receive func() ([]*Message, error)) []*Message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	held, err := e.db.sql.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	before := e.db.sql.Stats().WaitCount
+	type result struct {
+		msgs []*Message
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		msgs, err := receive()
+		done <- result{msgs, err}
+	}()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for e.db.sql.Stats().WaitCount == before {
+		select {
+		case r := <-done:
+			t.Fatalf("claim returned without waiting for the writer: %+v", r)
+		case <-ctx.Done():
+			t.Fatal("claim never waited for the writer")
+		case <-ticker.C:
+		}
+	}
+	advanceClock()
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		return r.msgs
+	case <-ctx.Done():
+		t.Fatal("claim never finished after releasing the writer")
+		return nil
+	}
+}
+
+func TestClaimTimeAfterWriterAdmission(t *testing.T) {
+	for _, ordering := range []OrderingMode{OrderStandard, OrderGroupFIFO, OrderStrictFIFO} {
+		for _, path := range []string{"plain", "attempt", "plain-delete", "attempt-delete", "deferred"} {
+			for _, timing := range []struct {
+				name    string
+				ttl, ms int64
+				want    int
+			}{
+				{"lease", 0, 2_000, 1},
+				{"before-ttl", 1_000, 999, 1},
+				{"at-ttl", 1_000, 1_000, 0},
+				{"after-ttl", 1_000, 2_000, 0},
+			} {
+				t.Run(string(ordering)+"/"+path+"/"+timing.name, func(t *testing.T) {
+					eachLocalStore(t, func(t *testing.T, dsn string) {
+						ctx := context.Background()
+						var now atomic.Int64
+						now.Store(100_000)
+						e, err := Open(ctx, Options{DB: dsn, Now: now.Load, DisableBackground: true})
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer e.Close()
+						mustQueue(t, e, "q", QueueConfig{Ordering: ordering, LockDurationMs: 1_000})
+						seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("kept"), GroupID: "g", TTLMs: timing.ttl})
+						if err != nil {
+							t.Fatal(err)
+						}
+						// Warm the cache before occupying the writer, so metadata lookup cannot
+						// accidentally hide a timestamp sampled before the claim's own wait.
+						if _, err := e.loadQueue(ctx, "q"); err != nil {
+							t.Fatal(err)
+						}
+						opts := ReceiveOptions{MaxMessages: 1}
+						if path == "attempt" || path == "attempt-delete" {
+							opts.AttemptID = "admission"
+						}
+						if path == "plain-delete" || path == "attempt-delete" {
+							opts.Mode = ReceiveAndDelete
+						}
+						receive := func() ([]*Message, error) { return e.Receive(ctx, "q", opts) }
+						wantDelivery := 1
+						if path == "deferred" {
+							m := recvOne(t, e, "q")
+							if err := e.Defer(ctx, "q", seq, m.LockToken); err != nil {
+								t.Fatal(err)
+							}
+							receive = func() ([]*Message, error) { return e.ReceiveDeferred(ctx, "q", seq) }
+							wantDelivery = 2
+						}
+						msgs := claimAfterWriterWait(t, e, func() { now.Add(timing.ms) }, receive)
+						if len(msgs) != timing.want {
+							t.Fatalf("received %d messages, want %d", len(msgs), timing.want)
+						}
+						if timing.want == 0 {
+							stats, err := e.Stats(ctx, "q")
+							if err != nil || stats.Locked != 0 || stats.Total != 1 {
+								t.Fatalf("expired message must not be claimed/deleted: %+v, %v", stats, err)
+							}
+							return
+						}
+						m := msgs[0]
+						if m.SeqNumber != seq || string(m.Body) != "kept" || m.DeliveryCount != wantDelivery {
+							t.Fatalf("wrong identity/delivery: %+v", m)
+						}
+						if m.LockedUntilMs != now.Load()+1_000 {
+							t.Fatalf("lease starts before writer admission: until=%d now=%d", m.LockedUntilMs, now.Load())
+						}
+						if opts.Mode != ReceiveAndDelete {
+							e.RunMaintenanceOnce(ctx)
+							if err := e.Complete(ctx, "q", seq, m.LockToken); err != nil {
+								t.Fatalf("fresh claim lost its lease: %v", err)
+							}
+						}
+					})
+				})
+			}
+		}
+	}
+}
+
+func TestClaimBatchUsesEachItemsTime(t *testing.T) {
+	for _, path := range []string{"plain", "attempt", "deferred"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			e, clock := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{LockDurationMs: 30_000})
+			seqs, err := e.Send(ctx, "q", OutMessage{Body: []byte("a")}, OutMessage{Body: []byte("b")}, OutMessage{Body: []byte("c")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if path == "deferred" {
+				for range seqs {
+					m := recvOne(t, e, "q")
+					if err := e.Defer(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// Time passes between statements, even with no other writer in the pool.
+			e.now = func() int64 { return atomic.AddInt64(clock, 100) }
+			opts := ReceiveOptions{MaxMessages: 3}
+			if path == "attempt" {
+				opts.AttemptID = "batch"
+			}
+			var msgs []*Message
+			if path == "deferred" {
+				msgs, err = e.ReceiveDeferred(ctx, "q", seqs...)
+			} else {
+				msgs, err = e.Receive(ctx, "q", opts)
+			}
+			if err != nil || len(msgs) != 3 {
+				t.Fatalf("batch: %d messages, %v", len(msgs), err)
+			}
+			for i, m := range msgs {
+				if m.SeqNumber != seqs[i] || (i > 0 && m.LockedUntilMs <= msgs[i-1].LockedUntilMs) {
+					t.Fatalf("item %d reused an earlier claim's time: %+v", i, msgs)
+				}
+			}
+			if path == "attempt" {
+				var created, expires int64
+				if err := e.db.queryRowScan(ctx, []any{&created, &expires},
+					`SELECT created_at, expires_at FROM receive_attempts WHERE queue='q' AND attempt_id='batch'`); err != nil {
+					t.Fatal(err)
+				}
+				if created < msgs[2].LockedUntilMs-30_000 || expires < created+recvAttemptTTLFloorMs {
+					t.Fatalf("attempt lifetime predates its final claim: created=%d expires=%d", created, expires)
+				}
+			}
+		})
+	}
+}
+
+func TestReceiveAttemptExpiryAfterWriterWait(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("old")}); err != nil {
+		t.Fatal(err)
+	}
+	opts := ReceiveOptions{AttemptID: "expiry"}
+	first, err := e.Receive(ctx, "q", opts)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("initial claim: %v, %v", first, err)
+	}
+	if err := e.Complete(ctx, "q", first[0].SeqNumber, first[0].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("new")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := claimAfterWriterWait(t, e, func() { advance(clock, 5*time.Minute) },
+		func() ([]*Message, error) { return e.Receive(ctx, "q", opts) })
+	if len(msgs) != 1 || msgs[0].SeqNumber != seq || string(msgs[0].Body) != "new" {
+		t.Fatalf("expired attempt replayed after writer wait: %+v", msgs)
+	}
+}
+
+func TestClaimBatchTTLBetweenItems(t *testing.T) {
+	for _, path := range []string{"plain", "attempt", "deferred"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			e, clock := testEngine(t)
+			const lease = 30_000
+			mustQueue(t, e, "q", QueueConfig{LockDurationMs: lease})
+			seqs, err := e.Send(ctx, "q", OutMessage{Body: []byte("first")},
+				OutMessage{Body: []byte("expires-next"), TTLMs: lease}, OutMessage{Body: []byte("last")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantState, wantUnclaimedDelivery := StateActive, 0
+			if path == "deferred" {
+				for range seqs {
+					m := recvOne(t, e, "q")
+					if err := e.Defer(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+						t.Fatal(err)
+					}
+				}
+				wantState, wantUnclaimedDelivery = StateDeferred, 1
+			}
+			// Arm the second item's expiry relative to the FIRST actual claim. This avoids
+			// depending on how many bookkeeping clock reads precede it (attempt lookup, etc.).
+			// The next clock read reaches the exact TTL boundary; a stale batch time admits it.
+			if _, err := e.db.exec(ctx, fmt.Sprintf(`CREATE TRIGGER expire_next_claim
+				AFTER UPDATE OF state ON messages WHEN NEW.id=%d AND NEW.state='locked'
+				BEGIN UPDATE messages SET expires_at=NEW.locked_until-%d+100 WHERE id=%d; END`,
+				seqs[0], lease, seqs[1])); err != nil {
+				t.Fatal(err)
+			}
+			e.now = func() int64 { return atomic.AddInt64(clock, 100) }
+			opts := ReceiveOptions{MaxMessages: 3}
+			if path == "attempt" {
+				opts.AttemptID = "batch-ttl"
+			}
+			var msgs []*Message
+			if path == "deferred" {
+				msgs, err = e.ReceiveDeferred(ctx, "q", seqs...)
+			} else {
+				msgs, err = e.Receive(ctx, "q", opts)
+			}
+			if err != nil || len(msgs) != 2 || msgs[0].SeqNumber != seqs[0] || msgs[1].SeqNumber != seqs[2] {
+				t.Fatalf("batch must skip only the expired middle item: %+v, %v", msgs, err)
+			}
+			peek, err := e.Peek(ctx, "q", PeekOptions{FromSeq: seqs[1], Max: 1})
+			if err != nil || len(peek) != 1 {
+				t.Fatalf("expired item disappeared: %+v, %v", peek, err)
+			}
+			p := peek[0]
+			if p.SeqNumber != seqs[1] || string(p.Body) != "expires-next" || p.State != wantState ||
+				p.DeliveryCount != wantUnclaimedDelivery || p.LockedUntilMs != 0 ||
+				p.ExpiresAtMs != msgs[0].LockedUntilMs-lease+100 {
+				t.Fatalf("expired item must remain unclaimed with its identity and delivery count intact: %+v", p)
+			}
+			for _, m := range msgs {
+				if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+					t.Fatalf("valid batch member cannot settle: %v", err)
+				}
+			}
+			stats, err := e.Stats(ctx, "q")
+			if err != nil || stats.Total != 1 || stats.Locked != 0 {
+				t.Fatalf("only the skipped expired item must remain: %+v, %v", stats, err)
+			}
+		})
+	}
+}
+
+func TestReceiveDeferredMixedItemsAndCommittedPrefix(t *testing.T) {
+	for _, failSecond := range []bool{false, true} {
+		name := "mixed"
+		if failSecond {
+			name = "failure-prefix"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			e, clock := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{LockDurationMs: 30_000})
+			bodies := []string{"first", "expired", "second", "tail"}
+			seqs, err := e.Send(ctx, "q", OutMessage{Body: []byte(bodies[0])},
+				OutMessage{Body: []byte(bodies[1]), TTLMs: 1},
+				OutMessage{Body: []byte(bodies[2])}, OutMessage{Body: []byte(bodies[3])})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range seqs {
+				m := recvOne(t, e, "q")
+				if err := e.Defer(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			advance(clock, time.Millisecond)
+			if failSecond {
+				if _, err := e.db.exec(ctx, fmt.Sprintf(`CREATE TRIGGER reject_second_claim
+					BEFORE UPDATE OF state ON messages WHEN NEW.id=%d AND NEW.state='locked'
+					BEGIN SELECT RAISE(ABORT, 'injected deferred claim failure'); END`, seqs[2])); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Missing, expired, and already-claimed duplicate identities are skipped. A later
+			// SQL failure returns the earlier committed item, and must not touch the suffix.
+			msgs, err := e.ReceiveDeferred(ctx, "q", 0, seqs[1], seqs[0], seqs[0], seqs[2], seqs[3])
+			wantSeqs := []int64{seqs[0], seqs[2], seqs[3]}
+			if failSecond {
+				wantSeqs = wantSeqs[:1]
+				if err == nil || !strings.Contains(err.Error(), "injected deferred claim failure") {
+					t.Fatalf("want the injected second-item failure, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if len(msgs) != len(wantSeqs) {
+				t.Fatalf("returned %d messages, want committed prefix %v", len(msgs), wantSeqs)
+			}
+			claimed := make(map[int64]bool)
+			for i, m := range msgs {
+				if m.SeqNumber != wantSeqs[i] || m.DeliveryCount != 2 || m.LockToken == "" {
+					t.Fatalf("wrong committed prefix item %d: %+v", i, m)
+				}
+				claimed[m.SeqNumber] = true
+			}
+			peek, err := e.Peek(ctx, "q", PeekOptions{Max: len(seqs) + 1})
+			if err != nil || len(peek) != len(seqs) {
+				t.Fatalf("persisted set changed: %+v, %v", peek, err)
+			}
+			for i, p := range peek {
+				wantState, wantDelivery := StateDeferred, 1
+				var wantUntil int64
+				if claimed[seqs[i]] {
+					wantState, wantDelivery = StateLocked, 2
+					wantUntil = atomic.LoadInt64(clock) + 30_000
+				}
+				if p.SeqNumber != seqs[i] || string(p.Body) != bodies[i] || p.State != wantState ||
+					p.DeliveryCount != wantDelivery || p.LockedUntilMs != wantUntil {
+					t.Fatalf("persisted item %d: %+v; want state=%s delivery_count=%d locked_until=%d",
+						i, p, wantState, wantDelivery, wantUntil)
+				}
+			}
+			for _, m := range msgs {
+				if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+					t.Fatalf("returned prefix was not committed: %v", err)
+				}
+			}
+			if failSecond {
+				if _, err := e.db.exec(ctx, `DROP TRIGGER reject_second_claim`); err != nil {
+					t.Fatal(err)
+				}
+				retry, err := e.ReceiveDeferred(ctx, "q", seqs[2], seqs[3])
+				if err != nil || len(retry) != 2 || retry[0].SeqNumber != seqs[2] || retry[1].SeqNumber != seqs[3] ||
+					retry[0].DeliveryCount != 2 || retry[1].DeliveryCount != 2 {
+					t.Fatalf("failed item and untouched suffix must remain receivable: %+v, %v", retry, err)
+				}
+				for _, m := range retry {
+					if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+						t.Fatalf("retry after an item failure cannot settle: %v", err)
+					}
+				}
+			}
+			stats, err := e.Stats(ctx, "q")
+			if err != nil || stats.Total != 1 || stats.Deferred != 1 || stats.Locked != 0 {
+				t.Fatalf("only the skipped expired item must remain: %+v, %v", stats, err)
+			}
+		})
+	}
 }

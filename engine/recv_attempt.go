@@ -12,8 +12,7 @@ import (
 // long as the lock the client is holding.
 const recvAttemptTTLFloorMs = 5 * 60 * 1000 // 5 min
 
-// claimRound performs one claim attempt. Without an attempt id it is the plain
-// (non-transactional, per-message) claim. With an attempt id the whole round —
+// claimRound performs one transactional claim attempt. With an attempt id the whole round —
 // replay-check, claim, and record — runs in one transaction so a client retrying
 // a Receive whose response was lost replays the SAME batch instead of claiming
 // new messages and burning delivery_count.
@@ -21,16 +20,17 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 	if attemptID == "" {
 		return e.claimUpTo(ctx, q, max, mode)
 	}
-	now := e.now()
 	var out []*Message
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		if msgs, ok, err := lookupAttempt(ctx, tx, q.name, attemptID, now); err != nil {
+		// Writer admission and remote retries can outlive an attempt record. Evaluate
+		// its expiry inside this transaction, never against the pre-wait time.
+		if msgs, ok, err := lookupAttempt(ctx, tx, q.name, attemptID, e.now()); err != nil {
 			return err
 		} else if ok {
 			out = msgs
 			return nil
 		}
-		msgs, err := e.claimUpToTx(ctx, tx, q, max, mode, now)
+		msgs, err := e.claimUpToTx(ctx, tx, q, max, mode)
 		if err != nil {
 			return err
 		}
@@ -39,6 +39,7 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 			if ttl < recvAttemptTTLFloorMs {
 				ttl = recvAttemptTTLFloorMs
 			}
+			now := e.now()
 			if err := storeAttempt(ctx, tx, q.name, attemptID, msgs, now, now+ttl); err != nil {
 				return err
 			}
@@ -82,11 +83,11 @@ func storeAttempt(ctx context.Context, tx *txn, queue, attemptID string, msgs []
 }
 
 // claimUpToTx is claimUpTo bound to an explicit transaction (idempotent receive).
-func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, mode ReceiveMode, now int64) ([]*Message, error) {
+func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, mode ReceiveMode) ([]*Message, error) {
 	var out []*Message
 	var bytes int64
 	for i := 0; i < max; i++ {
-		m, err := e.claimOneTx(ctx, tx, q, now)
+		m, err := e.claimOneTx(ctx, tx, q)
 		if err != nil {
 			return out, err
 		}
@@ -112,8 +113,11 @@ func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, 
 	return out, nil
 }
 
-func (e *Engine) claimOneTx(ctx context.Context, tx *txn, q queueRow, now int64) (*Message, error) {
+func (e *Engine) claimOneTx(ctx context.Context, tx *txn, q queueRow) (*Message, error) {
 	token := randToken()
+	// Read after acquiring the writer and for each item: a pool wait, retry, or
+	// preceding claim must not consume this item's lease or reuse stale TTL eligibility.
+	now := e.now()
 	lockUntil := now + q.lockDurationMs
 	var (
 		m                                                          Message

@@ -1113,3 +1113,47 @@ func TestCloseWakesLongPollWaiters(t *testing.T) {
 		}
 	}
 }
+
+// Claim timestamps must refresh across remote retries as well as local writer waits.
+// Each fake-driver busy result proves a failed attempt occurred; this does not depend
+// on network timing or sleep-based fault injection.
+func TestClaimTimeRefreshesOnRemoteRetry(t *testing.T) {
+	for _, path := range []string{"plain", "attempt", "deferred"} {
+		t.Run(path, func(t *testing.T) {
+			d, st := remoteDBFailingFirst(t, 2)
+			tick := int64(100_000)
+			q := queueRow{name: "q", lockDurationMs: 1_000}
+			e := &Engine{db: d, qcache: map[string]queueRow{"q": q}, now: func() int64 {
+				tick += 2_000
+				return tick
+			}}
+			opts := ReceiveOptions{}
+			if path == "attempt" {
+				opts.AttemptID = "retry"
+			}
+			var err error
+			if path == "deferred" {
+				_, err = e.ReceiveDeferred(context.Background(), "q", 1)
+			} else {
+				_, err = e.Receive(context.Background(), "q", opts)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(st.args) < 3 {
+				t.Fatalf("want two failed attempts and a successful one: %v", st.args)
+			}
+			var previous int64
+			for i, args := range st.args {
+				now, ok := args[len(args)-1].Value.(int64)
+				if !ok || now <= previous {
+					t.Fatalf("attempt %d reused stale time: args=%v previous=%d", i, args, previous)
+				}
+				if len(args) == 5 && args[0].Value != now+q.lockDurationMs {
+					t.Fatalf("claim lease and eligibility use different times: %v", args)
+				}
+				previous = now
+			}
+		})
+	}
+}

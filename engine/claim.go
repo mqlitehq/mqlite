@@ -181,11 +181,10 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 // concurrently (MQLITE-50). On a mid-batch error the whole batch rolls back (no orphaned
 // locks); Receive discards a partial batch on error anyway.
 func (e *Engine) claimUpTo(ctx context.Context, q queueRow, max int, mode ReceiveMode) ([]*Message, error) {
-	now := e.now()
 	var out []*Message
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		var err error
-		out, err = e.claimUpToTx(ctx, tx, q, max, mode, now)
+		out, err = e.claimUpToTx(ctx, tx, q, max, mode)
 		return err
 	})
 	if err != nil {
@@ -200,25 +199,29 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 	if err != nil {
 		return nil, err
 	}
-	now := e.now()
 	var out []*Message
 	for _, seq := range seqs {
 		token := randToken()
-		lockUntil := now + q.lockDurationMs
 		var (
 			m                                                          Message
 			groupID, messageID, correlationID, replyTo, subject, ctype sql.NullString
 			props                                                      sql.NullString
 		)
-		err := e.db.queryRowScan(ctx,
-			[]any{&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
-				&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs}, `
+		// Each item keeps its existing independent commit. Read the clock only after
+		// acquiring the writer, and again if a remote transaction must retry (MQLITE-108).
+		err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			now := e.now()
+			return tx.QueryRowContext(ctx, `
 			UPDATE messages
 			   SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
 			 WHERE id=? AND queue=? AND state='deferred'
+			   AND (expires_at=0 OR expires_at>?)
 			RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
 			          reply_to, subject, content_type, properties, enqueued_at, locked_until`,
-			lockUntil, token, seq, queue)
+				now+q.lockDurationMs, token, seq, queue, now).Scan(
+				&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
+				&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs)
+		})
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
