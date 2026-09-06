@@ -46,7 +46,7 @@ make build          # → bin/mqlite + bin/mqlite-bench
 make test           # go test ./...   (hermetic unit + invariant tests)
 make e2e            # ./test/run.sh — boots an ephemeral broker, runs curl+python+SDK blackbox suites
 make crash          # crash-injection layer: re-execs + hard-kills a worker mid-transaction, checks
-                    #   recovery. Build-tag `crash_injection`, Linux; not in the default -race matrix.
+                    #   recovery. Race-instrumented, build-tag `crash_injection`; separate Linux CI job.
 make bench          # Docker stress matrix → test/bench/out/
 make clean          # delete ALL generated data (*.db, bin/, bench out, smoke dirs)
 
@@ -64,6 +64,11 @@ Before committing, match CI locally: `go build ./...` · `go vet ./...` ·
 `golangci-lint run`. CI additionally enforces **per-package coverage floors** (see
 `coverage` job in `.github/workflows/ci.yml`: engine 72%, server 62%, wire 90%,
 cmd/mqlite 52%, root 55%, total 65%) — a drop below any floor fails the build.
+
+For crash-harness or recovery changes, also run `make crash`: the default
+`go test -race ./...` command skips the tagged suite. It checks outbox atomicity,
+producer-acknowledged commits, and orphaned locks returning to active or reaching the DLQ at
+the delivery limit. This is process-death recovery; it does not test power-loss durability.
 
 Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/windows.
 
@@ -228,7 +233,7 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 | Unit + invariant (TCK-style) | `*_test.go`, `engine/*_test.go` | Hermetic, temp dirs; CI runs with `-race`. `engine/main_test.go` is the harness. |
 | Blackbox e2e | `test/run.sh` + `test/api_curl.sh`, `api_tests.py`, `sdkcheck/` | Boots a real broker; catches HTTP API drift the in-process tests can't. |
 | Live Turso | `engine/turso_test.go` (gated by `MQLITE_TEST_DB`) | Skipped unless env set; runs in `turso-nightly.yml`. |
-| Crash injection | `test/crash/` (`make crash`) | Re-execs + hard-kills a worker mid-transaction; asserts outbox atomicity + orphaned-lock recovery. Build-tag `crash_injection`, own CI job (Linux), NOT in the default `-race` matrix. |
+| Crash injection | `test/crash/` (`make crash`) | Re-execs + hard-kills a worker; asserts outbox atomicity, acknowledged commits, and recovery to active or DLQ. Build-tag `crash_injection`, race-instrumented in its own Linux CI job; excluded from the default package matrix. |
 | Stress/bench | `test/bench/` (`make bench`) | Docker matrix. |
 
 `make clean` removes every generated artifact (DBs, binaries, bench output, smoke

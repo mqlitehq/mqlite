@@ -20,6 +20,14 @@ once and never silently dropped; handlers must be idempotent. (§3)
   — or to `dead_lettered` once `delivery_count >= max_delivery_count`. *(engine/engine_test.go)*
 - **1.5** Claims are O(log n) on a deep backlog (a partial index on `active` rows; the
   reaper, not the claim path, reclaims expired locks). *(engine/claim_plan_test.go)*
+- **1.6 Claim time.** `Receive` (with or without an `AttemptID`, including receive-and-delete)
+  and `ReceiveDeferred` MUST evaluate TTL eligibility and lease deadlines using fresh broker time
+  after writer admission, for each claimed item and each remote retry. A message whose TTL has
+  expired at that check MUST NOT be claimed. Waiting for the writer or processing an earlier batch
+  item MUST NOT consume a later item's lease before its claim begins.
+  *(engine/functional_test.go: TestClaimTimeAfterWriterAdmission, TestClaimBatchUsesEachItemsTime,
+  TestClaimBatchTTLBetweenItems, TestReceiveDeferredMixedItemsAndCommittedPrefix;
+  engine/storage_test.go: TestClaimTimeRefreshesOnRemoteRetry)*
 
 ## 2 · Settlement (fenced on `lock_token`)
 
@@ -42,11 +50,14 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   *(engine/functional_test.go: TestDeferHoldsHeadOfLine)*
 - **2.5 Renew** extends the lock by the queue's lock duration. *(engine/ga_fixes_test.go)*
 - **2.6** Settling with a wrong/expired token MUST fail with `ErrLockLost` (HTTP 409)
-  — **except** an idempotent replay (a live settlement receipt for that token) returns
-  success. *(engine/ga_fixes_test.go)*
+  — **except** an idempotent replay with a live receipt for the exact request (§3.2) returns
+  success. Matching the token alone is insufficient. *(engine/ga_fixes_test.go;
+  engine/complete_batch_test.go: TestSettlementReceiptIdentityMatrix)*
 - **2.7 CompleteBatch** settles many messages in one transaction with the same per-item
-  fencing + idempotency; a stale token yields `ok=false`, never failing the batch.
-  *(engine/complete_batch_test.go)*
+  fencing + idempotency; a stale token without an exact-request receipt yields `ok=false`,
+  never failing the batch. Single `Complete` and a `CompleteBatch` item share the completed
+  operation identity, so the same successful request can replay in either direction.
+  *(engine/complete_batch_test.go: TestCompleteBatch, TestSettlementReceiptIdentityMatrix)*
 - **2.8 RenewBatch** extends a whole batch's leases in ONE statement, fenced per item on its own
   `lock_token`, and reports the deadline it committed. `ok=true` means the lease was live when the
   broker's STATEMENT finished — the answer still has to travel, so `locked_until_ms` is the
@@ -69,10 +80,13 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   differs in ANY of them is not a replay and MUST return `ErrLockLost`, never a success
   that silently keeps the first call's effect.
   *(engine/ga_fixes_test.go; engine/complete_batch_test.go: TestReceiptsAreBoundToTheirMessage,
-  TestReceiptsAreBoundToTheirArguments, TestSettlementReceiptsAreVerbSpecific;
-  engine/model_test.go: TestEngineMatchesTheModel)*
+  TestReceiptsAreBoundToTheirArguments, TestSettlementReceiptsAreVerbSpecific,
+  TestSettlementReceiptIdentityMatrix;
+  engine/model_test.go: TestEngineMatchesTheModel, TestModelRejectReceiptArguments)*
 - **3.3** A `Receive` retried with the same `AttemptID` MUST replay the same batch /
-  same lock tokens, not double-deliver. *(engine/ga_fixes_test.go)*
+  same lock tokens while its attempt record is live. Record expiry MUST be checked against
+  fresh time after writer admission; a record that expires during the wait MUST NOT replay.
+  *(engine/ga_fixes_test.go; engine/functional_test.go: TestReceiveAttemptExpiryAfterWriterWait)*
 - **3.4** No message loss + no content corruption: a contiguous `1..N` sequence with
   random bodies (hashed into a property), consumed concurrently with redelivery, is
   delivered completely (every value once) and intact (each body matches its hash).
@@ -304,15 +318,22 @@ recovery, not filesystem durability.
 - **15.2 Orphaned locks reset on restart.** After a crash while messages are `locked`, `Open` reclaims
   every orphaned lock — to `active`, or to `dead_lettered` with `MaxDeliveryCountExceeded` if the
   message was already on its last permitted delivery (the same rule the reaper applies, §3.1). Either
-  way nothing is stranded `locked`. *(test/crash/crash_test.go: TestCrashRecoveryResetsOrphanedLocks;
-  the seeded set uses a high MaxDeliveryCount, so it exercises the reset-to-active path.)*
-- **15.3 No loss across recovery.** A message committed before the crash is still present after it —
-  a crash never silently drops a message. *(test/crash/crash_test.go)*
+  way nothing is stranded `locked`. The last-delivery case preserves the message body and delivery
+  count, clears the lock, and excludes it from normal receive.
+  *(test/crash/crash_test.go: TestCrashRecoveryResetsOrphanedLocks,
+  TestCrashRecoveryDeadLettersLastDelivery)*
+- **15.3 Acknowledged commits survive recovery.** Every producer commit acknowledged to and
+  observed by the harness before a kill MUST still be present after recovery. The harness checks
+  those acknowledged transaction identities against both recovered business rows and messages.
+  Commits whose acknowledgements were not observed remain subject to the all-or-nothing check
+  in §15.1. *(test/crash/crash_test.go: TestCrashOutboxAtomicity)*
 
-Run: `make crash` (tag-gated; not in the default `-race` matrix — see the testing-layers note).
+Run: `make crash` (race-instrumented, tag-gated; a separate Linux CI job, excluded from the default
+package matrix).
 
 ---
 
 *This spec is the contract a non-SQLite storage backend (see the Store-interface
-research) would have to satisfy to be a conformant mqlite. CI runs every referenced
-test with `-race`; the large no-loss sweep also runs weekly.*
+research) would have to satisfy to be a conformant mqlite. Hermetic package tests run with `-race`
+in the OS/Go matrix; tagged crash tests run with `-race` in their own Linux job. Live Turso tests
+run separately without `-race`; the large no-loss sweep also runs weekly without `-race`.*

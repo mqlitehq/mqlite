@@ -30,10 +30,10 @@ func affected(res sql.Result) error {
 
 // settleOp runs a terminal settle (Complete/Abandon/Reject/Defer) idempotently
 // under one transaction: it performs the fenced write (do), and
-//   - rows affected > 0 → records a receipt keyed by lock_token, returns nil;
-//   - rows affected = 0 but a live receipt exists → the client is retrying a
-//     settle whose response was lost; returns nil (idempotent success);
-//   - rows affected = 0 and no receipt → ErrLockLost (genuine fencing failure).
+//   - rows affected > 0 → records a receipt for the exact request, returns nil;
+//   - rows affected = 0 but a live receipt matches queue, seq, token, verb, and effect-bearing args →
+//     returns nil (idempotent replay of a settle whose response was lost);
+//   - rows affected = 0 and no matching receipt → ErrLockLost (genuine fencing failure).
 //
 // This is the difference between "I already Completed this, the completion just
 // got lost" (success) and "my lock expired and someone else has the message" (lost).
@@ -94,7 +94,7 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 				   WHERE queue=? AND seq_number=? AND lock_token=? AND operation=? AND args=? AND expires_at>?`,
 				queue, seq, token, op, args, now).Scan(&one)
 			if err == nil {
-				return nil // idempotent replay of the SAME verb on an already-settled token
+				return nil // idempotent replay of the exact request that already succeeded
 			}
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrLockLost
@@ -603,8 +603,8 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 			rec.Close()
 		}
 
-		// 3. One receipt per token this call settled — what makes a re-Complete with the SAME token
-		//    an idempotent success instead of ErrLockLost.
+		// 3. One receipt per Complete request this call settled — a replay must match the queue,
+		//    seq, token, completed verb, and empty args to succeed instead of ErrLockLost.
 		return chunkPairs(rows, func(group []SettleItem, _ string) error {
 			recArgs := make([]any, 0, 7*len(group))
 			var vals strings.Builder
@@ -636,7 +636,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		if it.LockToken == "" {
 			continue // Ok stays false
 		}
-		// Settled now, or already settled earlier under the same token (lost-response replay).
+		// Settled now, or already completed by the exact same request (lost-response replay).
 		k := settleKey(it.SeqNumber, it.LockToken)
 		out[i].Ok = settled[k] || replayed[k]
 	}

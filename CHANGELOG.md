@@ -19,6 +19,12 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 
 ### Behavior changes
 
+- **Claim timestamps now follow writer admission** (MQLITE-108). `Receive` (plain or
+  `AttemptID`, including receive-and-delete) and `ReceiveDeferred` use fresh broker time
+  for each item and each remote retry when checking TTL and setting the lease deadline.
+  Previously a wait for the single writer could consume the lease before a message was
+  claimed, and deferred receives could deliver messages whose TTL had expired. Attempt-record
+  expiry checks and creation timestamps also use fresh transaction-time observations.
 - **`seq_number` is now allocated with `AUTOINCREMENT` and never reused**
   (MQLITE-71). Previously SQLite could recycle the highest `id` after its row was deleted,
   so a stale `Cancel` (which is fenced only by `seq_number`) could delete a *later* message
@@ -227,19 +233,19 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   `--file` is an error instead of silently letting the file win.
 
 - **A settlement receipt now vouches only for the VERB THAT WROTE IT** (MQLITE-99). Receipts make a
-  settle whose response was lost replayable — the same verb, same token, same success. They were
+  settle whose response was lost replayable — the same request, the same success. They were
   not checking the verb, so `Abandon(T)` (which returns the message to `active`) left a receipt
   that a later `Complete(T)` read as "already completed": **the caller was told the message was
   gone while it sat in the queue, waiting to be handed to somebody else.** `CompleteBatch` reported
   the same false `ok`. Every cross-verb combination now fails with `ErrLockLost` / `ok=false` and
-  leaves the message where it was; a same-verb replay is still an idempotent success. **This defect
+  leaves the message where it was; an exact-request replay is still an idempotent success. **This defect
   predates the batch work and ships in the released v0.2.0.**
 - **`Engine.Tx` / `Embedded.Tx`: the callback may run more than once on a REMOTE store** (MQLITE-99,
   documentation). A transaction that fails on a retryable connection/busy error is replayed from
   the start. The SQL rolls back, so your data stays correct — but anything the callback does
   *outside* the transaction (an HTTP call, a charge, a counter) will have happened twice. Keep the
-  callback transaction-bound. Local file and `:memory:` stores never retry, so it runs exactly once
-  there.
+  callback transaction-bound. Local file and `:memory:` stores never retry, so it runs zero or one
+  time there: an already-cancelled caller never enters the callback.
 
 - **Cancelling a request can no longer wedge or erase a local database** (MQLITE-98/100).
   Interrupting an in-flight statement on a local SQLite store LEAKS the connection: the pool then
@@ -251,8 +257,9 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
   A statement that is already EXECUTING on a local store is therefore no longer interrupted. The
   contract stays narrow, and cancellation keeps its meaning: an already-cancelled caller never
   starts a statement, and a caller waiting for the single writer keeps its own deadline and mutates
-  nothing. Only a statement already running is allowed to finish, and the next one in a transaction
-  does not begin. **Be clear about what this costs**: a local statement that has started cannot be
+  nothing. A running statement finishes; mqlite-owned transaction statements check cancellation
+  before starting each subsequent statement. Raw `EngineTx.SQL()` calls bypass those guards — see
+  MQLITE-103 below. **Be clear about what this costs**: a local statement that has started cannot be
   cancelled, and there is no upper bound on how long it runs — `EngineTx.SQL()` executes arbitrary
   user SQL, a full `VACUUM` rewrites the file, a large `Purge` is a big `DELETE`. A write can
   therefore commit *after* its caller has given up, so keep treating a lost response as
@@ -276,6 +283,28 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 
   A replay is the SAME request, and only that. Anything else, on a message you no longer hold, is
   `ErrLockLost` — which is the truth.
+
+### Validation and contract documentation
+
+- **Raw transaction cancellation is documented at the public API boundary** (MQLITE-103).
+  On local stores, business SQL must use the protected `tx.Context()` and callers must check
+  the original context between their own statements. Raw `tx.SQL()` bypasses mqlite's statement
+  guards and can execute after cancellation; cancellation observed before commit rolls back
+  the whole transaction after the callback returns, even if it returns nil. Public file and
+  `:memory:` tests cover that boundary without changing the API or cancellation mechanism.
+- **Settlement replay checks cover the complete request identity** (MQLITE-104/105).
+  The regression matrix covers single/batch replays, queue/sequence/token/operation mismatches,
+  and effect-bearing arguments. The independent model uses structured receipt
+  keys so Reject reason/description delimiters cannot collide; it also checks equivalent default
+  reasons. These changes strengthen tests without changing settlement behavior.
+- **Crash recovery covers the final delivery reaching the DLQ** (MQLITE-107). A hard-killed
+  worker holds a message on its last permitted delivery; recovery must preserve the payload and
+  delivery count, clear the lock, and dead-letter it with `MaxDeliveryCountExceeded`. Producer
+  identities now use a cryptographically random process nonce plus a counter. Crash assertions
+  cover atomicity and every producer-acknowledged commit observed by the harness, not power loss.
+- **Contract wording and runnable examples are aligned** (MQLITE-106): exact-request settlement
+  receipts, zero-or-one local transaction callbacks, acknowledged-commit crash evidence, the
+  Stats example's `BASE_URL`, and the separate race-instrumented Linux crash CI job.
 
 ## v0.2.0 — 2026-07-11
 
