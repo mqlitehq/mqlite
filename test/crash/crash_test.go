@@ -117,6 +117,8 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 		runProducer(ctx, e)
 	case "locker":
 		runLocker(ctx, e)
+	case "delivery-limit":
+		runDeliveryLimitLocker(ctx, e)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown crash role %q\n", role)
 		os.Exit(2)
@@ -131,7 +133,7 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 //     writes and announce inTxMarker, so the harness kills with the order written and the message
 //     not. This is the deterministic proof that a torn callback rolls back whole.
 //
-// Order identity is a per-PROCESS nonce (this process's start time + a counter), not a value derived
+// Order identity is a per-PROCESS nonce (128 random bits + a counter), not a value derived
 // from the database like MAX(oid)+1. That matters for the no-loss check: if a crash lost a whole
 // acknowledged transaction, a db-derived id would be recomputed and reused by the next worker,
 // silently taking the lost one's place. A process-unique nonce can never be regenerated, so the loss
@@ -145,7 +147,11 @@ func runProducer(ctx context.Context, e *mqlite.Embedded) {
 		fail("create orders", err)
 	}
 
-	prefix := strconv.FormatInt(time.Now().UnixNano(), 10) // unique to THIS process
+	var processID [16]byte
+	if _, err := rand.Read(processID[:]); err != nil {
+		fail("producer identity", err)
+	}
+	prefix := hex.EncodeToString(processID[:]) // independent of clock resolution or clock rollback
 	counter := 0
 	nextNonce := func() string { counter++; return prefix + "-" + strconv.Itoa(counter) }
 
@@ -241,6 +247,52 @@ func runLocker(ctx context.Context, e *mqlite.Embedded) {
 			ready()
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// deliveryLimitCases exercise both sides of the recovery boundary, including a queue whose first
+// attempt is its last. Multiple queues also catch recovery using another queue's delivery limit.
+var deliveryLimitCases = []struct {
+	queue         string
+	maxDeliveries int
+	crashDelivery int
+}{
+	{"first-is-last", 1, 1},
+	{"last-delivery", 3, 3},
+	{"one-retry-left", 3, 2},
+}
+
+const deliveryLimitSeeds = 4
+
+// runDeliveryLimitLocker reaches each boundary by real Receive/Abandon calls, then holds every
+// final lock until SIGKILL. No Close or maintenance can settle these locks before recovery.
+func runDeliveryLimitLocker(ctx context.Context, e *mqlite.Embedded) {
+	for _, c := range deliveryLimitCases {
+		for attempt := 1; attempt <= c.crashDelivery; attempt++ {
+			msgs, err := e.Receive(ctx, c.queue, mqlite.RecvOpts{Max: deliveryLimitSeeds})
+			if err != nil {
+				fail("delivery-limit receive", err)
+			}
+			if len(msgs) != deliveryLimitSeeds {
+				fail("delivery-limit receive", fmt.Errorf("queue %s attempt %d: got %d messages, want %d",
+					c.queue, attempt, len(msgs), deliveryLimitSeeds))
+			}
+			for _, msg := range msgs {
+				if msg.DeliveryCount != attempt || !msg.LockedUntil.After(time.Now().Add(30*time.Minute)) {
+					fail("delivery-limit lock", fmt.Errorf("queue %s seq %d: attempt=%d, deadline=%s",
+						c.queue, msg.SequenceNumber, msg.DeliveryCount, msg.LockedUntil))
+				}
+				if attempt < c.crashDelivery {
+					if err := msg.Abandon(ctx); err != nil {
+						fail("delivery-limit abandon", err)
+					}
+				}
+			}
+		}
+	}
+	ready() // every boundary is reached with live locks; killLoop proves liveness before killing
+	for {
+		time.Sleep(time.Hour)
 	}
 }
 
@@ -441,6 +493,112 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 			"  duplicated bodies: %v\n"+
 			"  nothing was ever completed, so every seed id 0..%d must come back exactly once.",
 			total, m.Total, seeded, trim(missing), trim(duped), seeded-1)
+	}
+}
+
+// TestCrashRecoveryDeadLettersLastDelivery pins the recovery boundary after an actual process
+// kill (MQLITE-107). The reaper is disabled and leases last an hour, so only Open can recover them.
+func TestCrashRecoveryDeadLettersLastDelivery(t *testing.T) {
+	ctx := context.Background()
+	db := dbPath(t)
+	wantBodies := make(map[int64]string)
+	func() {
+		e := openWithRetry(ctx, db)
+		defer e.Close()
+		for _, c := range deliveryLimitCases {
+			if err := e.CreateQueue(ctx, c.queue, mqlite.QueueConfig{
+				LockDuration: time.Hour, MaxDeliveryCount: c.maxDeliveries,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < deliveryLimitSeeds; i++ {
+				body := fmt.Sprintf("%s-%d", c.queue, i)
+				seq, err := e.SendOne(ctx, c.queue, mqlite.OutMessage{Body: []byte(body), MessageID: body})
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantBodies[seq] = body
+			}
+		}
+	}()
+
+	_, _ = killLoop(t, db, "delivery-limit", readyMarker, true, 1)
+	e := openWithRetry(ctx, db)
+	defer e.Close()
+	// Peek exposes the deadline but intentionally hides the fencing token; pin both persisted
+	// lock fields before Receive has an opportunity to replace a stale token.
+	var staleLocks int
+	if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
+		return tx.SQL().QueryRowContext(tx.Context(),
+			`SELECT COUNT(*) FROM messages WHERE locked_until != 0 OR lock_token IS NOT NULL`).Scan(&staleLocks)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if staleLocks != 0 {
+		t.Fatalf("recovery left %d persisted lock(s); deadlines and fencing tokens must both be cleared", staleLocks)
+	}
+
+	for _, c := range deliveryLimitCases {
+		t.Run(c.queue, func(t *testing.T) {
+			wantState, wantReason := mqlite.Active, ""
+			var wantActive, wantDLQ int64 = deliveryLimitSeeds, 0
+			if c.crashDelivery == c.maxDeliveries {
+				wantState, wantReason = mqlite.DeadLettered, engine.ReasonMaxDeliveryCount
+				wantActive, wantDLQ = 0, deliveryLimitSeeds
+			}
+			stats, err := e.Stats(ctx, c.queue)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats.Total != deliveryLimitSeeds || stats.Active != wantActive || stats.DeadLettered != wantDLQ ||
+				stats.Locked != 0 || stats.Deferred != 0 || stats.Scheduled != 0 {
+				t.Fatalf("recovered counts: %+v; want total=%d active=%d dead_lettered=%d and no other states",
+					stats, deliveryLimitSeeds, wantActive, wantDLQ)
+			}
+			msgs, err := e.Peek(ctx, c.queue, mqlite.PeekOpts{Max: deliveryLimitSeeds + 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(msgs) != deliveryLimitSeeds {
+				t.Fatalf("recovered %d messages, want %d", len(msgs), deliveryLimitSeeds)
+			}
+			seen := make(map[string]bool)
+			for _, msg := range msgs {
+				body, ok := wantBodies[msg.SequenceNumber]
+				if !ok || string(msg.Body) != body || msg.MessageID != body || seen[body] ||
+					!strings.HasPrefix(body, c.queue+"-") {
+					t.Fatalf("recovered identity: seq=%d body=%q message_id=%q; expected unique seed %q in %s",
+						msg.SequenceNumber, msg.Body, msg.MessageID, body, c.queue)
+				}
+				seen[body] = true
+				if msg.State != wantState || msg.DeliveryCount != c.crashDelivery ||
+					msg.DeadLetterReason != wantReason || msg.DeadLetterDescription != "" || !msg.LockedUntil.IsZero() {
+					t.Fatalf("recovered seq=%d: state=%s delivery_count=%d reason=%q description=%q locked_until=%s; "+
+						"want state=%s delivery_count=%d reason=%q with cleared lock",
+						msg.SequenceNumber, msg.State, msg.DeliveryCount, msg.DeadLetterReason,
+						msg.DeadLetterDescription, msg.LockedUntil, wantState, c.crashDelivery, wantReason)
+				}
+			}
+			// Exhausted messages must never escape through Receive; the control retains exactly one
+			// valid delivery, and recovery must not consume or reset that remaining attempt.
+			received, err := e.Receive(ctx, c.queue, mqlite.RecvOpts{Max: deliveryLimitSeeds + 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if int64(len(received)) != wantActive {
+				t.Fatalf("received %d messages after recovery, want %d", len(received), wantActive)
+			}
+			for _, msg := range received {
+				if string(msg.Body) != wantBodies[msg.SequenceNumber] || !seen[string(msg.Body)] ||
+					msg.MessageID != string(msg.Body) || msg.DeliveryCount != c.maxDeliveries {
+					t.Fatalf("invalid remaining delivery: %+v", msg)
+				}
+				delete(seen, string(msg.Body))
+				if err := msg.Complete(ctx); err != nil {
+					t.Fatalf("remaining delivery cannot settle: %v", err)
+				}
+			}
+		})
 	}
 }
 
