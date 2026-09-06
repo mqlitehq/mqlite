@@ -16,6 +16,36 @@ import (
 // pool (TestTursoConcurrent). The hermetic retry-classification tests live in
 // storage_test.go.
 
+// Register after the engine's Close cleanup: testing runs cleanups last-in-first-out.
+// Only exact names owned by the test are removed, including auxiliary rows that
+// have no queue foreign key. Attempt every statement and fail visibly on errors.
+func cleanupTursoQueues(t *testing.T, e *Engine, queues ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		failed := false
+		for _, q := range queues {
+			for _, stmt := range []string{
+				`DELETE FROM messages WHERE queue=?`,
+				`DELETE FROM dedup WHERE queue=?`,
+				`DELETE FROM settlement_receipts WHERE queue=?`,
+				`DELETE FROM receive_attempts WHERE queue=?`,
+				`DELETE FROM subscriptions WHERE subscription=?`,
+				`DELETE FROM queues WHERE name=?`,
+			} {
+				if _, err := e.db.exec(ctx, stmt, q); err != nil {
+					failed = true
+					t.Errorf("cleanup queue %q (%s): %v", q, stmt, err)
+				}
+			}
+		}
+		if !failed {
+			t.Logf("Turso cleanup OK: removed %d test queue(s) and their auxiliary rows", len(queues))
+		}
+	})
+}
+
 // TestTursoIntegration runs the full lifecycle against a real remote Turso/libSQL
 // database. It is skipped unless MQLITE_TEST_DB is set, so `go test` stays
 // hermetic by default. The connection string and token come from the
@@ -37,21 +67,21 @@ func TestTursoIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open remote: %v", err)
 	}
-	defer e.Close()
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("close remote: %v", err)
+		}
+	})
 	if !e.Remote() {
 		t.Fatalf("expected remote store for dsn %q", dsn)
 	}
 
 	// unique queue per run so repeated runs don't collide.
 	q := fmt.Sprintf("itest_%d", time.Now().UnixNano())
+	cleanupTursoQueues(t, e, q)
 	if err := e.CreateQueue(ctx, q, QueueConfig{LockDurationMs: 30000, MaxDeliveryCount: 5}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}
-	t.Cleanup(func() {
-		// best-effort cleanup of this run's rows + queue metadata.
-		_, _ = e.db.sql.ExecContext(context.Background(), `DELETE FROM messages WHERE queue=?`, q)
-		_, _ = e.db.sql.ExecContext(context.Background(), `DELETE FROM queues WHERE name=?`, q)
-	})
 
 	// send a batch
 	seqs, err := e.Send(ctx, q,
@@ -118,7 +148,11 @@ func TestTursoExtended(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open remote: %v", err)
 	}
-	defer e.Close()
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("close remote: %v", err)
+		}
+	})
 	if !e.Remote() {
 		t.Fatalf("expected remote store for dsn %q", dsn)
 	}
@@ -128,14 +162,7 @@ func TestTursoExtended(t *testing.T) {
 	topic := fmt.Sprintf("xt_%d", run)
 	subAll := fmt.Sprintf("xs_all_%d", run)
 	subPaid := fmt.Sprintf("xs_paid_%d", run)
-	t.Cleanup(func() {
-		bg := context.Background()
-		for _, name := range []string{q, subAll, subPaid} {
-			_, _ = e.db.sql.ExecContext(bg, `DELETE FROM messages WHERE queue=?`, name)
-			_, _ = e.db.sql.ExecContext(bg, `DELETE FROM queues WHERE name=?`, name)
-		}
-		_, _ = e.db.sql.ExecContext(bg, `DELETE FROM subscriptions WHERE topic=?`, topic)
-	})
+	cleanupTursoQueues(t, e, q, subAll, subPaid)
 
 	if err := e.CreateQueue(ctx, q, QueueConfig{
 		LockDurationMs: 30000, MaxDeliveryCount: 5, DedupWindowMs: (10 * time.Minute).Milliseconds(),
@@ -266,22 +293,22 @@ func TestTursoConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open remote: %v", err)
 	}
-	defer e.Close()
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("close remote: %v", err)
+		}
+	})
 	if !e.Remote() {
 		t.Fatalf("expected remote store for dsn %q", dsn)
 	}
 
 	q := fmt.Sprintf("cc_%d", time.Now().UnixNano())
+	cleanupTursoQueues(t, e, q)
 	if err := e.CreateQueue(ctx, q, QueueConfig{
 		LockDurationMs: 60000, MaxDeliveryCount: 5, DedupWindowMs: (10 * time.Minute).Milliseconds(),
 	}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}
-	t.Cleanup(func() {
-		bg := context.Background()
-		_, _ = e.db.sql.ExecContext(bg, `DELETE FROM messages WHERE queue=?`, q)
-		_, _ = e.db.sql.ExecContext(bg, `DELETE FROM queues WHERE name=?`, q)
-	})
 
 	// ── Part 1: concurrent dedup — N goroutines race to send the SAME message id.
 	// All must collapse to one row (one seq), exercising the dedup path through the
@@ -397,13 +424,16 @@ func TestTursoBatchSettle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open remote: %v", err)
 	}
-	defer e.Close()
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("close remote: %v", err)
+		}
+	})
 
-	// A FIXED queue name, reused every run. A unique one would leave a queues row behind on the
-	// live database forever: Purge only deletes dead letters, never the queue metadata, and a
-	// t.Cleanup would run AFTER the deferred e.Close() anyway, so it could not issue the request.
-	// Reusing one queue leaks nothing; drain whatever a previous failed run may have left.
+	// Keep this test's reserved fixed name so a run can drain leftovers from older
+	// runs that did not clean up. Remove its rows and metadata before closing the DB.
 	const q = "batch-settle-turso"
+	cleanupTursoQueues(t, e, q)
 	if err := e.CreateQueue(ctx, q, QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}

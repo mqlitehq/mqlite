@@ -328,7 +328,7 @@ class WorkflowContractTests(unittest.TestCase):
         # continue-on-error, alternate publish step, matrix entry, or checkout is
         # security-relevant. Review any change before updating these goldens.
         expected = {
-            "ci.yml": "a84deed806aa3ec88bea55ceff3c9564282a17b062a764380e129656c9a27147",
+            "ci.yml": "3dbedcd8dfcd2e40a13819f103e316cf96750326fe0f79ab5a4d737b0e75026f",
             "release.yml": "badec32ab2c9e80b37e732ae0e4418ceebabb3de80b4a396d87dd0c799ab4ed4",
             "release-image.yml": "a7e7ab66172d60f82b9d493ed0429005f5556f890a029ce686bc2c8a6935cffb",
         }
