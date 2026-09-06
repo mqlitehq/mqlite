@@ -100,6 +100,7 @@ func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, 
 				return out, err
 			}
 			m.LockToken = ""
+			m.LockedUntilMs = 0 // The row is gone; neither response nor attempt replay grants a lease.
 		}
 		out = append(out, m)
 		// Stop once the response reaches the byte budget: we only ever claim messages we

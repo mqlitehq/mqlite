@@ -1421,7 +1421,11 @@ func TestClaimTimeAfterWriterAdmission(t *testing.T) {
 						if m.SeqNumber != seq || string(m.Body) != "kept" || m.DeliveryCount != wantDelivery {
 							t.Fatalf("wrong identity/delivery: %+v", m)
 						}
-						if m.LockedUntilMs != now.Load()+1_000 {
+						if opts.Mode == ReceiveAndDelete {
+							if m.LockToken != "" || m.LockedUntilMs != 0 {
+								t.Fatalf("receive-delete returned a lease: %+v", m)
+							}
+						} else if m.LockedUntilMs != now.Load()+1_000 {
 							t.Fatalf("lease starts before writer admission: until=%d now=%d", m.LockedUntilMs, now.Load())
 						}
 						if opts.Mode != ReceiveAndDelete {

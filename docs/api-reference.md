@@ -127,6 +127,9 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 ### Receive
 
 Peek-Lock (default) or Receive-and-Delete; long-polls up to `wait_time_ms`.
+Receive-and-Delete removes the row before returning it and grants no lease:
+`lock_token` is empty and `locked_until_ms` is zero (omitted when empty), including
+replays with the same receive attempt ID. The SDK exposes a zero `LockedUntil` time.
 
 - **Request** `ReceiveRequest`: `queue`, `max_messages` (int, default 1, max 256),
   `wait_time_ms` (int, long-poll; max 20000), `receive_mode` (int: `0` peek-lock,

@@ -29,6 +29,10 @@ once and never silently dropped; handlers must be idempotent. (§3)
   TestClaimBatchTTLBetweenItems, TestReceiveDeferredMixedItemsAndCommittedPrefix;
   engine/storage_test.go: TestClaimTimeRefreshesOnRemoteRetry)*
 
+- **1.7 Receive-and-delete** removes each returned row and grants no lease: its
+  lock token is empty and deadline is zero, including a cached attempt replay.
+  Peek-lock retains its token and lease deadline. *(sdk_test.go: TestSDKReceiveDeleteLeaseShape)*
+
 ## 2 · Settlement (fenced on `lock_token`)
 
 Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
