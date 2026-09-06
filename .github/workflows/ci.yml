@@ -149,25 +149,30 @@ jobs:
           go-version: stable # latest patch -> stdlib CVEs already fixed
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      # Use the release matrix and post-build hooks: Linux source analysis alone
+      # misses platform-specific dependencies in the Windows/macOS artifacts.
+      - name: scan all release binaries (build only, no publishing)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: build --snapshot --clean
 
   docker:
-    name: docker build + healthz smoke
+    name: docker build + authenticated restart smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: release guard contract tests
+        run: python3 test/release_guard_test.py -v
       - name: build image
-        run: docker build --platform linux/amd64 -t mqlite:ci .
-      - name: run + /healthz smoke
         run: |
-          docker run -d --name mq -p 6754:6754 mqlite:ci
-          ok=""
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:6754/healthz >/dev/null; then ok=1; break; fi
-            sleep 1
-          done
-          if [ -z "$ok" ]; then echo "healthz never came up"; docker logs mq; exit 1; fi
-          echo "healthz OK"
-          docker rm -f mq
+          version=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' internal/version/version.go)
+          docker build --pull --platform linux/amd64 --build-arg VERSION="$version" --build-arg REVISION="$GITHUB_SHA" -t mqlite:ci .
+      - name: authenticated message flow and persistent volume restart
+        run: |
+          version=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' internal/version/version.go)
+          python3 test/release_image_smoke.py mqlite:ci --expected-version "$version" --expected-revision "$GITHUB_SHA"
 
   e2e:
     # Black-box end-to-end: builds mqlite, boots an ephemeral broker, and runs the

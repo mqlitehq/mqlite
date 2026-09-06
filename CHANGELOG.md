@@ -10,6 +10,9 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 
 ## Unreleased
 
+The source version is prepared as **0.3.0**; this section remains unreleased until
+the maintainer approves tagging and publishing.
+
 > **Schema: this release is `schemaVersion = 5`.** mqlite keeps ONE canonical schema and never
 > migrates (pre-1.0), so an existing DB from any earlier release is refused with
 > `ErrSchemaVersionMismatch` and must be recreated. **Before upgrading, stop all writers and back
@@ -18,6 +21,18 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 > `seq_number` allocation and the settlement-receipt key.
 
 ### Behavior changes
+
+- **Release artifacts now require matching source and complete CI** (MQLITE-109).
+  Both release workflows resolve the real tag, verify its version constant, and
+  require all 12 CI jobs to succeed for that exact commit in one completed run
+  attempt. Manual image builds use the tagged commit. RC images get only their
+  full version tag; stable releases also update the minor and `latest` aliases.
+  Docker uses Go 1.27 / Alpine 3.24, scans its actual binary with `govulncheck`,
+  and tests authenticated message settlement and persistent-volume recovery.
+  CI and GoReleaser also scan both archive binaries for all six release platforms,
+  including Windows-specific dependency paths absent from a Linux source scan.
+  Artifacts retain symbols for binary analysis while omitting DWARF debug data.
+  The Go 1.21 embedding floor is unchanged.
 
 - **Claim timestamps now follow writer admission** (MQLITE-108). `Receive` (plain or
   `AttemptID`, including receive-and-delete) and `ReceiveDeferred` use fresh broker time

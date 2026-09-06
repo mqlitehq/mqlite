@@ -330,7 +330,7 @@ manual-only, via `mqlite vacuum`). See [docs/retention.md](docs/retention.md).
 ## Docker
 
 ```bash
-# --pull forces the latest golang:1.25 base (newest Go stdlib security patches) —
+# --pull forces the latest golang:1.27-alpine3.24 base (Go stdlib security patches) —
 # use it for release builds so a cached old base layer can't ship known CVEs.
 docker build --platform linux/amd64 --pull -t mqlite:dev .
 docker run --platform linux/amd64 -p 6754:6754 -e MQLITE_TOKENS=mqk_dev mqlite:dev

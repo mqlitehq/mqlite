@@ -14,17 +14,26 @@ builds:
     binary: mqlite
     env: [CGO_ENABLED=0] # pure Go (modernc SQLite) — static, cross-compiles cleanly
     flags: [-trimpath]
-    ldflags: [-s -w]
+    # Keep symbols so govulncheck can distinguish linked code from module metadata.
+    ldflags: [-w]
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
+    hooks:
+      post:
+        - cmd: go run golang.org/x/vuln/cmd/govulncheck@latest -mode=binary "{{ .Path }}"
+          output: true
   - id: mqlite-mcp
     main: ./cmd/mqlite-mcp
     binary: mqlite-mcp
     env: [CGO_ENABLED=0]
     flags: [-trimpath]
-    ldflags: [-s -w]
+    ldflags: [-w]
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
+    hooks:
+      post:
+        - cmd: go run golang.org/x/vuln/cmd/govulncheck@latest -mode=binary "{{ .Path }}"
+          output: true
 
 archives:
   # one archive per OS/arch containing both binaries (mqlite + mqlite-mcp).

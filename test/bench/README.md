@@ -6,8 +6,8 @@ runs system monitoring inside **Docker**, and uses an in-process probe reading
 
 | File | Role |
 |---|---|
-| `main.go` (this dir) | load generator: 9 scenarios + µs latency histogram + `/proc/self/io`·`/proc/self/stat` probes, writes `results.json` |
-| `Dockerfile` | bench image (golang + sysstat/procps), **native arch** (does not force amd64, to avoid qemu distortion) |
+| `main.go` (this dir) | load generator: scenario matrix + µs latency histogram + `/proc/self/io`·`/proc/self/stat` probes, writes `results.json` |
+| `Dockerfile` | Linux amd64 bench image (Go 1.27 on Debian trixie + sysstat/procps) |
 | `entry.sh` | in-container: start `iostat`/`vmstat` sampling → run bench → tear down, record `env.txt` |
 | `run-bench.sh` | host: build image → run (DB on the container fs, not a bind-mount) → `docker cp` the results into `out/` |
 
@@ -21,6 +21,10 @@ BENCH_DUR=10s BENCH_MSG=1024 ./test/bench/run-bench.sh    # custom duration / bo
 
 Artifacts land in `test/bench/out/`: `results.json`, `iostat.log`, `vmstat.log`,
 `env.txt`, and each scenario's `*.db`.
+
+Builds and runs use `--platform linux/amd64`. Use an amd64 Linux host for performance
+measurements; an ARM host may emulate the image, so a successful smoke run there
+only verifies functionality.
 
 ## Backend: local file vs remote Turso (MQLITE-41)
 
@@ -42,10 +46,11 @@ comparison:
 ## Scenarios
 
 produce ×{1,4,8 producers} · batch ×{16,64} · e2e(4×4) · drain(200k prefill, then empty)
-· sessions(64 groups) · produce FULL (fsync control).
+· sessions(64 groups) · produce FULL (fsync control) · message properties · body-size
+sweep · fill/drain reclamation · load ramp-down · consumer churn.
 
 For the full results and analysis, see the stress report in the design repo
 (`mqlite-stress-report.{md,html}`).
 
-> Caveat: Docker Linux VM (Apple Silicon), not bare metal; ratios carry over, absolute
-> numbers do not. The probe adds a low-single-digit-percent overhead on µs-scale operations.
+> Record the host architecture, virtualization, and emulation alongside results.
+> The in-process probe adds overhead to microsecond-scale operations.
