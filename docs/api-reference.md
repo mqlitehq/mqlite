@@ -150,7 +150,10 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 ### Complete / Abandon / Reject / Defer / Renew
 
 All take `SettleRequest` and return `SettleResponse` `{ "ok": true }`. Settling with
-an expired or wrong `lock_token` → `409 lock_lost`.
+an expired or wrong `lock_token` → `409 lock_lost`, unless a live settlement receipt
+matches the exact request: `queue`, `seq_number`, `lock_token`, operation, and the
+arguments that change its effect (`delay_ms`, or Reject's reason/description).
+This replay rule applies to Complete/Abandon/Reject/Defer; Renew extends a live lease.
 
 | Method | Extra fields | Effect |
 |---|---|---|
@@ -249,7 +252,7 @@ Browse without locking or settling (triage; recover a deferred seq).
 
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
-  --data '{"queue":"orders"}' https://<host>/mqlite.v1.QueueService/Stats
+  --data '{"queue":"orders"}' "$BASE_URL/mqlite.v1.QueueService/Stats"
 # → {"queue":"orders","active":128,"locked":3,"deferred":0,"scheduled":5,
 #    "dead_lettered":2,"total":138,"oldest_message_age_ms":41200}
 ```

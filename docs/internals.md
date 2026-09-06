@@ -312,10 +312,11 @@ Every claim in this document is enforced by something that fails loudly:
   exceeds its delivery bound.
 - **A crash-injection layer** — a real worker process, hard-killed (`SIGKILL`)
   mid-transaction and restarted, proving the outbox is atomic across the crash
-  and that `Open` reclaims every orphaned lock. It re-execs the test binary, so
+  and every producer commit acknowledged to the harness survives. `Open` reclaims orphaned locks
+  to active or DLQ at the delivery limit. It re-execs the test binary, so
   it is gated behind the `crash_injection` build tag and run on Linux in its own
-  CI job: `make crash` (it is deliberately kept out of the default `-race`
-  matrix). This tests *process* death, not power loss.
+  CI job: `make crash`, with the race detector, separately from the default package
+  matrix. This tests *process* death, not power loss.
 
 ## 10 · What this design refuses to do
 

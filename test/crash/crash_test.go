@@ -12,8 +12,8 @@
 // What it can and cannot prove, stated honestly so no one reads more into a green run than is there:
 //
 //   - It proves APPLICATION-LEVEL recovery: a transaction torn by a kill is atomic (all or nothing),
-//     orphaned locks are reset on restart, and nothing already committed is lost or duplicated. That
-//     is the contract engine.Open and the transactional outbox actually promise.
+//     orphaned locks are recovered on restart, and every producer commit acknowledged to the
+//     harness survives. These checks cover engine.Open and the transactional outbox contract.
 //   - It does NOT prove power-loss durability. A hard kill does not lose data the OS has already
 //     accepted; only a power cut or kernel panic can, and that needs fault-injecting the filesystem,
 //     which is out of scope here. So this is "the process died", not "the machine died".

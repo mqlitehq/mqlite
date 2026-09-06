@@ -368,11 +368,10 @@ func TestBatchSettleBeyondBindParameterLimit(t *testing.T) {
 	}
 }
 
-// A receipt vouches for a TOKEN, so replay detection must only consider receipts that existed
-// BEFORE this batch ran. If the lookup happens after the batch writes its own receipts, then a
-// batch carrying (wrongSeq, T) alongside the valid (liveSeq, T) sees the receipt it just wrote
-// for T and reports Ok for the wrong pair too — claiming a message settled that matched no row
-// at all. Same fencing hole as keying results by seq alone, one level over (codex).
+// A receipt vouches for the exact request. A batch carrying (wrongSeq, T) alongside the valid
+// (liveSeq, T) must never use the valid pair's receipt to report success for the wrong pair.
+// The token-only lookup previously did that after writing its own receipts — claiming a
+// message settled that matched no row. Both receipt and result matching must keep the full identity.
 func TestCompleteBatchDoesNotVouchForAPairWithItsOwnReceipt(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
@@ -391,7 +390,7 @@ func TestCompleteBatchDoesNotVouchForAPairWithItsOwnReceipt(t *testing.T) {
 	// (other.seq, live.token) is a mismatched pair: that token does not fence that row.
 	items := []SettleItem{
 		{SeqNumber: other.SeqNumber, LockToken: live.LockToken}, // must NOT settle
-		{SeqNumber: live.SeqNumber, LockToken: live.LockToken},  // settles, writing a receipt for the token
+		{SeqNumber: live.SeqNumber, LockToken: live.LockToken},  // settles, writing a receipt for this Complete request
 	}
 	res, err := e.CompleteBatch(ctx, "q", items)
 	if err != nil {
@@ -603,7 +602,7 @@ func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
 
 // A receipt vouches for the verb that WROTE it, not merely for the token.
 //
-// Receipts make a lost settle response replayable: the same verb, same token, same success. They
+// Receipts make a lost settle response replayable: the same request has the same success. They
 // are not a licence for a DIFFERENT verb to claim that success. Abandon(T) returns a message to
 // `active` — and used to leave a receipt that a later Complete(T) read as "already completed",
 // telling the caller the message was gone while it sat in the queue waiting for somebody else.

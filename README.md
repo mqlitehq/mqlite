@@ -359,9 +359,13 @@ MQLITE_INTEGRITY_N=500000 go test ./engine -run TestMessageIntegrity  # large sw
 # live remote round-trip against your own Turso DB:
 MQLITE_TEST_DB=libsql://<db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
   go test ./engine -run TestTursoIntegration -v
-# crash-injection: hard-kill a worker mid-transaction and check recovery (Linux; tag-gated):
+# crash-injection: hard-kill a worker and check recovery (separate Linux CI job; tag-gated):
 make crash                    # = go test -race -tags crash_injection -count=1 ./test/crash/
 ```
+
+`make crash` runs with the race detector; `go test -race ./...` skips this tagged suite.
+It checks outbox atomicity, survival of producer-acknowledged commits, and orphaned-lock recovery
+to active or DLQ at the delivery limit. It tests process death, not power loss.
 
 A contiguous `1..N` sequence is sent with random bodies (each hashed into a
 property) and consumed concurrently with redelivery stress; the test asserts every
