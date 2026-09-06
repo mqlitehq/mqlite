@@ -212,6 +212,19 @@ jobs:
           go-version: stable
       - name: blackbox suites (test/run.sh)
         run: ./test/run.sh
+      - name: production acceptance verifier controls
+        run: |
+          python3 test/production/soak_controls.py --output "$RUNNER_TEMP/soak-controls"
+          python3 test/production/supervisor_controls.py --output "$RUNNER_TEMP/supervisor-controls"
+      - name: preserve verifier control evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: production-verifier-controls
+          path: |
+            ${{ runner.temp }}/soak-controls
+            ${{ runner.temp }}/supervisor-controls
+          retention-days: 14
 
   crash:
     # The crash-injection layer: re-exec a worker, hard-kill it mid-transaction, restart, and check

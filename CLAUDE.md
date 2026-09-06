@@ -265,6 +265,7 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 | Live Turso | `engine/turso_test.go` (gated by `MQLITE_TEST_DB`) | Skipped unless env set; runs in `turso-nightly.yml`. |
 | Crash injection | `test/crash/` (`make crash`) | Re-execs + hard-kills a worker; asserts outbox atomicity, acknowledged commits, and recovery to active or DLQ. Build-tag `crash_injection`, race-instrumented in its own Linux CI job; excluded from the default package matrix. |
 | Stress/bench | `test/bench/` (`make bench`) | Docker matrix. |
+| Production candidate | `test/production/` | Fixed clean source/images, isolated disk-full and restore drills, and at least 24 hours of supervised mixed workload. Short runs are SMOKE only. Verifier negative controls run in the existing e2e CI job; see `test/production/README.md` for budgets, evidence and passing criteria. |
 
 `make clean` removes every generated artifact (DBs, binaries, bench output, smoke
 dirs); the regenerate targets recreate them. Source is never touched by clean.
