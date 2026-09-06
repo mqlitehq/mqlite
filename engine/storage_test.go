@@ -586,6 +586,8 @@ type busyConn struct{ st *busyState }
 type busyState struct {
 	failsLeft int
 	args      [][]driver.NamedValue // the args of every attempt, in order
+	queries   []string
+	noEffect  bool // a fenced write matched no message; exercise receipt lookup instead
 }
 
 func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
@@ -607,8 +609,9 @@ func (t *busyTx) Commit() error {
 }
 func (t *busyTx) Rollback() error { return nil }
 
-func (c *busyConn) record(args []driver.NamedValue) bool {
+func (c *busyConn) record(query string, args []driver.NamedValue) bool {
 	c.st.args = append(c.st.args, args)
+	c.st.queries = append(c.st.queries, query)
 	if c.st.failsLeft > 0 {
 		c.st.failsLeft--
 		return false
@@ -616,16 +619,19 @@ func (c *busyConn) record(args []driver.NamedValue) bool {
 	return true
 }
 
-func (c *busyConn) QueryContext(_ context.Context, _ string, args []driver.NamedValue) (driver.Rows, error) {
-	if !c.record(args) {
+func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if !c.record(query, args) {
 		return nil, errors.New("database is locked") // isBusyErr => retryable
 	}
 	return emptyRows{}, nil
 }
 
-func (c *busyConn) ExecContext(_ context.Context, _ string, args []driver.NamedValue) (driver.Result, error) {
-	if !c.record(args) {
+func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if !c.record(query, args) {
 		return nil, errors.New("database is locked")
+	}
+	if c.st.noEffect {
+		return driver.RowsAffected(0), nil
 	}
 	return driver.RowsAffected(1), nil
 }
@@ -1155,5 +1161,73 @@ func TestClaimTimeRefreshesOnRemoteRetry(t *testing.T) {
 				previous = now
 			}
 		})
+	}
+}
+
+// MQLITE-114: fresh eligibility is required for every settlement attempt, not
+// just for a newly calculated renewal deadline. The driver's two BUSY responses
+// prove retries occurred without depending on a real remote service's timing.
+func TestSettlementTimeRefreshesOnRemoteRetry(t *testing.T) {
+	for _, op := range deadlineOperations {
+		for _, noEffect := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/no_effect=%t", op, noEffect), func(t *testing.T) {
+				d, st := remoteDBFailingFirst(t, 2)
+				st.noEffect = noEffect
+				var tick int64 = 100_000
+				q := queueRow{name: "q", lockDurationMs: 1_000}
+				e := &Engine{db: d, note: newNotifier(), qcache: map[string]queueRow{"q": q}, now: func() int64 {
+					tick += 2_000
+					return tick
+				}}
+				err := callDeadlineOperation(context.Background(), e, op, "q", SettleItem{SeqNumber: 1, LockToken: "token"})
+				if err != nil && !errors.Is(err, ErrLockLost) {
+					t.Fatal(err)
+				}
+				if len(st.args) < 3 {
+					t.Fatalf("fewer than two failures and a final attempt: %v", st.args)
+				}
+				clockIndex := map[string]int{"Complete": 3, "Abandon": 5, "Reject": 5, "Defer": 3, "Renew": 4, "RenewBatch": 1, "CompleteBatch": 0}[op]
+				var previous int64
+				for i, args := range st.args[:3] {
+					if !strings.Contains(st.queries[i], "locked_until>?") || !strings.Contains(st.queries[i], "state='locked'") {
+						t.Fatalf("attempt %d omitted its live-lease predicate: %s", i, st.queries[i])
+					}
+					now, ok := args[clockIndex].Value.(int64)
+					if !ok || now <= previous {
+						t.Fatalf("attempt %d reused stale time: %v (previous=%d)", i, args, previous)
+					}
+					if (op == "Renew" || op == "RenewBatch") && args[0].Value != now+q.lockDurationMs {
+						t.Fatalf("renewal deadline and eligibility used different clocks: %v", args)
+					}
+					if op == "Abandon" && args[1].Value != now+500 {
+						t.Fatalf("Abandon delay predates its successful attempt: %v", args)
+					}
+					previous = now
+				}
+				for i := 3; i < len(st.args); i++ {
+					query, args := st.queries[i], st.args[i]
+					switch {
+					case strings.Contains(query, "INSERT OR REPLACE INTO settlement_receipts"):
+						created := args[5].Value.(int64)
+						if created <= previous || args[6].Value != created+settlementTTLMs {
+							t.Fatalf("receipt creation predates its statement: %v", args)
+						}
+						previous = created
+					case strings.Contains(query, "FROM settlement_receipts"):
+						index := len(args) - 1
+						if op == "CompleteBatch" {
+							index = 0
+						}
+						now := args[index].Value.(int64)
+						if now <= previous {
+							t.Fatalf("receipt eligibility predates lookup: %v", args)
+						}
+						previous = now
+					default:
+						t.Fatalf("unexpected statement after the fenced write: %s", query)
+					}
+				}
+			})
+		}
 	}
 }

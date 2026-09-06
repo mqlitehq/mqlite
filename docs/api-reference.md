@@ -154,6 +154,11 @@ an expired or wrong `lock_token` → `409 lock_lost`, unless a live settlement r
 matches the exact request: `queue`, `seq_number`, `lock_token`, operation, and the
 arguments that change its effect (`delay_ms`, or Reject's reason/description).
 This replay rule applies to Complete/Abandon/Reject/Defer; Renew extends a live lease.
+New settlement and renewal effects require `locked_until_ms > now`: the exact deadline
+already counts as expired, even if the background reaper has not run. The broker samples
+time after local writer admission and afresh for each statement and remote retry. A
+live exact-request receipt can replay a previously committed settlement after its
+original lease deadline; it cannot authorize a different request or revive a lease.
 
 | Method | Extra fields | Effect |
 |---|---|---|

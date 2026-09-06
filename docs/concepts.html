@@ -239,9 +239,12 @@
             Cancel only removes a scheduled row that has never been delivered
             (<code>delivery_count=0</code>). TTL applies before every claim, including
             deferred receives; expired rows are dead-lettered or discarded by policy.</p>
-          <p>Settlement is fenced by the current lock token. A lost-response replay
+          <p>New settlement and renewal effects require the current lock token and
+            <code>locked_until_ms &gt; now</code>. Equality is expired, even before the
+            reaper runs; renew before that deadline. A lost-response replay
             succeeds only for the exact queue, sequence, token, operation and
-            effect-bearing arguments recorded in a live receipt.</p>
+            effect-bearing arguments recorded in a live receipt, including after the
+            original lease expires.</p>
           <p><b>The DLQ is not another queue</b> — it is the same queue's
             <code>state='dead_lettered'</code> sub-state, worked with
             <code>peek</code> / <code>redrive</code> / <code>purge</code>.</p>

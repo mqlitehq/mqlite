@@ -3,12 +3,359 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"reflect"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// MQLITE-114: the full exported settlement surface shares the same lease boundary.
+// Pin the inventory against settle.go so adding a method requires extending this matrix.
+var deadlineOperations = []string{"Abandon", "Complete", "CompleteBatch", "Defer", "Reject", "Renew", "RenewBatch"}
+
+func TestSettlementDeadlineSurface(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "settle.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var methods []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Recv != nil && ast.IsExported(fn.Name.Name) && fn.Name.Name != "CompletedCounts" {
+			methods = append(methods, fn.Name.Name)
+		}
+	}
+	sort.Strings(methods)
+	if !reflect.DeepEqual(methods, deadlineOperations) {
+		t.Fatalf("settlement surface changed: got %v, matrix covers %v", methods, deadlineOperations)
+	}
+}
+
+// Normalize a one-item batch's documented Ok=false to the single-operation sentinel.
+// Result shape and lease metadata remain checked rather than reduced to a loose bool.
+func callDeadlineOperation(ctx context.Context, e *Engine, op, queue string, item SettleItem) error {
+	switch op {
+	case "Complete":
+		return e.Complete(ctx, queue, item.SeqNumber, item.LockToken)
+	case "Abandon":
+		return e.Abandon(ctx, queue, item.SeqNumber, item.LockToken, 500)
+	case "Reject":
+		return e.Reject(ctx, queue, item.SeqNumber, item.LockToken, "deadline", "test")
+	case "Defer":
+		return e.Defer(ctx, queue, item.SeqNumber, item.LockToken)
+	case "Renew":
+		return e.Renew(ctx, queue, item.SeqNumber, item.LockToken)
+	case "CompleteBatch", "RenewBatch":
+		var result []SettleResult
+		var err error
+		if op == "CompleteBatch" {
+			result, err = e.CompleteBatch(ctx, queue, []SettleItem{item})
+		} else {
+			result, err = e.RenewBatch(ctx, queue, []SettleItem{item})
+		}
+		if err != nil {
+			return err
+		}
+		if len(result) != 1 || result[0].SeqNumber != item.SeqNumber ||
+			((op == "CompleteBatch" || !result[0].Ok) && result[0].LockedUntilMs != 0) {
+			return fmt.Errorf("invalid %s result: %+v", op, result)
+		}
+		if !result[0].Ok {
+			return ErrLockLost
+		}
+		return nil
+	default:
+		return fmt.Errorf("uncovered settlement operation %q", op)
+	}
+}
+
+func deadlineFixture(t *testing.T, dsn string) (*Engine, *atomic.Int64) {
+	t.Helper()
+	clock := new(atomic.Int64)
+	clock.Store(100_000)
+	e, err := Open(context.Background(), Options{DB: dsn, Now: clock.Load, DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1_000})
+	return e, clock
+}
+
+func deadlineLock(t *testing.T, e *Engine) SettleItem {
+	t.Helper()
+	if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("kept")}); err != nil {
+		t.Fatal(err)
+	}
+	m := recvOne(t, e, "q")
+	if m == nil {
+		t.Fatal("missing fixture lease")
+	}
+	return SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+}
+
+func deadlineAfterWriterWait(t *testing.T, e *Engine, advanceClock func(), call func() error) error {
+	t.Helper()
+	var result error
+	claimAfterWriterWait(t, e, advanceClock, func() ([]*Message, error) {
+		result = call()
+		return nil, nil // the operation's ErrLockLost is an expected result, not a helper error
+	})
+	return result
+}
+
+// Both local stores, every operation, and both direct and queued admission paths
+// must treat exactly locked_until as expired. Maintenance never runs in this test.
+func TestSettlementLeaseDeadline(t *testing.T) {
+	for _, op := range deadlineOperations {
+		for _, wait := range []bool{false, true} {
+			for _, delta := range []int64{-1, 0, 1} {
+				t.Run(fmt.Sprintf("%s/wait=%t/deadline%+d", op, wait, delta), func(t *testing.T) {
+					eachLocalStore(t, func(t *testing.T, dsn string) {
+						ctx := context.Background()
+						e, clock := deadlineFixture(t, dsn)
+						item := deadlineLock(t, e)
+						before, err := e.Peek(ctx, "q", PeekOptions{Max: 10})
+						if err != nil || len(before) != 1 {
+							t.Fatalf("snapshot: %+v, %v", before, err)
+						}
+						at := before[0].LockedUntilMs + delta
+						call := func() error { return callDeadlineOperation(ctx, e, op, "q", item) }
+						if wait {
+							err = deadlineAfterWriterWait(t, e, func() { clock.Store(at) }, call)
+						} else {
+							clock.Store(at)
+							err = call()
+						}
+						if delta < 0 {
+							if err != nil {
+								t.Fatalf("live lease was refused: %v", err)
+							}
+						} else if !errors.Is(err, ErrLockLost) {
+							t.Fatalf("unreaped expired lease must fail: got %v", err)
+						}
+						after, err := e.Peek(ctx, "q", PeekOptions{Max: 10})
+						if err != nil {
+							t.Fatal(err)
+						}
+						if delta >= 0 && !reflect.DeepEqual(before, after) {
+							t.Fatalf("expired lease changed message identity/state: before=%+v after=%+v", before, after)
+						}
+						terminal := op != "Renew" && op != "RenewBatch"
+						var receipts int64
+						if err := e.db.queryRowScan(ctx, []any{&receipts}, `SELECT COUNT(*) FROM settlement_receipts`); err != nil {
+							t.Fatal(err)
+						}
+						wantReceipts := int64(0)
+						if delta < 0 && terminal {
+							wantReceipts = 1
+						}
+						if receipts != wantReceipts {
+							t.Fatalf("receipts=%d, want %d", receipts, wantReceipts)
+						}
+						wantCompleted := uint64(0)
+						if delta < 0 && (op == "Complete" || op == "CompleteBatch") {
+							wantCompleted = 1
+							if len(after) != 0 {
+								t.Fatal("successful completion retained the message")
+							}
+						} else if delta < 0 {
+							if len(after) != 1 || after[0].SeqNumber != item.SeqNumber || after[0].DeliveryCount != 1 {
+								t.Fatalf("unexpected post-settlement identity/delivery: %+v", after)
+							}
+							want := map[string]State{"Abandon": StateScheduled, "Reject": StateDeadLettered, "Defer": StateDeferred, "Renew": StateLocked, "RenewBatch": StateLocked}[op]
+							if after[0].State != want || (!terminal && after[0].LockedUntilMs != at+1_000) ||
+								(op == "Abandon" && after[0].VisibleAtMs != at+500) {
+								t.Fatalf("wrong live effect at write time %d: %+v", at, after[0])
+							}
+						}
+						if e.CompletedCounts()["q"] != wantCompleted {
+							t.Fatalf("completed count=%d, want %d", e.CompletedCounts()["q"], wantCompleted)
+						}
+					})
+				})
+			}
+		}
+	}
+}
+
+func TestSettlementReceiptTimeAfterWriterAdmission(t *testing.T) {
+	for _, op := range []string{"Abandon", "Complete", "CompleteBatch", "Defer", "Reject"} {
+		t.Run(op, func(t *testing.T) {
+			eachLocalStore(t, func(t *testing.T, dsn string) {
+				ctx := context.Background()
+				e, clock := deadlineFixture(t, dsn)
+				item := deadlineLock(t, e)
+				call := func() error { return callDeadlineOperation(ctx, e, op, "q", item) }
+				if err := deadlineAfterWriterWait(t, e, func() { clock.Add(500) }, call); err != nil {
+					t.Fatal(err)
+				}
+				var created, expires int64
+				if err := e.db.queryRowScan(ctx, []any{&created, &expires},
+					`SELECT created_at, expires_at FROM settlement_receipts WHERE queue='q' AND seq_number=?`, item.SeqNumber); err != nil {
+					t.Fatal(err)
+				}
+				if created != clock.Load() || expires != created+settlementTTLMs {
+					t.Fatalf("receipt lifetime predates admission: created=%d expires=%d now=%d", created, expires, clock.Load())
+				}
+				// Enter before receipt expiry, but obtain the writer exactly at expiry.
+				// The old message lease is irrelevant to the live receipt replay.
+				clock.Store(expires - 1)
+				if err := call(); err != nil {
+					t.Fatalf("live receipt after original lease: %v", err)
+				}
+				if err := deadlineAfterWriterWait(t, e, func() { clock.Store(expires) }, call); !errors.Is(err, ErrLockLost) {
+					t.Fatalf("receipt expired during admission wait must fail: %v", err)
+				}
+			})
+		})
+	}
+}
+
+func TestBatchSettlementMixedLeaseDeadlines(t *testing.T) {
+	for _, op := range []string{"CompleteBatch", "RenewBatch"} {
+		t.Run(op, func(t *testing.T) {
+			eachLocalStore(t, func(t *testing.T, dsn string) {
+				ctx := context.Background()
+				e, clock := deadlineFixture(t, dsn)
+				expired := deadlineLock(t, e)
+				clock.Add(500)
+				live := deadlineLock(t, e)
+				receipt := deadlineLock(t, e)
+				if err := e.Complete(ctx, "q", receipt.SeqNumber, receipt.LockToken); err != nil {
+					t.Fatal(err)
+				}
+				mustQueue(t, e, "other", QueueConfig{LockDurationMs: 1_000})
+				if _, err := e.SendOne(ctx, "other", OutMessage{Body: []byte("other")}); err != nil {
+					t.Fatal(err)
+				}
+				other := recvOne(t, e, "other")
+				if other == nil {
+					t.Fatal("missing other queue fixture")
+				}
+				clock.Add(500) // expired is exactly at its deadline; live still has 500 ms
+				before, err := e.Peek(ctx, "q", PeekOptions{Max: 10})
+				if err != nil || len(before) != 2 {
+					t.Fatalf("before: %+v, %v", before, err)
+				}
+				otherBefore, err := e.Peek(ctx, "other", PeekOptions{Max: 10})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pattern := []SettleItem{live, expired, {SeqNumber: live.SeqNumber, LockToken: "wrong"}, live,
+					{SeqNumber: live.SeqNumber}, {SeqNumber: other.SeqNumber, LockToken: other.LockToken},
+					{SeqNumber: 999_999, LockToken: "missing"}, receipt}
+				var items []SettleItem
+				for len(items) < MaxRenewBatch {
+					items = append(items, pattern...)
+				}
+				if op == "CompleteBatch" {
+					items = append(items, live) // duplicate of a successful earlier chunk
+				}
+				var result []SettleResult
+				if op == "CompleteBatch" {
+					result, err = e.CompleteBatch(ctx, "q", items)
+				} else {
+					result, err = e.RenewBatch(ctx, "q", items)
+				}
+				if err != nil || len(result) != len(items) {
+					t.Fatalf("batch: %+v, %v", result, err)
+				}
+				for i, got := range result {
+					want := i%len(pattern) == 0 || i%len(pattern) == 3 ||
+						(op == "CompleteBatch" && i%len(pattern) == 7)
+					until := int64(0)
+					if op == "RenewBatch" && want {
+						until = clock.Load() + 1_000
+					}
+					if got.SeqNumber != items[i].SeqNumber || got.Ok != want || got.LockedUntilMs != until {
+						t.Fatalf("item %d: %+v, want ok=%t until=%d", i, got, want, until)
+					}
+				}
+				after, err := e.Peek(ctx, "q", PeekOptions{Max: 10})
+				if err != nil || len(after) == 0 || !reflect.DeepEqual(before[0], after[0]) {
+					t.Fatalf("expired row changed without maintenance: before=%+v after=%+v err=%v", before, after, err)
+				}
+				otherAfter, err := e.Peek(ctx, "other", PeekOptions{Max: 10})
+				if err != nil || !reflect.DeepEqual(otherBefore, otherAfter) {
+					t.Fatal("wrong queue identity changed an unrelated message")
+				}
+				wantCompleted := uint64(1) // the receipt fixture was completed once
+				if op == "CompleteBatch" {
+					wantCompleted++
+				}
+				if e.CompletedCounts()["q"] != wantCompleted {
+					t.Fatalf("duplicate/invalid items inflated completed count: %v", e.CompletedCounts())
+				}
+			})
+		})
+	}
+}
+
+func TestCompleteBatchRefreshesTimeBetweenChunks(t *testing.T) {
+	for _, path := range []string{"new_effect", "receipt_replay"} {
+		t.Run(path, func(t *testing.T) {
+			eachLocalStore(t, func(t *testing.T, dsn string) {
+				ctx := context.Background()
+				e, clock := deadlineFixture(t, dsn)
+				first, last := deadlineLock(t, e), deadlineLock(t, e)
+				boundary := clock.Load() + 1_000
+				if path == "receipt_replay" {
+					for _, item := range []SettleItem{first, last} {
+						if err := e.Complete(ctx, "q", item.SeqNumber, item.LockToken); err != nil {
+							t.Fatal(err)
+						}
+					}
+					boundary = clock.Load() + settlementTTLMs
+				}
+				items := make([]SettleItem, settleChunk+1)
+				for i := range items {
+					items[i] = SettleItem{SeqNumber: 999_999, LockToken: "wrong"}
+				}
+				items[0], items[settleChunk] = first, last
+				// Each call represents one statement admission. No real sleep or reaper:
+				// the first relevant chunk is just before expiry, the second exactly at it.
+				if path == "new_effect" {
+					clock.Store(boundary - 2)
+				} else {
+					clock.Store(boundary - 4) // two DELETE chunks precede the receipt reads
+				}
+				e.now = func() int64 { return clock.Add(1) }
+				result, err := e.CompleteBatch(ctx, "q", items)
+				e.now = clock.Load
+				if err != nil || len(result) != len(items) {
+					t.Fatalf("batch: %+v, %v", result, err)
+				}
+				for i, got := range result {
+					if got.Ok != (i == 0) || got.SeqNumber != items[i].SeqNumber || got.LockedUntilMs != 0 {
+						t.Fatalf("chunk item %d crossed its deadline incorrectly: %+v", i, got)
+					}
+				}
+				if path == "new_effect" {
+					remaining, err := e.Peek(ctx, "q", PeekOptions{Max: 10})
+					if err != nil || len(remaining) != 1 || remaining[0].SeqNumber != last.SeqNumber ||
+						remaining[0].State != StateLocked || remaining[0].LockedUntilMs != boundary || remaining[0].DeliveryCount != 1 {
+						t.Fatalf("expired final chunk must remain unchanged: %+v, %v", remaining, err)
+					}
+					var created, expires int64
+					if err := e.db.queryRowScan(ctx, []any{&created, &expires},
+						`SELECT created_at, expires_at FROM settlement_receipts WHERE seq_number=?`, first.SeqNumber); err != nil {
+						t.Fatal(err)
+					}
+					if created <= boundary || expires != created+settlementTTLMs {
+						t.Fatalf("receipt insertion reused an earlier chunk's time: created=%d expires=%d boundary=%d", created, expires, boundary)
+					}
+				}
+			})
+		})
+	}
+}
 
 // CompleteBatch settles a received batch in one transaction: all valid items
 // succeed, a stale token comes back Ok=false (not fatal), and a replay of
@@ -543,10 +890,8 @@ func TestRenewBatchNeverShortensAndNeverLiesAboutADeadLease(t *testing.T) {
 			pushedTo, locked[0].LockedUntilMs)
 	}
 
-	// 2. Now let the lease actually expire. A renewal that lands after it is gone matches no row
-	//    (the reaper cleared the token) or writes a dead deadline — either way it must NOT say Ok.
+	// 2. Expiry itself fences renewal, even while the unreaped row retains its token.
 	advance(ms, time.Hour)
-	e.RunMaintenanceOnce(ctx) // the reaper reclaims the expired lock
 	res, err := e.RenewBatch(ctx, "q", []SettleItem{item})
 	if err != nil {
 		t.Fatal(err)
@@ -585,9 +930,16 @@ func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
 	}
 	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
 
-	// From here on, every clock read jumps an hour: whatever deadline the write computes, it is
-	// long gone by the time the statement finishes.
-	e.now = func() int64 { return atomic.AddInt64(&ms, time.Hour.Milliseconds()) }
+	// The old lease is still live when the write begins. Only the following read,
+	// after RETURNING reaches EOF, crosses the newly committed deadline.
+	var reads int
+	e.now = func() int64 {
+		reads++
+		if reads == 1 {
+			return atomic.AddInt64(&ms, 500)
+		}
+		return atomic.AddInt64(&ms, time.Hour.Milliseconds())
+	}
 
 	res, err := e.RenewBatch(ctx, "q", []SettleItem{item})
 	if err != nil {
@@ -595,6 +947,13 @@ func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
 	}
 	if res[0].Ok {
 		t.Error("RenewBatch claimed Ok for a lease that was already expired when the write completed — the caller would settle a message it no longer holds")
+	}
+	var committed int64
+	if err := e.db.queryRowScan(ctx, []any{&committed}, `SELECT locked_until FROM messages WHERE id=?`, item.SeqNumber); err != nil {
+		t.Fatal(err)
+	}
+	if committed != msgs[0].LockedUntilMs+500 {
+		t.Fatalf("the write must have extended the live lease before its response became stale: %d", committed)
 	}
 }
 
@@ -819,7 +1178,8 @@ func TestSettlementReceiptIdentityMatrix(t *testing.T) {
 	ctx := context.Background()
 	for _, first := range ops {
 		t.Run(first.name, func(t *testing.T) {
-			e, _ := testEngine(t)
+			e, clock := testEngine(t)
+			created := atomic.LoadInt64(clock)
 			for _, q := range []string{"q", "other"} {
 				mustQueue(t, e, q, QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 10})
 				for i := 0; i < 2; i++ {
@@ -890,21 +1250,34 @@ func TestSettlementReceiptIdentityMatrix(t *testing.T) {
 				{"wrong_token", "q", b.LockToken, a.SeqNumber},
 				{"empty_token", "q", "", a.SeqNumber},
 			}
-			for _, second := range ops {
-				for _, id := range identities {
-					t.Run(second.name+"/"+id.name, func(t *testing.T) {
-						want := id.name == "exact" && first.verb == second.verb &&
-							first.delay == second.delay && first.reason == second.reason && first.desc == second.desc
-						if got := call(t, second, id.queue, id.seq, id.token); got != want {
-							t.Errorf("receipt replay ok=%v, want %v", got, want)
-						}
-						if after := snapshot(t); !reflect.DeepEqual(after, before) {
-							t.Errorf("receipt replay changed messages: before=%+v after=%+v", before, after)
-						}
-						if after := e.CompletedCounts(); !reflect.DeepEqual(after, completed) {
-							t.Errorf("receipt replay changed completed counts: before=%v after=%v", completed, after)
-						}
-					})
+			for _, timing := range []struct {
+				name  string
+				delta int64
+				live  bool
+			}{
+				{"initial", 0, true},
+				{"lease_expired", 600_001, true},
+				{"receipt_before", settlementTTLMs - 1, true},
+				{"receipt_exact", settlementTTLMs, false},
+				{"receipt_after", settlementTTLMs + 1, false},
+			} {
+				atomic.StoreInt64(clock, created+timing.delta)
+				for _, second := range ops {
+					for _, id := range identities {
+						t.Run(timing.name+"/"+second.name+"/"+id.name, func(t *testing.T) {
+							want := timing.live && id.name == "exact" && first.verb == second.verb &&
+								first.delay == second.delay && first.reason == second.reason && first.desc == second.desc
+							if got := call(t, second, id.queue, id.seq, id.token); got != want {
+								t.Errorf("receipt replay ok=%v, want %v", got, want)
+							}
+							if after := snapshot(t); !reflect.DeepEqual(after, before) {
+								t.Errorf("receipt replay changed messages: before=%+v after=%+v", before, after)
+							}
+							if after := e.CompletedCounts(); !reflect.DeepEqual(after, completed) {
+								t.Errorf("receipt replay changed completed counts: before=%v after=%v", completed, after)
+							}
+						})
+					}
 				}
 			}
 		})

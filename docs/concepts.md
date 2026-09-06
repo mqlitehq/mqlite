@@ -83,7 +83,7 @@ Every transition, with its trigger and the condition under which it fires:
 | scheduled | scheduler loop | active | enqueue time reached |
 | scheduled | `Cancel` | ✗ removed | cancel before it activates; never-delivered rows only (`delivery_count=0`) |
 | active | `Receive` / claim | locked | `count`++; lock acquired |
-| locked | `Complete` | ✗ removed | fenced on `lock_token` |
+| locked | `Complete` | ✗ removed | matching `lock_token` and unexpired lease |
 | locked | `Abandon` | active | `count < max`, no backoff delay (immediate redelivery) |
 | locked | `Abandon` | scheduled | `count < max` with `delay_ms > 0`: backoff parking — auto-reactivated when due, holds its group on ordered queues |
 | locked | `Abandon` | dead_lettered | `count ≥ max` |
@@ -104,6 +104,11 @@ Every transition, with its trigger and the condition under which it fires:
   `max_delivery_count` (i.e. `≥`), on an explicit `reject`, or on TTL expiry (when the
   queue's `dead_letter_on_expire=1`). Inspect with `peek state=dead_lettered`, send back
   with `redrive`, or delete with `purge`.
+- **Lease deadlines fence every settlement and renewal.** A new effect requires the
+  current token and `locked_until_ms > now`; equality is expired, even before the
+  reaper runs. Renew before that deadline. A live receipt can replay an already
+  committed settlement only for the same queue, sequence, token, operation and
+  effect-bearing arguments, including after the original lease expires.
 - **Two redelivery paths.** `Abandon` is an explicit, client-driven settlement; **lock
   expiry** is automatic — the reaper (~1s) reclaims a lock held past `lock_duration`
   without settling. Both redeliver while `count < max` and dead-letter once `count ≥ max`.
