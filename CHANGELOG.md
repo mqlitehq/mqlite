@@ -30,6 +30,13 @@ the maintainer approves tagging and publishing.
   Live receipts still replay only an exact previously committed settlement request;
   this remains valid after that request's original lease expires.
 
+- **Runtime images patch their installed Alpine packages** (MQLITE-115).
+  Image builds upgrade APKs within Alpine 3.24 before adding runtime dependencies,
+  including the OpenSSL 3.5.8 fix for CVE-2026-14456. Selecting a supported base
+  branch alone previously left older preinstalled libraries in the shipped image.
+  CI scans the actual image's OS packages and fails on HIGH/CRITICAL findings;
+  CI and release builds refresh the runtime layer instead of reusing its APK cache.
+
 - **Release artifacts now require matching source and complete CI** (MQLITE-109).
   Both release workflows resolve the real tag, verify its version constant, and
   require all 12 CI jobs to succeed for that exact commit in one completed run

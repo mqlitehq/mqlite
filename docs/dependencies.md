@@ -43,6 +43,21 @@ backup connections read-only and never run another writer/checkpointer against t
 live file. The [operations runbook](operations.md#consistent-backups) preserves that
 restriction. Review native engine advisories before changing this connection model.
 
+Container OS packages have a separate security boundary from Go dependencies.
+The runtime image upgrades installed APKs within the supported Alpine branch
+before adding certificates and time-zone data. A supported base tag can still
+contain older packages: Alpine 3.24.1 included OpenSSL 3.5.7, while its repository
+provides the 3.5.8 patch for [CVE-2026-14456](https://openssl-library.org/news/secadv/20260813.txt).
+The existing Docker CI job scans its actual image's OS packages independently
+of `govulncheck`, using a checksum-verified Trivy release and a fresh vulnerability
+database. HIGH/CRITICAL findings fail the job without advisory exclusions; its
+JSON report is retained as an artifact. Update the scanner version and checksum
+together after reviewing the official release. CI and release image builds bypass
+the runtime stage's cache so the APK upgrade runs even when the base tag is unchanged.
+The exact final release candidate image must also pass an OS scan before promotion.
+MQLite's static Go binary does not link these system OpenSSL libraries; that does not justify
+shipping avoidable vulnerable runtime packages.
+
 ## How the freeze is enforced
 
 1. **`.github/dependabot.yml`** ignores `modernc.org/sqlite >=1.36.2` and
