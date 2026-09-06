@@ -29,9 +29,14 @@ once and never silently dropped; handlers must be idempotent. (§3)
   TestClaimBatchTTLBetweenItems, TestReceiveDeferredMixedItemsAndCommittedPrefix;
   engine/storage_test.go: TestClaimTimeRefreshesOnRemoteRetry)*
 
+- **1.7 Receive-and-delete** removes each returned row and grants no lease: its
+  lock token is empty and deadline is zero, including a cached attempt replay.
+  Peek-lock retains its token and lease deadline. *(sdk_test.go: TestSDKReceiveDeleteLeaseShape)*
+
 ## 2 · Settlement (fenced on `lock_token`)
 
-Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
+Exactly one verb per outcome; new effects require the `lock_token` from `Receive`
+and an unexpired lease, with the exact-request replay exception in §2.6.
 
 - **2.1 Complete** removes the message. *(engine/functional_test.go)*
 - **2.2 Abandon** returns it to `active` for redelivery (or `dead_lettered` if over
@@ -83,8 +88,9 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
   `dead_lettered` (`MaxDeliveryCountExceeded`) once `delivery_count >=
   max_delivery_count` — a crash never buys an extra delivery.
   *(engine/engine_test.go: TestCrashRecoveryRespectsMaxDelivery)*
-- **3.2** A settle whose response was lost MUST replay as success, not `ErrLockLost` —
-  and ONLY when it is the same request. A `settlement_receipt` identifies
+- **3.2** While its exact-request receipt is live, a settle whose response was lost MUST
+  replay as success, not `ErrLockLost` — and ONLY when it is the same request.
+  A `settlement_receipt` identifies
   `queue + seq_number + lock_token + operation + effect-bearing arguments`; a call that
   differs in ANY of them is not a replay and MUST return `ErrLockLost`, never a success
   that silently keeps the first call's effect.

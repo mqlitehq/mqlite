@@ -22,6 +22,11 @@ the maintainer approves tagging and publishing.
 
 ### Behavior changes
 
+- **Receive-and-delete no longer returns a phantom lease deadline** (MQLITE-116).
+  Both the initial response and receive-attempt replay now clear the deadline as
+  well as the token. The deleted message has no lease to renew or settle; the SDK
+  reports a zero `LockedUntil` time. Peek-lock responses retain their lease metadata.
+
 - **Expired leases now reject settlement immediately** (MQLITE-114).
   Complete, Abandon, Reject, Defer, Renew and both batch variants require a matching
   token and an unexpired lease, including the interval before background recovery.

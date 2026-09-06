@@ -1228,3 +1228,92 @@ func TestEmbeddedCloseWaitsForPublicTx(t *testing.T) {
 		t.Fatalf("the Tx's enqueue is not durable after reopen: got %d message(s)", len(msgs))
 	}
 }
+
+// Receive-delete has no lease, including a cached attempt replay; peek-lock
+// retains its full lease shape. Compare every exported Message field in both modes.
+func TestSDKReceiveDeleteLeaseShape(t *testing.T) {
+	for _, storage := range []string{"memory", "file"} {
+		for _, transport := range []string{"embedded", "http"} {
+			for _, atMostOnce := range []bool{false, true} {
+				for _, attempt := range []string{"", "same-attempt"} {
+					t.Run(fmt.Sprintf("%s/%s/delete_%t/attempt_%t", storage, transport, atMostOnce, attempt != ""), func(t *testing.T) {
+						ctx := context.Background()
+						const now = int64(1700000000000)
+						dsn := ":memory:"
+						if storage == "file" {
+							dir, err := os.MkdirTemp("", "mqlite-delete-lease-*")
+							if err != nil {
+								t.Fatal(err)
+							}
+							t.Cleanup(func() { _ = os.RemoveAll(dir) })
+							dsn = "file:" + filepath.Join(dir, "mq.db")
+						}
+						eng, err := mqlite.OpenEmbedded(ctx, dsn, mqlite.WithoutBackground(), mqlite.WithClock(func() int64 { return now }))
+						if err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() { _ = eng.Close() })
+						receive := eng.Receive
+						if transport == "http" {
+							ts := httptest.NewServer(server.New(eng.Engine(), []string{"delete-test"}).Handler())
+							t.Cleanup(ts.Close)
+							remote, err := mqlite.Open(ctx, ts.URL, mqlite.WithToken("delete-test"))
+							if err != nil {
+								t.Fatal(err)
+							}
+							t.Cleanup(func() { _ = remote.Close() })
+							receive = remote.Receive
+						}
+						if err := eng.CreateQueue(ctx, "q", mqlite.QueueConfig{LockDuration: time.Second}); err != nil {
+							t.Fatal(err)
+						}
+						out := mqlite.OutMessage{Body: []byte{0, 255, 128, 3}, MessageID: "id", GroupID: "group", CorrelationID: "correlation", ReplyTo: "reply", Subject: "subject", ContentType: "binary", Properties: map[string]string{"key": "value"}}
+						seq, err := eng.SendOne(ctx, "q", out)
+						if err != nil {
+							t.Fatal(err)
+						}
+						want := &mqlite.Message{SequenceNumber: seq, Body: out.Body, MessageID: out.MessageID, GroupID: out.GroupID, CorrelationID: out.CorrelationID, ReplyTo: out.ReplyTo, Subject: out.Subject, ContentType: out.ContentType, Properties: out.Properties, DeliveryCount: 1, EnqueuedAt: time.UnixMilli(now)}
+						if !atMostOnce {
+							want.LockedUntil = time.UnixMilli(now + 1000)
+						}
+						wantJSON, err := json.Marshal(want)
+						if err != nil {
+							t.Fatal(err)
+						}
+						rounds := 1
+						if attempt != "" {
+							rounds = 2
+						}
+						var token string
+						for round := 0; round < rounds; round++ {
+							messages, err := receive(ctx, "q", mqlite.RecvOpts{Max: 1, AtMostOnce: atMostOnce, Attempt: attempt})
+							if err != nil || len(messages) != 1 {
+								t.Fatalf("receive round %d: %+v, %v", round, messages, err)
+							}
+							msg := messages[0]
+							gotJSON, err := json.Marshal(msg)
+							if err != nil || string(gotJSON) != string(wantJSON) {
+								t.Fatalf("complete message shape: got=%s want=%s err=%v", gotJSON, wantJSON, err)
+							}
+							if (msg.LockToken() == "") != atMostOnce || (round > 0 && msg.LockToken() != token) {
+								t.Fatal("wrong token presence or replay identity")
+							}
+							token = msg.LockToken()
+							if atMostOnce && !errors.Is(msg.Complete(ctx), mqlite.ErrLockLost) {
+								t.Fatal("receive-delete handle unexpectedly settled")
+							}
+						}
+						stats, err := eng.Stats(ctx, "q")
+						wantRetained := int64(1)
+						if atMostOnce {
+							wantRetained = 0
+						}
+						if err != nil || stats.Total != wantRetained || stats.Locked != wantRetained {
+							t.Fatalf("retained state: %+v, %v", stats, err)
+						}
+					})
+				}
+			}
+		}
+	}
+}
