@@ -286,6 +286,13 @@ covers both. The dual-write problem — "the row committed but the event didn't"
 is not mitigated here; it is **unrepresentable**. This is the transactional
 outbox pattern with no outbox table, no poller, and no CDC pipeline.
 
+On a local store, `tx.Context()` protects SQL from mid-statement interruption. Raw
+`tx.SQL()` calls bypass mqlite's per-statement cancellation guards, so check the original
+`ctx.Err()` between business statements and return promptly when it is cancelled.
+Cancellation observed before commit rolls back both the business writes and the enqueue,
+even if the callback returns nil; it cannot stop a callback that keeps running. See the
+[cancellation contract](conformance.md#13--cancellation-context-deadlines).
+
 ## 9 · What keeps it true
 
 Every claim in this document is enforced by something that fails loudly:

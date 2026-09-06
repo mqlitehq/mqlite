@@ -215,10 +215,12 @@ Cancelling a call is not a way to *undo* it, and on a local store it is not a la
 either. The rules below are the whole contract; they are stated here, and not only in the
 changelog, because a caller can observe every one of them.
 
-- **13.1** A caller whose context is already cancelled MUST NOT execute anything. This holds
+- **13.1** A mqlite operation whose context is already cancelled MUST NOT execute anything. This holds
   at both boundaries — before the wait for the writer, and again after the connection is in
-  hand. *(engine/cancel_test.go: TestPreCancelledNeverExecutes,
-  TestCancelInTheHandoffWindowStartsNothing)*
+  hand — and before entering a local `Tx` callback.
+  *(engine/cancel_test.go: TestPreCancelledNeverExecutes,
+  TestCancelInTheHandoffWindowStartsNothing, TestNothingBeginsInTheLastWindowBeforeAStatement;
+  sdk_test.go: TestEmbeddedTxCancellation)*
 - **13.2** A caller waiting for the single writer keeps its own deadline: cancelling while
   queued MUST return promptly and MUST mutate nothing.
   *(engine/cancel_test.go: TestCancelWhileWaitingWritesNothing)*
@@ -230,11 +232,17 @@ changelog, because a caller can observe every one of them.
   which leaves a file DB locked (`SQLITE_BUSY`, permanently) or destroys a `:memory:` DB
   outright. *(engine/cancel_test.go: TestCancelStormLeavesTheDatabaseUsable,
   TestCancelledSettleWritesLeaveTheDatabaseUsable)*
-- **13.4** Inside a transaction the rule is **per statement**: the one already running finishes,
-  and the next one MUST NOT begin. A local transaction whose caller cancels MUST roll back —
-  it MUST NOT commit work the caller abandoned, and it MUST NOT grind through the rest of the
-  closure first. *(engine/cancel_test.go: TestCancelledTransactionStopsIssuingStatements,
-  TestTxCancelledBetweenStatementsRollsBack)*
+- **13.4** Inside a local transaction, **mqlite-owned statements** (including `EngineTx.SendOne`)
+  check the caller's context before each statement: one already running finishes, and a statement
+  whose check observes cancellation MUST NOT begin. `EngineTx.SQL()` exposes a raw `*sql.Tx`
+  outside those guards. Its statements MUST use `tx.Context()` to avoid interrupting local SQLite;
+  that context is deliberately not cancellable, so raw SQL can still execute after the caller
+  cancels. Callers MUST check the original context between their own statements and return promptly.
+  Mqlite cannot interrupt the callback or release the single writer before it returns. Cancellation
+  observed after the callback and before commit MUST roll back the whole transaction, including raw
+  SQL writes, even if the callback returned nil.
+  *(engine/cancel_test.go: TestCancelledTransactionStopsIssuingStatements,
+  TestTxCancelledBetweenStatementsRollsBack; sdk_test.go: TestEmbeddedTxCancellation)*
 - **13.5** On a **remote** (Turso/libSQL) store, statement cancellation is real and unchanged:
   those statements can genuinely block on the network, and a discarded connection there holds
   no local lock.

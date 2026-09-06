@@ -143,7 +143,14 @@ eng.Tx(ctx, func(tx *engine.EngineTx) error {
 > run **more than once**: a transaction that fails on a retryable connection/busy error is replayed
 > from the start. The SQL rolls back, so your *data* stays correct — but anything that is not part
 > of the transaction (an HTTP call, a charge, a counter in memory) will have happened twice. Local
-> file and `:memory:` stores never retry, so the callback runs exactly once there.
+> file and `:memory:` stores never retry, so the callback runs at most once there; an
+> already-cancelled caller never enters it.
+
+> **Local cancellation:** use `tx.Context()` for business SQL to protect SQLite from interruption,
+> and check the original `ctx.Err()` between statements. Raw `tx.SQL()` calls bypass mqlite's
+> per-statement guards and can still execute after cancellation. The callback must return before
+> the writer is released; cancellation observed before commit rolls back all its writes, even if
+> it returned nil. See the [cancellation contract](docs/conformance.md#13--cancellation-context-deadlines).
 
 > Outgrow a single process? The *same* engine upgrades to a network broker with one
 > call — `eng.Serve(ctx, ":6754")` — and remote clients speak the same semantics

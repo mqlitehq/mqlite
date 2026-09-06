@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -314,10 +315,45 @@ func TestCancelInTheHandoffWindowStartsNothing(t *testing.T) {
 // The statements inside a local transaction deliberately run on an uninterruptible context, which
 // is what keeps an in-flight write from wedging the database. The trap is that "uninterruptible"
 // used to mean the closure kept going: a cancelled caller's 256-message Send still executed all
-// 256 inserts, and an Engine.Tx callback held the process's one writer for its full duration with
-// no way to stop it (codex, round-6). The rule is per-statement, and *txn enforces it: a statement
-// already executing finishes; the next one does not begin.
+// 256 inserts. The rule for mqlite-owned statements is per-statement, and *txn enforces it:
+// a statement already executing finishes; the next one does not begin. Raw EngineTx.SQL calls
+// bypass these guards; the public boundary is pinned in sdk_test.go (MQLITE-103).
 func TestCancelledTransactionStopsIssuingStatements(t *testing.T) {
+	statements := []struct {
+		name string
+		run  func(context.Context, *txn) error
+	}{
+		{"ExecContext", func(ctx context.Context, tx *txn) error {
+			_, err := tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES ('probe2','1')`)
+			return err
+		}},
+		{"QueryContext", func(ctx context.Context, tx *txn) error {
+			rows, err := tx.QueryContext(ctx, `INSERT INTO meta(key,value) VALUES ('probe2','1') RETURNING value`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+			}
+			return rows.Err()
+		}},
+		{"QueryRowContext", func(ctx context.Context, tx *txn) error {
+			var value string
+			return tx.QueryRowContext(ctx, `INSERT INTO meta(key,value) VALUES ('probe2','1') RETURNING value`).Scan(&value)
+		}},
+	}
+	var want, got []string
+	for _, statement := range statements {
+		want = append(want, statement.name)
+	}
+	want = append(want, "SQL") // The raw escape hatch is intentionally outside the guard.
+	txType := reflect.TypeOf((*txn)(nil))
+	for i := 0; i < txType.NumMethod(); i++ {
+		got = append(got, txType.Method(i).Name)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("txn methods = %v, want %v; extend the cancellation checks for new methods", got, want)
+	}
 	eachLocalStore(t, func(t *testing.T, dsn string) {
 		ctx := context.Background()
 		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
@@ -327,31 +363,36 @@ func TestCancelledTransactionStopsIssuingStatements(t *testing.T) {
 		defer e.Close()
 		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
 
-		cctx, cancel := context.WithCancel(context.Background())
-		var second error
-		txErr := e.inTx(cctx, func(ec context.Context, tx *txn) error {
-			if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe','1')`); err != nil {
-				t.Fatalf("the FIRST statement runs normally: %v", err)
-			}
-			cancel() // the caller gives up, mid-transaction
-			_, second = tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe2','1')`)
-			return second
-		})
-		if !errors.Is(second, context.Canceled) {
-			t.Fatalf("the statement AFTER the cancellation must not be issued at all; got err=%v", second)
-		}
-		if !errors.Is(txErr, context.Canceled) {
-			t.Fatalf("inTx must surface the cancellation, got %v", txErr)
-		}
+		for _, statement := range statements {
+			t.Run(statement.name, func(t *testing.T) {
+				cctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				var second error
+				txErr := e.inTx(cctx, func(ec context.Context, tx *txn) error {
+					if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe','1')`); err != nil {
+						t.Fatalf("the FIRST statement runs normally: %v", err)
+					}
+					cancel() // the caller gives up, mid-transaction
+					second = statement.run(ec, tx)
+					return second
+				})
+				if !errors.Is(second, context.Canceled) {
+					t.Fatalf("the statement AFTER the cancellation must not be issued at all; got err=%v", second)
+				}
+				if !errors.Is(txErr, context.Canceled) {
+					t.Fatalf("inTx must surface the cancellation, got %v", txErr)
+				}
 
-		// ...and the transaction rolled back, so not even the first statement survives.
-		var n int
-		if err := e.db.queryRowScan(context.Background(), []any{&n},
-			`SELECT COUNT(*) FROM meta WHERE key IN ('probe','probe2')`); err != nil {
-			t.Fatal(err)
-		}
-		if n != 0 {
-			t.Fatalf("a cancelled transaction committed %d row(s) — it must roll back entirely", n)
+				// ...and the transaction rolled back, so not even the first statement survives.
+				var n int
+				if err := e.db.queryRowScan(context.Background(), []any{&n},
+					`SELECT COUNT(*) FROM meta WHERE key IN ('probe','probe2')`); err != nil {
+					t.Fatal(err)
+				}
+				if n != 0 {
+					t.Fatalf("a cancelled transaction committed %d row(s) — it must roll back entirely", n)
+				}
+			})
 		}
 
 		// The database is still perfectly usable: nothing was interrupted, so nothing leaked.

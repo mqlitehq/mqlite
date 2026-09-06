@@ -805,6 +805,128 @@ func TestEmbeddedErrClosedThroughSDK(t *testing.T) {
 	}
 }
 
+// MQLITE-103: the public raw SQL handle is outside the engine's per-statement guards.
+// Pin every EngineTx method so a new transaction operation needs a cancellation classification.
+func TestEmbeddedTxCancellation(t *testing.T) {
+	txType := reflect.TypeOf((*engine.EngineTx)(nil))
+	var methods []string
+	for i := 0; i < txType.NumMethod(); i++ {
+		methods = append(methods, txType.Method(i).Name)
+	}
+	if want := []string{"Context", "SQL", "SendOne"}; !reflect.DeepEqual(methods, want) {
+		t.Fatalf("EngineTx methods = %v, want %v; extend the cancellation contract for new methods", methods, want)
+	}
+	for _, store := range []string{"memory", "file"} {
+		t.Run(store, func(t *testing.T) {
+			ctx := context.Background()
+			dsn := ":memory:"
+			if store == "file" {
+				dsn = "file:" + filepath.Join(t.TempDir(), "mq.db")
+			}
+			e, err := mqlite.OpenEmbedded(ctx, dsn, mqlite.WithoutBackground())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
+				_, err := tx.SQL().ExecContext(tx.Context(), `CREATE TABLE business (id INTEGER PRIMARY KEY)`)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Run("already cancelled", func(t *testing.T) {
+				caller, cancel := context.WithCancel(ctx)
+				cancel()
+				entered := false
+				err := e.Tx(caller, func(*engine.EngineTx) error {
+					entered = true
+					return nil
+				})
+				if !errors.Is(err, context.Canceled) || entered {
+					t.Fatalf("pre-cancelled Tx: err=%v callback entered=%v", err, entered)
+				}
+			})
+
+			t.Run("raw SQL after cancellation rolls back", func(t *testing.T) {
+				caller, cancel := context.WithCancel(ctx)
+				defer cancel()
+				returnedNil := false
+				err := e.Tx(caller, func(tx *engine.EngineTx) error {
+					if _, err := tx.SQL().ExecContext(tx.Context(), `INSERT INTO business VALUES (1)`); err != nil {
+						return err
+					}
+					if _, err := tx.SendOne("q", engine.OutMessage{Body: []byte("before")}); err != nil {
+						return err
+					}
+					cancel()
+					if tx.Context().Err() != nil || tx.Context().Done() != nil {
+						return fmt.Errorf("local execution context must remain uncancellable")
+					}
+					// Every raw statement method can still write using the protected context.
+					if _, err := tx.SQL().ExecContext(tx.Context(), `INSERT INTO business VALUES (2)`); err != nil {
+						return fmt.Errorf("raw ExecContext after cancellation: %w", err)
+					}
+					rows, err := tx.SQL().QueryContext(tx.Context(), `INSERT INTO business VALUES (3) RETURNING id`)
+					if err != nil {
+						return fmt.Errorf("raw QueryContext after cancellation: %w", err)
+					}
+					for rows.Next() {
+					}
+					readErr := rows.Err()
+					closeErr := rows.Close()
+					if err := errors.Join(readErr, closeErr); err != nil {
+						return err
+					}
+					var id int
+					if err := tx.SQL().QueryRowContext(tx.Context(), `INSERT INTO business VALUES (4) RETURNING id`).Scan(&id); err != nil {
+						return fmt.Errorf("raw QueryRowContext after cancellation: %w", err)
+					}
+					// The public mqlite-owned operation observes the original caller, not tx.Context().
+					if _, err := tx.SendOne("q", engine.OutMessage{Body: []byte("after")}); !errors.Is(err, context.Canceled) {
+						return fmt.Errorf("SendOne after cancellation: got %w, want context.Canceled", err)
+					}
+					var business, messages int
+					if err := tx.SQL().QueryRowContext(tx.Context(),
+						`SELECT (SELECT COUNT(*) FROM business), (SELECT COUNT(*) FROM messages)`).Scan(&business, &messages); err != nil {
+						return err
+					}
+					if business != 4 || messages != 1 {
+						return fmt.Errorf("before rollback: business=%d messages=%d, want 4 and 1", business, messages)
+					}
+					returnedNil = true
+					return nil // Cancellation must roll everything back even if the callback reports success.
+				})
+				if !errors.Is(err, context.Canceled) || !returnedNil {
+					t.Fatalf("Tx must roll back after the callback returns nil: err=%v returned nil=%v", err, returnedNil)
+				}
+				if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
+					var business int
+					if err := tx.SQL().QueryRowContext(tx.Context(), `SELECT COUNT(*) FROM business`).Scan(&business); err != nil {
+						return err
+					}
+					if business != 0 {
+						return fmt.Errorf("cancelled transaction committed %d business writes", business)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				stats, err := e.Stats(ctx, "q")
+				if err != nil || stats.Total != 0 {
+					t.Fatalf("queue after rollback: stats=%+v err=%v", stats, err)
+				}
+				if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("healthy")}); err != nil {
+					t.Fatalf("writer after rollback: %v", err)
+				}
+			})
+		})
+	}
+}
+
 // TestEmbeddedCloseStopsRunPromptly is the end-to-end twin of the engine-level long-poll-wake test
 // (round-8): a Receiver.Run long-polling an EMPTY embedded queue must return promptly when another
 // goroutine calls Close — not sleep out its ~20s poll window against a torn-down engine. The
