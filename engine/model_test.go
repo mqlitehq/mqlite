@@ -17,6 +17,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -39,12 +40,31 @@ type modelMsg struct {
 type model struct {
 	msgs map[int64]*modelMsg // by seq
 	// receipts: what a settle promised, keyed by the REQUEST it settled.
-	receipts map[string]bool // key: queue|seq|token|verb|args
+	receipts map[modelReceipt]bool
 	maxDeliv int
 }
 
-func rkey(queue string, seq int64, token, verb, args string) string {
-	return fmt.Sprintf("%s|%d|%s|%s|%s", queue, seq, token, verb, args)
+// MQLITE-105: keep fields separate, independent of the engine's receipt encoding.
+// Delimiter concatenation aliases distinct Reject reason/description pairs.
+type modelReceipt struct {
+	queue, token, verb string
+	seq                int64
+	delay              int64
+	reason             [2]string
+}
+
+func modelReceiptKey(queue string, seq int64, token, verb string, delay int64, reason [2]string) modelReceipt {
+	key := modelReceipt{queue: queue, seq: seq, token: token, verb: verb}
+	switch verb {
+	case "abandoned":
+		key.delay = delay
+	case "dead_lettered":
+		if reason[0] == "" {
+			reason[0] = ReasonAppRequested
+		}
+		key.reason = reason
+	}
+	return key
 }
 
 // settle returns what the ENGINE is expected to answer for this exact request.
@@ -55,12 +75,13 @@ func rkey(queue string, seq int64, token, verb, args string) string {
 //
 // Note what is NOT here — nothing says a token vouches for a different message, that one verb
 // inherits another's receipt, or that a request may keep its success when its ARGUMENTS change.
-// `args` is what makes that last one checkable: it carries the parameters that change what the
-// settle DOES (Abandon's delay, Reject's reason/description), so a replay that alters them is a
+// The key carries the parameters that change what the settle DOES (Abandon's delay,
+// Reject's reason/description), so a replay that alters them is a
 // different request and gets no receipt. The model was blind to this bug for three rounds for one
 // reason — it always passed the same delay and the same reason, so the arguments never varied and
 // the spec was never exercised. A model only finds what its generator is willing to say.
-func (m *model) settle(queue string, seq int64, token, verb, args string, delay int64) (ok bool) {
+func (m *model) settle(queue string, seq int64, token, verb string, delay int64, reason [2]string) (ok bool) {
+	key := modelReceiptKey(queue, seq, token, verb, delay, reason)
 	msg := m.msgs[seq]
 	if msg != nil && msg.queue == queue && msg.state == StateLocked && msg.token == token {
 		switch verb {
@@ -85,11 +106,60 @@ func (m *model) settle(queue string, seq int64, token, verb, args string, delay 
 			msg.state = StateDeferred
 		}
 		msg.token = ""
-		m.receipts[rkey(queue, seq, token, verb, args)] = true
+		m.receipts[key] = true
 		return true
 	}
 	// A replay of the SAME request that already succeeded.
-	return m.receipts[rkey(queue, seq, token, verb, args)]
+	return m.receipts[key]
+}
+
+// Both directions of the old delimiter collision must be rejected by the model
+// and engine. Empty reasons and their explicit default remain equivalent.
+func TestModelRejectReceiptArguments(t *testing.T) {
+	reasons := [][2]string{
+		{"x|desc=y", "z"},
+		{"x", "y|desc=z"},
+		{"", ""},
+		{ReasonAppRequested, ""},
+		{ReasonAppRequested, "|desc="},
+	}
+	ctx := context.Background()
+	for i, first := range reasons {
+		for j, second := range reasons {
+			t.Run(fmt.Sprintf("%d_to_%d", i, j), func(t *testing.T) {
+				e, _ := testEngine(t)
+				mustQueue(t, e, "q", QueueConfig{})
+				if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+					t.Fatal(err)
+				}
+				msg := recvOne(t, e, "q")
+				m := &model{
+					msgs: map[int64]*modelMsg{msg.SeqNumber: {
+						seq: msg.SeqNumber, queue: "q", state: StateLocked, token: msg.LockToken,
+					}},
+					receipts: map[modelReceipt]bool{},
+				}
+				if !m.settle("q", msg.SeqNumber, msg.LockToken, "dead_lettered", 0, first) {
+					t.Fatal("model rejected initial settlement")
+				}
+				if err := e.Reject(ctx, "q", msg.SeqNumber, msg.LockToken, first[0], first[1]); err != nil {
+					t.Fatal(err)
+				}
+				// Spell out equivalence independently of modelReceiptKey and settleArgs.
+				sameReason := first[0] == second[0] ||
+					(first[0] == "" && second[0] == ReasonAppRequested) ||
+					(first[0] == ReasonAppRequested && second[0] == "")
+				want := sameReason && first[1] == second[1]
+				if got := m.settle("q", msg.SeqNumber, msg.LockToken, "dead_lettered", 0, second); got != want {
+					t.Errorf("model Reject(%q) after Reject(%q): ok=%v, want %v", second, first, got, want)
+				}
+				err := e.Reject(ctx, "q", msg.SeqNumber, msg.LockToken, second[0], second[1])
+				if (err == nil) != want || (err != nil && !errors.Is(err, ErrLockLost)) {
+					t.Errorf("engine Reject(%q) after Reject(%q): err=%v, want ok=%v", second, first, err, want)
+				}
+			})
+		}
+	}
 }
 
 func (m *model) counts(queue string) (active, locked, dead, deferred, scheduled, total int64) {
@@ -168,7 +238,7 @@ func runModel(t *testing.T, seed int64) {
 	for _, q := range qs {
 		mustQueue(t, e, q, QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: maxDeliv})
 	}
-	m := &model{msgs: map[int64]*modelMsg{}, receipts: map[string]bool{}, maxDeliv: maxDeliv}
+	m := &model{msgs: map[int64]*modelMsg{}, receipts: map[modelReceipt]bool{}, maxDeliv: maxDeliv}
 
 	rng := rand.New(rand.NewSource(seed))
 	verbs := []string{"completed", "abandoned", "dead_lettered", "deferred"}
@@ -193,14 +263,15 @@ func runModel(t *testing.T, seed int64) {
 	}
 	var history []issued
 
-	// The argument sets a settle may be replayed with. Two of each, so a replay can differ from the
+	// The argument sets a settle may be replayed with, so a replay can differ from the
 	// original in exactly the way a real client's would: same message, same token, same verb, a
 	// different backoff or a different dead-letter reason.
 	delays := []int64{0, 30_000}
-	reasons := [][2]string{{ReasonAppRequested, ""}, {"PoisonMessage", "gave up after 3 tries"}}
+	reasons := [][2]string{
+		{ReasonAppRequested, ""}, {"PoisonMessage", "gave up after 3 tries"},
+		{"x|desc=y", "z"}, {"x", "y|desc=z"}, {"", ""},
+	}
 
-	// settleArgs mirrors the ENGINE's own encoding on purpose: the model asserts that the arguments
-	// are part of the request's identity, not how they happen to be hashed.
 	settleEngine := func(q string, seq int64, token, verb string, delay int64, reason [2]string) error {
 		switch verb {
 		case "completed":
@@ -292,7 +363,7 @@ func runModel(t *testing.T, seed int64) {
 					t.Fatalf("round %d: CompleteBatch: %v", i, err)
 				}
 				for k, r := range res {
-					want := m.settle(q, items[k].SeqNumber, items[k].LockToken, "completed", "", 0)
+					want := m.settle(q, items[k].SeqNumber, items[k].LockToken, "completed", 0, [2]string{})
 					if r.Ok != want {
 						t.Fatalf(`round %d: BATCH SETTLE DISAGREEMENT
   item   : seq=%d token=%s in queue %s
@@ -344,28 +415,18 @@ func runModel(t *testing.T, seed int64) {
 				}
 			}
 
-			// Only the arguments THIS verb actually reads belong to its identity; Complete and
-			// Defer take none, so they must stay replayable across everything else that varies.
-			args := ""
-			switch verb {
-			case "abandoned":
-				args = fmt.Sprintf("delay=%d", delay)
-			case "dead_lettered":
-				args = fmt.Sprintf("reason=%s|desc=%s", reason[0], reason[1])
-			}
-
-			want := m.settle(tq, seq, token, verb, args, delay)
+			want := m.settle(tq, seq, token, verb, delay, reason)
 			err := settleEngine(tq, seq, token, verb, delay, reason)
 			got := err == nil
 
 			if got != want {
 				t.Fatalf(`round %d: SETTLE DISAGREEMENT
-  request: %s(queue=%s seq=%d token=%s %s)
+  request: %s(queue=%s seq=%d token=%s delay=%d reason=%q)
   engine : ok=%v (err=%v)
   model  : ok=%v
   the model is the specification: a settle succeeds only for a message you hold the lock on, or as
   an idempotent replay of that exact request — SAME message, SAME verb, SAME arguments.`,
-					i, verb, tq, seq, token, args, got, err, want)
+					i, verb, tq, seq, token, delay, reason, got, err, want)
 			}
 			if got { // it left a receipt — so it is worth replaying
 				history = append(history, issued{q: tq, seq: seq, token: token, verb: verb, delay: delay, reason: reason})
