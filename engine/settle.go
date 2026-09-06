@@ -36,7 +36,7 @@ func affected(res sql.Result) error {
 //   - rows affected = 0 and no matching receipt → ErrLockLost (genuine fencing failure).
 //
 // This is the difference between "I already Completed this, the completion just
-// got lost" (success) and "my lock expired and someone else has the message" (lost).
+// got lost" (success) and "my lock expired, even if nobody has reclaimed it" (lost).
 // settleArgs canonically encodes the arguments that CHANGE WHAT A SETTLE DOES, so they can join
 // the receipt's identity. Length-prefixed (so ("a","bc") and ("ab","c") differ) and hashed, which
 // keeps the key bounded no matter how long a dead-letter description runs. No effect-bearing
@@ -53,17 +53,18 @@ func settleArgs(parts ...string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, op, args string, do func(ctx context.Context, tx *txn) (int64, error)) error {
+func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, op, args string, do func(ctx context.Context, tx *txn, now int64) (int64, error)) error {
 	if token == "" {
 		return ErrLockLost
 	}
-	now := e.now()
 	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// `ctx` here is the one inTx hands us — protected on a local store. Passing it to `do` is
 		// what keeps the fenced settle WRITE from being interrupted: an interrupted local write
 		// leaks the connection and wedges (or erases) the database. The do-closures used to capture
 		// the CALLER's context and were interruptible after all (codex).
-		n, err := do(ctx, tx)
+		// Read after writer/transaction admission, including every remote retry.
+		// Lease expiry fences a new effect even before the reaper clears its token.
+		n, err := do(ctx, tx, e.now())
 		if err != nil {
 			return err
 		}
@@ -92,7 +93,7 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 			err := tx.QueryRowContext(ctx,
 				`SELECT 1 FROM settlement_receipts
 				   WHERE queue=? AND seq_number=? AND lock_token=? AND operation=? AND args=? AND expires_at>?`,
-				queue, seq, token, op, args, now).Scan(&one)
+				queue, seq, token, op, args, e.now()).Scan(&one)
 			if err == nil {
 				return nil // idempotent replay of the exact request that already succeeded
 			}
@@ -101,6 +102,7 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 			}
 			return err
 		}
+		now := e.now() // the receipt's retention starts when it is recorded
 		_, err = tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at)
 			 VALUES (?,?,?,?,?,?,?)`, token, queue, seq, op, args, now, now+settlementTTLMs)
@@ -134,12 +136,12 @@ func (e *Engine) CompletedCounts() map[string]uint64 {
 	return out
 }
 
-// Complete removes a successfully-processed message (fencing on lock_token).
+// Complete removes a successfully-processed message while its lock lease is live.
 func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token string) error {
 	var removed int64
-	err := e.settleOp(ctx, queue, seq, token, "completed", "", func(ctx context.Context, tx *txn) (int64, error) {
+	err := e.settleOp(ctx, queue, seq, token, "completed", "", func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx,
-			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=?`, seq, queue, token)
+			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`, seq, queue, token, now)
 		if err != nil {
 			return 0, err
 		}
@@ -162,10 +164,9 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 // head keeps blocking its group and successors cannot overtake it (MQLITE-66);
 // the scheduler re-activates it at visible_at. delayMs=0 redelivers immediately.
 func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
-	now := e.now()
 	// The delay is part of the request's identity: replaying Abandon with a DIFFERENT delay is a
 	// different request, not a lost-response retry, and must not inherit the first one's success.
-	err := e.settleOp(ctx, queue, seq, token, "abandoned", settleArgs(strconv.FormatInt(delayMs, 10)), func(ctx context.Context, tx *txn) (int64, error) {
+	err := e.settleOp(ctx, queue, seq, token, "abandoned", settleArgs(strconv.FormatInt(delayMs, 10)), func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET
 			    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
@@ -178,8 +179,8 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 			                      THEN visible_at ELSE ? END,
 			    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 			                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
-			 WHERE id=? AND queue=? AND lock_token=?`,
-			delayMs, now+delayMs, seq, queue, token)
+			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`,
+			delayMs, now+delayMs, seq, queue, token, now)
 		if err != nil {
 			return 0, err
 		}
@@ -201,12 +202,12 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 	// of the DLQ, and a replay that changed them would report success while keeping the old text.
 	// Encoded AFTER the default is applied, so Reject(…, "") and Reject(…, ReasonAppRequested) are
 	// correctly the same request.
-	return e.settleOp(ctx, queue, seq, token, "dead_lettered", settleArgs(reason, desc), func(ctx context.Context, tx *txn) (int64, error) {
+	return e.settleOp(ctx, queue, seq, token, "dead_lettered", settleArgs(reason, desc), func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET state='dead_lettered', locked_until=0, lock_token=NULL,
 			    dead_letter_reason=?, dead_letter_description=?
-			 WHERE id=? AND queue=? AND lock_token=?`,
-			reason, nz(desc), seq, queue, token)
+			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`,
+			reason, nz(desc), seq, queue, token, now)
 		if err != nil {
 			return 0, err
 		}
@@ -216,10 +217,10 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 
 // Defer sets a message aside; it is later retrieved by seq via ReceiveDeferred.
 func (e *Engine) Defer(ctx context.Context, queue string, seq int64, token string) error {
-	return e.settleOp(ctx, queue, seq, token, "deferred", "", func(ctx context.Context, tx *txn) (int64, error) {
+	return e.settleOp(ctx, queue, seq, token, "deferred", "", func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE messages SET state='deferred', locked_until=0, lock_token=NULL
-			   WHERE id=? AND queue=? AND lock_token=?`, seq, queue, token)
+			   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`, seq, queue, token, now)
 		if err != nil {
 			return 0, err
 		}
@@ -227,7 +228,7 @@ func (e *Engine) Defer(ctx context.Context, queue string, seq int64, token strin
 	})
 }
 
-// Renew extends the lock lease by the queue's lock duration (§11.3).
+// Renew extends a live lock lease by the queue's lock duration (§11.3).
 func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token string) error {
 	q, err := e.loadQueue(ctx, queue)
 	if err != nil {
@@ -239,8 +240,12 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	res, err := e.db.execFresh(ctx,
 		// MAX(): a renewal only ever extends a lease. A racing renewal writing an older deadline
 		// would otherwise shorten a lock that had already been pushed further out.
-		`UPDATE messages SET locked_until=MAX(locked_until, ?) WHERE id=? AND queue=? AND lock_token=?`,
-		func() []any { return []any{e.now() + q.lockDurationMs, seq, queue, token} })
+		`UPDATE messages SET locked_until=MAX(locked_until, ?)
+		   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`,
+		func() []any {
+			now := e.now()
+			return []any{now + q.lockDurationMs, seq, queue, token, now}
+		})
 	if err != nil {
 		return err
 	}
@@ -389,13 +394,16 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		// the clock AFTER the statement finished. Whether a lease is live is a fact about the
 		// moment we answer, not the moment we asked.
 		`UPDATE messages SET locked_until=MAX(locked_until, ?)
-		   WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+		   WHERE state='locked' AND locked_until>? AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
 		 RETURNING id, lock_token, locked_until`,
 		// The deadline is built per ATTEMPT, once a connection is already held — see queryFresh.
 		// Computed any earlier, a backoff (or a wait for a free connection) could leave it in the
 		// past by the time the successful attempt commits: the row would report Ok while the reaper
 		// reclaimed it at once.
-		func() []any { return append([]any{e.now() + q.lockDurationMs}, args...) },
+		func() []any {
+			now := e.now()
+			return append([]any{now + q.lockDurationMs, now}, args...)
+		},
 		func(sel *sql.Rows) error {
 			// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
 			// absent from the RETURNING set and its Ok stays false. That is Renew's contract, not
@@ -460,7 +468,7 @@ type SettleItem struct {
 // SettleResult is the per-item outcome of a batch settle.
 type SettleResult struct {
 	SeqNumber int64
-	Ok        bool // true = settled (or an idempotent replay of an already-settled token)
+	Ok        bool // true = succeeded (or a live receipt replays this exact settlement request)
 	// LockedUntilMs is the deadline a RenewBatch actually committed (0 for other operations). The
 	// caller needs it: without the new deadline it cannot know when to renew again, and would
 	// either hammer the broker or let the lease it just extended lapse.
@@ -492,7 +500,6 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		return out, nil
 	}
 
-	now := e.now()
 	settled := make(map[string]bool, len(rows))  // (seq, token) pairs this call actually deleted
 	replayed := make(map[string]bool, len(rows)) // (seq, token) pairs with a live receipt from an earlier settle
 	var removed int64
@@ -522,9 +529,11 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		//    rows it hands back ARE the ones this call settled. Fewer round trips, and no window
 		//    between looking and deleting.
 		err := chunkPairs(rows, func(group []SettleItem, pairs string) error {
+			// Each chunk has its own write time: later chunks cannot use leases
+			// that expired while an earlier statement was running.
 			sel, err := tx.QueryContext(ctx,
-				`DELETE FROM messages WHERE queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
-				 RETURNING id, lock_token`, pairArgs(queue, group)...)
+				`DELETE FROM messages WHERE state='locked' AND locked_until>? AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+				 RETURNING id, lock_token`, append([]any{e.now()}, pairArgs(queue, group)...)...)
 			if err != nil {
 				return err
 			}
@@ -575,7 +584,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 			}
 			group := rows[start:end]
 			args := make([]any, 0, 4+2*len(group))
-			args = append(args, now, "completed", "", queue)
+			args = append(args, e.now(), "completed", "", queue)
 			for _, it := range group {
 				args = append(args, it.SeqNumber, it.LockToken)
 			}
@@ -606,6 +615,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		// 3. One receipt per Complete request this call settled — a replay must match the queue,
 		//    seq, token, completed verb, and empty args to succeed instead of ErrLockLost.
 		return chunkPairs(rows, func(group []SettleItem, _ string) error {
+			now := e.now()
 			recArgs := make([]any, 0, 7*len(group))
 			var vals strings.Builder
 			for _, it := range group {

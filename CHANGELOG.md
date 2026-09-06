@@ -22,6 +22,14 @@ the maintainer approves tagging and publishing.
 
 ### Behavior changes
 
+- **Expired leases now reject settlement immediately** (MQLITE-114).
+  Complete, Abandon, Reject, Defer, Renew and both batch variants require a matching
+  token and an unexpired lease, including the interval before background recovery.
+  Time is sampled after writer admission and again for every statement and remote
+  retry. Previously an expired token could still settle or revive a locked row.
+  Live receipts still replay only an exact previously committed settlement request;
+  this remains valid after that request's original lease expires.
+
 - **Release artifacts now require matching source and complete CI** (MQLITE-109).
   Both release workflows resolve the real tag, verify its version constant, and
   require all 12 CI jobs to succeed for that exact commit in one completed run

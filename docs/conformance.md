@@ -51,8 +51,17 @@ Exactly one verb per outcome; each is fenced on the `lock_token` from `Receive`.
 - **2.5 Renew** extends the lock by the queue's lock duration. *(engine/ga_fixes_test.go)*
 - **2.6** Settling with a wrong/expired token MUST fail with `ErrLockLost` (HTTP 409)
   — **except** an idempotent replay with a live receipt for the exact request (§3.2) returns
-  success. Matching the token alone is insufficient. *(engine/ga_fixes_test.go;
-  engine/complete_batch_test.go: TestSettlementReceiptIdentityMatrix)*
+  success. Matching the token alone is insufficient: new settlement and renewal effects
+  require a locked row with `locked_until_ms > now`, including before the reaper runs.
+  The equality boundary is expired. Time is sampled after local writer admission and
+  afresh for each settlement statement and remote retry; waiting cannot preserve an
+  expired lease or receipt. A live exact-request receipt can still replay a previously
+  committed effect after the original lease expires.
+  *(engine/ga_fixes_test.go; engine/complete_batch_test.go:
+  TestSettlementLeaseDeadline, TestSettlementReceiptIdentityMatrix,
+  TestSettlementReceiptTimeAfterWriterAdmission, TestCompleteBatchRefreshesTimeBetweenChunks;
+  engine/storage_test.go: TestSettlementTimeRefreshesOnRemoteRetry;
+  sdk_test.go: TestSDKSettlementDeadline)*
 - **2.7 CompleteBatch** settles many messages in one transaction with the same per-item
   fencing + idempotency; a stale token without an exact-request receipt yields `ok=false`,
   never failing the batch. Single `Complete` and a `CompleteBatch` item share the completed

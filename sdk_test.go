@@ -75,6 +75,102 @@ func newBroker(t *testing.T, token string) (*mqlite.Client, *mqlite.Embedded) {
 
 // ─── Remote / SDK over HTTP ─────────────────────────────────────────────────
 
+// The public boundary is identical with and without HTTP, including the exact
+// millisecond at which a lease expires, before maintenance has reclaimed it.
+func TestSDKSettlementDeadline(t *testing.T) {
+	type settlementClient interface {
+		Receive(context.Context, string, ...mqlite.RecvOpts) ([]*mqlite.Message, error)
+		CompleteBatch(context.Context, string, ...*mqlite.Message) ([]mqlite.SettleResult, error)
+		RenewBatch(context.Context, string, ...*mqlite.Message) ([]mqlite.SettleResult, error)
+	}
+	for _, storage := range []string{"memory", "file"} {
+		for _, transport := range []string{"embedded", "http"} {
+			for _, operation := range []string{"Complete", "Abandon", "Reject", "Defer", "Renew", "CompleteBatch", "RenewBatch"} {
+				for _, offset := range []int64{-1, 0, 1} {
+					t.Run(fmt.Sprintf("%s/%s/%s/offset_%d", storage, transport, operation, offset), func(t *testing.T) {
+						ctx := context.Background()
+						var clock atomic.Int64
+						clock.Store(1700000000000)
+						dsn := ":memory:"
+						if storage == "file" {
+							// Match newBroker's best-effort Windows file-handle cleanup.
+							dir, err := os.MkdirTemp("", "mqlite-deadline-*")
+							if err != nil {
+								t.Fatal(err)
+							}
+							t.Cleanup(func() { _ = os.RemoveAll(dir) })
+							dsn = "file:" + filepath.Join(dir, "mq.db")
+						}
+						eng, err := mqlite.OpenEmbedded(ctx, dsn, mqlite.WithClock(clock.Load), mqlite.WithoutBackground())
+						if err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() { _ = eng.Close() })
+						var cli settlementClient = eng
+						if transport == "http" {
+							ts := httptest.NewServer(server.New(eng.Engine(), []string{"deadline-test"}).Handler())
+							t.Cleanup(ts.Close)
+							remote, err := mqlite.Open(ctx, ts.URL, mqlite.WithToken("deadline-test"))
+							if err != nil {
+								t.Fatal(err)
+							}
+							t.Cleanup(func() { _ = remote.Close() })
+							cli = remote
+						}
+						if err := eng.CreateQueue(ctx, "q", mqlite.QueueConfig{LockDuration: time.Second}); err != nil {
+							t.Fatal(err)
+						}
+						seq, err := eng.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("deadline payload"), MessageID: "deadline-id", Properties: map[string]string{"key": "value"}})
+						if err != nil {
+							t.Fatal(err)
+						}
+						messages, err := cli.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+						if err != nil || len(messages) != 1 || messages[0].SequenceNumber != seq {
+							t.Fatalf("receive: %+v, %v", messages, err)
+						}
+						msg := messages[0]
+						before, err := eng.Peek(ctx, "q", mqlite.PeekOpts{State: mqlite.Locked})
+						if err != nil || len(before) != 1 {
+							t.Fatalf("peek before: %+v, %v", before, err)
+						}
+						clock.Store(msg.LockedUntil.UnixMilli() + offset)
+						var results []mqlite.SettleResult
+						switch operation {
+						case "Complete":
+							err = msg.Complete(ctx)
+						case "Abandon":
+							err = msg.Abandon(ctx, mqlite.AbandonOpts{Delay: 2 * time.Second})
+						case "Reject":
+							err = msg.Reject(ctx, mqlite.RejectOpts{Reason: "reason", Detail: "detail"})
+						case "Defer":
+							err = msg.Defer(ctx)
+						case "Renew":
+							err = msg.Renew(ctx)
+						case "CompleteBatch":
+							results, err = cli.CompleteBatch(ctx, "q", msg)
+						case "RenewBatch":
+							results, err = cli.RenewBatch(ctx, "q", msg)
+						}
+						if strings.HasSuffix(operation, "Batch") {
+							if err != nil || len(results) != 1 || results[0].SequenceNumber != seq || results[0].Ok != (offset < 0) {
+								t.Fatalf("batch result: %+v, %v", results, err)
+							}
+						} else if (offset < 0 && err != nil) || (offset >= 0 && !errors.Is(err, mqlite.ErrLockLost)) {
+							t.Fatalf("offset %d: got %v", offset, err)
+						}
+						if offset >= 0 {
+							after, err := eng.Peek(ctx, "q", mqlite.PeekOpts{State: mqlite.Locked})
+							if err != nil || !reflect.DeepEqual(before, after) {
+								t.Fatalf("expired request mutated message: before=%+v after=%+v err=%v", before, after, err)
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
 // CompleteBatch over HTTP: receive a batch, then settle it in one round-trip.
 func TestRemoteCompleteBatch(t *testing.T) {
 	ctx := context.Background()
@@ -631,8 +727,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "197c8cf32b7820a2ceadd8c8f285680e2c88a55cc47e8fb8f9998d587b5c0da4",
-		"concepts.html": "a522a802baa96cb402006ebb70a4a86d119f413ad24ecbf54be6ea231392f7b4",
+		"concepts.md":   "c5e050fc93b47c50473a0559a688b30e71c5fb624613e7d2fa28adfce6496e15",
+		"concepts.html": "209f56e17b10497d40d97fb7b930e120c2dd33376de280cd6686c0ea59024e98",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {

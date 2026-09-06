@@ -188,25 +188,22 @@ func TestConcurrentConsumersNeverShareAMessage(t *testing.T) {
 								t.Errorf("consumer %d: abandon: %v", consumer, err)
 							}
 						case 2:
-							// OVERRUN the lease and then try to settle. The reaper will have taken
-							// the message back and handed it to somebody else, so this settle must
-							// be refused — that refusal is the fence doing its job, and it is what
-							// stops the two holders from both acknowledging.
+							// OVERRUN the lease and then try to settle. Expiry itself fences the
+							// holder, even if the reaper has not reclaimed the row yet.
 							time.Sleep(time.Duration(400+rng.Intn(200)) * time.Millisecond)
 							err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken)
-							if err == nil {
-								// The lease had NOT actually lapsed (nobody took it): still ours.
-								x.settled(m.SeqNumber, m.LockToken, true)
-								atomic.AddInt64(&completed, 1)
-							} else if errors.Is(err, ErrLockLost) {
-								x.settled(m.SeqNumber, m.LockToken, false)
-							} else {
-								t.Errorf("consumer %d: late complete: %v", consumer, err)
+							x.settled(m.SeqNumber, m.LockToken, false)
+							if !errors.Is(err, ErrLockLost) {
+								t.Errorf("consumer %d: late complete: %v, want ErrLockLost", consumer, err)
+								return
 							}
 						case 3:
 							// Renew, then complete: the lease must hold across the renewal.
+							// The request's start gives a conservative lease bound. Adding the
+							// duration after a slow response could invent lease time never granted.
+							started := time.Now().UnixMilli()
 							if err := e.Renew(ctx, "q", m.SeqNumber, m.LockToken); err == nil {
-								x.renewed(m.SeqNumber, m.LockToken, time.Now().UnixMilli()+300)
+								x.renewed(m.SeqNumber, m.LockToken, started+300)
 							} else if !errors.Is(err, ErrLockLost) {
 								t.Errorf("consumer %d: renew: %v", consumer, err)
 							}
@@ -252,15 +249,16 @@ func TestConcurrentConsumersNeverShareAMessage(t *testing.T) {
 // TestConcurrentSettlementPicksExactlyOneWinner is the exclusivity invariant reduced to its sharpest
 // form: two consumers, one message, a lock that has just expired. Both of them try to settle it.
 //
-// Exactly one may win. If both do, the message was processed twice and acknowledged twice, and the
-// fencing token — the entire mechanism this queue rests on — has failed. If neither does, the
-// message is stuck.
+// Exactly the new, still-live holder may win. The fake clock is held still while both calls race:
+// if both leases expired, refusing both would be correct and would say nothing about exclusivity.
 //
 // It runs many rounds because this is a race: a single round proves nothing.
 func TestConcurrentSettlementPicksExactlyOneWinner(t *testing.T) {
 	eachLocalStore(t, func(t *testing.T, dsn string) {
 		ctx := context.Background()
-		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		var now atomic.Int64
+		now.Store(1_700_000_000_000)
+		e, err := Open(ctx, Options{DB: dsn, Now: now.Load, DisableBackground: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +278,7 @@ func TestConcurrentSettlementPicksExactlyOneWinner(t *testing.T) {
 
 			// Let the lease lapse and hand the message to a second consumer. Now TWO tokens exist
 			// for one message: A's, which is stale, and B's, which is live.
-			time.Sleep(80 * time.Millisecond)
+			now.Store(a.LockedUntilMs)
 			e.RunMaintenanceOnce(ctx)
 			second, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
 			if err != nil || len(second) != 1 {
