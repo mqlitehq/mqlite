@@ -22,6 +22,17 @@ SOURCE = "https://github.com/mqlitehq/mqlite"
 # Alpine 3.24 main support: https://alpinelinux.org/releases/ (reviewed 2026-09-10).
 # Trivy 0.74 can scan this branch but does not yet know its support deadline.
 ALPINE_END_OF_SUPPORT = date(2028, 6, 1)
+# Docker's older image-inspect APIs add these exact defaults to absent fields.
+# https://docs.docker.com/reference/api/engine/version-history/#v150-api-changes
+# https://docs.docker.com/reference/api/engine/version-history/#v152-api-changes
+INSPECT_DEFAULTS = {
+    "Hostname": "", "Domainname": "", "Image": "", "MacAddress": "",
+    "AttachStdin": False, "AttachStdout": False, "AttachStderr": False,
+    "Tty": False, "OpenStdin": False, "StdinOnce": False,
+    "NetworkDisabled": False, "StopTimeout": None,
+    "Cmd": None, "Entrypoint": None, "Env": None, "Labels": None,
+    "OnBuild": None, "Volumes": None, "User": "", "WorkingDir": "",
+}
 
 
 def require(condition, message):
@@ -121,6 +132,25 @@ def check_build_info(info, arch):
     require(paths == ["github.com/mqlitehq/mqlite/cmd/mqlite"], "unexpected binary build path")
 
 
+def check_loaded_image(actual, expected, arch):
+    config = dict(actual["Config"])
+    wanted = expected["config"]
+    for key, default in INSPECT_DEFAULTS.items():
+        if key not in wanted and key in config and type(config[key]) is type(default) and config[key] == default:
+            del config[key]
+    # Preserve every source field, including explicit defaults, and reject unknown extras.
+    # Report field names only: environment values can contain credentials.
+    differences = ["Config." + key for key in sorted(config.keys() | wanted.keys())
+                   if key not in config or key not in wanted
+                   or json.dumps(config[key], sort_keys=True) != json.dumps(wanted[key], sort_keys=True)]
+    for key, value in (("Os", "linux"), ("Architecture", arch)):
+        if actual[key] != value:
+            differences.append(key)
+    if actual["RootFS"]["Layers"] != expected["rootfs"]["diff_ids"]:
+        differences.append("RootFS.Layers")
+    require(not differences, "loaded image differs from scanned OCI source: " + ", ".join(differences))
+
+
 def verify(archive, output, version, revision):
     output.mkdir(parents=True, exist_ok=False)
     identity = inspect_archive(archive, version, revision)
@@ -164,10 +194,7 @@ def verify(archive, output, version, revision):
             loaded = True
             actual = json.loads(command("docker", "image", "inspect", image, capture=True))[0]
             expected = identity["images"][arch]["config"]
-            require(actual["Config"] == expected["config"]
-                    and actual["RootFS"]["Layers"] == expected["rootfs"]["diff_ids"]
-                    and actual["Os"] == "linux" and actual["Architecture"] == arch,
-                    "loaded image differs from scanned OCI source")
+            check_loaded_image(actual, expected, arch)
             container = "mqlite-gate-binary-" + uuid.uuid4().hex
             binary = output / (arch + "-mqlite")
             command("docker", "create", "--platform", "linux/" + arch, "--name", container, actual["Id"])

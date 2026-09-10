@@ -122,8 +122,12 @@ class CandidateTests(unittest.TestCase):
             elif args[:3] == ("docker", "image", "inspect"):
                 arch = images[args[-1]]
                 expected = identity["images"][arch]
+                config = copy.deepcopy(expected["config"]["config"])
+                config.update({key: value for key, value in candidate.INSPECT_DEFAULTS.items() if key not in config})
+                if arch == failed_arch and failure == "loaded-image":
+                    config["Labels"]["org.opencontainers.image.revision"] = "wrong"
                 return json.dumps([{"Id": expected["config_digest"], "Os": "linux", "Architecture": arch,
-                                    "Config": expected["config"]["config"],
+                                    "Config": config,
                                     "RootFS": {"Layers": expected["config"]["rootfs"]["diff_ids"]}}]).encode()
             elif args[:2] == ("docker", "create"):
                 arch = args[args.index("--platform") + 1].split("/")[1]
@@ -179,12 +183,12 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(events["removed"], events["loaded"])
 
     def test_verify_gate_failures_never_write_pass_and_clean_loaded_images(self):
-        for failure in ("scan-command", "scan-report", "build-info", "smoke"):
+        for failure in ("scan-command", "scan-report", "loaded-image", "build-info", "smoke"):
             for arch in ("amd64", "arm64"):
                 with self.subTest(failure=failure, arch=arch):
                     output = self.root / (failure + "-" + arch)
                     with self.verify_commands(output, failure, arch) as (_, events):
-                        expected_error = RuntimeError if failure in ("scan-report", "build-info") else subprocess.CalledProcessError
+                        expected_error = RuntimeError if failure in ("scan-report", "loaded-image", "build-info") else subprocess.CalledProcessError
                         with self.assertRaises(expected_error):
                             candidate.verify(self.archive, output, "0.3.0", SHA)
                     self.assertFalse((output / "verified.json").exists())
@@ -193,9 +197,81 @@ class CandidateTests(unittest.TestCase):
                     completed = [] if arch == "amd64" else ["amd64"]
                     expected_smokes = completed + ([arch] if failure == "smoke" else [])
                     self.assertEqual(events["smokes"], expected_smokes)
-                    expected_loaded = len(completed) + (1 if failure in ("build-info", "smoke") else 0)
+                    expected_loaded = len(completed) + (1 if failure in ("loaded-image", "build-info", "smoke") else 0)
                     self.assertEqual(len(events["loaded"]), expected_loaded)
                     self.assertEqual(events["removed"], events["loaded"])
+
+    def test_loaded_image_accepts_only_documented_extra_defaults(self):
+        defaults = {
+            "Hostname": "", "Domainname": "", "Image": "", "MacAddress": "",
+            "AttachStdin": False, "AttachStdout": False, "AttachStderr": False,
+            "Tty": False, "OpenStdin": False, "StdinOnce": False,
+            "NetworkDisabled": False, "StopTimeout": None,
+            "Cmd": None, "Entrypoint": None, "Env": None, "Labels": None,
+            "OnBuild": None, "Volumes": None, "User": "", "WorkingDir": "",
+        }
+        self.assertEqual(candidate.INSPECT_DEFAULTS, defaults)
+        for arch in ("amd64", "arm64"):
+            expected = {"config": {}, "rootfs": {"diff_ids": ["sha256:first", "sha256:second"]}}
+            actual = {"Config": {}, "RootFS": {"Layers": expected["rootfs"]["diff_ids"]},
+                      "Os": "linux", "Architecture": arch}
+            candidate.check_loaded_image(actual, expected, arch)
+            actual["Config"] = copy.deepcopy(defaults)
+            candidate.check_loaded_image(actual, expected, arch)
+            self.assertEqual(actual["Config"], defaults, "comparison mutated inspect evidence")
+            for key, default in defaults.items():
+                for wrong in (True, 0, "unexpected", [], {}):
+                    with self.subTest(arch=arch, field=key, wrong=wrong):
+                        actual["Config"] = {key: wrong}
+                        with self.assertRaisesRegex(RuntimeError, "Config." + key):
+                            candidate.check_loaded_image(actual, expected, arch)
+                # Defaults present in the source are part of its exact identity too.
+                expected["config"] = {key: default}
+                actual["Config"] = {key: default}
+                candidate.check_loaded_image(actual, expected, arch)
+                actual["Config"] = {}
+                with self.assertRaisesRegex(RuntimeError, "Config." + key):
+                    candidate.check_loaded_image(actual, expected, arch)
+                expected["config"] = {}
+            for value in (None, False, "", 0):
+                actual["Config"] = {"UnexpectedField": value}
+                with self.assertRaisesRegex(RuntimeError, "Config.UnexpectedField"):
+                    candidate.check_loaded_image(actual, expected, arch)
+
+    def test_loaded_image_rejects_every_behavior_platform_and_layer_change(self):
+        config = {"Env": ["MQLITE_DB=/data/queue.db", "MQLITE_SYNC=FULL"],
+                  "Entrypoint": ["/usr/local/bin/mqlite"], "Cmd": ["serve"],
+                  "WorkingDir": "/data", "User": "1000", "Labels": {"revision": SHA},
+                  "ExposedPorts": {"6754/tcp": {}}, "Volumes": {"/data": {}},
+                  "StopSignal": "SIGTERM", "Healthcheck": {"Test": ["CMD", "true"]},
+                  "ArgsEscaped": False, "OnBuild": ["RUN true"], "Shell": ["/bin/sh", "-c"]}
+        for arch in ("amd64", "arm64"):
+            expected = {"config": config, "rootfs": {"diff_ids": ["sha256:first", "sha256:second"]}}
+            original = {"Config": copy.deepcopy(config), "Os": "linux", "Architecture": arch,
+                        "RootFS": {"Layers": list(expected["rootfs"]["diff_ids"])}}
+            candidate.check_loaded_image(original, expected, arch)
+            for key in config:
+                for operation in ("remove", "change"):
+                    actual = copy.deepcopy(original)
+                    if operation == "remove":
+                        del actual["Config"][key]
+                    else:
+                        actual["Config"][key] = "changed-secret-do-not-print"
+                    with self.subTest(arch=arch, field=key, operation=operation):
+                        with self.assertRaisesRegex(RuntimeError, "Config." + key) as error:
+                            candidate.check_loaded_image(actual, expected, arch)
+                        self.assertNotIn("changed-secret-do-not-print", str(error.exception))
+            for key, wrong in (("Os", "windows"), ("Architecture", "arm64" if arch == "amd64" else "amd64")):
+                actual = copy.deepcopy(original)
+                actual[key] = wrong
+                with self.assertRaisesRegex(RuntimeError, key):
+                    candidate.check_loaded_image(actual, expected, arch)
+            for layers in ([], ["sha256:first"], ["sha256:second", "sha256:first"],
+                           ["sha256:first", "sha256:second", "sha256:extra"]):
+                actual = copy.deepcopy(original)
+                actual["RootFS"]["Layers"] = layers
+                with self.assertRaisesRegex(RuntimeError, "RootFS.Layers"):
+                    candidate.check_loaded_image(actual, expected, arch)
 
     def test_binary_build_info_requires_each_setting_once_for_each_platform(self):
         for arch in ("amd64", "arm64"):
