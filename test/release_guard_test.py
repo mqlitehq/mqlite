@@ -328,9 +328,9 @@ class WorkflowContractTests(unittest.TestCase):
         # continue-on-error, alternate publish step, matrix entry, or checkout is
         # security-relevant. Review any change before updating these goldens.
         expected = {
-            "ci.yml": "3dbedcd8dfcd2e40a13819f103e316cf96750326fe0f79ab5a4d737b0e75026f",
+            "ci.yml": "5f750ec6738e3086d89ab4971020394a1f28d3018f220738a7fe8e351c0cab69",
             "release.yml": "badec32ab2c9e80b37e732ae0e4418ceebabb3de80b4a396d87dd0c799ab4ed4",
-            "release-image.yml": "a7e7ab66172d60f82b9d493ed0429005f5556f890a029ce686bc2c8a6935cffb",
+            "release-image.yml": "00ce4b311619e3f573537516713741efc523d0fb2b1692cacb81d8e5e5219643",
         }
         self.assertEqual({p.name for p in (ROOT / ".github/workflows").iterdir()},
                          {"ci.yml", "release.yml", "release-image.yml", "turso-nightly.yml", "integrity-weekly.yml"})
@@ -342,6 +342,12 @@ class WorkflowContractTests(unittest.TestCase):
                          "Review runtime APK upgrades, stage names, and artifact scans before updating the golden")
         self.assertEqual(hashlib.sha256((ROOT / ".goreleaser.yaml").read_bytes()).hexdigest(), "57a16550597eab93319f89e89f93299ca3853fbccdb4873b922335ff952dc67a",
                          "Review every release build target, flag, and binary scan hook before updating the golden")
+
+    def test_image_verification_command_contract(self):
+        # The scanner flags and promotion commands moved out of YAML; pin that
+        # entire execution surface too, so bypasses require deliberate review.
+        self.assertEqual(hashlib.sha256((ROOT / ".github/scripts/image_candidate.py").read_bytes()).hexdigest(),
+                         "9dcb43ceab8898dda7e9f9cc7022881f20936f0df86c0b198c6c5353c10dee26", "Review the complete image gate before updating its golden")
 
     def test_shared_guard_is_the_only_publish_gate(self):
         for name in ("release.yml", "release-image.yml"):

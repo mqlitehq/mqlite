@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Smoke-test a built linux/amd64 Docker image using only the Python stdlib.
+"""Smoke-test a built Linux Docker image using only the Python stdlib.
 
 Usage: python3 test/release_image_smoke.py IMAGE [--expected-version X.Y.Z[-rc.N]]
-       [--expected-revision COMMIT_SHA]
+       [--expected-revision COMMIT_SHA] [--platform linux/amd64|linux/arm64]
 The OCI version must match exactly; RC binaries report the base X.Y.Z version.
 Uses an ephemeral loopback port and removes its containers and named volume.
 """
@@ -41,9 +41,13 @@ def smoke(args):
     http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def docker(*command, required=True):
-        result = subprocess.run(
-            [args.docker, *command], capture_output=True, text=True, timeout=60
-        )
+        try:
+            result = subprocess.run(
+                [args.docker, *command], capture_output=True, text=True, timeout=60
+            )
+        except subprocess.TimeoutExpired:
+            # Docker run's argv contains the generated authentication token.
+            raise RuntimeError(f"docker {command[0]} timed out after 60 seconds") from None
         if required and result.returncode != 0:
             raise RuntimeError(f"docker {command[0]} failed: {result.stderr.strip()}")
         return result
@@ -72,7 +76,7 @@ def smoke(args):
         nonlocal endpoint
         live_containers.add(container)
         docker(
-            "run", "--detach", "--platform", "linux/amd64", "--pull", "never",
+            "run", "--detach", "--platform", args.platform, "--pull", "never",
             "--name", container, "--publish", "127.0.0.1::6754",
             "--mount", f"type=volume,source={volume},target=/data",
             "--env", "MQLITE_TOKENS=" + token,
@@ -176,8 +180,8 @@ def smoke(args):
 
     try:
         image = json.loads(docker("image", "inspect", args.image).stdout)[0]
-        check(image["Os"] == "linux" and image["Architecture"] == "amd64",
-              "smoke image must be built for linux/amd64")
+        check(image["Os"] + "/" + image["Architecture"] == args.platform,
+              "smoke image must be built for " + args.platform)
         labels = image["Config"].get("Labels") or {}
         expected_labels = {
             "source": "https://github.com/mqlitehq/mqlite",
@@ -246,7 +250,7 @@ def smoke(args):
                 result = docker(*command, required=False)
                 if result.returncode != 0:
                     failures.append(result.stderr.strip())
-            except (OSError, subprocess.TimeoutExpired) as error:
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                 failures.append(str(error))
         if failures:
             raise RuntimeError("Docker cleanup failed: " + "; ".join(failures))
@@ -254,7 +258,8 @@ def smoke(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", help="local linux/amd64 image to test")
+    parser.add_argument("image", help="local Linux image to test")
+    parser.add_argument("--platform", choices=("linux/amd64", "linux/arm64"), default="linux/amd64")
     parser.add_argument("--expected-version", type=image_version, metavar="X.Y.Z[-rc.N]",
                         help="exact OCI version; binary/discovery must report its base X.Y.Z")
     parser.add_argument("--expected-revision", help="require this OCI revision (commit SHA)")
