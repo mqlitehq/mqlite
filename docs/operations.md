@@ -1,7 +1,8 @@
 # Production operations
 
-This runbook describes the unreleased v0.3.0 source on `main` (port 6754,
-schema token 5). The latest published release is v0.2.0 (port 8080, schema token 2).
+This runbook describes v0.3.0 (port 6754, schema token 5).
+Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
+follow [upgrade and rollback](#upgrade-and-rollback) before replacing the broker.
 See [deployment](deployment.md) for installation and [observability](observability.md)
 for metric definitions and alerts.
 

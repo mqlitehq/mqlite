@@ -10,8 +10,7 @@ DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't mi
 
 ## Unreleased
 
-The source version is prepared as **0.3.0**; this section remains unreleased until
-the maintainer approves tagging and publishing.
+## v0.3.0 — 2026-09-10
 
 > **Schema: this release is `schemaVersion = 5`.** mqlite keeps ONE canonical schema and never
 > migrates (pre-1.0), so an existing DB from any earlier release is refused with
@@ -41,6 +40,8 @@ the maintainer approves tagging and publishing.
   branch alone previously left older preinstalled libraries in the shipped image.
   CI scans the actual image's OS packages and fails on HIGH/CRITICAL findings;
   CI and release builds refresh the runtime layer instead of reusing its APK cache.
+  Both architectures of the actual release image are scanned and run before
+  publishing that same OCI archive with its digests preserved (MQLITE-119).
 
 - **Release artifacts now require matching source and complete CI** (MQLITE-109).
   Both release workflows resolve the real tag, verify its version constant, and
@@ -120,10 +121,11 @@ the maintainer approves tagging and publishing.
   `--addr` listens on `:6754`; the direct local endpoint, the admin console (`/ui`), and
   `mqlite-mcp`'s default `MQLITE_ENDPOINT` all move to `http://127.0.0.1:6754`. Container
   images `>= 0.3.0` `EXPOSE 6754` and default to it. There is no fallback to the old port
-  and no port probing. Upgrading: if you relied on the previous default, set it explicitly
-  — `mqlite serve --addr :8080` (or `MQLITE_ADDR=:8080`), and map the container with
-  `-p 8080:6754` — and update SDK/CLI/MCP endpoints, health probes, and firewall rules
-  copied from the old value.
+  and no port probing. To keep an existing 8080 endpoint, configure a native broker with
+  `mqlite serve --addr :8080` (or `MQLITE_ADDR=:8080`). For a container still listening on
+  its new default 6754, publish `-p 8080:6754`; if its internal listener is also changed to
+  8080, publish `-p 8080:8080`. Update SDK/CLI/MCP endpoints, health probes and firewall
+  rules to match the chosen listener and mapping.
 - **New `MQLITE_ADDR`** sets the broker listen address; precedence is `--addr` >
   `MQLITE_ADDR` > `:6754`. A blank/whitespace value is rejected (it would otherwise bind
   port 80).
