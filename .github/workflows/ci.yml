@@ -161,42 +161,56 @@ jobs:
   docker:
     name: docker build + authenticated restart smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: release guard contract tests
-        run: python3 test/release_guard_test.py -v
-      - name: build image
+        run: |
+          python3 test/release_guard_test.py -v
+          python3 test/image_candidate_test.py -v
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - name: install OCI copy tool
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y skopeo
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      - name: identify candidate version
+        id: image
         run: |
           version=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' internal/version/version.go)
-          docker build --pull --no-cache-filter runtime --platform linux/amd64 --build-arg VERSION="$version" --build-arg REVISION="$GITHUB_SHA" -t mqlite:ci .
-      - name: authenticated message flow and persistent volume restart
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: build actual multi-platform image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          no-cache-filters: runtime
+          provenance: false
+          sbom: false
+          outputs: type=oci,dest=${{ runner.temp }}/mqlite-image.oci.tar
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+            REVISION=${{ github.sha }}
+      - name: scan and run both actual candidate platforms (no publishing)
         run: |
-          version=$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' internal/version/version.go)
-          python3 test/release_image_smoke.py mqlite:ci --expected-version "$version" --expected-revision "$GITHUB_SHA"
-      - name: scan actual image OS packages
-        run: |
-          set -euo pipefail
-          scan_dir="$RUNNER_TEMP/mqlite-os-scan"
-          mkdir -p "$scan_dir"
-          # Official immutable release; review the version and checksum together.
-          curl --fail --location --retry 3 --output "$scan_dir/trivy.tar.gz" \
-            https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz
-          printf '%s  %s\n' 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a "$scan_dir/trivy.tar.gz" | sha256sum --check -
-          tar -xzf "$scan_dir/trivy.tar.gz" -C "$scan_dir" trivy
-          printf '{}\n' > "$scan_dir/config.yaml"
-          : > "$scan_dir/empty-ignore"
-          docker save --output "$scan_dir/image.tar" mqlite:ci
-          "$scan_dir/trivy" image --input "$scan_dir/image.tar" --platform linux/amd64 \
-            --config "$scan_dir/config.yaml" --ignorefile "$scan_dir/empty-ignore" \
-            --cache-dir "$scan_dir/cache" --db-repository ghcr.io/aquasecurity/trivy-db:2 \
-            --scanners vuln --pkg-types os --severity HIGH,CRITICAL --exit-code 1 --exit-on-eol 1 \
-            --skip-java-db-update --no-progress --format json --output "$scan_dir/report.json"
-      - name: upload OS scan report
+          python3 .github/scripts/image_candidate.py verify \
+            --archive "$RUNNER_TEMP/mqlite-image.oci.tar" --output "$RUNNER_TEMP/mqlite-image-checks" \
+            --version "$IMAGE_VERSION" --revision "$GITHUB_SHA"
+        env:
+          IMAGE_VERSION: ${{ steps.image.outputs.version }}
+      - name: upload candidate verification evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: image-os-vulnerabilities
-          path: ${{ runner.temp }}/mqlite-os-scan/report.json
+          name: image-candidate-verification
+          path: |
+            ${{ runner.temp }}/mqlite-image-checks/*.json
+            ${{ runner.temp }}/mqlite-image-checks/*.log
 
   e2e:
     # Black-box end-to-end: builds mqlite, boots an ephemeral broker, and runs the

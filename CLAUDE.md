@@ -105,10 +105,18 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
   Release builds remove DWARF data with `-w` but retain symbols: `-s` would make
   binary analysis fall back to conservative module-level matches.
 - **Container verification:** Docker builds scan the actual compiled binary with
-  `govulncheck -mode=binary` before copying it to the runtime image. CI builds
-  `linux/amd64` with current base images and checks OCI version/revision labels,
-  authentication, send/receive/complete, and recovery after recreating the
-  container with the same persistent volume (`test/release_image_smoke.py`).
+  `govulncheck -mode=binary` before copying it to the runtime image. CI and image
+  releases build one OCI archive containing `linux/amd64` and `linux/arm64`, then
+  scan both actual images' Alpine packages with the checksum-pinned Trivy tool
+  and its current database. Unknown/empty OS scans, end-of-life Alpine, or any
+  HIGH/CRITICAL finding fail. Alpine 3.24's reviewed support deadline is also
+  enforced because the pinned scanner's built-in EOL table predates that branch.
+  Both images run the authenticated message and persistent-volume restart smoke
+  (`test/release_image_smoke.py`), with QEMU for
+  arm64. Config digests and complete RootFS identities tie the scanned and running
+  images to the original archive. Only after both pass does Skopeo publish that
+  archive with `--all --preserve-digests`; no rebuild or intermediate image tag is
+  published. Each published tag's index digest is read back and checked.
   For an RC, the OCI version is the full `X.Y.Z-rc.N`; binaries report the source
   constant's base `X.Y.Z`. The smoke accepts the full expected image version and
   checks both forms.

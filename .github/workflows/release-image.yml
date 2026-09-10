@@ -19,8 +19,9 @@ permissions:
 
 jobs:
   ghcr:
-    name: build + push multi-arch image (GHCR)
+    name: verify + publish multi-arch image (GHCR)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,23 +40,58 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
         env:
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
-      - uses: docker/setup-buildx-action@v4
-      - name: log in to GHCR
-        uses: docker/login-action@v4.5.2
+      - uses: docker/setup-qemu-action@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      # The Dockerfile cross-compiles and scans each actual binary before COPY.
-      - name: build + push (linux/amd64, linux/arm64)
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - name: install OCI copy tool
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y skopeo
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      # Build once. Every subsequent scan, smoke and publish uses this exact archive.
+      - name: build candidate (linux/amd64, linux/arm64)
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           pull: true
           no-cache-filters: runtime
-          push: true
-          tags: ${{ steps.release.outputs.image_tags }}
+          provenance: false
+          sbom: false
+          outputs: type=oci,dest=${{ runner.temp }}/mqlite-image.oci.tar
           build-args: |
             VERSION=${{ steps.release.outputs.version }}
             REVISION=${{ steps.release.outputs.sha }}
+      - name: scan and run both actual candidate platforms
+        run: |
+          python3 .github/scripts/image_candidate.py verify \
+            --archive "$RUNNER_TEMP/mqlite-image.oci.tar" --output "$RUNNER_TEMP/mqlite-image-checks" \
+            --version "$RELEASE_VERSION" --revision "$RELEASE_SHA"
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+      - name: log in to GHCR
+        uses: docker/login-action@v4.5.2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: publish the verified OCI archive without rebuilding
+        run: |
+          python3 .github/scripts/image_candidate.py publish \
+            --archive "$RUNNER_TEMP/mqlite-image.oci.tar" --output "$RUNNER_TEMP/mqlite-image-checks" \
+            --version "$RELEASE_VERSION" --revision "$RELEASE_SHA" --tags "$RELEASE_IMAGE_TAGS"
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_IMAGE_TAGS: ${{ steps.release.outputs.image_tags }}
+      - name: upload candidate verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-image-verification
+          path: |
+            ${{ runner.temp }}/mqlite-image-checks/*.json
+            ${{ runner.temp }}/mqlite-image-checks/*.log
