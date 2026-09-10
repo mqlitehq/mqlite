@@ -376,13 +376,20 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-**v0.2.0 is the current release** ([tagged releases](https://github.com/mqlitehq/mqlite/releases)
-carry binaries and a GHCR image). The next wave — the default-port move to 6754, the CLI/API
-parity work, and the fixes listed under *Unreleased* in [CHANGELOG.md](CHANGELOG.md) — is on
-main and **not yet tagged**, so docs that pin a `0.3.0` image describe that upcoming release,
-not something you can pull today; use the latest tagged image until then. Hermetic unit +
-invariant (TCK-style) tests run in CI on every push, and live Turso/libSQL round-trips run in
-the nightly workflow.
+This source tree targets **v0.3.0**: default broker port **6754**, schema token **5**,
+expanded CLI and MCP tools, and the reliability fixes in [CHANGELOG.md](CHANGELOG.md).
+Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
+or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.0`; see
+[deployment](docs/deployment.md) for configuration.
+
+**Upgrading from v0.2.0 requires a new database.** There is no in-place schema
+migration. Account for retained messages in every state, preserve the old binary
+and a consistent database backup, and follow the
+[upgrade and rollback procedure](docs/operations.md#upgrade-and-rollback).
+Delivery remains at-least-once; consumers must be idempotent.
+
+Hermetic unit + invariant (TCK-style) tests run in CI on every push, and live
+Turso/libSQL round-trips run in the nightly workflow.
 
 ## License
 

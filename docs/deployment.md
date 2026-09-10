@@ -44,17 +44,16 @@ and error reference: [api-reference.md](api-reference.md).
 
 ## Docker / GHCR
 
-> **Release status — read before copy-pasting.**
-> These docs describe **`main`, which will ship as v0.3.0** and defaults to port **6754**.
-> **`0.3.0` is not published yet**, so the commands below are not runnable as written — they are
-> the shape they will have on release. The newest image you can actually pull today is
-> **`0.2.x`, and it listens on `8080`**: use `-p 8080:8080` and `ghcr.io/mqlitehq/mqlite:0.2.0`
-> until v0.3.0 is tagged. The port move is the headline change of that release.
+> **Version and upgrade compatibility.**
+> These instructions target **v0.3.0**, with default port **6754** and schema token **5**.
+> **v0.2.0 uses port 8080 and schema token 2.** Its database cannot be opened by
+> v0.3.0: preserve the old binary/database pair and follow the
+> [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before replacing it.
 
 The published image is multi-arch (amd64 + arm64):
 
 ```bash
-# On release (v0.3.0, port 6754):
+# v0.3.0, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
@@ -79,9 +78,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.3.0"   # public image, no build on Fly (see the release
-                                           # note above: 0.3.0 is not published yet; today's
-                                           # pullable tag is 0.2.x, which listens on 8080)
+  image = "ghcr.io/mqlitehq/mqlite:0.3.0"   # pinned image, no build on Fly
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -164,9 +161,9 @@ Follow the [production runbook](operations.md#consistent-backups) for read-only
 online snapshots, offline directory copies, isolated restore validation and rollback.
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
-**v0.2.0 databases use schema 2; the v0.3.0 candidate uses schema 5.** There is no
+**v0.2.0 databases use schema 2; v0.3.0 uses schema 5.** There is no
 in-place migration. Before the upgrade, account for retained work in every state,
-keep the old binary/database pair, and create the candidate database separately.
+keep the old binary/database pair, and create the v0.3.0 database separately.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).
 
 ## Turso (remote libSQL)
