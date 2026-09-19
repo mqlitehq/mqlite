@@ -35,6 +35,10 @@ upgrade notes before replacing a broker.
 - The console adds an Access keys page with permission selection, pagination,
   expiry/revocation status and a one-time secret display. The MCP server adds
   `create_key`, `list_keys` and `revoke_key`.
+- Console expiry and scheduled delivery use an English calendar and fixed
+  `yyyy-MM-dd HH:mm` local input, with strict invalid-date validation. Listed
+  timestamps use `yyyy-MM-dd HH:mm:ss`; runtime-issued credentials are labeled
+  "managed keys" to distinguish them from configured administrator tokens.
 - Permissions apply to the whole broker. The console and `/metrics`
   require `manage`; ordinary application keys use the SDK, CLI or HTTP API.
   Explicit auth-off mode keeps the existing queue behavior and refuses key

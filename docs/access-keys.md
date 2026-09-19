@@ -99,6 +99,11 @@ created secret before dismissing its one-time display. The console explains when
 an older broker does not support the feature. Application `send`/`listen` keys
 belong in clients, not the administrator console.
 
+The **managed keys** list contains runtime-issued access keys. Configured
+`MQLITE_TOKENS` administrators are changed through configuration and a broker
+restart. Expiry uses local time in `yyyy-MM-dd HH:mm` format with an English
+calendar, independent of browser language; list timestamps include seconds.
+
 The MCP server exposes `create_key`, `list_keys` and `revoke_key`. Configure its
 `MQLITE_TOKEN` with the permission required by each tool. Key creation needs a
 public ID allocated before the call. See [MCP usage](mcp.md); do not paste new
