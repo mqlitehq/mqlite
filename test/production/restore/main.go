@@ -34,11 +34,18 @@ type entry struct {
 }
 
 type manifest struct {
-	Now      int64    `json:"now"`
-	Prefix   string   `json:"prefix"`
-	Entries  []*entry `json:"entries"`
-	Receipt  *entry   `json:"receipt"`
-	Business string   `json:"business"`
+	Now      int64        `json:"now"`
+	Prefix   string       `json:"prefix"`
+	Entries  []*entry     `json:"entries"`
+	Receipt  *entry       `json:"receipt"`
+	Business string       `json:"business"`
+	Keys     []keyFixture `json:"keys"`
+}
+
+type keyFixture struct {
+	ID, Name, Token                 string
+	Permissions                     engine.KeyPermissions
+	CreatedAt, ExpiresAt, RevokedAt int64
 }
 
 func main() {
@@ -80,6 +87,9 @@ func run() (err error) {
 	}
 	defer func() { err = errors.Join(err, e.Close()) }()
 	if os.Args[1] == "seed" {
+		if err := seedKeys(ctx, e, &f, &now); err != nil {
+			return fmt.Errorf("seed keys: %w", err)
+		}
 		if err := seed(ctx, e, &f); err != nil {
 			return fmt.Errorf("seed: %w", err)
 		}
@@ -315,6 +325,9 @@ func requireError(got, want error, label string) error {
 }
 
 func verify(ctx context.Context, e *mq.Embedded, f *manifest, now *int64) error {
+	if err := verifyKeys(ctx, e, f); err != nil {
+		return err
+	}
 	// A persisted completion receipt survives restoration; a different operation
 	// never inherits that receipt's success.
 	r := e.Message(f.Receipt.Queue, f.Receipt.Sequence, f.Receipt.Token)
@@ -474,6 +487,52 @@ func verify(ctx context.Context, e *mq.Embedded, f *manifest, now *int64) error 
 		}
 		if len(rows) != 0 {
 			return fmt.Errorf("%s has late/extra messages: %d", q.Name, len(rows))
+		}
+	}
+	return nil
+}
+
+func seedKeys(ctx context.Context, e *mq.Embedded, f *manifest, now *int64) error {
+	*now = f.Now - 2000
+	defer func() { *now = f.Now }()
+	for i, permissions := range []engine.KeyPermissions{engine.KeySend, engine.KeyListen, engine.KeyManage} {
+		want := keyFixture{ID: mq.GenerateKeyID(), Name: []string{"active", "expired", "revoked"}[i], Permissions: permissions, CreatedAt: *now}
+		if i == 1 {
+			want.ExpiresAt = f.Now - 1000
+		}
+		_, token, err := e.Engine().CreateAccessKey(ctx, engine.CreateAccessKeyOptions{ID: want.ID, Name: want.Name, Permissions: permissions, ExpiresAtMs: want.ExpiresAt})
+		if err != nil {
+			return err
+		}
+		want.Token = token
+		if i == 2 {
+			if err := e.Engine().RevokeAccessKey(ctx, want.ID); err != nil {
+				return err
+			}
+			want.RevokedAt = *now
+		}
+		f.Keys = append(f.Keys, want)
+	}
+	return nil
+}
+
+func verifyKeys(ctx context.Context, e *mq.Embedded, f *manifest) error {
+	if len(f.Keys) != 3 {
+		return errors.New("fixture must retain active, expired and revoked keys")
+	}
+	for _, want := range f.Keys {
+		key, err := e.Engine().AuthenticateAccessKey(ctx, want.Token)
+		if want.ExpiresAt != 0 || want.RevokedAt != 0 {
+			if err := requireError(err, mq.ErrUnauthenticated, "restored "+want.Name+" key"); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("restored active key: %w", err)
+		}
+		if key.ID != want.ID || key.Name != want.Name || key.Permissions != want.Permissions || key.CreatedAtMs != want.CreatedAt || key.ExpiresAtMs != want.ExpiresAt || key.RevokedAtMs != want.RevokedAt {
+			return errors.New("restored active key metadata changed")
 		}
 	}
 	return nil

@@ -7,12 +7,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -197,5 +199,40 @@ func TestBlackboxEmptyTokenSendsNoAuth(t *testing.T) {
 	dsnCleared.Env = dsnEnv
 	if code, _ := exitCode(dsnCleared); code == 0 {
 		t.Error("--token= must strip a DSN-embedded credential (mqlite://token@host)")
+	}
+}
+
+func TestBlackboxKeyCommand(t *testing.T) {
+	url, eng := bbBroker(t, "administrator")
+	id := strings.Repeat("a", 32)
+	cmd := exec.Command(mqliteBin, "key", "create", "--name", "automation", "--permissions", "send", "--id", id, "--output", "json")
+	cmd.Env = append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN=administrator")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if code, stderr := exitCode(cmd); code != 0 {
+		t.Fatalf("key create exited %d: %s", code, stderr)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	page, err := eng.ListAccessKeys(context.Background(), "", 0)
+	if err != nil || len(page.Keys) != 1 || page.Keys[0].ID != id {
+		t.Fatalf("key create did not persist metadata: %+v, %v", page, err)
+	}
+	for _, args := range [][]string{{"key", "list"}, {"key", "revoke", "--id", id}, {"key", "create", "--name", "escalation", "--permissions", "manage"}} {
+		cmd = exec.Command(mqliteBin, args...)
+		cmd.Env = append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN="+created.Token)
+		out.Reset()
+		cmd.Stdout = &out
+		code, stderr := exitCode(cmd)
+		if code == 0 || !strings.Contains(stderr, "permission denied") || strings.Contains(stderr, created.Token) || out.Len() != 0 {
+			t.Fatalf("restricted command result: code=%d stderr=%q stdout bytes=%d", code, stderr, out.Len())
+		}
+		if args[1] == "create" && !regexp.MustCompile(`create key ID [0-9a-f]{32}:`).MatchString(stderr) {
+			t.Fatal("failed create must preserve generated ID")
+		}
 	}
 }

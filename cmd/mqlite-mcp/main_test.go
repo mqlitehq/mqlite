@@ -3,17 +3,22 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/authkey"
 	"github.com/mqlitehq/mqlite/internal/defaults"
 	"github.com/mqlitehq/mqlite/server"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // TestResolveEndpoint pins the MCP endpoint fallback to the shared loopback default and the
@@ -64,10 +69,14 @@ func TestToolsList(t *testing.T) {
 			t.Fatalf("tool %v has no inputSchema", td["name"])
 		}
 	}
-	for _, want := range []string{"send", "receive", "complete", "create_queue", "stats", "list_queues"} {
-		if !names[want] {
-			t.Fatalf("missing tool %q", want)
-		}
+	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "list_keys", "list_queues", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats"}
+	got := make([]string, 0, len(names))
+	for name := range names {
+		got = append(got, name)
+	}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) || len(list) != len(want) {
+		t.Fatalf("tool inventory = %v, want %v", got, want)
 	}
 }
 
@@ -152,6 +161,10 @@ func TestToolSchemaForwardConsistency(t *testing.T) {
 				sentinel = float64(987654) // JSON numbers decode to float64 in args
 			case "array":
 				sentinel = []any{float64(987654)} // JSON arrays decode to []any
+				items, _ := spec.(map[string]any)["items"].(map[string]any)
+				if items["type"] == "string" {
+					sentinel = []any{"send"}
+				}
 			}
 			if fwdBody(tl, map[string]any{key: sentinel}) == base {
 				t.Errorf("%s: schema property %q has no effect on the forwarded request — "+
@@ -173,10 +186,10 @@ func TestToolForwardsHitRealBrokerRoutes(t *testing.T) {
 	if err := eng.CreateQueue(context.Background(), "q", engine.QueueConfig{}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}
-	ts := httptest.NewServer(server.New(eng, nil).Handler()) // no auth
+	ts := httptest.NewServer(server.New(eng, []string{"administrator"}).Handler())
 	defer ts.Close()
 	broker.endpoint = ts.URL
-	broker.token = ""
+	broker.token = "administrator"
 	broker.http = ts.Client()
 
 	// One superset of args; each forward reads only the keys it needs.
@@ -185,6 +198,7 @@ func TestToolForwardsHitRealBrokerRoutes(t *testing.T) {
 		"seq_number": float64(1), "lock_token": "tok", "max_messages": float64(1),
 		"wait_time_ms": float64(0), "state": "active", "max": float64(8),
 		"reason": "because", "delay_ms": float64(0),
+		"id": strings.Repeat("a", 32), "permissions": []any{"manage"},
 	}
 	for _, tl := range tools {
 		res := callTool(tl.name, args)
@@ -245,7 +259,10 @@ func wireShape(t reflect.Type) []string {
 // here — forcing a conscious decision about whether the MCP tool schema should expose
 // it (then update this golden). Closes gap 1-reverse in docs/mcp-wire-compat-notes.md.
 var goldenWireShapes = map[string][]string{
-	"wire.Empty": {},
+	"wire.Empty":            {},
+	"wire.CreateKeyRequest": {"id", "name", "permissions", "expires_at_ms"},
+	"wire.ListKeysRequest":  {"after_id", "limit"},
+	"wire.RevokeKeyRequest": {"id"},
 	"wire.CreateQueueRequest": {
 		"config.dead_letter_on_expire", "config.default_ttl_ms", "config.dedup_window_ms",
 		"config.dlq_max_age_ms", "config.dlq_max_bytes", "config.dlq_max_count", "config.kind",
@@ -311,5 +328,382 @@ func TestToolsCallBrokerError(t *testing.T) {
 	resp := call(t, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"stats","arguments":{"queue":"nope"}}}`)
 	if resp.Result.(map[string]any)["isError"] != true {
 		t.Fatal("broker 404 should surface as isError=true")
+	}
+}
+
+// Existing MCP tools forward the configured credential and preserve permission
+// failures, including calls made with managed credentials.
+func TestToolsPermissionDenied(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	const credential = "restricted-credential"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+credential {
+			t.Error("configured token was not forwarded")
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":"permission_denied","message":"listen permission required"}`))
+	}))
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, credential, ts.Client()
+	resp := call(t, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"stats","arguments":{"queue":"q"}}}`)
+	result := resp.Result.(map[string]any)
+	if result["isError"] != true {
+		t.Fatal("permission denial must remain an MCP tool error")
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "permission_denied") || strings.Contains(string(encoded), credential) {
+		t.Fatal("tool error must preserve permission code without credential")
+	}
+}
+
+func toolText(t *testing.T, name string, args map[string]any, wantError bool) string {
+	t.Helper()
+	params, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": name, "arguments": args}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := call(t, string(params)).Result.(map[string]any)
+	text := result["content"].([]map[string]any)[0]["text"].(string)
+	if result["isError"] != wantError {
+		t.Fatalf("tool %s isError=%v, want %v: %s", name, result["isError"], wantError, text)
+	}
+	return text
+}
+
+func TestKeyToolsAgainstBroker(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	ts := httptest.NewServer(server.New(eng, []string{"administrator"}).Handler())
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+	if text := toolText(t, "list_keys", nil, false); text != `{"keys":[]}`+"\n" {
+		t.Fatalf("empty list = %q", text)
+	}
+	managerID, senderID := strings.Repeat("1", 32), strings.Repeat("2", 32)
+	createArgs := func(id, name, permission string) map[string]any {
+		return map[string]any{"id": id, "name": name, "permissions": []any{permission}}
+	}
+	var manager, sender wire.CreateKeyResponse
+	text := toolText(t, "create_key", createArgs(managerID, "manager", "manage"), false)
+	if err := json.Unmarshal([]byte(text), &manager); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Key.ID != managerID || !authkey.ValidToken(manager.Token) || strings.Count(text, manager.Token) != 1 {
+		t.Fatal("create_key must return one complete token and its public ID")
+	}
+	broker.token = manager.Token
+	args := createArgs(senderID, "producer", "send")
+	args["expires_at_ms"] = float64(time.Now().Add(time.Hour).UnixMilli())
+	text = toolText(t, "create_key", args, false)
+	if err := json.Unmarshal([]byte(text), &sender); err != nil {
+		t.Fatal(err)
+	}
+	if sender.Key.ID != senderID || sender.Key.ExpiresAtMs != int64(args["expires_at_ms"].(float64)) {
+		t.Fatal("managed administrator must be able to issue an expiring key")
+	}
+	for i, after := range []string{"", managerID} {
+		text = toolText(t, "list_keys", map[string]any{"after_id": after, "limit": 1}, false)
+		var page wire.ListKeysResponse
+		if err := json.Unmarshal([]byte(text), &page); err != nil {
+			t.Fatal(err)
+		}
+		wantID, wantNext := managerID, managerID
+		if i == 1 {
+			wantID, wantNext = senderID, ""
+		}
+		if len(page.Keys) != 1 || page.Keys[0].ID != wantID || page.NextAfterID != wantNext || strings.Contains(text, "token") || strings.Contains(text, "hash") {
+			t.Fatalf("page %d metadata contract differs", i)
+		}
+	}
+	text = toolText(t, "create_key", createArgs(senderID, "repeat", "manage"), true)
+	if !strings.Contains(text, "key_conflict") || !strings.Contains(text, senderID) || strings.Contains(text, sender.Token) {
+		t.Fatal("conflict must retain public ID without repeating the token")
+	}
+	broker.token = sender.Token
+	toolText(t, "send", map[string]any{"queue": "missing", "body": "hi"}, true) // send passes auth and reports the missing queue
+	for _, request := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"create_key", createArgs(strings.Repeat("3", 32), "escalation", "manage")},
+		{"list_keys", nil}, {"revoke_key", map[string]any{"id": managerID}},
+	} {
+		text = toolText(t, request.name, request.args, true)
+		if !strings.Contains(text, "permission_denied") || strings.Contains(text, sender.Token) {
+			t.Fatalf("%s must preserve permission denial without secret", request.name)
+		}
+	}
+	broker.token = manager.Token
+	for i := 0; i < 2; i++ {
+		toolText(t, "revoke_key", map[string]any{"id": senderID}, false)
+	}
+	text = toolText(t, "list_keys", nil, false)
+	var page wire.ListKeysResponse
+	if err := json.Unmarshal([]byte(text), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Keys) != 2 || page.Keys[1].RevokedAtMs == 0 {
+		t.Fatal("revoked key must remain listed")
+	}
+	broker.token = sender.Token
+	if text = toolText(t, "stats", map[string]any{"queue": "q"}, true); !strings.Contains(text, "unauthenticated") {
+		t.Fatal("revoked key must stop authenticating")
+	}
+	broker.token = manager.Token
+	toolText(t, "revoke_key", map[string]any{"id": managerID}, false)
+	if text = toolText(t, "list_keys", nil, true); !strings.Contains(text, "unauthenticated") {
+		t.Fatal("self-revocation must take effect")
+	}
+	broker.token = "administrator"
+	toolText(t, "list_keys", nil, false)
+}
+
+func TestCreateKeyToolFailureRetainsIDWithoutSecret(t *testing.T) {
+	const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	secret := "mqk_" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name, body string
+		status     int
+	}{
+		{"truncated", `{"key":{"id":"` + id + `"},"token":"` + secret, http.StatusOK},
+		{"missing secret", `{"key":{"id":"` + id + `"}}`, http.StatusOK},
+		{"wrong id", `{"key":{"id":"` + strings.Repeat("c", 32) + `"},"token":"` + secret + `"}`, http.StatusOK},
+		{"invalid token", `{"key":{"id":"` + id + `"},"token":"partial-secret"}`, http.StatusOK},
+		{"server error", `{"code":"internal","message":"database unavailable"}`, http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := broker
+			defer func() { broker = old }()
+			var calls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+			text := toolText(t, "create_key", map[string]any{"id": id, "name": "recovery", "permissions": []any{"manage"}}, true)
+			if calls.Load() != 1 || !strings.Contains(text, id) || strings.Contains(text, secret) || strings.Contains(text, "partial-secret") {
+				t.Fatalf("uncertain create must identify key without retrying or leaking response fragments; calls=%d", calls.Load())
+			}
+			for _, badID := range []any{nil, "", "BAD", secret, 123} {
+				text = toolText(t, "create_key", map[string]any{"id": badID, "name": "invalid", "permissions": []any{"manage"}}, true)
+				if calls.Load() != 1 || strings.Contains(text, secret) {
+					t.Fatal("invalid id must be rejected without a request or value echo")
+				}
+			}
+		})
+	}
+}
+
+func TestKeyToolsRejectMalformedSuccess(t *testing.T) {
+	id := strings.Repeat("a", 32)
+	secret := "mqk_" + strings.Repeat("b", 64)
+	key := wire.AccessKey{ID: id, Name: "worker", Permissions: []string{"manage"}, CreatedAtMs: 100}
+	metadata, err := json.Marshal(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := `{"key":` + string(metadata) + `,"token":"` + secret + `"}`
+	listed := `{"keys":[` + string(metadata) + `]}`
+	for _, tc := range []struct {
+		name, tool, body string
+		truncated        bool
+	}{
+		{"create null", "create_key", "null", false},
+		{"create empty", "create_key", "{}", false},
+		{"create missing metadata", "create_key", `{"key":{"id":"` + id + `"},"token":"` + secret + `"}`, false},
+		{"create mismatched rights", "create_key", strings.Replace(created, `"manage"`, `"send"`, 1), false},
+		{"create wrong expiry", "create_key", strings.Replace(created, `"expires_at_ms":0`, `"expires_at_ms":200`, 1), false},
+		{"create wrong name", "create_key", strings.Replace(created, `"worker"`, `"other"`, 1), false},
+		{"create trailing", "create_key", created + `{}`, false},
+		{"create oversized", "create_key", strings.Repeat(" ", wire.MaxKeyResponseBytes) + created, false},
+		{"create truncated", "create_key", created, true},
+		{"list null", "list_keys", "null", false},
+		{"list empty", "list_keys", "{}", false},
+		{"list null keys", "list_keys", `{"keys":null}`, false},
+		{"list repeated id", "list_keys", `{"keys":[` + string(metadata) + `,` + string(metadata) + `]}`, false},
+		{"list backward cursor", "list_keys", `{"keys":[` + string(metadata) + `],"next_after_id":"` + strings.Repeat("0", 32) + `"}`, false},
+		{"list partial metadata", "list_keys", `{"keys":[{"id":"` + id + `","token":"` + secret + `"}]}`, false},
+		{"list trailing", "list_keys", listed + `{}`, false},
+		{"list oversized", "list_keys", strings.Repeat(" ", wire.MaxKeyResponseBytes) + listed, false},
+		{"list truncated", "list_keys", listed, true},
+		{"revoke null", "revoke_key", "null", false},
+		{"revoke empty", "revoke_key", "{}", false},
+		{"revoke false", "revoke_key", `{"ok":false}`, false},
+		{"revoke trailing", "revoke_key", `{"ok":true}{}`, false},
+		{"revoke oversized", "revoke_key", strings.Repeat(" ", wire.MaxKeyResponseBytes) + `{"ok":true}`, false},
+		{"revoke truncated", "revoke_key", `{"ok":true}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := broker
+			defer func() { broker = old }()
+			var calls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				if tc.truncated {
+					w.Header().Set("Content-Length", fmt.Sprint(len(tc.body)+50))
+				}
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+			args := map[string]any{}
+			switch tc.tool {
+			case "create_key":
+				args = map[string]any{"id": id, "name": "worker", "permissions": []any{"manage"}}
+			case "revoke_key":
+				args["id"] = id
+			}
+			text := toolText(t, tc.tool, args, true)
+			if calls.Load() != 1 || strings.Contains(text, secret) || tc.tool == "create_key" && !strings.Contains(text, id) {
+				t.Fatal("invalid success was retried, leaked its token, or lost the public ID")
+			}
+		})
+	}
+	for _, operation := range []string{"create_key", "list_keys", "revoke_key"} {
+		t.Run(operation+" error and unknown field secrecy", func(t *testing.T) {
+			old := broker
+			defer func() { broker = old }()
+			body := listed
+			switch operation {
+			case "create_key":
+				body = created
+			case "revoke_key":
+				body = `{"ok":true}`
+			}
+			body = strings.TrimSuffix(body, "}") + `,"unexpected_secret":"` + secret + `"}`
+			var errorPhase atomic.Bool
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if errorPhase.Load() {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"code":"internal","message":"` + secret + `"}`))
+					return
+				}
+				_, _ = w.Write([]byte(body))
+			}))
+			defer ts.Close()
+			broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+			args := map[string]any{}
+			switch operation {
+			case "create_key":
+				args = map[string]any{"id": id, "name": "worker", "permissions": []any{"manage"}}
+			case "revoke_key":
+				args["id"] = id
+			}
+			text := toolText(t, operation, args, false)
+			if strings.Contains(text, "unexpected_secret") || operation != "create_key" && strings.Contains(text, secret) || operation == "create_key" && strings.Count(text, secret) != 1 {
+				t.Fatal("unreviewed success fields reached the MCP result")
+			}
+			errorPhase.Store(true)
+			text = toolText(t, operation, args, true)
+			if !strings.Contains(text, "internal") || strings.Contains(text, secret) {
+				t.Fatal("key error did not preserve code or leaked intermediary text")
+			}
+		})
+	}
+}
+
+func TestKeyToolsRejectUnknownArguments(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+	id := strings.Repeat("a", 32)
+	secret := "mqk_" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		tool, typo string
+		args       map[string]any
+	}{
+		{"create_key", "expires_at_m", map[string]any{"id": id, "name": "worker", "permissions": []any{"manage"}}},
+		{"list_keys", "afterId", map[string]any{"limit": 1}},
+		{"revoke_key", "key_id", map[string]any{"id": id}},
+	} {
+		for _, unknown := range []string{tc.typo, secret} {
+			tc.args[unknown] = secret
+			text := toolText(t, tc.tool, tc.args, true)
+			delete(tc.args, unknown)
+			if requests.Load() != 0 || strings.Contains(text, unknown) || strings.Contains(text, secret) || tc.tool == "create_key" && !strings.Contains(text, id) {
+				t.Fatalf("%s unknown argument was sent, leaked, or lost the create ID", tc.tool)
+			}
+		}
+	}
+}
+
+func TestKeyToolSchemasPinned(t *testing.T) {
+	golden := map[string]string{
+		"create_key": `{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","pattern":"^[0-9a-f]{32}$","description":"unique public key ID; choose before the call"},"name":{"type":"string","description":"key name"},"permissions":{"type":"array","items":{"type":"string","enum":["send","listen","manage"]},"minItems":1,"description":"manage includes send and listen"},"expires_at_ms":{"type":"integer","description":"UTC epoch milliseconds; 0 or omitted means no expiry"}},"required":["id","name","permissions"]}`,
+		"list_keys":  `{"type":"object","additionalProperties":false,"properties":{"after_id":{"type":"string","description":"next_after_id from the previous page"},"limit":{"type":"integer","description":"page size, default 100, maximum 1000"}}}`,
+		"revoke_key": `{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","description":"public key ID, not the secret token"}},"required":["id"]}`,
+	}
+	seen := map[string]bool{}
+	for _, tl := range tools {
+		want, ok := golden[tl.name]
+		if !ok {
+			continue
+		}
+		seen[tl.name] = true
+		got, err := json.Marshal(tl.schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var actual, expected any
+		if err := json.Unmarshal(got, &actual); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(want), &expected); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(actual, expected) {
+			t.Errorf("%s schema changed: review and update the full contract", tl.name)
+		}
+	}
+	if len(seen) != len(golden) {
+		t.Fatal("managed key tool inventory changed")
+	}
+	for _, input := range []any{nil, "send", []any{"send", 1}} {
+		if got := strArr(map[string]any{"permissions": input}, "permissions"); got != nil {
+			t.Fatalf("invalid permission array accepted: %v", input)
+		}
+	}
+}
+
+func TestKeyToolRejectsInvalidNumbers(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+	for _, bad := range []any{"tomorrow", nil, true, 1.5, 1e30} {
+		text := toolText(t, "create_key", map[string]any{"id": strings.Repeat("a", 32), "name": "worker", "permissions": []any{"send"}, "expires_at_ms": bad}, true)
+		if !strings.Contains(text, strings.Repeat("a", 32)) || !strings.Contains(text, "expires_at_ms must be an integer") {
+			t.Fatal("invalid expiry must retain key ID and explain the input error")
+		}
+		toolText(t, "list_keys", map[string]any{"limit": bad}, true)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("invalid numbers must fail before issuing requests")
+	}
+	if !validKeyInteger(map[string]any{"n": int64(123)}, "n") {
+		t.Fatal("int64 helper input must be accepted")
 	}
 }

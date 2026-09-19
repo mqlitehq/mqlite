@@ -15,12 +15,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/mqlitehq/mqlite/internal/authkey"
 	"github.com/mqlitehq/mqlite/internal/defaults"
 	ver "github.com/mqlitehq/mqlite/internal/version"
 	"github.com/mqlitehq/mqlite/wire"
@@ -180,6 +182,13 @@ func obj(props map[string]any, required ...string) map[string]any {
 	}
 	return m
 }
+
+func keyObj(props map[string]any, required ...string) map[string]any {
+	m := obj(props, required...)
+	m["additionalProperties"] = false
+	return m
+}
+
 func strProp(desc string) map[string]any {
 	return map[string]any{"type": "string", "description": desc}
 }
@@ -218,6 +227,40 @@ func intArr(a map[string]any, k string) []int64 {
 		case int64:
 			out = append(out, n)
 		}
+	}
+	return out
+}
+
+// Key expiry and pagination must not silently treat an invalid number as zero.
+func validKeyInteger(args map[string]any, name string) bool {
+	value, present := args[name]
+	if !present {
+		return true
+	}
+	switch n := value.(type) {
+	case float64:
+		return n >= -0x1p63 && n < 0x1p63 && math.Trunc(n) == n
+	case int64:
+		return true
+	default:
+		return false
+	}
+}
+
+// strArr rejects mixed-type arrays instead of silently discarding an invalid
+// permission. The broker remains the authority for allowed permission names.
+func strArr(a map[string]any, key string) []string {
+	raw, ok := a[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(raw))
+	for i, value := range raw {
+		s, ok := value.(string)
+		if !ok {
+			return nil
+		}
+		out[i] = s
 	}
 	return out
 }
@@ -346,13 +389,92 @@ var tools = []tool{
 			return wire.PathPurge, wire.PurgeRequest{Queue: str(a, "queue"), Max: int(num(a, "max"))}
 		},
 	},
+	{
+		name: "create_key", desc: "Create an access key (manage required). Save the one-time token; retain id for recovery.",
+		schema: keyObj(map[string]any{
+			"id":            map[string]any{"type": "string", "pattern": "^[0-9a-f]{32}$", "description": "unique public key ID; choose before the call"},
+			"name":          strProp("key name"),
+			"permissions":   map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"send", "listen", "manage"}}, "minItems": 1, "description": "manage includes send and listen"},
+			"expires_at_ms": intProp("UTC epoch milliseconds; 0 or omitted means no expiry"),
+		}, "id", "name", "permissions"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathCreateKey, wire.CreateKeyRequest{ID: str(a, "id"), Name: str(a, "name"), Permissions: strArr(a, "permissions"), ExpiresAtMs: num(a, "expires_at_ms")}
+		},
+	},
+	{
+		name: "list_keys", desc: "List access key metadata without secrets (manage required). Includes revoked and expired keys.",
+		schema: keyObj(map[string]any{
+			"after_id": strProp("next_after_id from the previous page"),
+			"limit":    intProp("page size, default 100, maximum 1000"),
+		}),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathListKeys, wire.ListKeysRequest{AfterID: str(a, "after_id"), Limit: int(num(a, "limit"))}
+		},
+	},
+	{
+		name: "revoke_key", desc: "Revoke a managed access key by public id (manage required). Repeating revocation is safe.",
+		schema: keyObj(map[string]any{"id": strProp("public key ID, not the secret token")}, "id"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathRevokeKey, wire.RevokeKeyRequest{ID: str(a, "id")}
+		},
+	},
 }
 
 func callTool(name string, args map[string]any) map[string]any {
 	for _, t := range tools {
 		if t.name == name {
 			path, body := t.forward(args)
+			create, creating := body.(wire.CreateKeyRequest)
+			if creating && !authkey.ValidID(create.ID) {
+				return textResult("error: key id must be 32 lowercase hexadecimal characters", true)
+			}
+			if creating || path == wire.PathListKeys || path == wire.PathRevokeKey {
+				// Validate against the published schema itself. In particular, a
+				// misspelled expiry must not silently create a non-expiring key.
+				properties := t.schema["properties"].(map[string]any)
+				for name := range args {
+					if _, known := properties[name]; !known {
+						message := "unknown access key argument"
+						if creating {
+							message = "create key ID " + create.ID + ": " + message
+						}
+						return textResult("error: "+message, true)
+					}
+				}
+			}
+			if creating && !validKeyInteger(args, "expires_at_ms") {
+				return textResult("error: create key ID "+create.ID+": expires_at_ms must be an integer", true)
+			}
+			if path == wire.PathListKeys && !validKeyInteger(args, "limit") {
+				return textResult("error: limit must be an integer", true)
+			}
 			text, err := post(path, body)
+			if err == nil {
+				var validated any
+				switch request := body.(type) {
+				case wire.CreateKeyRequest:
+					validated, err = wire.DecodeCreateKeyResponse([]byte(text), request)
+					if err != nil {
+						err = fmt.Errorf("invalid create response; list and revoke this ID before issuing a replacement")
+					}
+				case wire.ListKeysRequest:
+					validated, err = wire.DecodeListKeysResponse([]byte(text), request)
+				case wire.RevokeKeyRequest:
+					validated, err = wire.DecodeRevokeKeyResponse([]byte(text))
+					if err != nil {
+						err = fmt.Errorf("invalid revocation acknowledgement; verify the key state or repeat revocation")
+					}
+				}
+				if validated != nil && err == nil {
+					// Only reviewed fields reach the tool result. Never echo an
+					// invalid success body, unknown field or partial token.
+					normalized, _ := json.Marshal(validated)
+					text = string(normalized) + "\n"
+				}
+			}
+			if creating && err != nil {
+				err = fmt.Errorf("create key ID %s: %w", create.ID, err)
+			}
 			if err != nil {
 				return textResult("error: "+err.Error(), true)
 			}
@@ -384,11 +506,28 @@ func post(path string, body any) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	rb, err := io.ReadAll(resp.Body)
+	var rb []byte
+	if path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey {
+		rb, err = wire.ReadKeyResponse(resp.Body)
+	} else {
+		rb, err = io.ReadAll(resp.Body)
+	}
 	if err != nil {
 		return "", err
 	}
 	if resp.StatusCode >= 300 {
+		if path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey {
+			// Keep the recognized error code, never arbitrary intermediary text:
+			// an error response must not disclose a partial creation secret.
+			var envelope wire.ErrorBody
+			_ = json.Unmarshal(rb, &envelope)
+			code := "request failed"
+			switch envelope.Code {
+			case "unauthenticated", "permission_denied", "key_conflict", "not_found", "invalid_argument", "message_too_large", "outcome_unknown", "internal", "canceled", "unimplemented":
+				code = envelope.Code
+			}
+			return "", fmt.Errorf("broker %d: %s", resp.StatusCode, code)
+		}
 		return "", fmt.Errorf("broker %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
 	}
 	return string(rb), nil

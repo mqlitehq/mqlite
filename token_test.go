@@ -14,13 +14,29 @@ func TestGenerateToken(t *testing.T) {
 		t.Fatalf("token %q missing %q prefix", a, mqlite.TokenPrefix)
 	}
 	hexPart := strings.TrimPrefix(a, mqlite.TokenPrefix)
-	if len(hexPart) != 32 { // 16 bytes = 128 bits
-		t.Fatalf("hex part %q has %d chars, want 32 (128-bit)", hexPart, len(hexPart))
+	if len(hexPart) != 64 { // 32 bytes = 256 bits
+		t.Fatalf("hex part has %d chars, want 64 (256-bit)", len(hexPart))
+	}
+	if hexPart != strings.ToLower(hexPart) {
+		t.Fatal("token body must be lowercase")
 	}
 	if _, err := hex.DecodeString(hexPart); err != nil {
 		t.Fatalf("token body is not hex: %v", err)
 	}
 	if b := mqlite.GenerateToken(); a == b {
 		t.Fatal("two generated tokens must differ (randomness)")
+	}
+}
+
+func TestGenerateKeyID(t *testing.T) {
+	a := mqlite.GenerateKeyID()
+	if len(a) != 32 || a != strings.ToLower(a) {
+		t.Fatalf("invalid key ID format: %q", a)
+	}
+	if _, err := hex.DecodeString(a); err != nil {
+		t.Fatalf("key ID is not hex: %v", err)
+	}
+	if b := mqlite.GenerateKeyID(); a == b {
+		t.Fatal("two generated key IDs must differ")
 	}
 }

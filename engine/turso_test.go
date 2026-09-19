@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mqlitehq/mqlite/internal/authkey"
 )
 
 // Live remote Turso/libSQL tests — all gated on MQLITE_TEST_DB (skipped otherwise,
@@ -126,6 +130,176 @@ func TestTursoIntegration(t *testing.T) {
 		t.Fatalf("queue should be drained, got %+v", mt)
 	}
 	t.Logf("Turso integration OK: round-trip + abandon/redeliver + drain verified")
+}
+
+// TestTursoAccessKeys exercises real indexed authentication, independently
+// revocable credentials and restart persistence through the four-connection pool.
+func TestTursoAccessKeys(t *testing.T) {
+	dsn := os.Getenv("MQLITE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set MQLITE_TEST_DB (and MQLITE_TEST_DB_AUTH_TOKEN) to run the Turso integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	var now atomic.Int64
+	now.Store(time.Now().UnixMilli())
+	opts := Options{DB: dsn, AuthToken: os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"), DisableBackground: true, Now: now.Load}
+	e, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.Remote() || e.db.sql.Stats().MaxOpenConnections != 4 {
+		t.Fatal("access key live test requires the four-connection remote pool")
+	}
+	var ids []string
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cleanupCancel()
+		failed := false
+		for _, id := range ids {
+			if _, err := e.db.exec(cleanupCtx, `DELETE FROM access_keys WHERE id = ?`, id); err != nil {
+				failed = true
+				t.Errorf("cleanup test access key %s: %v", id, err)
+			}
+		}
+		if !failed {
+			t.Logf("Turso cleanup OK: removed %d test access keys", len(ids))
+		}
+		if err := e.Close(); err != nil {
+			t.Errorf("close remote: %v", err)
+		}
+	})
+	var keys []AccessKey
+	var tokens []string
+	for _, p := range []KeyPermissions{KeySend, KeyListen, KeySend | KeyListen, KeyManage} {
+		id, err := authkey.GenerateID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id) // Track before the write, including an uncertain result.
+		key, token, err := e.CreateAccessKey(ctx, CreateAccessKeyOptions{ID: id, Name: "turso access key test", Permissions: p, ExpiresAtMs: now.Load() + 60_000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, tokens = append(keys, key), append(tokens, token)
+		if got, err := e.AuthenticateAccessKey(ctx, token); err != nil || got != key {
+			t.Fatalf("create not visible to authentication: %+v %v", got, err)
+		}
+	}
+	// Four callers competing for a single preselected ID produce one record.
+	id, err := authkey.GenerateID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids = append(ids, id)
+	var wg sync.WaitGroup
+	var created atomic.Int32
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, err := e.CreateAccessKey(ctx, CreateAccessKeyOptions{ID: id, Name: "turso same id", Permissions: KeySend})
+			if err == nil {
+				created.Add(1)
+			} else if !errors.Is(err, ErrKeyConflict) {
+				t.Errorf("concurrent creation: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if created.Load() != 1 {
+		t.Fatalf("same ID produced %d credentials", created.Load())
+	}
+	// Revocation's completed response must fence every later pooled lookup.
+	if err := e.RevokeAccessKey(ctx, keys[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := e.AuthenticateAccessKey(ctx, tokens[0]); !errors.Is(err, ErrUnauthenticated) {
+				t.Errorf("post-revoke pooled lookup accepted: %v", err)
+			}
+			if _, err := e.AuthenticateAccessKey(ctx, tokens[1]); err != nil {
+				t.Errorf("independent pooled key failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []func() error{
+		func() error {
+			_, _, err := e.CreateAccessKey(ctx, CreateAccessKeyOptions{ID: id, Name: "closed", Permissions: KeySend})
+			return err
+		},
+		func() error { _, err := e.ListAccessKeys(ctx, "", 1); return err },
+		func() error { return e.RevokeAccessKey(ctx, id) },
+		func() error { _, err := e.AuthenticateAccessKey(ctx, tokens[1]); return err },
+	} {
+		if err := operation(); !errors.Is(err, ErrClosed) {
+			t.Fatalf("remote access key after close: %v", err)
+		}
+	}
+	// Use a separate variable so failed reopening does not erase the cleanup handle.
+	reopened, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e = reopened
+	if _, err := e.AuthenticateAccessKey(ctx, tokens[0]); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("restart reactivated revoked key: %v", err)
+	}
+	for i := 1; i < len(tokens); i++ {
+		if got, err := e.AuthenticateAccessKey(ctx, tokens[i]); err != nil || got != keys[i] {
+			t.Fatalf("restart lost key: %+v %v", got, err)
+		}
+	}
+	var listed []AccessKey
+	for cursor := ""; ; {
+		page, err := e.ListAccessKeys(ctx, cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listed = append(listed, page.Keys...)
+		if page.NextAfterID == "" {
+			break
+		}
+		if page.NextAfterID <= cursor {
+			t.Fatal("remote cursor failed to advance")
+		}
+		cursor = page.NextAfterID
+	}
+	for _, id := range ids {
+		found := 0
+		for _, key := range listed {
+			if key.ID == id {
+				found++
+			}
+		}
+		if found != 1 {
+			t.Fatalf("pagination found test key %s %d times", id, found)
+		}
+	}
+	// Measure actual network lookup cost without claiming it equals static auth.
+	latencies := make([]time.Duration, 20)
+	var total time.Duration
+	for i := range latencies {
+		started := time.Now()
+		if _, err := e.AuthenticateAccessKey(ctx, tokens[1]); err != nil {
+			t.Fatal(err)
+		}
+		latencies[i] = time.Since(started)
+		total += latencies[i]
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	t.Logf("Turso indexed access key lookup: n=%d mean=%s p50=%s p95=%s throughput=%.2f/s", len(latencies), total/time.Duration(len(latencies)), latencies[9], latencies[18], float64(len(latencies))/total.Seconds())
+	now.Add(60_000)
+	if _, err := e.AuthenticateAccessKey(ctx, tokens[1]); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("remote key accepted at its exact expiry: %v", err)
+	}
 }
 
 // TestTursoExtended exercises the correctness paths the basic smoke test does not

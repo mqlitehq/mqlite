@@ -31,12 +31,13 @@ MQLite engine opens the live source.
 
 | Check | Passing evidence |
 | --- | --- |
-| Fixture completeness | Independent send manifest matches every message column, full binary body and identity; all nine current tables are nonempty |
+| Fixture completeness | Independent send manifest matches every message column, full binary body and identity; all ten fixture tables (eight broker tables, SQLite sequence, business outbox) are nonempty |
 | Live backup | Source process remains open at a quiescent barrier; committed business data exists in WAL and is absent from an isolated main-file-only negative control; read-only `VACUUM INTO` preserves the complete logical snapshot |
 | Cold backup | Worker closes successfully; entire source directory is copied and every file hash matches |
 | Restore before opening | Fresh directory; `integrity_check=ok`, no foreign-key errors; every schema object, table, column, typed value and row matches the source, including business data and auxiliary tables |
 | Startup recovery | Only orphan locks change: below-limit rows become active; final-attempt rows become DLQ with `MaxDeliveryCountExceeded`; both clear token/deadline and retain all other fields |
 | Restored operations | Full identity/body/metadata checks through fresh Receive, deferred Pick, scheduled activation, DLQ redrive, dedup replay/conflict, receipt replay, attempt replay and stale-token fencing; subscription filter includes and excludes the intended messages |
+| Restored credentials | Active key retains exact metadata and authenticates; expired/revoked keys are rejected; all three digest-only records stay unchanged |
 | Convergence | Every queue's Stats and all-state Peek are empty; the entire messages table is empty; committed business data remains exact; backup copies remain unchanged |
 | Schema refusal | Actual v0.2.0 creates schema 2 with a different physical schema; current binary refuses it and old binary refuses the current schema, with complete logical snapshots unchanged in both directions |
 | Rollback | Old snapshot restored into another fresh directory; old binary returns the exact expected identity/body and completes the message |
@@ -46,7 +47,10 @@ rows, standard/group FIFO/strict FIFO configurations, two subscriptions includin
 real filter, and committed/rolled-back `Embedded.Tx` business operations.
 Completion deletes a message; its receipt and retired highest sequence number
 exercise `settlement_receipts` and `sqlite_sequence` without inventing a completed
-row. The full snapshot also covers `dedup`, `receive_attempts` and `meta`.
+row. The full snapshot also covers `dedup`, `receive_attempts`, `meta` and
+`access_keys`. Three test keys cover active, expired and revoked credentials; the
+private fixture manifest retains their test secrets, while full database snapshots
+must contain only independently computed SHA-256 digests and exact metadata.
 
 The clock is fixed and background workers are disabled while taking snapshots.
 After reopening, the worker advances the clock by 60 seconds and runs maintenance
@@ -87,3 +91,25 @@ fixture allowlist deliberately fails when schema tables change, requiring a revi
 of the new surface rather than silently skipping it.
 
 See [operations](../../../docs/operations.md) for the operator procedure.
+
+## Compatible v0.3.0 upgrade and rollback
+
+The independent access-key table keeps schema token 5. Verify this with the real
+v0.3.0 binary and its clean source checkout (used only to build the full old
+message-state fixture):
+
+```sh
+python3 test/production/restore/compat.py \
+  --old-binary /absolute/path/to/released-v0.3.0/mqlite \
+  --old-source /absolute/path/to/clean-v0.3.0-source \
+  --new-binary /absolute/path/to/candidate/mqlite \
+  --output /absolute/path/to/evidence/new-compat-run
+```
+
+The script compares five complete logical snapshots through upgrade, old-binary
+rollback and a second upgrade. All nine prior fixture tables and their schema
+objects must remain exact except for predicted orphan recovery and a verified
+message written by the old broker. Active/expired/revoked key state must survive;
+the old broker must reject managed credentials while configured administrators
+continue to work. The re-upgraded broker must authenticate and revoke the retained
+active key. Evidence contains binary hashes and no access-token plaintext.

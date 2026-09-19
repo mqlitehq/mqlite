@@ -18,7 +18,7 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
-// Server adapts an Engine to HTTP with static Bearer-token auth.
+// Server adapts an Engine to HTTP with static administrators and managed access keys.
 type Server struct {
 	eng     *engine.Engine
 	tokens  map[string]bool // empty -> auth disabled (dev/LAN only)
@@ -61,32 +61,35 @@ func New(eng *engine.Engine, tokens []string) *Server {
 func (s *Server) Handler() http.Handler { return s.cors(s.logging(s.auth(s.observe(s.mux)))) }
 
 func (s *Server) routes() {
-	h := func(path string, fn http.HandlerFunc) {
-		s.mux.HandleFunc(path, s.postOnly(fn))
+	h := func(path string, permission engine.KeyPermissions, fn http.HandlerFunc) {
+		s.mux.HandleFunc(path, s.authorize(permission, s.postOnly(fn)))
 		s.rpcPaths = append(s.rpcPaths, path) // feeds the "/" discovery catalog
 	}
-	h(wire.PathSend, s.handleSend)
-	h(wire.PathReceive, s.handleReceive)
-	h(wire.PathComplete, s.handleComplete)
-	h(wire.PathCompleteBatch, s.handleCompleteBatch)
-	h(wire.PathRenewBatch, s.handleRenewBatch)
-	h(wire.PathAbandon, s.handleAbandon)
-	h(wire.PathReject, s.handleReject)
-	h(wire.PathDefer, s.handleDefer)
-	h(wire.PathReceiveDeferred, s.handleReceiveDeferred)
-	h(wire.PathRenew, s.handleRenew)
-	h(wire.PathSchedule, s.handleSchedule)
-	h(wire.PathCancel, s.handleCancel)
-	h(wire.PathPeek, s.handlePeek)
-	h(wire.PathStats, s.handleStats)
-	h(wire.PathCreateQueue, s.handleCreateQueue)
-	h(wire.PathSubscribe, s.handleSubscribe)
-	h(wire.PathListQueues, s.handleListQueues)
-	h(wire.PathListSubscriptions, s.handleListSubscriptions)
-	h(wire.PathTestFilter, s.handleTestFilter)
-	h(wire.PathRedrive, s.handleRedrive)
-	h(wire.PathPurge, s.handlePurge)
-	h(wire.PathStatus, s.handleStatus)
+	h(wire.PathSend, engine.KeySend, s.handleSend)
+	h(wire.PathReceive, engine.KeyListen, s.handleReceive)
+	h(wire.PathComplete, engine.KeyListen, s.handleComplete)
+	h(wire.PathCompleteBatch, engine.KeyListen, s.handleCompleteBatch)
+	h(wire.PathRenewBatch, engine.KeyListen, s.handleRenewBatch)
+	h(wire.PathAbandon, engine.KeyListen, s.handleAbandon)
+	h(wire.PathReject, engine.KeyListen, s.handleReject)
+	h(wire.PathDefer, engine.KeyListen, s.handleDefer)
+	h(wire.PathReceiveDeferred, engine.KeyListen, s.handleReceiveDeferred)
+	h(wire.PathRenew, engine.KeyListen, s.handleRenew)
+	h(wire.PathSchedule, engine.KeySend, s.handleSchedule)
+	h(wire.PathCancel, engine.KeySend, s.handleCancel)
+	h(wire.PathPeek, engine.KeyListen, s.handlePeek)
+	h(wire.PathStats, engine.KeyListen, s.handleStats)
+	h(wire.PathCreateQueue, engine.KeyManage, s.handleCreateQueue)
+	h(wire.PathSubscribe, engine.KeyManage, s.handleSubscribe)
+	h(wire.PathListQueues, engine.KeyManage, s.handleListQueues)
+	h(wire.PathListSubscriptions, engine.KeyManage, s.handleListSubscriptions)
+	h(wire.PathTestFilter, engine.KeyManage, s.handleTestFilter)
+	h(wire.PathRedrive, engine.KeyManage, s.handleRedrive)
+	h(wire.PathPurge, engine.KeyManage, s.handlePurge)
+	h(wire.PathStatus, engine.KeyManage, s.handleStatus)
+	h(wire.PathCreateKey, engine.KeyManage, s.authEnabled(s.handleCreateKey))
+	h(wire.PathListKeys, engine.KeyManage, s.authEnabled(s.handleListKeys))
+	h(wire.PathRevokeKey, engine.KeyManage, s.authEnabled(s.handleRevokeKey))
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -96,7 +99,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.handleIndex)
 	// Prometheus metrics: per-queue gauges. Behind auth like the RPCs (a scraper
 	// passes the Bearer token); only /healthz stays open for liveness.
-	s.mux.HandleFunc("/metrics", s.handleMetrics)
+	s.mux.HandleFunc("/metrics", s.authorize(engine.KeyManage, s.handleMetrics))
 	// Embedded admin console (the built mqlite-web SPA) at /ui, when Server.UI is on
 	// (MQLITE_UI). The static page is open; its API calls carry the Bearer token.
 	s.mux.Handle("/ui/", s.console())
@@ -214,32 +217,80 @@ func (s *Server) postOnly(fn http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// auth enforces Bearer tokens (skips /healthz and when no tokens configured).
+// permissionContextKey is private so callers cannot inject HTTP permissions.
+type permissionContextKey struct{}
+
+// auth authenticates once before dispatch. Revocation applies to the next request;
+// an already-authorized operation, including a long poll, may finish normally.
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// /ui is matched exactly ("/ui" or "/ui/..."), not by loose prefix — a
-		// loose HasPrefix would also auth-exempt /uixyz (review F11).
+		// Exact console paths only: /uixyz must not bypass authentication.
 		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" ||
 			r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
 			next.ServeHTTP(w, r)
 			return
 		}
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		// Constant-time comparison against every configured token (review F10):
-		// a plain map lookup / == leaks how many leading bytes matched. No early
-		// break, so timing is independent of which token (if any) matches.
-		authed := false
-		for t := range s.tokens {
-			if len(t) == len(tok) && subtle.ConstantTimeCompare([]byte(t), []byte(tok)) == 1 {
-				authed = true
-			}
-		}
-		if tok == "" || !authed {
-			writeErr(w, http.StatusUnauthorized, "unauthenticated", "missing or invalid Bearer token")
+		values := r.Header.Values("Authorization")
+		if len(values) != 1 {
+			s.fail(w, engine.ErrUnauthenticated)
 			return
 		}
-		next.ServeHTTP(w, r)
+		scheme, tok, ok := strings.Cut(values[0], " ")
+		// RFC Bearer syntax permits multiple spaces after the scheme, but never
+		// multiple credentials or whitespace inside/after the opaque token.
+		tok = strings.TrimLeft(tok, " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || tok == "" || strings.ContainsAny(tok, " \t\r\n,") {
+			s.fail(w, engine.ErrUnauthenticated)
+			return
+		}
+		// Preserve static administrator precedence, even if the same token is also
+		// stored as an expired, revoked, or restricted database key. Compare every
+		// configured token without an early exit.
+		static := false
+		for t := range s.tokens {
+			if len(t) == len(tok) && subtle.ConstantTimeCompare([]byte(t), []byte(tok)) == 1 {
+				static = true
+			}
+		}
+		permission := engine.KeyManage
+		if !static {
+			key, err := s.eng.AuthenticateAccessKey(r.Context(), tok)
+			if err != nil {
+				s.fail(w, err)
+				return
+			}
+			permission = key.Permissions
+		}
+		ctx := context.WithValue(r.Context(), permissionContextKey{}, permission)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// authorize binds a route and its required permission at registration, before
+// decoding or invoking its handler. There is no separate policy catalog to drift.
+func (s *Server) authorize(required engine.KeyPermissions, fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(s.tokens) > 0 {
+			permission, ok := r.Context().Value(permissionContextKey{}).(engine.KeyPermissions)
+			if !ok || !permission.Allows(required) {
+				s.fail(w, engine.ErrPermissionDenied)
+				return
+			}
+		}
+		fn(w, r)
+	}
+}
+
+// Anonymous development mode never exposes credential issuance or metadata.
+func (s *Server) authEnabled(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(s.tokens) == 0 {
+			writeErr(w, http.StatusForbidden, "permission_denied", "key management requires authentication to be enabled")
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		fn(w, r)
+	}
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -287,6 +338,12 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 // mapErr translates engine errors to a Connect-style (status, code) error.
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, engine.ErrUnauthenticated):
+		writeErr(w, http.StatusUnauthorized, "unauthenticated", "missing or invalid Bearer token")
+	case errors.Is(err, engine.ErrPermissionDenied):
+		writeErr(w, http.StatusForbidden, "permission_denied", "access key lacks the required permission")
+	case errors.Is(err, engine.ErrKeyConflict):
+		writeErr(w, http.StatusConflict, "key_conflict", err.Error())
 	case errors.Is(err, engine.ErrQueueNotFound), errors.Is(err, engine.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, engine.ErrDedupConflict):
@@ -767,4 +824,58 @@ func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
 	}
 	logf(w, "n", purged)
 	writeJSON(w, wire.PurgeResponse{Purged: purged})
+}
+
+// ── AuthService handlers ────────────────────────────────────────────────────
+
+func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
+	var req wire.CreateKeyRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	permissions, err := engine.ParseKeyPermissions(req.Permissions)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	key, token, err := s.eng.CreateAccessKey(r.Context(), engine.CreateAccessKeyOptions{
+		ID: req.ID, Name: req.Name, Permissions: permissions, ExpiresAtMs: req.ExpiresAtMs,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, wire.CreateKeyResponse{Key: wire.FromAccessKey(key), Token: token})
+}
+
+func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
+	var req wire.ListKeysRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	page, err := s.eng.ListAccessKeys(r.Context(), req.AfterID, req.Limit)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	resp := wire.ListKeysResponse{Keys: make([]wire.AccessKey, len(page.Keys)), NextAfterID: page.NextAfterID}
+	for i, key := range page.Keys {
+		resp.Keys[i] = wire.FromAccessKey(key)
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
+	var req wire.RevokeKeyRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	if err := s.eng.RevokeAccessKey(r.Context(), req.ID); err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, wire.RevokeKeyResponse{Ok: true})
 }

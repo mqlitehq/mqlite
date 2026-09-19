@@ -1317,3 +1317,325 @@ func TestSDKReceiveDeleteLeaseShape(t *testing.T) {
 		}
 	}
 }
+
+// ─── Managed access keys ────────────────────────────────────────────────────
+
+func TestManagedKeySDKParity(t *testing.T) {
+	type keyAdmin interface {
+		CreateKey(context.Context, mqlite.CreateKeyOptions) (mqlite.CreateKeyResult, error)
+		ListKeys(context.Context, string, int) (mqlite.KeyPage, error)
+		RevokeKey(context.Context, string) error
+	}
+	ctx := context.Background()
+	for _, mode := range []string{"embedded", "http"} {
+		t.Run(mode, func(t *testing.T) {
+			client, embedded := newBroker(t, "administrator")
+			var admin keyAdmin = embedded
+			if mode == "http" {
+				admin = client
+			}
+			page, err := admin.ListKeys(ctx, "", 0)
+			if err != nil || page.Keys == nil || len(page.Keys) != 0 || page.NextAfterID != "" {
+				t.Fatalf("empty page = %+v, %v", page, err)
+			}
+			ids := []string{strings.Repeat("1", 32), strings.Repeat("2", 32)}
+			for i, id := range ids {
+				opts := mqlite.CreateKeyOptions{ID: id, Name: fmt.Sprintf("worker-%d", i), Permissions: []string{"listen", "send"}, ExpiresAtMs: time.Now().Add(time.Hour).UnixMilli()}
+				result, err := admin.CreateKey(ctx, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Key.ID != id || result.Key.Name != opts.Name || result.Key.CreatedAtMs <= 0 || result.Key.ExpiresAtMs != opts.ExpiresAtMs || result.Key.RevokedAtMs != 0 || !reflect.DeepEqual(result.Key.Permissions, []string{"send", "listen"}) || !regexp.MustCompile(`^mqk_[0-9a-f]{64}$`).MatchString(result.Token) {
+					t.Fatal("created key metadata or token format differs from contract")
+				}
+				duplicate, err := admin.CreateKey(ctx, opts)
+				if !errors.Is(err, mqlite.ErrKeyConflict) || !reflect.DeepEqual(duplicate, mqlite.CreateKeyResult{}) {
+					t.Fatalf("repeated ID must conflict and reveal no secret: %v", err)
+				}
+			}
+			for i, after := range []string{"", ids[0]} {
+				page, err = admin.ListKeys(ctx, after, 1)
+				if err != nil || len(page.Keys) != 1 || page.Keys[0].ID != ids[i] {
+					t.Fatalf("page %d = %+v, %v", i, page, err)
+				}
+				wantNext := ""
+				if i == 0 {
+					wantNext = ids[0]
+				}
+				if page.NextAfterID != wantNext {
+					t.Fatalf("page %d next = %q, want %q", i, page.NextAfterID, wantNext)
+				}
+			}
+			for i := 0; i < 2; i++ {
+				if err := admin.RevokeKey(ctx, ids[0]); err != nil {
+					t.Fatalf("revoke %d: %v", i, err)
+				}
+			}
+			page, err = admin.ListKeys(ctx, "", 100)
+			if err != nil || len(page.Keys) != 2 || page.Keys[0].RevokedAtMs <= 0 {
+				t.Fatalf("revoked metadata must remain visible: %+v, %v", page, err)
+			}
+			if err := admin.RevokeKey(ctx, strings.Repeat("f", 32)); !errors.Is(err, mqlite.ErrNotFound) {
+				t.Fatalf("missing revoke = %v", err)
+			}
+			for _, bad := range []mqlite.CreateKeyOptions{
+				{Name: "missing-id", Permissions: []string{"send"}},
+				{ID: "BAD", Name: "invalid-id", Permissions: []string{"send"}},
+				{ID: mqlite.GenerateKeyID(), Name: "bad-permission", Permissions: []string{"read"}},
+				{ID: mqlite.GenerateKeyID(), Permissions: []string{"manage"}},
+				{ID: mqlite.GenerateKeyID(), Name: "past", Permissions: []string{"manage"}, ExpiresAtMs: 1},
+			} {
+				if _, err := admin.CreateKey(ctx, bad); !errors.Is(err, mqlite.ErrInvalidArgument) {
+					t.Fatalf("invalid create %+v: %v", bad, err)
+				}
+			}
+			for _, invalid := range []struct {
+				after string
+				limit int
+			}{{"bad", 1}, {"", -1}, {"", 1001}} {
+				if _, err := admin.ListKeys(ctx, invalid.after, invalid.limit); !errors.Is(err, mqlite.ErrInvalidArgument) {
+					t.Fatalf("invalid list: %v", err)
+				}
+			}
+			if err := admin.RevokeKey(ctx, "bad"); !errors.Is(err, mqlite.ErrInvalidArgument) {
+				t.Fatalf("invalid revoke: %v", err)
+			}
+		})
+	}
+}
+
+func TestManagedKeySDKAuthorization(t *testing.T) {
+	ctx := context.Background()
+	emb, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emb.Close()
+	ts := httptest.NewServer(server.New(emb.Engine(), []string{"bootstrap"}).Handler())
+	defer ts.Close()
+	open := func(token string) *mqlite.Client {
+		c, err := mqlite.Open(ctx, ts.URL, mqlite.WithToken(token))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	admin := open("bootstrap")
+	manager, err := admin.CreateKey(ctx, mqlite.CreateKeyOptions{ID: mqlite.GenerateKeyID(), Name: "manager", Permissions: []string{"send", "listen", "manage"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(manager.Key.Permissions, []string{"manage"}) {
+		t.Fatal("manage must canonicalize all rights")
+	}
+	managerClient := open(manager.Token)
+	sender, err := managerClient.CreateKey(ctx, mqlite.CreateKeyOptions{ID: mqlite.GenerateKeyID(), Name: "sender", Permissions: []string{"send"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	senderClient := open(sender.Token)
+	if _, err := senderClient.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("hello")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := senderClient.Receive(ctx, "q"); !errors.Is(err, mqlite.ErrPermissionDenied) {
+		t.Fatalf("sender receive = %v", err)
+	}
+	if _, err := senderClient.CreateKey(ctx, mqlite.CreateKeyOptions{ID: mqlite.GenerateKeyID(), Name: "escalation", Permissions: []string{"manage"}}); !errors.Is(err, mqlite.ErrPermissionDenied) {
+		t.Fatalf("sender create = %v", err)
+	}
+	if _, err := senderClient.ListKeys(ctx, "", 1); !errors.Is(err, mqlite.ErrPermissionDenied) {
+		t.Fatalf("sender list = %v", err)
+	}
+	if err := senderClient.RevokeKey(ctx, manager.Key.ID); !errors.Is(err, mqlite.ErrPermissionDenied) {
+		t.Fatalf("sender revoke = %v", err)
+	}
+	if err := managerClient.RevokeKey(ctx, sender.Key.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := senderClient.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("revoked")}); !errors.Is(err, mqlite.ErrUnauthenticated) {
+		t.Fatalf("revoked sender = %v", err)
+	}
+	if err := managerClient.RevokeKey(ctx, manager.Key.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := managerClient.ListKeys(ctx, "", 1); !errors.Is(err, mqlite.ErrUnauthenticated) {
+		t.Fatalf("self-revoked manager = %v", err)
+	}
+	if _, err := admin.ListKeys(ctx, "", 0); err != nil {
+		t.Fatalf("bootstrap survives managed revocation: %v", err)
+	}
+}
+
+func TestManagedKeyCreateLostResponseIsNotRetried(t *testing.T) {
+	ctx := context.Background()
+	emb, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emb.Close()
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var opts mqlite.CreateKeyOptions
+		if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := emb.CreateKey(r.Context(), opts); err != nil {
+			t.Error(err)
+			return
+		}
+		// The DB commit succeeded, but a truncated reply cannot disclose the secret.
+		_, _ = w.Write([]byte(`{"key":`))
+	}))
+	defer ts.Close()
+	c, err := mqlite.Open(ctx, ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateKey(ctx, mqlite.CreateKeyOptions{}); !errors.Is(err, mqlite.ErrInvalidArgument) || calls.Load() != 0 {
+		t.Fatal("invalid ID must fail before issuing a request")
+	}
+	id := mqlite.GenerateKeyID()
+	result, err := c.CreateKey(ctx, mqlite.CreateKeyOptions{ID: id, Name: "uncertain", Permissions: []string{"manage"}})
+	if err == nil || !reflect.DeepEqual(result, mqlite.CreateKeyResult{}) || calls.Load() != 1 {
+		t.Fatal("uncertain create must return no secret and never retry")
+	}
+	page, err := emb.ListKeys(ctx, "", 0)
+	if err != nil || len(page.Keys) != 1 || page.Keys[0].ID != id {
+		t.Fatalf("retained ID must identify committed key: %+v, %v", page, err)
+	}
+	if err := emb.RevokeKey(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTPAuthorizationErrorMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		want       error
+	}{
+		{"bare unauthorized", "Unauthorized", http.StatusUnauthorized, mqlite.ErrUnauthenticated},
+		{"bare forbidden", "Forbidden", http.StatusForbidden, mqlite.ErrPermissionDenied},
+		{"proxy forbidden code", `{"code":"forbidden","message":"policy denied"}`, http.StatusForbidden, mqlite.ErrPermissionDenied},
+		{"structured forbidden", `{"code":"permission_denied","message":"permission required"}`, http.StatusForbidden, mqlite.ErrPermissionDenied},
+		{"conflict", `{"code":"key_conflict","message":"key ID already exists"}`, http.StatusConflict, mqlite.ErrKeyConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			c, err := mqlite.Open(context.Background(), ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.ListKeys(context.Background(), "", 1); !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestManagedKeySDKRejectsInvalidSuccess(t *testing.T) {
+	ctx := context.Background()
+	id := strings.Repeat("a", 32)
+	token := "mqk_" + strings.Repeat("b", 64)
+	key := wire.AccessKey{ID: id, Name: "worker", Permissions: []string{"manage"}, CreatedAtMs: 100}
+	metadata, err := json.Marshal(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodCreate := `{"key":` + string(metadata) + `,"token":"` + token + `"}`
+	goodList := `{"keys":[` + string(metadata) + `]}`
+	for _, tc := range []struct {
+		name, operation, body string
+		truncated             bool
+	}{
+		{"create null", "create", "null", false},
+		{"create empty", "create", "{}", false},
+		{"create missing metadata", "create", `{"key":{"id":"` + id + `"},"token":"` + token + `"}`, false},
+		{"create wrong id", "create", strings.Replace(goodCreate, id, strings.Repeat("c", 32), 1), false},
+		{"create wrong secret", "create", strings.Replace(goodCreate, token, "partial-secret", 1), false},
+		{"create wrong rights", "create", strings.Replace(goodCreate, `"manage"`, `"send"`, 1), false},
+		{"create wrong name", "create", strings.Replace(goodCreate, `"worker"`, `"other"`, 1), false},
+		{"create wrong expiry", "create", strings.Replace(goodCreate, `"expires_at_ms":0`, `"expires_at_ms":200`, 1), false},
+		{"create trailing JSON", "create", goodCreate + `{}`, false},
+		{"create oversized", "create", strings.Repeat(" ", wire.MaxKeyResponseBytes) + goodCreate, false},
+		{"create truncated read", "create", goodCreate, true},
+		{"list null", "list", "null", false},
+		{"list empty object", "list", "{}", false},
+		{"list null keys", "list", `{"keys":null}`, false},
+		{"list missing metadata", "list", `{"keys":[{"id":"` + id + `"}]}`, false},
+		{"list backward cursor", "list", `{"keys":[` + string(metadata) + `],"next_after_id":"` + strings.Repeat("0", 32) + `"}`, false},
+		{"list repeated id", "list", `{"keys":[` + string(metadata) + `,` + string(metadata) + `]}`, false},
+		{"list trailing JSON", "list", goodList + `{}`, false},
+		{"list oversized", "list", strings.Repeat(" ", wire.MaxKeyResponseBytes) + goodList, false},
+		{"list truncated read", "list", goodList, true},
+		{"revoke null", "revoke", "null", false},
+		{"revoke empty", "revoke", "{}", false},
+		{"revoke false", "revoke", `{"ok":false}`, false},
+		{"revoke trailing JSON", "revoke", `{"ok":true}{}`, false},
+		{"revoke oversized", "revoke", strings.Repeat(" ", wire.MaxKeyResponseBytes) + `{"ok":true}`, false},
+		{"revoke truncated read", "revoke", `{"ok":true}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				if tc.truncated {
+					w.Header().Set("Content-Length", fmt.Sprint(len(tc.body)+50))
+				}
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			c, err := mqlite.Open(ctx, ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch tc.operation {
+			case "create":
+				var result mqlite.CreateKeyResult
+				result, err = c.CreateKey(ctx, mqlite.CreateKeyOptions{ID: id, Name: "worker", Permissions: []string{"manage"}})
+				if !reflect.DeepEqual(result, mqlite.CreateKeyResult{}) || err == nil || !strings.Contains(err.Error(), id) {
+					t.Fatal("invalid create returned credentials or lost the request ID")
+				}
+			case "list":
+				var result mqlite.KeyPage
+				result, err = c.ListKeys(ctx, "", 2)
+				if !reflect.DeepEqual(result, mqlite.KeyPage{}) {
+					t.Fatal("invalid list returned partial metadata")
+				}
+			case "revoke":
+				err = c.RevokeKey(ctx, id)
+			}
+			if err == nil || calls.Load() != 1 || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "partial-secret") {
+				t.Fatalf("malformed response accepted, retried, or exposed response contents; requests=%d", calls.Load())
+			}
+			if tc.operation != "list" && !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+				t.Fatalf("malformed write response must preserve uncertainty: %v", err)
+			}
+		})
+	}
+	// Error responses from proxies must not reintroduce a secret via message/code.
+	for _, body := range []string{`{"code":"internal","message":"` + token + `"}`, `{"code":"` + token + `","message":"partial-secret"}`} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(body))
+		}))
+		c, err := mqlite.Open(ctx, ts.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.CreateKey(ctx, mqlite.CreateKeyOptions{ID: id, Name: "worker", Permissions: []string{"manage"}})
+		ts.Close()
+		if err == nil || !strings.Contains(err.Error(), id) || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "partial-secret") {
+			t.Fatal("create error omitted its request ID or exposed untrusted error text")
+		}
+	}
+}

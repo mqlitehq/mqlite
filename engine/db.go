@@ -217,6 +217,11 @@ func (d *db) initSchema(ctx context.Context) error {
 			"recreate it (delete the file / drop the tables) — mqlite keeps a single schema and does not migrate",
 			ErrSchemaVersionMismatch, v, schemaVersion)
 	}
+	// This name could already belong to an embedded application's business table.
+	// Check before running any DDL: CREATE IF NOT EXISTS must not silently adopt it.
+	if err := d.validateAccessKeySchema(ctx); err != nil {
+		return err
+	}
 	for _, stmt := range schemaStmts {
 		if _, err := d.exec(ctx, stmt); err != nil {
 			return fmt.Errorf("schema: %w\n%s", err, firstLine(stmt))
@@ -225,6 +230,27 @@ func (d *db) initSchema(ctx context.Context) error {
 	if _, err := d.exec(ctx,
 		`INSERT OR IGNORE INTO meta(key,value) VALUES ('schema_version', ?)`, schemaVersion); err != nil {
 		return fmt.Errorf("schema version: %w", err)
+	}
+	return nil
+}
+
+func (d *db) validateAccessKeySchema(ctx context.Context) error {
+	var kind, ddl string
+	err := d.queryRowScan(ctx, []any{&kind, &ddl}, `SELECT type, sql FROM sqlite_master WHERE name = 'access_keys' COLLATE NOCASE`)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check access key schema: %w", err)
+	}
+	// SQLite drops IF NOT EXISTS when recording the statement. Compare the entire
+	// canonical definition (including STRICT, checks and unique constraints), not
+	// just column names: accepting weakened constraints would weaken authentication.
+	normalize := func(s string) string {
+		return strings.Join(strings.Fields(strings.Replace(s, " IF NOT EXISTS", "", 1)), " ")
+	}
+	if kind != "table" || normalize(ddl) != normalize(accessKeySchema) {
+		return fmt.Errorf("%w: existing access_keys object does not match the access key schema; move the conflicting application object before opening this database", ErrSchemaVersionMismatch)
 	}
 	return nil
 }

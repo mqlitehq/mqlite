@@ -45,6 +45,8 @@ type fakeSource struct {
 	batch             []*Message
 	recvErr           error // if set, receiveOne always returns this (permanent-error test)
 	recvErrAfterBatch error // if set, the receive AFTER the batch returns this instead of quiescing
+	abandonErr        error
+	renewErr          error
 	completeErr       error // if set, complete returns this (settle-error test)
 	unlimited         bool  // if set, every receiveOne returns a fresh single-message batch
 }
@@ -77,7 +79,7 @@ func (f *fakeSource) complete(ctx context.Context, queue string, seq int64, toke
 	return f.completeErr
 }
 func (f *fakeSource) abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
-	return nil
+	return f.abandonErr
 }
 func (f *fakeSource) reject(ctx context.Context, queue string, seq int64, token, reason, desc string) error {
 	return nil
@@ -86,7 +88,7 @@ func (f *fakeSource) deferMsg(ctx context.Context, queue string, seq int64, toke
 	return nil
 }
 func (f *fakeSource) renew(ctx context.Context, queue string, seq int64, token string) error {
-	return nil
+	return f.renewErr
 }
 
 // MQLITE-8: a transient receive error must be retried ONCE with the SAME attempt
@@ -387,5 +389,53 @@ func TestErrorHandlerCancelDoesNotRewriteOrdering(t *testing.T) {
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("ErrClosed was observed while the context was live; a cancellation issued BY the "+
 			"error handler must not rewrite that ordering. got %v", err)
+	}
+}
+
+// Permission revocation must terminate every receiver path, including the renew
+// goroutine and both handler outcomes, without a transient receive retry.
+func TestReceiverPermissionDeniedStopsEveryPath(t *testing.T) {
+	for _, operation := range []string{"receive", "complete", "abandon", "renew"} {
+		t.Run(operation, func(t *testing.T) {
+			denied := fmt.Errorf("permission revoked: %w", ErrPermissionDenied)
+			f := &fakeSource{}
+			f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f, LockedUntil: time.Now().Add(time.Second)}}
+			switch operation {
+			case "receive":
+				f.recvErr = denied
+			case "complete":
+				f.completeErr = denied
+			case "abandon":
+				f.abandonErr = denied
+			case "renew":
+				f.renewErr = denied
+			}
+			var observed bool
+			r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+				if errors.Is(err, ErrPermissionDenied) {
+					observed = true
+				}
+			})})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := r.Run(ctx, func(ctx context.Context, _ *Message) error {
+				if operation == "renew" {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				if operation == "abandon" {
+					return errors.New("handler failed")
+				}
+				return nil
+			})
+			if !errors.Is(err, ErrPermissionDenied) || !observed {
+				t.Fatalf("Run = %v, observed = %v", err, observed)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.calls != 1 {
+				t.Fatalf("permission failure must not trigger a receive retry; calls=%d", f.calls)
+			}
+		})
 	}
 }

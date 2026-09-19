@@ -28,9 +28,9 @@ code and becomes **database invariants**.
 
 The rest of this document is those invariants, in the order they earn their keep.
 
-## 2 · The schema: seven tables, one of which matters most
+## 2 · The schema: eight tables, one of which matters most
 
-Everything lives in seven `STRICT` tables (`engine/schema.go`). Six carry the
+Everything lives in eight `STRICT` tables (`engine/schema.go`). Seven carry the
 machinery; one carries your data:
 
 | Table | Job |
@@ -42,6 +42,7 @@ machinery; one carries your data:
 | `settlement_receipts` | makes acknowledgements idempotent (§7) |
 | `receive_attempts` | makes receives idempotent (§7) |
 | `meta` | one row: the schema guard token (§9) |
+| `access_keys` | SHA-256 token digests, permission sets, expiry and revocation metadata (v0.3.1) |
 
 The heart, abridged:
 
@@ -313,10 +314,11 @@ Every claim in this document is enforced by something that fails loudly:
   them with the race detector on three OSes.
 - **Plan-pinning tests** — `EXPLAIN QUERY PLAN` output is asserted, so the
   performance shape is a regression-tested contract, not a hope (§5).
-- **A schema golden test** — the DDL's hash is pinned to the schema guard token
-  in `meta`. mqlite keeps a *single canonical schema* and refuses to open a file
-  from a different one (`ErrSchemaVersionMismatch`); pre-1.0 there are no silent
-  migrations, and the golden test makes forgetting the token bump impossible.
+- **A schema golden test** — the complete canonical DDL is pinned. A database
+  with a different guard token is refused (`ErrSchemaVersionMismatch`); existing
+  table layouts are never migrated. Incompatible changes require a token change.
+  The independent `access_keys` addition preserves token 5, with a separate golden
+  for its DDL, the unchanged prior DDL and actual old-binary compatibility checks.
 - **An integrity sweep** — a randomized send/receive/crash workload asserting
   every message arrives (no loss), arrives intact (content hash), and never
   exceeds its delivery bound.

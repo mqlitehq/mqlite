@@ -178,12 +178,36 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **9.1** When `MQLITE_TOKENS` is set, every endpoint MUST require a valid
   `Authorization: Bearer` token **except** the open `/` (discovery), `/healthz`, and
   the static admin console under `/ui` (when enabled — its own API calls still carry a
-  token); a missing/invalid token → 401 `unauthenticated`.
+  token); a missing/invalid/expired/revoked token → 401 `unauthenticated`.
   *(server/errors_test.go, server/index_test.go, server/console_test.go)*
 - **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status:
-  400 `invalid_argument`/`group_required` · 401 `unauthenticated` · 404 `not_found` ·
-  409 `already_exists`/`lock_lost`/`name_conflict` · 413 `message_too_large` · 500
+  400 `invalid_argument`/`group_required` · 401 `unauthenticated` · 403
+  `permission_denied` · 404 `not_found` · 409
+  `already_exists`/`lock_lost`/`name_conflict`/`key_conflict` · 413 `message_too_large` · 500
   `internal`. *(server/errors_test.go; see [api-reference.md](api-reference.md))*
+- **9.3** Every registered RPC MUST bind a permission in the route registration.
+  Send/Schedule/Cancel require send; all other QueueService methods require listen;
+  AdminService, AuthService and `/metrics` require manage. Manage includes both
+  data permissions. Configured and managed administrators MUST have identical
+  operation rights, including issuing manage keys. Insufficient permission MUST
+  fail before the handler can read or change protected data.
+  *(server/errors_test.go: TestAccessKeyCompletePermissionMatrix)*
+- **9.4** Managed keys MUST survive restart and store only a SHA-256 digest of
+  their token. New tokens MUST be `mqk_` plus 64 lowercase hex characters from
+  a secure random source. Existing configured tokens remain accepted exactly.
+  Only the successful creation response returns a secret; list, errors and logs
+  MUST NOT return tokens or digests. A duplicate public ID MUST NOT mint a second
+  credential. Auth-off mode MUST refuse key management.
+  *(engine/storage_test.go: TestAccessKeyLifecycle, TestAccessKeyValidation;
+  server/errors_test.go: TestAccessKeyManagementLifecycleAndSecrecy,
+  TestAccessKeyErrorsDoNotEchoSecrets; token_test.go)*
+- **9.5** Successful revocation MUST reject subsequent authentication; already
+  authorized requests may finish. Static configuration takes precedence over a
+  matching database record. The SDK MUST treat permission denial as permanent in
+  receive, settlement and renewal paths, without unauthorized batch fallback.
+  *(server/errors_test.go: TestAccessKeyRevocationAndExpiryBoundaries;
+  sdk_test.go: TestManagedKeySDKAuthorization; receiver_internal_test.go;
+  cmd/mqlite/safety_test.go)*
 
 ## 10 · Storage & schema invariants
 
@@ -196,6 +220,13 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
   tests. The remote (Turso) path retries transient errors with backoff; the local
   path never retries. *(engine/storage_test.go, engine/turso_test.go)*
+- **10.4** A compatible access-key table addition MUST preserve schema token 5
+  and existing v0.3.0 data. Verify real upgrade/downgrade behavior and complete
+  backup/restore content, including active, expired and revoked credentials.
+  An incompatible existing object named `access_keys` MUST fail rather than be
+  overwritten or silently trusted.
+  *(engine/storage_test.go: TestAccessKeySchemaAdditiveCompatibility,
+  TestAccessKeySchemaConflict; test/production/restore/run.py, compat.py)*
 
 ## 11 · Subscription filters
 

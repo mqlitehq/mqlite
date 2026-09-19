@@ -243,15 +243,19 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
 - **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do
   not keep version history or migrations. `schemaVersion` is just an opaque guard
-  token. `initSchema` is CREATE-IF-NOT-EXISTS only, so it never alters an existing DB —
-  instead `Open` **refuses** a DB whose recorded token differs
+  token. `initSchema` is CREATE-IF-NOT-EXISTS only: it does not rewrite existing
+  table layouts, but can add a proven-compatible table under the same token.
+  Additions require the complete schema golden, actual prior-version upgrade /
+  downgrade checks, and backup/restore coverage. `Open` **refuses** a DB whose recorded token differs
   (`ErrSchemaVersionMismatch`). Change the token whenever the schema changes
   incompatibly; pre-1.0 there is no migration, a stale DB is recreated.
 - **DB DSN is read only from the environment**, never compiled in. Auth tokens are
   injected at `resolveDSN` time. `MQLITE_DB` (embedded/serve) vs
   `MQLITE_ENDPOINT`+`MQLITE_TOKEN` (client mode, wins if set); `MQLITE_ADDR` = broker
   listen address (`serve`; precedence `--addr` > `MQLITE_ADDR` > `:6754`); `MQLITE_TOKENS` =
-  broker's accepted Bearer tokens; `MQLITE_CORS` = `Access-Control-Allow-Origin` the
+  broker's configured administrator Bearer tokens; additional scoped-permission
+  keys are stored in the same DB and managed at runtime. These permissions apply
+  to the whole broker, not individual queues. `MQLITE_CORS` = `Access-Control-Allow-Origin` the
   broker sends (unset → `*` while auth is on since RPCs still need a token, but off while
   auth is off; `off` disables — lets a
   browser console on another origin reach the broker); `MQLITE_SYNC` = durability knob

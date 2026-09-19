@@ -1,5 +1,8 @@
 # Examples
 
+For authenticated producer/consumer credentials, Go SDK key management, console and
+MCP workflows, see [Access keys](access-keys.md) (v0.3.1 and later).
+
 Copy-runnable examples for the four ways to use mqlite: **embedded** in-process, the
 **transactional outbox** (the killer feature), a **remote** client with a hands-off
 consumer, and raw **curl**. Full API: [api-reference.md](api-reference.md).

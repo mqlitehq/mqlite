@@ -10,6 +10,7 @@ import argparse
 import base64
 import json
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -66,10 +67,10 @@ def smoke(args):
             with error:
                 return error.code, error.read()
 
-    def rpc(service, method, body):
+    def rpc(service, method, body, auth=token):
         path = f"/mqlite.v1.{service}Service/{method}"
-        status, raw = request(path, body, token)
-        check(status == 200, f"{method}: HTTP {status}: {raw!r}")
+        status, raw = request(path, body, auth)
+        check(status == 200, f"{method}: HTTP {status}")
         return json.loads(raw)
 
     def start(container):
@@ -149,8 +150,8 @@ def smoke(args):
             "body": base64.b64encode(b"release smoke\x00\xff\n" + label.encode()).decode(),
         }
 
-    def receive(count):
-        result = rpc("Queue", "Receive", {"queue": queue, "max_messages": max(count, 1)})
+    def receive(count, auth=token):
+        result = rpc("Queue", "Receive", {"queue": queue, "max_messages": max(count, 1)}, auth)
         messages = result.get("messages")
         check(isinstance(messages, list) and len(messages) == count,
               f"expected {count} received messages: {result!r}")
@@ -165,11 +166,11 @@ def smoke(args):
               and actual.get("locked_until_ms", 0) > actual["enqueued_at_ms"],
               f"invalid received message state: {actual!r}")
 
-    def complete(message):
+    def complete(message, auth=token):
         result = rpc("Queue", "Complete", {
             "queue": queue, "seq_number": message["seq_number"],
             "lock_token": message["lock_token"],
-        })
+        }, auth)
         check(result.get("ok") is True, f"complete failed: {result!r}")
 
     def drained():
@@ -201,14 +202,36 @@ def smoke(args):
             "name": queue, "config": {"lock_duration_ms": 300000},
         })
         check(created == {}, f"unexpected create queue result: {created!r}")
+        keys = {}
+        for permission in ("send", "listen", "manage"):
+            public_id = secrets.token_hex(16)
+            result = rpc("Auth", "CreateKey", {"id": public_id, "name": "image-" + permission,
+                                               "permissions": [permission]})
+            check(result.get("key", {}).get("id") == public_id and
+                  result["key"].get("permissions") == [permission] and
+                  re.fullmatch(r"mqk_[0-9a-f]{64}", result.get("token", "")),
+                  "invalid managed key creation response")
+            keys[permission] = result
+        sender, listener, manager = (keys[p]["token"] for p in ("send", "listen", "manage"))
+        for path, body, auth in (
+            ("/mqlite.v1.QueueService/Receive", {"queue": queue}, sender),
+            ("/mqlite.v1.QueueService/Send", {"queue": queue, "messages": [message("denied")]}, listener),
+            ("/mqlite.v1.AuthService/ListKeys", {}, listener),
+            ("/metrics", None, sender),
+        ):
+            status, raw = request(path, body, auth)
+            check(status == 403 and json.loads(raw).get("code") == "permission_denied",
+                  path + " did not enforce managed permissions")
         first = message("complete-before-restart")
-        sent = rpc("Queue", "Send", {"queue": queue, "messages": [first]})["seq_numbers"]
+        sent = rpc("Queue", "Send", {"queue": queue, "messages": [first]}, sender)["seq_numbers"]
         check(len(sent) == 1 and sent[0] > 0, f"invalid send result: {sent!r}")
-        received = receive(1)[0]
+        received = receive(1, listener)[0]
         verify_message(received, first, sent[0], 1)
-        complete(received)
+        complete(received, listener)
         drained()
         print("PASS authenticated create/send/receive/complete and empty queue", flush=True)
+        check(rpc("Auth", "RevokeKey", {"id": keys["send"]["key"]["id"]}, manager).get("ok") is True,
+              "managed administrator could not revoke sender")
 
         pending = [message("locked-before-restart"), message("active-before-restart")]
         seqs = rpc("Queue", "Send", {"queue": queue, "messages": pending})["seq_numbers"]
@@ -225,6 +248,20 @@ def smoke(args):
         restarted = start(containers[1])
         check(restarted["schema_version"] == initial["schema_version"]
               and restarted.get("queues") == 1, "queue/schema metadata did not survive restart")
+        status, raw = request("/mqlite.v1.QueueService/Send", {"queue": queue, "messages": [first]}, sender)
+        check(status == 401 and json.loads(raw).get("code") == "unauthenticated",
+              "revoked key became valid after container replacement")
+        key_page = rpc("Auth", "ListKeys", {}, manager)
+        metadata = {key["id"]: key for key in key_page["keys"]}
+        check(set(metadata) == {key["key"]["id"] for key in keys.values()} and
+              all("token" not in key and "token_hash" not in key for key in metadata.values()) and
+              metadata[keys["send"]["key"]["id"]]["revoked_at_ms"] > 0,
+              "managed key metadata/revocation did not survive replacement")
+        for permission in ("listen", "manage"):
+            check(metadata[keys[permission]["key"]["id"]] == keys[permission]["key"],
+                  "active key metadata changed after replacement")
+        check(rpc("Queue", "Stats", {"queue": queue}, listener)["total"] == 2,
+              "listen key did not survive replacement")
         recovered = receive(2)
         for index, actual in enumerate(recovered):
             verify_message(actual, pending[index], seqs[index], 2 if index == 0 else 1)
@@ -233,6 +270,10 @@ def smoke(args):
                 check(actual["enqueued_at_ms"] == locked["enqueued_at_ms"], "restart changed enqueue time")
             complete(actual)
         drained()
+        for key in keys.values():
+            check(rpc("Auth", "RevokeKey", {"id": key["key"]["id"]}).get("ok") is True,
+                  "test key cleanup failed")
+        print("PASS managed permissions and persistent credentials/revocation on container replacement", flush=True)
         print("PASS same-volume container replacement: active and locked messages survive and settle", flush=True)
     except BaseException:
         for container in sorted(live_containers):
