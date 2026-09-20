@@ -55,6 +55,9 @@ upgrade notes before replacing a broker.
   require `manage`; ordinary application keys use the SDK, CLI or HTTP API.
   Explicit auth-off mode keeps the existing queue behavior and refuses key
   management. Bare or duplicate Authorization headers are rejected.
+- The concepts guide and console's AI filter reference now correctly explain
+  that `now()` reads the wall clock; use message timestamps for repeatable routing.
+  Filter behavior is unchanged. The guide's Go SDK filter example is also corrected.
 
 ## v0.3.0 — 2026-09-10
 
