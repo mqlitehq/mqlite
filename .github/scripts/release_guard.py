@@ -25,6 +25,7 @@ EXPECTED_JOBS = frozenset({
     "docker build + authenticated restart smoke",
     "e2e (curl + python + SDK blackbox)",
     "crash injection (recovery invariants)",
+    "observability (Prometheus + Grafana + fault recovery)",
 })
 VERSION_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -145,7 +146,7 @@ def check_ci(api, repository, target):
     # Never combine jobs from different attempts. Rerun all jobs after a failure.
     jobs = pages(api, path + "/attempts/" + str(attempt) + "/jobs", "jobs")
     require(collections.Counter(job.get("name") for job in jobs) == collections.Counter(EXPECTED_JOBS),
-            "CI job set differs from the required 12 jobs (missing, extra, or duplicate)")
+            "CI job set differs from the required 13 jobs (missing, extra, or duplicate)")
     require(all(positive_int(job.get("id")) for job in jobs)
             and len({job["id"] for job in jobs}) == len(jobs), "invalid or duplicate CI job IDs")
     for job in jobs:

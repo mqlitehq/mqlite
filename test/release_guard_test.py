@@ -314,21 +314,21 @@ class WorkflowContractTests(unittest.TestCase):
     def test_ci_job_set_is_explicit_and_complete(self):
         ci = (ROOT / guard.CI_PATH).read_text()
         self.assertEqual(set(re.findall(r"^  ([a-z0-9_]+):$", ci.split("jobs:\n", 1)[1], re.MULTILINE)),
-                         {"test", "coverage", "lint", "govulncheck", "docker", "e2e", "crash"})
+                         {"test", "coverage", "lint", "govulncheck", "docker", "e2e", "crash", "observability"})
         names = set(re.findall(r"^    name: (.+)$", ci, re.MULTILINE))
         names.remove("test (${{ matrix.os }} · go ${{ matrix.go }})")
         names.update("test (" + os + " · go " + go + ")" for os, go in (
             ("ubuntu-latest", "1.21.x"), ("ubuntu-latest", "stable"), ("macos-14", "1.21.x"),
             ("macos-latest", "stable"), ("windows-latest", "1.21.x"), ("windows-latest", "stable")))
         self.assertEqual(names, guard.EXPECTED_JOBS)
-        self.assertEqual(len(names), 12)
+        self.assertEqual(len(names), 13)
 
     def test_workflow_surface_requires_deliberate_review(self):
         # Hash the complete workflows, not selected "good" lines: an added if,
         # continue-on-error, alternate publish step, matrix entry, or checkout is
         # security-relevant. Review any change before updating these goldens.
         expected = {
-            "ci.yml": "5f750ec6738e3086d89ab4971020394a1f28d3018f220738a7fe8e351c0cab69",
+            "ci.yml": "47e1305b415a7beee480ad8308be1f86c7269845821ed9b6ffc0859cdf64e4e9",
             "release.yml": "badec32ab2c9e80b37e732ae0e4418ceebabb3de80b4a396d87dd0c799ab4ed4",
             "release-image.yml": "00ce4b311619e3f573537516713741efc523d0fb2b1692cacb81d8e5e5219643",
         }
