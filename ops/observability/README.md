@@ -74,14 +74,51 @@ blocks. Do not run the driver against an existing production deployment.
 The test leaves named `obsdemo-*` queues for inspection: active backlog,
 scheduled/deferred work and an intentional dead letter. A repeat run resets only
 those queues via public operations. If an interrupted prior test still holds a
-live lease, wait for its expiry before retrying. Example continuous normal traffic:
+live lease, wait for its expiry before retrying.
+
+### Keep the dashboard moving
+
+Start live traffic directly, without repeating verification or interrupting any
+monitoring service. This example requests one hour:
 
 ```sh
-python3 test/observability/verify.py --traffic-seconds 3600
+python3 test/observability/verify.py --traffic-only --traffic-seconds 3600
 ```
 
-The `obsdemo-live` queue generates verified send/receive/complete traffic every two
-seconds. Stop the driver to stop traffic; the monitoring services continue running.
+Open [the live queue view](http://127.0.0.1:13000/d/mqlite-observability?var-queue=obsdemo-live&from=now-5m&to=now&refresh=5s).
+It selects only `obsdemo-live`, the last five minutes and a five-second refresh,
+so the verifier's intentionally retained backlog/dead letters do not dominate the
+view. The general dashboard keeps its normal All-queues, 15-minute default.
+Watch the status cards and the retained-depth, enqueue/delivery, settlement, and
+dead-letter/removal trends. Allow two rounds to collect visible history.
+
+The driver alternates 24- and 48-message waves. It publishes 3 or 6 messages per
+second, holds the backlog for ten seconds, then drains at 6 or 12 messages per
+second. Each round also abandons and verifies three real redeliveries, rejects
+three messages, leaves them in the DLQ for ten seconds, and redrives/completes them.
+Delivered sequence numbers and full bodies must match the acknowledged sends;
+each round checks that the queue is empty after settlement. These are real API
+operations, not generated Prometheus samples.
+
+The timed generation interval starts after startup ownership/queue checks.
+`--traffic-seconds` limits new production. At the deadline, or after Ctrl-C, the
+driver stops adding work and drains its current round; finishing bounded HTTP
+requests can extend elapsed time past the requested duration. It stops only the
+traffic process and leaves all three services running. `--output /tmp/live.json`
+optionally writes the actual duration, stop reason and counters after traffic has
+finished. Omitting `--traffic-only` runs verification first, followed by the
+requested traffic; its final report includes both phases. An output file is marked
+`RUNNING` during execution and `FAIL` on error, so failed traffic cannot leave a
+successful verification report for an incomplete combined run.
+
+Only this reserved demo queue is changed. A process lock prevents two drivers
+from resetting each other's work; a pre-existing live lease or unexpected stored
+state makes startup fail before cleanup. Restart cleanup is limited to 96 old
+active/dead-lettered messages. Each running round retains at most 48 messages and
+finishes empty. A two-minute TTL and bounded DLQ retention cover leftovers after
+an unexpected failure; known live leases are abandoned on failure. Do not use
+`obsdemo-live` for application traffic or run other consumers against it.
+
 The short `MQLiteDemoDeadLetter` rule is demonstration-only. Normal production
 thresholds remain in `prometheus/rules.yml` and should be tuned to application SLA.
 The stack evaluates alert conditions; it does not send email, Slack or paging

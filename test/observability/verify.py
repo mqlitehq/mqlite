@@ -388,27 +388,179 @@ def faults():
 
 
 def traffic(seconds):
+    import fcntl
+    import signal
+    import sys
+    import threading
+
+    if seconds <= 0:
+        raise ValueError("traffic duration must be positive")
     name = "obsdemo-live"
-    queue(name)
-    deadline = time.monotonic() + seconds
-    print("Generating normal traffic on obsdemo-live; Ctrl-C stops traffic only.", flush=True)
-    while time.monotonic() < deadline:
-        body = "live " + secrets.token_hex(8)
-        send(name, body)
-        message = receive(name)[0]
-        if base64.b64decode(message["body"]).decode() != body:
-            raise AssertionError("live traffic body mismatch")
-        settle("Complete", name, message)
-        time.sleep(2)
+    stop = threading.Event()
+    pending = {}
+    held = {}
+    totals = {key: 0 for key in ("rounds", "enqueued", "completed", "abandoned", "rejected", "redriven", "peak_retained")}
+
+    def stopping():
+        return stop.is_set() or time.monotonic() >= deadline
+
+    def pause(duration):
+        stop.wait(max(0, min(duration, deadline - time.monotonic())))
+
+    def state(phase):
+        stats = rpc("QueueService", "Stats", {"queue": name})
+        if stats["total"] > 48:
+            raise AssertionError("live traffic exceeded its 48-message bound")
+        totals["peak_retained"] = max(totals["peak_retained"], stats["total"])
+        print(f"TRAFFIC round={totals['rounds'] + 1} phase={phase} "
+              f"active={stats['active']} locked={stats['locked']} dlq={stats['dead_lettered']} "
+              f"retained={stats['total']}", flush=True)
+        return stats
+
+    def publish(count, kind):
+        bodies = [f"observability live {kind} {secrets.token_hex(16)}" for _ in range(count)]
+        result = rpc("QueueService", "Send", {"queue": name, "messages": [
+            {"body": base64.b64encode(body.encode()).decode()} for body in bodies]})
+        seqs = result["seq_numbers"]
+        if len(seqs) != count or len(set(seqs)) != count or any(seq <= 0 or seq in pending for seq in seqs):
+            raise AssertionError("live send did not acknowledge distinct message identities")
+        pending.update(zip(seqs, bodies))
+        totals["enqueued"] += count
+
+    def claim(maximum):
+        rows = receive(name, maximum=maximum)
+        if not rows or len(rows) > maximum:
+            raise AssertionError("live receive did not return the expected work")
+        held.update((row["seq_number"], row) for row in rows)
+        for row in rows:
+            seq = row["seq_number"]
+            if seq not in pending or base64.b64decode(row["body"]).decode() != pending[seq]:
+                raise AssertionError("live delivery identity or complete body mismatch")
+        return rows
+
+    def finish(method, row, **extra):
+        settle(method, name, row, **extra)
+        held.pop(row["seq_number"], None)
+        if method == "Complete":
+            pending.pop(row["seq_number"])
+            totals["completed"] += 1
+
+    # One driver per initialized stack. The kernel releases this lock after a
+    # crash; a second process cannot reset a live driver's queue.
+    with (DATA / "traffic.lock").open("a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise AssertionError("another traffic driver owns this stack; stop it before starting another") from None
+
+        status, prior = request(BROKER + "/mqlite.v1.QueueService/Stats", {"queue": name}, "Bearer " + ADMIN)
+        if status == 200:
+            if prior["locked"]:
+                raise AssertionError("obsdemo-live has a live lease; wait for expiry before restarting traffic")
+            if prior["total"] > 96 or prior["total"] != prior["active"] + prior["dead_lettered"]:
+                raise AssertionError("obsdemo-live contains unexpected work; inspect it before starting traffic")
+        elif status != 404:
+            raise AssertionError("cannot inspect the live demo queue")
+        rpc("AdminService", "CreateQueue", {"name": name, "config": {
+            "lock_duration_ms": 5000, "default_ttl_ms": 120000, "dead_letter_on_expire": False,
+            "dlq_max_count": 48, "dlq_max_age_ms": 120000}})
+        # Only bounded leftovers from an interrupted run of this reserved queue.
+        rpc("AdminService", "Purge", {"queue": name, "max": 96})
+        receive(name, maximum=96, receive_mode=1)
+        if rpc("QueueService", "Stats", {"queue": name})["total"]:
+            raise AssertionError("live queue did not reset; another client may be using it")
+
+        started = time.monotonic()
+        deadline = started + seconds
+        previous_handler = signal.signal(signal.SIGINT, lambda *_: stop.set())
+        print(f"TRAFFIC requested_seconds={seconds} queue={name}; Ctrl-C stops new work and drains this round.", flush=True)
+        try:
+            while not stopping():
+                size = 24 if totals["rounds"] % 2 == 0 else 48
+                produce_rate, consume_rate = size // 8, size // 4
+                for _ in range(8):
+                    if stopping():
+                        break
+                    publish(produce_rate, "backlog")
+                    pause(1)
+                state("backlog")
+                pause(10)
+                while pending:
+                    for row in claim(min(consume_rate, len(pending))):
+                        finish("Complete", row)
+                    pause(1)
+                state("recovered")
+
+                for _ in range(3):
+                    if stopping():
+                        break
+                    publish(1, "retry")
+                    first = claim(1)[0]
+                    finish("Abandon", first)
+                    totals["abandoned"] += 1
+                    pause(1)
+                    second = claim(1)[0]
+                    if second["seq_number"] != first["seq_number"] or second["delivery_count"] != first["delivery_count"] + 1:
+                        raise AssertionError("abandon did not produce a real redelivery")
+                    finish("Complete", second)
+
+                if not stopping():
+                    publish(3, "dead-letter")
+                    for row in claim(3):
+                        finish("Reject", row, dead_letter_reason="observability-live-demo")
+                        totals["rejected"] += 1
+                    if state("dead-letter")["dead_lettered"] != 3:
+                        raise AssertionError("live rejection did not retain three dead letters")
+                    pause(10)
+                    moved = rpc("AdminService", "Redrive", {"queue": name, "max": 3})["moved"]
+                    if moved != 3:
+                        raise AssertionError("live redrive did not restore all three identities")
+                    totals["redriven"] += moved
+                    while pending:
+                        for row in claim(len(pending)):
+                            finish("Complete", row)
+                if state("drained")["total"] != 0 or held:
+                    raise AssertionError("live round left retained messages or unsettled deliveries")
+                totals["rounds"] += 1
+                pause(5)
+        finally:
+            # Unexpected failures release known leases; TTL/retention bounds the
+            # small remainder. Do not silently purge evidence after a failure.
+            failed = sys.exc_info()[0] is not None
+            cleanup_failures = 0
+            try:
+                for row in list(held.values()):
+                    try:
+                        settle("Abandon", name, row)
+                    except Exception:
+                        cleanup_failures += 1
+            finally:
+                signal.signal(signal.SIGINT, previous_handler)
+            if cleanup_failures:
+                print(f"WARN could not abandon {cleanup_failures} held deliveries; expiry/TTL still applies.", file=sys.stderr)
+                if not failed:
+                    raise AssertionError("live traffic lease cleanup failed")
+
+    result = {"status": "PASS", "mode": "traffic", "queue": name, **totals,
+              "requested_seconds": seconds, "elapsed_seconds": round(time.monotonic() - started, 3),
+              "stopped_by": "interrupt" if stop.is_set() else "duration"}
+    print("PASS live traffic " + json.dumps(result, sort_keys=True), flush=True)
+    return result
 
 
 def main():
     global ADMIN, MONITOR, GRAFANA_AUTH, DATA
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--faults", action="store_true", help="also interrupt this isolated scraper/broker and verify recovery")
-    parser.add_argument("--traffic-seconds", type=int, default=0, help="generate normal traffic after verification")
+    parser.add_argument("--traffic-only", action="store_true", help="run live traffic without verification or fault drills")
+    parser.add_argument("--traffic-seconds", type=int, default=0, help="generate bounded wave traffic for this duration, then drain in-flight work")
     parser.add_argument("--output", type=Path, help="write non-secret JSON evidence outside the repository")
     args = parser.parse_args()
+    if args.traffic_seconds < 0 or (args.traffic_only and args.traffic_seconds == 0):
+        parser.error("traffic duration must be positive when --traffic-only is used")
+    if args.traffic_only and args.faults:
+        parser.error("--traffic-only cannot be combined with --faults")
     config = dict(line.split("=", 1) for line in (STACK / ".env").read_text().splitlines()
                   if line and not line.startswith("#") and "=" in line)
     DATA = Path(os.environ.get("OBS_DATA_DIR", config["OBS_DATA_DIR"].strip('"')))
@@ -417,22 +569,33 @@ def main():
     password = (DATA / "secrets/grafana-admin.token").read_text().strip()
     GRAFANA_AUTH = "Basic " + base64.b64encode(("admin:" + password).encode()).decode()
     started = time.time()
+
+    def output(report):
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(report, indent=2) + "\n")
+
     try:
+        output({"status": "RUNNING", "mode": "traffic" if args.traffic_only else "verification"})
+        if args.traffic_only:
+            output(traffic(args.traffic_seconds))
+            return
         verify()
         if args.faults:
             faults()
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps({"status": "PASS", "checks": CHECKS,
-                "faults_tested": args.faults, "elapsed_seconds": round(time.time() - started, 3),
-                "broker": BROKER, "prometheus": PROM, "grafana": GRAFANA}, indent=2) + "\n")
-        print(f"PASS {len(CHECKS)} checks", flush=True)
+        report = {"status": "PASS", "checks": CHECKS, "faults_tested": args.faults,
+                  "broker": BROKER, "prometheus": PROM, "grafana": GRAFANA}
         if args.traffic_seconds > 0:
-            traffic(args.traffic_seconds)
+            report["traffic"] = traffic(args.traffic_seconds)
+        report["elapsed_seconds"] = round(time.time() - started, 3)
+        output(report)
+        print(f"PASS {len(CHECKS)} checks", flush=True)
     except Exception as error:
         text = str(error)
         for credential in (ADMIN, MONITOR, password, GRAFANA_AUTH):
             text = text.replace(credential, "[redacted]")
+        output({"status": "FAIL", "checks": CHECKS, "error": type(error).__name__ + ": " + text,
+                "elapsed_seconds": round(time.time() - started, 3)})
         raise SystemExit(type(error).__name__ + ": " + text) from None
 
 

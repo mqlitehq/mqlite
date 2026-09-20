@@ -7,7 +7,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 41,
-  "version": 1,
+  "version": 2,
   "refresh": "5s",
   "editable": false,
   "time": {
@@ -81,8 +81,8 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 12,
-        "h": 8
+        "w": 6,
+        "h": 3
       },
       "datasource": {
         "type": "prometheus",
@@ -136,13 +136,13 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Queue snapshot collection",
+      "title": "Snapshot collection",
       "description": "1 means the canonical queue snapshot was collected. Failed collection omits queue gauges; process counters remain available.",
       "gridPos": {
-        "x": 12,
+        "x": 6,
         "y": 0,
-        "w": 12,
-        "h": 8
+        "w": 6,
+        "h": 3
       },
       "datasource": {
         "type": "prometheus",
@@ -196,13 +196,13 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Last successful collection age",
+      "title": "Collection age",
       "description": "Time since a successful queue snapshot. No data before the first successful collection; inspect collection availability separately.",
       "gridPos": {
-        "x": 0,
-        "y": 8,
-        "w": 12,
-        "h": 8
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 3
       },
       "datasource": {
         "type": "prometheus",
@@ -263,10 +263,10 @@
       "title": "Broker uptime",
       "description": "Counters are process-local and reset at restart; they are not a durable business ledger.",
       "gridPos": {
-        "x": 12,
-        "y": 8,
-        "w": 12,
-        "h": 8
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 3
       },
       "datasource": {
         "type": "prometheus",
@@ -312,9 +312,9 @@
       "description": "Stored active/locked/deferred/scheduled/dead_lettered rows. Active does not guarantee current eligibility; locked is not a consumer count.",
       "gridPos": {
         "x": 0,
-        "y": 16,
+        "y": 3,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -354,64 +354,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "Oldest active or locked message",
-      "description": "Age since original enqueue time; excludes scheduled, deferred and dead letters. Not handler duration or ready-only wait.",
-      "gridPos": {
-        "x": 12,
-        "y": 16,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "mqlite_queue_oldest_message_age_seconds{instance=~\"$instance\",queue=~\"$queue\"}",
-          "legendFormat": "{{queue}}",
-          "range": true,
-          "instant": false
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "noValue": "No data",
-          "color": {
-            "mode": "palette-classic"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -425,10 +368,10 @@
       "title": "Confirmed enqueue and delivery effects",
       "description": "Fanout counts stored copies. Redelivered is a subset of delivered. Do not subtract these rates to infer loss.",
       "gridPos": {
-        "x": 0,
-        "y": 24,
+        "x": 12,
+        "y": 3,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -468,7 +411,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -482,10 +425,10 @@
       "title": "Settlement effects",
       "description": "Confirmed transitions; exact receipt replays add no new effect. Missing event series means unobserved, not a fabricated zero.",
       "gridPos": {
-        "x": 12,
-        "y": 24,
+        "x": 0,
+        "y": 9,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -525,7 +468,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -539,10 +482,10 @@
       "title": "Dead letters and removals",
       "description": "Five-minute observed increases. Some events overlap: reject can also dead-letter. Do not sum into a ledger.",
       "gridPos": {
-        "x": 0,
-        "y": 32,
+        "x": 12,
+        "y": 9,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -582,7 +525,64 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Oldest active or locked message",
+      "description": "Age since original enqueue time; excludes scheduled, deferred and dead letters. Not handler duration or ready-only wait.",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mqlite_queue_oldest_message_age_seconds{instance=~\"$instance\",queue=~\"$queue\"}",
+          "legendFormat": "{{queue}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -597,9 +597,9 @@
       "description": "Rows outside the normal five retained states remain included in total; investigate without deleting evidence.",
       "gridPos": {
         "x": 12,
-        "y": 32,
+        "y": 15,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -639,7 +639,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -654,9 +654,9 @@
       "description": "Requests, including authentication rejection. One request may contain a batch; this is not message throughput.",
       "gridPos": {
         "x": 0,
-        "y": 40,
+        "y": 21,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -696,7 +696,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -711,9 +711,9 @@
       "description": "Only bounded categories; no key identity or token is exported.",
       "gridPos": {
         "x": 12,
-        "y": 40,
+        "y": 21,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -753,7 +753,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -768,9 +768,9 @@
       "description": "Arithmetic mean including authentication. Not a percentile. Long-poll wait is included.",
       "gridPos": {
         "x": 0,
-        "y": 48,
+        "y": 27,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -810,7 +810,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -825,9 +825,9 @@
       "description": "Legacy histogram starts after authentication. Receive includes intentional long polling; a high tail alone does not prove contention.",
       "gridPos": {
         "x": 12,
-        "y": 48,
+        "y": 27,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -867,7 +867,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -882,9 +882,9 @@
       "description": "Cost of collecting the canonical queue snapshot.",
       "gridPos": {
         "x": 0,
-        "y": 56,
+        "y": 33,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -924,7 +924,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -939,9 +939,9 @@
       "description": "Each series is a firing alert and is shown in red. No data means no firing series was returned, not proof that monitoring is healthy. Notification delivery requires your Alertmanager and receiver configuration.",
       "gridPos": {
         "x": 12,
-        "y": 56,
+        "y": 33,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -951,7 +951,7 @@
         {
           "refId": "A",
           "expr": "ALERTS{alertstate=\"firing\",instance=~\"$instance\"}",
-          "legendFormat": "{{alertname}}",
+          "legendFormat": "{{alertname}} / {{instance}} / {{queue}}",
           "range": false,
           "instant": true
         }
@@ -999,9 +999,9 @@
       "description": "Unknown outcome means commit status is uncertain; do not classify it as a known rollback.",
       "gridPos": {
         "x": 0,
-        "y": 64,
+        "y": 39,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1024,7 +1024,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1039,9 +1039,9 @@
       "description": "Retries are storage attempts, not redelivered messages or SDK HTTP retries.",
       "gridPos": {
         "x": 12,
-        "y": 64,
+        "y": 39,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1064,7 +1064,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1079,9 +1079,9 @@
       "description": "Monotonic elapsed storage-operation duration; separate from connection-pool wait accounting.",
       "gridPos": {
         "x": 0,
-        "y": 72,
+        "y": 45,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1104,7 +1104,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1119,9 +1119,9 @@
       "description": "Pool connections and capacity; not consumer connections.",
       "gridPos": {
         "x": 12,
-        "y": 72,
+        "y": 45,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1144,7 +1144,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1156,12 +1156,12 @@
       "id": 21,
       "type": "timeseries",
       "title": "Connection pool waiting time (5m)",
-      "description": "Seconds waiting for pool connections per second; can exceed one with concurrent callers.",
+      "description": "Total time spent waiting for pool connections over the last five minutes, summed across callers; can exceed five minutes with concurrent callers.",
       "gridPos": {
         "x": 0,
-        "y": 80,
+        "y": 51,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1184,7 +1184,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1199,9 +1199,9 @@
       "description": "Maintenance effects are collected in the engine, including embedded use.",
       "gridPos": {
         "x": 12,
-        "y": 80,
+        "y": 51,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1224,7 +1224,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1239,9 +1239,9 @@
       "description": "Time since the last successful pass for enabled tasks. Disabled tasks and tasks with no successful pass are omitted, not shown as epoch-sized ages; compare enabled status and maintenance outcomes.",
       "gridPos": {
         "x": 0,
-        "y": 88,
+        "y": 57,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1264,7 +1264,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1279,9 +1279,9 @@
       "description": "Compile/evaluation failures are distinct from a valid filter returning false.",
       "gridPos": {
         "x": 12,
-        "y": 88,
+        "y": 57,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1304,7 +1304,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1319,9 +1319,9 @@
       "description": "A SELECT 1 read probe; success does not prove writes or full data integrity.",
       "gridPos": {
         "x": 0,
-        "y": 96,
+        "y": 63,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1344,7 +1344,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1359,9 +1359,9 @@
       "description": "Omitted when the read fails; No data must not be interpreted as zero latency.",
       "gridPos": {
         "x": 12,
-        "y": 96,
+        "y": 63,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1384,7 +1384,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1399,9 +1399,9 @@
       "description": "Local database plus WAL/shared-memory footprint. Not available for memory or remote storage.",
       "gridPos": {
         "x": 0,
-        "y": 104,
+        "y": 69,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1424,7 +1424,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
@@ -1439,9 +1439,9 @@
       "description": "Disabled or inapplicable tasks must not trigger a heartbeat failure.",
       "gridPos": {
         "x": 12,
-        "y": 104,
+        "y": 69,
         "w": 12,
-        "h": 8
+        "h": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -1464,7 +1464,7 @@
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom"
         },
         "tooltip": {
