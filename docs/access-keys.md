@@ -55,10 +55,14 @@ Use an administrator for `mqlite key list --output json`. Pagination uses
 `--after-id` with the previous `next_after_id`; the default page limit is 100,
 maximum 1000. Listings include expired and revoked metadata, never secrets or
 digests. Configured tokens are managed in configuration and do not appear here.
+The CLI defaults to public ID order. Use `mqlite key list --sort created_desc --output json`
+for newest first, retaining `--sort created_desc` on subsequent
+pages. Equal creation timestamps are ordered by public ID descending.
 
 ## Go SDK
 
-Both `Client` and `Embedded` expose `CreateKey`, `ListKeys` and `RevokeKey`.
+Both `Client` and `Embedded` expose `CreateKey`, `ListKeys`, `ListKeysWithOptions`
+and `RevokeKey`.
 Embedded administration is trusted local access and needs exclusive ownership of
 a local database. Use `Client` to manage a running broker.
 
@@ -81,7 +85,10 @@ _, err = producer.SendOne(ctx, "orders", mqlite.OutMessage{Body: []byte("hello")
 ```
 
 Pass `page.NextAfterID` to the next `ListKeys(ctx, afterID, limit)` call until it is
-empty. Revoke a managed key with `RevokeKey(ctx, id)`. The SDK returns
+empty. This method keeps public ID order. For newest-first pagination, use
+`ListKeysWithOptions(ctx, mqlite.ListKeysOptions{Sort: "created_desc", Limit: 100})`
+and set `AfterID` to the returned cursor for later pages, keeping the same `Sort`.
+Revoke a managed key with `RevokeKey(ctx, id)`. The SDK returns
 `ErrUnauthenticated` for missing/invalid/revoked/expired credentials and
 `ErrPermissionDenied` for insufficient permissions. `Receiver.Run` stops on these
 permanent authentication/authorization failures, including settlement and renewal.
@@ -99,7 +106,9 @@ created secret before dismissing its one-time display. The console explains when
 an older broker does not support the feature. Application `send`/`listen` keys
 belong in clients, not the administrator console.
 
-The **managed keys** list contains runtime-issued access keys. Configured
+The **managed keys** list shows runtime-issued access keys newest first across
+all pages. Creating a key returns to the first page; equal creation timestamps
+use public ID descending as a stable tie-breaker. Configured
 `MQLITE_TOKENS` administrators are changed through configuration and a broker
 restart. Expiry uses local time in `yyyy-MM-dd HH:mm` format with an English
 calendar, independent of browser language; list timestamps include seconds.

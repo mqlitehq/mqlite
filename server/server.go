@@ -855,7 +855,7 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 		decodeErr(w, err)
 		return
 	}
-	page, err := s.eng.ListAccessKeys(r.Context(), req.AfterID, req.Limit)
+	page, err := s.eng.ListAccessKeysWithOptions(r.Context(), engine.ListAccessKeysOptions{AfterID: req.AfterID, Limit: req.Limit, Sort: req.Sort})
 	if err != nil {
 		s.fail(w, err)
 		return

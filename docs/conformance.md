@@ -208,6 +208,16 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   *(server/errors_test.go: TestAccessKeyRevocationAndExpiryBoundaries;
   sdk_test.go: TestManagedKeySDKAuthorization; receiver_internal_test.go;
   cmd/mqlite/safety_test.go)*
+- **9.6** Access-key lists MUST retain ID-ascending order by default. Explicit
+  `created_desc` MUST order the complete result by creation time descending, then
+  ID descending, with stable cursor pagination. Revocation MUST NOT move a key;
+  insertion ahead of a cursor MUST NOT repeat or skip existing keys on later
+  pages. Unknown sort values and unknown creation-order cursors MUST fail with
+  `invalid_argument`. SDKs and tools MUST reject incorrectly ordered responses.
+  *(engine/storage_test.go: TestAccessKeyCreationOrderPagination,
+  TestAccessKeySortValidationAndIndex; server/errors_test.go:
+  TestAccessKeyCreationOrderHTTP; wire/wire_test.go:
+  TestAccessKeyCreationOrderResponseValidation; test/api_tests.py)*
 
 ## 10 · Storage & schema invariants
 
@@ -220,13 +230,14 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
   tests. The remote (Turso) path retries transient errors with backoff; the local
   path never retries. *(engine/storage_test.go, engine/turso_test.go)*
-- **10.4** A compatible access-key table addition MUST preserve schema token 5
+- **10.4** Compatible access-key table and index additions MUST preserve schema token 5
   and existing v0.3.0 data. Verify real upgrade/downgrade behavior and complete
   backup/restore content, including active, expired and revoked credentials.
-  An incompatible existing object named `access_keys` MUST fail rather than be
-  overwritten or silently trusted.
+  An incompatible existing object named `access_keys` or
+  `idx_access_keys_created` MUST fail rather than be overwritten or silently trusted.
   *(engine/storage_test.go: TestAccessKeySchemaAdditiveCompatibility,
-  TestAccessKeySchemaConflict; test/production/restore/run.py, compat.py)*
+  TestAccessKeySchemaConflict, TestAccessKeyCreationIndexUpgradeAndConflicts;
+  test/production/restore/run.py, compat.py)*
 
 ## 11 · Subscription filters
 

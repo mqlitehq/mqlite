@@ -550,6 +550,26 @@ func TestKeyCommandsJSONContract(t *testing.T) {
 			if len(page.Keys) != 1 || page.Keys[0].ID != ids[1] || page.NextAfterID != "" {
 				t.Fatalf("last page = %+v", page)
 			}
+			for i, after := range []string{"", ids[1]} {
+				out = run("list", "--sort", "created_desc", "--after-id", after, "--limit", "1")
+				page = wire.ListKeysResponse{}
+				if err := json.Unmarshal([]byte(out), &page); err != nil {
+					t.Fatal(err)
+				}
+				wantNext := ids[1]
+				if i == 1 {
+					wantNext = ""
+				}
+				if len(page.Keys) != 1 || page.Keys[0].ID != ids[1-i] || page.NextAfterID != wantNext || strings.Contains(out, secret) {
+					t.Fatalf("creation-order page %d = %+v", i, page)
+				}
+			}
+			human, err := captureStdout(t, func() error {
+				return cmdKey(ctx, []string{"list", "--sort", "created_desc", "--limit", "1", "--output", "text"})
+			})
+			if err != nil || !strings.Contains(human, "Next page: key list --after-id "+ids[1]+" --limit 1 --sort created_desc\n") {
+				t.Fatalf("human continuation lost creation order: %q, %v", human, err)
+			}
 			for i := 0; i < 2; i++ {
 				out = run("revoke", "--id", ids[0])
 				if strings.TrimSpace(out) != "{\n  \"ok\": true\n}" {
@@ -606,6 +626,7 @@ func TestKeyCommandsHumanOutputAndErrors(t *testing.T) {
 		{"create", "--name", "x", "--permissions", "send", "--id", secret},
 		{"create", "--name", "x", "--permissions", "send", "--expires-at-ms", "1"},
 		{"list", "extra"}, {"list", "--after-id", "bad"}, {"list", "--limit", "1001"},
+		{"list", "--sort", "newest"}, {"list", "--sort", ""}, {"list", "--sort", secret},
 		{"revoke"}, {"revoke", "--id", "bad"}, {"revoke", "--id", id, "extra"},
 	} {
 		_, err := captureStdout(t, func() error { return cmdKey(ctx, args) })

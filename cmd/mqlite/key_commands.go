@@ -81,19 +81,23 @@ func cmdKeyList(ctx context.Context, args []string) error {
 	fs := newFlags("key list")
 	after := fs.String("after-id", "", "continue after this public key ID")
 	limit := fs.Int("limit", 100, "page size (1-1000)")
+	order := fs.String("sort", "id_asc", "id_asc or created_desc (newest first)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 0 {
-		return fmt.Errorf("usage: key list [--after-id ID] [--limit N]")
+		return fmt.Errorf("usage: key list [--after-id ID] [--limit N] [--sort id_asc|created_desc]")
+	}
+	if *order != "id_asc" && *order != "created_desc" {
+		return fmt.Errorf("invalid key sort: want id_asc or created_desc")
 	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	page, err := c.ListKeys(ctx, *after, *limit)
+	page, err := c.ListKeysWithOptions(ctx, mqlite.ListKeysOptions{AfterID: *after, Limit: *limit, Sort: *order})
 	if err != nil {
 		return err
 	}
@@ -107,7 +111,11 @@ func cmdKeyList(ctx context.Context, args []string) error {
 		}
 	}
 	if page.NextAfterID != "" {
-		_, err = fmt.Fprintf(os.Stdout, "Next page: key list --after-id %s --limit %d\n", page.NextAfterID, *limit)
+		sortFlag := ""
+		if *order == "created_desc" {
+			sortFlag = " --sort created_desc"
+		}
+		_, err = fmt.Fprintf(os.Stdout, "Next page: key list --after-id %s --limit %d%s\n", page.NextAfterID, *limit, sortFlag)
 	}
 	return err
 }

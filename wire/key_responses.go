@@ -83,6 +83,9 @@ func DecodeCreateKeyResponse(data []byte, request CreateKeyRequest) (CreateKeyRe
 
 // DecodeListKeysResponse validates bounded, ordered metadata and cursor progress.
 func DecodeListKeysResponse(data []byte, request ListKeysRequest) (ListKeysResponse, error) {
+	if request.Sort != "" && request.Sort != engine.KeySortIDAsc && request.Sort != engine.KeySortCreatedDesc {
+		return ListKeysResponse{}, errKeyResponse
+	}
 	fields, err := keyResponseObject(data, "keys")
 	if err != nil {
 		return ListKeysResponse{}, err
@@ -98,19 +101,31 @@ func DecodeListKeysResponse(data []byte, request ListKeysRequest) (ListKeysRespo
 	}
 	page := ListKeysResponse{Keys: make([]AccessKey, len(rawKeys))}
 	previous := request.AfterID
+	var previousCreatedAt int64
+	seen := map[string]bool{request.AfterID: true}
 	for i, raw := range rawKeys {
 		key, err := decodeAccessKey(raw)
-		if err != nil || key.ID <= previous {
+		if err != nil || seen[key.ID] {
 			return ListKeysResponse{}, errKeyResponse
 		}
+		if request.Sort == engine.KeySortCreatedDesc {
+			if i > 0 && (key.CreatedAtMs > previousCreatedAt || key.CreatedAtMs == previousCreatedAt && key.ID >= previous) {
+				return ListKeysResponse{}, errKeyResponse
+			}
+		} else if key.ID <= previous {
+			return ListKeysResponse{}, errKeyResponse
+		}
+		seen[key.ID] = true
 		page.Keys[i], previous = key, key.ID
+		previousCreatedAt = key.CreatedAtMs
 	}
 	if next, ok := fields["next_after_id"]; ok {
 		if bytes.Equal(bytes.TrimSpace(next), []byte("null")) || json.Unmarshal(next, &page.NextAfterID) != nil {
 			return ListKeysResponse{}, errKeyResponse
 		}
 	}
-	if page.NextAfterID != "" && (len(page.Keys) != limit || page.NextAfterID != previous || page.NextAfterID <= request.AfterID) {
+	if page.NextAfterID != "" && (len(page.Keys) != limit || page.NextAfterID != previous || page.NextAfterID == request.AfterID ||
+		request.Sort != engine.KeySortCreatedDesc && page.NextAfterID <= request.AfterID) {
 		return ListKeysResponse{}, errKeyResponse
 	}
 	return page, nil

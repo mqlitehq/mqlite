@@ -1469,6 +1469,142 @@ func TestManagedKeySDKAuthorization(t *testing.T) {
 	}
 }
 
+func TestManagedKeySDKSortedPaginationParity(t *testing.T) {
+	type keyAdmin interface {
+		ListKeys(context.Context, string, int) (mqlite.KeyPage, error)
+		ListKeysWithOptions(context.Context, mqlite.ListKeysOptions) (mqlite.KeyPage, error)
+	}
+	ctx := context.Background()
+	for _, mode := range []string{"embedded", "http"} {
+		t.Run(mode, func(t *testing.T) {
+			var clock atomic.Int64
+			clock.Store(100)
+			emb, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithClock(clock.Load), mqlite.WithoutBackground())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer emb.Close()
+			var admin keyAdmin = emb
+			if mode == "http" {
+				ts := httptest.NewServer(server.New(emb.Engine(), []string{"administrator"}).Handler())
+				defer ts.Close()
+				client, err := mqlite.Open(ctx, ts.URL, mqlite.WithToken("administrator"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				admin = client
+			}
+			id := func(prefix string) string { return strings.Repeat(prefix, 32) }
+			for _, fixture := range []struct {
+				prefix  string
+				created int64
+				expires int64
+			}{{"a", 100, 0}, {"1", 200, 250}, {"f", 200, 0}, {"7", 300, 0}} {
+				clock.Store(fixture.created)
+				if _, err := emb.CreateKey(ctx, mqlite.CreateKeyOptions{ID: id(fixture.prefix), Name: "worker-" + fixture.prefix, Permissions: []string{"send"}, ExpiresAtMs: fixture.expires}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := emb.RevokeKey(ctx, id("f")); err != nil {
+				t.Fatal(err)
+			}
+			for _, order := range []string{"", "id_asc", "created_desc"} {
+				want := []string{id("1"), id("7"), id("a"), id("f")}
+				if order == "created_desc" {
+					want = []string{id("7"), id("f"), id("1"), id("a")}
+				}
+				for _, limit := range []int{0, 1, 2, 3} {
+					opts := mqlite.ListKeysOptions{Sort: order, Limit: limit}
+					var got []string
+					for round := 0; round < 5; round++ {
+						page, err := admin.ListKeysWithOptions(ctx, opts)
+						if err != nil {
+							t.Fatalf("sort=%q limit=%d: %v", order, limit, err)
+						}
+						for _, key := range page.Keys {
+							got = append(got, key.ID)
+							if key.ID == id("f") && key.RevokedAtMs != 300 || key.ID == id("1") && key.ExpiresAtMs != 250 {
+								t.Fatal("revoked and expired metadata must remain visible")
+							}
+						}
+						if page.NextAfterID == "" {
+							break
+						}
+						if len(page.Keys) != limit || page.NextAfterID != page.Keys[len(page.Keys)-1].ID || page.NextAfterID == opts.AfterID {
+							t.Fatal("continuation must use the last public ID and make progress")
+						}
+						opts.AfterID = page.NextAfterID
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("sort=%q limit=%d got=%v want=%v", order, limit, got, want)
+					}
+				}
+			}
+			// ID order still accepts an absent predecessor for lost-create reconciliation.
+			legacy, err := admin.ListKeys(ctx, id("0"), 1)
+			if err != nil || len(legacy.Keys) != 1 || legacy.Keys[0].ID != id("1") {
+				t.Fatalf("legacy predecessor page = %+v, %v", legacy, err)
+			}
+			for _, invalid := range []mqlite.ListKeysOptions{
+				{Sort: "created_desc", AfterID: id("0")}, {Sort: "created_desc", AfterID: "bad"},
+				{Sort: "created_desc", Limit: -1}, {Sort: "created_desc", Limit: 1001}, {Sort: "newest"},
+			} {
+				if _, err := admin.ListKeysWithOptions(ctx, invalid); !errors.Is(err, mqlite.ErrInvalidArgument) {
+					t.Fatalf("invalid list options %+v: %v", invalid, err)
+				}
+			}
+		})
+	}
+}
+
+func TestManagedKeySDKSortedResponseValidation(t *testing.T) {
+	ctx := context.Background()
+	id := func(prefix string) string { return strings.Repeat(prefix, 32) }
+	key := func(prefix string, created int64) mqlite.AccessKey {
+		return mqlite.AccessKey{ID: id(prefix), Name: "worker", Permissions: []string{"send"}, CreatedAtMs: created}
+	}
+	opts := mqlite.ListKeysOptions{Sort: "created_desc", AfterID: id("5"), Limit: 2}
+	for _, tc := range []struct {
+		name string
+		page mqlite.KeyPage
+		ok   bool
+	}{
+		{"creation order allows ascending IDs", mqlite.KeyPage{Keys: []mqlite.AccessKey{key("2", 300), key("f", 200)}, NextAfterID: id("f")}, true},
+		{"equal timestamps use descending IDs", mqlite.KeyPage{Keys: []mqlite.AccessKey{key("f", 200), key("2", 200)}}, true},
+		{"ascending timestamps", mqlite.KeyPage{Keys: []mqlite.AccessKey{key("f", 200), key("2", 300)}}, false},
+		{"tie with ascending IDs", mqlite.KeyPage{Keys: []mqlite.AccessKey{key("2", 200), key("f", 200)}}, false},
+		{"duplicate ID with different timestamp", mqlite.KeyPage{Keys: []mqlite.AccessKey{key("2", 300), key("2", 200)}}, false},
+		{"cursor repeated in page", mqlite.KeyPage{Keys: []mqlite.AccessKey{key("5", 300)}}, false},
+		{"cursor differs from last record", mqlite.KeyPage{Keys: []mqlite.AccessKey{key("2", 300), key("f", 200)}, NextAfterID: id("2")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var got wire.ListKeysRequest
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil || got != opts || r.URL.Path != wire.PathListKeys {
+					t.Error("list options were not forwarded unchanged")
+				}
+				_ = json.NewEncoder(w).Encode(tc.page)
+			}))
+			defer ts.Close()
+			client, err := mqlite.Open(ctx, ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			got, err := client.ListKeysWithOptions(ctx, opts)
+			if (err == nil) != tc.ok || calls.Load() != 1 {
+				t.Fatalf("valid=%v error=%v calls=%d", tc.ok, err, calls.Load())
+			}
+			if tc.ok && !reflect.DeepEqual(got, tc.page) || !tc.ok && !reflect.DeepEqual(got, mqlite.KeyPage{}) {
+				t.Fatal("valid page changed or invalid response returned partial metadata")
+			}
+		})
+	}
+}
+
 func TestManagedKeyCreateLostResponseIsNotRetried(t *testing.T) {
 	ctx := context.Background()
 	emb, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground())

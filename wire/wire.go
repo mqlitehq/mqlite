@@ -384,6 +384,7 @@ type CreateKeyResponse struct {
 type ListKeysRequest struct {
 	AfterID string `json:"after_id,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
+	Sort    string `json:"sort,omitempty"`
 }
 
 type ListKeysResponse struct {

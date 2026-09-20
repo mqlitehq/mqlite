@@ -261,7 +261,7 @@ func wireShape(t reflect.Type) []string {
 var goldenWireShapes = map[string][]string{
 	"wire.Empty":            {},
 	"wire.CreateKeyRequest": {"id", "name", "permissions", "expires_at_ms"},
-	"wire.ListKeysRequest":  {"after_id", "limit"},
+	"wire.ListKeysRequest":  {"after_id", "limit", "sort"},
 	"wire.RevokeKeyRequest": {"id"},
 	"wire.CreateQueueRequest": {
 		"config.dead_letter_on_expire", "config.default_ttl_ms", "config.dedup_window_ms",
@@ -648,7 +648,7 @@ func TestKeyToolsRejectUnknownArguments(t *testing.T) {
 func TestKeyToolSchemasPinned(t *testing.T) {
 	golden := map[string]string{
 		"create_key": `{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","pattern":"^[0-9a-f]{32}$","description":"unique public key ID; choose before the call"},"name":{"type":"string","description":"key name"},"permissions":{"type":"array","items":{"type":"string","enum":["send","listen","manage"]},"minItems":1,"description":"manage includes send and listen"},"expires_at_ms":{"type":"integer","description":"UTC epoch milliseconds; 0 or omitted means no expiry"}},"required":["id","name","permissions"]}`,
-		"list_keys":  `{"type":"object","additionalProperties":false,"properties":{"after_id":{"type":"string","description":"next_after_id from the previous page"},"limit":{"type":"integer","description":"page size, default 100, maximum 1000"}}}`,
+		"list_keys":  `{"type":"object","additionalProperties":false,"properties":{"after_id":{"type":"string","description":"next_after_id from the previous page"},"limit":{"type":"integer","description":"page size, default 100, maximum 1000"},"sort":{"type":"string","enum":["id_asc","created_desc"],"description":"default id_asc; created_desc lists newest first; keep the same sort when paging"}}}`,
 		"revoke_key": `{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","description":"public key ID, not the secret token"}},"required":["id"]}`,
 	}
 	seen := map[string]bool{}
@@ -705,5 +705,119 @@ func TestKeyToolRejectsInvalidNumbers(t *testing.T) {
 	}
 	if !validKeyInteger(map[string]any{"n": int64(123)}, "n") {
 		t.Fatal("int64 helper input must be accepted")
+	}
+}
+
+func TestKeyToolSortedPagination(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	ctx := context.Background()
+	var clock atomic.Int64
+	clock.Store(100)
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, Now: clock.Load})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	for _, fixture := range []struct {
+		prefix  string
+		created int64
+	}{{"f", 100}, {"1", 200}, {"a", 200}} {
+		clock.Store(fixture.created)
+		if _, _, err := eng.CreateAccessKey(ctx, engine.CreateAccessKeyOptions{ID: strings.Repeat(fixture.prefix, 32), Name: "worker-" + fixture.prefix, Permissions: engine.KeySend}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ts := httptest.NewServer(server.New(eng, []string{"administrator"}).Handler())
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+	for _, order := range []string{"", "id_asc", "created_desc"} {
+		want := []string{"1", "a", "f"}
+		if order == "created_desc" {
+			want = []string{"a", "1", "f"}
+		}
+		after := ""
+		for i, prefix := range want {
+			args := map[string]any{"after_id": after, "limit": 1}
+			if order != "" {
+				args["sort"] = order
+			}
+			text := toolText(t, "list_keys", args, false)
+			var page wire.ListKeysResponse
+			if err := json.Unmarshal([]byte(text), &page); err != nil {
+				t.Fatal(err)
+			}
+			id := strings.Repeat(prefix, 32)
+			wantNext := id
+			if i == len(want)-1 {
+				wantNext = ""
+			}
+			if len(page.Keys) != 1 || page.Keys[0].ID != id || page.NextAfterID != wantNext || strings.Contains(text, "token") || strings.Contains(text, "hash") {
+				t.Fatalf("sort=%q page=%d: metadata, order or continuation differs", order, i)
+			}
+			after = page.NextAfterID
+		}
+	}
+	text := toolText(t, "list_keys", map[string]any{"sort": "created_desc", "after_id": strings.Repeat("0", 32)}, true)
+	if !strings.Contains(text, "invalid_argument") {
+		t.Fatal("unknown creation-order cursor must preserve the broker's invalid_argument error")
+	}
+}
+
+func TestKeyToolSortValidation(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+	secret := "mqk_" + strings.Repeat("a", 64)
+	for _, bad := range []any{nil, false, 1, "", "newest", secret, []any{"created_desc"}, map[string]any{"sort": "created_desc"}} {
+		text := toolText(t, "list_keys", map[string]any{"sort": bad}, true)
+		if text != "error: sort must be id_asc or created_desc" || strings.Contains(text, secret) {
+			t.Fatal("invalid sort must return a fixed safe validation error")
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("invalid sort must fail before issuing requests")
+	}
+}
+
+func TestKeyToolSortedResponseValidation(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	id := func(prefix string) string { return strings.Repeat(prefix, 32) }
+	key := func(prefix string, created int64) wire.AccessKey {
+		return wire.AccessKey{ID: id(prefix), Name: "worker", Permissions: []string{"send"}, CreatedAtMs: created}
+	}
+	for _, tc := range []struct {
+		name string
+		keys []wire.AccessKey
+		ok   bool
+	}{
+		{"descending creation permits ascending IDs", []wire.AccessKey{key("1", 300), key("f", 200)}, true},
+		{"ascending creation", []wire.AccessKey{key("f", 200), key("1", 300)}, false},
+		{"equal timestamp descending IDs", []wire.AccessKey{key("f", 200), key("1", 200)}, true},
+		{"equal timestamp ascending IDs", []wire.AccessKey{key("1", 200), key("f", 200)}, false},
+		{"duplicate ID", []wire.AccessKey{key("1", 300), key("1", 200)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request wire.ListKeysRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Sort != "created_desc" || request.Limit != 2 {
+					t.Error("sort and limit must reach the broker unchanged")
+				}
+				_ = json.NewEncoder(w).Encode(wire.ListKeysResponse{Keys: tc.keys})
+			}))
+			defer ts.Close()
+			broker.endpoint, broker.token, broker.http = ts.URL, "administrator", ts.Client()
+			text := toolText(t, "list_keys", map[string]any{"sort": "created_desc", "limit": 2}, !tc.ok)
+			if !tc.ok && strings.Contains(text, id("1")) {
+				t.Fatal("invalid success must not return partial metadata")
+			}
+		})
 	}
 }

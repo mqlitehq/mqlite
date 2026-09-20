@@ -39,6 +39,10 @@ upgrade notes before replacing a broker.
   `yyyy-MM-dd HH:mm` local input, with strict invalid-date validation. Listed
   timestamps use `yyyy-MM-dd HH:mm:ss`; runtime-issued credentials are labeled
   "managed keys" to distinguish them from configured administrator tokens.
+- Managed keys in the console are ordered newest first across pages. HTTP,
+  SDK, CLI and MCP listing support `created_desc` ordering with a stable ID
+  tie-breaker and indexed cursor pagination; the existing default ID order is
+  retained for API clients and exact-ID recovery.
 - Permissions apply to the whole broker. The console and `/metrics`
   require `manage`; ordinary application keys use the SDK, CLI or HTTP API.
   Explicit auth-off mode keeps the existing queue behavior and refuses key

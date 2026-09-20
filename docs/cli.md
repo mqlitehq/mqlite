@@ -101,13 +101,14 @@ mqlite key create --name worker --permissions listen --output json
 mqlite key create --name processor --permissions send,listen --output json
 mqlite key create --name operator --permissions manage --output json
 mqlite key list --limit 100 --output json
+mqlite key list --sort created_desc --limit 25 --output json
 mqlite key revoke --id <public-key-id>
 ```
 
 | Subcommand | Flags | Result |
 |---|---|---|
 | `create` | required `--name`, `--permissions`; optional `--id`, `--expires-at-ms` | key metadata plus its one-time secret |
-| `list` | optional `--after-id`, `--limit` (default 100, maximum 1000) | metadata and a continuation cursor; no secrets or digests |
+| `list` | optional `--after-id`, `--limit` (default 100, maximum 1000), `--sort id_asc\|created_desc` (default `id_asc`) | metadata and a continuation cursor; no secrets or digests |
 | `revoke` | required `--id` | idempotently revokes an existing database key |
 
 `--id` is a public 32-character lowercase hex ID; when omitted, the CLI generates
@@ -116,6 +117,14 @@ result can be reconciled without guessing from a name. The secret is a separate
 `mqk_` token with 64 lowercase hex characters. Save it securely when returned;
 it cannot be retrieved again. `--expires-at-ms` uses epoch milliseconds; zero
 (the default) means no expiry. Key names need not be unique.
+
+Lists default to ascending public ID order. `--sort created_desc` lists the
+newest-created keys first across all pages, with descending ID as the tie-breaker
+for identical creation timestamps. Pass `next_after_id` as `--after-id` and keep
+the same `--sort` on every page; text output includes the full continuation
+command. In creation order, the cursor must be an existing key ID (revoked and
+expired keys remain valid cursors). ID order also accepts absent predecessor IDs
+for reconciling a lost create response.
 
 `send` permits sending, scheduling and cancelling scheduled messages; `listen`
 permits consumption, settlement, renewal, peek and queue stats; `manage` includes

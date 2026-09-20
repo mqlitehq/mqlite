@@ -114,6 +114,7 @@ func TestAccessKeyJSONContract(t *testing.T) {
 		{"create request", wire.CreateKeyRequest{ID: "id", Name: "worker", Permissions: []string{"send", "listen"}, ExpiresAtMs: 22}, `{"id":"id","name":"worker","permissions":["send","listen"],"expires_at_ms":22}`},
 		{"create response", wire.CreateKeyResponse{Key: key, Token: "secret"}, `{"key":` + keyJSON + `,"token":"secret"}`},
 		{"list request", wire.ListKeysRequest{AfterID: "id", Limit: 2}, `{"after_id":"id","limit":2}`},
+		{"sorted list request", wire.ListKeysRequest{AfterID: "id", Limit: 2, Sort: engine.KeySortCreatedDesc}, `{"after_id":"id","limit":2,"sort":"created_desc"}`},
 		{"default list", wire.ListKeysRequest{}, `{}`},
 		{"list response", wire.ListKeysResponse{Keys: []wire.AccessKey{key}, NextAfterID: "id"}, `{"keys":[` + keyJSON + `],"next_after_id":"id"}`},
 		{"empty list", wire.ListKeysResponse{Keys: []wire.AccessKey{}}, `{"keys":[]}`},
@@ -250,6 +251,60 @@ func TestAccessKeyResponseValidation(t *testing.T) {
 	}
 	if result, err := wire.DecodeRevokeKeyResponse([]byte(`{"ok":true,"unknown":"secret"}`)); err != nil || !result.Ok {
 		t.Fatal("valid revocation acknowledgement rejected")
+	}
+}
+
+func TestAccessKeyCreationOrderResponseValidation(t *testing.T) {
+	key := func(id string, created int64) wire.AccessKey {
+		return wire.AccessKey{ID: strings.Repeat(id, 32), Name: "key", Permissions: []string{"send"}, CreatedAtMs: created}
+	}
+	keys := []wire.AccessKey{key("1", 300), key("f", 200), key("9", 200), key("a", 100)}
+	encode := func(keys []wire.AccessKey, next string) []byte {
+		t.Helper()
+		data, err := json.Marshal(wire.ListKeysResponse{Keys: keys, NextAfterID: next})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	// Descending creation time, not random ID lexicographic order, is primary.
+	request := wire.ListKeysRequest{Sort: engine.KeySortCreatedDesc, Limit: 4, AfterID: strings.Repeat("b", 32)}
+	if page, err := wire.DecodeListKeysResponse(encode(keys, keys[3].ID), request); err != nil || !reflect.DeepEqual(page.Keys, keys) || page.NextAfterID != keys[3].ID {
+		t.Fatalf("valid created-desc page rejected: %+v %v", page, err)
+	}
+	for _, order := range []string{"", engine.KeySortIDAsc, "CREATED_DESC", "created_desc ", "unknown"} {
+		req := request
+		req.Sort = order
+		if _, err := wire.DecodeListKeysResponse(encode(keys, keys[3].ID), req); err == nil {
+			t.Fatalf("wrong/invalid sort accepted: %q", order)
+		}
+	}
+	for _, invalid := range []struct {
+		keys []wire.AccessKey
+		next string
+	}{
+		{[]wire.AccessKey{keys[1], keys[0]}, ""},       // Increasing creation time.
+		{[]wire.AccessKey{keys[2], keys[1]}, ""},       // Increasing ID within a timestamp tie.
+		{[]wire.AccessKey{keys[1], key("f", 100)}, ""}, // Same ID at different times.
+		{[]wire.AccessKey{key("b", 400)}, ""},          // Request boundary repeated.
+		{keys, request.AfterID},
+		{keys, keys[0].ID},
+		{keys[:3], keys[2].ID}, // Cursor requires a full page.
+		{[]wire.AccessKey{}, keys[0].ID},
+	} {
+		page, err := wire.DecodeListKeysResponse(encode(invalid.keys, invalid.next), request)
+		if err == nil || !reflect.DeepEqual(page, wire.ListKeysResponse{}) {
+			t.Fatalf("malformed created-desc page accepted: %+v", invalid)
+		}
+	}
+	if page, err := wire.DecodeListKeysResponse(encode([]wire.AccessKey{}, ""), request); err != nil || page.Keys == nil || len(page.Keys) != 0 {
+		t.Fatalf("empty terminal created-desc page rejected: %+v %v", page, err)
+	}
+	request.Limit = 1
+	// A later page may have an ID larger than after_id because its creation time
+	// is older; the server resolves the immutable timestamp from that boundary ID.
+	if _, err := wire.DecodeListKeysResponse(encode(keys[1:2], keys[1].ID), request); err != nil {
+		t.Fatalf("creation ordering incorrectly compared IDs across timestamps: %v", err)
 	}
 }
 

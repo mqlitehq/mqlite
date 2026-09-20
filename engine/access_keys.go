@@ -84,13 +84,32 @@ type CreateAccessKeyOptions struct {
 	ExpiresAtMs int64
 }
 
-// AccessKeyPage is ordered by ID and includes revoked and expired records.
+const (
+	// KeySortIDAsc preserves the original key listing and recovery cursor order.
+	KeySortIDAsc = "id_asc"
+	// KeySortCreatedDesc lists newest keys first, breaking timestamp ties by ID.
+	KeySortCreatedDesc = "created_desc"
+)
+
+// ListAccessKeysOptions selects a bounded page. An empty Sort means KeySortIDAsc.
+// With KeySortCreatedDesc, AfterID must identify an existing key; its immutable
+// creation time and ID form the page boundary, even if it is expired or revoked.
+type ListAccessKeysOptions struct {
+	AfterID string
+	Limit   int
+	Sort    string
+}
+
+// AccessKeyPage includes revoked and expired records in the requested order.
 type AccessKeyPage struct {
 	Keys        []AccessKey
 	NextAfterID string
 }
 
 const accessKeyColumns = `id, name, permissions, created_at, expires_at, revoked_at`
+
+const newestAccessKeysSQL = `SELECT ` + accessKeyColumns + ` FROM access_keys ORDER BY created_at DESC, id DESC LIMIT ?`
+const olderAccessKeysSQL = `SELECT ` + accessKeyColumns + ` FROM access_keys WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?`
 
 // CreateAccessKey persists a digest and returns the new secret exactly once.
 // Repeated IDs fail with ErrKeyConflict; an existing secret is never recovered.
@@ -141,6 +160,13 @@ func (e *Engine) CreateAccessKey(ctx context.Context, opts CreateAccessKeyOption
 
 // ListAccessKeys lists public metadata in ID order, using a bounded cursor page.
 func (e *Engine) ListAccessKeys(ctx context.Context, afterID string, limit int) (AccessKeyPage, error) {
+	return e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{AfterID: afterID, Limit: limit})
+}
+
+// ListAccessKeysWithOptions lists metadata using the selected stable keyset order.
+// New keys ahead of a descending cursor do not shift or repeat subsequent pages.
+func (e *Engine) ListAccessKeysWithOptions(ctx context.Context, opts ListAccessKeysOptions) (AccessKeyPage, error) {
+	afterID, limit := opts.AfterID, opts.Limit
 	if afterID != "" && !authkey.ValidID(afterID) {
 		return AccessKeyPage{}, fmt.Errorf("%w: invalid key cursor", ErrInvalidArgument)
 	}
@@ -150,8 +176,28 @@ func (e *Engine) ListAccessKeys(ctx context.Context, afterID string, limit int) 
 	if limit < 1 || limit > 1000 {
 		return AccessKeyPage{}, fmt.Errorf("%w: key page limit must be between 1 and 1000", ErrInvalidArgument)
 	}
+	query := `SELECT ` + accessKeyColumns + ` FROM access_keys WHERE id > ? ORDER BY id LIMIT ?`
+	args := []any{afterID, limit + 1}
+	switch opts.Sort {
+	case "", KeySortIDAsc:
+	case KeySortCreatedDesc:
+		query, args = newestAccessKeysSQL, []any{limit + 1}
+		if afterID != "" {
+			var createdAt int64
+			err := e.db.queryRowScan(ctx, []any{&createdAt}, `SELECT created_at FROM access_keys WHERE id = ?`, afterID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return AccessKeyPage{}, fmt.Errorf("%w: creation-order cursor must identify an existing key", ErrInvalidArgument)
+			}
+			if err != nil {
+				return AccessKeyPage{}, err
+			}
+			query, args = olderAccessKeysSQL, []any{createdAt, afterID, limit + 1}
+		}
+	default:
+		return AccessKeyPage{}, fmt.Errorf("%w: key sort must be id_asc or created_desc", ErrInvalidArgument)
+	}
 	page := AccessKeyPage{Keys: []AccessKey{}}
-	err := e.db.queryRows(ctx, `SELECT `+accessKeyColumns+` FROM access_keys WHERE id > ? ORDER BY id LIMIT ?`, func(rows *sql.Rows) error {
+	err := e.db.queryRows(ctx, query, func(rows *sql.Rows) error {
 		for rows.Next() {
 			var key AccessKey
 			if err := rows.Scan(&key.ID, &key.Name, &key.Permissions, &key.CreatedAtMs, &key.ExpiresAtMs, &key.RevokedAtMs); err != nil {
@@ -160,7 +206,7 @@ func (e *Engine) ListAccessKeys(ctx context.Context, afterID string, limit int) 
 			page.Keys = append(page.Keys, key)
 		}
 		return rows.Err()
-	}, afterID, limit+1)
+	}, args...)
 	if err != nil {
 		return AccessKeyPage{}, err
 	}

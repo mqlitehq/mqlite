@@ -751,3 +751,50 @@ func TestAccessKeyErrorsDoNotEchoSecrets(t *testing.T) {
 		}
 	}
 }
+
+func TestAccessKeyCreationOrderHTTP(t *testing.T) {
+	ctx := context.Background()
+	now := int64(1_000_000)
+	eng := keyTestEngine(t, func() int64 { return now })
+	var keys []engine.AccessKey
+	for i, id := range []int{90, 1, 50, 3, 80, 2, 40} {
+		now = 1_000_000 + int64(i/2)
+		key, _ := keyTestCreate(t, eng, id, engine.KeySend, 0)
+		keys = append(keys, key)
+	}
+	handler := server.New(eng, []string{"admin"}).Handler()
+	// Expected full order is independent of the query and spans four HTTP pages.
+	expected := []string{keys[6].ID, keys[4].ID, keys[5].ID, keys[2].ID, keys[3].ID, keys[0].ID, keys[1].ID}
+	var listed []string
+	for after := ""; ; {
+		req := wire.ListKeysRequest{Sort: engine.KeySortCreatedDesc, AfterID: after, Limit: 2}
+		response := keyTestRequest(handler, http.MethodPost, wire.PathListKeys, "admin", req)
+		keyTestStatus(t, response, 200, "")
+		page, err := wire.DecodeListKeysResponse(response.Body.Bytes(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range page.Keys {
+			listed = append(listed, key.ID)
+		}
+		if page.NextAfterID == "" {
+			break
+		}
+		if err := eng.RevokeAccessKey(ctx, page.NextAfterID); err != nil {
+			t.Fatal(err)
+		}
+		after = page.NextAfterID
+	}
+	if !reflect.DeepEqual(listed, expected) {
+		t.Fatalf("HTTP sort ignored global timestamps/tie order: %v != %v", listed, expected)
+	}
+	for _, req := range []wire.ListKeysRequest{
+		{Sort: "unknown"}, {Sort: "CREATED_DESC"},
+		{Sort: engine.KeySortCreatedDesc, AfterID: fmt.Sprintf("%032x", 999)},
+	} {
+		keyTestStatus(t, keyTestRequest(handler, http.MethodPost, wire.PathListKeys, "admin", req), 400, "invalid_argument")
+	}
+	_, token := keyTestCreate(t, eng, 999, engine.KeySend, 0)
+	keyTestStatus(t, keyTestRequest(handler, http.MethodPost, wire.PathListKeys, token, wire.ListKeysRequest{Sort: engine.KeySortCreatedDesc}), 403, "permission_denied")
+	keyTestStatus(t, keyTestRequest(server.New(eng, nil).Handler(), http.MethodPost, wire.PathListKeys, "", wire.ListKeysRequest{Sort: engine.KeySortCreatedDesc}), 403, "permission_denied")
+}

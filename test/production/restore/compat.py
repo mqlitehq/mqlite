@@ -159,8 +159,10 @@ def run(args, out):
         compare(old_surface(initial), before, "candidate first open: all old schema/data")
         require(rows(initial, "access_keys") == [], "candidate did not add an empty independent table")
         extras = [obj for obj in initial["schema"] if obj not in before["schema"]]
-        require(len(extras) == 3 and all(obj[2] == "access_keys" for obj in extras),
-                "candidate added objects outside the key table and its two unique indexes")
+        require(len(extras) == 4 and all(obj[2] == "access_keys" for obj in extras) and
+                {obj[1] for obj in extras} == {"access_keys", "sqlite_autoindex_access_keys_1",
+                                               "sqlite_autoindex_access_keys_2", "idx_access_keys_created"},
+                "candidate added objects outside the key table, unique indexes and creation-order index")
         for name, permissions in (("active", ["manage"]), ("expired", ["send"]), ("revoked", ["listen"])):
             request = {"id": ids[name], "name": name, "permissions": permissions}
             if name == "expired":

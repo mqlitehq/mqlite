@@ -283,6 +283,89 @@ func TestTursoAccessKeys(t *testing.T) {
 			t.Fatalf("pagination found test key %s %d times", id, found)
 		}
 	}
+	// Exercise the indexed tuple cursor against real libSQL, including timestamp
+	// ties and a newly inserted head between pages. Compare only this test's IDs.
+	owned := map[string]bool{}
+	for _, id := range ids {
+		owned[id] = true
+	}
+	var expectedDescending []AccessKey
+	for _, key := range listed {
+		if owned[key.ID] {
+			expectedDescending = append(expectedDescending, key)
+		}
+	}
+	sort.Slice(expectedDescending, func(i, j int) bool {
+		if expectedDescending[i].CreatedAtMs != expectedDescending[j].CreatedAtMs {
+			return expectedDescending[i].CreatedAtMs > expectedDescending[j].CreatedAtMs
+		}
+		return expectedDescending[i].ID > expectedDescending[j].ID
+	})
+	var descending []AccessKey
+	var previous AccessKey
+	seen := map[string]bool{}
+	newHeadID := ""
+	for cursor := ""; ; {
+		page, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: cursor, Limit: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range page.Keys {
+			if seen[key.ID] || key.ID == newHeadID || previous.ID != "" && (key.CreatedAtMs > previous.CreatedAtMs || key.CreatedAtMs == previous.CreatedAtMs && key.ID >= previous.ID) {
+				t.Fatal("remote creation-order pagination duplicated or misordered a key")
+			}
+			seen[key.ID], previous = true, key
+			if owned[key.ID] {
+				descending = append(descending, key)
+			}
+		}
+		if cursor == "" {
+			newHeadID, err = authkey.GenerateID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, newHeadID)
+			clockBeforeInsert := now.Load()
+			newestTime := clockBeforeInsert
+			for _, existing := range listed {
+				if existing.CreatedAtMs > newestTime {
+					newestTime = existing.CreatedAtMs
+				}
+			}
+			now.Store(newestTime + 1)
+			if _, _, err := e.CreateAccessKey(ctx, CreateAccessKeyOptions{ID: newHeadID, Name: "new pagination head", Permissions: KeySend}); err != nil {
+				t.Fatal(err)
+			}
+			now.Store(clockBeforeInsert)
+		}
+		if page.NextAfterID == "" {
+			break
+		}
+		if page.NextAfterID == cursor {
+			t.Fatal("remote creation-order cursor failed to advance")
+		}
+		cursor = page.NextAfterID
+	}
+	if len(descending) != len(expectedDescending) {
+		t.Fatal("remote creation-order pagination lost owned keys")
+	}
+	for i := range descending {
+		if descending[i] != expectedDescending[i] {
+			t.Fatalf("remote creation-order metadata differs at %d", i)
+		}
+	}
+	head, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, Limit: 1})
+	if err != nil || len(head.Keys) != 1 || head.Keys[0].ID != newHeadID {
+		t.Fatalf("remote newest head is not visible: %+v %v", head, err)
+	}
+	missing, err := authkey.GenerateID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: missing}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("remote missing creation cursor = %v", err)
+	}
+	t.Log("Turso creation-order key pagination OK: ties, stable cursor, new head, metadata and missing cursor verified")
 	// Measure actual network lookup cost without claiming it equals static auth.
 	latencies := make([]time.Duration, 20)
 	var total time.Duration
@@ -296,7 +379,7 @@ func TestTursoAccessKeys(t *testing.T) {
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	t.Logf("Turso indexed access key lookup: n=%d mean=%s p50=%s p95=%s throughput=%.2f/s", len(latencies), total/time.Duration(len(latencies)), latencies[9], latencies[18], float64(len(latencies))/total.Seconds())
-	now.Add(60_000)
+	now.Store(keys[1].ExpiresAtMs)
 	if _, err := e.AuthenticateAccessKey(ctx, tokens[1]); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("remote key accepted at its exact expiry: %v", err)
 	}

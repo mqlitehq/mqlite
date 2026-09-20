@@ -212,6 +212,7 @@ type api interface {
 	Purge(ctx context.Context, queue string, opts ...mqlite.PurgeOpts) (int, error)
 	CreateKey(context.Context, mqlite.CreateKeyOptions) (mqlite.CreateKeyResult, error)
 	ListKeys(context.Context, string, int) (mqlite.KeyPage, error)
+	ListKeysWithOptions(context.Context, mqlite.ListKeysOptions) (mqlite.KeyPage, error)
 	RevokeKey(context.Context, string) error
 	Close() error
 }

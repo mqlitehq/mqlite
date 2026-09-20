@@ -406,9 +406,10 @@ var tools = []tool{
 		schema: keyObj(map[string]any{
 			"after_id": strProp("next_after_id from the previous page"),
 			"limit":    intProp("page size, default 100, maximum 1000"),
+			"sort":     map[string]any{"type": "string", "enum": []string{"id_asc", "created_desc"}, "description": "default id_asc; created_desc lists newest first; keep the same sort when paging"},
 		}),
 		forward: func(a map[string]any) (string, any) {
-			return wire.PathListKeys, wire.ListKeysRequest{AfterID: str(a, "after_id"), Limit: int(num(a, "limit"))}
+			return wire.PathListKeys, wire.ListKeysRequest{AfterID: str(a, "after_id"), Limit: int(num(a, "limit")), Sort: str(a, "sort")}
 		},
 	},
 	{
@@ -447,6 +448,11 @@ func callTool(name string, args map[string]any) map[string]any {
 			}
 			if path == wire.PathListKeys && !validKeyInteger(args, "limit") {
 				return textResult("error: limit must be an integer", true)
+			}
+			if path == wire.PathListKeys {
+				if value, present := args["sort"]; present && value != "id_asc" && value != "created_desc" {
+					return textResult("error: sort must be id_asc or created_desc", true)
+				}
 			}
 			text, err := post(path, body)
 			if err == nil {

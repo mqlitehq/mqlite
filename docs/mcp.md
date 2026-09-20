@@ -63,7 +63,7 @@ models misuse them):
 | `redrive` | move dead letters back to active |
 | `purge` | permanently delete dead letters |
 | `create_key` | create a managed key (`id`, `name`, `permissions`, optional `expires_at_ms`); returns the token once |
-| `list_keys` | list public key metadata, including revoked/expired keys (`after_id`, `limit`) |
+| `list_keys` | list public key metadata, including revoked/expired keys (`after_id`, `limit`, `sort`) |
 | `revoke_key` | revoke a managed key by public `id`; repeated revocation is safe |
 
 Settlement is by `lock_token` from `receive` — delivery is at-least-once, so an agent
@@ -102,5 +102,10 @@ public ID; after an uncertain result, use `list_keys` and `revoke_key` for that 
 before issuing a replacement with a new ID. Reusing an ID returns `key_conflict`
 and cannot recover a secret. Pass `next_after_id` from `list_keys` back as
 `after_id` until the cursor is absent; the default limit is 100, maximum 1000.
+The optional `sort` is `id_asc` (default) or `created_desc` (newest-created first,
+then descending public ID for timestamp ties). Keep the same sort on every page.
+Creation-order cursors must identify an existing key, including revoked or
+expired keys. The default ID order also accepts absent predecessor IDs when
+reconciling a lost create response.
 Environment tokens are not listed or revocable through these tools. Key tools are
 unavailable when broker authentication is explicitly disabled.

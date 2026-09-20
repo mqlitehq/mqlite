@@ -24,8 +24,15 @@ type CreateKeyOptions = wire.CreateKeyRequest
 // Store Token securely: neither ListKeys nor a repeated CreateKey can recover it.
 type CreateKeyResult = wire.CreateKeyResponse
 
+// ListKeysOptions selects a metadata page. Sort is "id_asc" (the default) or
+// "created_desc" (creation time descending, then ID descending for ties).
+// Keep the same Sort when passing a page's NextAfterID as AfterID. In created_desc
+// order, AfterID must identify an existing key, including revoked or expired keys.
+type ListKeysOptions = wire.ListKeysRequest
+
 // KeyPage is a page of metadata, including revoked and expired keys. Pass
-// NextAfterID to ListKeys for the next page; an empty value marks the final page.
+// NextAfterID to the next list request with the same sort order; an empty value
+// marks the final page.
 type KeyPage = wire.ListKeysResponse
 
 // CreateKey creates a managed credential. The caller must have manage permission.
@@ -46,15 +53,21 @@ func (c *Client) CreateKey(ctx context.Context, opts CreateKeyOptions) (CreateKe
 	return result, nil
 }
 
-// ListKeys lists managed credentials without secrets. Limit defaults to 100 and
-// may not exceed 1000. Static administrator tokens are not part of this list.
+// ListKeys lists managed credentials without secrets in ascending ID order.
+// Limit defaults to 100 and may not exceed 1000. Static administrator tokens are
+// not part of this list. Use ListKeysWithOptions to list newest-created keys first.
 func (c *Client) ListKeys(ctx context.Context, afterID string, limit int) (KeyPage, error) {
-	request := wire.ListKeysRequest{AfterID: afterID, Limit: limit}
+	return c.ListKeysWithOptions(ctx, ListKeysOptions{AfterID: afterID, Limit: limit})
+}
+
+// ListKeysWithOptions lists managed metadata in the requested sort order.
+// Limit defaults to 100 and may not exceed 1000. No token or digest is returned.
+func (c *Client) ListKeysWithOptions(ctx context.Context, opts ListKeysOptions) (KeyPage, error) {
 	var raw json.RawMessage
-	if err := c.post(ctx, wire.PathListKeys, request, &raw); err != nil {
+	if err := c.post(ctx, wire.PathListKeys, opts, &raw); err != nil {
 		return KeyPage{}, err
 	}
-	return wire.DecodeListKeysResponse(raw, request)
+	return wire.DecodeListKeysResponse(raw, opts)
 }
 
 // RevokeKey permanently revokes a managed key. Repeating a successful revocation
@@ -86,9 +99,17 @@ func (e *Embedded) CreateKey(ctx context.Context, opts CreateKeyOptions) (Create
 	return CreateKeyResult{Key: wire.FromAccessKey(key), Token: token}, nil
 }
 
-// ListKeys lists managed credential metadata in the embedded database.
+// ListKeys lists managed metadata in the embedded database in ascending ID order.
 func (e *Embedded) ListKeys(ctx context.Context, afterID string, limit int) (KeyPage, error) {
-	page, err := e.eng.ListAccessKeys(ctx, afterID, limit)
+	return e.ListKeysWithOptions(ctx, ListKeysOptions{AfterID: afterID, Limit: limit})
+}
+
+// ListKeysWithOptions lists managed metadata in the requested sort order in the
+// embedded database, with the same limits and cursor rules as the HTTP client.
+func (e *Embedded) ListKeysWithOptions(ctx context.Context, opts ListKeysOptions) (KeyPage, error) {
+	page, err := e.eng.ListAccessKeysWithOptions(ctx, engine.ListAccessKeysOptions{
+		AfterID: opts.AfterID, Limit: opts.Limit, Sort: opts.Sort,
+	})
 	if err != nil {
 		return KeyPage{}, err
 	}

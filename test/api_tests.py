@@ -426,6 +426,33 @@ def t_access_keys():
             if not cursor:
                 break
         check(all(key_id in seen for key_id in created), "pagination includes every created public ID")
+        newest, cursor, previous, unique, cursors = [], "", None, set(), set()
+        while True:
+            if cursor in cursors:
+                check(False, "newest-first pagination cannot repeat a cursor")
+                break
+            cursors.add(cursor)
+            status, page = call(auth + "ListKeys", {"sort": "created_desc", "limit": 2,
+                                                    "after_id": cursor}, manager)
+            check(status == 200, "newest-first key page succeeds")
+            for key in page["keys"]:
+                order = (key["created_at_ms"], key["id"])
+                check((previous is None or order < previous) and key["id"] not in unique,
+                      "newest-first order stays strict across page boundaries")
+                previous = order
+                unique.add(key["id"])
+                newest.append(key)
+            cursor = page.get("next_after_id", "")
+            if not cursor:
+                break
+        expected = sorted((seen[key_id] for key_id in created),
+                          key=lambda key: (key["created_at_ms"], key["id"]), reverse=True)
+        check([key["id"] for key in newest if key["id"] in created] ==
+              [key["id"] for key in expected], "newest-first listing includes every issued key in creation order")
+        check(call(auth + "ListKeys", {"sort": "unknown"}, manager)[0] == 400,
+              "unsupported key sort is rejected")
+        check(call(auth + "ListKeys", {"sort": "created_desc", "after_id": secrets.token_hex(16)}, manager)[0] == 400,
+              "unknown newest-first cursor is rejected")
         check(call(auth + "RevokeKey", {"id": created[0]}, manager)[0] == 200, "managed administrator revokes producer")
         status, revoked = call(queue + "Send", payload, producer)
         check(status == 401 and revoked.get("code") == "unauthenticated", "revoked key rejected on next request")

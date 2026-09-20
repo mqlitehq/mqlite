@@ -117,14 +117,24 @@ authentication enabled.
 | Method | Request | Response |
 |---|---|---|
 | `CreateKey` | `id`, `name`, `permissions`, optional `expires_at_ms` | `{"key": <AccessKey>, "token": "mqk_…"}` |
-| `ListKeys` | optional `after_id`, `limit` | `{"keys": [<AccessKey>], "next_after_id": "…"}`; cursor omitted at the end |
+| `ListKeys` | optional `after_id`, `limit`, `sort` | `{"keys": [<AccessKey>], "next_after_id": "…"}`; cursor omitted at the end |
 | `RevokeKey` | `id` | `{"ok": true}`; already revoked records succeed again |
 
 `AccessKey` metadata contains `id`, `name`, `permissions`, `created_at_ms`,
 `expires_at_ms` and `revoked_at_ms`. Zero expiry means no expiry; zero revocation
 time means not revoked. Expired and revoked records remain visible to managers.
-Metadata never contains a token or its digest. Lists include only database keys,
-ordered by ID; limit defaults to 100 and cannot exceed 1000.
+Metadata never contains a token or its digest. Lists include only managed keys;
+limit defaults to 100 and cannot exceed 1000. Omitted or empty `sort` means
+`id_asc` (public ID ascending). Use `sort: "created_desc"` for newest first:
+creation time descending, then public ID descending for equal timestamps.
+
+Pass the previous page's `next_after_id` as `after_id`, retaining the same sort.
+For `created_desc`, the cursor must identify an existing key; an unknown cursor
+or unsupported sort returns `400 invalid_argument`. Revocation and expiry do not
+remove records or change their position. Return to the first page to see records
+newer than the current cursor. Pagination is not a snapshot of concurrent inserts.
+The `id_asc` mode also accepts a valid ID that is not present, which supports
+looking up a retained creation ID using its immediate predecessor and `limit: 1`.
 
 Before creation, generate and retain a public ID: exactly 32 lowercase hexadecimal
 characters representing 128 random bits. The SDK provides `GenerateKeyID()`; the

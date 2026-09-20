@@ -235,22 +235,27 @@ func (d *db) initSchema(ctx context.Context) error {
 }
 
 func (d *db) validateAccessKeySchema(ctx context.Context) error {
-	var kind, ddl string
-	err := d.queryRowScan(ctx, []any{&kind, &ddl}, `SELECT type, sql FROM sqlite_master WHERE name = 'access_keys' COLLATE NOCASE`)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("check access key schema: %w", err)
-	}
 	// SQLite drops IF NOT EXISTS when recording the statement. Compare the entire
 	// canonical definition (including STRICT, checks and unique constraints), not
 	// just column names: accepting weakened constraints would weaken authentication.
 	normalize := func(s string) string {
 		return strings.Join(strings.Fields(strings.Replace(s, " IF NOT EXISTS", "", 1)), " ")
 	}
-	if kind != "table" || normalize(ddl) != normalize(accessKeySchema) {
-		return fmt.Errorf("%w: existing access_keys object does not match the access key schema; move the conflicting application object before opening this database", ErrSchemaVersionMismatch)
+	for _, object := range []struct{ name, kind, ddl string }{
+		{"access_keys", "table", accessKeySchema},
+		{"idx_access_keys_created", "index", accessKeyCreatedIndex},
+	} {
+		var kind, ddl string
+		err := d.queryRowScan(ctx, []any{&kind, &ddl}, `SELECT type, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE`, object.name)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("check access key schema: %w", err)
+		}
+		if kind != object.kind || normalize(ddl) != normalize(object.ddl) {
+			return fmt.Errorf("%w: existing %s object does not match the access key schema; move the conflicting application object before opening this database", ErrSchemaVersionMismatch, object.name)
+		}
 	}
 	return nil
 }
