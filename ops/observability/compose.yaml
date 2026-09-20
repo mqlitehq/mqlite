@@ -1,0 +1,103 @@
+name: mqlite-observability-032
+
+services:
+  mqlite:
+    image: mqlite-observability:local
+    platform: linux/amd64
+    build:
+      context: ../..
+      platforms: [linux/amd64]
+    user: "${OBS_UID:?Run python3 init.py}:${OBS_GID:?Run python3 init.py}"
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /etc/mqlite/start.sh]
+    environment:
+      MQLITE_DB: file:/data/mq.db
+      MQLITE_ADDR: :6754
+      MQLITE_UI: "1"
+      MQLITE_CORS: off
+    ports:
+      - "127.0.0.1:${MQLITE_OBS_PORT:-17654}:6754"
+    volumes:
+      - ${OBS_DATA_DIR:?Run python3 init.py}/mqlite:/data
+      - ./start-broker.sh:/etc/mqlite/start.sh:ro
+    secrets:
+      - admin_token
+      - monitor_token
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:6754/healthz]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  prometheus:
+    # Prometheus LTS, verified against the official release and registry manifest.
+    image: prom/prometheus:v3.13.3@sha256:6976aa8a60fec930796ce5772b8d12da7a318a5daa8d40d69c5c7819a05eeed7
+    platform: linux/amd64
+    user: "${OBS_UID:?Run python3 init.py}:${OBS_GID:?Run python3 init.py}"
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=1GB
+    ports:
+      - "127.0.0.1:${PROMETHEUS_OBS_PORT:-19190}:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - ${OBS_DATA_DIR:?Run python3 init.py}/prometheus:/prometheus
+    secrets:
+      - monitor_token
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      mqlite:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:9090/-/ready]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  grafana:
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
+    platform: linux/amd64
+    user: "${OBS_UID:?Run python3 init.py}:${OBS_GID:?Run python3 init.py}"
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_LOG_MODE: console
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/mqlite.json
+    ports:
+      - "127.0.0.1:${GRAFANA_OBS_PORT:-13000}:3000"
+    volumes:
+      - ${OBS_DATA_DIR:?Run python3 init.py}/grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    secrets:
+      - grafana_admin
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:3000/api/health]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+secrets:
+  admin_token:
+    file: ${OBS_DATA_DIR:?Run python3 init.py}/secrets/admin.token
+  monitor_token:
+    file: ${OBS_DATA_DIR:?Run python3 init.py}/secrets/monitor.token
+  grafana_admin:
+    file: ${OBS_DATA_DIR:?Run python3 init.py}/secrets/grafana-admin.token

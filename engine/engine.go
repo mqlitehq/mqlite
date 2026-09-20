@@ -37,11 +37,7 @@ type Engine struct {
 	filterMu    sync.Mutex              // guards filterCache
 	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
 
-	// processed counts lifetime Completed messages per queue — in-process and
-	// rough: it resets on restart (no durable store, no schema change). Exposed
-	// as the mqlite_messages_completed_total counter; Prometheus rate()/increase()
-	// absorb the restart reset. Zero value is ready; values are *atomic.Uint64. (MQLITE-54)
-	processed sync.Map
+	observation observations
 }
 
 // Options configures Open.
@@ -112,6 +108,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		qcache:      map[string]queueRow{},
 		filterCache: map[string]*filterEntry{},
 		maxMsgBytes: maxMsg,
+		observation: observations{started: nowFn(), background: !opts.DisableBackground},
 		dlqMaxAgeMs: opts.DLQMaxAgeMs,
 		dlqMaxCount: opts.DLQMaxCount,
 		dlqMaxBytes: opts.DLQMaxBytes,
@@ -123,7 +120,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	// the reaper (MQLITE-58): a message that died on its LAST allowed attempt is
 	// dead-lettered here, not redelivered an (max+1)th time — max_delivery_count
 	// is a bound on deliveries, not on deliveries-without-a-crash.
-	if _, err := e.db.exec(ctx, `
+	if err := e.mutateMessages(ctx, "recovered", `
 		UPDATE messages SET
 		    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                 THEN 'dead_lettered' ELSE 'active' END,
@@ -211,6 +208,7 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	e.qmu.Lock()
 	delete(e.qcache, name)
 	e.qmu.Unlock()
+	e.rememberQueue(name)
 	return nil
 }
 
@@ -395,6 +393,7 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 	e.qmu.Lock()
 	delete(e.qcache, name)
 	e.qmu.Unlock()
+	e.rememberQueue(name)
 	// A re-subscribe may have changed the filter — drop any cached program so the
 	// next publish recompiles from the freshly stored expression.
 	e.invalidateFilter(name)
@@ -565,6 +564,8 @@ func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	} else {
+		e.recordMessage(queue, "canceled", n)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -107,6 +108,14 @@ func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		et := &EngineTx{e: e, tx: tx, ctx: ctx, now: e.now(), woke: map[string]bool{}}
 		if err := fn(et); err != nil {
+			// An arbitrary application callback error is a rollback, not evidence of
+			// storage failure. Retain database errors observed by MQLite's guarded SQL.
+			// SQL() bypasses those guards; its caller-owned statements are not instrumented.
+			if errors.Is(err, sql.ErrNoRows) || tx.statementError == nil || !errors.Is(err, tx.statementError) {
+				if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
+					a.callbackRejected.Store(true)
+				}
+			}
 			return err
 		}
 		woke = et.woke

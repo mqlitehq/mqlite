@@ -129,13 +129,20 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 
 	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		if !crossQueue {
-			_, err := tx.ExecContext(ctx, `
+			res, err := tx.ExecContext(ctx, `
 				UPDATE messages SET state='active', delivery_count=0, lock_token=NULL,
 				    locked_until=0, visible_at=0, dead_letter_reason=NULL, dead_letter_description=NULL
 				 WHERE id IN `+inClause, ids...)
+			if err == nil {
+				n, _ := res.RowsAffected()
+				tx.record(dlq, "redriven", n)
+			}
 			return err
 		}
 		for _, r := range batch {
+			if r.body == nil {
+				r.body = []byte{}
+			} // Preserve a legal empty BLOB, never bind SQL NULL.
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO messages
 				  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
@@ -145,7 +152,12 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 				return err
 			}
 		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE id IN `+inClause, ids...)
+		res, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE id IN `+inClause, ids...)
+		if err == nil {
+			n, _ := res.RowsAffected()
+			tx.record(dlq, "redriven", n)
+			tx.record(target, "enqueued", int64(len(batch)))
+		}
 		return err
 	})
 }
@@ -177,5 +189,6 @@ func (e *Engine) Purge(ctx context.Context, queue string, opts RedriveOptions) (
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	e.recordMessage(queue, "purged", n)
 	return int(n), nil
 }

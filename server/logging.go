@@ -18,7 +18,10 @@ func (s *Server) logging(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		rec, ok := w.(*statusRecorder)
+		if !ok {
+			rec = &statusRecorder{ResponseWriter: w, status: http.StatusOK, logging: true}
+		}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
 
@@ -47,9 +50,12 @@ func (s *Server) logging(next http.Handler) http.Handler {
 // fields handlers append (logf) and the error code (writeErr).
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
-	kv     []any // key/value pairs appended to the access-log line
-	quiet  bool  // log at Debug even on success (empty Receive)
+	status  int
+	kv      []any // key/value pairs appended to the access-log line
+	quiet   bool  // log at Debug even on success (empty Receive)
+	code    string
+	auth    string
+	logging bool
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
@@ -61,7 +67,7 @@ func (r *statusRecorder) WriteHeader(code int) {
 // is the logging recorder (i.e. Server.Logger is configured), so handlers may call it
 // unconditionally on the hot path — the cost is one type assertion plus a slice append.
 func logf(w http.ResponseWriter, kv ...any) {
-	if rec, ok := w.(*statusRecorder); ok {
+	if rec, ok := w.(*statusRecorder); ok && rec.logging {
 		rec.kv = append(rec.kv, kv...)
 	}
 }

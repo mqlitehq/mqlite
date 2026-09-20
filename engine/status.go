@@ -38,19 +38,12 @@ func (e *Engine) Status(ctx context.Context) Status {
 		s.Backend = "local file"
 		path := strings.TrimPrefix(dsn, "file:")
 		s.Location = path
-		s.SizeBytes = localFootprint(path)
 	}
 
-	t0 := time.Now()
-	var one int
-	// queryRowScan, not e.db.sql: Status is reachable from an HTTP handler, so its ctx carries the
-	// request deadline — and the one thing that must never happen on a local store is a statement
-	// cut off in flight (round-6 §4).
-	if err := e.db.queryRowScan(ctx, []any{&one}, "SELECT 1"); err != nil {
-		s.PingMs = -1
-	} else {
-		s.PingMs = time.Since(t0).Milliseconds()
-	}
+	runtime, pingMs := e.runtimeObservation(ctx)
+	s.PingMs = pingMs
+	s.SizeBytes = runtime.DBSizeBytes
+
 	return s
 }
 
@@ -69,14 +62,45 @@ func redactRemoteDSN(dsn string) string {
 	return u.Scheme + "://***"
 }
 
-// localFootprint sums the on-disk bytes a local DB occupies: the main file plus the WAL
-// and shared-memory sidecars when present.
-func localFootprint(path string) int64 {
-	var total int64
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if fi, err := os.Stat(path + suffix); err == nil {
-			total += fi.Size()
+// RuntimeObservation holds the same probe used by legacy Status, without its
+// administrative location. Durations retain monotonic sub-millisecond precision.
+type RuntimeObservation struct {
+	SchemaVersion   string  `json:"schema_version"`
+	PingSeconds     float64 `json:"ping_seconds"`
+	ReadAvailable   bool    `json:"read_available"`
+	DBSizeBytes     int64   `json:"db_size_bytes"`
+	DBSizeAvailable bool    `json:"db_size_available"`
+}
+
+func (e *Engine) runtimeObservation(ctx context.Context) (RuntimeObservation, int64) {
+	r := RuntimeObservation{SchemaVersion: schemaVersion}
+	if !e.db.remote {
+		if path, ok := localFilePath(e.db.dsn); ok {
+			r.DBSizeBytes, r.DBSizeAvailable = localFootprintObservation(path)
 		}
 	}
-	return total
+	start := time.Now()
+	var one int
+	if err := e.db.queryRowScan(ctx, []any{&one}, "SELECT 1"); err != nil {
+		return r, -1
+	}
+	elapsed := time.Since(start)
+	r.ReadAvailable = true
+	r.PingSeconds = elapsed.Seconds()
+	return r, elapsed.Milliseconds()
+}
+
+func localFootprintObservation(path string) (int64, bool) {
+	var total int64
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		fi, err := os.Stat(path + suffix)
+		if err != nil {
+			if suffix != "" && os.IsNotExist(err) {
+				continue
+			}
+			return 0, false
+		}
+		total += fi.Size()
+	}
+	return total, true
 }

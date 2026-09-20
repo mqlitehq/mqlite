@@ -1,0 +1,97 @@
+# Example operating thresholds. Tune ages, volumes and hold times to your workload.
+groups:
+  - name: mqlite
+    rules:
+      - alert: MQLiteScrapeUnavailable
+        expr: up{job="mqlite"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: MQLite metrics cannot be scraped
+          description: Check the broker, network and monitor credential. Missing data is not an empty queue.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#scrape-or-collection-failure
+      - alert: MQLiteCollectionUnavailable
+        expr: mqlite_collection_success{job="mqlite"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: MQLite queue snapshot collection failed
+          description: Process metrics may remain available while storage cannot be read. Queue gauges are omitted.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#scrape-or-collection-failure
+      - alert: MQLiteCollectionStale
+        expr: time() - mqlite_collection_last_success_timestamp_seconds{job="mqlite"} > 60
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: MQLite has no recent successful queue snapshot
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#scrape-or-collection-failure
+      - alert: MQLiteUnexpectedRetainedState
+        expr: mqlite_queue_unexpected_messages{job="mqlite"} > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: MQLite retains messages outside the normal five states
+          description: Preserve evidence and inspect storage; do not delete rows merely to silence the alert.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#queue-backlog-and-dead-letters
+      - alert: MQLiteBacklogAge
+        expr: mqlite_queue_oldest_message_age_seconds{job="mqlite"} > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Oldest active or locked message exceeds five minutes
+          description: Check consumers, leases, ordering and workload SLA; this is not ready-only waiting time.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#queue-backlog-and-dead-letters
+      - alert: MQLiteDeadLettersPresent
+        expr: mqlite_queue_messages{job="mqlite",state="dead_lettered"} > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: MQLite retains dead-lettered messages
+          description: Inspect reasons before redrive. Retention or purge may reduce depth while failures continue.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#queue-backlog-and-dead-letters
+      - alert: MQLiteAuthenticationFailures
+        expr: sum by (instance) (increase(mqlite_authentication_total{job="mqlite",outcome!="success"}[5m])) > 10
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: Repeated MQLite authentication or authorization failures
+          description: Inspect the bounded outcome categories and client configuration without exposing credentials.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#authentication-and-integration
+      - alert: MQLiteStorageReadUnavailable
+        expr: mqlite_storage_read_available{job="mqlite"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: MQLite cannot complete its storage read probe
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#storage-and-maintenance
+      - alert: MQLiteStorageOutcomeUnknown
+        expr: sum by (instance) (increase(mqlite_storage_operations_total{job="mqlite",outcome="outcome_unknown"}[5m])) > 0
+        for: 30s
+        labels: {severity: warning}
+        annotations:
+          summary: A MQLite storage operation has an uncertain outcome
+          description: Reconcile application identity or idempotency receipts; do not assume rollback and blindly resend.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#storage-and-maintenance
+      - alert: MQLiteMaintenanceErrors
+        expr: sum by (instance, task) (increase(mqlite_maintenance_runs_total{job="mqlite",outcome="error"}[5m])) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: MQLite background maintenance is failing
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#storage-and-maintenance
+      - alert: MQLiteMaintenanceStale
+        expr: (time() - mqlite_maintenance_last_success_timestamp_seconds{job="mqlite",task=~"locks|scheduled|ttl|dedup|receipts|retention"} > 180) and on (instance, task) (mqlite_maintenance_enabled{job="mqlite"} == 1)
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: An enabled MQLite maintenance task has no recent successful pass
+          description: This rule excludes tasks without a periodic heartbeat contract.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#storage-and-maintenance
+      - alert: MQLiteFilterFailures
+        expr: increase(mqlite_filter_failures_total{job="mqlite"}[5m]) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: MQLite routing filter compilation or evaluation failed
+          description: Normal false filter results are not errors. Review the filter and expected message schema.
+          runbook_url: https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md#queue-backlog-and-dead-letters

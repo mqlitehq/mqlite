@@ -185,7 +185,7 @@ func TestUsageListsAllCommands(t *testing.T) {
 	for _, cmd := range []string{
 		"serve", "create-queue", "subscribe", "send", "schedule", "cancel", "receive",
 		"receive-deferred", "complete", "abandon", "reject", "defer", "renew", "peek",
-		"metrics", "status", "list", "list-subscriptions", "test-filter", "redrive",
+		"metrics", "status", "observe", "list", "list-subscriptions", "test-filter", "redrive",
 		"purge-dlq", "vacuum",
 	} {
 		if !strings.Contains(out, cmd) {
@@ -213,6 +213,7 @@ func TestExactArity(t *testing.T) {
 		{"subscribe", cmdCreateSubscription, []string{"topic", "sub", "extra"}},
 		{"peek", cmdPeek, []string{"q", "extra"}},
 		{"metrics", cmdMetrics, []string{"q", "extra"}},
+		{"observe", cmdObserve, []string{"extra"}},
 		{"list", cmdList, []string{"extra"}},
 		{"vacuum", cmdVacuum, []string{"extra"}},
 		{"redrive", cmdRedrive, []string{"q", "extra"}},
@@ -704,5 +705,38 @@ func TestKeyCreateLostResponseRetainsGeneratedID(t *testing.T) {
 	id := <-ids
 	if err == nil || len(id) != 32 || !strings.Contains(err.Error(), id) || out != "" {
 		t.Fatalf("lost response: ID=%q, calls=%d, output bytes=%d, error=%v", id, calls, len(out), err)
+	}
+}
+
+// Observe always emits the canonical response, including explicit unavailable domains.
+func TestCLIObserveContract(t *testing.T) {
+	embeddedEnv(t)
+	for _, args := range [][]string{nil, {"--output", "json"}} {
+		out, err := captureStdout(t, func() error { return cmdObserve(context.Background(), args) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		value, err := wire.DecodeObserveResponse([]byte(out))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value.Access != "embedded" || value.HTTP.State != "not_applicable" || value.Collection.State != "available" {
+			t.Fatalf("unexpected canonical response: %s", out)
+		}
+	}
+	for _, tc := range []struct {
+		env, admins string
+		valid       bool
+	}{
+		{"", "", true}, {" monitor-a, monitor-b ", "admin", true}, {", ,", "admin", false},
+		{"monitor", "", false}, {"admin", "admin", false},
+	} {
+		tokens, err := resolveMonitorTokens(tc.env, tc.admins)
+		if (err == nil) != tc.valid {
+			t.Fatalf("monitor configuration validity = %v, want %v", err, tc.valid)
+		}
+		if err == nil && tc.env != "" && len(tokens) != 2 {
+			t.Fatalf("parsed monitors: %d", len(tokens))
+		}
 	}
 }

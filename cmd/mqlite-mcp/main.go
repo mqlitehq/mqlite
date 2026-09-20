@@ -267,6 +267,11 @@ func strArr(a map[string]any, key string) []string {
 
 var tools = []tool{
 	{
+		name: "observe", desc: "Observe broker health and counters (monitor or manage).",
+		schema:  keyObj(map[string]any{}),
+		forward: func(a map[string]any) (string, any) { return wire.PathObserve, wire.ObserveRequest{} },
+	},
+	{
 		name: "list_queues", desc: "List all queues and subscriptions.",
 		schema:  obj(map[string]any{}),
 		forward: func(a map[string]any) (string, any) { return wire.PathListQueues, wire.Empty{} },
@@ -429,6 +434,9 @@ func callTool(name string, args map[string]any) map[string]any {
 			if creating && !authkey.ValidID(create.ID) {
 				return textResult("error: key id must be 32 lowercase hexadecimal characters", true)
 			}
+			if path == wire.PathObserve && len(args) != 0 {
+				return textResult("error: observe takes no arguments", true)
+			}
 			if creating || path == wire.PathListKeys || path == wire.PathRevokeKey {
 				// Validate against the published schema itself. In particular, a
 				// misspelled expiry must not silently create a non-expiring key.
@@ -458,6 +466,8 @@ func callTool(name string, args map[string]any) map[string]any {
 			if err == nil {
 				var validated any
 				switch request := body.(type) {
+				case wire.ObserveRequest:
+					validated, err = wire.DecodeObserveResponse([]byte(text))
 				case wire.CreateKeyRequest:
 					validated, err = wire.DecodeCreateKeyResponse([]byte(text), request)
 					if err != nil {
@@ -513,9 +523,12 @@ func post(path string, body any) (string, error) {
 	}
 	defer resp.Body.Close()
 	var rb []byte
-	if path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey {
+	switch path {
+	case wire.PathCreateKey, wire.PathListKeys, wire.PathRevokeKey:
 		rb, err = wire.ReadKeyResponse(resp.Body)
-	} else {
+	case wire.PathObserve:
+		rb, err = wire.ReadObserveResponse(resp.Body)
+	default:
 		rb, err = io.ReadAll(resp.Body)
 	}
 	if err != nil {

@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/version"
 	"github.com/mqlitehq/mqlite/server"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // Embedded runs the queue engine in-process (like goqite), exposing the same
@@ -333,24 +335,23 @@ func (e *Embedded) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (
 // Client.Status). Version is empty and UptimeMs/Auth are zero-valued — an in-process engine
 // has no broker build stamp, no process uptime and no auth; queue/subscription counts are live.
 func (e *Embedded) Status(ctx context.Context) (StatusInfo, error) {
-	s := e.eng.Status(ctx)
+	s, queues, subscriptions := e.eng.RuntimeStatus(ctx)
 	info := StatusInfo{
 		Backend: s.Backend, Remote: s.Remote, Location: s.Location,
 		SchemaVersion: s.SchemaVersion, PingMs: s.PingMs, DBSizeBytes: s.SizeBytes,
+		Queues: queues, Subscriptions: subscriptions,
 	}
-	if qs, err := e.eng.ListQueues(ctx); err == nil {
-		// Exclude subscription backing queues from the queue count so embedded status
-		// matches what the broker's /status reports (queues vs subscriptions are disjoint).
-		for _, q := range qs {
-			if q.Kind != "subscription" {
-				info.Queues++
-			}
-		}
-	}
-	if ss, err := e.eng.ListSubscriptions(ctx); err == nil {
-		info.Subscriptions = len(ss)
-	}
+
 	return info, nil
+}
+
+// Observe samples the same canonical observation as the broker. HTTP measurements
+// are explicitly not applicable to an in-process engine.
+func (e *Embedded) Observe(ctx context.Context) (Observation, error) {
+	return Observation{
+		ObservabilitySnapshot: e.eng.Observability(ctx), Access: "embedded", Version: version.Version,
+		HTTP: wire.HTTPObservation{State: "not_applicable", Requests: []wire.RequestObservation{}, Authentication: []wire.AuthenticationObservation{}, HandlerLatency: []wire.RPCLatencyObservation{}},
+	}, nil
 }
 
 // ListSubscriptions returns every subscription with its topic and filter expression.
@@ -386,12 +387,13 @@ func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 // ── serve: upgrade in-process engine to a network broker ─────────────────────
 
 type serveConfig struct {
-	tokens    []string
-	version   string
-	cors      string
-	reqLogger *slog.Logger
-	ui        bool
-	ready     func()
+	tokens        []string
+	monitorTokens []string
+	version       string
+	cors          string
+	reqLogger     *slog.Logger
+	ui            bool
+	ready         func()
 }
 
 // ServeOption configures Serve.
@@ -406,6 +408,13 @@ func WithVersion(v string) ServeOption {
 // WithTokens sets the accepted Bearer tokens for the broker.
 func WithTokens(tokens ...string) ServeOption {
 	return func(c *serveConfig) { c.tokens = append(c.tokens, tokens...) }
+}
+
+// WithMonitorTokens adds configured read-only credentials for Observe and /metrics.
+// Serve rejects blank credentials, overlap with administrators, or disabled auth.
+// These credentials can authenticate during a storage outage without a DB lookup.
+func WithMonitorTokens(tokens ...string) ServeOption {
+	return func(c *serveConfig) { c.monitorTokens = append(c.monitorTokens, tokens...) }
 }
 
 // WithTokenCSV sets accepted Bearer tokens from a comma-separated string (env-friendly).
@@ -454,7 +463,12 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	for _, o := range opts {
 		o(&sc)
 	}
+	if err := server.ValidateMonitorTokens(sc.tokens, sc.monitorTokens); err != nil {
+		return err
+	}
+
 	srv := server.New(e.eng, sc.tokens)
+	srv.MonitorTokens = append([]string(nil), sc.monitorTokens...)
 	srv.Version = sc.version
 	srv.CORS = sc.cors
 	srv.Logger = sc.reqLogger

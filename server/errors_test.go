@@ -238,6 +238,7 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 		{"/mqlite.v1.AdminService/Redrive", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Purge", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Status", engine.KeyManage},
+		{"/mqlite.v1.AdminService/Observe", engine.KeyManage},
 		{"/mqlite.v1.AuthService/CreateKey", engine.KeyManage},
 		{"/mqlite.v1.AuthService/ListKeys", engine.KeyManage},
 		{"/mqlite.v1.AuthService/RevokeKey", engine.KeyManage},
@@ -255,7 +256,7 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 	if !reflect.DeepEqual(card.Endpoints, paths) {
 		t.Fatalf("complete route inventory drift:\n got %v\nwant %v", card.Endpoints, paths)
 	}
-	for _, identity := range []string{"anonymous", "invalid", "send", "listen", "send+listen", "manage", "static", "expired", "revoked", "auth-off"} {
+	for _, identity := range []string{"anonymous", "invalid", "send", "listen", "send+listen", "manage", "static", "monitor", "expired", "revoked", "auth-off"} {
 		for _, route := range routes {
 			t.Run(identity+"/"+route.path, func(t *testing.T) {
 				ctx := context.Background()
@@ -388,6 +389,10 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 					tokens = nil
 				}
 				srv := server.New(eng, tokens)
+				if identity == "monitor" {
+					srv.MonitorTokens = []string{"monitor"}
+					token = "monitor"
+				}
 				srv.CORS = "*"
 				rec := keyTestRequest(srv.Handler(), http.MethodPost, route.path, token, body)
 				want, code := http.StatusOK, ""
@@ -396,6 +401,10 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 					want, code = http.StatusUnauthorized, "unauthenticated"
 				case "auth-off":
 					if strings.HasPrefix(route.path, "/mqlite.v1.AuthService/") {
+						want, code = http.StatusForbidden, "permission_denied"
+					}
+				case "monitor":
+					if route.path != wire.PathObserve && route.path != "/metrics" {
 						want, code = http.StatusForbidden, "permission_denied"
 					}
 				default:

@@ -129,6 +129,32 @@ func TestTursoIntegration(t *testing.T) {
 	if mt.Total != 0 {
 		t.Fatalf("queue should be drained, got %+v", mt)
 	}
+	snapshot := e.Observability(ctx)
+	if snapshot.Collection.State != "available" || snapshot.Backend != "remote" || !snapshot.Runtime.ReadAvailable || snapshot.Runtime.DBSizeAvailable || snapshot.Storage.Pool.MaxOpen != 4 {
+		t.Fatalf("remote observation unavailable: collection=%+v runtime=%+v", snapshot.Collection, snapshot.Runtime)
+	}
+	var observedQueue bool
+	for _, row := range snapshot.Queues {
+		if row.Queue == q {
+			observedQueue = true
+			if row.Metrics != mt {
+				t.Fatalf("remote native stats and observation differ: %+v %+v", row.Metrics, mt)
+			}
+		}
+	}
+	if !observedQueue {
+		t.Fatal("remote observation omitted owned queue")
+	}
+	own := map[string]uint64{}
+	for _, event := range snapshot.Messages {
+		if event.Queue == q {
+			own[event.Event] = event.Count
+		}
+	}
+	if own["enqueued"] != 2 || own["delivered"] != 3 || own["redelivered"] != 1 || own["completed"] != 2 || own["abandoned"] != 1 {
+		t.Fatalf("remote committed effects differ: %+v", own)
+	}
+	t.Log("Turso canonical observation OK: batched gauges, committed events, runtime probe and pool verified")
 	t.Logf("Turso integration OK: round-trip + abandon/redeliver + drain verified")
 }
 

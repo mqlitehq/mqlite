@@ -158,6 +158,9 @@ func (e *Engine) filterAccepts(t target, m OutMessage, enqueuedAtMs, visibleAtMs
 		return true // plain queue or no filter
 	}
 	if t.entry.err != nil {
+		e.observation.mu.Lock()
+		e.observation.filters[0]++
+		e.observation.mu.Unlock()
 		e.log.Error("subscription filter failed to compile; routing skipped (fail-closed)",
 			"subscription", t.name, "error", t.entry.err)
 		return false
@@ -176,6 +179,9 @@ func (e *Engine) filterAccepts(t target, m OutMessage, enqueuedAtMs, visibleAtMs
 	}
 	ok, err := evalFilter(t.entry.prog, env)
 	if err != nil {
+		e.observation.mu.Lock()
+		e.observation.filters[1]++
+		e.observation.mu.Unlock()
 		e.log.Error("subscription filter evaluation failed; routing skipped (fail-closed)",
 			"subscription", t.name, "expr", t.entry.expr, "error", err)
 		return false

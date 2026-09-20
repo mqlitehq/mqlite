@@ -1,0 +1,15 @@
+# Merge this job into an existing Prometheus configuration. Replace the DNS name
+# and mount a dedicated monitor credential; do not start a second MQLite writer.
+scrape_configs:
+  - job_name: mqlite
+    scheme: https
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/mqlite-monitor.token
+    static_configs:
+      - targets: [mqlite.internal.example:443]
+    # For a private CA, set tls_config.ca_file to its mounted certificate file.
+    # Do not use insecure_skip_verify.

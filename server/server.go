@@ -27,6 +27,9 @@ type Server struct {
 	CORS    string       // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
 	Logger  *slog.Logger // per-request access log; nil -> no request logging (see logging.go)
 	UI      bool         // serve the embedded admin console at /ui (see console.go)
+	// MonitorTokens grants only Observe and /metrics. Configure before Handler is
+	// used. These credentials never consult the database and cannot manage keys.
+	MonitorTokens []string
 	// MaxBodyBytes bounds any single RPC request body BEFORE JSON decoding
 	// (review F8): without it a multi-GB body OOMs the broker before the
 	// per-message MaxMessageBytes check ever runs. Bodies are base64 (x4/3) and
@@ -35,6 +38,7 @@ type Server struct {
 	// smallest supported deployment's RAM. Over the cap -> 413 message_too_large.
 	MaxBodyBytes int64
 	rpcLat       *rpcLatency // per-RPC latency histogram, exposed at /metrics (see rpchist.go)
+	transport    transportMetrics
 	started      time.Time
 	// rpcPaths is every RPC route, collected as routes() registers them, so the "/"
 	// discovery card enumerates exactly what is actually served — it can't drift from
@@ -58,7 +62,45 @@ func New(eng *engine.Engine, tokens []string) *Server {
 
 // Handler returns the HTTP handler: CORS (outermost, so preflight bypasses auth) wrapping
 // the optional request log, Bearer-token auth, the RPC-latency observer, and the route mux.
-func (s *Server) Handler() http.Handler { return s.cors(s.logging(s.auth(s.observe(s.mux)))) }
+func (s *Server) Handler() http.Handler {
+	admins := make([]string, 0, len(s.tokens))
+	for token := range s.tokens {
+		admins = append(admins, token)
+	}
+	if err := ValidateMonitorTokens(admins, s.MonitorTokens); err != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeErr(w, http.StatusInternalServerError, "internal", "invalid monitoring credential configuration")
+		})
+	}
+	return s.cors(s.observeRequests(s.logging(s.auth(s.observe(s.mux)))))
+}
+
+// ValidateMonitorTokens rejects ambiguous or ineffective monitoring credentials.
+// Errors describe configuration only and never contain a credential value.
+func ValidateMonitorTokens(admins, monitors []string) error {
+	if len(monitors) == 0 {
+		return nil
+	}
+	adminSet := make(map[string]bool)
+	for _, token := range admins {
+		if token = strings.TrimSpace(token); token != "" {
+			adminSet[token] = true
+		}
+	}
+	if len(adminSet) == 0 {
+		return errors.New("monitor credentials require administrator authentication")
+	}
+	for _, token := range monitors {
+		token = strings.TrimSpace(token)
+		if token == "" || strings.ContainsAny(token, " \t\r\n,") {
+			return errors.New("monitor credentials must be nonempty Bearer tokens")
+		}
+		if adminSet[token] {
+			return errors.New("monitor and administrator credentials must be distinct")
+		}
+	}
+	return nil
+}
 
 func (s *Server) routes() {
 	h := func(path string, permission engine.KeyPermissions, fn http.HandlerFunc) {
@@ -87,6 +129,7 @@ func (s *Server) routes() {
 	h(wire.PathRedrive, engine.KeyManage, s.handleRedrive)
 	h(wire.PathPurge, engine.KeyManage, s.handlePurge)
 	h(wire.PathStatus, engine.KeyManage, s.handleStatus)
+	h(wire.PathObserve, monitorPermission, s.handleObserve)
 	h(wire.PathCreateKey, engine.KeyManage, s.authEnabled(s.handleCreateKey))
 	h(wire.PathListKeys, engine.KeyManage, s.authEnabled(s.handleListKeys))
 	h(wire.PathRevokeKey, engine.KeyManage, s.authEnabled(s.handleRevokeKey))
@@ -99,7 +142,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.handleIndex)
 	// Prometheus metrics: per-queue gauges. Behind auth like the RPCs (a scraper
 	// passes the Bearer token); only /healthz stays open for liveness.
-	s.mux.HandleFunc("/metrics", s.authorize(engine.KeyManage, s.handleMetrics))
+	s.mux.HandleFunc("/metrics", s.authorize(monitorPermission, s.handleMetrics))
 	// Embedded admin console (the built mqlite-web SPA) at /ui, when Server.UI is on
 	// (MQLITE_UI). The static page is open; its API calls carry the Bearer token.
 	s.mux.Handle("/ui/", s.console())
@@ -125,7 +168,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		version = "dev"
 	}
 	auth := "none" // auth off -> RPCs are open (dev/loopback)
-	if len(s.tokens) > 0 {
+	if s.authenticationEnabled() {
 		auth = "bearer"
 	}
 	card := wire.DiscoveryCard{
@@ -145,65 +188,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, card)
 }
 
-// handleMetrics exposes per-queue counters in Prometheus text format (MQLITE-5).
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	queues, err := s.eng.ListQueues(r.Context())
-	if err != nil {
-		http.Error(w, "metrics: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	type qm struct {
-		name string
-		m    engine.Metrics
-	}
-	stats := make([]qm, 0, len(queues))
-	for _, q := range queues {
-		m, err := s.eng.Stats(r.Context(), q.Name)
-		if err != nil {
-			http.Error(w, "metrics: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		stats = append(stats, qm{q.Name, m})
-	}
-
-	var b strings.Builder
-	b.WriteString("# HELP mqlite_queue_messages Messages in a queue by state.\n")
-	b.WriteString("# TYPE mqlite_queue_messages gauge\n")
-	for _, st := range stats {
-		for _, sv := range []struct {
-			state string
-			n     int64
-		}{
-			{"active", st.m.Active}, {"locked", st.m.Locked}, {"deferred", st.m.Deferred},
-			{"scheduled", st.m.Scheduled}, {"dead_lettered", st.m.DeadLettered},
-		} {
-			fmt.Fprintf(&b, "mqlite_queue_messages{queue=%q,state=%q} %d\n", st.name, sv.state, sv.n)
-		}
-	}
-	b.WriteString("# HELP mqlite_queue_total Total messages in a queue.\n")
-	b.WriteString("# TYPE mqlite_queue_total gauge\n")
-	for _, st := range stats {
-		fmt.Fprintf(&b, "mqlite_queue_total{queue=%q} %d\n", st.name, st.m.Total)
-	}
-	b.WriteString("# HELP mqlite_queue_oldest_message_age_ms Age of the oldest active or locked message in a queue, in milliseconds.\n")
-	b.WriteString("# TYPE mqlite_queue_oldest_message_age_ms gauge\n")
-	for _, st := range stats {
-		fmt.Fprintf(&b, "mqlite_queue_oldest_message_age_ms{queue=%q} %d\n", st.name, st.m.OldestMessageAgeMs)
-	}
-	// Lifetime completed messages per queue — a running count that survives the
-	// row being deleted on Complete (MQLITE-54). In-process and resets on restart;
-	// Prometheus rate()/increase() absorb the reset.
-	completed := s.eng.CompletedCounts()
-	b.WriteString("# HELP mqlite_messages_completed_total Messages successfully completed, cumulative since broker start.\n")
-	b.WriteString("# TYPE mqlite_messages_completed_total counter\n")
-	for _, st := range stats {
-		fmt.Fprintf(&b, "mqlite_messages_completed_total{queue=%q} %d\n", st.name, completed[st.name])
-	}
-	s.rpcLat.write(&b) // per-RPC latency histogram (rpchist.go)
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = w.Write([]byte(b.String()))
-}
-
 func (s *Server) postOnly(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -220,18 +204,33 @@ func (s *Server) postOnly(fn http.HandlerFunc) http.HandlerFunc {
 // permissionContextKey is private so callers cannot inject HTTP permissions.
 type permissionContextKey struct{}
 
+// A transport-only capability, never a database access-key permission bit.
+const monitorPermission engine.KeyPermissions = 128
+
+func (s *Server) authenticationEnabled() bool {
+	return len(s.tokens) > 0 || len(s.MonitorTokens) > 0
+}
+
+func openPath(path string) bool {
+	return path == "/" || path == "/healthz" || path == "/ui" || strings.HasPrefix(path, "/ui/")
+}
+
 // auth authenticates once before dispatch. Revocation applies to the next request;
 // an already-authorized operation, including a long poll, may finish normally.
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Exact console paths only: /uixyz must not bypass authentication.
-		if len(s.tokens) == 0 || r.URL.Path == "/" || r.URL.Path == "/healthz" ||
-			r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") {
+		if !s.authenticationEnabled() || openPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		values := r.Header.Values("Authorization")
 		if len(values) != 1 {
+			outcome := "invalid"
+			if len(values) == 0 {
+				outcome = "missing"
+			}
+			authOutcome(w, outcome)
 			s.fail(w, engine.ErrUnauthenticated)
 			return
 		}
@@ -240,6 +239,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		// multiple credentials or whitespace inside/after the opaque token.
 		tok = strings.TrimLeft(tok, " ")
 		if !ok || !strings.EqualFold(scheme, "Bearer") || tok == "" || strings.ContainsAny(tok, " \t\r\n,") {
+			authOutcome(w, "invalid")
 			s.fail(w, engine.ErrUnauthenticated)
 			return
 		}
@@ -254,13 +254,26 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		}
 		permission := engine.KeyManage
 		if !static {
-			key, err := s.eng.AuthenticateAccessKey(r.Context(), tok)
-			if err != nil {
-				s.fail(w, err)
-				return
+			monitor := false
+			for _, t := range s.MonitorTokens {
+				t = strings.TrimSpace(t)
+				if len(t) == len(tok) && subtle.ConstantTimeCompare([]byte(t), []byte(tok)) == 1 {
+					monitor = true
+				}
 			}
-			permission = key.Permissions
+			if monitor {
+				permission = monitorPermission
+			} else {
+				key, outcome, err := s.eng.AuthenticateAccessKeyWithOutcome(r.Context(), tok)
+				if err != nil {
+					authOutcome(w, outcome)
+					s.fail(w, err)
+					return
+				}
+				permission = key.Permissions
+			}
 		}
+		authOutcome(w, "success")
 		ctx := context.WithValue(r.Context(), permissionContextKey{}, permission)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -270,9 +283,14 @@ func (s *Server) auth(next http.Handler) http.Handler {
 // decoding or invoking its handler. There is no separate policy catalog to drift.
 func (s *Server) authorize(required engine.KeyPermissions, fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if len(s.tokens) > 0 {
+		if s.authenticationEnabled() {
 			permission, ok := r.Context().Value(permissionContextKey{}).(engine.KeyPermissions)
-			if !ok || !permission.Allows(required) {
+			allowed := permission.Allows(required)
+			if required == monitorPermission {
+				allowed = permission == engine.KeyManage || permission == monitorPermission
+			}
+			if !ok || !allowed {
+				authOutcome(w, "permission_denied")
 				s.fail(w, engine.ErrPermissionDenied)
 				return
 			}
@@ -284,7 +302,7 @@ func (s *Server) authorize(required engine.KeyPermissions, fn http.HandlerFunc) 
 // Anonymous development mode never exposes credential issuance or metadata.
 func (s *Server) authEnabled(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if len(s.tokens) == 0 {
+		if !s.authenticationEnabled() {
 			writeErr(w, http.StatusForbidden, "permission_denied", "key management requires authentication to be enabled")
 			return
 		}
@@ -329,6 +347,9 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	if rec, ok := w.(*statusRecorder); ok {
+		rec.code = code
+	}
 	logf(w, "code", code)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -733,22 +754,10 @@ func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request)
 // redacted location, read latency, local footprint, counts, uptime. Behind auth.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	st := s.eng.Status(ctx)
+	st, queues, subs := s.eng.RuntimeStatus(ctx)
 	version := s.Version
 	if version == "" {
 		version = "dev"
-	}
-	// Counts are best-effort — a count failure must not fail the whole status read.
-	var queues, subs int
-	if qs, err := s.eng.ListQueues(ctx); err == nil {
-		for _, q := range qs {
-			if q.Kind != "subscription" {
-				queues++
-			}
-		}
-	}
-	if ss, err := s.eng.ListSubscriptions(ctx); err == nil {
-		subs = len(ss)
 	}
 	writeJSON(w, wire.StatusResponse{
 		Version:       version,
@@ -761,7 +770,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Queues:        queues,
 		Subscriptions: subs,
 		UptimeMs:      time.Since(s.started).Milliseconds(),
-		Auth:          len(s.tokens) > 0,
+		Auth:          s.authenticationEnabled(),
 	})
 }
 

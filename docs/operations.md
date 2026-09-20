@@ -71,7 +71,10 @@ not an archive. Leave space for a new backup and WAL growth during a long read.
 
 Use a separate managed key for each producer, consumer or administrator. A
 `manage` key can issue or revoke keys, including other administrators; a `send`
-or `listen` key cannot. The current console and metrics scraper require `manage`.
+or `listen` key cannot. Console administration requires `manage`; use distinct
+configured `MQLITE_MONITOR_TOKENS` for a read-only metrics scraper or monitoring
+view. These credentials do not rely on the key database. See the
+[monitoring starter](observability.md) and [cloud integration guide](observability-cloud.md).
 Create managed keys with `mqlite key create`, move clients to the replacement,
 then `mqlite key revoke --id <old-id>`. These changes persist in the database and
 take effect without restarting the broker. Revocation rejects new authentication

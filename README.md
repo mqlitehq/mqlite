@@ -229,6 +229,7 @@ mqlite receive orders --wait 5s                  # auto-Complete; --no-ack print
 mqlite complete orders 42 <lock-token>           # settle a --no-ack message (also abandon/reject/defer/renew)
 mqlite peek orders --state dead_lettered
 mqlite status                                    # backend / ping / counts
+mqlite observe --output json                     # unified observation; monitor or manage
 mqlite list-subscriptions ; mqlite test-filter 'subject == "x"'
 mqlite metrics orders --output json              # machine-readable: the same keys as the HTTP API
 mqlite redrive orders --max 100                  # DLQ → active
@@ -248,6 +249,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens for `serve` |
+| `MQLITE_MONITOR_TOKENS` | optional, distinct read-only credentials for `observe` and `/metrics`; administrator auth must remain enabled |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 

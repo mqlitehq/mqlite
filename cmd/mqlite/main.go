@@ -103,6 +103,8 @@ func main() {
 		err = cmdPeek(ctx, args)
 	case "metrics":
 		err = cmdMetrics(ctx, args)
+	case "observe":
+		err = cmdObserve(ctx, args)
 	case "status":
 		err = cmdStatus(ctx, args)
 	case "list":
@@ -166,6 +168,7 @@ usage: mqlite <command> [flags]
   peek <queue>              browse messages without locking (--state --from --max)
   test-filter <expr>        dry-run a filter expression against an optional sample
   metrics <queue>           show queue counters
+  observe                   unified observation (monitor or manage; --output json)
   status                    backend snapshot (backend, ping, size, counts)
   redrive <queue>           move dead-lettered messages back to active
   purge-dlq <queue>         permanently delete dead-lettered messages
@@ -208,6 +211,7 @@ type api interface {
 	TestFilter(ctx context.Context, expr string, sample *mqlite.OutMessage, enqueuedAtMs, visibleAtMs int64) (mqlite.FilterTestResult, error)
 	Stats(ctx context.Context, queue string) (mqlite.Metrics, error)
 	Status(ctx context.Context) (mqlite.StatusInfo, error)
+	Observe(ctx context.Context) (mqlite.Observation, error)
 	Redrive(ctx context.Context, dlq string, opts ...mqlite.RedriveOpts) (int, error)
 	Purge(ctx context.Context, queue string, opts ...mqlite.PurgeOpts) (int, error)
 	CreateKey(context.Context, mqlite.CreateKeyOptions) (mqlite.CreateKeyResult, error)
@@ -468,6 +472,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	monitorTokens, err := resolveMonitorTokens(os.Getenv("MQLITE_MONITOR_TOKENS"), tokens)
+	if err != nil {
+		return err
+	}
 	// With auth disabled, refuse a non-loopback bind unless explicitly allowed: an open
 	// broker on all interfaces is remotely reachable by anyone (MQLITE-70 / D2).
 	if tokens == "" && !isLoopbackListen(listenAddr) && !*insecureAllowRemote {
@@ -530,7 +538,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// "ready" fires from WithReady, i.e. only after the listener actually binds — so a
 	// bind failure surfaces as an error instead of a misleading "ready" line (MQLITE-88).
 	return eng.Serve(sctx, listenAddr,
-		mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version),
+		mqlite.WithTokenCSV(tokens), mqlite.WithMonitorTokens(monitorTokens...), mqlite.WithVersion(version),
 		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui),
 		mqlite.WithReady(func() { lg.Info("ready — Ctrl-C to stop") }))
 }

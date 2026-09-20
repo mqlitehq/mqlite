@@ -19,6 +19,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_DB` | embedded DB DSN: `file:./mq.db` / `:memory:` / `libsql://<db>.turso.io` |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: a running broker + its Bearer token |
+| `MQLITE_MONITOR_TOKENS` | optional comma-separated read-only credentials for `observe` and `/metrics`; requires administrator auth and credentials distinct from administrators |
 | `MQLITE_TOKENS` | broker (`serve`) administrator Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth; additional managed keys live in the database |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
@@ -284,6 +285,31 @@ Cancel a scheduled message before it activates with **`cancel <queue> <seq>`**.
 ```bash
 mqlite receive-deferred orders --seq 42,57      # re-locks them and prints tokens to settle
 ```
+
+### `observe` — canonical observation
+
+```bash
+mqlite observe --output json
+MQLITE_ENDPOINT=http://127.0.0.1:6754 MQLITE_TOKEN="$MONITOR_TOKEN" mqlite observe
+```
+
+Both output modes print the complete canonical JSON snapshot, including collection
+availability/freshness, queue gauges, committed message effects, storage operations,
+maintenance, filter failures, and HTTP request/authentication measurements. It is the
+same data contract as SDK `Observe`, MCP `observe`, and the HTTP `Observe` route;
+`/metrics` serializes these measurements for Prometheus.
+
+Check `collection.state` before interpreting queue counts. An unavailable collection
+has `queues: null`, not zero messages; process counters remain usable when the
+configured credential can authenticate. Durations use seconds, timestamps use epoch
+milliseconds, and process counters reset on restart. Embedded mode marks HTTP as
+`not_applicable`. Runtime `read_available` and `db_size_available` distinguish unknown
+or unsupported measurements from real zeroes. See [observability.md](observability.md).
+
+A configured `MQLITE_MONITOR_TOKENS` credential can call only `observe` and `/metrics`.
+It also opens the console's read-only overview/metrics views. `manage` includes
+observation; managed `send`/`listen` keys do not gain broker-wide monitoring. Monitor
+credentials are configured at startup and cannot be created through `key create`.
 
 ### `status` — backend snapshot
 ```bash

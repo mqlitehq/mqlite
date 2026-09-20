@@ -1775,3 +1775,127 @@ func TestManagedKeySDKRejectsInvalidSuccess(t *testing.T) {
 		}
 	}
 }
+
+// ─── Canonical observability across embedded and HTTP ───
+
+func TestSDKObserveCanonicalAndMonitor(t *testing.T) {
+	ctx := context.Background()
+	embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground(), mqlite.WithClock(func() int64 { return 1800000000000 }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	if err := embedded.CreateQueue(ctx, "observed", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := embedded.SendOne(ctx, "observed", mqlite.OutMessage{Body: []byte("secret body")}); err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(embedded.Engine(), []string{"observe-admin"})
+	srv.Version = "test"
+	srv.MonitorTokens = []string{"observe-monitor"}
+	httpServer := httptest.NewServer(srv.Handler())
+	defer httpServer.Close()
+	local, err := embedded.Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.HTTP.State != "not_applicable" || local.Access != "embedded" || local.Version == "" {
+		t.Fatalf("embedded domain: %+v", local.HTTP)
+	}
+	encoded, _ := json.Marshal(local)
+	if _, err := wire.DecodeObserveResponse(encoded); err != nil {
+		t.Fatalf("embedded canonical response: %v", err)
+	}
+	if strings.Contains(string(encoded), "secret body") || strings.Contains(string(encoded), "observe-admin") {
+		t.Fatal("observation leaked a secret")
+	}
+	for _, identity := range []struct{ token, access string }{{"observe-admin", "manage"}, {"observe-monitor", "monitor"}} {
+		client, err := mqlite.Open(ctx, httpServer.URL, mqlite.WithToken(identity.token))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		remote, err := client.Observe(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if remote.Access != identity.access || remote.HTTP.State != "available" {
+			t.Fatalf("HTTP visibility = %q/%q", remote.Access, remote.HTTP.State)
+		}
+		if !reflect.DeepEqual(local.Queues, remote.Queues) || !reflect.DeepEqual(local.Messages, remote.Messages) {
+			t.Fatal("native and HTTP queue/counter projections differ")
+		}
+		if identity.access == "monitor" {
+			if _, err := client.Status(ctx); !errors.Is(err, mqlite.ErrPermissionDenied) {
+				t.Fatalf("monitor Status: %v", err)
+			}
+			if _, err := client.SendOne(ctx, "observed", mqlite.OutMessage{Body: []byte("denied")}); !errors.Is(err, mqlite.ErrPermissionDenied) {
+				t.Fatalf("monitor Send: %v", err)
+			}
+		}
+	}
+	if err := embedded.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := embedded.Observe(ctx)
+	if err != nil || after.Collection.State != "unavailable" || after.Queues != nil || len(after.Messages) == 0 {
+		t.Fatalf("partial embedded observation lost availability/counters: %v %+v", err, after.Collection)
+	}
+}
+
+func TestSDKObserveRejectsInvalidSuccessAndPreservesErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		sentinel   error
+	}{
+		{"empty", `{}`, 200, nil}, {"null", `null`, 200, nil}, {"trailing", `{} {}`, 200, nil},
+		{"unauthorized", `{}`, 401, mqlite.ErrUnauthenticated}, {"forbidden", `{}`, 403, mqlite.ErrPermissionDenied},
+		{"unsupported", `{"code":"unimplemented","message":"no such path"}`, 404, mqlite.ErrUnsupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != wire.PathObserve {
+					t.Errorf("Observe path = %s", r.URL.Path)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			client, err := mqlite.Open(context.Background(), ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			_, err = client.Observe(context.Background())
+			if err == nil || tc.sentinel != nil && !errors.Is(err, tc.sentinel) {
+				t.Fatalf("Observe error = %v, want %v", err, tc.sentinel)
+			}
+		})
+	}
+}
+
+func TestSDKMonitorTokenServeValidation(t *testing.T) {
+	embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	for _, options := range [][]mqlite.ServeOption{
+		{mqlite.WithMonitorTokens("monitor")},
+		{mqlite.WithTokens("admin"), mqlite.WithMonitorTokens("admin")},
+		{mqlite.WithTokens("admin"), mqlite.WithMonitorTokens(" ")},
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := embedded.Serve(ctx, "127.0.0.1:0", options...); err == nil {
+			t.Fatal("invalid monitor configuration accepted")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := embedded.Serve(ctx, "127.0.0.1:0", mqlite.WithTokens("admin"), mqlite.WithMonitorTokens("monitor"), mqlite.WithReady(cancel)); err != nil {
+		t.Fatalf("valid monitor configuration: %v", err)
+	}
+}

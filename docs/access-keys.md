@@ -23,6 +23,13 @@ generated token uses `mqk_` followed by 64 lowercase hexadecimal characters. The
 broker stores only the SHA-256 digest of managed tokens, together with their public
 ID, name, permissions and lifecycle timestamps. Names need not be unique.
 
+For read-only monitoring, configure distinct `MQLITE_MONITOR_TOKENS` alongside
+administrator authentication. These credentials grant only `Observe` and `/metrics`,
+including the console's monitoring views; they cannot read message bodies, consume,
+publish or manage keys. `monitor` is a configuration capability, not a managed-key
+permission. It works independently of the key database during a storage outage.
+See the [monitoring starter](observability.md) for configuration and rotation.
+
 Managed authentication performs one indexed database query for every request,
 without caching credentials. On Turso this includes a remote round trip; measure
 the application's request latency and throughput with its intended credentials
@@ -100,7 +107,8 @@ See the complete [request/response contract](api-reference.md#createkey--listkey
 All require `Authorization: Bearer <administrator-token>`. Authentication disabled
 with `MQLITE_TOKENS=off` does not enable anonymous key administration.
 
-The console at `/ui/` accepts a configured administrator or managed `manage` key.
+The console at `/ui/` accepts a configured administrator or managed `manage` key
+for administration; configured monitor credentials open its observability views.
 Open **Access keys** to create, inspect and revoke credentials. Save the newly
 created secret before dismissing its one-time display. The console explains when
 an older broker does not support the feature. Application `send`/`listen` keys

@@ -2,16 +2,19 @@ package server_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/server"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // MQLITE-5: /metrics serves per-queue counters in Prometheus text format.
@@ -51,6 +54,198 @@ func TestMetricsEndpoint(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("/metrics output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// The read-only credential remains usable when storage cannot authenticate a
+// managed key. Failed collection is unavailable, never a healthy empty queue.
+func TestObserveStorageFailureAvailability(t *testing.T) {
+	ctx := context.Background()
+	eng := keyTestEngine(t, nil)
+	_, managed := keyTestCreate(t, eng, 1, engine.KeyManage, 0)
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("secret-body")}); err != nil {
+		t.Fatal(err)
+	}
+	s := server.New(eng, []string{"administrator-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	h := s.Handler()
+	read := func() wire.ObserveResponse {
+		t.Helper()
+		r := keyTestRequest(h, http.MethodPost, wire.PathObserve, "monitor-secret", wire.ObserveRequest{})
+		keyTestStatus(t, r, http.StatusOK, "")
+		if r.Header().Get("Cache-Control") != "no-store" {
+			t.Fatal("snapshot must not be cached")
+		}
+		for _, secret := range []string{"administrator-secret", "monitor-secret", managed, "secret-body", "token_hash", "location"} {
+			if strings.Contains(r.Body.String(), secret) {
+				t.Fatalf("observation exposed protected data category")
+			}
+		}
+		out, err := wire.DecodeObserveResponse(r.Body.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	before := read()
+	if before.Access != "monitor" || before.Collection.State != "available" || len(before.Queues) != 1 || before.Queues[0].Total != 1 {
+		t.Fatalf("bad healthy observation: %+v", before)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after := read()
+	if after.Collection.State != "unavailable" || after.Queues != nil || after.Collection.LastSuccessAtMs != before.Collection.LastSuccessAtMs || after.Runtime.ReadAvailable {
+		t.Fatalf("failure replaced by healthy zero: %+v", after)
+	}
+	r := keyTestRequest(h, http.MethodGet, "/metrics", "monitor-secret", nil)
+	keyTestStatus(t, r, http.StatusOK, "")
+	for _, want := range []string{"mqlite_collection_success 0", "mqlite_storage_read_available 0", `mqlite_message_events_total{queue="q",event="enqueued"} 1`} {
+		if !strings.Contains(r.Body.String(), want) {
+			t.Errorf("missing failure fact %q", want)
+		}
+	}
+	if strings.Contains(r.Body.String(), `mqlite_queue_messages{`) || strings.Contains(r.Body.String(), "mqlite_storage_ping_seconds ") && !strings.Contains(r.Body.String(), "mqlite_storage_ping_seconds gauge") {
+		t.Fatal("failed gauge serialized")
+	}
+	keyTestStatus(t, keyTestRequest(h, http.MethodPost, wire.PathObserve, managed, wire.ObserveRequest{}), http.StatusInternalServerError, "internal")
+}
+
+func TestObserveAuthOutcomesAndWholeRequestCoverage(t *testing.T) {
+	ctx := context.Background()
+	now := int64(10000)
+	eng := keyTestEngine(t, func() int64 { return now })
+	_, expired := keyTestCreate(t, eng, 1, engine.KeyManage, now+1)
+	revokedKey, revoked := keyTestCreate(t, eng, 2, engine.KeyManage, 0)
+	_, send := keyTestCreate(t, eng, 3, engine.KeySend, 0)
+	if err := eng.RevokeAccessKey(ctx, revokedKey.ID); err != nil {
+		t.Fatal(err)
+	}
+	now++
+	s := server.New(eng, []string{"admin"})
+	s.MonitorTokens = []string{"monitor"}
+	h := s.Handler()
+	for _, tt := range []struct {
+		token  string
+		status int
+		code   string
+	}{
+		{"", 401, "unauthenticated"}, {"invalid", 401, "unauthenticated"}, {expired, 401, "unauthenticated"}, {revoked, 401, "unauthenticated"}, {send, 403, "permission_denied"}, {"admin", 200, ""},
+	} {
+		keyTestStatus(t, keyTestRequest(h, http.MethodPost, wire.PathObserve, tt.token, wire.ObserveRequest{}), tt.status, tt.code)
+	}
+	keyTestStatus(t, keyTestRequest(h, http.MethodGet, wire.PathObserve, "monitor", nil), 405, "unimplemented")
+	keyTestStatus(t, keyTestRequest(h, http.MethodPost, wire.PathObserve, "monitor", map[string]bool{"unknown": true}), 400, "invalid_argument")
+	r := keyTestRequest(h, http.MethodPost, wire.PathObserve, "monitor", wire.ObserveRequest{})
+	out, err := wire.DecodeObserveResponse(r.Body.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAuth := map[string]uint64{"success": 3, "missing": 1, "invalid": 1, "expired": 1, "revoked": 1, "permission_denied": 1, "backend_error": 0}
+	for _, a := range out.HTTP.Authentication {
+		if a.Count != wantAuth[a.Outcome] {
+			t.Errorf("auth %s=%d want %d", a.Outcome, a.Count, wantAuth[a.Outcome])
+		}
+		delete(wantAuth, a.Outcome)
+	}
+	if len(wantAuth) != 0 {
+		t.Fatalf("auth domain incomplete: %v", wantAuth)
+	}
+	wantCode := map[string]uint64{"unauthenticated": 4, "permission_denied": 1, "ok": 1, "unimplemented": 1, "invalid_argument": 1}
+	for _, rq := range out.HTTP.Requests {
+		if rq.Count == 0 {
+			continue
+		}
+		if rq.RPC != "AdminService/Observe" || rq.Count != wantCode[rq.Code] || rq.DurationSeconds < 0 {
+			t.Errorf("unexpected request counter %+v", rq)
+		}
+		delete(wantCode, rq.Code)
+	}
+	if len(wantCode) != 0 {
+		t.Fatalf("request domain incomplete: %v", wantCode)
+	}
+	if len(out.HTTP.HandlerLatency) != 1 || out.HTTP.HandlerLatency[0].Count != 4 {
+		t.Fatalf("legacy handler timing must exclude failed authentication, include403: %+v", out.HTTP.HandlerLatency)
+	}
+}
+
+func TestObserveConcurrentHistogramAndSpecialLabels(t *testing.T) {
+	eng := keyTestEngine(t, nil)
+	name := "orders\tline\n\"quote\\\u96ea"
+	if err := eng.CreateQueue(context.Background(), name, engine.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	h := server.New(eng, nil).Handler()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				keyTestRequest(h, http.MethodPost, wire.PathListQueues, "", wire.Empty{})
+			}
+		}()
+	}
+	for i := 0; i < 30; i++ {
+		r := keyTestRequest(h, http.MethodPost, wire.PathObserve, "", wire.ObserveRequest{})
+		out, err := wire.DecodeObserveResponse(r.Body.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, lat := range out.HTTP.HandlerLatency {
+			var last uint64
+			for _, b := range lat.Buckets {
+				if b.Count < last || b.Count > lat.Count {
+					t.Fatalf("inconsistent buckets: %+v", lat)
+				}
+				last = b.Count
+			}
+		}
+		prom := keyTestRequest(h, http.MethodGet, "/metrics", "", nil).Body.String()
+		if !strings.Contains(prom, "queue=\"orders\tline\\n\\\"quote\\\\\u96ea\"") {
+			t.Fatal("Prometheus label escaping drift")
+		}
+		inf, count := map[string]string{}, map[string]string{}
+		for _, line := range strings.Split(prom, "\n") {
+			if strings.HasPrefix(line, "mqlite_rpc_duration_seconds_bucket{") && strings.Contains(line, `,le="+Inf"}`) {
+				parts := strings.SplitN(line, `,le="+Inf"} `, 2)
+				inf[strings.TrimPrefix(parts[0], "mqlite_rpc_duration_seconds_bucket{")] = parts[1]
+			}
+			if strings.HasPrefix(line, "mqlite_rpc_duration_seconds_count{") {
+				parts := strings.SplitN(line, "} ", 2)
+				count[strings.TrimPrefix(parts[0], "mqlite_rpc_duration_seconds_count{")] = parts[1]
+			}
+		}
+		a, _ := json.Marshal(inf)
+		b, _ := json.Marshal(count)
+		if string(a) != string(b) {
+			t.Fatalf("+Inf differs from count: %s vs %s", a, b)
+		}
+	}
+	wg.Wait()
+}
+
+func TestMonitorConfigurationFailsClosed(t *testing.T) {
+	eng := keyTestEngine(t, nil)
+	for _, tt := range []struct{ admins, monitors []string }{{nil, []string{"monitor"}}, {[]string{"same"}, []string{"same"}}, {[]string{"admin"}, []string{""}}, {[]string{"admin"}, []string{"bad token"}}, {[]string{"admin"}, []string{"bad,token"}}} {
+		if err := server.ValidateMonitorTokens(tt.admins, tt.monitors); err == nil {
+			t.Fatal("bad monitoring configuration accepted")
+		}
+		s := server.New(eng, tt.admins)
+		s.MonitorTokens = tt.monitors
+		for _, path := range []string{"/", wire.PathObserve, wire.PathSend, "/metrics"} {
+			r := keyTestRequest(s.Handler(), http.MethodPost, path, "admin", wire.Empty{})
+			keyTestStatus(t, r, 500, "internal")
+			if strings.Contains(r.Body.String(), "bad token") {
+				t.Fatal("configuration error exposed token")
+			}
+		}
+	}
+	if err := server.ValidateMonitorTokens([]string{"admin"}, []string{"monitor", "monitor-rotated"}); err != nil {
+		t.Fatal(err)
 	}
 }
 

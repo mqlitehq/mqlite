@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -46,6 +47,139 @@ func TestMessageJSONContract(t *testing.T) {
 	if back.SeqNumber != m.SeqNumber || back.GroupID != m.GroupID ||
 		back.EnqueuedAtMs != m.EnqueuedAtMs || back.Properties["k"] != "v" {
 		t.Errorf("round-trip mismatch: %+v", back)
+	}
+}
+
+func TestObserveResponseCompleteShape(t *testing.T) {
+	data, err := os.ReadFile("../server/testdata/observability.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := wire.DecodeObserveResponse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if valid.Queues[0].Total != 21 || valid.Runtime.PingSeconds != .00125 {
+		t.Fatal("fixture values changed")
+	}
+	decode := func() map[string]any {
+		var out map[string]any
+		if err := json.Unmarshal(data, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	reject := func(value any) {
+		t.Helper()
+		b, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := wire.DecodeObserveResponse(b)
+		if err == nil || !reflect.DeepEqual(out, wire.ObserveResponse{}) {
+			t.Fatal("incomplete or invalid observation accepted")
+		}
+	}
+	// Every field at every canonical type level is required. Array element schemas
+	// are the same, so the first element exhaustively represents each item type.
+	rootFixture := decode()
+	var walk func(map[string]any)
+	walk = func(object map[string]any) {
+		keys := make([]string, 0, len(object))
+		for key := range object {
+			keys = append(keys, key)
+		}
+		for _, key := range keys {
+			value := object[key]
+			delete(object, key)
+			reject(rootFixture)
+			object[key] = nil
+			if _, slice := value.([]any); !slice {
+				reject(rootFixture)
+			}
+			object[key] = value
+			switch nested := value.(type) {
+			case map[string]any:
+				walk(nested)
+			case []any:
+				if len(nested) > 0 {
+					if first, ok := nested[0].(map[string]any); ok {
+						walk(first)
+					}
+				}
+			}
+		}
+	}
+	walk(rootFixture)
+	for _, change := range []func(map[string]any){
+		func(o map[string]any) { o["maintenance"] = []any{} },
+		func(o map[string]any) { o["filters"] = []any{} },
+		func(o map[string]any) { o["http"].(map[string]any)["authentication"] = []any{} },
+		func(o map[string]any) { v := o["maintenance"].([]any); o["maintenance"] = append(v, v[0]) },
+		func(o map[string]any) { v := o["filters"].([]any); o["filters"] = append(v, v[0]) },
+		func(o map[string]any) {
+			h := o["http"].(map[string]any)
+			v := h["authentication"].([]any)
+			h["authentication"] = append(v, v[0])
+		},
+		func(o map[string]any) { v := o["messages"].([]any); o["messages"] = append(v, v[0]) },
+		func(o map[string]any) {
+			s := o["storage"].(map[string]any)
+			v := s["operations"].([]any)
+			s["operations"] = append(v, v[0])
+		},
+		func(o map[string]any) {
+			h := o["http"].(map[string]any)
+			v := h["requests"].([]any)
+			h["requests"] = append(v, v[0])
+		},
+		func(o map[string]any) {
+			h := o["http"].(map[string]any)
+			v := h["handler_latency"].([]any)
+			h["handler_latency"] = append(v, v[0])
+		},
+		func(o map[string]any) { o["collection"].(map[string]any)["state"] = "unknown" },
+		func(o map[string]any) { o["queues"] = nil },
+		func(o map[string]any) { o["queue_count"] = 99 },
+		func(o map[string]any) { o["runtime"].(map[string]any)["ping_seconds"] = -1 },
+		func(o map[string]any) { o["queues"].([]any)[0].(map[string]any)["total"] = 0 },
+		func(o map[string]any) { o["http"].(map[string]any)["state"] = "not_applicable" },
+		func(o map[string]any) {
+			o["storage"].(map[string]any)["operations"].([]any)[0].(map[string]any)["duration"].(map[string]any)["bucket_counts"] = []any{}
+		},
+		func(o map[string]any) { o["maintenance"].([]any)[0].(map[string]any)["failures"] = 99 },
+		func(o map[string]any) {
+			o["http"].(map[string]any)["handler_latency"].([]any)[0].(map[string]any)["count"] = 0
+		},
+	} {
+		o := decode()
+		change(o)
+		reject(o)
+	}
+	for _, invalid := range [][]byte{nil, []byte("null"), []byte("{}"), append(append([]byte{}, data...), []byte("{}")...)} {
+		if _, err := wire.DecodeObserveResponse(invalid); err == nil {
+			t.Fatal("invalid top-level response accepted")
+		}
+	}
+	failed := decode()
+	failed["collection"].(map[string]any)["state"] = "unavailable"
+	failed["collection"].(map[string]any)["error_code"] = "closed"
+	failed["queues"] = nil
+	b, _ := json.Marshal(failed)
+	if _, err := wire.DecodeObserveResponse(b); err != nil {
+		t.Fatalf("honest unavailable result rejected: %v", err)
+	}
+	future := decode()
+	future["future"] = "ignored"
+	b, _ = json.Marshal(future)
+	if _, err := wire.DecodeObserveResponse(b); err != nil {
+		t.Fatal("forward-compatible field rejected")
+	}
+	if _, err := wire.ReadObserveResponse(strings.NewReader(strings.Repeat("x", wire.MaxObserveResponseBytes+1))); err == nil {
+		t.Fatal("unbounded observation body")
+	}
+	if _, err := wire.ReadObserveResponse(failedKeyResponseReader{}); err == nil || strings.Contains(err.Error(), "partial-secret") {
+		t.Fatal("failed read accepted or exposed body")
 	}
 }
 
@@ -329,4 +463,89 @@ func TestReadKeyResponseBound(t *testing.T) {
 	if err == nil || data != nil || strings.Contains(err.Error(), "partial-secret") {
 		t.Fatal("truncated response returned partial content")
 	}
+}
+
+func TestObserveResponseRequiresCompleteCounterMatrices(t *testing.T) {
+	data, err := os.ReadFile("../server/testdata/observability.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := wire.DecodeObserveResponse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(base.Storage.Operations) != 33 || len(base.HTTP.Requests) != 26*15 || len(base.Messages) != len(base.Queues)*20 {
+		t.Fatal("fixture must exercise the entire current counter matrix")
+	}
+	check := func(value wire.ObserveResponse, accept bool) {
+		t.Helper()
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := wire.DecodeObserveResponse(encoded)
+		if accept && err != nil {
+			t.Fatalf("valid complete response rejected: %v", err)
+		}
+		if !accept && (err == nil || !reflect.DeepEqual(got, wire.ObserveResponse{})) {
+			t.Fatal("incomplete counter matrix accepted")
+		}
+	}
+	for i := range base.Storage.Operations {
+		v := base
+		v.Storage.Operations = append(append([]engine.StorageOperation{}, base.Storage.Operations[:i]...), base.Storage.Operations[i+1:]...)
+		check(v, false)
+	}
+	for i := range base.HTTP.Requests {
+		v := base
+		v.HTTP.Requests = append(append([]wire.RequestObservation{}, base.HTTP.Requests[:i]...), base.HTTP.Requests[i+1:]...)
+		check(v, false)
+	}
+	for i := range base.Messages {
+		v := base
+		v.Messages = append(append([]engine.MessageCounter{}, base.Messages[:i]...), base.Messages[i+1:]...)
+		check(v, false)
+		// Unavailable collections still require every event for each known queue.
+		v.Collection.State, v.Collection.ErrorCode, v.Queues = "unavailable", "closed", nil
+		check(v, false)
+	}
+	for i := range base.Maintenance {
+		v := base
+		v.Maintenance = append(append([]engine.MaintenanceObservation{}, base.Maintenance[:i]...), base.Maintenance[i+1:]...)
+		check(v, false)
+	}
+	for i := range base.Filters {
+		v := base
+		v.Filters = append(append([]engine.FilterCounter{}, base.Filters[:i]...), base.Filters[i+1:]...)
+		check(v, false)
+	}
+	for i := range base.HTTP.Authentication {
+		v := base
+		v.HTTP.Authentication = append(append([]wire.AuthenticationObservation{}, base.HTTP.Authentication[:i]...), base.HTTP.Authentication[i+1:]...)
+		check(v, false)
+	}
+	v := base
+	v.Messages = []engine.MessageCounter{}
+	check(v, false) // Existing inventory cannot silently lose all event counters.
+	v.Queues = []engine.QueueObservation{}
+	v.QueueCount, v.SubscriptionCount = 0, 0
+	check(v, true)
+	v.Messages = append([]engine.MessageCounter{}, base.Messages...)
+	check(v, true) // Counter-only historical queues remain complete after inventory removal.
+	v.Collection.State, v.Collection.ErrorCode, v.Queues = "unavailable", "closed", nil
+	check(v, true)
+	v.Messages = []engine.MessageCounter{}
+	check(v, true) // No known queues before the first successful collection.
+	v = base
+	future := base.Storage.Operations[0]
+	future.Operation = "future"
+	v.Storage.Operations = append(append([]engine.StorageOperation{}, base.Storage.Operations...), future)
+	v.HTTP.Requests = append(append([]wire.RequestObservation{}, base.HTTP.Requests...), wire.RequestObservation{RPC: "FutureService/Observe", Code: "future"})
+	v.Messages = append(append([]engine.MessageCounter{}, base.Messages...), engine.MessageCounter{Queue: base.Queues[0].Queue, Event: "future"})
+	check(v, true) // Added unique future labels do not require a synchronized client release.
+	v.HTTP.State = "not_applicable"
+	v.HTTP.Requests = []wire.RequestObservation{}
+	v.HTTP.Authentication = []wire.AuthenticationObservation{}
+	v.HTTP.HandlerLatency = []wire.RPCLatencyObservation{}
+	check(v, true)
 }

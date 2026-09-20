@@ -34,6 +34,7 @@ const (
 	PathRedrive           = "/mqlite.v1.AdminService/Redrive"
 	PathPurge             = "/mqlite.v1.AdminService/Purge"
 	PathStatus            = "/mqlite.v1.AdminService/Status"
+	PathObserve           = "/mqlite.v1.AdminService/Observe"
 
 	PathCreateKey = "/mqlite.v1.AuthService/CreateKey"
 	PathListKeys  = "/mqlite.v1.AuthService/ListKeys"
