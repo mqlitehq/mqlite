@@ -161,7 +161,7 @@ eng.Tx(ctx, func(tx *engine.EngineTx) error {
 ```bash
 export MQLITE_DB="file:./mq.db"           # or libsql://<db>.turso.io
 export MQLITE_DB_AUTH_TOKEN="<jwt>"        # only for remote Turso
-export MQLITE_TOKENS="mqk_dev"             # accepted Bearer tokens
+export MQLITE_TOKENS="mqk_dev"             # administrator Bearer tokens
 mqlite serve --addr :6754
 ```
 
@@ -247,7 +247,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_DB` | DB DSN: `file:./mq.db`, `:memory:`, or `libsql://<db>.turso.io` (embedded/serve) |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
-| `MQLITE_TOKENS` | comma-separated Bearer tokens that `serve` accepts |
+| `MQLITE_TOKENS` | comma-separated administrator Bearer tokens for `serve` |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
@@ -256,6 +256,12 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 > the binary does **not** auto-load a dotenv file, so export them into the process
 > yourself — `set -a && . ./.env.local && set +a` for a shell, or an `Environment=`/
 > compose `environment:` block for systemd/Docker.
+
+Starting with v0.3.1, create additional keys without restarting the broker using
+`mqlite key create --name producer --permissions send`. Keys can grant `send`,
+`listen`, both, or `manage` (which also grants key issuance and revocation).
+Configured administrator tokens remain supported. See [key commands](docs/cli.md#key-createlistrevoke--manage-persistent-access-keys)
+and the [complete access-key guide](docs/access-keys.md).
 
 ### 6. MCP (drive it from an AI agent)
 
@@ -376,8 +382,9 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-This source tree targets **v0.3.0**: default broker port **6754**, schema token **5**,
-expanded CLI and MCP tools, and the reliability fixes in [CHANGELOG.md](CHANGELOG.md).
+This source tree targets **v0.3.1 (unreleased)**: default broker port **6754**, schema
+token **5**, and runtime-managed access keys. The current published release remains
+**v0.3.0**. See [CHANGELOG.md](CHANGELOG.md) for the upcoming changes.
 Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
 or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.0`; see
 [deployment](docs/deployment.md) for configuration.

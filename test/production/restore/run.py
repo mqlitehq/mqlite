@@ -95,7 +95,7 @@ def compare(actual, expected, label):
 
 def check_seed(snap, fixture):
     required = {"queues", "subscriptions", "messages", "dedup", "settlement_receipts",
-                "receive_attempts", "meta", "sqlite_sequence", "business_orders"}
+                "receive_attempts", "meta", "sqlite_sequence", "business_orders", "access_keys"}
     require(set(snap["tables"]) == required, "fixture table surface changed; review complete oracle")
     for table in required:
         require(bool(rows(snap, table)), "fixture did not populate " + table)
@@ -116,6 +116,14 @@ def check_seed(snap, fixture):
     # Compare typed full rows against the independently generated send manifest.
     to_cells = lambda data: sorted([{key: cell(value) for key, value in row.items()} for row in data], key=canonical)
     compare(to_cells(rows(snap, "messages")), to_cells(expected), "seed identities/content/all message columns")
+    expected_keys = [{"id": key["ID"], "name": key["Name"], "permissions": key["Permissions"],
+                      "created_at": key["CreatedAt"], "expires_at": key["ExpiresAt"],
+                      "revoked_at": key["RevokedAt"],
+                      "token_hash": hashlib.sha256(key["Token"].encode()).digest()} for key in fixture["keys"]]
+    require(len(expected_keys) == 3 and {key["name"] for key in expected_keys} ==
+            {"active", "expired", "revoked"}, "fixture missing key lifecycle state")
+    compare(to_cells(rows(snap, "access_keys")), to_cells(expected_keys), "seed complete key metadata and digests")
+    require(all(key["Token"] not in canonical(snap) for key in fixture["keys"]), "plaintext key leaked into database")
     outbox = next(item for item in fixture["entries"] if item["queue"] == "outbox")
     compare(to_cells(rows(snap, "business_orders")), to_cells([{
         "id": fixture["business"], "amount": 12345, "payload": base64.b64decode(outbox["message"]["Body"])
@@ -346,6 +354,7 @@ def execute(args, out):
         save(out / (kind + "-final.json"), final)
         require(not rows(final, "messages"), kind + " restore left unexpected messages")
         compare(final["tables"]["business_orders"], before["tables"]["business_orders"], kind + " business content changed")
+        compare(final["tables"]["access_keys"], before["tables"]["access_keys"], kind + " key metadata/digests changed")
     compare({"hot": digest(hot), "cold": tree_hashes(cold)}, backup_hashes, "verification mutated immutable backups")
     schema = schema_drill(args, out)
     save(out / "metadata.json", metadata)

@@ -10,6 +10,8 @@ Env: ENDPOINT, TOKEN, RUNID (set by run.sh).
 import base64
 import json
 import os
+import re
+import secrets
 import sys
 import time
 import urllib.error
@@ -375,12 +377,98 @@ def t_cancel_scheduled():
     check(len(r["messages"]) == 0, "scheduled message gone after cancel")
 
 
+def t_access_keys():
+    section("managed keys: separate producer/consumer, administration and revocation")
+    q = f"{RUNID}_py_keys"
+    check(create_queue(q)[0] == 200, "administrator creates credential test queue")
+    auth = "/mqlite.v1.AuthService/"
+    queue = "/mqlite.v1.QueueService/"
+    created = []
+    try:
+        tokens = {}
+        for permission in ("send", "listen", "manage"):
+            # Keep the public ID before the request, including uncertain outcomes.
+            key_id = secrets.token_hex(16)
+            created.append(key_id)
+            request = {"id": key_id, "name": RUNID + "-" + permission,
+                       "permissions": [permission]}
+            status, result = call(auth + "CreateKey", request)
+            check(status == 200 and result["key"]["id"] == key_id and
+                  result["key"]["permissions"] == [permission], permission + " key created")
+            token = result["token"]
+            check(re.fullmatch(r"mqk_[0-9a-f]{64}", token) is not None, "generated token format")
+            tokens[permission] = token
+            status, duplicate = call(auth + "CreateKey", request)
+            check(status == 409 and duplicate.get("code") == "key_conflict" and
+                  "token" not in duplicate, "duplicate ID cannot recover a secret")
+        producer, consumer, manager = (tokens[p] for p in ("send", "listen", "manage"))
+        payload = {"queue": q, "messages": [{"body": b64("scoped-canary:" + RUNID)}]}
+        check(call(queue + "Send", payload, producer)[0] == 200, "send key produces")
+        status, denied = call(queue + "Send", payload, consumer)
+        check(status == 403 and denied.get("code") == "permission_denied", "listen key cannot send")
+        check(call(queue + "Receive", {"queue": q}, producer)[0] == 403, "send key cannot consume")
+        status, received = call(queue + "Receive", {"queue": q}, consumer)
+        check(status == 200 and len(received["messages"]) == 1, "listen key consumes exactly one message")
+        message = received["messages"][0]
+        check(base64.b64decode(message["body"]).decode() == "scoped-canary:" + RUNID, "scoped round-trip payload preserved")
+        settlement = {"queue": q, "seq_number": message["seq_number"], "lock_token": message["lock_token"]}
+        check(call(queue + "Complete", settlement, consumer)[0] == 200, "listen key settles")
+        check(call(auth + "ListKeys", {}, producer)[0] == 403 and
+              call(auth + "RevokeKey", {"id": created[0]}, consumer)[0] == 403,
+              "application keys cannot list or revoke credentials")
+        seen, cursor = {}, ""
+        while True:
+            status, page = call(auth + "ListKeys", {"limit": 2, "after_id": cursor}, manager)
+            check(status == 200 and all("token" not in key and "token_hash" not in key for key in page["keys"]),
+                  "managed administrator lists metadata without secrets")
+            seen.update((key["id"], key) for key in page["keys"])
+            cursor = page.get("next_after_id", "")
+            if not cursor:
+                break
+        check(all(key_id in seen for key_id in created), "pagination includes every created public ID")
+        newest, cursor, previous, unique, cursors = [], "", None, set(), set()
+        while True:
+            if cursor in cursors:
+                check(False, "newest-first pagination cannot repeat a cursor")
+                break
+            cursors.add(cursor)
+            status, page = call(auth + "ListKeys", {"sort": "created_desc", "limit": 2,
+                                                    "after_id": cursor}, manager)
+            check(status == 200, "newest-first key page succeeds")
+            for key in page["keys"]:
+                order = (key["created_at_ms"], key["id"])
+                check((previous is None or order < previous) and key["id"] not in unique,
+                      "newest-first order stays strict across page boundaries")
+                previous = order
+                unique.add(key["id"])
+                newest.append(key)
+            cursor = page.get("next_after_id", "")
+            if not cursor:
+                break
+        expected = sorted((seen[key_id] for key_id in created),
+                          key=lambda key: (key["created_at_ms"], key["id"]), reverse=True)
+        check([key["id"] for key in newest if key["id"] in created] ==
+              [key["id"] for key in expected], "newest-first listing includes every issued key in creation order")
+        check(call(auth + "ListKeys", {"sort": "unknown"}, manager)[0] == 400,
+              "unsupported key sort is rejected")
+        check(call(auth + "ListKeys", {"sort": "created_desc", "after_id": secrets.token_hex(16)}, manager)[0] == 400,
+              "unknown newest-first cursor is rejected")
+        check(call(auth + "RevokeKey", {"id": created[0]}, manager)[0] == 200, "managed administrator revokes producer")
+        status, revoked = call(queue + "Send", payload, producer)
+        check(status == 401 and revoked.get("code") == "unauthenticated", "revoked key rejected on next request")
+        check(call(queue + "Stats", {"queue": q}, consumer)[1]["total"] == 0, "denied requests had no queue side effects")
+    finally:
+        for key_id in created:
+            status, _ = call(auth + "RevokeKey", {"id": key_id})
+            check(status in (200, 404), "test credential revoked or never committed")
+
+
 def main():
     print(f"Python behavioural suite — endpoint={ENDPOINT} runid={RUNID}")
     for fn in (t_lifecycle, t_batch, t_visibility_timeout, t_dlq_redrive,
                t_explicit_deadletter, t_defer, t_schedule, t_dedup, t_sessions,
                t_receive_and_delete, t_fencing,
-               t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled):
+               t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled, t_access_keys):
         try:
             fn()
         except Exception as e:  # noqa

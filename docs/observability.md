@@ -1,7 +1,7 @@
 # Observability
 
-The broker exposes Prometheus metrics at **`GET /metrics`** (behind Bearer auth, like
-the RPCs — a scraper passes the token; `/`, `/healthz` and the enabled static `/ui`
+The broker exposes Prometheus metrics at **`GET /metrics`** (requiring a Bearer key
+with `manage` permission when auth is enabled; `/`, `/healthz` and the enabled static `/ui`
 console are open, while its API calls still require authentication). This guide
 wires `/metrics` into Prometheus + Grafana and suggests alerts.
 
@@ -96,7 +96,7 @@ scrape_configs:
     metrics_path: /metrics
     authorization:
       type: Bearer
-      credentials: mqk_prod_CHANGEME   # one of MQLITE_TOKENS (use a file in real setups)
+      credentials: mqk_prod_CHANGEME   # configured administrator or managed manage key; use a credentials file
     static_configs:
       - targets: ["your-mqlite.fly.dev"]
 ```

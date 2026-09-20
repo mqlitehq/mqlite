@@ -7,18 +7,21 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/server"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 var mqliteBin string
@@ -197,5 +200,100 @@ func TestBlackboxEmptyTokenSendsNoAuth(t *testing.T) {
 	dsnCleared.Env = dsnEnv
 	if code, _ := exitCode(dsnCleared); code == 0 {
 		t.Error("--token= must strip a DSN-embedded credential (mqlite://token@host)")
+	}
+}
+
+func TestBlackboxKeyCommand(t *testing.T) {
+	url, eng := bbBroker(t, "administrator")
+	id := strings.Repeat("a", 32)
+	cmd := exec.Command(mqliteBin, "key", "create", "--name", "automation", "--permissions", "send", "--id", id, "--output", "json")
+	cmd.Env = append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN=administrator")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if code, stderr := exitCode(cmd); code != 0 {
+		t.Fatalf("key create exited %d: %s", code, stderr)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	page, err := eng.ListAccessKeys(context.Background(), "", 0)
+	if err != nil || len(page.Keys) != 1 || page.Keys[0].ID != id {
+		t.Fatalf("key create did not persist metadata: %+v, %v", page, err)
+	}
+	for _, args := range [][]string{{"key", "list"}, {"key", "revoke", "--id", id}, {"key", "create", "--name", "escalation", "--permissions", "manage"}} {
+		cmd = exec.Command(mqliteBin, args...)
+		cmd.Env = append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN="+created.Token)
+		out.Reset()
+		cmd.Stdout = &out
+		code, stderr := exitCode(cmd)
+		if code == 0 || !strings.Contains(stderr, "permission denied") || strings.Contains(stderr, created.Token) || out.Len() != 0 {
+			t.Fatalf("restricted command result: code=%d stderr=%q stdout bytes=%d", code, stderr, out.Len())
+		}
+		if args[1] == "create" && !regexp.MustCompile(`create key ID [0-9a-f]{32}:`).MatchString(stderr) {
+			t.Fatal("failed create must preserve generated ID")
+		}
+	}
+}
+
+func TestBlackboxKeyListSort(t *testing.T) {
+	ctx := context.Background()
+	clock := int64(100)
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, Now: func() int64 { return clock }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	for _, fixture := range []struct {
+		prefix  string
+		created int64
+	}{{"f", 100}, {"1", 200}, {"a", 200}} {
+		clock = fixture.created
+		if _, _, err := eng.CreateAccessKey(ctx, engine.CreateAccessKeyOptions{ID: strings.Repeat(fixture.prefix, 32), Name: "worker-" + fixture.prefix, Permissions: engine.KeySend}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ts := httptest.NewServer(server.New(eng, []string{"administrator"}).Handler())
+	defer ts.Close()
+	run := func(args ...string) (int, string, string) {
+		t.Helper()
+		cmd := exec.Command(mqliteBin, args...)
+		cmd.Env = append(os.Environ(), "MQLITE_ENDPOINT="+ts.URL, "MQLITE_TOKEN=administrator")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		code, stderr := exitCode(cmd)
+		return code, out.String(), stderr
+	}
+	code, out, stderr := run("key", "list", "--sort", "created_desc", "--limit", "1")
+	if code != 0 {
+		t.Fatalf("sorted list exited %d: %s", code, stderr)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], strings.Repeat("a", 32)+"\t") || !strings.Contains(lines[1], "--sort created_desc") {
+		t.Fatalf("first sorted page or continuation incorrect: %q", out)
+	}
+	// Run the actual continuation printed to the operator, including its sort.
+	args := strings.Fields(strings.TrimPrefix(lines[1], "Next page: "))
+	code, out, stderr = run(append(args, "--output", "json")...)
+	var page wire.ListKeysResponse
+	if code != 0 || json.Unmarshal([]byte(out), &page) != nil || len(page.Keys) != 1 || page.Keys[0].ID != strings.Repeat("1", 32) {
+		t.Fatalf("printed next-page command lost sort: code=%d, stderr=%s", code, stderr)
+	}
+	for _, order := range []string{"", "id_asc"} {
+		args = []string{"key", "list", "--limit", "1", "--output", "json"}
+		if order != "" {
+			args = append(args, "--sort", order)
+		}
+		code, out, stderr = run(args...)
+		page = wire.ListKeysResponse{}
+		if code != 0 || json.Unmarshal([]byte(out), &page) != nil || len(page.Keys) != 1 || page.Keys[0].ID != strings.Repeat("1", 32) {
+			t.Fatalf("default ID order changed: code=%d, stderr=%s", code, stderr)
+		}
+	}
+	code, out, stderr = run("key", "list", "--sort", "created_desc", "--after-id", strings.Repeat("0", 32))
+	if code == 0 || out != "" || !strings.Contains(stderr, "invalid argument") {
+		t.Fatalf("unknown sorted cursor: code=%d stdout=%q stderr=%q", code, out, stderr)
 	}
 }

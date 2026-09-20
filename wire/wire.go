@@ -34,6 +34,10 @@ const (
 	PathRedrive           = "/mqlite.v1.AdminService/Redrive"
 	PathPurge             = "/mqlite.v1.AdminService/Purge"
 	PathStatus            = "/mqlite.v1.AdminService/Status"
+
+	PathCreateKey = "/mqlite.v1.AuthService/CreateKey"
+	PathListKeys  = "/mqlite.v1.AuthService/ListKeys"
+	PathRevokeKey = "/mqlite.v1.AuthService/RevokeKey"
 )
 
 // Message is the wire form of a message (both send input and receive output).
@@ -352,4 +356,52 @@ func (c QueueConfigJSON) ToConfig() engine.QueueConfig {
 		DLQMaxCount:        c.DLQMaxCount,
 		DLQMaxBytes:        c.DLQMaxBytes,
 	}
+}
+
+// AccessKey exposes public metadata only; the secret and its digest are never listed.
+type AccessKey struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Permissions []string `json:"permissions"`
+	CreatedAtMs int64    `json:"created_at_ms"`
+	ExpiresAtMs int64    `json:"expires_at_ms"`
+	RevokedAtMs int64    `json:"revoked_at_ms"`
+}
+
+type CreateKeyRequest struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Permissions []string `json:"permissions"`
+	ExpiresAtMs int64    `json:"expires_at_ms,omitempty"`
+}
+
+// CreateKeyResponse returns the secret exactly once, at creation.
+type CreateKeyResponse struct {
+	Key   AccessKey `json:"key"`
+	Token string    `json:"token"`
+}
+
+type ListKeysRequest struct {
+	AfterID string `json:"after_id,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+	Sort    string `json:"sort,omitempty"`
+}
+
+type ListKeysResponse struct {
+	Keys        []AccessKey `json:"keys"`
+	NextAfterID string      `json:"next_after_id,omitempty"`
+}
+
+type RevokeKeyRequest struct {
+	ID string `json:"id"`
+}
+
+type RevokeKeyResponse struct {
+	Ok bool `json:"ok"`
+}
+
+// FromAccessKey converts public metadata without exposing authentication material.
+func FromAccessKey(key engine.AccessKey) AccessKey {
+	return AccessKey{ID: key.ID, Name: key.Name, Permissions: key.Permissions.Names(),
+		CreatedAtMs: key.CreatedAtMs, ExpiresAtMs: key.ExpiresAtMs, RevokedAtMs: key.RevokedAtMs}
 }

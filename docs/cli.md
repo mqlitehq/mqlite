@@ -19,7 +19,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_DB` | embedded DB DSN: `file:./mq.db` / `:memory:` / `libsql://<db>.turso.io` |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: a running broker + its Bearer token |
-| `MQLITE_TOKENS` | broker (`serve`) Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth |
+| `MQLITE_TOKENS` | broker (`serve`) administrator Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth; additional managed keys live in the database |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
@@ -86,6 +86,57 @@ The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
 
 Serves the RPC API, `/metrics`, the open `/` + `/healthz`, and — unless
 `MQLITE_UI=off` — the embedded admin console at `/ui`.
+
+### `key create|list|revoke` — manage persistent access keys
+
+Available in the v0.3.1 source tree. In client mode, use an environment administrator
+or a managed `manage` key as `MQLITE_TOKEN`. The broker can keep running while keys
+are created or revoked. Embedded mode directly manages the configured database
+and requires exclusive ownership; it cannot open a running local broker's DB.
+
+```bash
+# MQLITE_ENDPOINT and MQLITE_TOKEN already select the broker and administrator.
+mqlite key create --name producer --permissions send --output json
+mqlite key create --name worker --permissions listen --output json
+mqlite key create --name processor --permissions send,listen --output json
+mqlite key create --name operator --permissions manage --output json
+mqlite key list --limit 100 --output json
+mqlite key list --sort created_desc --limit 25 --output json
+mqlite key revoke --id <public-key-id>
+```
+
+| Subcommand | Flags | Result |
+|---|---|---|
+| `create` | required `--name`, `--permissions`; optional `--id`, `--expires-at-ms` | key metadata plus its one-time secret |
+| `list` | optional `--after-id`, `--limit` (default 100, maximum 1000), `--sort id_asc\|created_desc` (default `id_asc`) | metadata and a continuation cursor; no secrets or digests |
+| `revoke` | required `--id` | idempotently revokes an existing database key |
+
+`--id` is a public 32-character lowercase hex ID; when omitted, the CLI generates
+it before contacting the broker. Creation failures report that ID so an ambiguous
+result can be reconciled without guessing from a name. The secret is a separate
+`mqk_` token with 64 lowercase hex characters. Save it securely when returned;
+it cannot be retrieved again. `--expires-at-ms` uses epoch milliseconds; zero
+(the default) means no expiry. Key names need not be unique.
+
+Lists default to ascending public ID order. `--sort created_desc` lists the
+newest-created keys first across all pages, with descending ID as the tie-breaker
+for identical creation timestamps. Pass `next_after_id` as `--after-id` and keep
+the same `--sort` on every page; text output includes the full continuation
+command. In creation order, the cursor must be an existing key ID (revoked and
+expired keys remain valid cursors). ID order also accepts absent predecessor IDs
+for reconciling a lost create response.
+
+`send` permits sending, scheduling and cancelling scheduled messages; `listen`
+permits consumption, settlement, renewal, peek and queue stats; `manage` includes
+both and all administration, including issuing other `manage` keys. Permissions
+apply to the whole broker. A 403 is a permission failure, not an invalid token;
+ordinary send/listen keys cannot use `key`, `list`, `status` or the admin console.
+Existing configured administrator tokens retain their original format and rights.
+
+To rotate a managed key, create its replacement, move the application to the new
+token, then revoke the old ID. No broker restart is needed. See
+[the authentication contract](api-reference.md#auth) and
+[backup/restore implications](operations.md#consistent-backups).
 
 ### `create-queue <name>` — create/update a queue
 ```bash

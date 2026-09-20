@@ -1,6 +1,7 @@
 # Production operations
 
-This runbook describes v0.3.0 (port 6754, schema token 5).
+This runbook covers v0.3.0 and the upcoming v0.3.1 (port 6754, schema token 5).
+Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
 follow [upgrade and rollback](#upgrade-and-rollback) before replacing the broker.
 See [deployment](deployment.md) for installation and [observability](observability.md)
@@ -20,8 +21,9 @@ for metric definitions and alerts.
   can lose recent commits after power loss. `FULL` still depends on the storage
   stack honoring flushes; SIGKILL tests do not simulate a power failure.
 - Set stable `MQLITE_TOKENS`, terminate HTTPS, and keep the broker behind the proxy
-  or a private network. Every token grants the same API access; there are no
-  per-queue roles. Keep credentials in a restricted environment/secret file.
+  or a private network. Configured tokens are administrators; runtime keys can
+  restrict sending or listening across the broker. There are no per-queue roles.
+  Keep credentials in a restricted environment/secret file.
 - Consumers must be idempotent. Restarts, lost responses and restoring an older
   snapshot can repeat work whose external side effects already happened. Reuse
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
@@ -65,10 +67,24 @@ for the difference between backlog gauges and the completion counter. Review DLQ
 messages before retention removes them; retention is a bounded failure buffer,
 not an archive. Leave space for a new backup and WAL growth during a long read.
 
-For token rotation, configure `MQLITE_TOKENS=old,new`, restart the single broker,
-move clients and scrapers to the new token, then remove the old token and restart.
-Token changes take effect at startup. Quiesce clients during each replacement and
-verify the canary before resuming normal traffic.
+## Key rotation
+
+Use a separate managed key for each producer, consumer or administrator. A
+`manage` key can issue or revoke keys, including other administrators; a `send`
+or `listen` key cannot. The current console and metrics scraper require `manage`.
+Create managed keys with `mqlite key create`, move clients to the replacement,
+then `mqlite key revoke --id <old-id>`. These changes persist in the database and
+take effect without restarting the broker. Revocation rejects new authentication
+attempts; requests already authorized may finish. Keys issued by another key are
+independent, so revoking their issuer does not revoke them.
+
+Configured administrator rotation still uses `MQLITE_TOKENS=old,new`, a broker
+restart, client/scraper cutover, then removal of the old configured token and
+another restart. Quiesce clients during each replacement and verify the canary
+before resuming traffic. A token explicitly configured here remains an
+administrator even if a matching database key has expired or been revoked;
+remove that configuration to revoke the static grant. Keep a configured
+administrator available for recovery, and store secrets outside command history.
 
 ## Consistent backups
 
@@ -76,10 +92,15 @@ These procedures are for a local SQLite file. Turso backups and point-in-time
 recovery belong to the remote service; rehearse that provider's restore process
 and keep one active MQLite owner during the switchover.
 
-Protect backups like the live database: they include message bodies, properties
-and any business tables used by the embedded outbox. Keep a verified copy outside
+Protect backups like the live database: they include message bodies, properties,
+managed key digests/permissions/revocations and any embedded outbox business tables.
+Keep a verified copy outside
 the database's failure domain, together with the matching binary/image identity
-and configuration needed to restore it. Store credentials separately.
+and configuration needed to restore it. Store plaintext credentials separately.
+Restoring a snapshot also restores its key state: newer keys may disappear and
+keys revoked after the snapshot may become valid again. Before reopening client
+traffic, use a configured administrator to review key metadata and revoke or
+replace credentials whose state changed after the backup.
 
 ### Online snapshot
 
@@ -166,6 +187,14 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Different schema token | Keep the old database with its old binary. Account for all retained work, then create a new database using the candidate. Do not edit the schema token or point the candidate at the old file as a migration. |
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
+
+For **v0.3.0 → v0.3.1**, schema token **5** and the port remain unchanged.
+The candidate adds the independent `access_keys` table without rewriting existing
+queue or message tables. Rehearse opening a restored copy first. Rolling back to
+v0.3.0 preserves that extra table, but the old binary cannot authenticate managed
+keys or enforce their permissions: reconnect clients with configured administrator
+tokens, or keep them stopped until v0.3.1 is restored. A database with an unrelated,
+incompatible table named `access_keys` is rejected without modifying it.
 
 For **v0.2.0 → v0.3.0**, schema **2 → 5** and default port **8080 → 6754** both
 change. Before the cutover, stop producers and account for **every queue and

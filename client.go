@@ -76,9 +76,24 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 		return err
 	}
 	defer resp.Body.Close()
+	keyResponse := path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey
+	var keyData []byte
+	if keyResponse {
+		keyData, err = wire.ReadKeyResponse(resp.Body)
+		if err != nil {
+			if path == wire.PathCreateKey || path == wire.PathRevokeKey {
+				return fmt.Errorf("%w: incomplete or oversized access key response", ErrOutcomeUnknown)
+			}
+			return err
+		}
+	}
 	if resp.StatusCode/100 != 2 {
 		var eb wire.ErrorBody
-		_ = json.NewDecoder(resp.Body).Decode(&eb)
+		if keyResponse {
+			_ = json.Unmarshal(keyData, &eb)
+		} else {
+			_ = json.NewDecoder(resp.Body).Decode(&eb)
+		}
 		// Did the broker say "I have no such ROUTE" — i.e. it is too old to serve this operation —
 		// rather than "that queue/message does not exist"? Both are 404s, and the difference
 		// decides whether a client may fall back to an older equivalent.
@@ -93,9 +108,33 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 			(eb.Code == "" || strings.HasPrefix(eb.Message, "no such path")) {
 			return fmt.Errorf("%w: %s", ErrUnsupported, path)
 		}
+		if keyResponse {
+			// Intermediary error bodies are untrusted too. Keep recognized codes
+			// without echoing arbitrary text that could contain a partial secret.
+			eb.Message = "access key request failed"
+			switch eb.Code {
+			case "unauthenticated", "permission_denied", "key_conflict", "not_found", "invalid_argument", "message_too_large", "outcome_unknown", "internal", "canceled", "unimplemented":
+			default:
+				eb.Code = ""
+			}
+		}
+		// Proxies may omit or rename the JSON error code. HTTP authentication
+		// failures are still permanent, so a Receiver must never retry them.
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			eb.Code = "unauthenticated"
+		case http.StatusForbidden:
+			eb.Code = "permission_denied"
+		}
 		return mapErr(eb)
 	}
 	if respOut != nil {
+		if raw, ok := respOut.(*json.RawMessage); ok && keyResponse {
+			// Key management validates a COMPLETE response, including trailing data,
+			// before returning a secret or acknowledging a security-sensitive write.
+			*raw = keyData
+			return nil
+		}
 		return json.NewDecoder(resp.Body).Decode(respOut)
 	}
 	return nil
@@ -119,6 +158,10 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrLockLost, eb.Message)
 	case "unauthenticated":
 		return fmt.Errorf("%w: %s", ErrUnauthenticated, eb.Message)
+	case "permission_denied":
+		return fmt.Errorf("%w: %s", ErrPermissionDenied, eb.Message)
+	case "key_conflict":
+		return fmt.Errorf("%w: %s", ErrKeyConflict, eb.Message)
 	case "outcome_unknown":
 		return fmt.Errorf("%w: %s", ErrOutcomeUnknown, eb.Message)
 	default:

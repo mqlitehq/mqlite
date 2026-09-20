@@ -481,3 +481,228 @@ func TestPeekViewActuallyCopiesTheFieldsItClaims(t *testing.T) {
 		}
 	}
 }
+
+// The key commands retain the wire shape in both connection modes and only the
+// successful create response carries a secret. Lists include revoked metadata.
+func TestKeyCommandsJSONContract(t *testing.T) {
+	ctx := context.Background()
+	for _, mode := range []string{"embedded", "http"} {
+		t.Run(mode, func(t *testing.T) {
+			embeddedEnv(t)
+			if mode == "http" {
+				url, _ := bbBroker(t, "administrator")
+				t.Setenv("MQLITE_ENDPOINT", url)
+				t.Setenv("MQLITE_TOKEN", "administrator")
+			}
+			run := func(args ...string) string {
+				t.Helper()
+				out, err := captureStdout(t, func() error { return cmdKey(ctx, append(args, "--output", "json")) })
+				if err != nil {
+					t.Fatal(err)
+				}
+				return out
+			}
+			if out := strings.TrimSpace(run("list")); out != "{\n  \"keys\": []\n}" {
+				t.Fatalf("empty page = %q", out)
+			}
+			ids := []string{strings.Repeat("1", 32), strings.Repeat("2", 32)}
+			var secret string
+			for i, id := range ids {
+				out := run("create", "--name", "worker", "--permissions", "send,listen", "--id", id)
+				var result wire.CreateKeyResponse
+				if err := json.Unmarshal([]byte(out), &result); err != nil {
+					t.Fatal(err)
+				}
+				if result.Key.ID != id || len(result.Token) != 68 || !strings.HasPrefix(result.Token, "mqk_") || strings.Count(out, result.Token) != 1 {
+					t.Fatal("creation must show one secret and the retained public ID")
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(out), &fields); err != nil {
+					t.Fatal(err)
+				}
+				if len(fields) != 2 || fields["key"] == nil || fields["token"] == nil {
+					t.Fatalf("unexpected create response fields: %v", fields)
+				}
+				var metadata map[string]any
+				if err := json.Unmarshal(fields["key"], &metadata); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(jsonTagsOf(reflect.TypeOf(wire.AccessKey{})), fieldSet(metadata)) {
+					t.Fatalf("key metadata fields = %v", keysOf(metadata))
+				}
+				if i == 0 {
+					secret = result.Token
+				}
+			}
+			out := run("list", "--limit", "1")
+			var page wire.ListKeysResponse
+			if err := json.Unmarshal([]byte(out), &page); err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Keys) != 1 || page.Keys[0].ID != ids[0] || page.NextAfterID != ids[0] || strings.Contains(out, secret) || strings.Contains(out, "token") || strings.Contains(out, "hash") {
+				t.Fatal("first page must contain public metadata and cursor only")
+			}
+			out = run("list", "--after-id", page.NextAfterID, "--limit", "1")
+			page = wire.ListKeysResponse{}
+			if err := json.Unmarshal([]byte(out), &page); err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Keys) != 1 || page.Keys[0].ID != ids[1] || page.NextAfterID != "" {
+				t.Fatalf("last page = %+v", page)
+			}
+			for i, after := range []string{"", ids[1]} {
+				out = run("list", "--sort", "created_desc", "--after-id", after, "--limit", "1")
+				page = wire.ListKeysResponse{}
+				if err := json.Unmarshal([]byte(out), &page); err != nil {
+					t.Fatal(err)
+				}
+				wantNext := ids[1]
+				if i == 1 {
+					wantNext = ""
+				}
+				if len(page.Keys) != 1 || page.Keys[0].ID != ids[1-i] || page.NextAfterID != wantNext || strings.Contains(out, secret) {
+					t.Fatalf("creation-order page %d = %+v", i, page)
+				}
+			}
+			human, err := captureStdout(t, func() error {
+				return cmdKey(ctx, []string{"list", "--sort", "created_desc", "--limit", "1", "--output", "text"})
+			})
+			if err != nil || !strings.Contains(human, "Next page: key list --after-id "+ids[1]+" --limit 1 --sort created_desc\n") {
+				t.Fatalf("human continuation lost creation order: %q, %v", human, err)
+			}
+			for i := 0; i < 2; i++ {
+				out = run("revoke", "--id", ids[0])
+				if strings.TrimSpace(out) != "{\n  \"ok\": true\n}" {
+					t.Fatalf("revoke JSON = %q", out)
+				}
+			}
+			out = run("list")
+			if err := json.Unmarshal([]byte(out), &page); err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Keys) != 2 || page.Keys[0].RevokedAtMs == 0 || strings.Contains(out, secret) {
+				t.Fatal("revoked key must remain listed without its secret")
+			}
+		})
+	}
+}
+
+func fieldSet(fields map[string]any) map[string]bool {
+	out := make(map[string]bool, len(fields))
+	for name := range fields {
+		out[name] = true
+	}
+	return out
+}
+
+func TestKeyCommandsHumanOutputAndErrors(t *testing.T) {
+	embeddedEnv(t)
+	ctx := context.Background()
+	create := []string{"create", "--name", "human", "--permissions", "manage"}
+	out, err := captureStdout(t, func() error { return cmdKey(ctx, create) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 4 || !strings.HasPrefix(lines[0], "Key ID: ") || !strings.HasPrefix(lines[3], "Token (save now; shown only once): mqk_") {
+		t.Fatalf("human create = %q", out)
+	}
+	id := strings.TrimPrefix(lines[0], "Key ID: ")
+	secret := strings.TrimPrefix(lines[3], "Token (save now; shown only once): ")
+	if len(id) != 32 || len(secret) != 68 || strings.Count(out, secret) != 1 {
+		t.Fatal("generated ID and one-time secret must be distinguishable")
+	}
+	out, err = captureStdout(t, func() error { return cmdKey(ctx, []string{"list", "--limit", "1"}) })
+	if err != nil || !strings.Contains(out, id) || strings.Contains(out, secret) {
+		t.Fatalf("human list err = %v", err)
+	}
+	out, err = captureStdout(t, func() error { return cmdKey(ctx, []string{"revoke", "--id", id}) })
+	if err != nil || strings.TrimSpace(out) != "Revoked key ID: "+id {
+		t.Fatalf("human revoke = %q, %v", out, err)
+	}
+	for _, args := range [][]string{
+		nil, {"unknown"}, {"create"}, {"create", "--name", "x", "--permissions", "manage", "extra"},
+		{"create", "--name", "x", "--permissions", "read"}, {"create", "--name", "x", "--permissions", "send", "--id="},
+		{"create", "--name", "x", "--permissions", "send", "--id", secret},
+		{"create", "--name", "x", "--permissions", "send", "--expires-at-ms", "1"},
+		{"list", "extra"}, {"list", "--after-id", "bad"}, {"list", "--limit", "1001"},
+		{"list", "--sort", "newest"}, {"list", "--sort", ""}, {"list", "--sort", secret},
+		{"revoke"}, {"revoke", "--id", "bad"}, {"revoke", "--id", id, "extra"},
+	} {
+		_, err := captureStdout(t, func() error { return cmdKey(ctx, args) })
+		if err == nil {
+			t.Fatalf("args %v should fail", args)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatal("a command failure must not disclose an existing secret")
+		}
+	}
+	// A failed request with a caller-supplied ID must preserve that ID in the
+	// error, so an operator can list/revoke a key after losing its response.
+	t.Setenv("MQLITE_ENDPOINT", "://bad")
+	_, err = captureStdout(t, func() error { return cmdKey(ctx, append(create, "--id", id)) })
+	if err == nil || !strings.Contains(err.Error(), id) {
+		t.Fatalf("failed create did not retain public ID: %v", err)
+	}
+}
+
+func TestKeyCreateLostOutputRetainsPublicID(t *testing.T) {
+	embeddedEnv(t)
+	ctx := context.Background()
+	id := strings.Repeat("b", 32)
+	file, err := os.CreateTemp(t.TempDir(), "closed-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = file
+	defer func() { os.Stdout = old }()
+	err = cmdKey(ctx, []string{"create", "--id", id, "--name", "lost-output", "--permissions", "manage", "--output", "json"})
+	os.Stdout = old
+	if err == nil || !strings.Contains(err.Error(), id) || strings.Contains(err.Error(), "mqk_") {
+		t.Fatalf("output failure must retain public ID only: %v", err)
+	}
+	c, err := dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	page, err := c.ListKeys(ctx, "", 0)
+	if err != nil || len(page.Keys) != 1 || page.Keys[0].ID != id {
+		t.Fatalf("committed key must remain identifiable after output failure: %+v, %v", page, err)
+	}
+	if err := c.RevokeKey(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKeyCreateLostResponseRetainsGeneratedID(t *testing.T) {
+	resetGlobals(t)
+	ids := make(chan string, 10)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req wire.CreateKeyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		ids <- req.ID
+		_, _ = w.Write([]byte(`{"key":`))
+	}))
+	defer ts.Close()
+	t.Setenv("MQLITE_ENDPOINT", ts.URL)
+	t.Setenv("MQLITE_TOKEN", "admin")
+	out, err := captureStdout(t, func() error {
+		return cmdKey(context.Background(), []string{"create", "--name", "uncertain", "--permissions", "send", "--output", "json"})
+	})
+	calls := len(ids)
+	if calls != 1 {
+		t.Fatalf("create requests = %d, want 1", calls)
+	}
+	id := <-ids
+	if err == nil || len(id) != 32 || !strings.Contains(err.Error(), id) || out != "" {
+		t.Fatalf("lost response: ID=%q, calls=%d, output bytes=%d, error=%v", id, calls, len(out), err)
+	}
+}

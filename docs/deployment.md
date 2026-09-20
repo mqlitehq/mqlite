@@ -18,7 +18,7 @@ Everything is read from the environment — the DB string is never compiled in.
 |---|---|
 | `MQLITE_DB` | `file:/data/mq.db` (local) or `libsql://<db>.turso.io` (remote) |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
-| `MQLITE_TOKENS` | comma-separated Bearer tokens the broker accepts (**set this in production**) |
+| `MQLITE_TOKENS` | comma-separated administrator Bearer tokens (**set this in production**) |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
@@ -154,6 +154,13 @@ Put a TLS-terminating reverse proxy (Caddy/nginx) in front for anything public; 
 connects to the broker on `127.0.0.1:6754`, which is the only interface the broker binds
 above — so the proxy (with TLS + whatever access control you add) is the single entry
 point, not a bypassable layer over an all-interfaces socket.
+
+Runtime-managed keys in the upcoming v0.3.1 can be created and revoked without a
+restart. Use a configured administrator or managed `manage` key for the console,
+metrics scraper and key administration; use `send`/`listen` for applications.
+See [key commands](cli.md#key-createlistrevoke--manage-persistent-access-keys) and
+[key rotation](operations.md#key-rotation). Existing v0.3.0 deployment examples in this guide
+remain pinned to the published release and do not include managed keys.
 
 ## Backup, restore and upgrades
 

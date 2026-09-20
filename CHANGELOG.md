@@ -5,10 +5,48 @@ those are what an upgrade can feel. Commit-level notes are auto-generated on eac
 [GitHub Release](https://github.com/mqlitehq/mqlite/releases); this file only
 records what changes semantics, adds capability, or fixes something you could hit.
 
-mqlite is pre-1.0: any release may change behavior, and a schema change makes old
-DB files unreadable by design (`ErrSchemaVersionMismatch` — recreate, don't migrate).
+mqlite is pre-1.0: any release may change behavior. Incompatible schema changes
+refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
+Compatible additions can preserve the existing schema token; read each release's
+upgrade notes before replacing a broker.
 
 ## Unreleased
+
+### Persistent access keys (MQLITE-121)
+
+- Create, list and revoke broker access keys at runtime through the HTTP API,
+  Go SDK, `mqlite key` commands, MCP tools or the console. Records survive restart
+  in the same database;
+  only SHA-256 digests are stored, and a generated secret is returned once.
+- Assign `send`, `listen`, their combination, or `manage`. Consumption includes
+  message settlement and renewal. `manage` includes both data permissions and
+  can issue or revoke other managed administrator keys. Existing `MQLITE_TOKENS`
+  and `WithTokens` credentials remain administrators with the same operation
+  rights; changing them still requires updating configuration.
+- All newly generated tokens use `mqk_` plus 64 lowercase hexadecimal characters
+  (256 random bits). Previously configured tokens remain accepted unchanged.
+  Invalid, expired or revoked credentials return 401; insufficient permission
+  returns 403 `permission_denied`. The SDK treats permission denial as permanent.
+- A compatible `access_keys` table is added under **schema token 5**. Existing
+  v0.3.0 queue data can be reused. Downgrading to v0.3.0 preserves these records
+  but ignores database keys; retain a configured administrator for that rollback.
+  Backups include key state, so restoring an older snapshot can also restore a
+  subsequently revoked key. Review credentials before reopening restored traffic.
+- The console adds an Access keys page with permission selection, pagination,
+  expiry/revocation status and a one-time secret display. The MCP server adds
+  `create_key`, `list_keys` and `revoke_key`.
+- Console expiry and scheduled delivery use an English calendar and fixed
+  `yyyy-MM-dd HH:mm` local input, with strict invalid-date validation. Listed
+  timestamps use `yyyy-MM-dd HH:mm:ss`; runtime-issued credentials are labeled
+  "managed keys" to distinguish them from configured administrator tokens.
+- Managed keys in the console are ordered newest first across pages. HTTP,
+  SDK, CLI and MCP listing support `created_desc` ordering with a stable ID
+  tie-breaker and indexed cursor pagination; the existing default ID order is
+  retained for API clients and exact-ID recovery.
+- Permissions apply to the whole broker. The console and `/metrics`
+  require `manage`; ordinary application keys use the SDK, CLI or HTTP API.
+  Explicit auth-off mode keeps the existing queue behavior and refuses key
+  management. Bare or duplicate Authorization headers are rejected.
 
 ## v0.3.0 — 2026-09-10
 

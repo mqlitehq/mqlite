@@ -45,7 +45,8 @@ func WithPrefetch(n int) ReceiverOption { return func(c *receiverConfig) { c.pre
 // a transient receive error being retried, or a per-message settle/renew failure (e.g. a lost
 // lock). It is advisory — for logging or metrics — is called serially (the Receiver guards
 // it, so a plain slice-append or counter is safe), and must not block. A permanent error
-// (bad token, missing queue) is passed here first and then also returned from Run (MQLITE-77).
+// (bad token, denied permission, missing queue) is passed here first and then also
+// returned from Run (MQLITE-77).
 func WithErrorHandler(fn func(error)) ReceiverOption {
 	return func(c *receiverConfig) { c.onError = fn }
 }
@@ -80,11 +81,12 @@ func (r *Receiver) notify(err error) {
 }
 
 // isPermanent reports whether an error will not be fixed by retrying and means the consumer
-// is misconfigured — a bad token or a missing queue: the receive loop stops and Run returns
-// it, instead of spinning forever. Transient errors (network, 5xx, timeouts) and an expected
+// is misconfigured — a bad token, denied permission, or a missing queue: the loop
+// stops and Run returns it, instead of spinning forever. Transient errors (network, 5xx, timeouts) and an expected
 // ErrLockLost are not permanent.
 func isPermanent(err error) bool {
 	return errors.Is(err, ErrUnauthenticated) ||
+		errors.Is(err, ErrPermissionDenied) ||
 		errors.Is(err, ErrNotFound) ||
 		errors.Is(err, ErrQueueNotFound) ||
 		// The broker does not serve this operation at all — an older broker, or a proxy that
@@ -260,7 +262,7 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 
 // settleErr surfaces a settle/renew failure: an expected ErrLockLost (the message was
 // redelivered) or a transient error goes to the observer only; a permanent one (bad token,
-// missing queue) is also fatal and stops Run.
+// denied permission, missing queue) is also fatal and stops Run.
 func (r *Receiver) settleErr(err error, cancelled func() bool, fail func(error, bool)) {
 	if err == nil {
 		return

@@ -7,6 +7,20 @@ package engine
 // whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
 const schemaVersion = "5"
 
+// MQLITE-121: this independent table is additive to schema 5. Existing queue data
+// and indexes remain unchanged; a v0.3.0 broker ignores and preserves these rows.
+const accessKeySchema = `CREATE TABLE IF NOT EXISTS access_keys (
+	    id           TEXT PRIMARY KEY CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),
+	    name         TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 128),
+	    token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+	    permissions  INTEGER NOT NULL CHECK (permissions IN (1,2,3,7)),
+	    created_at   INTEGER NOT NULL CHECK (created_at >= 0),
+	    expires_at   INTEGER NOT NULL DEFAULT 0 CHECK (expires_at = 0 OR expires_at > created_at),
+	    revoked_at   INTEGER NOT NULL DEFAULT 0 CHECK (revoked_at >= 0)
+	) STRICT`
+
+const accessKeyCreatedIndex = `CREATE INDEX IF NOT EXISTS idx_access_keys_created ON access_keys(created_at DESC, id DESC)`
+
 // schemaStmts is the mqlite SQLite/libSQL schema (design §5.2 + §11.1).
 // Executed one statement at a time so it works identically on local modernc
 // SQLite and on remote Turso/libSQL (Hrana wants one statement per exec).
@@ -156,5 +170,7 @@ var schemaStmts = []string{
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_recv_attempt_expire ON receive_attempts(expires_at)`,
 
+	accessKeySchema,
+	accessKeyCreatedIndex,
 	`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`,
 }

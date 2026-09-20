@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -854,5 +855,44 @@ func TestFailedRenewalKeepsAStillValidLease(t *testing.T) {
 	}
 	if pace(time.Time{}) != renewRetryInterval {
 		t.Fatal("sanity: an unknown deadline should use the retry cadence")
+	}
+}
+
+// A denied batch route is an authorization failure, not evidence of an old
+// broker. Neither settlement nor renewal may silently fall back to single RPCs.
+func TestBatchPermissionDeniedNeverFallsBack(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	var completeBatch, complete, renewBatch, renew atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wire.PathCompleteBatch:
+			completeBatch.Add(1)
+		case wire.PathComplete:
+			complete.Add(1)
+		case wire.PathRenewBatch:
+			renewBatch.Add(1)
+		case wire.PathRenew:
+			renew.Add(1)
+		default:
+			t.Errorf("unexpected request path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":"permission_denied","message":"listen permission required"}`))
+	}))
+	defer ts.Close()
+	c, err := mqlite.Open(ctx, ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := c.Message("q", 1, "lease-token")
+	if _, err := c.CompleteBatch(ctx, "q", msg); !errors.Is(err, mqlite.ErrPermissionDenied) {
+		t.Fatalf("batch settlement = %v", err)
+	}
+	if got := renewFunc(c, "q", []*mqlite.Message{msg}, time.Minute)(ctx); !got.IsZero() {
+		t.Fatal("denied renewal must not invent a renewed lease")
+	}
+	if completeBatch.Load() != 1 || renewBatch.Load() != 1 || complete.Load() != 0 || renew.Load() != 0 {
+		t.Fatalf("RPC counts: completeBatch=%d complete=%d renewBatch=%d renew=%d", completeBatch.Load(), complete.Load(), renewBatch.Load(), renew.Load())
 	}
 }

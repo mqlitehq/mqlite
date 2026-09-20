@@ -19,17 +19,19 @@ import (
 
 // Re-exported sentinel errors so callers can use errors.Is on either mode.
 var (
-	ErrLockLost        = engine.ErrLockLost
-	ErrUnauthenticated = engine.ErrUnauthenticated
-	ErrOutcomeUnknown  = engine.ErrOutcomeUnknown
-	ErrInvalidArgument = engine.ErrInvalidArgument
-	ErrNotFound        = engine.ErrNotFound
-	ErrUnsupported     = engine.ErrUnsupported
-	ErrQueueNotFound   = engine.ErrQueueNotFound
-	ErrDedupConflict   = engine.ErrDedupConflict
-	ErrMessageTooLarge = engine.ErrMessageTooLarge
-	ErrNameConflict    = engine.ErrNameConflict
-	ErrGroupRequired   = engine.ErrGroupRequired
+	ErrLockLost         = engine.ErrLockLost
+	ErrUnauthenticated  = engine.ErrUnauthenticated
+	ErrPermissionDenied = engine.ErrPermissionDenied
+	ErrKeyConflict      = engine.ErrKeyConflict
+	ErrOutcomeUnknown   = engine.ErrOutcomeUnknown
+	ErrInvalidArgument  = engine.ErrInvalidArgument
+	ErrNotFound         = engine.ErrNotFound
+	ErrUnsupported      = engine.ErrUnsupported
+	ErrQueueNotFound    = engine.ErrQueueNotFound
+	ErrDedupConflict    = engine.ErrDedupConflict
+	ErrMessageTooLarge  = engine.ErrMessageTooLarge
+	ErrNameConflict     = engine.ErrNameConflict
+	ErrGroupRequired    = engine.ErrGroupRequired
 	// ErrDBLocked is returned by OpenEmbedded when the local file DB is already open
 	// in another process: embedded mode is single-process, single-writer (MQLITE-6).
 	ErrDBLocked = engine.ErrDBLocked

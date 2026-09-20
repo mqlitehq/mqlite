@@ -22,11 +22,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mqlitehq/mqlite/internal/authkey"
 )
 
 // netTimeout is a net.Error whose message contains none of isConnErr's substrings,
@@ -127,7 +132,9 @@ func TestSchemaVersionGuard(t *testing.T) {
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
 		wantVersion = "5"
-		wantHash    = "9dcb13ddf1fbf11179a690e70d357dcfa1b87fa6f135a85db02164185d5854e6"
+		// MQLITE-121: the independent access_keys table is additive; all previous
+		// statements are pinned separately by TestAccessKeySchemaAdditiveCompatibility.
+		wantHash = "755981e5ff9dbd1e04a7e0f1152358452464053ff1a6276300f20135b5c21ec0"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -588,6 +595,8 @@ type busyState struct {
 	args      [][]driver.NamedValue // the args of every attempt, in order
 	queries   []string
 	noEffect  bool // a fenced write matched no message; exercise receipt lookup instead
+	commitErr error
+	execErr   error
 }
 
 func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
@@ -605,7 +614,7 @@ func (t *busyTx) Commit() error {
 		t.st.failsLeft--
 		return errors.New("database is locked") // busy: the commit provably did not land
 	}
-	return nil
+	return t.st.commitErr
 }
 func (t *busyTx) Rollback() error { return nil }
 
@@ -629,6 +638,9 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if !c.record(query, args) {
 		return nil, errors.New("database is locked")
+	}
+	if c.st.execErr != nil {
+		return nil, c.st.execErr
 	}
 	if c.st.noEffect {
 		return driver.RowsAffected(0), nil
@@ -1229,5 +1241,871 @@ func TestSettlementTimeRefreshesOnRemoteRetry(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// ─── Persistent access keys (MQLITE-121) ────────────────────────────────────
+
+func TestKeyPermissionsExhaustive(t *testing.T) {
+	names := map[KeyPermissions][]string{
+		KeySend: {"send"}, KeyListen: {"listen"},
+		KeySend | KeyListen: {"send", "listen"}, KeyManage: {"manage"},
+	}
+	for p := 0; p < 256; p++ {
+		got := KeyPermissions(p)
+		wantNames, valid := names[got]
+		if !reflect.DeepEqual(got.Names(), wantNames) {
+			t.Fatalf("permissions %d names = %v, want %v", p, got.Names(), wantNames)
+		}
+		if valid {
+			parsed, err := ParseKeyPermissions(wantNames)
+			if err != nil || parsed != got {
+				t.Fatalf("permission round trip: %d %v", parsed, err)
+			}
+		}
+		for r := 0; r < 256; r++ {
+			_, requiredValid := names[KeyPermissions(r)]
+			if allowed := got.Allows(KeyPermissions(r)); allowed != (valid && requiredValid && p&r == r) {
+				t.Fatalf("Allows(%d,%d) = %v", p, r, allowed)
+			}
+		}
+	}
+	for _, input := range [][]string{nil, {}, {""}, {"read"}, {"Send"}, {" listen"}, {"manage", "unknown"}, {"manage", ""}} {
+		if _, err := ParseKeyPermissions(input); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("invalid permission list %q accepted: %v", input, err)
+		}
+	}
+	for _, input := range [][]string{{"send", "send", "listen"}, {"listen", "send"}} {
+		if p, err := ParseKeyPermissions(input); err != nil || p != KeySend|KeyListen {
+			t.Fatalf("normalization %q = %d %v", input, p, err)
+		}
+	}
+	for _, input := range [][]string{{"manage", "send", "listen"}, {"listen", "manage"}, {"manage", "manage"}} {
+		if p, err := ParseKeyPermissions(input); err != nil || p != KeyManage {
+			t.Fatalf("manage normalization %q = %d %v", input, p, err)
+		}
+	}
+}
+
+func accessKeyOptions(n int) CreateAccessKeyOptions {
+	return CreateAccessKeyOptions{ID: fmt.Sprintf("%032x", n), Name: "application", Permissions: KeySend}
+}
+
+func TestAccessKeyLifecycle(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	var issued []string
+	for i, p := range []KeyPermissions{KeySend, KeyListen, KeySend | KeyListen, KeyManage} {
+		opts := accessKeyOptions(i + 1)
+		opts.Permissions = p
+		key, token, err := e.CreateAccessKey(ctx, opts)
+		if err != nil || !authkey.ValidToken(token) || key.ID != opts.ID || key.Name != opts.Name || key.Permissions != p || key.CreatedAtMs != atomic.LoadInt64(clock) || key.ExpiresAtMs != 0 || key.RevokedAtMs != 0 {
+			t.Fatalf("create metadata/format: %+v err=%v", key, err)
+		}
+		issued = append(issued, token)
+		var digest []byte
+		if err := e.db.queryRowScan(ctx, []any{&digest}, `SELECT token_hash FROM access_keys WHERE id = ?`, key.ID); err != nil {
+			t.Fatal(err)
+		}
+		want := sha256.Sum256([]byte(token))
+		if !reflect.DeepEqual(digest, want[:]) {
+			t.Fatal("database did not store exactly the token digest")
+		}
+		if got, err := e.AuthenticateAccessKey(ctx, token); err != nil || got != key {
+			t.Fatalf("authenticate metadata = %+v err=%v", got, err)
+		}
+		if duplicate, secret, err := e.CreateAccessKey(ctx, opts); !errors.Is(err, ErrKeyConflict) || duplicate != (AccessKey{}) || secret != "" {
+			t.Fatalf("duplicate id must return conflict without secret: err=%v", err)
+		}
+	}
+	page, err := e.ListAccessKeys(ctx, "", 0)
+	if err != nil || len(page.Keys) != 4 || page.NextAfterID != "" {
+		t.Fatalf("list = %+v %v", page, err)
+	}
+	// The full exported metadata surface is deliberately secret-free.
+	meta := reflect.TypeOf(AccessKey{})
+	var fields []string
+	for i := 0; i < meta.NumField(); i++ {
+		fields = append(fields, meta.Field(i).Name)
+	}
+	if !reflect.DeepEqual(fields, []string{"ID", "Name", "Permissions", "CreatedAtMs", "ExpiresAtMs", "RevokedAtMs"}) {
+		t.Fatalf("public metadata fields changed: %v", fields)
+	}
+	id := page.Keys[3].ID
+	if err := e.RevokeAccessKey(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	revokedAt := atomic.LoadInt64(clock)
+	advance(clock, time.Second)
+	if err := e.RevokeAccessKey(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.AuthenticateAccessKey(ctx, issued[3]); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("revoked administrator authenticated: %v", err)
+	}
+	page, err = e.ListAccessKeys(ctx, "", 1000)
+	if err != nil || len(page.Keys) != 4 || page.Keys[3].RevokedAtMs != revokedAt {
+		t.Fatalf("repeated revoke changed/deleted history: %+v %v", page, err)
+	}
+	for _, token := range issued[:3] {
+		if _, err := e.AuthenticateAccessKey(ctx, token); err != nil {
+			t.Fatalf("independent key revoked with administrator: %v", err)
+		}
+	}
+	if err := e.RevokeAccessKey(ctx, accessKeyOptions(99).ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown revoke = %v", err)
+	}
+	// Authentication must use the unique digest index, not a scan across all keys.
+	var plan string
+	if err := e.db.queryRowScan(ctx, []any{new(int), new(int), new(int), &plan}, `EXPLAIN QUERY PLAN SELECT `+accessKeyColumns+` FROM access_keys WHERE token_hash = ?`, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "SEARCH access_keys USING INDEX") || !strings.Contains(plan, "token_hash=?") {
+		t.Fatalf("authentication lost indexed lookup: %s", plan)
+	}
+}
+
+func TestAccessKeyValidation(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	base := accessKeyOptions(1)
+	for _, id := range []string{"", "a", strings.Repeat("0", 31), strings.Repeat("0", 33), strings.Repeat("A", 32), strings.Repeat("g", 32), strings.Repeat("é", 16)} {
+		opts := base
+		opts.ID = id
+		if _, token, err := e.CreateAccessKey(ctx, opts); !errors.Is(err, ErrInvalidArgument) || token != "" {
+			t.Fatalf("invalid ID accepted: %v", err)
+		}
+		if err := e.RevokeAccessKey(ctx, id); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("invalid revoke ID accepted: %v", err)
+		}
+		if id != "" {
+			if _, err := e.ListAccessKeys(ctx, id, 1); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("invalid cursor accepted: %v", err)
+			}
+		}
+	}
+	for _, name := range []string{"", " ", " name", "name\n", strings.Repeat("a", 129), strings.Repeat("é", 65), "name\x00", "\xff"} {
+		opts := base
+		opts.Name = name
+		if _, token, err := e.CreateAccessKey(ctx, opts); !errors.Is(err, ErrInvalidArgument) || token != "" {
+			t.Fatalf("invalid name accepted: %v", err)
+		}
+	}
+	for p := 0; p < 256; p++ {
+		if p == 1 || p == 2 || p == 3 || p == 7 {
+			continue
+		}
+		opts := base
+		opts.Permissions = KeyPermissions(p)
+		if _, token, err := e.CreateAccessKey(ctx, opts); !errors.Is(err, ErrInvalidArgument) || token != "" {
+			t.Fatalf("invalid permission %d accepted: %v", p, err)
+		}
+	}
+	for _, expiry := range []int64{-1, atomic.LoadInt64(clock) - 1, atomic.LoadInt64(clock)} {
+		opts := base
+		opts.ExpiresAtMs = expiry
+		if _, token, err := e.CreateAccessKey(ctx, opts); !errors.Is(err, ErrInvalidArgument) || token != "" {
+			t.Fatalf("invalid expiry accepted: %v", err)
+		}
+	}
+	for _, limit := range []int{-1, 1001} {
+		if _, err := e.ListAccessKeys(ctx, "", limit); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("invalid limit accepted: %v", err)
+		}
+	}
+	page, err := e.ListAccessKeys(ctx, "", 0)
+	if err != nil || page.Keys == nil || len(page.Keys) != 0 || page.NextAfterID != "" {
+		t.Fatalf("invalid operations changed storage or empty list is nil: %+v %v", page, err)
+	}
+	base.Name = strings.Repeat("é", 64) // Exactly 128 UTF-8 bytes is permitted.
+	base.ExpiresAtMs = atomic.LoadInt64(clock) + 1
+	key, token, err := e.CreateAccessKey(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := e.AuthenticateAccessKey(ctx, token); err != nil || got != key {
+		t.Fatalf("valid until millisecond before expiry: %v", err)
+	}
+	advance(clock, time.Millisecond)
+	if _, err := e.AuthenticateAccessKey(ctx, token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("exact expiry boundary accepted: %v", err)
+	}
+	for _, invalid := range []string{"", token[:len(token)-1], token + "0", "MQK_" + token[4:], strings.ToUpper(token), "mqk_" + strings.Repeat("g", 64), "mqk_" + strings.Repeat("0", 64), "legacy-static-token"} {
+		if _, err := e.AuthenticateAccessKey(ctx, invalid); !errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("unknown/malformed token did not fail closed: %v", err)
+		}
+	}
+}
+
+func TestAccessKeyPagination(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	for i := 105; i > 0; i-- {
+		if _, _, err := e.CreateAccessKey(ctx, accessKeyOptions(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := e.ListAccessKeys(ctx, "", 0)
+	if err != nil || len(first.Keys) != 100 || first.NextAfterID != accessKeyOptions(100).ID {
+		t.Fatalf("default page = %+v %v", first, err)
+	}
+	var all []AccessKey
+	cursor := ""
+	for {
+		page, err := e.ListAccessKeys(ctx, cursor, 13)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, page.Keys...)
+		if page.NextAfterID == "" {
+			break
+		}
+		if page.NextAfterID <= cursor || len(page.Keys) != 13 {
+			t.Fatalf("cursor did not advance exactly one page: %+v", page)
+		}
+		cursor = page.NextAfterID
+	}
+	if len(all) != 105 {
+		t.Fatalf("pagination lost/duplicated keys: %d", len(all))
+	}
+	for i, key := range all {
+		if key.ID != accessKeyOptions(i+1).ID {
+			t.Fatalf("unstable key order at %d: %+v", i, key)
+		}
+	}
+	last, err := e.ListAccessKeys(ctx, all[len(all)-1].ID, 1)
+	if err != nil || len(last.Keys) != 0 || last.Keys == nil || last.NextAfterID != "" {
+		t.Fatalf("terminal page = %+v %v", last, err)
+	}
+}
+
+func TestAccessKeyCreationOrderPagination(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "creation-order.db")
+	e, clock := testEngineAt(t, path)
+	base := atomic.LoadInt64(clock)
+	var expected []AccessKey
+	for i := 0; i < 61; i++ {
+		id, err := authkey.GenerateID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Multiple keys share every timestamp; their random IDs have no relation
+		// to creation order and must break ties consistently in descending order.
+		atomic.StoreInt64(clock, base+int64(i/3))
+		opts := CreateAccessKeyOptions{ID: id, Name: "random ID", Permissions: KeySend}
+		if i%2 == 0 {
+			opts.ExpiresAtMs = base + 1000
+		}
+		key, _, err := e.CreateAccessKey(ctx, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i%4 == 0 {
+			if err := e.RevokeAccessKey(ctx, key.ID); err != nil {
+				t.Fatal(err)
+			}
+			key.RevokedAtMs = atomic.LoadInt64(clock)
+		}
+		expected = append(expected, key)
+	}
+	atomic.StoreInt64(clock, base+2000) // Expired and revoked rows remain in the list.
+	sort.Slice(expected, func(i, j int) bool {
+		if expected[i].CreatedAtMs != expected[j].CreatedAtMs {
+			return expected[i].CreatedAtMs > expected[j].CreatedAtMs
+		}
+		return expected[i].ID > expected[j].ID
+	})
+	first, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, Limit: 7})
+	if err != nil || !reflect.DeepEqual(first.Keys, expected[:7]) || first.NextAfterID != expected[6].ID {
+		t.Fatalf("newest first page differs: %+v err=%v", first, err)
+	}
+	// Insert at the head between pages. Offset pagination would duplicate an old
+	// row; a keyset boundary must continue the original sequence without shifts.
+	inserted := make(chan error, 1)
+	go func() {
+		_, _, err := e.CreateAccessKey(ctx, accessKeyOptions(0))
+		inserted <- err
+	}()
+	if err := <-inserted; err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RevokeAccessKey(ctx, first.NextAfterID); err != nil {
+		t.Fatal(err)
+	}
+	var got []AccessKey
+	got = append(got, first.Keys...)
+	for cursor := first.NextAfterID; cursor != ""; {
+		page, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: cursor, Limit: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.NextAfterID == cursor || page.NextAfterID != "" && (len(page.Keys) != 7 || page.NextAfterID != page.Keys[6].ID) {
+			t.Fatalf("cursor failed to progress: %+v", page)
+		}
+		got = append(got, page.Keys...)
+		if len(got) > len(expected) {
+			t.Fatal("descending pagination repeated rows or included the newer head")
+		}
+		cursor = page.NextAfterID
+	}
+	if len(got) != len(expected) {
+		t.Fatalf("descending pagination omitted rows: %d != %d", len(got), len(expected))
+	}
+	for i := range expected {
+		if got[i].ID != expected[i].ID || got[i].CreatedAtMs != expected[i].CreatedAtMs {
+			t.Fatalf("global creation order differs at %d", i)
+		}
+	}
+	last, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: got[len(got)-1].ID, Limit: 7})
+	if err != nil || len(last.Keys) != 0 || last.Keys == nil || last.NextAfterID != "" {
+		t.Fatalf("descending final page = %+v %v", last, err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: first.NextAfterID}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed cursor lookup = %v", err)
+	}
+	reopened, _ := testEngineAt(t, path)
+	page, err := reopened.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: first.NextAfterID, Limit: 7})
+	if err != nil || !reflect.DeepEqual(page.Keys, expected[7:14]) {
+		t.Fatalf("restart changed immutable boundary: %+v %v", page, err)
+	}
+	head, err := reopened.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, Limit: 1})
+	if err != nil || len(head.Keys) != 1 || head.Keys[0].ID != accessKeyOptions(0).ID {
+		t.Fatalf("new head not globally newest after restart: %+v %v", head, err)
+	}
+}
+
+func TestAccessKeySortValidationAndIndex(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	if _, _, err := e.CreateAccessKey(ctx, accessKeyOptions(2)); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []ListAccessKeysOptions{
+		{Sort: "unknown"}, {Sort: "CREATED_DESC"}, {Sort: "created_desc "},
+		{Sort: KeySortCreatedDesc, AfterID: "invalid"},
+		{Sort: KeySortCreatedDesc, AfterID: accessKeyOptions(1).ID},
+		{Sort: KeySortCreatedDesc, Limit: -1}, {Sort: KeySortCreatedDesc, Limit: 1001},
+	} {
+		if page, err := e.ListAccessKeysWithOptions(ctx, opts); !errors.Is(err, ErrInvalidArgument) || !reflect.DeepEqual(page, AccessKeyPage{}) {
+			t.Fatalf("invalid sort/cursor accepted: %+v %v", opts, err)
+		}
+	}
+	for _, order := range []string{"", KeySortIDAsc} {
+		page, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: order, AfterID: accessKeyOptions(1).ID})
+		if err != nil || len(page.Keys) != 1 || page.Keys[0].ID != accessKeyOptions(2).ID {
+			t.Fatalf("ID predecessor recovery changed: %+v %v", page, err)
+		}
+	}
+	for _, test := range []struct {
+		query string
+		args  []any
+	}{
+		{newestAccessKeysSQL, []any{101}},
+		{olderAccessKeysSQL, []any{e.now(), accessKeyOptions(2).ID, 101}},
+	} {
+		var plan []string
+		err := e.db.queryRows(ctx, "EXPLAIN QUERY PLAN "+test.query, func(rows *sql.Rows) error {
+			for rows.Next() {
+				var detail string
+				if err := rows.Scan(new(int), new(int), new(int), &detail); err != nil {
+					return err
+				}
+				plan = append(plan, detail)
+			}
+			return rows.Err()
+		}, test.args...)
+		if err != nil || len(plan) != 1 || !strings.Contains(plan[0], "USING INDEX idx_access_keys_created") || strings.Contains(plan[0], "TEMP B-TREE") {
+			t.Fatalf("newest-key query lost bounded index order: %v err=%v", plan, err)
+		}
+		if test.query == olderAccessKeysSQL && !strings.Contains(plan[0], "SEARCH access_keys") {
+			t.Fatalf("keyset cursor must seek, not rescan earlier keys: %v", plan)
+		}
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := e.ListAccessKeysWithOptions(cancelled, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: accessKeyOptions(2).ID}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled cursor lookup = %v", err)
+	}
+	if _, err := e.db.exec(ctx, `DROP TABLE access_keys`); err != nil {
+		t.Fatal(err)
+	}
+	for _, cursor := range []string{"", accessKeyOptions(2).ID} {
+		if _, err := e.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc, AfterID: cursor}); err == nil || errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("creation-order DB failure was misclassified: %v", err)
+		}
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.validateAccessKeySchema(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("schema catalog error was hidden: %v", err)
+	}
+}
+
+func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
+	ctx := context.Background()
+	t.Run("table-only upgrade", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "keys.db")
+		e, _ := testEngineAt(t, path)
+		key, token, err := e.CreateAccessKey(ctx, accessKeyOptions(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.db.exec(ctx, `DROP INDEX idx_access_keys_created`); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, _ := testEngineAt(t, path)
+		if got, err := reopened.AuthenticateAccessKey(ctx, token); err != nil || got != key {
+			t.Fatalf("index addition changed the existing key: %+v %v", got, err)
+		}
+		page, err := reopened.ListAccessKeysWithOptions(ctx, ListAccessKeysOptions{Sort: KeySortCreatedDesc})
+		if err != nil || !reflect.DeepEqual(page.Keys, []AccessKey{key}) {
+			t.Fatalf("table-only upgrade did not retain key metadata: %+v %v", page, err)
+		}
+		var ddl string
+		if err := reopened.db.queryRowScan(ctx, []any{&ddl}, `SELECT sql FROM sqlite_master WHERE name='idx_access_keys_created'`); err != nil || !strings.Contains(ddl, "created_at DESC, id DESC") {
+			t.Fatalf("creation-order index was not added: %s %v", ddl, err)
+		}
+	})
+	for name, statements := range map[string][]string{
+		"table name":      {`CREATE TABLE idx_access_keys_created (business TEXT) STRICT`},
+		"view name":       {`CREATE VIEW IDX_ACCESS_KEYS_CREATED AS SELECT 1 AS business`},
+		"wrong columns":   {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(name)`},
+		"wrong direction": {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at ASC, id DESC)`},
+		"partial":         {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at DESC, id DESC) WHERE revoked_at=0`},
+		"wrong table":     {`CREATE TABLE business(created_at INTEGER, id TEXT) STRICT`, `CREATE INDEX idx_access_keys_created ON business(created_at DESC, id DESC)`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "conflict.db")
+			d, err := openDB(ctx, path, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, stmt := range statements {
+				if _, err := d.exec(ctx, stmt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := d.close(); err != nil {
+				t.Fatal(err)
+			}
+			if eng, err := Open(ctx, Options{DB: path, DisableBackground: true}); !errors.Is(err, ErrSchemaVersionMismatch) || eng != nil {
+				if eng != nil {
+					_ = eng.Close()
+				}
+				t.Fatalf("conflicting index was silently adopted: %v", err)
+			}
+			d, err = openDB(ctx, path, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.close()
+			var count int
+			if err := d.queryRowScan(ctx, []any{&count}, `SELECT count(*) FROM sqlite_master WHERE name = 'queues'`); err != nil || count != 0 {
+				t.Fatalf("index conflict applied DDL before refusal: %d %v", count, err)
+			}
+		})
+	}
+}
+
+func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
+	// Pin every pre-existing DDL byte, independent of the new table's golden.
+	var oldSchema []string
+	for _, stmt := range schemaStmts {
+		if stmt != accessKeySchema && stmt != accessKeyCreatedIndex {
+			oldSchema = append(oldSchema, stmt)
+		}
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "9dcb13ddf1fbf11179a690e70d357dcfa1b87fa6f135a85db02164185d5854e6" || schemaVersion != "5" {
+		t.Fatalf("v0.3.0 queue schema changed: hash=%s token=%s", got, schemaVersion)
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+	d, err := openDB(ctx, path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range oldSchema {
+		if _, err := d.exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.exec(ctx, `INSERT INTO meta VALUES ('schema_version','5')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.exec(ctx, `INSERT INTO queues(name, created_at, updated_at) VALUES ('existing', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.close(); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := testEngineAt(t, path)
+	if _, err := e.Stats(ctx, "existing"); err != nil {
+		t.Fatalf("existing queue was lost: %v", err)
+	}
+	first, token, err := e.CreateAccessKey(ctx, accessKeyOptions(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, revoked, err := e.CreateAccessKey(ctx, accessKeyOptions(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RevokeAccessKey(ctx, accessKeyOptions(2).ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _ := testEngineAt(t, path)
+	if got, err := reopened.AuthenticateAccessKey(ctx, token); err != nil || got != first {
+		t.Fatalf("reopen lost key: %+v %v", got, err)
+	}
+	if _, err := reopened.AuthenticateAccessKey(ctx, revoked); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("reopen reactivated revoked key: %v", err)
+	}
+}
+
+func TestAccessKeySchemaConflict(t *testing.T) {
+	for _, ddl := range []string{
+		`CREATE TABLE access_keys (business_data TEXT) STRICT`,
+		`CREATE TABLE ACCESS_KEYS (business_data TEXT) STRICT`,
+		`CREATE VIEW access_keys AS SELECT 1 AS id`,
+		strings.Replace(accessKeySchema, " STRICT", "", 1),
+		strings.Replace(accessKeySchema, " UNIQUE", "", 1),
+		strings.Replace(accessKeySchema, "CHECK (permissions IN (1,2,3,7))", "", 1),
+		strings.Replace(accessKeySchema, "BLOB NOT NULL", "TEXT NOT NULL", 1),
+	} {
+		t.Run(fmt.Sprintf("%x", sha256.Sum256([]byte(ddl)))[:12], func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "conflict.db")
+			d, err := openDB(ctx, path, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := d.exec(ctx, ddl); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.close(); err != nil {
+				t.Fatal(err)
+			}
+			if e, err := Open(ctx, Options{DB: path, DisableBackground: true}); !errors.Is(err, ErrSchemaVersionMismatch) || e != nil {
+				if e != nil {
+					_ = e.Close()
+				}
+				t.Fatalf("conflicting schema accepted: %v", err)
+			}
+			// Reopen proves Open's failure released the lock; no queue DDL was applied.
+			d, err = openDB(ctx, path, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.close()
+			var count int
+			if err := d.queryRowScan(ctx, []any{&count}, `SELECT count(*) FROM sqlite_master WHERE name = 'queues'`); err != nil || count != 0 {
+				t.Fatalf("conflict mutated original database: %d %v", count, err)
+			}
+		})
+	}
+}
+
+func TestAccessKeyStorageConstraints(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	base := []any{accessKeyOptions(1).ID, "name", make([]byte, 32), 1, 100, 0, 0}
+	for _, tc := range []struct {
+		field int
+		value any
+	}{
+		{0, nil}, {0, "bad"}, {0, strings.Repeat("A", 32)},
+		{1, ""}, {1, strings.Repeat("a", 129)}, {1, nil},
+		{2, []byte{1}}, {2, strings.Repeat("0", 32)}, {2, nil},
+		{3, 0}, {3, 4}, {3, 5}, {3, 6}, {3, 8}, {3, nil},
+		{4, -1}, {4, nil}, {5, -1}, {5, 99}, {5, 100}, {6, -1},
+	} {
+		args := append([]any(nil), base...)
+		args[tc.field] = tc.value
+		if _, err := e.db.exec(ctx, `INSERT INTO access_keys VALUES (?, ?, ?, ?, ?, ?, ?)`, args...); err == nil {
+			t.Fatalf("constraint accepted field %d value %v", tc.field, tc.value)
+		}
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO access_keys VALUES (?, ?, ?, ?, ?, ?, ?)`, base...); err != nil {
+		t.Fatal(err)
+	}
+	base[0] = accessKeyOptions(2).ID
+	if _, err := e.db.exec(ctx, `INSERT INTO access_keys VALUES (?, ?, ?, ?, ?, ?, ?)`, base...); err == nil {
+		t.Fatal("duplicate token digest accepted")
+	}
+}
+
+func TestAccessKeyConcurrencyAndClose(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	const workers = 24
+	var wg sync.WaitGroup
+	var successes atomic.Int64
+	var token string
+	var mu sync.Mutex
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, secret, err := e.CreateAccessKey(ctx, accessKeyOptions(1))
+			if err == nil {
+				successes.Add(1)
+				mu.Lock()
+				token = secret
+				mu.Unlock()
+			} else if !errors.Is(err, ErrKeyConflict) || secret != "" {
+				t.Errorf("competing creation: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if successes.Load() != 1 {
+		t.Fatalf("one ID produced %d keys", successes.Load())
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := e.AuthenticateAccessKey(ctx, token); err != nil && !errors.Is(err, ErrUnauthenticated) {
+				t.Errorf("concurrent auth: %v", err)
+			}
+			if err := e.RevokeAccessKey(ctx, accessKeyOptions(1).ID); err != nil {
+				t.Errorf("concurrent revoke: %v", err)
+			}
+			if _, err := e.AuthenticateAccessKey(ctx, token); !errors.Is(err, ErrUnauthenticated) {
+				t.Errorf("post-revoke request authenticated: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []func() error{
+		func() error { _, _, err := e.CreateAccessKey(ctx, accessKeyOptions(2)); return err },
+		func() error { _, err := e.ListAccessKeys(ctx, "", 1); return err },
+		func() error { return e.RevokeAccessKey(ctx, accessKeyOptions(1).ID) },
+		func() error { _, err := e.AuthenticateAccessKey(ctx, token); return err },
+	} {
+		if err := op(); !errors.Is(err, ErrClosed) {
+			t.Fatalf("post-close access key operation: %v", err)
+		}
+	}
+}
+
+func TestAccessKeyCancellationAndFailures(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	_, token, err := e.CreateAccessKey(ctx, accessKeyOptions(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	for _, op := range []func() error{
+		func() error { _, _, err := e.CreateAccessKey(cancelled, accessKeyOptions(2)); return err },
+		func() error { _, err := e.ListAccessKeys(cancelled, "", 1); return err },
+		func() error { return e.RevokeAccessKey(cancelled, accessKeyOptions(1).ID) },
+		func() error { _, err := e.AuthenticateAccessKey(cancelled, token); return err },
+	} {
+		if err := op(); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled operation = %v", err)
+		}
+	}
+	if page, err := e.ListAccessKeys(ctx, "", 0); err != nil || len(page.Keys) != 1 || page.Keys[0].RevokedAtMs != 0 {
+		t.Fatalf("cancelled writes changed data: %+v %v", page, err)
+	}
+	atomic.StoreInt64(clock, 0)
+	if err := e.RevokeAccessKey(ctx, accessKeyOptions(1).ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.AuthenticateAccessKey(ctx, token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("epoch-zero revoke must still revoke: %v", err)
+	}
+	if _, err := e.db.exec(ctx, `DROP TABLE access_keys`); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []func() error{
+		func() error { _, _, err := e.CreateAccessKey(ctx, accessKeyOptions(2)); return err },
+		func() error { _, err := e.ListAccessKeys(ctx, "", 1); return err },
+		func() error { return e.RevokeAccessKey(ctx, accessKeyOptions(1).ID) },
+		func() error { _, err := e.AuthenticateAccessKey(ctx, token); return err },
+	} {
+		if err := op(); err == nil || errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrNotFound) {
+			t.Fatalf("database failure was hidden: %v", err)
+		}
+	}
+}
+
+func TestAccessKeyRemoteRetryAndUnknownOutcome(t *testing.T) {
+	ctx := context.Background()
+	t.Run("stable identity across retries", func(t *testing.T) {
+		d, st := remoteDBFailingFirst(t, 2)
+		e := &Engine{db: d, now: func() int64 { return 1000 }}
+		key, token, err := e.CreateAccessKey(ctx, accessKeyOptions(1))
+		if err != nil || len(st.args) != 3 || !authkey.ValidToken(token) {
+			t.Fatalf("retried creation: attempts=%d err=%v", len(st.args), err)
+		}
+		digest := sha256.Sum256([]byte(token))
+		for _, args := range st.args {
+			if args[0].Value != key.ID || !reflect.DeepEqual(args[5].Value, digest[:]) {
+				t.Fatal("retry changed the key ID or secret digest")
+			}
+		}
+	})
+	t.Run("expiry rechecked after waiting", func(t *testing.T) {
+		d, st := remoteDBFailingFirst(t, 1)
+		tick := int64(1000)
+		e := &Engine{db: d, now: func() int64 { tick++; return tick }}
+		opts := accessKeyOptions(1)
+		opts.ExpiresAtMs = 1003
+		if _, token, err := e.CreateAccessKey(ctx, opts); !errors.Is(err, ErrInvalidArgument) || token != "" || len(st.args) != 1 {
+			t.Fatalf("retry created an expired key: attempts=%d err=%v", len(st.args), err)
+		}
+	})
+	for _, op := range []string{"create", "revoke"} {
+		t.Run(op+" unknown acknowledgement", func(t *testing.T) {
+			d, st := remoteDBFailingFirst(t, 0)
+			e := &Engine{db: d, now: func() int64 { return 1000 }}
+			var err error
+			if op == "create" {
+				st.commitErr = io.EOF
+				var token string
+				var key AccessKey
+				key, token, err = e.CreateAccessKey(ctx, accessKeyOptions(1))
+				if token != "" || key != (AccessKey{}) {
+					t.Fatal("uncertain creation returned a secret or success metadata")
+				}
+			} else {
+				st.execErr = io.EOF
+				err = e.RevokeAccessKey(ctx, accessKeyOptions(1).ID)
+			}
+			if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, io.EOF) || len(st.args) != 1 {
+				t.Fatalf("uncertain write was retried/misclassified: attempts=%d err=%v", len(st.args), err)
+			}
+		})
+	}
+}
+
+func TestAccessKeyCloseWaitsForAdmittedAuthentication(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	_, token, err := e.CreateAccessKey(ctx, accessKeyOptions(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	// Pause after admission and acquiring the one connection, before the query.
+	afterConnAcquired = func() {
+		once.Do(func() { close(entered); <-release })
+	}
+	t.Cleanup(func() { afterConnAcquired = nil })
+	authenticated := make(chan error, 1)
+	go func() { _, err := e.AuthenticateAccessKey(ctx, token); authenticated <- err }()
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e)
+	for _, op := range []func() error{
+		func() error { _, _, err := e.CreateAccessKey(ctx, accessKeyOptions(2)); return err },
+		func() error { _, err := e.ListAccessKeys(ctx, "", 1); return err },
+		func() error { return e.RevokeAccessKey(ctx, accessKeyOptions(1).ID) },
+		func() error { _, err := e.AuthenticateAccessKey(ctx, token); return err },
+	} {
+		if err := op(); !errors.Is(err, ErrClosed) {
+			t.Errorf("new operation during Close should fail immediately: %v", err)
+		}
+	}
+	select {
+	case err := <-closed:
+		t.Errorf("Close returned before the admitted query: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-authenticated; err != nil {
+		t.Fatalf("admitted query was torn down by Close: %v", err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccessKeyWaitCancellationAndExpiry(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	_, token, err := e.CreateAccessKey(ctx, accessKeyOptions(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reserve the only writer. Every queued operation must remain cancellable.
+	conn, err := e.db.sql.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, op := range []func(context.Context) error{
+		func(ctx context.Context) error { _, _, err := e.CreateAccessKey(ctx, accessKeyOptions(2)); return err },
+		func(ctx context.Context) error { _, err := e.ListAccessKeys(ctx, "", 1); return err },
+		func(ctx context.Context) error { return e.RevokeAccessKey(ctx, accessKeyOptions(1).ID) },
+		func(ctx context.Context) error { _, err := e.AuthenticateAccessKey(ctx, token); return err },
+	} {
+		waiting, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
+		err := op(waiting)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("queued access key operation ignored deadline: %v", err)
+		}
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.AuthenticateAccessKey(ctx, token); err != nil {
+		t.Fatalf("cancelled revoke was applied or connection damaged: %v", err)
+	}
+	// Expiry must be rechecked after admission, including the local writer wait.
+	opts := accessKeyOptions(2)
+	opts.ExpiresAtMs = atomic.LoadInt64(clock) + 1
+	afterBeginTx = func() { advance(clock, time.Millisecond) }
+	t.Cleanup(func() { afterBeginTx = nil })
+	if _, secret, err := e.CreateAccessKey(ctx, opts); !errors.Is(err, ErrInvalidArgument) || secret != "" {
+		t.Fatalf("expired while waiting but still created: %v", err)
+	}
+}
+
+func BenchmarkAccessKeyAuthentication(b *testing.B) {
+	for _, count := range []int{1, 1000} {
+		b.Run(fmt.Sprintf("file/keys=%d", count), func(b *testing.B) {
+			ctx := context.Background()
+			e, err := Open(ctx, Options{DB: filepath.Join(b.TempDir(), "keys.db"), DisableBackground: true})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer e.Close()
+			var token string
+			for i := 1; i <= count; i++ {
+				_, token, err = e.CreateAccessKey(ctx, accessKeyOptions(i))
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := e.AuthenticateAccessKey(ctx, token); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

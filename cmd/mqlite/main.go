@@ -115,6 +115,8 @@ func main() {
 		err = cmdRedrive(ctx, args)
 	case "purge-dlq":
 		err = cmdPurgeDLQ(ctx, args)
+	case "key":
+		err = cmdKey(ctx, args)
 	case "vacuum":
 		err = cmdVacuum(ctx, args)
 	case "version", "-v", "--version":
@@ -167,6 +169,7 @@ usage: mqlite <command> [flags]
   status                    backend snapshot (backend, ping, size, counts)
   redrive <queue>           move dead-lettered messages back to active
   purge-dlq <queue>         permanently delete dead-lettered messages
+  key create|list|revoke    manage access keys (--name --permissions / --id)
   vacuum                    reclaim free DB pages to the OS (local maintenance; --full)
 
  messages
@@ -207,6 +210,10 @@ type api interface {
 	Status(ctx context.Context) (mqlite.StatusInfo, error)
 	Redrive(ctx context.Context, dlq string, opts ...mqlite.RedriveOpts) (int, error)
 	Purge(ctx context.Context, queue string, opts ...mqlite.PurgeOpts) (int, error)
+	CreateKey(context.Context, mqlite.CreateKeyOptions) (mqlite.CreateKeyResult, error)
+	ListKeys(context.Context, string, int) (mqlite.KeyPage, error)
+	ListKeysWithOptions(context.Context, mqlite.ListKeysOptions) (mqlite.KeyPage, error)
+	RevokeKey(context.Context, string) error
 	Close() error
 }
 

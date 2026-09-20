@@ -64,12 +64,100 @@ card from `$BASE_URL` and the paths are usable as-is.
 
 ## Auth
 
-Bearer token via `Authorization: Bearer <token>`. The broker accepts the tokens in
-`MQLITE_TOKENS` (comma-separated). **Secure by default:** if `MQLITE_TOKENS` is
-**unset**, `mqlite serve` **generates a random token** (`mqk_…`, 128-bit) and prints it
-at startup — the broker is never silently wide open. Set `MQLITE_TOKENS=off` to
-explicitly disable auth (localhost/LAN only). When auth is on, every endpoint needs the
-token **except** the open ones below. A missing/invalid token → `401 unauthenticated`.
+Use one `Authorization: Bearer <token>` header. The broker accepts configured
+administrator tokens in `MQLITE_TOKENS` (comma-separated), plus managed access keys
+stored in its database. **Secure by default:** if `MQLITE_TOKENS` is **unset**,
+`mqlite serve` generates and prints an administrator token at startup. Newly
+generated tokens always use `mqk_` plus 64 lowercase hexadecimal characters:
+256 random bits, 68 ASCII characters in total. Existing configured tokens remain
+valid without changing their format. Token values are case-sensitive.
+
+Set `MQLITE_TOKENS=off` to explicitly disable auth (loopback by default; a remote
+bind needs the explicit insecure override). In that mode, the existing queue API
+remains open and key-management RPCs are forbidden. An embedded `Serve` without
+`WithTokens` has the same explicit auth-off behavior.
+
+With auth enabled, missing, malformed, unknown, expired or revoked credentials
+return `401 unauthenticated`; a valid key without the required permission returns
+`403 permission_denied`. A key-store failure is a server error, never an auth
+bypass. Bare tokens, other authentication schemes and duplicate Authorization
+headers are rejected.
+
+### Permissions
+
+Permissions apply to **all queues and subscriptions in this broker**. Use `send`,
+`listen`, both, or `manage`; `manage` includes the other two and may issue new
+administrator keys. This is consumption permission, not a read-only observer:
+receiving, settling and renewing change message state.
+
+| Required permission | Operations |
+|---|---|
+| `send` | `QueueService/Send`, `Schedule`, `Cancel` |
+| `listen` | `QueueService/Receive`, `ReceiveDeferred`, `Peek`, `Stats`, `Complete`, `CompleteBatch`, `Abandon`, `Reject`, `Defer`, `Renew`, `RenewBatch` |
+| `manage` | All `AdminService` methods, all `AuthService` methods, and `/metrics` |
+
+Both receive modes require `listen`, including receive-and-delete. Batch and
+idempotent replay paths use the same permission checks as the original operation.
+The current web console requires `manage` because it lists and manages the whole
+broker. The public static page alone grants no access to its API.
+
+Configured administrators and managed `manage` keys have identical operation
+rights. Configured credentials are checked first: explicitly placing an existing
+managed token in `MQLITE_TOKENS` grants it administrator rights independently of
+its database permissions, expiry or revocation. Remove it from configuration to
+withdraw that static grant. Database key operations never alter environment
+configuration.
+
+### CreateKey / ListKeys / RevokeKey
+
+These methods are available in the v0.3.1 source tree; v0.3.0 does not implement
+them. All paths are `/mqlite.v1.AuthService/<Method>` and require `manage` with
+authentication enabled.
+
+| Method | Request | Response |
+|---|---|---|
+| `CreateKey` | `id`, `name`, `permissions`, optional `expires_at_ms` | `{"key": <AccessKey>, "token": "mqk_…"}` |
+| `ListKeys` | optional `after_id`, `limit`, `sort` | `{"keys": [<AccessKey>], "next_after_id": "…"}`; cursor omitted at the end |
+| `RevokeKey` | `id` | `{"ok": true}`; already revoked records succeed again |
+
+`AccessKey` metadata contains `id`, `name`, `permissions`, `created_at_ms`,
+`expires_at_ms` and `revoked_at_ms`. Zero expiry means no expiry; zero revocation
+time means not revoked. Expired and revoked records remain visible to managers.
+Metadata never contains a token or its digest. Lists include only managed keys;
+limit defaults to 100 and cannot exceed 1000. Omitted or empty `sort` means
+`id_asc` (public ID ascending). Use `sort: "created_desc"` for newest first:
+creation time descending, then public ID descending for equal timestamps.
+
+Pass the previous page's `next_after_id` as `after_id`, retaining the same sort.
+For `created_desc`, the cursor must identify an existing key; an unknown cursor
+or unsupported sort returns `400 invalid_argument`. Revocation and expiry do not
+remove records or change their position. Return to the first page to see records
+newer than the current cursor. Pagination is not a snapshot of concurrent inserts.
+The `id_asc` mode also accepts a valid ID that is not present, which supports
+looking up a retained creation ID using its immediate predecessor and `limit: 1`.
+
+Before creation, generate and retain a public ID: exactly 32 lowercase hexadecimal
+characters representing 128 random bits. The SDK provides `GenerateKeyID()`; the
+CLI generates one if `--id` is omitted. This ID is separate from the secret and
+lets you identify a creation whose response was lost. Names are nonempty UTF-8
+labels up to 128 bytes without leading/trailing whitespace or NUL. Names need not
+be unique. `permissions` accepts `send`, `listen`, or `manage`; any combination
+containing `manage` is normalized to `["manage"]`. Expiry is epoch milliseconds,
+either zero or a future instant.
+
+The server generates the secret and stores only its SHA-256 digest. Save the
+creation response securely: no later operation can recover the same secret. A
+duplicate ID returns `409 key_conflict` rather than producing or revealing a key.
+Do not automatically retry a creation after an ambiguous response. Reconcile the
+retained ID, revoke an undelivered key when confirmed, and use a new ID for its
+replacement. An absent row does not prove that an outstanding request cannot
+still commit. Never guess which same-named key to revoke.
+
+Revocation rejects subsequent authentication attempts immediately. Requests
+already authorized, including a long-poll Receive, may finish. Subsequent
+settlement and renewal still require a valid key. Issued keys are independent:
+revoking their creator does not revoke them. Change permissions by issuing a
+replacement key, moving clients, then revoking the old key.
 
 ## Open endpoints (no auth)
 
@@ -102,7 +190,7 @@ which case `/ui` 404s and the card's optional `ui` field is omitted.
 
 | Method | Path | Auth | Returns |
 |---|---|---|---|
-| `GET` | `/metrics` | Bearer | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
+| `GET` | `/metrics` | Bearer with `manage` | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
 
 ## QueueService
 
@@ -422,13 +510,15 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 400 | `invalid_argument` | malformed JSON, an **unknown field**, trailing data after the object, a bad filter expression, an empty queue name, or an unknown enum (`kind` / `ordering_mode`). The decoder is strict — a typo'd field is a 400, not a silently-dropped no-op (`mqlite.ErrInvalidArgument`). |
 | 400 | `group_required` | a `group_fifo` send with no `group_id` |
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
+| 403 | `permission_denied` | a valid key lacks permission, or key management was attempted with auth disabled (`mqlite.ErrPermissionDenied`) |
 | 404 | `not_found` | the queue or message doesn't exist; or an unknown path |
 | 409 | `already_exists` | single-message dedup conflict (same id, different body) |
 | 409 | `name_conflict` | a queue/subscription/topic name collision at creation time — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
+| 409 | `key_conflict` | a managed key ID or token digest is already registered (`mqlite.ErrKeyConflict`); no existing secret is returned |
 | 409 | `lock_lost` | settle with an expired or wrong `lock_token` |
 | 413 | `message_too_large` | body over `MaxMessageBytes` (default 1 MiB) |
 | 499 | `canceled` | the client canceled the request |
-| 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile by `message_id`/dedup first (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
+| 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
 
 The Go SDK re-exports the sentinel errors (`mqlite.ErrLockLost`, `ErrDedupConflict`,

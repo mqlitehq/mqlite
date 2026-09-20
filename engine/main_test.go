@@ -34,7 +34,7 @@ func resetRemoteTestDB(dsn, token string) {
 	// re-stamp alone could miss.
 	for _, t := range []string{
 		"messages", "subscriptions", "dedup", "settlement_receipts",
-		"receive_attempts", "queues", "meta",
+		"receive_attempts", "queues", "access_keys", "meta",
 	} {
 		_, _ = db.Exec("DROP TABLE IF EXISTS " + t)
 	}
