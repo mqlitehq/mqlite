@@ -44,7 +44,13 @@ func TestObservabilityFullContract(t *testing.T) {
 	}
 	got := prometheusSnapshot(s)
 	if got != string(want) {
-		t.Fatalf("complete Prometheus contract drift; review JSON + exposition together:\n%s", got)
+		actual, expected := strings.Split(got, "\n"), strings.Split(string(want), "\n")
+		for i := 0; i < len(actual) && i < len(expected); i++ {
+			if actual[i] != expected[i] {
+				t.Fatalf("Prometheus contract drift at line %d; review JSON + exposition together:\ngot  %q\nwant %q", i+1, actual[i], expected[i])
+			}
+		}
+		t.Fatalf("Prometheus contract line count changed: got %d, want %d", len(actual), len(expected))
 	}
 	// The reverse availability edge must omit failed measurements, while keeping
 	// the real in-memory event facts and explicit failure indicators.
@@ -122,7 +128,9 @@ func TestFirstAuthenticationFailuresHaveZeroBaselines(t *testing.T) {
 		if row.Code == "unauthenticated" {
 			want = 1
 		}
-		if !exists || row.Count-old.Count != want || (want == 1 && row.DurationSeconds <= 0) {
+		// A request shorter than the platform clock resolution can take zero
+		// measured time. Preserve that fact while requiring exact counter deltas.
+		if !exists || row.Count-old.Count != want || row.DurationSeconds < old.DurationSeconds || (want == 0 && row.DurationSeconds != 0) {
 			t.Fatalf("first request outcome cannot be measured from baseline: %+v", row)
 		}
 	}
