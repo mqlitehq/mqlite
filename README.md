@@ -382,12 +382,16 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-This source tree targets **v0.3.1 (unreleased)**: default broker port **6754**, schema
-token **5**, and runtime-managed access keys. The current published release remains
-**v0.3.0**. See [CHANGELOG.md](CHANGELOG.md) for the upcoming changes.
+This source tree targets **v0.3.1**: default broker port **6754**, schema token **5**,
+and runtime-managed access keys. See [CHANGELOG.md](CHANGELOG.md) for release and
+upgrade notes.
 Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
-or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.0`; see
+or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.1`; see
 [deployment](docs/deployment.md) for configuration.
+
+**Upgrading from v0.3.0 preserves existing queue data.** Back up first and retain a
+configured administrator token if you need to roll back; v0.3.0 cannot authenticate
+managed keys.
 
 **Upgrading from v0.2.0 requires a new database.** There is no in-place schema
 migration. Account for retained messages in every state, preserve the old binary

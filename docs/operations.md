@@ -1,6 +1,6 @@
 # Production operations
 
-This runbook covers v0.3.0 and the upcoming v0.3.1 (port 6754, schema token 5).
+This runbook covers v0.3.1 and upgrades from v0.3.0 (port 6754, schema token 5).
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
 follow [upgrade and rollback](#upgrade-and-rollback) before replacing the broker.

@@ -45,21 +45,23 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> These instructions target **v0.3.0**, with default port **6754** and schema token **5**.
+> These instructions target **v0.3.1**, with default port **6754** and schema token **5**.
+> Existing v0.3.0 databases remain compatible; back up before upgrading and retain
+> a configured administrator for rollback, since v0.3.0 ignores managed keys.
 > **v0.2.0 uses port 8080 and schema token 2.** Its database cannot be opened by
-> v0.3.0: preserve the old binary/database pair and follow the
+> v0.3.1: preserve the old binary/database pair and follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before replacing it.
 
 The published image is multi-arch (amd64 + arm64):
 
 ```bash
-# v0.3.0, default port 6754
+# v0.3.1, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.3.0
+  ghcr.io/mqlitehq/mqlite:0.3.1
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
@@ -78,7 +80,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.3.0"   # pinned image, no build on Fly
+  image = "ghcr.io/mqlitehq/mqlite:0.3.1"   # pinned image, no build on Fly
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -155,12 +157,11 @@ connects to the broker on `127.0.0.1:6754`, which is the only interface the brok
 above — so the proxy (with TLS + whatever access control you add) is the single entry
 point, not a bypassable layer over an all-interfaces socket.
 
-Runtime-managed keys in the upcoming v0.3.1 can be created and revoked without a
+Runtime-managed keys in v0.3.1 can be created and revoked without a
 restart. Use a configured administrator or managed `manage` key for the console,
 metrics scraper and key administration; use `send`/`listen` for applications.
 See [key commands](cli.md#key-createlistrevoke--manage-persistent-access-keys) and
-[key rotation](operations.md#key-rotation). Existing v0.3.0 deployment examples in this guide
-remain pinned to the published release and do not include managed keys.
+[key rotation](operations.md#key-rotation).
 
 ## Backup, restore and upgrades
 
@@ -168,9 +169,11 @@ Follow the [production runbook](operations.md#consistent-backups) for read-only
 online snapshots, offline directory copies, isolated restore validation and rollback.
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
-**v0.2.0 databases use schema 2; v0.3.0 uses schema 5.** There is no
-in-place migration. Before the upgrade, account for retained work in every state,
-keep the old binary/database pair, and create the v0.3.0 database separately.
+**v0.2.0 databases use schema 2; v0.3.0 and v0.3.1 use schema 5.** There is no
+in-place migration from schema 2. Before upgrading from v0.2.0, account for retained
+work in every state, keep the old binary/database pair, and create the v0.3.1
+database separately. Upgrading from v0.3.0 reuses the existing database and adds
+managed-key storage; take a consistent backup first.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).
 
 ## Turso (remote libSQL)

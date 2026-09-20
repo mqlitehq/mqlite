@@ -10,7 +10,13 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## Unreleased
+## v0.3.1 — 2026-09-20
+
+> **Upgrade from v0.3.0:** port **6754** and schema token **5** are unchanged.
+> Stop the broker and take a consistent backup before replacing it. Existing queue
+> data is retained; startup adds the managed-key table and indexes. Keep a configured
+> administrator token available for rollback. See the
+> [upgrade and rollback procedure](docs/operations.md#upgrade-and-rollback).
 
 ### Persistent access keys (MQLITE-121)
 
@@ -35,6 +41,8 @@ upgrade notes before replacing a broker.
 - The console adds an Access keys page with permission selection, pagination,
   expiry/revocation status and a one-time secret display. The MCP server adds
   `create_key`, `list_keys` and `revoke_key`.
+  The [console source](https://github.com/mqlitehq/mqlite-web) is public, and its
+  bundled third-party license notices are included in the embedded assets.
 - Console expiry and scheduled delivery use an English calendar and fixed
   `yyyy-MM-dd HH:mm` local input, with strict invalid-date validation. Listed
   timestamps use `yyyy-MM-dd HH:mm:ss`; runtime-issued credentials are labeled
@@ -47,6 +55,9 @@ upgrade notes before replacing a broker.
   require `manage`; ordinary application keys use the SDK, CLI or HTTP API.
   Explicit auth-off mode keeps the existing queue behavior and refuses key
   management. Bare or duplicate Authorization headers are rejected.
+- The concepts guide and console's AI filter reference now correctly explain
+  that `now()` reads the wall clock; use message timestamps for repeatable routing.
+  Filter behavior is unchanged. The guide's Go SDK filter example is also corrected.
 
 ## v0.3.0 — 2026-09-10
 
