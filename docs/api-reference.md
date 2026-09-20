@@ -110,7 +110,7 @@ configuration.
 
 ### CreateKey / ListKeys / RevokeKey
 
-These methods are available in the v0.3.1 source tree; v0.3.0 does not implement
+These methods are available in v0.3.1 and later; v0.3.0 does not implement
 them. All paths are `/mqlite.v1.AuthService/<Method>` and require `manage` with
 authentication enabled.
 

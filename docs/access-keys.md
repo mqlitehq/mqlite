@@ -1,7 +1,7 @@
 # Access keys
 
-Runtime access keys are available in the **v0.3.1 source tree (unreleased)**.
-The published v0.3.0 supports configured administrator tokens only.
+Runtime access keys are available in **v0.3.1 and later**.
+Version v0.3.0 supports configured administrator tokens only.
 
 ## Choose a permission
 

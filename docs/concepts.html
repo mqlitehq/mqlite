@@ -118,7 +118,7 @@
     <p class="sub">One SQLite file is the entire message broker. The model sits closest
     to Azure Service Bus, but is simplified from first principles. This page explains how
     it works, and how it compares to the equivalents on Azure / AWS / GCP.</p>
-    <p class="sub">This interactive overview describes <b>v0.3.0</b>.
+    <p class="sub">This interactive overview describes <b>v0.3.1</b>.
       The <a href="concepts.md">canonical concepts and lifecycle contract</a> and
       <a href="operations.md">production runbook</a> contain the complete operational rules.</p>
     <div class="adv">
@@ -482,12 +482,14 @@
       <line x1="390" y1="126" x2="436" y2="126" stroke="#34d399" stroke-width="1.5" marker-end="url(#fag)"/>
       <rect x="440" y="110" width="170" height="32" rx="8" fill="rgba(52,211,153,.08)" stroke="#2f6f53"/><text x="454" y="131" font-size="11" class="mono" fill="#34d399">route when true</text>
     </svg>
-    <p>Because the filter runs at publish it sees the message's own fields and timestamps;
-      evaluation is deterministic and replayable (it never reads a wall clock).</p>
+    <p>The filter environment contains the message's own fields and timestamps. Use
+      <code>enqueued_at</code> as the publish-time reference for repeatable routing decisions.
+      The upstream <code>now()</code> builtin is also available and reads the wall clock, so
+      an expression using it can produce different results for the same message.</p>
 
     <h3>Try it — does this message route?</h3>
-    <p class="lead" style="margin-bottom:10px">Toggle the sample message, then click a filter to
-      evaluate it live against the current message (illustrative — the real engine runs expr-lang):</p>
+    <p class="lead" style="margin-bottom:10px">Toggle the sample message to update the filter
+      results below (illustrative — the real engine runs expr-lang):</p>
     <div class="tester" id="tester">
       <div class="chiprow"><span class="lbl">subject</span><span class="chip" data-k="subject">orders.eu.new</span></div>
       <div class="chiprow"><span class="lbl">properties</span>
@@ -629,8 +631,10 @@ visible_at - enqueued_at > duration("1d")</span>
         <tr><td>Docs home</td><td><a href="https://expr-lang.org/docs/getting-started" target="_blank" rel="noopener">expr-lang.org/docs/getting-started</a></td></tr>
       </tbody>
     </table>
-    <p style="color:var(--muted)">The evaluator is sandboxed (memory-safe, side-effect-free,
-      always-terminating; §13), so IO/non-deterministic upstream builtins don't apply.
+    <p style="color:var(--muted)">The evaluator exposes no file or network I/O APIs and is
+      sandboxed (memory-safe, side-effect-free, always-terminating; §13). The upstream
+      <code>now()</code> builtin remains available; prefer message-derived timestamps
+      when routing decisions must be repeatable.
       <code>days()</code>/<code>weeks()</code>/<code>duration("…d…w")</code> are MQLite extensions
       on top of expr's date functions.</p>
   </div>
@@ -654,8 +658,8 @@ body_text contains "urgent"</span>
 <section id="fsafe">
   <div class="wrap">
     <h2><span class="num">13</span>Filter safety</h2>
-    <p class="lead">Filters are safe to accept from untrusted callers — the env is the only
-      input and there is no IO.</p>
+    <p class="lead">Filters evaluate the message environment and available expr builtins.
+      No file or network I/O APIs are exposed; <code>now()</code> can read the wall clock.</p>
     <ul class="tight">
       <li>expr is <b>memory-safe, side-effect-free, and always-terminating</b> by design (no
         file or network access, no unbounded loops).</li>

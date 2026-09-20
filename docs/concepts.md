@@ -292,15 +292,17 @@ gate in the topic fan-out from §1–§3):
  Publish   ──► for each subscription: run program(message) ──► route when true
 ```
 
-Because the filter runs at publish, it sees the message's own fields and timestamps;
-evaluation is deterministic and replayable (it never reads a wall clock).
+The filter environment contains the message's own fields and timestamps. Use
+`enqueued_at` as the publish-time reference for repeatable routing decisions.
+The upstream `now()` builtin is also available and reads the wall clock, so an
+expression using it can produce different results for the same message.
 
 ## 6. Setting a filter
 
 | surface | how |
 |---|---|
 | CLI | `mqlite subscribe orders orders-gold --expr 'properties["tier"]=="gold"'` |
-| Go SDK | `cli.Subscribe(ctx, "orders", "orders-gold", &mqlite.Filter{Expr: ` + "`properties[\"tier\"]==\"gold\"`" + `})` |
+| Go SDK | `cli.Subscribe(ctx, "orders", "orders-gold", &mqlite.Filter{Expr: "properties[\"tier\"]==\"gold\""})` |
 | HTTP | `POST /mqlite.v1.AdminService/Subscribe` body `{"topic":"orders","name":"orders-gold","filter":{"expr":"..."}}` |
 
 Re-subscribing with the same name and a new `expr` replaces the filter (recompiled on
@@ -402,9 +404,9 @@ visible_at - enqueued_at > duration("1d")
 
 The filter engine **is** [`expr-lang/expr`](https://github.com/expr-lang/expr) (pinned
 at **v1.17.8**), so its full language — every operator, literal form, and built-in — is
-available and documented upstream. Only two things on this page are MQLite-specific: the
-**message environment** in §7 (the variables a filter sees) and the fail-closed boolean
-contract in §10; everything else is stock expr. When in doubt about a builtin's exact
+available and documented upstream. The **message environment** in §7, the duration
+helpers above and the fail-closed boolean contract in §10 are MQLite-specific;
+everything else is stock expr. When in doubt about a builtin's exact
 behavior, the upstream reference is authoritative.
 
 | What | Where |
@@ -419,9 +421,10 @@ behavior, the upstream reference is authoritative.
 | Type-conversion builtins | <https://expr-lang.org/docs/language-definition#type-conversion-functions> |
 | Docs home | <https://expr-lang.org/docs/getting-started> |
 
-> Caveat: a few upstream builtins that do IO or are non-deterministic are irrelevant
-> here — the filter env exposes no such values and the evaluator is sandboxed
-> (memory-safe, side-effect-free, always-terminating; see §10). The duration helpers
+> The evaluator exposes no file or network I/O APIs and is sandboxed
+> (memory-safe, side-effect-free, always-terminating; see §10). This does not remove
+> the upstream `now()` builtin: prefer message-derived timestamps when routing
+> decisions must be repeatable. The duration helpers
 > `days()`/`weeks()`/`duration("…d…w")` are MQLite extensions on top of expr's date
 > functions, not part of stock expr.
 
@@ -441,8 +444,8 @@ body_text contains "urgent"
 
 ## 10. Filter safety
 
-Filters are safe to accept from untrusted callers — the env is the only input and
-there is no IO:
+Filters evaluate the message environment and available expr builtins. No file or
+network I/O APIs are exposed; `now()` can read the wall clock:
 
 - expr is **memory-safe, side-effect-free, and always-terminating** by design (no file
   or network access, no unbounded loops).

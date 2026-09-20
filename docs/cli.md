@@ -89,7 +89,7 @@ Serves the RPC API, `/metrics`, the open `/` + `/healthz`, and — unless
 
 ### `key create|list|revoke` — manage persistent access keys
 
-Available in the v0.3.1 source tree. In client mode, use an environment administrator
+Available in v0.3.1 and later. In client mode, use an environment administrator
 or a managed `manage` key as `MQLITE_TOKEN`. The broker can keep running while keys
 are created or revoked. Embedded mode directly manages the configured database
 and requires exclusive ownership; it cannot open a running local broker's DB.
