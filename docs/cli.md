@@ -288,6 +288,9 @@ mqlite receive-deferred orders --seq 42,57      # re-locks them and prints token
 
 ### `observe` — canonical observation
 
+Available in **v0.3.2 and later**. Remote mode requires a v0.3.2 or later broker;
+configured monitor credentials are also new in v0.3.2.
+
 ```bash
 mqlite observe --output json
 MQLITE_ENDPOINT=http://127.0.0.1:6754 MQLITE_TOKEN="$MONITOR_TOKEN" mqlite observe

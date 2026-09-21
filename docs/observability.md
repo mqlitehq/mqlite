@@ -1,5 +1,9 @@
 # Observability
 
+The canonical `Observe` interface, configured monitor credentials and the
+monitoring starter require **v0.3.2 or later**. Earlier releases expose only the
+legacy metrics described under [compatibility](#compatibility-from-v031).
+
 MQLite exposes one canonical observation through `AdminService/Observe`, the Go
 SDK, CLI, MCP, console and Prometheus `/metrics`. Queue snapshots and committed
 message effects originate in the engine. HTTP request measurements originate in

@@ -103,8 +103,8 @@ idempotent replay paths use the same permission checks as the original operation
 The console's administration views require `manage`. A configured monitor token
 opens only its observability views. The public static page alone grants no API access.
 
-`MQLITE_MONITOR_TOKENS` configures comma-separated read-only monitoring credentials
-alongside administrator authentication. The embedded equivalent is
+In v0.3.2 and later, `MQLITE_MONITOR_TOKENS` configures comma-separated read-only
+monitoring credentials alongside administrator authentication. The embedded equivalent is
 `WithMonitorTokens`. Monitor and administrator credentials must be distinct;
 configuring monitor tokens with authentication disabled is rejected. Monitor
 credentials authenticate without querying the key database, so collection failures
@@ -121,6 +121,8 @@ withdraw that static grant. Database key operations never alter environment
 configuration.
 
 ### Observe
+
+Available in **v0.3.2 and later**; older brokers do not implement this route.
 
 `POST /mqlite.v1.AdminService/Observe` with `{}` returns the canonical broker
 observation used by `/metrics`, the SDK `Observe`, CLI `observe`, MCP `observe`

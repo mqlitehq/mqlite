@@ -8,12 +8,18 @@ For production or an existing monitoring platform, use
 
 ## Start
 
-Requirements: Linux or macOS, Docker with Compose, Python 3, and available loopback ports. All
-container builds and this example's runtime platform are explicitly `linux/amd64`.
+Requirements: Linux or macOS, Git, Docker with Compose, Python 3, and available
+loopback ports. All container builds and this example's runtime platform are
+explicitly `linux/amd64`.
 An ARM host uses Docker's emulation; this does not benchmark native ARM performance.
 
+Use the matching release tag so the broker, dashboard and rules come from the same
+version. Before that tag is published, use the exact reviewed candidate commit
+for a release rehearsal instead.
+
 ```sh
-cd ops/observability
+git clone --branch v0.3.2 --depth 1 https://github.com/mqlitehq/mqlite.git
+cd mqlite/ops/observability
 python3 init.py
 docker compose up --build -d
 docker compose ps

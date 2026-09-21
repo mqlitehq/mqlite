@@ -72,6 +72,9 @@ should treat handlers as idempotent. Full HTTP semantics: [api-reference.md](api
 
 ## Read-only observation
 
+The `observe` tool requires **v0.3.2 or later** of both `mqlite-mcp` and the broker.
+Configured monitor credentials also require a v0.3.2 or later broker.
+
 Call `observe` with `{}` to get the same canonical JSON snapshot as the HTTP route,
 Go SDK and CLI: availability/freshness, queue gauges, process message effects,
 storage operations, maintenance, filters and HTTP measurements. The tool does not

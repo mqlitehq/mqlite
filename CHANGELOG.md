@@ -10,7 +10,14 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## Unreleased
+## v0.3.2
+
+> **Upgrade from v0.3.1:** port **6754**, schema token **5**, message data and
+> managed-key storage are unchanged. Stop the broker and take a consistent backup
+> before replacing it. Process counters restart from zero. Rolling back to
+> v0.3.1 also requires its previous monitoring configuration: `Observe` and
+> configured monitor credentials require v0.3.2. See the
+> [upgrade and rollback procedure](docs/operations.md#upgrade-and-rollback).
 
 ### Unified observability (MQLITE-124)
 

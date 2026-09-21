@@ -1,5 +1,8 @@
 # Cloud and Kubernetes monitoring
 
+These examples require **MQLite v0.3.2 or later**, including configured monitor
+credentials and the canonical metric families.
+
 MQLite exposes native Prometheus metrics. The same dashboard and metric definitions
 work with a private Prometheus collector or a compatible managed service. Keep the
 broker's metrics authenticated: configure a distinct `MQLITE_MONITOR_TOKENS`

@@ -203,6 +203,9 @@ The broker bakes a web console into the binary and serves it at **`/ui`** (e.g.
 edit subscription filters, and redrive a DLQ. It's on by default; set `MQLITE_UI=off` to
 run headless. (The same console is also published standalone for hosting elsewhere.)
 
+Starting with v0.3.2, a configured monitor token opens only the read-only overview
+and metrics views; administration still requires `manage`.
+
 ### 4. Or the Go SDK (remote)
 
 ```go
@@ -264,6 +267,10 @@ Starting with v0.3.1, create additional keys without restarting the broker using
 `listen`, both, or `manage` (which also grants key issuance and revocation).
 Configured administrator tokens remain supported. See [key commands](docs/cli.md#key-createlistrevoke--manage-persistent-access-keys)
 and the [complete access-key guide](docs/access-keys.md).
+
+Starting with v0.3.2, `mqlite observe` and configured `MQLITE_MONITOR_TOKENS`
+provide read-only broker observation. See the [monitoring guide](docs/observability.md)
+and [Prometheus/Grafana quickstart](ops/observability/README.md).
 
 ### 6. MCP (drive it from an AI agent)
 
@@ -384,12 +391,17 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-This source tree targets **v0.3.1**: default broker port **6754**, schema token **5**,
-and runtime-managed access keys. See [CHANGELOG.md](CHANGELOG.md) for release and
-upgrade notes.
+This source tree targets **v0.3.2**: default broker port **6754**, schema token **5**,
+runtime-managed access keys and unified observability. See [CHANGELOG.md](CHANGELOG.md)
+for release and upgrade notes.
 Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
-or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.1`; see
+or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.2`; see
 [deployment](docs/deployment.md) for configuration.
+
+**Upgrading from v0.3.1 preserves message and managed-key data.** Back up first;
+process counters reset at restart. A rollback to v0.3.1 also needs compatible
+scraper/rule configuration because `Observe` and configured monitor credentials
+are new in v0.3.2. See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
 
 **Upgrading from v0.3.0 preserves existing queue data.** Back up first and retain a
 configured administrator token if you need to roll back; v0.3.0 cannot authenticate

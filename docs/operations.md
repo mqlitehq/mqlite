@@ -1,7 +1,8 @@
 # Production operations
 
-This runbook covers v0.3.1 and upgrades from v0.3.0 (port 6754, schema token 5).
+This runbook covers v0.3.2 and upgrades from v0.3.0/v0.3.1 (port 6754, schema token 5).
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
+Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
 follow [upgrade and rollback](#upgrade-and-rollback) before replacing the broker.
 See [deployment](deployment.md) for installation and [observability](observability.md)
@@ -191,13 +192,29 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
-For **v0.3.0 → v0.3.1**, schema token **5** and the port remain unchanged.
+For **v0.3.1 → v0.3.2**, schema token **5**, port **6754**, message data and
+managed-key storage remain unchanged. Follow the same-schema procedure above;
+do not overlap brokers. Validate existing key permissions and a complete canary
+cycle, then check `Observe`, the monitor credential and the new dashboard/rules.
+Process counters reset at restart; existing Prometheus history is separate from
+the broker database.
+
+When rolling back to v0.3.1, stop the candidate before starting the old binary.
+Existing managed keys retain their permissions, but v0.3.1 has no `Observe`
+endpoint or configured monitor credentials. Pause v0.3.2-only observers and
+restore the previous authorized scraper/rule configuration; the old `/metrics`
+endpoint requires an administrator. Keep administrator authentication enabled.
+Preserve writes accepted by the candidate rather than blindly restoring the
+pre-upgrade snapshot. The two deprecated metric aliases remain available in
+v0.3.2; see [metric compatibility](observability.md#compatibility-from-v031).
+
+For **v0.3.0 → v0.3.1 or v0.3.2**, schema token **5** and the port remain unchanged.
 The candidate adds the independent `access_keys` table without rewriting existing
 queue or message tables. Rehearse opening a restored copy first. Rolling back to
 v0.3.0 preserves that extra table, but the old binary cannot authenticate managed
 keys or enforce their permissions: reconnect clients with configured administrator
-tokens, or keep them stopped until v0.3.1 is restored. A database with an unrelated,
-incompatible table named `access_keys` is rejected without modifying it.
+tokens, or keep them stopped until v0.3.1 or later is restored. A database with an
+unrelated, incompatible table named `access_keys` is rejected without modifying it.
 
 For **v0.2.0 → v0.3.0**, schema **2 → 5** and default port **8080 → 6754** both
 change. Before the cutover, stop producers and account for **every queue and
