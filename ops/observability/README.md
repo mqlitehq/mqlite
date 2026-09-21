@@ -132,6 +132,13 @@ Grafana provides instance and queue selectors, backlog/flow/error panels, storag
 and maintenance measurements. No traffic, failed collection and missing data have
 different meanings; the dashboard does not convert missing samples into green zero.
 
+The **Firing alerts** table lists each alert's severity, name, instance, queue and
+state, with task/stage labels when present. Warnings are orange, critical alerts
+red and informational alerts blue. Selecting a queue keeps its alerts and
+broker-wide alerts without a queue label. Open **Alert runbooks** from the panel
+for investigation steps. An empty result is not proof of health: check the scrape
+and collection status cards; datasource failures remain visible errors.
+
 ```sh
 docker compose logs --tail 100 mqlite prometheus grafana
 docker compose stop

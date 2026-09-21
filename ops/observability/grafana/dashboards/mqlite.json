@@ -7,7 +7,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 41,
-  "version": 2,
+  "version": 3,
   "refresh": "5s",
   "editable": false,
   "time": {
@@ -876,14 +876,264 @@
       }
     },
     {
+      "id": 16,
+      "type": "table",
+      "title": "Firing alerts",
+      "description": "One row per currently firing alert. Queue selection includes matching queues and broker-wide alerts without a queue label. No data means no firing series was returned, not proof of health; check scrape and collection status. Query failures remain errors. Open the runbook for investigation steps.",
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ALERTS{alertstate=\"firing\",instance=~\"$instance\",queue=~\"$queue|\"}",
+          "format": "table",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "minWidth": 100,
+            "wrapText": true,
+            "inspect": true
+          },
+          "noValue": "No data",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Severity"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 105
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "text": "Critical",
+                        "color": "red"
+                      },
+                      "warning": {
+                        "text": "Warning",
+                        "color": "orange"
+                      },
+                      "info": {
+                        "text": "Info",
+                        "color": "blue"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "noValue",
+                "value": "Unknown"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Alert"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 240
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Instance"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Queue"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 200
+              },
+              {
+                "id": "noValue",
+                "value": "Broker-wide"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 95
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "firing": {
+                        "text": "Firing"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Task"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Stage"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Purpose"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Alert",
+            "desc": false
+          },
+          {
+            "displayName": "Instance",
+            "desc": false
+          },
+          {
+            "displayName": "Queue",
+            "desc": false
+          }
+        ],
+        "enablePagination": false
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "job": true,
+              "state": true
+            },
+            "indexByName": {
+              "severity": 0,
+              "alertname": 1,
+              "instance": 2,
+              "queue": 3,
+              "alertstate": 4,
+              "task": 5,
+              "stage": 6,
+              "purpose": 7
+            },
+            "renameByName": {
+              "severity": "Severity",
+              "alertname": "Alert",
+              "instance": "Instance",
+              "queue": "Queue",
+              "alertstate": "State",
+              "task": "Task",
+              "stage": "Stage",
+              "purpose": "Purpose"
+            }
+          }
+        }
+      ],
+      "links": [
+        {
+          "title": "Alert runbooks",
+          "url": "https://github.com/mqlitehq/mqlite/blob/main/docs/observability.md",
+          "targetBlank": true
+        }
+      ]
+    },
+    {
       "id": 15,
       "type": "timeseries",
       "title": "Collection duration",
       "description": "Cost of collecting the canonical queue snapshot.",
       "gridPos": {
         "x": 0,
-        "y": 33,
-        "w": 12,
+        "y": 42,
+        "w": 8,
         "h": 6
       },
       "datasource": {
@@ -933,14 +1183,14 @@
       }
     },
     {
-      "id": 16,
-      "type": "stat",
-      "title": "Active alerts",
-      "description": "Each series is a firing alert and is shown in red. No data means no firing series was returned, not proof that monitoring is healthy. Notification delivery requires your Alertmanager and receiver configuration.",
+      "id": 25,
+      "type": "timeseries",
+      "title": "Storage read availability",
+      "description": "A SELECT 1 read probe; success does not prove writes or full data integrity.",
       "gridPos": {
-        "x": 12,
-        "y": 33,
-        "w": 12,
+        "x": 8,
+        "y": 42,
+        "w": 8,
         "h": 6
       },
       "datasource": {
@@ -950,46 +1200,66 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "ALERTS{alertstate=\"firing\",instance=~\"$instance\"}",
-          "legendFormat": "{{alertname}} / {{instance}} / {{queue}}",
-          "range": false,
-          "instant": true
+          "expr": "mqlite_storage_read_available{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} {{task}}",
+          "range": true
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "noValue": "No data",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "gray",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          }
+          "noValue": "Not available"
         },
         "overrides": []
       },
       "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
         },
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "auto"
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Storage read round trip",
+      "description": "Omitted when the read fails; No data must not be interpreted as zero latency.",
+      "gridPos": {
+        "x": 16,
+        "y": 42,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mqlite_storage_ping_seconds{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} {{task}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Not available"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       }
     },
     {
@@ -999,7 +1269,7 @@
       "description": "Unknown outcome means commit status is uncertain; do not classify it as a known rollback.",
       "gridPos": {
         "x": 0,
-        "y": 39,
+        "y": 48,
         "w": 12,
         "h": 6
       },
@@ -1039,7 +1309,7 @@
       "description": "Retries are storage attempts, not redelivered messages or SDK HTTP retries.",
       "gridPos": {
         "x": 12,
-        "y": 39,
+        "y": 48,
         "w": 12,
         "h": 6
       },
@@ -1079,7 +1349,7 @@
       "description": "Monotonic elapsed storage-operation duration; separate from connection-pool wait accounting.",
       "gridPos": {
         "x": 0,
-        "y": 45,
+        "y": 54,
         "w": 12,
         "h": 6
       },
@@ -1119,7 +1389,7 @@
       "description": "Pool connections and capacity; not consumer connections.",
       "gridPos": {
         "x": 12,
-        "y": 45,
+        "y": 54,
         "w": 12,
         "h": 6
       },
@@ -1159,7 +1429,7 @@
       "description": "Total time spent waiting for pool connections over the last five minutes, summed across callers; can exceed five minutes with concurrent callers.",
       "gridPos": {
         "x": 0,
-        "y": 51,
+        "y": 60,
         "w": 12,
         "h": 6
       },
@@ -1193,13 +1463,53 @@
       }
     },
     {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Local database footprint",
+      "description": "Local database plus WAL/shared-memory footprint. Not available for memory or remote storage.",
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "mqlite_storage_size_bytes{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} {{task}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "Not available"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
       "id": 22,
       "type": "timeseries",
       "title": "Maintenance outcomes",
       "description": "Maintenance effects are collected in the engine, including embedded use.",
       "gridPos": {
-        "x": 12,
-        "y": 51,
+        "x": 0,
+        "y": 66,
         "w": 12,
         "h": 6
       },
@@ -1238,8 +1548,8 @@
       "title": "Maintenance last success age",
       "description": "Time since the last successful pass for enabled tasks. Disabled tasks and tasks with no successful pass are omitted, not shown as epoch-sized ages; compare enabled status and maintenance outcomes.",
       "gridPos": {
-        "x": 0,
-        "y": 57,
+        "x": 12,
+        "y": 66,
         "w": 12,
         "h": 6
       },
@@ -1278,8 +1588,8 @@
       "title": "Routing filter failures",
       "description": "Compile/evaluation failures are distinct from a valid filter returning false.",
       "gridPos": {
-        "x": 12,
-        "y": 57,
+        "x": 0,
+        "y": 72,
         "w": 12,
         "h": 6
       },
@@ -1313,133 +1623,13 @@
       }
     },
     {
-      "id": 25,
-      "type": "timeseries",
-      "title": "Storage read availability",
-      "description": "A SELECT 1 read probe; success does not prove writes or full data integrity.",
-      "gridPos": {
-        "x": 0,
-        "y": 63,
-        "w": 12,
-        "h": 6
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "mqlite_storage_read_available{instance=~\"$instance\"}",
-          "legendFormat": "{{instance}} {{task}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "noValue": "Not available"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 26,
-      "type": "timeseries",
-      "title": "Storage read round trip",
-      "description": "Omitted when the read fails; No data must not be interpreted as zero latency.",
-      "gridPos": {
-        "x": 12,
-        "y": 63,
-        "w": 12,
-        "h": 6
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "mqlite_storage_ping_seconds{instance=~\"$instance\"}",
-          "legendFormat": "{{instance}} {{task}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "noValue": "Not available"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 27,
-      "type": "timeseries",
-      "title": "Local database footprint",
-      "description": "Local database plus WAL/shared-memory footprint. Not available for memory or remote storage.",
-      "gridPos": {
-        "x": 0,
-        "y": 69,
-        "w": 12,
-        "h": 6
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "mqlite_storage_size_bytes{instance=~\"$instance\"}",
-          "legendFormat": "{{instance}} {{task}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "noValue": "Not available"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
       "id": 28,
       "type": "timeseries",
       "title": "Enabled maintenance tasks",
       "description": "Disabled or inapplicable tasks must not trigger a heartbeat failure.",
       "gridPos": {
         "x": 12,
-        "y": 69,
+        "y": 72,
         "w": 12,
         "h": 6
       },

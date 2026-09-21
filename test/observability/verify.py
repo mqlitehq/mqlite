@@ -136,12 +136,12 @@ def event(name, kind):
                  if entry["queue"] == name and entry["event"] == kind), 0)
 
 
-def grafana_query(expr, datasource="mqlite-prometheus"):
+def grafana_query(expr, datasource="mqlite-prometheus", query_format="time_series"):
     now = int(time.time() * 1000)
     return request(GRAFANA + "/api/ds/query", {
         "from": str(now - 60000), "to": str(now),
         "queries": [{"refId": "A", "datasource": {"type": "prometheus", "uid": datasource},
-                     "expr": expr, "instant": True, "range": False,
+                     "expr": expr, "instant": True, "range": False, "format": query_format,
                      "intervalMs": 5000, "maxDataPoints": 100}],
     }, GRAFANA_AUTH)
 
@@ -176,6 +176,13 @@ def alert_firing(name):
     assert status == 200
     return any(a["labels"].get("alertname") == name and a["state"] == "firing"
                for a in data["data"]["alerts"])
+
+
+def panel_alert_firing(name, selected_queue):
+    board = json.loads((STACK / "grafana/dashboards/mqlite.json").read_text())
+    panel = next(panel for panel in board["panels"] if panel["id"] == 16)
+    expr = panel["targets"][0]["expr"].replace("$instance", ".*").replace("$queue", selected_queue)
+    return any(row["metric"].get("alertname") == name for row in query(expr))
 
 
 def verify():
@@ -259,9 +266,15 @@ def verify():
     bad = receive("obsdemo-alert")[0]
     settle("Reject", "obsdemo-alert", bad, dead_letter_reason="demo-rejection")
     wait_for("real Prometheus demo rule fires", lambda: alert_firing("MQLiteDemoDeadLetter"))
+    wait_for("alert panel includes the selected queue's firing alert",
+             lambda: panel_alert_firing("MQLiteDemoDeadLetter", "obsdemo-alert"))
+    check(not panel_alert_firing("MQLiteDemoDeadLetter", "obsdemo-backlog"),
+          "alert panel excludes other queues' firing alerts")
     rpc("AdminService", "Redrive", {"queue": "obsdemo-alert", "max": 1})
     settle("Complete", "obsdemo-alert", receive("obsdemo-alert")[0])
     wait_for("real Prometheus demo rule resolves", lambda: not alert_firing("MQLiteDemoDeadLetter"))
+    wait_for("resolved alert disappears from the selected queue panel",
+             lambda: not panel_alert_firing("MQLiteDemoDeadLetter", "obsdemo-alert"))
 
     # Keep one explicitly named demonstration DLQ for the operator to inspect.
     queue("obsdemo-dlq")
@@ -348,7 +361,7 @@ def verify():
     for panel in board["dashboard"]["panels"]:
         for target in panel.get("targets", []):
             expr = target["expr"].replace("$instance", ".*").replace("$queue", ".*").replace("$__rate_interval", "1m")
-            grafana_result(*grafana_query(expr))
+            grafana_result(*grafana_query(expr, query_format=target.get("format", "time_series")))
             check(True, "Grafana panel query: " + panel["title"])
 
 
@@ -365,11 +378,15 @@ def faults():
         token_file.write_text("invalid-observability-demo-token\n")
         wait_for("invalid scraper credential makes target down", lambda: value('up{job="mqlite"}') == 0)
         wait_for("production scrape-failure rule fires", lambda: alert_firing("MQLiteScrapeUnavailable"), timeout=130)
+        wait_for("queue selection retains broker-wide firing alerts without a queue label",
+                 lambda: panel_alert_firing("MQLiteScrapeUnavailable", "obsdemo-alert"))
     finally:
         token_file.write_bytes(original)
         token_file.chmod(0o600)
     wait_for("credential restoration recovers scrape", lambda: value('up{job="mqlite"}') == 1)
     wait_for("production scrape-failure rule resolves", lambda: not alert_firing("MQLiteScrapeUnavailable"))
+    wait_for("resolved broker-wide alert disappears despite the queue selection",
+             lambda: not panel_alert_firing("MQLiteScrapeUnavailable", "obsdemo-alert"))
 
     try:
         compose("stop", "prometheus")
