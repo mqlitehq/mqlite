@@ -388,6 +388,10 @@ func TestServePrivateMetricsListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = embedded.Close() })
+	if err := embedded.Serve(context.Background(), "127.0.0.1:0",
+		mqlite.WithMetricsURL("http://127.0.0.1:9091/metrics")); err == nil {
+		t.Fatal("metrics URL without a metrics listener must fail before serving")
+	}
 	apiAddr, metricsAddr := reserve(), reserve()
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -399,6 +403,7 @@ func TestServePrivateMetricsListener(t *testing.T) {
 			mqlite.WithTokens("admin-secret"),
 			mqlite.WithMonitorTokens("monitor-secret"),
 			mqlite.WithMetricsAddr(metricsAddr),
+			mqlite.WithMetricsURL("http://"+metricsAddr+"/metrics"),
 			mqlite.WithReady(func() { close(ready) }),
 		)
 	}()
@@ -406,6 +411,17 @@ func TestServePrivateMetricsListener(t *testing.T) {
 	case <-ready:
 	case <-time.After(5 * time.Second):
 		t.Fatal("private metrics listener never became ready")
+	}
+
+	cardResp, err := client.Get("http://" + apiAddr + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var card wire.DiscoveryCard
+	err = json.NewDecoder(cardResp.Body).Decode(&card)
+	cardResp.Body.Close()
+	if err != nil || card.Metrics != "http://"+metricsAddr+"/metrics" {
+		t.Fatalf("explicit discovery URL = %q, decode error %v", card.Metrics, err)
 	}
 
 	resp, err := client.Get("http://" + apiAddr + "/metrics")

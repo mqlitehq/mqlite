@@ -29,11 +29,28 @@ The example binds locally for development. In a deployment, replace the loopback
 address with the broker's private interface or service address and keep port 9091
 out of public ingress. The monitor credential is still required; a private
 network is an additional boundary, not a replacement for Bearer authentication.
-When the listener is disabled, the discovery card leaves `metrics` empty.
+The discovery card omits `metrics` by default, even when this listener is enabled.
 
 For a runnable broker, Prometheus and Grafana stack, see
 [the local observability demo](../ops/observability/README.md). For an existing
 platform, use the [cloud and Kubernetes guide](observability-cloud.md).
+
+## Discovery URL
+
+To include the separate endpoint in the unauthenticated `GET /` discovery card,
+set `MQLITE_METRICS_URL` or `mqlite serve --metrics-url` explicitly. For the local
+listener above, use `MQLITE_METRICS_URL=http://127.0.0.1:9091/metrics`.
+The Go SDK offers `WithMetricsURL` alongside the required `WithMetricsAddr`.
+
+The URL must be absolute HTTP(S), with the exact path `/metrics` and no credentials,
+query parameters or fragment. A configured URL requires an enabled metrics
+listener; the URL itself does not create a listener or proxy traffic. Scrapes
+still require Bearer authentication, and the API listener still returns `404`
+for `/metrics`.
+
+Discovery never infers or publishes private addresses automatically. Setting this
+URL makes its host and port visible to anyone who can read the discovery card;
+leave it unset in production unless you intend to disclose that address.
 
 ## Read-only monitoring access
 

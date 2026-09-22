@@ -22,6 +22,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_MONITOR_TOKENS` | optional comma-separated read-only credentials for `observe` and `/metrics`; requires administrator auth and credentials distinct from administrators |
 | `MQLITE_TOKENS` | broker (`serve`) administrator Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth; additional managed keys live in the database |
 | `MQLITE_METRICS_ADDR` | optional separate listener for authenticated Prometheus `/metrics` (for example `:9091`); unset/`off` disables it |
+| `MQLITE_METRICS_URL` | optional absolute HTTP(S) `/metrics` URL for unauthenticated discovery; requires `MQLITE_METRICS_ADDR` or `--metrics-addr`; empty/unset omits the field |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
@@ -80,6 +81,7 @@ MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :6754
 |---|---|---|
 | `--addr` | `:6754` | listen address |
 | `--metrics-addr` | disabled | separate authenticated `/metrics` listener; the API listener never serves `/metrics` |
+| `--metrics-url` | omitted | advertise the separate metrics URL in discovery; overrides `MQLITE_METRICS_URL` and requires an enabled metrics listener |
 | `--insecure-allow-remote` | `false` | with auth disabled, allow a non-loopback bind (otherwise refused) |
 
 The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
@@ -93,6 +95,22 @@ the embedded admin console at `/ui`. When `--metrics-addr` or
 listener and requires a configured administrator or monitor credential. The API
 listener deliberately returns 404 for `/metrics`; keep the metrics listener on a
 private network or behind an authenticated TLS proxy.
+
+Discovery omits `metrics` by default, even when the listener is enabled. To
+advertise a local endpoint explicitly:
+
+```bash
+MQLITE_DB=file:./mq.db MQLITE_TOKENS=mqk_dev mqlite serve \
+  --metrics-addr 127.0.0.1:9091 \
+  --metrics-url http://127.0.0.1:9091/metrics
+```
+
+The URL must be absolute HTTP(S), use exactly `/metrics`, and contain no
+credentials, query parameters or fragment. It is visible to anyone reading the
+unauthenticated `GET /` card. Leave it unset in production unless that address
+is intended for disclosure; no private address is inferred automatically.
+`--metrics-url=` clears an environment-provided URL. This setting only changes
+discovery metadata; it does not open a listener, proxy traffic or relax authentication.
 
 ### `key create|list|revoke` — manage persistent access keys
 

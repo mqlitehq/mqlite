@@ -449,6 +449,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
 	metricsAddr := fs.String("metrics-addr", "", "private metrics listen address (disabled by default; or set MQLITE_METRICS_ADDR)")
+	metricsURL := fs.String("metrics-url", os.Getenv("MQLITE_METRICS_URL"), "advertise the separate metrics URL in discovery (optional; or set MQLITE_METRICS_URL)")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote", false, "allow a non-loopback bind while auth is disabled (MQLITE_TOKENS=off)")
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 { // exact arity: serve takes flags only (round-3 §3.4)
@@ -551,6 +552,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	return eng.Serve(sctx, listenAddr,
 		mqlite.WithTokenCSV(tokens), mqlite.WithMonitorTokens(monitorTokens...), mqlite.WithVersion(version),
 		mqlite.WithMetricsAddr(metricsListen),
+		mqlite.WithMetricsURL(*metricsURL),
 		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui),
 		mqlite.WithReady(func() { lg.Info("ready — Ctrl-C to stop") }))
 }

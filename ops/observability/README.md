@@ -56,6 +56,14 @@ over the private Compose network. Keep all published addresses bound to loopback
 A tunnel can expose these local ports to your own workstation without publishing
 management interfaces to the Internet.
 
+This local Compose example explicitly sets `MQLITE_METRICS_URL` to
+`http://127.0.0.1:${MQLITE_METRICS_OBS_PORT:-17655}/metrics`, so the broker's
+unauthenticated `GET /` card includes the host-accessible metrics URL. Prometheus
+continues to use `mqlite:9091` internally. The advertised URL needs a monitor or
+administrator credential, and `/metrics` on the API port still returns `404`.
+Outside this demo, discovery omits `metrics` unless a URL is configured; leave
+it unset in production unless you intend to disclose the address in the open card.
+
 ## Exercise actual scenarios
 
 From the repository root:

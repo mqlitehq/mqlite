@@ -35,6 +35,11 @@ upgrade notes before replacing a broker.
   `MQLITE_METRICS_ADDR` or `--metrics-addr`; it is disabled by default and the
   public API listener never exposes `/metrics`. The listener shares the broker
   process and engine, so monitoring does not require a second MQLite VM.
+- Omit `metrics` from discovery by default. Explicit `MQLITE_METRICS_URL`,
+  `--metrics-url` or SDK `WithMetricsURL` can advertise the separate endpoint
+  when its listener is enabled. The URL is visible without authentication;
+  credentials, query parameters and fragments are rejected, and scrape
+  authentication is unchanged.
 - Include a runnable MQLite, Prometheus and Grafana starter with a provisioned
   dashboard, rules, repeatable verification scenarios and cloud deployment guidance.
 - Preserve old metrics as exact compatibility projections. Prefer

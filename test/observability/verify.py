@@ -199,6 +199,9 @@ def verify():
     check(ADMIN != MONITOR, "monitor and administrator credentials differ")
     status, _ = request(BROKER + "/metrics", auth="Bearer " + ADMIN)
     check(status == 404, "public API does not expose metrics")
+    status, card = request(BROKER + "/")
+    check(status == 200 and card.get("metrics") == METRICS + "/metrics",
+          "local discovery advertises the explicitly configured private metrics URL")
     for token, expected in (("", 401), ("invalid-demo-credential", 401), (MONITOR, 200)):
         status, _ = request(METRICS + "/metrics", auth="Bearer " + token if token else "")
         check(status == expected, "metrics authentication HTTP " + str(expected))

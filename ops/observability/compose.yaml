@@ -17,6 +17,8 @@ services:
       # Prometheus reaches it over the Compose network; the loopback-only host
       # mapping below is for the local verifier and is never bound publicly.
       MQLITE_METRICS_ADDR: :9091
+      # Advertise the host-mapped URL for this local-only demo explicitly.
+      MQLITE_METRICS_URL: http://127.0.0.1:${MQLITE_METRICS_OBS_PORT:-17655}/metrics
       MQLITE_UI: "1"
       MQLITE_CORS: off
     ports:

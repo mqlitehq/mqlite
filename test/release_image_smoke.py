@@ -128,7 +128,7 @@ def smoke(args):
         check(card.get("name") == "mqlite" and card.get("status") == "ok"
               and card.get("auth") == "bearer" and card.get("health") == "/healthz",
               f"unexpected discovery metadata: {card!r}")
-        check(card.get("metrics", "") == "", f"public discovery advertises metrics: {card!r}")
+        check("metrics" not in card, f"public discovery advertises metrics without opt-in: {card!r}")
         version = card.get("version", "")
         check(re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version),
               f"invalid image version: {version!r}")

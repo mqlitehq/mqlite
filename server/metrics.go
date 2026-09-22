@@ -1,14 +1,53 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/wire"
 )
+
+// ValidateMetricsURL validates an optional URL for the open discovery card.
+// Credentials and URL parameters are rejected rather than published. Errors
+// deliberately omit the supplied value, which may contain a secret.
+func ValidateMetricsURL(value string) error {
+	if value == "" {
+		return nil
+	}
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
+		u.User != nil || u.Opaque != "" || u.Path != "/metrics" || u.RawPath != "" ||
+		u.RawQuery != "" || u.ForceQuery || strings.Contains(value, "#") {
+		return errors.New("metrics URL must be an absolute HTTP(S) URL ending in /metrics without credentials, query or fragment")
+	}
+	if strings.Contains(u.Hostname(), " ") || strings.HasSuffix(u.Host, ":") {
+		return errors.New("metrics URL must have a valid host and port")
+	}
+	if strings.HasPrefix(u.Host, "[") {
+		ip, err := netip.ParseAddr(u.Hostname())
+		if err != nil || !ip.Is6() {
+			return errors.New("metrics URL brackets require an IPv6 address")
+		}
+	} else if strings.Contains(u.Host, ":") {
+		if _, _, err := net.SplitHostPort(u.Host); err != nil {
+			return errors.New("metrics URL must have a valid host and port")
+		}
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return errors.New("metrics URL port must be between 1 and 65535")
+		}
+	}
+	return nil
+}
 
 // MetricsHandler exposes only GET /metrics. Mount it on a private listener,
 // never on the public API listener. It shares the API server's engine and

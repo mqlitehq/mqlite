@@ -27,6 +27,9 @@ type Server struct {
 	CORS    string       // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
 	Logger  *slog.Logger // per-request access log; nil -> no request logging (see logging.go)
 	UI      bool         // serve the embedded admin console at /ui (see console.go)
+	// MetricsURL optionally advertises the separate scrape endpoint on the open
+	// discovery card. Empty omits it. This never enables /metrics on Handler.
+	MetricsURL string
 	// MonitorTokens grants only Observe and /metrics. Configure before Handler is
 	// used. These credentials never consult the database and cannot manage keys.
 	MonitorTokens []string
@@ -70,6 +73,11 @@ func (s *Server) Handler() http.Handler {
 	if err := ValidateMonitorTokens(admins, s.MonitorTokens); err != nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "internal", "invalid monitoring credential configuration")
+		})
+	}
+	if err := ValidateMetricsURL(s.MetricsURL); err != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeErr(w, http.StatusInternalServerError, "internal", "invalid metrics discovery URL")
 		})
 	}
 	handler := s.cors(s.observeRequests(s.logging(s.auth(s.observe(s.mux)))))
@@ -184,7 +192,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Docs:        "https://github.com/mqlitehq/mqlite",
 		Endpoints:   s.rpcPaths, // the complete RPC catalog, exactly as registered
 		Health:      "/healthz",
-		Metrics:     "", // metrics are available only on a separately configured listener
+		Metrics:     s.MetricsURL,
 	}
 	if s.UI {
 		card.UI = "/ui"

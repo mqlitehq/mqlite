@@ -390,6 +390,7 @@ type serveConfig struct {
 	tokens        []string
 	monitorTokens []string
 	metricsAddr   string
+	metricsURL    string
 	version       string
 	cors          string
 	reqLogger     *slog.Logger
@@ -423,6 +424,14 @@ func WithMonitorTokens(tokens ...string) ServeOption {
 // this port out of public ingress. The API listener never serves /metrics.
 func WithMetricsAddr(addr string) ServeOption {
 	return func(c *serveConfig) { c.metricsAddr = addr }
+}
+
+// WithMetricsURL advertises the separate scrape URL on the open discovery card.
+// Empty omits it (the default). Requires WithMetricsAddr and an absolute HTTP(S)
+// URL without credentials, query parameters or a fragment. It does not enable
+// scraping on the API listener or change authentication.
+func WithMetricsURL(url string) ServeOption {
+	return func(c *serveConfig) { c.metricsURL = url }
 }
 
 // WithTokenCSV sets accepted Bearer tokens from a comma-separated string (env-friendly).
@@ -474,6 +483,12 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	if err := server.ValidateMonitorTokens(sc.tokens, sc.monitorTokens); err != nil {
 		return err
 	}
+	if err := server.ValidateMetricsURL(sc.metricsURL); err != nil {
+		return err
+	}
+	if sc.metricsURL != "" && sc.metricsAddr == "" {
+		return errors.New("metrics discovery URL requires a metrics listener")
+	}
 	if sc.metricsAddr != "" {
 		hasAdmin := false
 		for _, token := range sc.tokens {
@@ -490,6 +505,7 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.CORS = sc.cors
 	srv.Logger = sc.reqLogger
 	srv.UI = sc.ui
+	srv.MetricsURL = sc.metricsURL
 	hs := newHTTPServer(addr, srv.Handler())
 
 	// Bind synchronously so a bind failure (port in use, bad addr) surfaces here —
