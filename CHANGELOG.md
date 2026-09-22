@@ -14,8 +14,9 @@ upgrade notes before replacing a broker.
 
 > **Upgrade from v0.3.1:** port **6754**, schema token **5**, message data and
 > managed-key storage are unchanged. Stop the broker and take a consistent backup
-> before replacing it. Process counters restart from zero. Rolling back to
-> v0.3.1 also requires its previous monitoring configuration: `Observe` and
+> before replacing it. Prometheus scraping now requires `MQLITE_METRICS=on` or
+> `--metrics`; it is disabled by default. Process counters restart from zero.
+> Rolling back to v0.3.1 also requires its previous monitoring configuration: `Observe` and
 > configured monitor credentials require v0.3.2. See the
 > [upgrade and rollback procedure](docs/operations.md#upgrade-and-rollback).
 
@@ -31,15 +32,12 @@ upgrade notes before replacing a broker.
 - Add configured read-only `MQLITE_MONITOR_TOKENS` / `WithMonitorTokens` for
   `Observe` and `/metrics`, independently of the managed-key database. The
   managed-key permissions and database schema remain unchanged.
-- Serve Prometheus `/metrics` from an optional authenticated listener configured by
-  `MQLITE_METRICS_ADDR` or `--metrics-addr`; it is disabled by default and the
-  public API listener never exposes `/metrics`. The listener shares the broker
-  process and engine, so monitoring does not require a second MQLite VM.
-- Omit `metrics` from discovery by default. Explicit `MQLITE_METRICS_URL`,
-  `--metrics-url` or SDK `WithMetricsURL` can advertise the separate endpoint
-  when its listener is enabled. The URL is visible without authentication;
-  credentials, query parameters and fragments are rejected, and scrape
-  authentication is unchanged.
+- Make Prometheus `/metrics` opt-in on the existing API port with
+  `MQLITE_METRICS=on`, `--metrics` or SDK `WithMetrics(true)`. Administrator auth
+  must remain enabled; monitor and administrator credentials can scrape it.
+  Disabled requests return `404`, and discovery omits `metrics`. Enabling it
+  automatically adds `"metrics":"/metrics"` to discovery. No extra port, URL
+  setting, process or VM is required.
 - Include a runnable MQLite, Prometheus and Grafana starter with a provisioned
   dashboard, rules, repeatable verification scenarios and cloud deployment guidance.
 - Preserve old metrics as exact compatibility projections. Prefer

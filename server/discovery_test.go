@@ -65,10 +65,11 @@ func getCard(t *testing.T, url string) (wire.DiscoveryCard, []string) {
 // auth ("bearer"/"none"), a complete endpoints[] catalog, and a fixed field set — so
 // the server can't silently drift from the documented shape (MQLITE-87 / D4).
 func TestDiscoveryCardPinned(t *testing.T) {
-	// Pin every combination of the two optional fields and authentication mode.
+	// Pin both optional fields independently. Metrics require authentication;
+	// that invalid combination fails closed rather than publishing a card.
 	for _, auth := range []bool{false, true} {
 		for _, ui := range []bool{false, true} {
-			for _, metricsURL := range []string{"", "http://127.0.0.1:17655/metrics"} {
+			for _, metrics := range []bool{false, true} {
 				name := "anonymous"
 				if auth {
 					name = "bearer"
@@ -76,8 +77,8 @@ func TestDiscoveryCardPinned(t *testing.T) {
 				if ui {
 					name += "/console"
 				}
-				if metricsURL != "" {
-					name += "/metrics_url"
+				if metrics {
+					name += "/metrics"
 				}
 				t.Run(name, func(t *testing.T) {
 					eng, err := engine.Open(context.Background(), engine.Options{DB: ":memory:", DisableBackground: true})
@@ -92,107 +93,55 @@ func TestDiscoveryCardPinned(t *testing.T) {
 						wantAuth = "bearer"
 					}
 					srv := server.New(eng, tokens)
-					srv.UI, srv.MetricsURL = ui, metricsURL
-					ts := httptest.NewServer(srv.Handler())
+					srv.UI, srv.Metrics = ui, metrics
+					h := srv.Handler()
+					if metrics && !auth {
+						keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/", "", nil), http.StatusInternalServerError, "internal")
+						return
+					}
+					ts := httptest.NewServer(h)
 					t.Cleanup(ts.Close)
 					card, keys := getCard(t, ts.URL+"/")
 					wantKeys := []string{"auth", "description", "docs", "endpoints", "health", "name", "status", "version"}
-					wantUI := ""
+					wantUI, wantMetrics := "", ""
 					if ui {
 						wantKeys = append(wantKeys, "ui")
 						wantUI = "/ui"
 					}
-					if metricsURL != "" {
+					if metrics {
 						wantKeys = append(wantKeys, "metrics")
+						wantMetrics = "/metrics"
 					}
 					sort.Strings(wantKeys)
 					if !reflect.DeepEqual(keys, wantKeys) {
 						t.Errorf("card field set = %v\n            want %v", keys, wantKeys)
 					}
-					if card.Name != "mqlite" || card.Status != "ok" || card.Health != "/healthz" || card.Metrics != metricsURL || card.UI != wantUI || card.Auth != wantAuth {
+					if card.Name != "mqlite" || card.Status != "ok" || card.Health != "/healthz" || card.Metrics != wantMetrics || card.UI != wantUI || card.Auth != wantAuth {
 						t.Errorf("card metadata drift: %+v", card)
 					}
 					if !reflect.DeepEqual(card.Endpoints, wantRPCRoutes) {
 						t.Errorf("endpoints catalog drift:\n got  %v\n want %v", card.Endpoints, wantRPCRoutes)
 					}
-					// Advertising a link never mounts the exporter on the API listener,
-					// even for a configured administrator.
+					// The advertised relative URL is live on this same handler, and
+					// the exporter remains independent of the optional console.
 					for _, credential := range []string{"", "secret"} {
-						req, err := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
-						if err != nil {
-							t.Fatal(err)
+						want := http.StatusNotFound
+						if metrics {
+							want = http.StatusUnauthorized
+							if credential != "" {
+								want = http.StatusOK
+							}
 						}
-						if credential != "" {
-							req.Header.Set("Authorization", "Bearer "+credential)
-						}
-						res, err := ts.Client().Do(req)
-						if err != nil {
-							t.Fatal(err)
-						}
-						res.Body.Close()
-						if res.StatusCode != http.StatusNotFound {
-							t.Errorf("API /metrics status = %d, want 404", res.StatusCode)
-						}
+						keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/metrics", credential, nil), want, "")
 					}
+					wantUIStatus := http.StatusNotFound
+					if ui {
+						wantUIStatus = http.StatusOK
+					}
+					keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/ui/", "", nil), wantUIStatus, "")
 				})
 			}
 		}
-	}
-}
-
-func TestValidateMetricsURL(t *testing.T) {
-	for _, value := range []string{
-		"", "http://127.0.0.1:17655/metrics", "http://[::1]:9091/metrics",
-		"http://[::1]/metrics", "http://[fe80::1%25eth0]:9091/metrics",
-		"https://mqlite-metrics.internal.example/metrics",
-		"http://127.0.0.1:1/metrics", "http://127.0.0.1:65535/metrics",
-	} {
-		if err := server.ValidateMetricsURL(value); err != nil {
-			t.Errorf("valid metrics URL %q rejected: %v", value, err)
-		}
-	}
-	const secret = "discovery-url-test-secret"
-	for _, value := range []string{
-		" ", "/metrics", "//127.0.0.1:9091/metrics", "127.0.0.1:9091/metrics",
-		"http:/metrics", "http:///metrics", "http://:9091/metrics",
-		"http://127.0.0.1:/metrics", "http://127.0.0.1:0/metrics",
-		"http://127.0.0.1:65536/metrics", "http://127.0.0.1:abc/metrics",
-		"http://::1:9091/metrics", "http://127.0.0.1:9091:9092/metrics",
-		"http://[not-an-ip]:9091/metrics", "http://[127.0.0.1]:9091/metrics",
-		"ftp://127.0.0.1:9091/metrics", "javascript:" + secret,
-		"http://127.0.0.1:9091", "http://127.0.0.1:9091/", "http://127.0.0.1:9091/metrics/",
-		"http://127.0.0.1:9091/met%72ics",
-		"http://127.0.0.1:9091/" + secret,
-		"http://user:" + secret + "@127.0.0.1:9091/metrics",
-		"http://127.0.0.1:9091/metrics?token=" + secret,
-		"http://127.0.0.1:9091/metrics?",
-		"http://127.0.0.1:9091/metrics#" + secret,
-		"http://127.0.0.1:9091/metrics#",
-		"http://%" + secret + "/metrics",
-		"http://127.0.0.1:9091/metrics\n" + secret,
-	} {
-		err := server.ValidateMetricsURL(value)
-		if err == nil {
-			t.Errorf("invalid metrics URL %q accepted", value)
-		} else if strings.Contains(err.Error(), secret) {
-			t.Errorf("metrics URL validation leaked a credential: %v", err)
-		}
-	}
-}
-
-func TestDiscoveryRejectsInvalidMetricsURLWithoutLeak(t *testing.T) {
-	eng, err := engine.Open(context.Background(), engine.Options{DB: ":memory:", DisableBackground: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { eng.Close() })
-	srv := server.New(eng, []string{"admin"})
-	const secret = "discovery-url-test-secret"
-	srv.MetricsURL = "http://user:" + secret + "@127.0.0.1:9091/metrics"
-	res := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
-	if res.Code != http.StatusInternalServerError || strings.Contains(res.Body.String(), secret) {
-		t.Fatalf("invalid URL response = %d %s", res.Code, res.Body.String())
 	}
 }
 

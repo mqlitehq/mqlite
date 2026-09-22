@@ -11,46 +11,35 @@ the server; pure embedded use marks that domain `not_applicable`. Grafana derive
 rates, time windows and percentiles from these values instead of maintaining
 another set of message counters.
 
-The Prometheus endpoint is deliberately separate from the broker API. The API
-listener never serves `/metrics`; it returns `404` even for an administrator
-credential. A metrics listener is disabled by default and is enabled with
-`MQLITE_METRICS_ADDR` or `mqlite serve --metrics-addr`. It uses the same process,
-engine and counters, so it does not require a second writer or VM:
+Prometheus scraping is disabled by default. Enable authenticated `/metrics` on
+the existing API port with `MQLITE_METRICS=on` or `mqlite serve --metrics`:
 
 ```sh
 MQLITE_DB=file:/data/mq.db \
 MQLITE_TOKENS="$ADMIN_TOKEN" \
 MQLITE_MONITOR_TOKENS="$MONITOR_TOKEN" \
-MQLITE_METRICS_ADDR=127.0.0.1:9091 \
-mqlite serve --addr :6754
+MQLITE_METRICS=on \
+mqlite serve --addr 127.0.0.1:6754
 ```
 
-The example binds locally for development. In a deployment, replace the loopback
-address with the broker's private interface or service address and keep port 9091
-out of public ingress. The monitor credential is still required; a private
-network is an additional boundary, not a replacement for Bearer authentication.
-The discovery card omits `metrics` by default, even when this listener is enabled.
+This local example exposes both the API and metrics on loopback. The exporter
+shares the broker's process, engine and counters; it needs no extra port or VM.
+The Go SDK uses `WithMetrics(true)` alongside `WithTokens(...)` and optionally
+`WithMonitorTokens(...)`. Enabling metrics without administrator auth is rejected.
+
+When enabled, `GET /` automatically includes `"metrics":"/metrics"`; clients
+resolve this against the same origin. When disabled, discovery omits the field
+and `/metrics` returns `404` even with valid credentials.
+
+In production, use a private broker address or an ingress that blocks `/metrics`
+from the public Internet while allowing private collectors. API and metrics
+share a port, so a port-level firewall cannot separate them. Bearer authentication
+protects the data but does not hide a publicly reachable route. The monitor
+credential remains required on private networks.
 
 For a runnable broker, Prometheus and Grafana stack, see
 [the local observability demo](../ops/observability/README.md). For an existing
 platform, use the [cloud and Kubernetes guide](observability-cloud.md).
-
-## Discovery URL
-
-To include the separate endpoint in the unauthenticated `GET /` discovery card,
-set `MQLITE_METRICS_URL` or `mqlite serve --metrics-url` explicitly. For the local
-listener above, use `MQLITE_METRICS_URL=http://127.0.0.1:9091/metrics`.
-The Go SDK offers `WithMetricsURL` alongside the required `WithMetricsAddr`.
-
-The URL must be absolute HTTP(S), with the exact path `/metrics` and no credentials,
-query parameters or fragment. A configured URL requires an enabled metrics
-listener; the URL itself does not create a listener or proxy traffic. Scrapes
-still require Bearer authentication, and the API listener still returns `404`
-for `/metrics`.
-
-Discovery never infers or publishes private addresses automatically. Setting this
-URL makes its host and port visible to anyone who can read the discovery card;
-leave it unset in production unless you intend to disclose that address.
 
 ## Read-only monitoring access
 
@@ -72,7 +61,7 @@ A Prometheus job should reference a mounted secret file:
 scrape_configs:
   - job_name: mqlite
     # The native listener is plain HTTP. Use https only when a TLS proxy
-    # terminates TLS in front of the private listener.
+    # terminates TLS in front of the private broker.
     scheme: http
     metrics_path: /metrics
     scrape_interval: 15s
@@ -81,7 +70,7 @@ scrape_configs:
       type: Bearer
       credentials_file: /run/secrets/mqlite-monitor.token
     static_configs:
-      - targets: [mqlite-metrics.internal.example:9091]
+      - targets: [mqlite.internal.example:6754]
 ```
 
 If a TLS proxy fronts the listener, use the correct TLS CA rather than disabling
@@ -232,8 +221,11 @@ are separate concepts.
 
 ### Compatibility from v0.3.1
 
-All five pre-existing families remain available. These compatibility views read
-canonical values; they do not maintain separate counters:
+Prometheus scraping is now disabled by default. On upgrade, enable
+`MQLITE_METRICS=on` or `--metrics` to keep scraping the same API port, and configure
+a monitor token for the collector. All five pre-existing families remain available
+when enabled. These compatibility views read canonical values; they do not
+maintain separate counters:
 
 | Existing family | Canonical mapping |
 | --- | --- |

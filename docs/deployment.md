@@ -20,7 +20,7 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens (**set this in production**) |
 | `MQLITE_MONITOR_TOKENS` | v0.3.2+: optional comma-separated credentials for `Observe` and `/metrics` only; requires auth and distinct administrator credentials |
-| `MQLITE_METRICS_ADDR` | v0.3.2+: optional separate listener for authenticated `/metrics` (for example `:9091`); unset/`off` disables it |
+| `MQLITE_METRICS` | v0.3.2+: opt-in authenticated `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
@@ -49,7 +49,9 @@ and error reference: [api-reference.md](api-reference.md).
 > **Version and upgrade compatibility.**
 > These instructions target **v0.3.2**, with default port **6754** and schema token **5**.
 > Existing v0.3.0/v0.3.1 databases remain compatible; back up before upgrading and
-> retain a configured administrator. Rolling back to v0.3.1 also requires its
+> retain a configured administrator. Existing Prometheus scrapers require
+> `MQLITE_METRICS=on` after upgrading; metrics is now disabled by default.
+> Rolling back to v0.3.1 also requires its
 > previous monitoring configuration; v0.3.0 additionally ignores managed keys.
 > **v0.2.0 uses port 8080 and schema token 2.** Its database cannot be opened by
 > v0.3.2: preserve the old binary/database pair and follow the
@@ -64,7 +66,6 @@ docker run -d --name mqlite -p 6754:6754 \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
-  -e MQLITE_METRICS_ADDR=:9091 \
   -e MQLITE_SYNC=FULL \
   ghcr.io/mqlitehq/mqlite:0.3.2
 ```
@@ -73,10 +74,10 @@ docker run -d --name mqlite -p 6754:6754 \
 - Pin a version tag in production; `:0.3` tracks patches, `:latest` the newest release.
   Images `>= 0.3.0` listen on `6754`; **`0.2.x` and earlier listen on `8080`** — if you pin an
   older tag, publish the port it actually uses.
-- Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. The API
-  listener intentionally returns 404 for `/metrics`; if a private collector is
-  configured, give it access to the separate `MQLITE_METRICS_ADDR` listener and
-  its monitor credential without publishing that port to the public Internet.
+- Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. Metrics is
+  disabled by default. For a private broker or an ingress that blocks public
+  `/metrics`, add `-e MQLITE_METRICS=on` and give the collector a monitor token.
+  Scraping uses the same API port; enabled discovery includes `"metrics":"/metrics"`.
 
 ## Fly.io (minimal cost)
 
@@ -93,7 +94,6 @@ primary_region = "sin"            # pick a region near you
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
   MQLITE_SYNC = "FULL"                      # sync every acknowledged local commit
-  MQLITE_METRICS_ADDR = "fly-local-6pn:9091" # private authenticated scrape listener
 
 [[mounts]]
   source      = "data"                       # the volume created below
@@ -120,13 +120,23 @@ fly deploy --ha=false                            # single machine
 curl https://your-mqlite.fly.dev/                # discovery card
 ```
 
-The `[http_service]` above publishes only the API on `6754`. Keep the metrics
-listener on Fly's private network (or behind an authenticated tunnel) and do not
-add a public service for port `9091`; a private Prometheus collector must attach
-the monitor Bearer token when scraping it. For a local inspection tunnel, run
-`fly proxy 9091:9091 --app your-mqlite` and then query
-`http://127.0.0.1:9091/metrics` with the monitor token; the proxy binds locally
-and does not create a public service. See [cloud and Kubernetes monitoring](observability-cloud.md#flyio).
+The public recipe leaves metrics disabled. Enabling `MQLITE_METRICS=on` also
+makes `/metrics` reachable through this public HTTP service; authentication
+protects its contents but does not make the route private.
+
+For private monitoring without another Fly Machine, remove `[http_service]` and
+any public `[[services]]` entries, set `MQLITE_ADDR=fly-local-6pn:6754` and
+`MQLITE_METRICS=on`, and connect clients and the collector through Fly's private
+network. From your workstation, `fly proxy 6754:6754 --app your-mqlite` opens a
+loopback tunnel; Prometheus can scrape `http://127.0.0.1:6754/metrics` using the
+monitor token. Start the Machine before connecting: direct private access does
+not provide the public recipe's autostart behavior.
+
+If the API must stay public, enable metrics only when your existing ingress
+actually blocks public `/metrics` while preserving private collector access;
+otherwise leave it disabled. See [cloud and Kubernetes monitoring](observability-cloud.md#flyio)
+and Fly's [private networking](https://fly.io/docs/networking/private-networking/)
+and [proxy](https://fly.io/docs/flyctl/proxy/) references.
 
 **Cost:** with `auto_stop_machines="stop"` + `min_machines_running=0` the machine
 runs only while serving requests (cold-starts in seconds, stops when idle), so the
@@ -241,4 +251,4 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 - [ ] One active broker per database; no overlapping replacement.
 - [ ] Verified backup and rehearsed restore meet the application's RPO/RTO.
 - [ ] Free-disk, restart/error and queue-age alerts; an authenticated write/consume canary.
-- [ ] Scrape the private `MQLITE_METRICS_ADDR` `/metrics` listener (Prometheus) for queue depths — see [observability.md](observability.md); do not publish it with the API ingress.
+- [ ] Enable `MQLITE_METRICS=on` for authenticated Prometheus scraping on the API port; use private routing or public-ingress path filtering to keep `/metrics` private — see [observability.md](observability.md).

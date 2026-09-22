@@ -448,22 +448,21 @@ func stripEndpointCredentials(ep string) string {
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
-	metricsAddr := fs.String("metrics-addr", "", "private metrics listen address (disabled by default; or set MQLITE_METRICS_ADDR)")
-	metricsURL := fs.String("metrics-url", os.Getenv("MQLITE_METRICS_URL"), "advertise the separate metrics URL in discovery (optional; or set MQLITE_METRICS_URL)")
+	metrics := fs.Bool("metrics", false, "enable authenticated /metrics on the API listener (default off; or set MQLITE_METRICS)")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote", false, "allow a non-loopback bind while auth is disabled (MQLITE_TOKENS=off)")
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 { // exact arity: serve takes flags only (round-3 §3.4)
-		return fmt.Errorf("usage: serve [--addr host:port] [--insecure-allow-remote]   (no positional arguments, got %q)",
+		return fmt.Errorf("usage: serve [--addr host:port] [--metrics] [--insecure-allow-remote]   (no positional arguments, got %q)",
 			strings.Join(fs.Args(), " "))
 	}
 
-	addrSet, metricsAddrSet := false, false
+	addrSet, metricsSet := false, false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "addr" {
 			addrSet = true
 		}
-		if f.Name == "metrics-addr" {
-			metricsAddrSet = true
+		if f.Name == "metrics" {
+			metricsSet = true
 		}
 	})
 	envAddr, envSet := os.LookupEnv("MQLITE_ADDR")
@@ -471,7 +470,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	metricsListen, err := resolveMetricsAddr(*metricsAddr, metricsAddrSet, os.Getenv("MQLITE_METRICS_ADDR"))
+	metricsEnabled, err := resolveMetrics(*metrics, metricsSet, os.Getenv("MQLITE_METRICS"))
 	if err != nil {
 		return err
 	}
@@ -485,8 +484,8 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if metricsListen != "" && tokens == "" {
-		return errors.New("metrics listener requires administrator authentication; do not set MQLITE_TOKENS=off")
+	if metricsEnabled && tokens == "" {
+		return errors.New("metrics require administrator authentication; do not set MQLITE_TOKENS=off")
 	}
 	// With auth disabled, refuse a non-loopback bind unless explicitly allowed: an open
 	// broker on all interfaces is remotely reachable by anyone (MQLITE-70 / D2).
@@ -551,31 +550,27 @@ func cmdServe(ctx context.Context, args []string) error {
 	// bind failure surfaces as an error instead of a misleading "ready" line (MQLITE-88).
 	return eng.Serve(sctx, listenAddr,
 		mqlite.WithTokenCSV(tokens), mqlite.WithMonitorTokens(monitorTokens...), mqlite.WithVersion(version),
-		mqlite.WithMetricsAddr(metricsListen),
-		mqlite.WithMetricsURL(*metricsURL),
+		mqlite.WithMetrics(metricsEnabled),
 		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui),
 		mqlite.WithReady(func() { lg.Info("ready — Ctrl-C to stop") }))
 }
 
-func resolveMetricsAddr(flagValue string, flagSet bool, env string) (string, error) {
-	value := env
+// resolveMetrics keeps scraping opt-in; an explicit flag overrides the environment.
+func resolveMetrics(flagValue, flagSet bool, env string) (bool, error) {
 	if flagSet {
-		if strings.TrimSpace(flagValue) == "" {
-			return "", errors.New("metrics listen address is blank; use off to disable")
+		return flagValue, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "on", "true", "1":
+		return true, nil
+	case "off", "false", "0":
+		return false, nil
+	case "":
+		if env == "" {
+			return false, nil
 		}
-		value = flagValue
 	}
-	if value == "" || strings.EqualFold(strings.TrimSpace(value), "off") {
-		return "", nil
-	}
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", errors.New("metrics listen address is blank; use off to disable")
-	}
-	if _, _, err := net.SplitHostPort(value); err != nil {
-		return "", fmt.Errorf("invalid metrics listen address: %w", err)
-	}
-	return value, nil
+	return false, errors.New("MQLITE_METRICS must be on/off, true/false, or 1/0")
 }
 
 // resolveListenAddr picks the broker's listen address with precedence

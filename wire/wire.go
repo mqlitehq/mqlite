@@ -277,7 +277,7 @@ type DiscoveryCard struct {
 	Docs        string   `json:"docs"`
 	Endpoints   []string `json:"endpoints"`
 	Health      string   `json:"health"`
-	Metrics     string   `json:"metrics,omitempty"` // present only when an explicit scrape URL is advertised
+	Metrics     string   `json:"metrics,omitempty"` // present only when the authenticated metrics endpoint is enabled
 	UI          string   `json:"ui,omitempty"`      // present only when the console is enabled
 }
 

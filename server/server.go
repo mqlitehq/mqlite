@@ -27,9 +27,9 @@ type Server struct {
 	CORS    string       // Access-Control-Allow-Origin to send; "" -> CORS off (see cors.go)
 	Logger  *slog.Logger // per-request access log; nil -> no request logging (see logging.go)
 	UI      bool         // serve the embedded admin console at /ui (see console.go)
-	// MetricsURL optionally advertises the separate scrape endpoint on the open
-	// discovery card. Empty omits it. This never enables /metrics on Handler.
-	MetricsURL string
+	// Metrics enables authenticated GET /metrics on the API listener and includes
+	// its path in discovery. Off by default; configure before Handler is used.
+	Metrics bool
 	// MonitorTokens grants only Observe and /metrics. Configure before Handler is
 	// used. These credentials never consult the database and cannot manage keys.
 	MonitorTokens []string
@@ -75,14 +75,14 @@ func (s *Server) Handler() http.Handler {
 			writeErr(w, http.StatusInternalServerError, "internal", "invalid monitoring credential configuration")
 		})
 	}
-	if err := ValidateMetricsURL(s.MetricsURL); err != nil {
+	if s.Metrics && len(s.tokens) == 0 {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			writeErr(w, http.StatusInternalServerError, "internal", "invalid metrics discovery URL")
+			writeErr(w, http.StatusInternalServerError, "internal", "metrics require administrator authentication")
 		})
 	}
 	handler := s.cors(s.observeRequests(s.logging(s.auth(s.observe(s.mux)))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/metrics" {
+		if r.URL.Path == "/metrics" && !s.Metrics {
 			http.NotFound(w, r)
 			return
 		}
@@ -148,6 +148,7 @@ func (s *Server) routes() {
 	h(wire.PathCreateKey, engine.KeyManage, s.authEnabled(s.handleCreateKey))
 	h(wire.PathListKeys, engine.KeyManage, s.authEnabled(s.handleListKeys))
 	h(wire.PathRevokeKey, engine.KeyManage, s.authEnabled(s.handleRevokeKey))
+	s.mux.HandleFunc("/metrics", s.authorize(monitorPermission, s.handleMetrics))
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -192,7 +193,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Docs:        "https://github.com/mqlitehq/mqlite",
 		Endpoints:   s.rpcPaths, // the complete RPC catalog, exactly as registered
 		Health:      "/healthz",
-		Metrics:     s.MetricsURL,
+	}
+	if s.Metrics {
+		card.Metrics = "/metrics"
 	}
 	if s.UI {
 		card.UI = "/ui"

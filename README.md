@@ -253,8 +253,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens for `serve` |
 | `MQLITE_MONITOR_TOKENS` | optional, distinct read-only credentials for `observe` and `/metrics`; administrator auth must remain enabled |
-| `MQLITE_METRICS_ADDR` | optional authenticated Prometheus listener (disabled by default; e.g. `127.0.0.1:9091`); the public API listener never serves `/metrics` |
-| `MQLITE_METRICS_URL` | optional absolute HTTP(S) `/metrics` URL advertised by unauthenticated discovery; requires the metrics listener; omitted by default |
+| `MQLITE_METRICS` | enable authenticated Prometheus `/metrics` on the API port (`on`/`true`/`1`; default `off`); requires administrator auth |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
@@ -274,14 +273,14 @@ Starting with v0.3.2, `mqlite observe` and configured `MQLITE_MONITOR_TOKENS`
 provide read-only broker observation. See the [monitoring guide](docs/observability.md)
 and [Prometheus/Grafana quickstart](ops/observability/README.md).
 
-Prometheus scraping is opt-in on a separate listener. Set `MQLITE_METRICS_ADDR` to
-a loopback or private-network address, keep port 9091 out of public ingress, and
-give the collector only a monitor token. Prometheus and Grafana can run on the
-same host or in an existing monitoring platform; no second MQLite VM is required.
-Discovery omits `metrics` unless you explicitly set `MQLITE_METRICS_URL` or
-`--metrics-url`; private addresses are never advertised automatically. This
-publishes the URL to anyone who can read `GET /`, without changing scrape
-authentication or opening a port. See [discovery configuration](docs/observability.md#discovery-url).
+Prometheus scraping is opt-in: set `MQLITE_METRICS=on` or run `mqlite serve --metrics`.
+The API then serves authenticated `/metrics`, and discovery includes
+`"metrics":"/metrics"`. With metrics disabled, the route returns `404` and the
+field is omitted. Give the collector a monitor token. To keep the route off the
+public Internet, use a private broker or block `/metrics` in your public ingress;
+Bearer authentication alone does not make the route private. Prometheus and Grafana
+can run locally or in an existing platform; no second MQLite VM is required. See
+[the monitoring guide](docs/observability.md).
 
 ### 6. MCP (drive it from an AI agent)
 

@@ -36,7 +36,7 @@ as your numeric UID/GID so file permissions need not be relaxed.
 | Service | Local URL | Credentials |
 | --- | --- | --- |
 | MQLite console | http://127.0.0.1:17654/ui/ | Administrator token in `OBS_DATA_DIR/secrets/admin.token` |
-| MQLite metrics | http://127.0.0.1:17655/metrics | Monitor token in `OBS_DATA_DIR/secrets/monitor.token`; loopback only |
+| MQLite metrics | http://127.0.0.1:17654/metrics | Monitor token in `OBS_DATA_DIR/secrets/monitor.token`; loopback only |
 | Prometheus | http://127.0.0.1:19190 | Loopback only; its broker monitor token is mounted privately |
 | Grafana | http://127.0.0.1:13000/d/mqlite-observability | User `admin`; password in `OBS_DATA_DIR/secrets/grafana-admin.token` |
 
@@ -47,22 +47,17 @@ The broker reads the two distinct credentials at startup; Grafana uses its Docke
 secret-file configuration. Compose file secrets protect access through the host's
 filesystem permissions; they are not an encrypted secret manager.
 
-Override `MQLITE_OBS_PORT`, `MQLITE_METRICS_OBS_PORT`, `PROMETHEUS_OBS_PORT` or
-`GRAFANA_OBS_PORT` if a port is already in use, exporting the same values when
-running the verifier. The broker API and metrics exporter listen on separate
-container ports (`6754` and `9091`). The metrics port is published to the host
-only on loopback for this local demo; Prometheus itself scrapes `mqlite:9091`
-over the private Compose network. Keep all published addresses bound to loopback.
-A tunnel can expose these local ports to your own workstation without publishing
-management interfaces to the Internet.
+Override `MQLITE_OBS_PORT`, `PROMETHEUS_OBS_PORT` or `GRAFANA_OBS_PORT` if a port
+is already in use, exporting the same values when running the verifier. API and
+metrics share container port `6754`; Prometheus scrapes `mqlite:6754` over the
+private Compose network. Keep all published addresses bound to loopback. A tunnel
+can expose these local ports to your own workstation without publishing management
+interfaces to the Internet.
 
-This local Compose example explicitly sets `MQLITE_METRICS_URL` to
-`http://127.0.0.1:${MQLITE_METRICS_OBS_PORT:-17655}/metrics`, so the broker's
-unauthenticated `GET /` card includes the host-accessible metrics URL. Prometheus
-continues to use `mqlite:9091` internally. The advertised URL needs a monitor or
-administrator credential, and `/metrics` on the API port still returns `404`.
-Outside this demo, discovery omits `metrics` unless a URL is configured; leave
-it unset in production unless you intend to disclose the address in the open card.
+The example sets `MQLITE_METRICS=on`, so the open `GET /` card automatically
+includes `"metrics":"/metrics"`. It resolves on the same host and port as the
+API and requires a monitor or administrator credential. Disable metrics to remove
+the discovery field and return `404` for scrapes.
 
 ## Exercise actual scenarios
 
@@ -179,11 +174,10 @@ as production.
 ## Reuse the configuration
 
 - Existing Prometheus: copy the authenticated job from
-  `prometheus/existing-broker.example.yml`, point it at the broker's private
-  **metrics** listener (`9091` in this example) and mount its monitor token. Add
-  the operating rules; omit `demo-rules.yml`. Do not point the scrape job at the
-  public API listener (`6754`); that listener deliberately returns 404 for
-  `/metrics`.
+  `prometheus/existing-broker.example.yml`, enable `MQLITE_METRICS=on`, point it
+  at the broker's private API address (`6754` without a TLS proxy), and mount its
+  monitor token. Add the operating rules; omit `demo-rules.yml`. Keep `/metrics`
+  off public ingress with path filtering or a private-only broker.
 - Existing Grafana: import `grafana/dashboards/mqlite.json` and select the existing
   Prometheus datasource. The local provisioning files use UID `mqlite-prometheus`.
 - Kubernetes: adapt [the Service/ServiceMonitor and broker environment patch](kubernetes/README.md)

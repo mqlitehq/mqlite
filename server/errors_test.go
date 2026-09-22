@@ -429,6 +429,7 @@ func TestAccessKeyStrictBearerAndOpenPaths(t *testing.T) {
 	srv := server.New(eng, []string{"Legacy-Admin"})
 	srv.CORS = "*"
 	srv.UI = true
+	srv.Metrics = true
 	h := srv.Handler()
 	for _, tt := range []struct {
 		name    string
@@ -451,15 +452,17 @@ func TestAccessKeyStrictBearerAndOpenPaths(t *testing.T) {
 		{"restricted dynamic", []string{"Bearer " + token}, 403},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, wire.PathListKeys, strings.NewReader(`{}`))
-			for _, header := range tt.headers {
-				req.Header.Add("Authorization", header)
-			}
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
-			keyTestStatus(t, rec, tt.status, "")
-			if strings.Contains(rec.Body.String(), token) || strings.Contains(rec.Body.String(), "Legacy-Admin") {
-				t.Fatal("credential exposed in response")
+			for _, route := range []struct{ method, path string }{{http.MethodPost, wire.PathListKeys}, {http.MethodGet, "/metrics"}} {
+				req := httptest.NewRequest(route.method, route.path, strings.NewReader(`{}`))
+				for _, header := range tt.headers {
+					req.Header.Add("Authorization", header)
+				}
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				keyTestStatus(t, rec, tt.status, "")
+				if strings.Contains(rec.Body.String(), token) || strings.Contains(rec.Body.String(), "Legacy-Admin") {
+					t.Fatal("credential exposed in response")
+				}
 			}
 		})
 	}
@@ -486,7 +489,7 @@ func TestAccessKeyStrictBearerAndOpenPaths(t *testing.T) {
 			want = 405
 		}
 		keyTestStatus(t, keyTestRequest(h, http.MethodGet, wire.PathListKeys, tok, nil), want, "")
-		for _, path := range append(append([]string{}, wantRPCRoutes...), "/uixyz") {
+		for _, path := range append(append([]string{}, wantRPCRoutes...), "/uixyz", "/metrics") {
 			req := httptest.NewRequest(http.MethodOptions, path, nil)
 			req.Header.Set("Origin", "https://example.test")
 			req.Header.Set("Access-Control-Request-Method", "POST")

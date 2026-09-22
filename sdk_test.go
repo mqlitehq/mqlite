@@ -366,107 +366,103 @@ func TestServeReadyAfterBind(t *testing.T) {
 	}
 }
 
-// TestServePrivateMetricsListener keeps the scrape surface off the API listener:
-// callers must opt into a second listener and authenticate the scrape. Both
-// listeners still share the same embedded engine and process.
-func TestServePrivateMetricsListener(t *testing.T) {
-	reserve := func() string {
-		t.Helper()
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		if err := ln.Close(); err != nil {
-			t.Fatal(err)
-		}
-		return addr
-	}
-
-	embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = embedded.Close() })
-	if err := embedded.Serve(context.Background(), "127.0.0.1:0",
-		mqlite.WithMetricsURL("http://127.0.0.1:9091/metrics")); err == nil {
-		t.Fatal("metrics URL without a metrics listener must fail before serving")
-	}
-	apiAddr, metricsAddr := reserve(), reserve()
-	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ready := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		done <- embedded.Serve(ctx, apiAddr,
-			mqlite.WithTokens("admin-secret"),
-			mqlite.WithMonitorTokens("monitor-secret"),
-			mqlite.WithMetricsAddr(metricsAddr),
-			mqlite.WithMetricsURL("http://"+metricsAddr+"/metrics"),
-			mqlite.WithReady(func() { close(ready) }),
-		)
-	}()
-	select {
-	case <-ready:
-	case <-time.After(5 * time.Second):
-		t.Fatal("private metrics listener never became ready")
-	}
-
-	cardResp, err := client.Get("http://" + apiAddr + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var card wire.DiscoveryCard
-	err = json.NewDecoder(cardResp.Body).Decode(&card)
-	cardResp.Body.Close()
-	if err != nil || card.Metrics != "http://"+metricsAddr+"/metrics" {
-		t.Fatalf("explicit discovery URL = %q, decode error %v", card.Metrics, err)
-	}
-
-	resp, err := client.Get("http://" + apiAddr + "/metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("public API /metrics = %d, want 404", resp.StatusCode)
-	}
-
-	for _, tc := range []struct {
-		name, token string
-		status      int
-	}{
-		{name: "missing", status: http.StatusUnauthorized},
-		{name: "monitor", token: "monitor-secret", status: http.StatusOK},
-		{name: "administrator", token: "admin-secret", status: http.StatusOK},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequest(http.MethodGet, "http://"+metricsAddr+"/metrics", nil)
+// TestServeMetricsToggle verifies the public SDK's opt-in on the API listener,
+// including discovery, authentication and graceful shutdown in both modes.
+func TestServeMetricsToggle(t *testing.T) {
+	for _, mode := range []string{"default", "off", "on"} {
+		t.Run(mode, func(t *testing.T) {
+			embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.token != "" {
-				req.Header.Set("Authorization", "Bearer "+tc.token)
-			}
-			resp, err := client.Do(req)
+			t.Cleanup(func() { _ = embedded.Close() })
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
+			addr := ln.Addr().String()
+			ln.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			ready, done := make(chan struct{}), make(chan error, 1)
+			opts := []mqlite.ServeOption{
+				mqlite.WithTokens("admin-secret"), mqlite.WithMonitorTokens("monitor-secret"),
+				mqlite.WithReady(func() { close(ready) }),
+			}
+			if mode != "default" {
+				opts = append(opts, mqlite.WithMetrics(mode == "on"))
+			}
+			go func() { done <- embedded.Serve(ctx, addr, opts...) }()
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("clean shutdown: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("Serve did not stop")
+				}
+			})
+			select {
+			case <-ready:
+			case <-time.After(5 * time.Second):
+				t.Fatal("broker did not become ready")
+			}
+			client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+			resp, err := client.Get("http://" + addr + "/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var card map[string]json.RawMessage
+			err = json.NewDecoder(resp.Body).Decode(&card)
 			resp.Body.Close()
-			if resp.StatusCode != tc.status {
-				t.Fatalf("metrics status = %d, want %d", resp.StatusCode, tc.status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, present := card["metrics"]
+			if (mode == "on") != present || (present && string(value) != `"/metrics"`) {
+				t.Fatalf("metrics discovery = %s, present %v", value, present)
+			}
+			for _, token := range []string{"", "wrong", "monitor-secret", "admin-secret"} {
+				req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/metrics", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if token != "" {
+					req.Header.Set("Authorization", "Bearer "+token)
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+				want := http.StatusNotFound
+				if mode == "on" {
+					want = http.StatusUnauthorized
+					if token == "monitor-secret" || token == "admin-secret" {
+						want = http.StatusOK
+					}
+				}
+				if resp.StatusCode != want {
+					t.Errorf("metrics HTTP %d, want %d", resp.StatusCode, want)
+				}
 			}
 		})
 	}
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("clean shutdown returned %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Serve did not return after ctx cancel")
+	for _, tokens := range [][]string{nil, {" ", ""}} {
+		t.Run("requires-auth", func(t *testing.T) {
+			embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer embedded.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err = embedded.Serve(ctx, "127.0.0.1:0", mqlite.WithMetrics(true), mqlite.WithTokens(tokens...))
+			if err == nil || !strings.Contains(err.Error(), "metrics require administrator authentication") {
+				t.Fatalf("metrics without authentication = %v", err)
+			}
+		})
 	}
 }
 

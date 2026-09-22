@@ -1,12 +1,8 @@
 package server
 
 import (
-	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"net/netip"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -14,78 +10,12 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
-// ValidateMetricsURL validates an optional URL for the open discovery card.
-// Credentials and URL parameters are rejected rather than published. Errors
-// deliberately omit the supplied value, which may contain a secret.
-func ValidateMetricsURL(value string) error {
-	if value == "" {
-		return nil
-	}
-	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
-		u.User != nil || u.Opaque != "" || u.Path != "/metrics" || u.RawPath != "" ||
-		u.RawQuery != "" || u.ForceQuery || strings.Contains(value, "#") {
-		return errors.New("metrics URL must be an absolute HTTP(S) URL ending in /metrics without credentials, query or fragment")
-	}
-	if strings.Contains(u.Hostname(), " ") || strings.HasSuffix(u.Host, ":") {
-		return errors.New("metrics URL must have a valid host and port")
-	}
-	if strings.HasPrefix(u.Host, "[") {
-		ip, err := netip.ParseAddr(u.Hostname())
-		if err != nil || !ip.Is6() {
-			return errors.New("metrics URL brackets require an IPv6 address")
-		}
-	} else if strings.Contains(u.Host, ":") {
-		if _, _, err := net.SplitHostPort(u.Host); err != nil {
-			return errors.New("metrics URL must have a valid host and port")
-		}
-	}
-	if port := u.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 {
-			return errors.New("metrics URL port must be between 1 and 65535")
-		}
-	}
-	return nil
-}
-
-// MetricsHandler exposes only GET /metrics. Mount it on a private listener,
-// never on the public API listener. It shares the API server's engine and
-// counters, and refuses anonymous operation even in development mode.
-func (s *Server) MetricsHandler() http.Handler {
-	admins := make([]string, 0, len(s.tokens))
-	for token := range s.tokens {
-		admins = append(admins, token)
-	}
-	if len(admins) == 0 {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			writeErr(w, http.StatusForbidden, "permission_denied", "metrics require administrator authentication")
-		})
-	}
-	if err := ValidateMonitorTokens(admins, s.MonitorTokens); err != nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			writeErr(w, http.StatusInternalServerError, "internal", "invalid monitoring credential configuration")
-		})
-	}
-	metrics := s.authorize(monitorPermission, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			writeErr(w, http.StatusMethodNotAllowed, "unimplemented", "metrics require GET")
-			return
-		}
-		s.handleMetrics(w, r)
-	})
-	handler := s.observeRequests(s.logging(s.auth(metrics)))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/metrics" {
-			http.NotFound(w, r)
-			return
-		}
-		handler.ServeHTTP(w, r)
-	})
-}
-
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeErr(w, http.StatusMethodNotAllowed, "unimplemented", "metrics require GET")
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(prometheusSnapshot(s.observation(r.Context()))))

@@ -223,7 +223,7 @@ def execute(args, out):
         docker("run", *limits, "--name", names["broker"], "--network-alias", "broker",
                "--mount", "type=bind,src=" + str(out / "broker-data") + ",dst=/data",
                "--env", "MQLITE_TOKENS", "--env", "MQLITE_MONITOR_TOKENS",
-               "--env", "MQLITE_METRICS_ADDR=:9091", "--env", "MQLITE_SYNC=FULL",
+               "--env", "MQLITE_METRICS=on", "--env", "MQLITE_SYNC=FULL",
                images["broker"]["id"], env=env)
         monitors["broker"] = Logs(args.docker, names["broker"], out / "broker-log-summary.json")
         def status():
@@ -235,7 +235,7 @@ def execute(args, out):
         def scrape_metrics():
             metrics = docker("exec", "--env", "MQLITE_TOKEN", names["broker"], "sh", "-c",
                              'wget -q -O - --header "Authorization: Bearer $MQLITE_TOKEN" '
-                             'http://127.0.0.1:9091/metrics', env=dict(env, MQLITE_TOKEN=monitor_token)).stdout
+                             'http://127.0.0.1:6754/metrics', env=dict(env, MQLITE_TOKEN=monitor_token)).stdout
             require("mqlite_rpc_duration_seconds_bucket" in metrics, "RPC histogram scrape missing")
             return metrics
 
@@ -249,15 +249,15 @@ def execute(args, out):
                         raise
                     time.sleep(0.25)
 
-        def public_metrics_are_hidden():
-            # The public API listener must not expose operational metrics, even with
-            # an administrator credential. The private listener above is the only
-            # scrape path and remains bearer-authenticated.
-            result = docker("exec", "--env", "MQLITE_TOKEN", names["broker"], "sh", "-c",
-                            'wget -S -O /dev/null --header "Authorization: Bearer $MQLITE_TOKEN" '
-                            'http://127.0.0.1:6754/metrics 2>&1 | grep -q " 404 "',
-                            env=env, required=False)
-            require(result.returncode == 0, "public API unexpectedly exposed /metrics")
+        def metrics_require_authentication():
+            # Enabling metrics on the API listener must never enable anonymous
+            # scrapes. Test both missing and invalid credentials before load starts.
+            for auth in ("", "invalid-" + monitor_token):
+                result = docker("exec", "--env", "MQLITE_TOKEN", names["broker"], "sh", "-c",
+                                'wget -S -O /dev/null --header "Authorization: Bearer $MQLITE_TOKEN" '
+                                'http://127.0.0.1:6754/metrics 2>&1 | grep -q " 401 "',
+                                env=dict(env, MQLITE_TOKEN=auth), required=False)
+                require(result.returncode == 0, "metrics accepted missing or invalid credentials")
 
         deadline = time.monotonic() + 45
         while True:
@@ -272,8 +272,8 @@ def execute(args, out):
         require(state.get("version") == args.expected_version and state.get("schema_version") == "5"
                 and state.get("backend") == "local file" and state.get("auth") is True,
                 "unexpected broker version/schema/storage/auth")
-        public_metrics_are_hidden()
-        # Verify the dedicated listener is up before starting the long-running workload;
+        metrics_require_authentication()
+        # Verify authenticated scraping before starting the long-running workload;
         # otherwise a later scrape failure could be mistaken for a workload failure.
         wait_for_metrics()
         metadata["status_at_start"] = state

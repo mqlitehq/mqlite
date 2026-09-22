@@ -196,6 +196,9 @@ For **v0.3.1 → v0.3.2**, schema token **5**, port **6754**, message data and
 managed-key storage remain unchanged. Follow the same-schema procedure above;
 do not overlap brokers. Validate existing key permissions and a complete canary
 cycle, then check `Observe`, the monitor credential and the new dashboard/rules.
+Prometheus scraping is now disabled by default: set `MQLITE_METRICS=on` or use
+`--metrics` to retain `/metrics` on the API port, and keep the route off public
+ingress. Configure the collector with its distinct monitor token.
 Process counters reset at restart; existing Prometheus history is separate from
 the broker database.
 

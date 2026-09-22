@@ -10,8 +10,8 @@ spec:
       containers:
         - name: mqlite
           env:
-            - name: MQLITE_METRICS_ADDR
-              value: ":9091"
+            - name: MQLITE_METRICS
+              value: "on"
             - name: MQLITE_MONITOR_TOKENS
               valueFrom:
                 secretKeyRef:

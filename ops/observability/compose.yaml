@@ -13,17 +13,12 @@ services:
     environment:
       MQLITE_DB: file:/data/mq.db
       MQLITE_ADDR: :6754
-      # Keep the authenticated exporter on a separate, non-public listener.
-      # Prometheus reaches it over the Compose network; the loopback-only host
-      # mapping below is for the local verifier and is never bound publicly.
-      MQLITE_METRICS_ADDR: :9091
-      # Advertise the host-mapped URL for this local-only demo explicitly.
-      MQLITE_METRICS_URL: http://127.0.0.1:${MQLITE_METRICS_OBS_PORT:-17655}/metrics
+      # Opt in on the API port; publish this local demo on loopback only.
+      MQLITE_METRICS: "on"
       MQLITE_UI: "1"
       MQLITE_CORS: off
     ports:
       - "127.0.0.1:${MQLITE_OBS_PORT:-17654}:6754"
-      - "127.0.0.1:${MQLITE_METRICS_OBS_PORT:-17655}:9091"
     volumes:
       - ${OBS_DATA_DIR:?Run python3 init.py}/mqlite:/data
       - ./start-broker.sh:/etc/mqlite/start.sh:ro

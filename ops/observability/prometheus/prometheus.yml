@@ -14,7 +14,7 @@ scrape_configs:
       type: Bearer
       credentials_file: /run/secrets/monitor_token
     static_configs:
-      - targets: ["mqlite:9091"]
+      - targets: ["mqlite:6754"]
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]

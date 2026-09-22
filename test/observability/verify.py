@@ -19,7 +19,6 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[2]
 STACK = ROOT / "ops" / "observability"
 BROKER = "http://127.0.0.1:" + os.environ.get("MQLITE_OBS_PORT", "17654")
-METRICS = "http://127.0.0.1:" + os.environ.get("MQLITE_METRICS_OBS_PORT", "17655")
 PROM = "http://127.0.0.1:" + os.environ.get("PROMETHEUS_OBS_PORT", "19190")
 GRAFANA = "http://127.0.0.1:" + os.environ.get("GRAFANA_OBS_PORT", "13000")
 ADMIN = ""
@@ -188,22 +187,20 @@ def panel_alert_firing(name, selected_queue):
 
 def verify():
     wait_for("broker liveness", lambda: request(BROKER + "/healthz")[0] == 200)
-    wait_for("metrics listener", lambda: request(METRICS + "/metrics")[0] in (401, 403))
+    wait_for("authenticated metrics endpoint", lambda: request(BROKER + "/metrics")[0] == 401)
     wait_for("Prometheus ready", lambda: request(PROM + "/-/ready")[0] == 200)
     wait_for("Grafana ready", lambda: request(GRAFANA + "/api/health")[0] == 200)
-    # A persistent Prometheus demo may retain one stale target series from the
-    # pre-split 6754 job. The current private target is healthy when the maximum
-    # job value is one; a historical zero must not block a fresh verification.
-    wait_for("actual authenticated scrape succeeds", lambda: value('max(up{job="mqlite"})') == 1)
+    # Scope readiness to the configured API target so a stale series from an old
+    # configuration cannot make a failed current scrape look healthy.
+    wait_for("actual authenticated scrape succeeds",
+             lambda: value('up{job="mqlite",instance="mqlite:6754"}') == 1)
     wait_for("canonical snapshot collection succeeds", lambda: value("mqlite_collection_success") == 1)
     check(ADMIN != MONITOR, "monitor and administrator credentials differ")
-    status, _ = request(BROKER + "/metrics", auth="Bearer " + ADMIN)
-    check(status == 404, "public API does not expose metrics")
     status, card = request(BROKER + "/")
-    check(status == 200 and card.get("metrics") == METRICS + "/metrics",
-          "local discovery advertises the explicitly configured private metrics URL")
-    for token, expected in (("", 401), ("invalid-demo-credential", 401), (MONITOR, 200)):
-        status, _ = request(METRICS + "/metrics", auth="Bearer " + token if token else "")
+    check(status == 200 and card.get("metrics") == "/metrics",
+          "discovery advertises the enabled metrics endpoint on the API port")
+    for token, expected in (("", 401), ("invalid-demo-credential", 401), (MONITOR, 200), (ADMIN, 200)):
+        status, _ = request(BROKER + "/metrics", auth="Bearer " + token if token else "")
         check(status == expected, "metrics authentication HTTP " + str(expected))
     observe = rpc("AdminService", "Observe", {}, token=MONITOR)
     check(observe["access"] == "monitor" and observe["collection"]["state"] == "available",
@@ -611,7 +608,7 @@ def main():
         if args.faults:
             faults()
         report = {"status": "PASS", "checks": CHECKS, "faults_tested": args.faults,
-                  "broker": BROKER, "metrics": METRICS, "prometheus": PROM, "grafana": GRAFANA}
+                  "broker": BROKER, "metrics": BROKER + "/metrics", "prometheus": PROM, "grafana": GRAFANA}
         if args.traffic_seconds > 0:
             report["traffic"] = traffic(args.traffic_seconds)
         report["elapsed_seconds"] = round(time.time() - started, 3)

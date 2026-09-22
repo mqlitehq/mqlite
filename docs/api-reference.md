@@ -9,7 +9,7 @@ and the Go SDK, so the two can't drift) and the server's error mapping.
 ## Conventions
 
 - **Transport:** HTTP `POST`, `Content-Type: application/json`. Discovery and
-  health use open `GET` endpoints; metrics uses authenticated `GET` on a separate listener.
+  health use open `GET` endpoints; opt-in metrics uses authenticated `GET` on the same port.
 - **`body`** is **base64** in JSON (Go marshals `[]byte` as base64).
 - **Timestamps** are **epoch milliseconds** (UTC) integers. Message durations use
   `*_ms`; observability durations explicitly named `*_seconds` retain fractional seconds.
@@ -48,8 +48,8 @@ loud now.
 
 ```bash
 # Talking to the broker directly. mqlite serves JSON-over-HTTP on TCP 6754 and terminates
-# no TLS of its own, so this is plain http. The optional metrics listener is
-# also plain HTTP; terminate TLS in a private reverse proxy when required.
+# no TLS of its own, so this is plain http. When enabled, /metrics uses the
+# same listener; terminate TLS in a reverse proxy when required.
 BASE_URL=http://127.0.0.1:6754
 
 # Behind a reverse proxy. Public HTTPS on 443 (which the URL omits, as usual) terminates at
@@ -63,8 +63,8 @@ same JSON-over-HTTP API listens on when nothing is proxying for you.
 The discovery card's `endpoints` are route **paths**, deliberately relative: they resolve
 against the origin that served the card, so they inherit its scheme, host and port. Fetch the
 card from `$BASE_URL` and the paths are usable as-is.
-The optional `metrics` field is an explicitly configured absolute URL for the
-separate listener; it is omitted by default and does not resolve against `$BASE_URL`.
+The optional `metrics` field is the same-origin path `/metrics` when enabled;
+it is omitted by default. Resolve it against `$BASE_URL` like the other paths.
 
 ## Auth
 
@@ -240,14 +240,11 @@ curl "$BASE_URL/healthz"             # ok
 The card's `auth` is `"bearer"` when RPCs require a token or `"none"` when auth is off,
 so an agent can branch on it directly. `endpoints` is the **complete** list of RPC route
 paths (it always matches what the broker serves — a pinned contract). `health` is
-the relative liveness path. The optional `metrics` field is absent unless an
-operator sets `--metrics-url` or `MQLITE_METRICS_URL`, for example
-`"metrics":"http://127.0.0.1:9091/metrics"`, with the separate metrics listener enabled.
-It must be an absolute HTTP(S) URL with the exact path `/metrics`, without
-credentials, query parameters or a fragment. This URL is visible without
-authentication; no private address is published automatically. Advertising it
-does not alter Bearer requirements, proxy requests or enable `/metrics` on the
-API listener, which continues to return `404`.
+the relative liveness path. The optional `metrics` field is `"/metrics"` when
+`--metrics` or `MQLITE_METRICS=on` enables the exporter on the API port. It is
+omitted when disabled, and the route returns `404` even with valid credentials.
+Enabling metrics requires administrator auth; the advertised route still requires
+a monitor or administrator credential. No separate URL configuration is needed.
 
 `/ui` serves the **embedded admin console** (a static single-page app baked into the
 binary) and is auth-exempt — the page itself loads without a token; its API calls
@@ -258,7 +255,7 @@ which case `/ui` 404s and the card's optional `ui` field is omitted.
 
 | Method | Path | Auth | Returns |
 |---|---|---|---|
-| `GET` | `/metrics` (metrics listener) | Bearer with `manage` or configured monitor | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
+| `GET` | `/metrics` (when enabled) | Bearer with `manage` or configured monitor | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
 
 ## QueueService
 

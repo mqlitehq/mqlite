@@ -3,9 +3,9 @@
 These examples require **MQLite v0.3.2 or later**, including configured monitor
 credentials and the canonical metric families.
 
-MQLite exposes native Prometheus metrics on an optional, authenticated listener
-separate from the public API listener. The same dashboard and metric definitions
-work with a private Prometheus collector or a compatible managed service. Keep the
+MQLite exposes native Prometheus metrics on the API port when `MQLITE_METRICS=on`
+is set; it is disabled by default. The same dashboard and metric definitions work
+with a private Prometheus collector or a compatible managed service. Keep the
 broker's metrics authenticated: configure a distinct `MQLITE_MONITOR_TOKENS`
 credential, give only that credential to the collector, and keep administrator
 credentials out of monitoring configuration. See [observability.md](observability.md)
@@ -14,22 +14,22 @@ for the metric contract and the runnable local stack.
 ## Common integration
 
 ```text
-MQLite :9091/metrics <-- private route + monitor Bearer token -- collector
+MQLite :6754/metrics <-- private route + monitor Bearer token -- collector
                                                           |
                                               Prometheus-compatible storage
                                                           |
                                                existing Grafana + rules
 ```
 
-1. Locate the collector in the broker's private network, or provide an authenticated
-   TLS endpoint reachable only from approved collectors. Configure the correct CA;
-   do not disable TLS certificate verification. Bind the exporter with
-   `MQLITE_METRICS_ADDR` (for example `:9091`) and allow that port only from the
-   collector's private network. The public API listener (`6754`) does not serve
-   `/metrics`.
-2. Configure `/metrics` on the private metrics listener, the actual metrics port,
-   a 15-second starting interval and a shorter scrape timeout. Use a secret file or
-   your collector's secret reference; do not put the credential into target URLs,
+1. Locate the collector in the broker's private network, or provide a TLS route
+   reachable only from approved collectors. Configure the correct CA; do not
+   disable TLS certificate verification. Enable `MQLITE_METRICS=on`. API and
+   metrics share a port, so keeping `/metrics` off the public Internet requires
+   either a private-only broker or public-ingress path filtering. A port-level
+   firewall cannot separate HTTP paths, and Bearer auth does not hide the route.
+2. Configure `/metrics` on the broker's API port (default `6754`), a 15-second
+   starting interval and a shorter scrape timeout. Use a secret file or your
+   collector's secret reference; do not put the credential into target URLs,
    labels or dashboard JSON.
 3. Verify `up{job="mqlite"} == 1` and `mqlite_collection_success == 1`. Scrape success
    alone does not establish database availability or successful business processing.
@@ -69,20 +69,36 @@ selectors and Secret access in your ACK installation before applying them.
 
 ## Fly.io
 
-Fly's documented automatic custom-metrics configuration provides a port and path.
-It does not document a per-target MQLite Bearer credential in that stanza, so adding
-`[metrics]` alone is not a verified way to scrape an authenticated broker. Keep the
-broker protected. A private collector using the reusable Prometheus job can attach
-the monitor token and scrape the broker's internal DNS address, for example
-`your-mqlite-app.internal:9091`. Configure MQLite with
-`MQLITE_METRICS_ADDR=fly-local-6pn:9091`; expose only that port through Fly's
-private network or an authenticated tunnel and verify reachability from the
-collector. For a local check, `fly proxy 9091:9091 --app <app>` binds the proxy
-to loopback. Do not add a public service for the exporter. The public API remains
-on `6754`.
-Fly's private network is scoped by organization/network configuration; it is not
-a replacement for application authentication. [Fly custom metrics](https://fly.io/docs/monitoring/metrics/),
-[private networking](https://fly.io/docs/networking/private-networking/).
+Use the existing Fly Machine for MQLite and run Prometheus/Grafana locally or in
+an existing monitoring platform. No second Fly Machine is required for export.
+
+For private-only access:
+
+1. Remove public `[http_service]` and `[[services]]` entries from `fly.toml`.
+2. Set `MQLITE_ADDR=fly-local-6pn:6754` and `MQLITE_METRICS=on`, preserving
+   administrator auth and a distinct configured monitor token.
+3. Connect your collector through Fly's 6PN or a WireGuard peer and scrape
+   `your-mqlite-app.internal:6754/metrics` with the monitor token. For a local
+   inspection tunnel, run `fly proxy 6754:6754 --app <app>`; a local Prometheus
+   process can use `127.0.0.1:6754` as its target. A Docker collector needs a
+   deliberate route to the host tunnel; its own `127.0.0.1` is the container.
+
+Fly's private network is scoped by organization/network configuration. It adds
+a network boundary; it does not replace MQLite authentication. These connections
+require the Machine to be running. See [private networking](https://fly.io/docs/networking/private-networking/),
+[app services](https://fly.io/docs/networking/app-services/) and
+[`fly proxy`](https://fly.io/docs/flyctl/proxy/).
+
+If the broker API must remain public, turning on metrics makes its route reachable
+through that same service. Use an existing ingress with an actual public
+`/metrics` deny rule while permitting private collection; otherwise leave metrics
+disabled. A monitor token restricts data access, but does not make a public path
+private. The examples do not assume Fly's public proxy filters paths.
+
+Fly's automatic custom-metrics stanza documents a port and path but no per-target
+MQLite Bearer credential. Adding `[metrics]` alone is therefore not a verified way
+to scrape this authenticated endpoint. Use the reusable authenticated Prometheus
+job and validate a real scrape. [Fly custom metrics](https://fly.io/docs/monitoring/metrics/).
 
 If you use Fly's managed Prometheus-compatible query endpoint in Grafana, its Fly
 access token authenticates Grafana to that service. It is separate from the MQLite

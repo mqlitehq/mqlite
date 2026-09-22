@@ -389,8 +389,7 @@ func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 type serveConfig struct {
 	tokens        []string
 	monitorTokens []string
-	metricsAddr   string
-	metricsURL    string
+	metrics       bool
 	version       string
 	cors          string
 	reqLogger     *slog.Logger
@@ -419,19 +418,11 @@ func WithMonitorTokens(tokens ...string) ServeOption {
 	return func(c *serveConfig) { c.monitorTokens = append(c.monitorTokens, tokens...) }
 }
 
-// WithMetricsAddr enables a separate authenticated GET /metrics listener.
-// Empty disables it (the default). Bind loopback or a private interface and keep
-// this port out of public ingress. The API listener never serves /metrics.
-func WithMetricsAddr(addr string) ServeOption {
-	return func(c *serveConfig) { c.metricsAddr = addr }
-}
-
-// WithMetricsURL advertises the separate scrape URL on the open discovery card.
-// Empty omits it (the default). Requires WithMetricsAddr and an absolute HTTP(S)
-// URL without credentials, query parameters or a fragment. It does not enable
-// scraping on the API listener or change authentication.
-func WithMetricsURL(url string) ServeOption {
-	return func(c *serveConfig) { c.metricsURL = url }
+// WithMetrics enables authenticated GET /metrics on the broker's API listener.
+// Off by default. Enabling it requires administrator authentication and adds
+// the /metrics path to discovery. Scrapers can use a read-only monitor token.
+func WithMetrics(on bool) ServeOption {
+	return func(c *serveConfig) { c.metrics = on }
 }
 
 // WithTokenCSV sets accepted Bearer tokens from a comma-separated string (env-friendly).
@@ -483,19 +474,13 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	if err := server.ValidateMonitorTokens(sc.tokens, sc.monitorTokens); err != nil {
 		return err
 	}
-	if err := server.ValidateMetricsURL(sc.metricsURL); err != nil {
-		return err
-	}
-	if sc.metricsURL != "" && sc.metricsAddr == "" {
-		return errors.New("metrics discovery URL requires a metrics listener")
-	}
-	if sc.metricsAddr != "" {
+	if sc.metrics {
 		hasAdmin := false
 		for _, token := range sc.tokens {
 			hasAdmin = hasAdmin || strings.TrimSpace(token) != ""
 		}
 		if !hasAdmin {
-			return errors.New("metrics listener requires administrator authentication")
+			return errors.New("metrics require administrator authentication")
 		}
 	}
 
@@ -505,7 +490,7 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.CORS = sc.cors
 	srv.Logger = sc.reqLogger
 	srv.UI = sc.ui
-	srv.MetricsURL = sc.metricsURL
+	srv.Metrics = sc.metrics
 	hs := newHTTPServer(addr, srv.Handler())
 
 	// Bind synchronously so a bind failure (port in use, bad addr) surfaces here —
@@ -515,51 +500,23 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 	defer ln.Close()
-	servers := []*http.Server{hs}
-	listeners := []net.Listener{ln}
-	if sc.metricsAddr != "" {
-		metrics, err := net.Listen("tcp", sc.metricsAddr)
-		if err != nil {
-			return fmt.Errorf("metrics listen %s: %w", sc.metricsAddr, err)
-		}
-		defer metrics.Close()
-		listeners = append(listeners, metrics)
-		servers = append(servers, newHTTPServer(sc.metricsAddr, srv.MetricsHandler()))
-	}
+	defer hs.Close()
 	if sc.ready != nil {
 		sc.ready()
 	}
-	errCh := make(chan error, len(servers))
-	for i, httpServer := range servers {
-		listener := listeners[i]
-		go func(h *http.Server) { errCh <- h.Serve(listener) }(httpServer)
-	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- hs.Serve(ln) }()
 	select {
 	case <-ctx.Done():
-		// Grace must exceed the longest in-flight request — a Receive long-poll runs up
-		// to 20s — so a clean Ctrl-C drains it instead of cutting it at 5s (MQLITE-88).
+		// Grace exceeds the longest Receive long poll (20s).
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			// Close both listeners if either serving loop fails.
-			for _, h := range servers {
-				err = errors.Join(err, h.Close())
-			}
 			return err
 		}
 	}
 	shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	var shutdownErr error
-	for _, h := range servers {
-		if err := h.Shutdown(shutCtx); err != nil {
-			shutdownErr = errors.Join(shutdownErr, err)
-			// A failed or timed-out graceful shutdown must not leave active
-			// handlers behind. A normal Shutdown already closes the listener;
-			// calling Close afterwards would report http.ErrServerClosed.
-			shutdownErr = errors.Join(shutdownErr, h.Close())
-		}
-	}
-	return shutdownErr
+	return hs.Shutdown(shutCtx)
 }
 
 // ── settler ─────────────────────────────────────────────────────────────────
