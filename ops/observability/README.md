@@ -36,6 +36,7 @@ as your numeric UID/GID so file permissions need not be relaxed.
 | Service | Local URL | Credentials |
 | --- | --- | --- |
 | MQLite console | http://127.0.0.1:17654/ui/ | Administrator token in `OBS_DATA_DIR/secrets/admin.token` |
+| MQLite metrics | http://127.0.0.1:17655/metrics | Monitor token in `OBS_DATA_DIR/secrets/monitor.token`; loopback only |
 | Prometheus | http://127.0.0.1:19190 | Loopback only; its broker monitor token is mounted privately |
 | Grafana | http://127.0.0.1:13000/d/mqlite-observability | User `admin`; password in `OBS_DATA_DIR/secrets/grafana-admin.token` |
 
@@ -46,10 +47,14 @@ The broker reads the two distinct credentials at startup; Grafana uses its Docke
 secret-file configuration. Compose file secrets protect access through the host's
 filesystem permissions; they are not an encrypted secret manager.
 
-Override `MQLITE_OBS_PORT`, `PROMETHEUS_OBS_PORT` or `GRAFANA_OBS_PORT` if a port is
-already in use, exporting the same values when running the verifier. Keep all
-published addresses bound to loopback. A tunnel can expose these local ports to
-your own workstation without publishing management interfaces to the Internet.
+Override `MQLITE_OBS_PORT`, `MQLITE_METRICS_OBS_PORT`, `PROMETHEUS_OBS_PORT` or
+`GRAFANA_OBS_PORT` if a port is already in use, exporting the same values when
+running the verifier. The broker API and metrics exporter listen on separate
+container ports (`6754` and `9091`). The metrics port is published to the host
+only on loopback for this local demo; Prometheus itself scrapes `mqlite:9091`
+over the private Compose network. Keep all published addresses bound to loopback.
+A tunnel can expose these local ports to your own workstation without publishing
+management interfaces to the Internet.
 
 ## Exercise actual scenarios
 
@@ -166,8 +171,11 @@ as production.
 ## Reuse the configuration
 
 - Existing Prometheus: copy the authenticated job from
-  `prometheus/existing-broker.example.yml`, point it at your actual broker and mount
-  its monitor token. Add the operating rules; omit `demo-rules.yml`.
+  `prometheus/existing-broker.example.yml`, point it at the broker's private
+  **metrics** listener (`9091` in this example) and mount its monitor token. Add
+  the operating rules; omit `demo-rules.yml`. Do not point the scrape job at the
+  public API listener (`6754`); that listener deliberately returns 404 for
+  `/metrics`.
 - Existing Grafana: import `grafana/dashboards/mqlite.json` and select the existing
   Prometheus datasource. The local provisioning files use UID `mqlite-prometheus`.
 - Kubernetes: adapt [the Service/ServiceMonitor and broker environment patch](kubernetes/README.md)

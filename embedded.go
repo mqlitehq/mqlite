@@ -389,6 +389,7 @@ func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 type serveConfig struct {
 	tokens        []string
 	monitorTokens []string
+	metricsAddr   string
 	version       string
 	cors          string
 	reqLogger     *slog.Logger
@@ -415,6 +416,13 @@ func WithTokens(tokens ...string) ServeOption {
 // These credentials can authenticate during a storage outage without a DB lookup.
 func WithMonitorTokens(tokens ...string) ServeOption {
 	return func(c *serveConfig) { c.monitorTokens = append(c.monitorTokens, tokens...) }
+}
+
+// WithMetricsAddr enables a separate authenticated GET /metrics listener.
+// Empty disables it (the default). Bind loopback or a private interface and keep
+// this port out of public ingress. The API listener never serves /metrics.
+func WithMetricsAddr(addr string) ServeOption {
+	return func(c *serveConfig) { c.metricsAddr = addr }
 }
 
 // WithTokenCSV sets accepted Bearer tokens from a comma-separated string (env-friendly).
@@ -466,6 +474,15 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	if err := server.ValidateMonitorTokens(sc.tokens, sc.monitorTokens); err != nil {
 		return err
 	}
+	if sc.metricsAddr != "" {
+		hasAdmin := false
+		for _, token := range sc.tokens {
+			hasAdmin = hasAdmin || strings.TrimSpace(token) != ""
+		}
+		if !hasAdmin {
+			return errors.New("metrics listener requires administrator authentication")
+		}
+	}
 
 	srv := server.New(e.eng, sc.tokens)
 	srv.MonitorTokens = append([]string(nil), sc.monitorTokens...)
@@ -481,26 +498,52 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
+	defer ln.Close()
+	servers := []*http.Server{hs}
+	listeners := []net.Listener{ln}
+	if sc.metricsAddr != "" {
+		metrics, err := net.Listen("tcp", sc.metricsAddr)
+		if err != nil {
+			return fmt.Errorf("metrics listen %s: %w", sc.metricsAddr, err)
+		}
+		defer metrics.Close()
+		listeners = append(listeners, metrics)
+		servers = append(servers, newHTTPServer(sc.metricsAddr, srv.MetricsHandler()))
+	}
 	if sc.ready != nil {
 		sc.ready()
 	}
-	errCh := make(chan error, 1)
-	go func() { errCh <- hs.Serve(ln) }()
+	errCh := make(chan error, len(servers))
+	for i, httpServer := range servers {
+		listener := listeners[i]
+		go func(h *http.Server) { errCh <- h.Serve(listener) }(httpServer)
+	}
 	select {
 	case <-ctx.Done():
 		// Grace must exceed the longest in-flight request — a Receive long-poll runs up
 		// to 20s — so a clean Ctrl-C drains it instead of cutting it at 5s (MQLITE-88).
-		shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		defer cancel()
-		// Return the shutdown result: a DeadlineExceeded means connections didn't drain
-		// in time — a real signal, not something to swallow.
-		return hs.Shutdown(shutCtx)
 	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		if !errors.Is(err, http.ErrServerClosed) {
+			// Close both listeners if either serving loop fails.
+			for _, h := range servers {
+				err = errors.Join(err, h.Close())
+			}
+			return err
 		}
-		return err
 	}
+	shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	var shutdownErr error
+	for _, h := range servers {
+		if err := h.Shutdown(shutCtx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
+			// A failed or timed-out graceful shutdown must not leave active
+			// handlers behind. A normal Shutdown already closes the listener;
+			// calling Close afterwards would report http.ErrServerClosed.
+			shutdownErr = errors.Join(shutdownErr, h.Close())
+		}
+	}
+	return shutdownErr
 }
 
 // ── settler ─────────────────────────────────────────────────────────────────

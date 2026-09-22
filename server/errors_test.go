@@ -242,14 +242,13 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 		{"/mqlite.v1.AuthService/CreateKey", engine.KeyManage},
 		{"/mqlite.v1.AuthService/ListKeys", engine.KeyManage},
 		{"/mqlite.v1.AuthService/RevokeKey", engine.KeyManage},
-		{"/metrics", engine.KeyManage},
 	}
 	inventory := keyTestRequest(server.New(keyTestEngine(t, nil), []string{"admin"}).Handler(), http.MethodGet, "/", "", nil)
 	var card wire.DiscoveryCard
 	if err := json.Unmarshal(inventory.Body.Bytes(), &card); err != nil {
 		t.Fatal(err)
 	}
-	paths := make([]string, len(routes)-1)
+	paths := make([]string, len(routes))
 	for i := range paths {
 		paths[i] = routes[i].path
 	}
@@ -400,11 +399,11 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 				case "anonymous", "invalid", "expired", "revoked":
 					want, code = http.StatusUnauthorized, "unauthenticated"
 				case "auth-off":
-					if strings.HasPrefix(route.path, "/mqlite.v1.AuthService/") {
+					if strings.HasPrefix(route.path, "/mqlite.v1.AuthService/") || route.path == wire.PathObserve {
 						want, code = http.StatusForbidden, "permission_denied"
 					}
 				case "monitor":
-					if route.path != wire.PathObserve && route.path != "/metrics" {
+					if route.path != wire.PathObserve {
 						want, code = http.StatusForbidden, "permission_denied"
 					}
 				default:
@@ -487,7 +486,7 @@ func TestAccessKeyStrictBearerAndOpenPaths(t *testing.T) {
 			want = 405
 		}
 		keyTestStatus(t, keyTestRequest(h, http.MethodGet, wire.PathListKeys, tok, nil), want, "")
-		for _, path := range append(append([]string{}, wantRPCRoutes...), "/metrics", "/uixyz") {
+		for _, path := range append(append([]string{}, wantRPCRoutes...), "/uixyz") {
 			req := httptest.NewRequest(http.MethodOptions, path, nil)
 			req.Header.Set("Origin", "https://example.test")
 			req.Header.Set("Access-Control-Request-Method", "POST")

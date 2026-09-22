@@ -11,6 +11,26 @@ the server; pure embedded use marks that domain `not_applicable`. Grafana derive
 rates, time windows and percentiles from these values instead of maintaining
 another set of message counters.
 
+The Prometheus endpoint is deliberately separate from the broker API. The API
+listener never serves `/metrics`; it returns `404` even for an administrator
+credential. A metrics listener is disabled by default and is enabled with
+`MQLITE_METRICS_ADDR` or `mqlite serve --metrics-addr`. It uses the same process,
+engine and counters, so it does not require a second writer or VM:
+
+```sh
+MQLITE_DB=file:/data/mq.db \
+MQLITE_TOKENS="$ADMIN_TOKEN" \
+MQLITE_MONITOR_TOKENS="$MONITOR_TOKEN" \
+MQLITE_METRICS_ADDR=127.0.0.1:9091 \
+mqlite serve --addr :6754
+```
+
+The example binds locally for development. In a deployment, replace the loopback
+address with the broker's private interface or service address and keep port 9091
+out of public ingress. The monitor credential is still required; a private
+network is an additional boundary, not a replacement for Bearer authentication.
+When the listener is disabled, the discovery card leaves `metrics` empty.
+
 For a runnable broker, Prometheus and Grafana stack, see
 [the local observability demo](../ops/observability/README.md). For an existing
 platform, use the [cloud and Kubernetes guide](observability-cloud.md).
@@ -34,7 +54,9 @@ A Prometheus job should reference a mounted secret file:
 ```yaml
 scrape_configs:
   - job_name: mqlite
-    scheme: https
+    # The native listener is plain HTTP. Use https only when a TLS proxy
+    # terminates TLS in front of the private listener.
+    scheme: http
     metrics_path: /metrics
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -42,11 +64,12 @@ scrape_configs:
       type: Bearer
       credentials_file: /run/secrets/mqlite-monitor.token
     static_configs:
-      - targets: [mqlite.internal.example:443]
+      - targets: [mqlite-metrics.internal.example:9091]
 ```
 
-Use the correct TLS CA rather than disabling certificate checks. Grafana connects
-to Prometheus and does not need the MQLite token. See the
+If a TLS proxy fronts the listener, use the correct TLS CA rather than disabling
+certificate checks. Grafana connects to Prometheus and does not need the MQLite
+token. See the
 [Prometheus authorization reference](https://prometheus.io/docs/prometheus/latest/configuration/configuration/).
 
 ## Availability and freshness

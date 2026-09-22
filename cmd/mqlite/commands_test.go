@@ -114,6 +114,33 @@ func TestResolveListenAddr(t *testing.T) {
 	}
 }
 
+func TestResolveMetricsAddr(t *testing.T) {
+	for _, value := range []string{"", "off", " OFF ", "  "} {
+		wantErr := strings.TrimSpace(value) == ""
+		got, err := resolveMetricsAddr(value, true, "")
+		if wantErr {
+			if err == nil {
+				t.Errorf("%q: blank explicit metrics address should be rejected", value)
+			}
+			continue
+		}
+		if err != nil || got != "" {
+			t.Errorf("%q: got %q, err %v; want disabled", value, got, err)
+		}
+	}
+	if got, err := resolveMetricsAddr("", false, "127.0.0.1:9091"); err != nil || got != "127.0.0.1:9091" {
+		t.Errorf("environment address: got %q, err %v", got, err)
+	}
+	if got, err := resolveMetricsAddr(":9091", true, "127.0.0.1:9092"); err != nil || got != ":9091" {
+		t.Errorf("explicit flag precedence: got %q, err %v", got, err)
+	}
+	for _, value := range []string{"9091", "metrics", "127.0.0.1"} {
+		if _, err := resolveMetricsAddr(value, true, ""); err == nil {
+			t.Errorf("%q: invalid metrics address accepted", value)
+		}
+	}
+}
+
 // TestReadCapped: an over-limit stdin body must error, never be silently truncated (MQLITE-79).
 func TestReadCapped(t *testing.T) {
 	if b, err := readCapped(strings.NewReader("hello"), 16); err != nil || string(b) != "hello" {

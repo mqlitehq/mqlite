@@ -1,7 +1,10 @@
-# Merge this job into an existing Prometheus configuration. Replace the DNS name
-# and mount a dedicated monitor credential; do not start a second MQLite writer.
+# Merge this job into an existing Prometheus configuration. Replace the private
+# metrics DNS name/port and mount a dedicated monitor credential; do not start a
+# second MQLite writer. The metrics listener is separate from the public API.
 scrape_configs:
   - job_name: mqlite
+    # This example assumes TLS is terminated on the private metrics route. If
+    # the private network itself is the transport boundary, use scheme: http.
     scheme: https
     metrics_path: /metrics
     scrape_interval: 15s
@@ -10,6 +13,6 @@ scrape_configs:
       type: Bearer
       credentials_file: /run/secrets/mqlite-monitor.token
     static_configs:
-      - targets: [mqlite.internal.example:443]
+      - targets: ["mqlite-metrics.internal.example:9091"]
     # For a private CA, set tls_config.ca_file to its mounted certificate file.
     # Do not use insecure_skip_verify.

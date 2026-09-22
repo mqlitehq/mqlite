@@ -31,6 +31,10 @@ upgrade notes before replacing a broker.
 - Add configured read-only `MQLITE_MONITOR_TOKENS` / `WithMonitorTokens` for
   `Observe` and `/metrics`, independently of the managed-key database. The
   managed-key permissions and database schema remain unchanged.
+- Serve Prometheus `/metrics` from an optional authenticated listener configured by
+  `MQLITE_METRICS_ADDR` or `--metrics-addr`; it is disabled by default and the
+  public API listener never exposes `/metrics`. The listener shares the broker
+  process and engine, so monitoring does not require a second MQLite VM.
 - Include a runnable MQLite, Prometheus and Grafana starter with a provisioned
   dashboard, rules, repeatable verification scenarios and cloud deployment guidance.
 - Preserve old metrics as exact compatibility projections. Prefer

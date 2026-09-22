@@ -32,10 +32,17 @@ func TestMetricsEndpoint(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	ts := httptest.NewServer(server.New(eng, nil).Handler()) // nil tokens -> auth off
+	s := server.New(eng, []string{"administrator-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	ts := httptest.NewServer(s.MetricsHandler())
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/metrics")
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatalf("build /metrics request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer monitor-secret")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /metrics: %v", err)
 	}
@@ -57,6 +64,97 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+// Metrics are deliberately absent from the public handler. Observation is also
+// never enabled by anonymous development mode, because queue names and health
+// state are operationally sensitive even when message bodies are not exposed.
+func TestPublicMetricsAndAnonymousObserveAreDenied(t *testing.T) {
+	eng := keyTestEngine(t, nil)
+	s := server.New(eng, nil)
+	main := s.Handler()
+
+	keyTestStatus(t, keyTestRequest(main, http.MethodGet, "/metrics", "", nil), http.StatusNotFound, "")
+	keyTestStatus(t, keyTestRequest(main, http.MethodPost, wire.PathObserve, "", wire.ObserveRequest{}), http.StatusForbidden, "permission_denied")
+}
+
+func TestMetricsHandlerRequiresConfiguredBearer(t *testing.T) {
+	eng := keyTestEngine(t, nil)
+	withoutAuth := server.New(eng, nil).MetricsHandler()
+	keyTestStatus(t, keyTestRequest(withoutAuth, http.MethodGet, "/metrics", "", nil), http.StatusForbidden, "permission_denied")
+
+	s := server.New(eng, []string{"admin-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	h := s.MetricsHandler()
+	keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/metrics", "", nil), http.StatusUnauthorized, "unauthenticated")
+	keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/metrics", "wrong-secret", nil), http.StatusUnauthorized, "unauthenticated")
+	keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/metrics", "monitor-secret", nil), http.StatusOK, "")
+	keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/metrics", "admin-secret", nil), http.StatusOK, "")
+	keyTestStatus(t, keyTestRequest(h, http.MethodPost, "/metrics", "monitor-secret", nil), http.StatusMethodNotAllowed, "unimplemented")
+}
+
+func TestMetricsPermissionMatrix(t *testing.T) {
+	for i, tc := range []struct {
+		name       string
+		permission engine.KeyPermissions
+		configured string
+		monitor    bool
+		expired    bool
+		revoked    bool
+		expected   int
+		code       string
+	}{
+		{name: "anonymous", expected: http.StatusForbidden, code: "permission_denied"},
+		{name: "invalid", configured: "admin", expected: http.StatusUnauthorized, code: "unauthenticated"},
+		{name: "send", permission: engine.KeySend, configured: "admin", expected: http.StatusForbidden, code: "permission_denied"},
+		{name: "listen", permission: engine.KeyListen, configured: "admin", expected: http.StatusForbidden, code: "permission_denied"},
+		{name: "send+listen", permission: engine.KeySend | engine.KeyListen, configured: "admin", expected: http.StatusForbidden, code: "permission_denied"},
+		{name: "manage", permission: engine.KeyManage, configured: "admin", expected: http.StatusOK},
+		{name: "static-admin", configured: "admin", expected: http.StatusOK},
+		{name: "monitor", configured: "admin", monitor: true, expected: http.StatusOK},
+		{name: "expired", permission: engine.KeyManage, configured: "admin", expired: true, expected: http.StatusUnauthorized, code: "unauthenticated"},
+		{name: "revoked", permission: engine.KeyManage, configured: "admin", revoked: true, expected: http.StatusUnauthorized, code: "unauthenticated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := int64(1000)
+			eng := keyTestEngine(t, func() int64 { return now })
+			token := tc.name
+			if tc.name == "invalid" {
+				token = "mqk_" + strings.Repeat("0", 64)
+			}
+			if tc.name == "static-admin" {
+				token = "admin"
+			}
+			if tc.permission != 0 {
+				key, secret := keyTestCreate(t, eng, i+1, tc.permission, func() int64 {
+					if tc.expired {
+						return now + 1
+					}
+					return 0
+				}())
+				token = secret
+				if tc.revoked {
+					if err := eng.RevokeAccessKey(context.Background(), key.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.expired {
+					now++
+				}
+			}
+			var admins []string
+			if tc.configured != "" {
+				admins = []string{tc.configured}
+			}
+			s := server.New(eng, admins)
+			if tc.monitor {
+				s.MonitorTokens = []string{"monitor"}
+				token = "monitor"
+			}
+			rec := keyTestRequest(s.MetricsHandler(), http.MethodGet, "/metrics", token, nil)
+			keyTestStatus(t, rec, tc.expected, tc.code)
+		})
+	}
+}
+
 // The read-only credential remains usable when storage cannot authenticate a
 // managed key. Failed collection is unavailable, never a healthy empty queue.
 func TestObserveStorageFailureAvailability(t *testing.T) {
@@ -72,6 +170,7 @@ func TestObserveStorageFailureAvailability(t *testing.T) {
 	s := server.New(eng, []string{"administrator-secret"})
 	s.MonitorTokens = []string{"monitor-secret"}
 	h := s.Handler()
+	mh := s.MetricsHandler()
 	read := func() wire.ObserveResponse {
 		t.Helper()
 		r := keyTestRequest(h, http.MethodPost, wire.PathObserve, "monitor-secret", wire.ObserveRequest{})
@@ -101,7 +200,7 @@ func TestObserveStorageFailureAvailability(t *testing.T) {
 	if after.Collection.State != "unavailable" || after.Queues != nil || after.Collection.LastSuccessAtMs != before.Collection.LastSuccessAtMs || after.Runtime.ReadAvailable {
 		t.Fatalf("failure replaced by healthy zero: %+v", after)
 	}
-	r := keyTestRequest(h, http.MethodGet, "/metrics", "monitor-secret", nil)
+	r := keyTestRequest(mh, http.MethodGet, "/metrics", "monitor-secret", nil)
 	keyTestStatus(t, r, http.StatusOK, "")
 	for _, want := range []string{"mqlite_collection_success 0", "mqlite_storage_read_available 0", `mqlite_message_events_total{queue="q",event="enqueued"} 1`} {
 		if !strings.Contains(r.Body.String(), want) {
@@ -178,19 +277,22 @@ func TestObserveConcurrentHistogramAndSpecialLabels(t *testing.T) {
 	if err := eng.CreateQueue(context.Background(), name, engine.QueueConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	h := server.New(eng, nil).Handler()
+	s := server.New(eng, []string{"administrator-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	h := s.Handler()
+	mh := s.MetricsHandler()
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				keyTestRequest(h, http.MethodPost, wire.PathListQueues, "", wire.Empty{})
+				keyTestRequest(h, http.MethodPost, wire.PathListQueues, "administrator-secret", wire.Empty{})
 			}
 		}()
 	}
 	for i := 0; i < 30; i++ {
-		r := keyTestRequest(h, http.MethodPost, wire.PathObserve, "", wire.ObserveRequest{})
+		r := keyTestRequest(h, http.MethodPost, wire.PathObserve, "monitor-secret", wire.ObserveRequest{})
 		out, err := wire.DecodeObserveResponse(r.Body.Bytes())
 		if err != nil {
 			t.Fatal(err)
@@ -204,7 +306,7 @@ func TestObserveConcurrentHistogramAndSpecialLabels(t *testing.T) {
 				last = b.Count
 			}
 		}
-		prom := keyTestRequest(h, http.MethodGet, "/metrics", "", nil).Body.String()
+		prom := keyTestRequest(mh, http.MethodGet, "/metrics", "monitor-secret", nil).Body.String()
 		if !strings.Contains(prom, "queue=\"orders\tline\\n\\\"quote\\\\\u96ea\"") {
 			t.Fatal("Prometheus label escaping drift")
 		}
@@ -277,9 +379,16 @@ func TestMetricsCompletedCounter(t *testing.T) {
 		}
 	}
 
-	ts := httptest.NewServer(server.New(eng, nil).Handler()) // auth off
+	s := server.New(eng, []string{"administrator-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	ts := httptest.NewServer(s.MetricsHandler())
 	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/metrics")
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer monitor-secret")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /metrics: %v", err)
 	}
@@ -305,12 +414,21 @@ func TestMetricsRPCLatencyHistogram(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer eng.Close()
-	ts := httptest.NewServer(server.New(eng, nil).Handler()) // auth off
-	defer ts.Close()
+	s := server.New(eng, []string{"administrator-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	api := httptest.NewServer(s.Handler())
+	defer api.Close()
+	metrics := httptest.NewServer(s.MetricsHandler())
+	defer metrics.Close()
 
 	const n = 5
 	for i := 0; i < n; i++ {
-		res, err := http.Post(ts.URL+"/mqlite.v1.AdminService/ListQueues", "application/json", strings.NewReader("{}"))
+		req, err := http.NewRequest(http.MethodPost, api.URL+"/mqlite.v1.AdminService/ListQueues", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer administrator-secret")
+		res, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -322,7 +440,12 @@ func TestMetricsRPCLatencyHistogram(t *testing.T) {
 	want := `mqlite_rpc_duration_seconds_count{rpc="AdminService/ListQueues"} 5`
 	var out string
 	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
-		res, err := http.Get(ts.URL + "/metrics")
+		req, err := http.NewRequest(http.MethodGet, metrics.URL+"/metrics", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer monitor-secret")
+		res, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -361,13 +484,21 @@ func TestMetricsRPCLabelsOnlyForRegisteredRoutes(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer eng.Close()
-	ts := httptest.NewServer(server.New(eng, nil).Handler()) // auth off
-	defer ts.Close()
+	s := server.New(eng, []string{"administrator-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	api := httptest.NewServer(s.Handler())
+	defer api.Close()
+	metrics := httptest.NewServer(s.MetricsHandler())
+	defer metrics.Close()
 
 	// A burst of distinct invented RPC names — none may become a label.
 	for i := 0; i < 20; i++ {
-		res, err := http.Post(ts.URL+fmt.Sprintf("/mqlite.v1.QueueService/Nope%d", i),
-			"application/json", strings.NewReader("{}"))
+		req, err := http.NewRequest(http.MethodPost, api.URL+fmt.Sprintf("/mqlite.v1.QueueService/Nope%d", i), strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer administrator-secret")
+		res, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -377,7 +508,12 @@ func TestMetricsRPCLabelsOnlyForRegisteredRoutes(t *testing.T) {
 		}
 	}
 	// One real RPC so the histogram section exists at all.
-	res, err := http.Post(ts.URL+"/mqlite.v1.AdminService/ListQueues", "application/json", strings.NewReader("{}"))
+	req, err := http.NewRequest(http.MethodPost, api.URL+"/mqlite.v1.AdminService/ListQueues", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer administrator-secret")
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +521,12 @@ func TestMetricsRPCLabelsOnlyForRegisteredRoutes(t *testing.T) {
 
 	var out string
 	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
-		r, err := http.Get(ts.URL + "/metrics")
+		req, err := http.NewRequest(http.MethodGet, metrics.URL+"/metrics", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer monitor-secret")
+		r, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}

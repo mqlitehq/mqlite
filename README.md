@@ -253,6 +253,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens for `serve` |
 | `MQLITE_MONITOR_TOKENS` | optional, distinct read-only credentials for `observe` and `/metrics`; administrator auth must remain enabled |
+| `MQLITE_METRICS_ADDR` | optional authenticated Prometheus listener (disabled by default; e.g. `127.0.0.1:9091`); the public API listener never serves `/metrics` |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
@@ -271,6 +272,11 @@ and the [complete access-key guide](docs/access-keys.md).
 Starting with v0.3.2, `mqlite observe` and configured `MQLITE_MONITOR_TOKENS`
 provide read-only broker observation. See the [monitoring guide](docs/observability.md)
 and [Prometheus/Grafana quickstart](ops/observability/README.md).
+
+Prometheus scraping is opt-in on a separate listener. Set `MQLITE_METRICS_ADDR` to
+a loopback or private-network address, keep port 9091 out of public ingress, and
+give the collector only a monitor token. Prometheus and Grafana can run on the
+same host or in an existing monitoring platform; no second MQLite VM is required.
 
 ### 6. MCP (drive it from an AI agent)
 

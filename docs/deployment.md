@@ -20,6 +20,7 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens (**set this in production**) |
 | `MQLITE_MONITOR_TOKENS` | v0.3.2+: optional comma-separated credentials for `Observe` and `/metrics` only; requires auth and distinct administrator credentials |
+| `MQLITE_METRICS_ADDR` | v0.3.2+: optional separate listener for authenticated `/metrics` (for example `:9091`); unset/`off` disables it |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
@@ -62,6 +63,8 @@ docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
+  -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
+  -e MQLITE_METRICS_ADDR=:9091 \
   -e MQLITE_SYNC=FULL \
   ghcr.io/mqlitehq/mqlite:0.3.2
 ```
@@ -70,7 +73,10 @@ docker run -d --name mqlite -p 6754:6754 \
 - Pin a version tag in production; `:0.3` tracks patches, `:latest` the newest release.
   Images `>= 0.3.0` listen on `6754`; **`0.2.x` and earlier listen on `8080`** — if you pin an
   older tag, publish the port it actually uses.
-- Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`.
+- Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. The API
+  listener intentionally returns 404 for `/metrics`; if a private collector is
+  configured, give it access to the separate `MQLITE_METRICS_ADDR` listener and
+  its monitor credential without publishing that port to the public Internet.
 
 ## Fly.io (minimal cost)
 
@@ -87,6 +93,7 @@ primary_region = "sin"            # pick a region near you
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
   MQLITE_SYNC = "FULL"                      # sync every acknowledged local commit
+  MQLITE_METRICS_ADDR = "fly-local-6pn:9091" # private authenticated scrape listener
 
 [[mounts]]
   source      = "data"                       # the volume created below
@@ -107,10 +114,19 @@ primary_region = "sin"            # pick a region near you
 ```bash
 fly apps create your-mqlite
 fly volume create data --size 1 --region sin     # 1 GB SQLite volume (region-bound)
-fly secrets set MQLITE_TOKENS=mqk_prod_CHANGEME  # broker auth (a Fly secret, not in fly.toml)
+fly secrets set MQLITE_TOKENS=mqk_prod_CHANGEME \
+                MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME # broker secrets, not in fly.toml
 fly deploy --ha=false                            # single machine
 curl https://your-mqlite.fly.dev/                # discovery card
 ```
+
+The `[http_service]` above publishes only the API on `6754`. Keep the metrics
+listener on Fly's private network (or behind an authenticated tunnel) and do not
+add a public service for port `9091`; a private Prometheus collector must attach
+the monitor Bearer token when scraping it. For a local inspection tunnel, run
+`fly proxy 9091:9091 --app your-mqlite` and then query
+`http://127.0.0.1:9091/metrics` with the monitor token; the proxy binds locally
+and does not create a public service. See [cloud and Kubernetes monitoring](observability-cloud.md#flyio).
 
 **Cost:** with `auto_stop_machines="stop"` + `min_machines_running=0` the machine
 runs only while serving requests (cold-starts in seconds, stops when idle), so the
@@ -225,4 +241,4 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 - [ ] One active broker per database; no overlapping replacement.
 - [ ] Verified backup and rehearsed restore meet the application's RPO/RTO.
 - [ ] Free-disk, restart/error and queue-age alerts; an authenticated write/consume canary.
-- [ ] Scrape `/metrics` (Prometheus) for queue depths — see [observability.md](observability.md).
+- [ ] Scrape the private `MQLITE_METRICS_ADDR` `/metrics` listener (Prometheus) for queue depths — see [observability.md](observability.md); do not publish it with the API ingress.

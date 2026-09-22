@@ -3,7 +3,8 @@
 These examples require **MQLite v0.3.2 or later**, including configured monitor
 credentials and the canonical metric families.
 
-MQLite exposes native Prometheus metrics. The same dashboard and metric definitions
+MQLite exposes native Prometheus metrics on an optional, authenticated listener
+separate from the public API listener. The same dashboard and metric definitions
 work with a private Prometheus collector or a compatible managed service. Keep the
 broker's metrics authenticated: configure a distinct `MQLITE_MONITOR_TOKENS`
 credential, give only that credential to the collector, and keep administrator
@@ -13,7 +14,7 @@ for the metric contract and the runnable local stack.
 ## Common integration
 
 ```text
-MQLite /metrics <-- private route + monitor Bearer token -- collector
+MQLite :9091/metrics <-- private route + monitor Bearer token -- collector
                                                           |
                                               Prometheus-compatible storage
                                                           |
@@ -22,10 +23,14 @@ MQLite /metrics <-- private route + monitor Bearer token -- collector
 
 1. Locate the collector in the broker's private network, or provide an authenticated
    TLS endpoint reachable only from approved collectors. Configure the correct CA;
-   do not disable TLS certificate verification.
-2. Configure `/metrics`, the actual broker port, a 15-second starting interval and a
-   shorter scrape timeout. Use a secret file or your collector's secret reference;
-   do not put the credential into target URLs, labels or dashboard JSON.
+   do not disable TLS certificate verification. Bind the exporter with
+   `MQLITE_METRICS_ADDR` (for example `:9091`) and allow that port only from the
+   collector's private network. The public API listener (`6754`) does not serve
+   `/metrics`.
+2. Configure `/metrics` on the private metrics listener, the actual metrics port,
+   a 15-second starting interval and a shorter scrape timeout. Use a secret file or
+   your collector's secret reference; do not put the credential into target URLs,
+   labels or dashboard JSON.
 3. Verify `up{job="mqlite"} == 1` and `mqlite_collection_success == 1`. Scrape success
    alone does not establish database availability or successful business processing.
 4. Import the [standard dashboard](../ops/observability/grafana/dashboards/mqlite.json),
@@ -69,8 +74,12 @@ It does not document a per-target MQLite Bearer credential in that stanza, so ad
 `[metrics]` alone is not a verified way to scrape an authenticated broker. Keep the
 broker protected. A private collector using the reusable Prometheus job can attach
 the monitor token and scrape the broker's internal DNS address, for example
-`your-mqlite-app.internal:6754`. Configure MQLite to listen on its private IPv6
-interface (for example `[::]:6754`), and verify reachability from the collector.
+`your-mqlite-app.internal:9091`. Configure MQLite with
+`MQLITE_METRICS_ADDR=fly-local-6pn:9091`; expose only that port through Fly's
+private network or an authenticated tunnel and verify reachability from the
+collector. For a local check, `fly proxy 9091:9091 --app <app>` binds the proxy
+to loopback. Do not add a public service for the exporter. The public API remains
+on `6754`.
 Fly's private network is scoped by organization/network configuration; it is not
 a replacement for application authentication. [Fly custom metrics](https://fly.io/docs/monitoring/metrics/),
 [private networking](https://fly.io/docs/networking/private-networking/).

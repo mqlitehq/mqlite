@@ -34,10 +34,12 @@ def smoke(args):
     run_id = "mqlite-image-smoke-" + uuid.uuid4().hex
     volume = run_id + "-data"
     token = "mqk_" + uuid.uuid4().hex
+    monitor_token = "mqk_" + uuid.uuid4().hex
     containers = [run_id + "-first", run_id + "-restart"]
     live_containers = set()
     volume_created = False
     endpoint = ""
+    metrics_endpoint = ""
     # Local broker traffic must not depend on a runner's HTTP proxy settings.
     http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -53,9 +55,9 @@ def smoke(args):
             raise RuntimeError(f"docker {command[0]} failed: {result.stderr.strip()}")
         return result
 
-    def request(path, body=None, auth=None, timeout=5):
+    def request(path, body=None, auth=None, timeout=5, base=None):
         data = None if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(endpoint + path, data=data)
+        req = urllib.request.Request((endpoint if base is None else base) + path, data=data)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         if auth is not None:
@@ -74,20 +76,28 @@ def smoke(args):
         return json.loads(raw)
 
     def start(container):
-        nonlocal endpoint
+        nonlocal endpoint, metrics_endpoint
         live_containers.add(container)
         docker(
             "run", "--detach", "--platform", args.platform, "--pull", "never",
             "--name", container, "--publish", "127.0.0.1::6754",
+            "--publish", "127.0.0.1::9091",
             "--mount", f"type=volume,source={volume},target=/data",
             "--env", "MQLITE_TOKENS=" + token,
+            "--env", "MQLITE_MONITOR_TOKENS=" + monitor_token,
+            "--env", "MQLITE_METRICS_ADDR=:9091",
             "--env", "MQLITE_SYNC=FULL", args.image,
         )
         binding = json.loads(docker("inspect", container).stdout)[0]
-        ports = binding["NetworkSettings"]["Ports"]["6754/tcp"]
-        check(len(ports) == 1 and ports[0]["HostIp"] == "127.0.0.1",
-              f"unexpected published ports: {ports!r}")
-        endpoint = "http://127.0.0.1:" + ports[0]["HostPort"]
+        ports = binding["NetworkSettings"]["Ports"]
+        api_ports = ports["6754/tcp"]
+        metrics_ports = ports["9091/tcp"]
+        check(len(api_ports) == 1 and api_ports[0]["HostIp"] == "127.0.0.1",
+              f"unexpected API published ports: {api_ports!r}")
+        check(len(metrics_ports) == 1 and metrics_ports[0]["HostIp"] == "127.0.0.1",
+              f"unexpected metrics published ports: {metrics_ports!r}")
+        endpoint = "http://127.0.0.1:" + api_ports[0]["HostPort"]
+        metrics_endpoint = "http://127.0.0.1:" + metrics_ports[0]["HostPort"]
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
@@ -99,6 +109,18 @@ def smoke(args):
             time.sleep(0.25)
         else:
             raise RuntimeError("broker did not become healthy within 30 seconds")
+        metrics_deadline = time.monotonic() + 30
+        while time.monotonic() < metrics_deadline:
+            try:
+                status, raw = request("/metrics", None, monitor_token, timeout=2,
+                                      base=metrics_endpoint)
+                if status == 200 and b"mqlite_storage_read_available" in raw:
+                    break
+            except (OSError, urllib.error.URLError):
+                pass
+            time.sleep(0.25)
+        else:
+            raise RuntimeError("private metrics listener did not become ready within 30 seconds")
 
         status, raw = request("/")
         check(status == 200, f"discovery: HTTP {status}")
@@ -106,6 +128,7 @@ def smoke(args):
         check(card.get("name") == "mqlite" and card.get("status") == "ok"
               and card.get("auth") == "bearer" and card.get("health") == "/healthz",
               f"unexpected discovery metadata: {card!r}")
+        check(card.get("metrics", "") == "", f"public discovery advertises metrics: {card!r}")
         version = card.get("version", "")
         check(re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version),
               f"invalid image version: {version!r}")
@@ -119,12 +142,23 @@ def smoke(args):
 
         paths = card.get("endpoints", [])
         check(isinstance(paths, list) and paths, "discovery has no RPC endpoints")
-        # Check every advertised RPC and metrics with both absent and wrong tokens.
-        for path in [*paths, "/metrics"]:
+        # Every advertised RPC must reject absent and wrong credentials on the public API.
+        for path in paths:
             for auth in (None, "invalid-" + token):
-                status, raw = request(path, None if path == "/metrics" else {}, auth)
+                status, raw = request(path, {}, auth)
                 check(status == 401 and json.loads(raw).get("code") == "unauthenticated",
                       f"{path} accepted absent/invalid credentials: HTTP {status}")
+        # Metrics are intentionally absent from the public API. The private listener
+        # still requires a monitor or administrator credential before doing any work.
+        status, raw = request("/metrics", None, token)
+        check(status == 404, f"public API exposed metrics: HTTP {status}")
+        for auth in (None, "invalid-" + monitor_token):
+            status, raw = request("/metrics", None, auth, base=metrics_endpoint)
+            check(status == 401 and json.loads(raw).get("code") == "unauthenticated",
+                  f"private metrics accepted absent/invalid credentials: HTTP {status}")
+        status, raw = request("/metrics", None, monitor_token, base=metrics_endpoint)
+        check(status == 200 and b"mqlite_storage_read_available" in raw,
+              f"private metrics scrape failed: HTTP {status}")
 
         runtime = rpc("Admin", "Status", {})
         check(runtime.get("version") == version and runtime.get("auth") is True
@@ -217,11 +251,13 @@ def smoke(args):
             ("/mqlite.v1.QueueService/Receive", {"queue": queue}, sender),
             ("/mqlite.v1.QueueService/Send", {"queue": queue, "messages": [message("denied")]}, listener),
             ("/mqlite.v1.AuthService/ListKeys", {}, listener),
-            ("/metrics", None, sender),
         ):
             status, raw = request(path, body, auth)
             check(status == 403 and json.loads(raw).get("code") == "permission_denied",
                   path + " did not enforce managed permissions")
+        status, raw = request("/metrics", None, sender, base=metrics_endpoint)
+        check(status == 403 and json.loads(raw).get("code") == "permission_denied",
+              "send-only managed key could scrape private metrics")
         first = message("complete-before-restart")
         sent = rpc("Queue", "Send", {"queue": queue, "messages": [first]}, sender)["seq_numbers"]
         check(len(sent) == 1 and sent[0] > 0, f"invalid send result: {sent!r}")

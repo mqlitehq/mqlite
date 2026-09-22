@@ -69,7 +69,7 @@ func TestDiscoveryCardPinned(t *testing.T) {
 	if !reflect.DeepEqual(keys, wantKeys) {
 		t.Errorf("card field set = %v\n            want %v", keys, wantKeys)
 	}
-	if card.Name != "mqlite" || card.Status != "ok" || card.Health != "/healthz" || card.Metrics != "/metrics" {
+	if card.Name != "mqlite" || card.Status != "ok" || card.Health != "/healthz" || card.Metrics != "" {
 		t.Errorf("card metadata drift: %+v", card)
 	}
 	if card.Auth != "bearer" {

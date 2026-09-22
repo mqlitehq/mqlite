@@ -48,7 +48,8 @@ loud now.
 
 ```bash
 # Talking to the broker directly. mqlite serves JSON-over-HTTP on TCP 6754 and terminates
-# no TLS of its own, so this is plain http.
+# no TLS of its own, so this is plain http. The optional metrics listener is
+# also plain HTTP; terminate TLS in a private reverse proxy when required.
 BASE_URL=http://127.0.0.1:6754
 
 # Behind a reverse proxy. Public HTTPS on 443 (which the URL omits, as usual) terminates at
@@ -230,7 +231,7 @@ curl "$BASE_URL/"                    # what is this? (no auth)
 # → {"name":"mqlite","version":"<the broker's version>","description":"...","status":"ok",
 #    "auth":"bearer","docs":"https://github.com/mqlitehq/mqlite",
 #    "endpoints":["/mqlite.v1.QueueService/Send", ...every RPC route...],
-#    "health":"/healthz","metrics":"/metrics"}
+#    "health":"/healthz","metrics":""}
 curl "$BASE_URL/healthz"             # ok
 ```
 
@@ -248,7 +249,7 @@ which case `/ui` 404s and the card's optional `ui` field is omitted.
 
 | Method | Path | Auth | Returns |
 |---|---|---|---|
-| `GET` | `/metrics` | Bearer with `manage` | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
+| `GET` | `/metrics` (metrics listener) | Bearer with `manage` or configured monitor | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
 
 ## QueueService
 

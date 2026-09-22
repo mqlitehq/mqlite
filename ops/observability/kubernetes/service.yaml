@@ -11,5 +11,5 @@ spec:
     app: mqlite
   ports:
     - name: metrics
-      port: 6754
-      targetPort: 6754
+      port: 9091
+      targetPort: 9091

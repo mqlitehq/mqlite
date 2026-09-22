@@ -72,7 +72,14 @@ func (s *Server) Handler() http.Handler {
 			writeErr(w, http.StatusInternalServerError, "internal", "invalid monitoring credential configuration")
 		})
 	}
-	return s.cors(s.observeRequests(s.logging(s.auth(s.observe(s.mux)))))
+	handler := s.cors(s.observeRequests(s.logging(s.auth(s.observe(s.mux)))))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
 }
 
 // ValidateMonitorTokens rejects ambiguous or ineffective monitoring credentials.
@@ -140,9 +147,6 @@ func (s *Server) routes() {
 	// Open discovery/index at "/" — hit the broker with no path/params/auth and get a
 	// plain JSON telling you what this is, the version, and a basic status.
 	s.mux.HandleFunc("/", s.handleIndex)
-	// Prometheus metrics: per-queue gauges. Behind auth like the RPCs (a scraper
-	// passes the Bearer token); only /healthz stays open for liveness.
-	s.mux.HandleFunc("/metrics", s.authorize(monitorPermission, s.handleMetrics))
 	// Embedded admin console (the built mqlite-web SPA) at /ui, when Server.UI is on
 	// (MQLITE_UI). The static page is open; its API calls carry the Bearer token.
 	s.mux.Handle("/ui/", s.console())
@@ -180,7 +184,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Docs:        "https://github.com/mqlitehq/mqlite",
 		Endpoints:   s.rpcPaths, // the complete RPC catalog, exactly as registered
 		Health:      "/healthz",
-		Metrics:     "/metrics",
+		Metrics:     "", // metrics are available only on a separately configured listener
 	}
 	if s.UI {
 		card.UI = "/ui"
@@ -283,17 +287,26 @@ func (s *Server) auth(next http.Handler) http.Handler {
 // decoding or invoking its handler. There is no separate policy catalog to drift.
 func (s *Server) authorize(required engine.KeyPermissions, fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.authenticationEnabled() {
-			permission, ok := r.Context().Value(permissionContextKey{}).(engine.KeyPermissions)
-			allowed := permission.Allows(required)
+		if !s.authenticationEnabled() {
+			// Anonymous development mode keeps data-plane RPCs usable for local
+			// tests, but never turns observation into an information leak.
 			if required == monitorPermission {
-				allowed = permission == engine.KeyManage || permission == monitorPermission
-			}
-			if !ok || !allowed {
 				authOutcome(w, "permission_denied")
 				s.fail(w, engine.ErrPermissionDenied)
 				return
 			}
+			fn(w, r)
+			return
+		}
+		permission, ok := r.Context().Value(permissionContextKey{}).(engine.KeyPermissions)
+		allowed := permission.Allows(required)
+		if required == monitorPermission {
+			allowed = permission == engine.KeyManage || permission == monitorPermission
+		}
+		if !ok || !allowed {
+			authOutcome(w, "permission_denied")
+			s.fail(w, engine.ErrPermissionDenied)
+			return
 		}
 		fn(w, r)
 	}

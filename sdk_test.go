@@ -366,6 +366,94 @@ func TestServeReadyAfterBind(t *testing.T) {
 	}
 }
 
+// TestServePrivateMetricsListener keeps the scrape surface off the API listener:
+// callers must opt into a second listener and authenticate the scrape. Both
+// listeners still share the same embedded engine and process.
+func TestServePrivateMetricsListener(t *testing.T) {
+	reserve := func() string {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return addr
+	}
+
+	embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = embedded.Close() })
+	apiAddr, metricsAddr := reserve(), reserve()
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- embedded.Serve(ctx, apiAddr,
+			mqlite.WithTokens("admin-secret"),
+			mqlite.WithMonitorTokens("monitor-secret"),
+			mqlite.WithMetricsAddr(metricsAddr),
+			mqlite.WithReady(func() { close(ready) }),
+		)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("private metrics listener never became ready")
+	}
+
+	resp, err := client.Get("http://" + apiAddr + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("public API /metrics = %d, want 404", resp.StatusCode)
+	}
+
+	for _, tc := range []struct {
+		name, token string
+		status      int
+	}{
+		{name: "missing", status: http.StatusUnauthorized},
+		{name: "monitor", token: "monitor-secret", status: http.StatusOK},
+		{name: "administrator", token: "admin-secret", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, "http://"+metricsAddr+"/metrics", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.token != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("metrics status = %d, want %d", resp.StatusCode, tc.status)
+			}
+		})
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("clean shutdown returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after ctx cancel")
+	}
+}
+
 // TestRemoteSettleByToken is the SDK contract the CLI's settle-later commands rely on
 // (MQLITE-92): receive a message, read its LockToken(), then settle it through a freshly
 // rehydrated Client.Message(queue, seq, token) — as a separate `mqlite complete …`

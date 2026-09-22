@@ -4,6 +4,9 @@ These templates connect an existing MQLite broker to an existing Prometheus
 Operator installation. They do not install a cluster, monitoring operator or a
 second broker. Set your namespace and confirm the Deployment/container names,
 pod labels, operator selectors, private routing and certificate policy first.
+The patch binds MQLite's authenticated metrics listener to `:9091`; the
+`mqlite-metrics` ClusterIP exposes only that listener and never the public API
+port (`6754`).
 
 Create the dedicated monitor token as a Secret from a private local file. Avoid
 putting its value in YAML, command history, a dashboard or a ConfigMap:
@@ -25,9 +28,9 @@ to introduce overlapping writers during a rolling update.
 The Secret belongs in the ServiceMonitor's namespace, and the operator needs
 permission to read it. Configure namespace and ServiceMonitor label selectors in
 your existing Prometheus resource. `jobLabel: app` sets the scrape job to
-`mqlite`, matching the provided rules. Restrict metrics routing with your existing
-network policy without blocking legitimate producer/consumer traffic on the same
-broker port.
+`mqlite`, matching the provided rules. Restrict the `mqlite-metrics` Service to
+the Prometheus collector with your existing network policy; application clients
+continue to use the broker API Service on `6754`.
 
 Validate the target and a real query before importing the dashboard:
 

@@ -21,6 +21,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: a running broker + its Bearer token |
 | `MQLITE_MONITOR_TOKENS` | optional comma-separated read-only credentials for `observe` and `/metrics`; requires administrator auth and credentials distinct from administrators |
 | `MQLITE_TOKENS` | broker (`serve`) administrator Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth; additional managed keys live in the database |
+| `MQLITE_METRICS_ADDR` | optional separate listener for authenticated Prometheus `/metrics` (for example `:9091`); unset/`off` disables it |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
@@ -78,6 +79,7 @@ MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :6754
 | Flag | Default | |
 |---|---|---|
 | `--addr` | `:6754` | listen address |
+| `--metrics-addr` | disabled | separate authenticated `/metrics` listener; the API listener never serves `/metrics` |
 | `--insecure-allow-remote` | `false` | with auth disabled, allow a non-loopback bind (otherwise refused) |
 
 The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
@@ -85,8 +87,12 @@ The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
 (`MQLITE_TOKENS=off`) the broker **refuses a non-loopback bind** unless
 `--insecure-allow-remote` is passed, and **`MQLITE_CORS` defaults to off**.
 
-Serves the RPC API, `/metrics`, the open `/` + `/healthz`, and — unless
-`MQLITE_UI=off` — the embedded admin console at `/ui`.
+Serves the RPC API, the open `/` + `/healthz`, and — unless `MQLITE_UI=off` —
+the embedded admin console at `/ui`. When `--metrics-addr` or
+`MQLITE_METRICS_ADDR` is configured, `/metrics` is served from that separate
+listener and requires a configured administrator or monitor credential. The API
+listener deliberately returns 404 for `/metrics`; keep the metrics listener on a
+private network or behind an authenticated TLS proxy.
 
 ### `key create|list|revoke` — manage persistent access keys
 
