@@ -1,0 +1,15 @@
+# Apply in the existing broker's namespace; its pod must have app: mqlite.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mqlite-metrics
+  labels:
+    app: mqlite
+spec:
+  type: ClusterIP
+  selector:
+    app: mqlite
+  ports:
+    - name: metrics
+      port: 6754
+      targetPort: 6754

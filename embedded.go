@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/version"
 	"github.com/mqlitehq/mqlite/server"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // Embedded runs the queue engine in-process (like goqite), exposing the same
@@ -333,24 +335,23 @@ func (e *Embedded) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (
 // Client.Status). Version is empty and UptimeMs/Auth are zero-valued — an in-process engine
 // has no broker build stamp, no process uptime and no auth; queue/subscription counts are live.
 func (e *Embedded) Status(ctx context.Context) (StatusInfo, error) {
-	s := e.eng.Status(ctx)
+	s, queues, subscriptions := e.eng.RuntimeStatus(ctx)
 	info := StatusInfo{
 		Backend: s.Backend, Remote: s.Remote, Location: s.Location,
 		SchemaVersion: s.SchemaVersion, PingMs: s.PingMs, DBSizeBytes: s.SizeBytes,
+		Queues: queues, Subscriptions: subscriptions,
 	}
-	if qs, err := e.eng.ListQueues(ctx); err == nil {
-		// Exclude subscription backing queues from the queue count so embedded status
-		// matches what the broker's /status reports (queues vs subscriptions are disjoint).
-		for _, q := range qs {
-			if q.Kind != "subscription" {
-				info.Queues++
-			}
-		}
-	}
-	if ss, err := e.eng.ListSubscriptions(ctx); err == nil {
-		info.Subscriptions = len(ss)
-	}
+
 	return info, nil
+}
+
+// Observe samples the same canonical observation as the broker. HTTP measurements
+// are explicitly not applicable to an in-process engine.
+func (e *Embedded) Observe(ctx context.Context) (Observation, error) {
+	return Observation{
+		ObservabilitySnapshot: e.eng.Observability(ctx), Access: "embedded", Version: version.Version,
+		HTTP: wire.HTTPObservation{State: "not_applicable", Requests: []wire.RequestObservation{}, Authentication: []wire.AuthenticationObservation{}, HandlerLatency: []wire.RPCLatencyObservation{}},
+	}, nil
 }
 
 // ListSubscriptions returns every subscription with its topic and filter expression.
@@ -386,12 +387,14 @@ func (e *Embedded) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 // ── serve: upgrade in-process engine to a network broker ─────────────────────
 
 type serveConfig struct {
-	tokens    []string
-	version   string
-	cors      string
-	reqLogger *slog.Logger
-	ui        bool
-	ready     func()
+	tokens        []string
+	monitorTokens []string
+	metrics       bool
+	version       string
+	cors          string
+	reqLogger     *slog.Logger
+	ui            bool
+	ready         func()
 }
 
 // ServeOption configures Serve.
@@ -406,6 +409,20 @@ func WithVersion(v string) ServeOption {
 // WithTokens sets the accepted Bearer tokens for the broker.
 func WithTokens(tokens ...string) ServeOption {
 	return func(c *serveConfig) { c.tokens = append(c.tokens, tokens...) }
+}
+
+// WithMonitorTokens adds configured read-only credentials for Observe and /metrics.
+// Serve rejects blank credentials, overlap with administrators, or disabled auth.
+// These credentials can authenticate during a storage outage without a DB lookup.
+func WithMonitorTokens(tokens ...string) ServeOption {
+	return func(c *serveConfig) { c.monitorTokens = append(c.monitorTokens, tokens...) }
+}
+
+// WithMetrics enables authenticated GET /metrics on the broker's API listener.
+// Off by default. Enabling it requires administrator authentication and adds
+// the /metrics path to discovery. Scrapers can use a read-only monitor token.
+func WithMetrics(on bool) ServeOption {
+	return func(c *serveConfig) { c.metrics = on }
 }
 
 // WithTokenCSV sets accepted Bearer tokens from a comma-separated string (env-friendly).
@@ -454,11 +471,26 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	for _, o := range opts {
 		o(&sc)
 	}
+	if err := server.ValidateMonitorTokens(sc.tokens, sc.monitorTokens); err != nil {
+		return err
+	}
+	if sc.metrics {
+		hasAdmin := false
+		for _, token := range sc.tokens {
+			hasAdmin = hasAdmin || strings.TrimSpace(token) != ""
+		}
+		if !hasAdmin {
+			return errors.New("metrics require administrator authentication")
+		}
+	}
+
 	srv := server.New(e.eng, sc.tokens)
+	srv.MonitorTokens = append([]string(nil), sc.monitorTokens...)
 	srv.Version = sc.version
 	srv.CORS = sc.cors
 	srv.Logger = sc.reqLogger
 	srv.UI = sc.ui
+	srv.Metrics = sc.metrics
 	hs := newHTTPServer(addr, srv.Handler())
 
 	// Bind synchronously so a bind failure (port in use, bad addr) surfaces here —
@@ -467,6 +499,8 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
+	defer ln.Close()
+	defer hs.Close()
 	if sc.ready != nil {
 		sc.ready()
 	}
@@ -474,19 +508,15 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	go func() { errCh <- hs.Serve(ln) }()
 	select {
 	case <-ctx.Done():
-		// Grace must exceed the longest in-flight request — a Receive long-poll runs up
-		// to 20s — so a clean Ctrl-C drains it instead of cutting it at 5s (MQLITE-88).
-		shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		defer cancel()
-		// Return the shutdown result: a DeadlineExceeded means connections didn't drain
-		// in time — a real signal, not something to swallow.
-		return hs.Shutdown(shutCtx)
+		// Grace exceeds the longest Receive long poll (20s).
 	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
 		}
-		return err
 	}
+	shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	return hs.Shutdown(shutCtx)
 }
 
 // ── settler ─────────────────────────────────────────────────────────────────

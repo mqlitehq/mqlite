@@ -135,6 +135,14 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 			*raw = keyData
 			return nil
 		}
+		if raw, ok := respOut.(*json.RawMessage); ok && path == wire.PathObserve {
+			data, err := wire.ReadObserveResponse(resp.Body)
+			if err != nil {
+				return err
+			}
+			*raw = data
+			return nil
+		}
 		return json.NewDecoder(resp.Body).Decode(respOut)
 	}
 	return nil
@@ -466,6 +474,15 @@ func (c *Client) Purge(ctx context.Context, queue string, opts ...PurgeOpts) (in
 		return 0, err
 	}
 	return resp.Purged, nil
+}
+
+// Observe returns canonical queue, storage, maintenance and HTTP measurements.
+func (c *Client) Observe(ctx context.Context) (Observation, error) {
+	var data json.RawMessage
+	if err := c.post(ctx, wire.PathObserve, wire.ObserveRequest{}, &data); err != nil {
+		return Observation{}, err
+	}
+	return wire.DecodeObserveResponse(data)
 }
 
 // Status returns a desensitized snapshot of the broker's backend (never a token or DSN).

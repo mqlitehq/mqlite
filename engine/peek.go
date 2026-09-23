@@ -70,29 +70,12 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 
 // Stats returns pgmq-style counters for a queue (§7.3).
 func (e *Engine) Stats(ctx context.Context, queue string) (Metrics, error) {
-	if _, err := e.loadQueue(ctx, queue); err != nil {
-		return Metrics{}, err
-	}
-	m := Metrics{Queue: queue}
-	var oldest sql.NullInt64
-	err := e.db.queryRowScan(ctx,
-		[]any{&m.Active, &m.Locked, &m.Deferred, &m.Scheduled, &m.DeadLettered, &m.Total, &oldest}, `
-		SELECT
-		    COALESCE(SUM(CASE WHEN state='active'        THEN 1 ELSE 0 END),0),
-		    COALESCE(SUM(CASE WHEN state='locked'        THEN 1 ELSE 0 END),0),
-		    COALESCE(SUM(CASE WHEN state='deferred'      THEN 1 ELSE 0 END),0),
-		    COALESCE(SUM(CASE WHEN state='scheduled'     THEN 1 ELSE 0 END),0),
-		    COALESCE(SUM(CASE WHEN state='dead_lettered' THEN 1 ELSE 0 END),0),
-		    COUNT(*),
-		    MIN(CASE WHEN state IN ('active','locked') THEN enqueued_at END)
-		FROM messages WHERE queue=?`, queue)
+	rows, _, err := e.queueSnapshot(ctx, &queue)
 	if err != nil {
 		return Metrics{}, err
 	}
-	if oldest.Valid {
-		if age := e.now() - oldest.Int64; age > 0 {
-			m.OldestMessageAgeMs = age
-		}
+	if len(rows) == 0 {
+		return Metrics{}, ErrQueueNotFound
 	}
-	return m, nil
+	return rows[0].Metrics, nil
 }

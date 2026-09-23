@@ -35,8 +35,10 @@ type controlAPI struct {
     queueAPI
     rows []*mq.Message
     retained []*mq.PeekedMessage
+    delay time.Duration
 }
 func (a *controlAPI) Receive(ctx context.Context, q string, opts ...mq.RecvOpts) ([]*mq.Message, error) {
+    if a.delay > 0 { time.Sleep(a.delay) }
     rows := a.rows
     a.rows = nil
     return rows, ctx.Err()
@@ -205,6 +207,26 @@ func otherOnlineControls() {
         err:=b.reconcile(context.Background())
         if closeErr:=b.ledger.close();closeErr!=nil{panic(closeErr)}
         recordControl(c.name,"reconcile acknowledged/terminal/retained identity sets",err,true)
+    }
+    for _,c:=range []struct{
+        name string
+        until time.Time
+        rows bool
+        delay time.Duration
+        reject bool
+    }{
+        {"excluded-before-valid",time.Now().Add(time.Second),false,0,false},
+        {"excluded-before-expired",time.Now().Add(-time.Millisecond),false,0,true},
+        {"excluded-before-unexpected",time.Now().Add(time.Second),true,0,true},
+        {"excluded-before-response-late",time.Now().Add(time.Millisecond),false,10*time.Millisecond,true},
+    }{
+        b,a,rows:=fixture(c.name)
+        if !c.rows { a.rows=nil } else { a.rows=rows }
+        a.delay=c.delay
+        q:=queue(b.plan.Seed,"ordinary")
+        err:=b.excludedBefore(context.Background(),q,mq.RecvOpts{},c.until)
+        if closeErr:=b.ledger.close();closeErr!=nil{panic(closeErr)}
+        recordControl(c.name,"excluded temporal window and empty-response oracle",err,c.reject)
     }
     for _,c:=range []struct{name string;actual error;reject bool}{
         {"fencing-rejection",mq.ErrLockLost,false},

@@ -2,7 +2,7 @@
 
 `mqlite-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server
 that exposes the mqlite broker as **agent tools** — so an AI agent (Claude, etc.) can
-create queues, send, receive, settle messages, and manage access keys without writing any HTTP. It is a
+observe broker health, create queues, send, receive, settle messages, and manage access keys without writing any HTTP. It is a
 thin, **dependency-free** forwarder: it speaks MCP (JSON-RPC 2.0 over stdio) and turns
 each tool call into one HTTP POST to the broker. Stdlib + the in-repo `wire` contract
 only — no MCP SDK, no CGO (the same ethos as the rest of mqlite).
@@ -19,7 +19,7 @@ it with the broker endpoint + token:
 | Env | Default | Meaning |
 |---|---|---|
 | `MQLITE_ENDPOINT` | `http://127.0.0.1:6754` | the broker base URL |
-| `MQLITE_TOKEN` | — | configured administrator or managed broker access key; tool calls follow its permissions |
+| `MQLITE_TOKEN` | — | configured administrator, monitor credential, or managed broker access key; tool calls follow its permissions |
 
 ## Connect an agent host
 
@@ -48,6 +48,7 @@ models misuse them):
 
 | Tool | Does |
 |---|---|
+| `observe` | complete canonical observation; takes no arguments; requires monitor or manage |
 | `list_queues` | list queues/subscriptions |
 | `create_queue` | create/update a queue by name |
 | `send` | send a message (`queue`, `body`, optional `message_id`/`group_id`) |
@@ -68,6 +69,24 @@ models misuse them):
 
 Settlement is by `lock_token` from `receive` — delivery is at-least-once, so an agent
 should treat handlers as idempotent. Full HTTP semantics: [api-reference.md](api-reference.md).
+
+## Read-only observation
+
+The `observe` tool requires **v0.3.2 or later** of both `mqlite-mcp` and the broker.
+Configured monitor credentials also require a v0.3.2 or later broker.
+
+Call `observe` with `{}` to get the same canonical JSON snapshot as the HTTP route,
+Go SDK and CLI: availability/freshness, queue gauges, process message effects,
+storage operations, maintenance, filters and HTTP measurements. The tool does not
+recompute counters. An unavailable queue collection remains explicit even when the
+HTTP request succeeds; inspect `collection.state` and runtime availability flags.
+Process counters reset when the broker restarts. See [observability.md](observability.md).
+
+Use a credential configured in the broker's `MQLITE_MONITOR_TOKENS` as this process's
+`MQLITE_TOKEN` for a read-only monitoring agent. The tool inventory stays the same,
+but the broker permits only `observe` for this credential; other tool calls return
+`permission_denied`. Managed `send`/`listen` credentials cannot observe the whole
+broker, and monitor is not a managed-key permission.
 
 ## Access key management
 

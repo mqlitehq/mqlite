@@ -254,3 +254,40 @@ jobs:
           go-version: stable
       - name: crash-recovery suite
         run: go test -race -tags crash_injection -count=1 ./test/crash/
+
+  observability:
+    name: observability (Prometheus + Grafana + fault recovery)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the actual candidate broker
+        run: docker build --platform linux/amd64 -t mqlite-observability:local .
+      - name: Initialize isolated credentials and persistent directories
+        run: python3 ops/observability/init.py
+      - name: Validate configuration and exposition contracts
+        run: python3 test/observability/check_config.py
+      - name: Start the provisioned stack
+        working-directory: ops/observability
+        run: docker compose up -d --no-build --wait --wait-timeout 180
+      - name: Verify real ingestion, dashboards and recovery
+        run: |
+          set -o pipefail
+          python3 test/observability/verify.py --faults \
+            --output "$RUNNER_TEMP/observability-proof.json" 2>&1 | tee "$RUNNER_TEMP/observability.log"
+      - name: Preserve non-secret verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: observability-verification
+          path: |
+            ${{ runner.temp }}/observability-proof.json
+            ${{ runner.temp }}/observability.log
+          retention-days: 14
+      - name: Stop this stack
+        if: always()
+        working-directory: ops/observability
+        run: |
+          if [ -f .env ]; then
+            docker compose down --remove-orphans
+          fi

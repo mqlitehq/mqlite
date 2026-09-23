@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite"
+	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
 
@@ -444,4 +445,50 @@ func parseProps(csv string) (map[string]string, error) {
 		props[strings.TrimSpace(k)] = v
 	}
 	return props, nil
+}
+
+// cmdObserve emits the canonical response without reconstructing business counters.
+func cmdObserve(ctx context.Context, args []string) error {
+	fs := newFlags("observe")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 0 {
+		return fmt.Errorf("usage: observe (takes no arguments)")
+	}
+	c, err := dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	observation, err := c.Observe(ctx)
+	if err != nil {
+		return err
+	}
+	// The observation is a structured inventory; JSON is also the human default.
+	// This preserves every canonical domain and explicit availability state.
+	return emitJSON(observation)
+}
+
+func resolveMonitorTokens(env, admins string) ([]string, error) {
+	if strings.TrimSpace(env) == "" {
+		return nil, nil
+	}
+	var tokens []string
+	for _, token := range strings.Split(env, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+
+		tokens = append(tokens, token)
+	}
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("MQLITE_MONITOR_TOKENS contains no usable token")
+	}
+	if err := server.ValidateMonitorTokens(strings.Split(admins, ","), tokens); err != nil {
+		return nil, fmt.Errorf("MQLITE_MONITOR_TOKENS: %w", err)
+	}
+	return tokens, nil
 }

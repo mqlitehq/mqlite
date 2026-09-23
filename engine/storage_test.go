@@ -2109,3 +2109,502 @@ func BenchmarkAccessKeyAuthentication(b *testing.B) {
 		})
 	}
 }
+
+// ─── Unified observation contract and failure isolation (MQLITE-124) ───────────
+
+func TestObservabilitySnapshotAndCompatibility(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "q", QueueConfig{})
+	mustQueue(t, e, "empty", QueueConfig{})
+	if err := e.Subscribe(ctx, "topic", "subscription", nil); err != nil {
+		t.Fatal(err)
+	}
+	// The schema deliberately still permits completed. It must remain part of Total.
+	for _, state := range []string{"active", "locked", "scheduled", "deferred", "dead_lettered", "completed"} {
+		if _, err := e.db.exec(ctx, `INSERT INTO messages(queue,state,enqueued_at,body) VALUES('q',?,?,?)`, state, *clock-1000, []byte{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := e.db.storage.snapshot(e.db.sql.Stats())
+	s := e.Observability(ctx)
+	if s.Collection.State != "available" || s.Collection.LastSuccessAtMs != *clock || s.SampledAtMs != *clock || s.StartedAtMs != *clock || s.Backend != "local" {
+		t.Fatalf("snapshot %+v", s)
+	}
+	if s.QueueCount != 2 || s.SubscriptionCount != 1 || len(s.Queues) != 3 || len(s.Messages) != 3*len(MessageEventNames()) {
+		t.Fatalf("inventory %+v", s)
+	}
+	var q QueueObservation
+	for _, row := range s.Queues {
+		if row.Queue == "q" {
+			q = row
+		}
+	}
+	if q.Total != 6 || q.Unexpected != 1 || q.Active != 1 || q.Locked != 1 || q.Deferred != 1 || q.Scheduled != 1 || q.DeadLettered != 1 || q.OldestMessageAgeMs != 1000 {
+		t.Fatalf("queue %+v", q)
+	}
+	legacy, err := e.Stats(ctx, "q")
+	if err != nil || !reflect.DeepEqual(legacy, q.Metrics) {
+		t.Fatalf("legacy %+v %v", legacy, err)
+	}
+	count := func(ops []StorageOperation) uint64 {
+		var n uint64
+		for _, o := range ops {
+			if o.Operation == "read" {
+				n += o.Duration.Count
+			}
+		}
+		return n
+	}
+	if delta := count(s.Storage.Operations) - count(before.Operations); delta != 2 {
+		t.Fatalf("snapshot did %d reads, want fixed probe+aggregate", delta)
+	}
+	if !s.Runtime.ReadAvailable || s.Runtime.PingSeconds < 0 || !s.Runtime.DBSizeAvailable || s.Runtime.DBSizeBytes <= 0 || s.Runtime.SchemaVersion != schemaVersion {
+		t.Fatalf("runtime %+v", s.Runtime)
+	}
+	// Snapshot slices are copies, and one sampling failure cannot publish fake zero queues.
+	s.Storage.Operations[0].Duration.BucketCounts[0] = 99999
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	failed := e.Observability(canceled)
+	if failed.Queues != nil || failed.Collection.State != "unavailable" || failed.Collection.ErrorCode != "canceled" || failed.Collection.LastSuccessAtMs != *clock || failed.Runtime.ReadAvailable {
+		t.Fatalf("failed %+v", failed)
+	}
+	if len(failed.Messages) != len(s.Messages) {
+		t.Fatal("lost known zero counters on collection failure")
+	}
+	for _, op := range failed.Storage.Operations {
+		for _, b := range op.Duration.BucketCounts {
+			if b == 99999 {
+				t.Fatal("snapshot aliases storage state")
+			}
+		}
+	}
+	_, queues, subscriptions := e.RuntimeStatus(ctx)
+	if queues != 2 || subscriptions != 1 {
+		t.Fatal("legacy runtime inventory diverged")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed := e.Observability(ctx)
+	if closed.Collection.ErrorCode != "closed" || closed.Queues != nil || closed.Runtime.ReadAvailable || len(closed.Messages) != len(s.Messages) {
+		t.Fatalf("closed %+v", closed)
+	}
+}
+
+func TestObservabilityTransactionRetriesAndUnknownOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		failures      int
+		commitErr     error
+		want          uint64
+		outcome, code string
+		retries       uint64
+	}{
+		{"safe replay", 2, nil, 1, "ok", "", 2},
+		{"exhausted", 6, nil, 0, "error", "busy", 5},
+		{"unknown", 0, io.EOF, 0, "outcome_unknown", "outcome_unknown", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, state := remoteDBFailingFirst(t, tc.failures)
+			state.commitErr = tc.commitErr
+			e := &Engine{db: d}
+			err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error { tx.record("q", "enqueued", 1); return nil })
+			if tc.want == 1 && err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == 0 && err == nil {
+				t.Fatal("missing injected failure")
+			}
+			if got := e.observation.events[eventKey{"q", "enqueued"}]; got != tc.want {
+				t.Fatalf("committed effects=%d want%d", got, tc.want)
+			}
+			s := d.storage.snapshot(d.sql.Stats())
+			ops := nonzeroStorageOperations(s)
+			if len(ops) != 1 {
+				t.Fatalf("ops %+v", ops)
+			}
+			op := ops[0]
+			if op.Operation != "transaction" || op.Outcome != tc.outcome || op.ErrorCode != tc.code || op.Retries != tc.retries || op.Duration.Count != 1 {
+				t.Fatalf("op %+v", op)
+			}
+		})
+	}
+}
+
+func TestObservabilityStorageClassificationAndHistogram(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{nil, ""}, {sql.ErrNoRows, ""}, {context.Canceled, "canceled"}, {context.DeadlineExceeded, "canceled"}, {ErrClosed, "closed"},
+		{errors.New("database is locked"), "busy"}, {io.EOF, "connection"}, {ErrOutcomeUnknown, "outcome_unknown"}, {ErrLockLost, "application"},
+		{errors.New("SQLITE_FULL secret must not become label"), "full"}, {errors.New("SQLITE_CORRUPT"), "corrupt"}, {errors.New("SQLITE_IOERR"), "io"}, {errors.New("private DSN"), "other"},
+	} {
+		if got := storageErrorCode(tc.err); got != tc.code {
+			t.Fatalf("code=%q want %q", got, tc.code)
+		}
+	}
+	var h DurationHistogram
+	h.observe(500 * time.Microsecond)
+	h.observe(time.Second)
+	h.observe(21 * time.Second)
+	if h.Count != 3 || h.SumSeconds != 22.0005 || h.BucketCounts[0] != 1 || h.BucketCounts[len(h.BucketCounts)-1] != 2 {
+		t.Fatalf("hist %+v", h)
+	}
+	e, _ := testEngine(t)
+	if err := e.inTx(context.Background(), func(context.Context, *txn) error { return ErrInvalidArgument }); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatal(err)
+	}
+	found := false
+	for _, op := range e.db.storage.snapshot(e.db.sql.Stats()).Operations {
+		if op.Outcome == "rejected" && op.ErrorCode == "application" && op.Duration.Count == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("application rejection was classified as storage failure")
+	}
+}
+
+func TestObservabilityMaintenanceFailuresAndFilterOutcomes(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	e.RunMaintenanceOnce(ctx)
+	s := e.Observability(ctx)
+	if len(s.Maintenance) != 7 {
+		t.Fatalf("maintenance=%d", len(s.Maintenance))
+	}
+	for _, m := range s.Maintenance {
+		if m.Enabled || m.Runs != 1 || m.Failures != 0 || m.LastSuccessAtMs != *clock || m.Duration.Count != 1 {
+			t.Fatalf("maintenance %+v", m)
+		}
+	}
+	if _, err := e.db.exec(ctx, "DROP TABLE messages"); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Second)
+	e.RunMaintenanceOnce(ctx)
+	failed := e.Observability(ctx)
+	for _, m := range failed.Maintenance {
+		if m.Task == "locks" || m.Task == "scheduled" || m.Task == "ttl" || m.Task == "retention" {
+			if m.Failures != 1 || m.Runs != 2 || m.LastSuccessAtMs == *clock {
+				t.Fatalf("failure masked %+v", m)
+			}
+		}
+	}
+	// Filter failures are bounded attempt counters, separate from normal nonmatches.
+	e2, _ := testEngine(t)
+	bad := target{name: "sub", entry: &filterEntry{err: errors.New("private filter error")}}
+	if e2.filterAccepts(bad, OutMessage{}, 0, 0) {
+		t.Fatal("compile failure matched")
+	}
+	prog, err := compileFilter(`subject_parts[9] == "x"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2.filterAccepts(target{name: "sub", entry: &filterEntry{prog: prog}}, OutMessage{Subject: "one"}, 0, 0) {
+		t.Fatal("evaluation failure matched")
+	}
+	filters := e2.Observability(ctx).Filters
+	if filters[0].Count != 1 || filters[1].Count != 1 {
+		t.Fatalf("filter counters %+v", filters)
+	}
+}
+
+func TestObservabilityAuthenticationReasons(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	opts := accessKeyOptions(500)
+	opts.ExpiresAtMs = *clock + 1000
+	key, secret, err := e.CreateAccessKey(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(token, want string, wantErr error) {
+		t.Helper()
+		_, reason, err := e.AuthenticateAccessKeyWithOutcome(ctx, token)
+		if reason != want || !errors.Is(err, wantErr) {
+			t.Fatalf("reason=%s error=%v", reason, err)
+		}
+		_, legacy := e.AuthenticateAccessKey(ctx, token)
+		if !errors.Is(legacy, wantErr) {
+			t.Fatalf("legacy error=%v", legacy)
+		}
+	}
+	check("invalid", "invalid", ErrUnauthenticated)
+	check("mqk_"+strings.Repeat("f", 64), "invalid", ErrUnauthenticated)
+	check(secret, "success", nil)
+	advance(clock, time.Second)
+	check(secret, "expired", ErrUnauthenticated)
+	if err := e.RevokeAccessKey(ctx, key.ID); err != nil {
+		t.Fatal(err)
+	}
+	check(secret, "revoked", ErrUnauthenticated)
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	check(secret, "backend_error", ErrClosed)
+}
+
+func TestObservabilityAgeUsesPostReadClock(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{}); err != nil {
+		t.Fatal(err)
+	}
+	afterConnAcquired = func() { advance(clock, time.Second) }
+	t.Cleanup(func() { afterConnAcquired = nil })
+	m, err := e.Stats(ctx, "q")
+	if err != nil || m.OldestMessageAgeMs != 1000 {
+		t.Fatalf("age=%d err=%v", m.OldestMessageAgeMs, err)
+	}
+	snapshot := e.Observability(ctx)
+	if snapshot.SampledAtMs != *clock || snapshot.Queues[0].OldestMessageAgeMs != 3000 {
+		t.Fatalf("sampling clock mismatch sampled=%d clock=%d age=%d", snapshot.SampledAtMs, *clock, snapshot.Queues[0].OldestMessageAgeMs)
+	}
+}
+
+func TestObservabilityConcurrentSnapshots(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "q", QueueConfig{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if _, err := e.SendOne(ctx, "q", OutMessage{}); err != nil {
+					errs <- err
+					return
+				}
+				rows, err := e.Receive(ctx, "q", ReceiveOptions{})
+				if err != nil {
+					errs <- err
+					return
+				}
+				for _, m := range rows {
+					if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	for {
+		s := e.Observability(ctx)
+		if s.Collection.State != "available" {
+			t.Fatal(s.Collection)
+		}
+		for _, op := range s.Storage.Operations {
+			var previous uint64
+			for _, bucket := range op.Duration.BucketCounts {
+				if bucket < previous || bucket > op.Duration.Count {
+					t.Fatalf("incoherent histogram %+v", op.Duration)
+				}
+				previous = bucket
+			}
+		}
+		select {
+		case <-done:
+			close(errs)
+			for err := range errs {
+				t.Fatal(err)
+			}
+			requireEvents(t, e, "q", map[string]uint64{"enqueued": 80, "delivered": 80, "completed": 80})
+			return
+		default:
+		}
+	}
+}
+
+func TestObservabilityUserTransactionRejections(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		callback      func(*EngineTx) error
+		outcome, code string
+	}{
+		{"business", func(*EngineTx) error { return errors.New("business rule") }, "rejected", "application"},
+		{"business wrapped transport", func(*EngineTx) error { return fmt.Errorf("external dependency: %w", io.EOF) }, "rejected", "application"},
+		{"canceled", func(*EngineTx) error { return context.Canceled }, "error", "canceled"},
+		{"missing business row", func(tx *EngineTx) error {
+			var value int
+			return tx.tx.QueryRowContext(tx.Context(), "SELECT 1 WHERE 0").Scan(&value)
+		}, "rejected", "application"},
+		{"statement", func(tx *EngineTx) error {
+			_, err := tx.tx.ExecContext(tx.Context(), "SELECT * FROM missing_table")
+			return fmt.Errorf("enqueue failed: %w", err)
+		}, "error", "other"},
+		{"query", func(tx *EngineTx) error {
+			_, err := tx.tx.QueryContext(tx.Context(), "SELECT * FROM missing_table")
+			return err
+		}, "error", "other"},
+		{"scan", func(tx *EngineTx) error {
+			var value int
+			return tx.tx.QueryRowContext(tx.Context(), "SELECT * FROM missing_table").Scan(&value)
+		}, "error", "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{})
+			e.db.storage.mu.Lock()
+			e.db.storage.operations = nil
+			e.db.storage.mu.Unlock()
+			err := e.Tx(context.Background(), func(tx *EngineTx) error {
+				if _, err := tx.SendOne("q", OutMessage{}); err != nil {
+					return err
+				}
+				return tc.callback(tx)
+			})
+			if err == nil {
+				t.Fatal("missing rejection")
+			}
+			ops := nonzeroStorageOperations(e.db.storage.snapshot(e.db.sql.Stats()))
+			if len(ops) != 1 || ops[0].Outcome != tc.outcome || ops[0].ErrorCode != tc.code || ops[0].Duration.Count != 1 {
+				t.Fatalf("operations %+v", ops)
+			}
+			requireEvents(t, e, "q", map[string]uint64{})
+		})
+	}
+	t.Run("callback retry cannot mask unknown commit", func(t *testing.T) {
+		d, state := remoteDBFailingFirst(t, 0)
+		state.commitErr = io.EOF
+		e := &Engine{db: d, now: func() int64 { return 1 }}
+		calls := 0
+		err := e.Tx(context.Background(), func(*EngineTx) error {
+			calls++
+			if calls == 1 {
+				return io.EOF
+			}
+			return nil
+		})
+		if !errors.Is(err, ErrOutcomeUnknown) || calls != 2 {
+			t.Fatalf("calls=%d error=%v", calls, err)
+		}
+		ops := nonzeroStorageOperations(d.storage.snapshot(d.sql.Stats()))
+		if len(ops) != 1 || ops[0].Outcome != "outcome_unknown" || ops[0].Retries != 1 {
+			t.Fatalf("operations %+v", ops)
+		}
+	})
+}
+
+func TestObservabilityMaintenanceInterrupted(t *testing.T) {
+	e, clock := testEngine(t)
+	e.runMaintenance(context.Background(), "locks", func(context.Context) {})
+	lastSuccess := *clock
+	advance(clock, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.runMaintenance(ctx, "locks", func(context.Context) {})
+	e.runMaintenance(context.Background(), "locks", func(ctx context.Context) { markMaintenanceFailure(ctx, ErrClosed) })
+	for _, m := range e.Observability(context.Background()).Maintenance {
+		if m.Task == "locks" && (m.Runs != 3 || m.Interrupted != 2 || m.Failures != 0 || m.LastSuccessAtMs != lastSuccess || m.Duration.Count != 3) {
+			t.Fatalf("interruption counted as successful maintenance: %+v", m)
+		}
+	}
+}
+
+func TestObservabilityFreshStoreHasNoStorageErrors(t *testing.T) {
+	for _, dsn := range []string{":memory:", filepath.Join(t.TempDir(), "fresh.db")} {
+		for attempt := 0; attempt < 2; attempt++ {
+			e, err := Open(context.Background(), Options{DB: dsn, DisableBackground: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, op := range e.Observability(context.Background()).Storage.Operations {
+				if op.Duration.Count > 0 && (op.Outcome != "ok" || op.ErrorCode != "") {
+					t.Errorf("normal fresh/reopen operation: %+v", op)
+				}
+			}
+			if err := e.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func nonzeroStorageOperations(s StorageObservation) []StorageOperation {
+	var out []StorageOperation
+	for _, op := range s.Operations {
+		if op.Duration.Count > 0 {
+			out = append(out, op)
+		}
+	}
+	return out
+}
+
+func TestObservabilityStorageStartsAtZeroForFirstFailure(t *testing.T) {
+	var d db
+	before := d.storage.snapshot(sql.DBStats{})
+	if len(before.Operations) != 33 {
+		t.Fatalf("finite tuple count=%d", len(before.Operations))
+	}
+	seen := map[storageKey]bool{}
+	for _, op := range before.Operations {
+		key := storageKey{op.Operation, op.Outcome, op.ErrorCode}
+		if seen[key] || op.Duration.Count != 0 || op.Duration.SumSeconds != 0 || op.Retries != 0 || !reflect.DeepEqual(op.Duration, newDurationHistogram()) {
+			t.Fatalf("invalid initial operation %+v", op)
+		}
+		seen[key] = true
+	}
+	for _, operation := range []string{"read", "write", "transaction"} {
+		for _, pair := range [][2]string{{"ok", ""}, {"rejected", "application"}, {"outcome_unknown", "outcome_unknown"}, {"error", "canceled"}, {"error", "closed"}, {"error", "busy"}, {"error", "connection"}, {"error", "full"}, {"error", "corrupt"}, {"error", "io"}, {"error", "other"}} {
+			if !seen[storageKey{operation, pair[0], pair[1]}] {
+				t.Fatalf("missing initial tuple %s %v", operation, pair)
+			}
+		}
+	}
+	_, attempt := startStorage(context.Background(), "transaction")
+	d.finishStorage(attempt, ErrOutcomeUnknown)
+	after := d.storage.snapshot(sql.DBStats{})
+	if len(after.Operations) != len(before.Operations) {
+		t.Fatal("first failure introduced a previously absent series")
+	}
+	var increments uint64
+	for i, op := range after.Operations {
+		prior := before.Operations[i]
+		if op.Operation != prior.Operation || op.Outcome != prior.Outcome || op.ErrorCode != prior.ErrorCode {
+			t.Fatal("tuple order changed")
+		}
+		increments += op.Duration.Count - prior.Duration.Count
+		if op.Outcome == "outcome_unknown" && op.Operation == "transaction" && op.Duration.Count != 1 {
+			t.Fatal("first unknown not observable from prior zero")
+		}
+	}
+	if increments != 1 {
+		t.Fatalf("increments=%d", increments)
+	}
+}
+
+func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
+	e, _ := testEngine(t)
+	for _, queue := range []*string{nil, func() *string { q := "q"; return &q }()} {
+		query, args := queueSnapshotQuery(queue)
+		var plan []string
+		err := e.db.queryRows(context.Background(), "EXPLAIN QUERY PLAN "+query, func(rows *sql.Rows) error {
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					return err
+				}
+				plan = append(plan, detail)
+			}
+			return rows.Err()
+		}, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(plan, "\n")
+		if !strings.Contains(joined, "MATERIALIZE m") || strings.Count(joined, "SCAN messages") != 1 || strings.Index(joined, "SCAN messages") > strings.Index(joined, "LEFT-JOIN") {
+			t.Fatalf("messages must be aggregated once before inventory join:\n%s", joined)
+		}
+	}
+}

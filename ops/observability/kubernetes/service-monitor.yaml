@@ -1,0 +1,25 @@
+# Requires Prometheus Operator. The operator's namespace/label selectors must
+# include this object. The Secret must be in this same namespace.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mqlite
+  labels:
+    app: mqlite
+spec:
+  jobLabel: app
+  selector:
+    matchLabels:
+      app: mqlite
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      authorization:
+        type: Bearer
+        credentials:
+          name: mqlite-monitor-token
+          key: token
+      # Use scheme: https and tlsConfig with your CA when TLS is terminated
+      # at the selected service. This example uses the broker's private HTTP port.

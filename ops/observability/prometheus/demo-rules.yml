@@ -1,0 +1,11 @@
+# Local scenario only. Do not copy this short threshold into production policy.
+groups:
+  - name: mqlite-demo
+    rules:
+      - alert: MQLiteDemoDeadLetter
+        expr: mqlite_queue_messages{job="mqlite",queue="obsdemo-alert",state="dead_lettered"} > 0
+        for: 10s
+        labels: {severity: info, purpose: demo}
+        annotations:
+          summary: Demonstration dead letter is retained
+          description: The scenario verifier rejects a message, observes firing, and redrives it to resolve this alert.

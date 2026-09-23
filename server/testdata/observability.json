@@ -1,0 +1,4471 @@
+{
+  "sampled_at_ms": 1700000002500,
+  "started_at_ms": 1700000000000,
+  "backend": "local",
+  "runtime": {
+    "schema_version": "5",
+    "ping_seconds": 0.00125,
+    "read_available": true,
+    "db_size_bytes": 123456,
+    "db_size_available": true
+  },
+  "collection": {
+    "state": "available",
+    "last_success_at_ms": 1700000002500,
+    "duration_seconds": 0.0015,
+    "error_code": ""
+  },
+  "queue_count": 1,
+  "subscription_count": 1,
+  "queues": [
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "active": 1,
+      "locked": 2,
+      "deferred": 3,
+      "scheduled": 4,
+      "dead_lettered": 5,
+      "total": 21,
+      "oldest_message_age_ms": 1250,
+      "kind": "queue",
+      "unexpected": 6
+    },
+    {
+      "queue": "worker",
+      "active": 0,
+      "locked": 0,
+      "deferred": 0,
+      "scheduled": 0,
+      "dead_lettered": 0,
+      "total": 0,
+      "oldest_message_age_ms": 0,
+      "kind": "subscription",
+      "unexpected": 0
+    }
+  ],
+  "messages": [
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "enqueued",
+      "count": 1
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "scheduled",
+      "count": 2
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "deduplicated",
+      "count": 3
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "dedup_conflict",
+      "count": 4
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "delivered",
+      "count": 5
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "redelivered",
+      "count": 6
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "completed",
+      "count": 7
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "receive_deleted",
+      "count": 8
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "abandoned",
+      "count": 9
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "deferred",
+      "count": 10
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "rejected",
+      "count": 11
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "dead_lettered",
+      "count": 12
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "ttl_discarded",
+      "count": 13
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "retention_deleted",
+      "count": 14
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "purged",
+      "count": 15
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "canceled",
+      "count": 16
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "redriven",
+      "count": 17
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "lock_expired",
+      "count": 18
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "recovered",
+      "count": 19
+    },
+    {
+      "queue": "orders\tline\n\"quote\\雪",
+      "event": "activated",
+      "count": 20
+    },
+    {
+      "queue": "worker",
+      "event": "enqueued",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "scheduled",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "deduplicated",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "dedup_conflict",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "delivered",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "redelivered",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "completed",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "receive_deleted",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "abandoned",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "deferred",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "rejected",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "dead_lettered",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "ttl_discarded",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "retention_deleted",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "purged",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "canceled",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "redriven",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "lock_expired",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "recovered",
+      "count": 0
+    },
+    {
+      "queue": "worker",
+      "event": "activated",
+      "count": 0
+    }
+  ],
+  "storage": {
+    "operations": [
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "busy",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "canceled",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "closed",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "connection",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "corrupt",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "full",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "io",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "error",
+        "error_code": "other",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "ok",
+        "error_code": "",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "count": 5,
+          "sum_seconds": 0.01
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "outcome_unknown",
+        "error_code": "outcome_unknown",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "read",
+        "outcome": "rejected",
+        "error_code": "application",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "busy",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "canceled",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "closed",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "connection",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "corrupt",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "full",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "io",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "error",
+        "error_code": "other",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "ok",
+        "error_code": "",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "outcome_unknown",
+        "error_code": "outcome_unknown",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "transaction",
+        "outcome": "rejected",
+        "error_code": "application",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "busy",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "canceled",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "closed",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "connection",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "corrupt",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "full",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            1,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "count": 3,
+          "sum_seconds": 0.006
+        },
+        "retries": 2
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "io",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "error",
+        "error_code": "other",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "ok",
+        "error_code": "",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "outcome_unknown",
+        "error_code": "outcome_unknown",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      },
+      {
+        "operation": "write",
+        "outcome": "rejected",
+        "error_code": "application",
+        "duration": {
+          "bounds_seconds": [
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "count": 0,
+          "sum_seconds": 0
+        },
+        "retries": 0
+      }
+    ],
+    "pool": {
+      "max_open": 4,
+      "open": 3,
+      "in_use": 2,
+      "idle": 1,
+      "wait_count": 7,
+      "wait_duration_seconds": 0.025
+    }
+  },
+  "maintenance": [
+    {
+      "enabled": true,
+      "task": "locks",
+      "runs": 8,
+      "interrupted": 1,
+      "failures": 0,
+      "last_success_at_ms": 1700000000100,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        "count": 8,
+        "sum_seconds": 0.016
+      }
+    },
+    {
+      "enabled": true,
+      "task": "scheduled",
+      "runs": 9,
+      "interrupted": 1,
+      "failures": 1,
+      "last_success_at_ms": 1700000000110,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          9,
+          9,
+          9,
+          9
+        ],
+        "count": 9,
+        "sum_seconds": 0.018000000000000002
+      }
+    },
+    {
+      "enabled": true,
+      "task": "ttl",
+      "runs": 10,
+      "interrupted": 1,
+      "failures": 2,
+      "last_success_at_ms": 1700000000120,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          10,
+          10,
+          10
+        ],
+        "count": 10,
+        "sum_seconds": 0.02
+      }
+    },
+    {
+      "enabled": true,
+      "task": "dedup",
+      "runs": 11,
+      "interrupted": 1,
+      "failures": 3,
+      "last_success_at_ms": 1700000000130,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          11,
+          11
+        ],
+        "count": 11,
+        "sum_seconds": 0.022
+      }
+    },
+    {
+      "enabled": true,
+      "task": "receipts",
+      "runs": 12,
+      "interrupted": 1,
+      "failures": 4,
+      "last_success_at_ms": 1700000000140,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          12
+        ],
+        "count": 12,
+        "sum_seconds": 0.024
+      }
+    },
+    {
+      "enabled": true,
+      "task": "retention",
+      "runs": 13,
+      "interrupted": 1,
+      "failures": 5,
+      "last_success_at_ms": 1700000000150,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "count": 13,
+        "sum_seconds": 0.026000000000000002
+      }
+    },
+    {
+      "enabled": false,
+      "task": "reclaim",
+      "runs": 14,
+      "interrupted": 1,
+      "failures": 6,
+      "last_success_at_ms": 1700000000160,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "count": 14,
+        "sum_seconds": 0.028
+      }
+    }
+  ],
+  "filters": [
+    {
+      "stage": "compile",
+      "count": 2
+    },
+    {
+      "stage": "evaluate",
+      "count": 3
+    }
+  ],
+  "version": "0.3.2",
+  "access": "monitor",
+  "http": {
+    "state": "available",
+    "requests": [
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/CreateQueue",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListQueues",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/ListSubscriptions",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "ok",
+        "count": 4,
+        "duration_seconds": 0.025
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Observe",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Purge",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Redrive",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Status",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/Subscribe",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AdminService/TestFilter",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/CreateKey",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/ListKeys",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "AuthService/RevokeKey",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Abandon",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Cancel",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Complete",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/CompleteBatch",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Defer",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Peek",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "permission_denied",
+        "count": 1,
+        "duration_seconds": 0.0002
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Receive",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/ReceiveDeferred",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Reject",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Renew",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/RenewBatch",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Schedule",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "ok",
+        "count": 2,
+        "duration_seconds": 0.02
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Send",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "already_exists",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "canceled",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "group_required",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "internal",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "invalid_argument",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "key_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "lock_lost",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "message_too_large",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "name_conflict",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "not_found",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "ok",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "outcome_unknown",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "permission_denied",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "unauthenticated",
+        "count": 0,
+        "duration_seconds": 0
+      },
+      {
+        "rpc": "QueueService/Stats",
+        "code": "unimplemented",
+        "count": 0,
+        "duration_seconds": 0
+      }
+    ],
+    "authentication": [
+      {
+        "outcome": "success",
+        "count": 0
+      },
+      {
+        "outcome": "missing",
+        "count": 1
+      },
+      {
+        "outcome": "invalid",
+        "count": 2
+      },
+      {
+        "outcome": "expired",
+        "count": 3
+      },
+      {
+        "outcome": "revoked",
+        "count": 4
+      },
+      {
+        "outcome": "permission_denied",
+        "count": 5
+      },
+      {
+        "outcome": "backend_error",
+        "count": 6
+      }
+    ],
+    "handler_latency": [
+      {
+        "rpc": "AdminService/Observe",
+        "buckets": [
+          {
+            "upper_bound_seconds": 0.001,
+            "count": 0
+          },
+          {
+            "upper_bound_seconds": 0.0025,
+            "count": 1
+          },
+          {
+            "upper_bound_seconds": 0.005,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 0.01,
+            "count": 3
+          },
+          {
+            "upper_bound_seconds": 0.025,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 0.05,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 0.1,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 0.25,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 0.5,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 1,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 2.5,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 5,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 10,
+            "count": 4
+          },
+          {
+            "upper_bound_seconds": 20,
+            "count": 4
+          }
+        ],
+        "count": 4,
+        "sum_seconds": 0.008
+      },
+      {
+        "rpc": "QueueService/Send",
+        "buckets": [
+          {
+            "upper_bound_seconds": 0.001,
+            "count": 0
+          },
+          {
+            "upper_bound_seconds": 0.0025,
+            "count": 1
+          },
+          {
+            "upper_bound_seconds": 0.005,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 0.01,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 0.025,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 0.05,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 0.1,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 0.25,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 0.5,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 1,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 2.5,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 5,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 10,
+            "count": 2
+          },
+          {
+            "upper_bound_seconds": 20,
+            "count": 2
+          }
+        ],
+        "count": 2,
+        "sum_seconds": 0.004
+      }
+    ]
+  }
+}

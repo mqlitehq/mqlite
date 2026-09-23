@@ -238,24 +238,24 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 		{"/mqlite.v1.AdminService/Redrive", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Purge", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Status", engine.KeyManage},
+		{"/mqlite.v1.AdminService/Observe", engine.KeyManage},
 		{"/mqlite.v1.AuthService/CreateKey", engine.KeyManage},
 		{"/mqlite.v1.AuthService/ListKeys", engine.KeyManage},
 		{"/mqlite.v1.AuthService/RevokeKey", engine.KeyManage},
-		{"/metrics", engine.KeyManage},
 	}
 	inventory := keyTestRequest(server.New(keyTestEngine(t, nil), []string{"admin"}).Handler(), http.MethodGet, "/", "", nil)
 	var card wire.DiscoveryCard
 	if err := json.Unmarshal(inventory.Body.Bytes(), &card); err != nil {
 		t.Fatal(err)
 	}
-	paths := make([]string, len(routes)-1)
+	paths := make([]string, len(routes))
 	for i := range paths {
 		paths[i] = routes[i].path
 	}
 	if !reflect.DeepEqual(card.Endpoints, paths) {
 		t.Fatalf("complete route inventory drift:\n got %v\nwant %v", card.Endpoints, paths)
 	}
-	for _, identity := range []string{"anonymous", "invalid", "send", "listen", "send+listen", "manage", "static", "expired", "revoked", "auth-off"} {
+	for _, identity := range []string{"anonymous", "invalid", "send", "listen", "send+listen", "manage", "static", "monitor", "expired", "revoked", "auth-off"} {
 		for _, route := range routes {
 			t.Run(identity+"/"+route.path, func(t *testing.T) {
 				ctx := context.Background()
@@ -388,6 +388,10 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 					tokens = nil
 				}
 				srv := server.New(eng, tokens)
+				if identity == "monitor" {
+					srv.MonitorTokens = []string{"monitor"}
+					token = "monitor"
+				}
 				srv.CORS = "*"
 				rec := keyTestRequest(srv.Handler(), http.MethodPost, route.path, token, body)
 				want, code := http.StatusOK, ""
@@ -395,7 +399,11 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 				case "anonymous", "invalid", "expired", "revoked":
 					want, code = http.StatusUnauthorized, "unauthenticated"
 				case "auth-off":
-					if strings.HasPrefix(route.path, "/mqlite.v1.AuthService/") {
+					if strings.HasPrefix(route.path, "/mqlite.v1.AuthService/") || route.path == wire.PathObserve {
+						want, code = http.StatusForbidden, "permission_denied"
+					}
+				case "monitor":
+					if route.path != wire.PathObserve {
 						want, code = http.StatusForbidden, "permission_denied"
 					}
 				default:
@@ -421,6 +429,7 @@ func TestAccessKeyStrictBearerAndOpenPaths(t *testing.T) {
 	srv := server.New(eng, []string{"Legacy-Admin"})
 	srv.CORS = "*"
 	srv.UI = true
+	srv.Metrics = true
 	h := srv.Handler()
 	for _, tt := range []struct {
 		name    string
@@ -443,15 +452,17 @@ func TestAccessKeyStrictBearerAndOpenPaths(t *testing.T) {
 		{"restricted dynamic", []string{"Bearer " + token}, 403},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, wire.PathListKeys, strings.NewReader(`{}`))
-			for _, header := range tt.headers {
-				req.Header.Add("Authorization", header)
-			}
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
-			keyTestStatus(t, rec, tt.status, "")
-			if strings.Contains(rec.Body.String(), token) || strings.Contains(rec.Body.String(), "Legacy-Admin") {
-				t.Fatal("credential exposed in response")
+			for _, route := range []struct{ method, path string }{{http.MethodPost, wire.PathListKeys}, {http.MethodGet, "/metrics"}} {
+				req := httptest.NewRequest(route.method, route.path, strings.NewReader(`{}`))
+				for _, header := range tt.headers {
+					req.Header.Add("Authorization", header)
+				}
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				keyTestStatus(t, rec, tt.status, "")
+				if strings.Contains(rec.Body.String(), token) || strings.Contains(rec.Body.String(), "Legacy-Admin") {
+					t.Fatal("credential exposed in response")
+				}
 			}
 		})
 	}
@@ -478,7 +489,7 @@ func TestAccessKeyStrictBearerAndOpenPaths(t *testing.T) {
 			want = 405
 		}
 		keyTestStatus(t, keyTestRequest(h, http.MethodGet, wire.PathListKeys, tok, nil), want, "")
-		for _, path := range append(append([]string{}, wantRPCRoutes...), "/metrics", "/uixyz") {
+		for _, path := range append(append([]string{}, wantRPCRoutes...), "/uixyz", "/metrics") {
 			req := httptest.NewRequest(http.MethodOptions, path, nil)
 			req.Header.Set("Origin", "https://example.test")
 			req.Header.Set("Access-Control-Request-Method", "POST")

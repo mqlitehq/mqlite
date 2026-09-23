@@ -69,7 +69,7 @@ func TestToolsList(t *testing.T) {
 			t.Fatalf("tool %v has no inputSchema", td["name"])
 		}
 	}
-	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "list_keys", "list_queues", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats"}
+	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "list_keys", "list_queues", "observe", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats"}
 	got := make([]string, 0, len(names))
 	for name := range names {
 		got = append(got, name)
@@ -260,6 +260,7 @@ func wireShape(t reflect.Type) []string {
 // it (then update this golden). Closes gap 1-reverse in docs/mcp-wire-compat-notes.md.
 var goldenWireShapes = map[string][]string{
 	"wire.Empty":            {},
+	"wire.ObserveRequest":   {},
 	"wire.CreateKeyRequest": {"id", "name", "permissions", "expires_at_ms"},
 	"wire.ListKeysRequest":  {"after_id", "limit", "sort"},
 	"wire.RevokeKeyRequest": {"id"},
@@ -819,5 +820,40 @@ func TestKeyToolSortedResponseValidation(t *testing.T) {
 				t.Fatal("invalid success must not return partial metadata")
 			}
 		})
+	}
+}
+
+func TestObserveToolCanonicalMonitorAndFailures(t *testing.T) {
+	eng, err := engine.Open(context.Background(), engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	srv := server.New(eng, []string{"administrator"})
+	srv.Version = "test"
+	srv.MonitorTokens = []string{"monitor"}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "monitor", ts.Client()
+	result := callTool("observe", map[string]any{})
+	if result["isError"] != false {
+		t.Fatalf("monitor observe: %v", result)
+	}
+	body := result["content"].([]map[string]any)[0]["text"].(string)
+	value, err := wire.DecodeObserveResponse([]byte(body))
+	if err != nil || value.Access != "monitor" {
+		t.Fatalf("canonical tool result: %v %s", err, body)
+	}
+	if callTool("observe", map[string]any{"queue": "unexpected"})["isError"] != true {
+		t.Fatal("observe accepted unknown argument")
+	}
+	if callTool("list_queues", map[string]any{})["isError"] != true {
+		t.Fatal("monitor gained administration")
+	}
+	malformed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer malformed.Close()
+	broker.endpoint, broker.http = malformed.URL, malformed.Client()
+	if callTool("observe", map[string]any{})["isError"] != true {
+		t.Fatal("malformed observation presented as success")
 	}
 }

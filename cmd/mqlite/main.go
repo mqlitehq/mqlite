@@ -103,6 +103,8 @@ func main() {
 		err = cmdPeek(ctx, args)
 	case "metrics":
 		err = cmdMetrics(ctx, args)
+	case "observe":
+		err = cmdObserve(ctx, args)
 	case "status":
 		err = cmdStatus(ctx, args)
 	case "list":
@@ -166,6 +168,7 @@ usage: mqlite <command> [flags]
   peek <queue>              browse messages without locking (--state --from --max)
   test-filter <expr>        dry-run a filter expression against an optional sample
   metrics <queue>           show queue counters
+  observe                   unified observation (monitor or manage; --output json)
   status                    backend snapshot (backend, ping, size, counts)
   redrive <queue>           move dead-lettered messages back to active
   purge-dlq <queue>         permanently delete dead-lettered messages
@@ -208,6 +211,7 @@ type api interface {
 	TestFilter(ctx context.Context, expr string, sample *mqlite.OutMessage, enqueuedAtMs, visibleAtMs int64) (mqlite.FilterTestResult, error)
 	Stats(ctx context.Context, queue string) (mqlite.Metrics, error)
 	Status(ctx context.Context) (mqlite.StatusInfo, error)
+	Observe(ctx context.Context) (mqlite.Observation, error)
 	Redrive(ctx context.Context, dlq string, opts ...mqlite.RedriveOpts) (int, error)
 	Purge(ctx context.Context, queue string, opts ...mqlite.PurgeOpts) (int, error)
 	CreateKey(context.Context, mqlite.CreateKeyOptions) (mqlite.CreateKeyResult, error)
@@ -444,21 +448,29 @@ func stripEndpointCredentials(ep string) string {
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
+	metrics := fs.Bool("metrics", false, "enable authenticated /metrics on the API listener (default off; or set MQLITE_METRICS)")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote", false, "allow a non-loopback bind while auth is disabled (MQLITE_TOKENS=off)")
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 { // exact arity: serve takes flags only (round-3 §3.4)
-		return fmt.Errorf("usage: serve [--addr host:port] [--insecure-allow-remote]   (no positional arguments, got %q)",
+		return fmt.Errorf("usage: serve [--addr host:port] [--metrics] [--insecure-allow-remote]   (no positional arguments, got %q)",
 			strings.Join(fs.Args(), " "))
 	}
 
-	addrSet := false
+	addrSet, metricsSet := false, false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "addr" {
 			addrSet = true
 		}
+		if f.Name == "metrics" {
+			metricsSet = true
+		}
 	})
 	envAddr, envSet := os.LookupEnv("MQLITE_ADDR")
 	listenAddr, err := resolveListenAddr(*addr, addrSet, envAddr, envSet)
+	if err != nil {
+		return err
+	}
+	metricsEnabled, err := resolveMetrics(*metrics, metricsSet, os.Getenv("MQLITE_METRICS"))
 	if err != nil {
 		return err
 	}
@@ -467,6 +479,13 @@ func cmdServe(ctx context.Context, args []string) error {
 	tokens, authNote, err := resolveBrokerTokens(os.Getenv("MQLITE_TOKENS"))
 	if err != nil {
 		return err
+	}
+	monitorTokens, err := resolveMonitorTokens(os.Getenv("MQLITE_MONITOR_TOKENS"), tokens)
+	if err != nil {
+		return err
+	}
+	if metricsEnabled && tokens == "" {
+		return errors.New("metrics require administrator authentication; do not set MQLITE_TOKENS=off")
 	}
 	// With auth disabled, refuse a non-loopback bind unless explicitly allowed: an open
 	// broker on all interfaces is remotely reachable by anyone (MQLITE-70 / D2).
@@ -530,9 +549,28 @@ func cmdServe(ctx context.Context, args []string) error {
 	// "ready" fires from WithReady, i.e. only after the listener actually binds — so a
 	// bind failure surfaces as an error instead of a misleading "ready" line (MQLITE-88).
 	return eng.Serve(sctx, listenAddr,
-		mqlite.WithTokenCSV(tokens), mqlite.WithVersion(version),
+		mqlite.WithTokenCSV(tokens), mqlite.WithMonitorTokens(monitorTokens...), mqlite.WithVersion(version),
+		mqlite.WithMetrics(metricsEnabled),
 		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui),
 		mqlite.WithReady(func() { lg.Info("ready — Ctrl-C to stop") }))
+}
+
+// resolveMetrics keeps scraping opt-in; an explicit flag overrides the environment.
+func resolveMetrics(flagValue, flagSet bool, env string) (bool, error) {
+	if flagSet {
+		return flagValue, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "on", "true", "1":
+		return true, nil
+	case "off", "false", "0":
+		return false, nil
+	case "":
+		if env == "" {
+			return false, nil
+		}
+	}
+	return false, errors.New("MQLITE_METRICS must be on/off, true/false, or 1/0")
 }
 
 // resolveListenAddr picks the broker's listen address with precedence

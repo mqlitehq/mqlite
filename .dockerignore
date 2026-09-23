@@ -1,4 +1,6 @@
 .git
+ops/observability/.local/
+ops/observability/.env
 bin/
 dist/
 *.db

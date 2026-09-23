@@ -8,24 +8,27 @@ Measured, reproducible numbers for the mqlite engine across realistic workloads 
 multi-core box) and on a deliberately tiny **cloud** box so the two tell different truths.
 
 > Philosophy: measure before claiming. Every number here is produced by
-> `test/bench/` and can be reproduced with the commands below.
+> `test/bench/` and can be reproduced with the commands below. These are historical
+> workload measurements, not v0.3.2 capacity guarantees. Recheck the current binary
+> with your message sizes, concurrency, queue count and monitoring load before
+> selecting a memory or CPU limit.
 
 ## Sizing & deployment (Fly.io)
 
-How much does a broker cost to run? **Less than you'd think** — a pure-Go single binary
-with an embedded SQLite engine (no JVM, no sidecar, no page-cache-hungry log segments)
-fits Fly's *smallest* machine with room to spare.
+The historical sample below ran a single broker on a 256 MB Fly machine. Treat
+these measurements as starting points for a workload-specific sizing test; they
+do not establish a safe backlog threshold or the current release image size.
 
 ```
 ┌─────────────┬──────────────────────────┬──────────────────────────────────────┐
 │ resource    │ measured (1 broker)      │ Fly choice                            │
 ├─────────────┼──────────────────────────┼──────────────────────────────────────┤
-│ memory      │ 19 MB idle               │ shared-cpu-1x · 256 MB  (>6× headroom)│
-│             │ 38 MB @ 50k msgs queued  │   bump to 512 MB only for >500k       │
-│             │                          │   in-flight backlogs                  │
+│ memory      │ 19 MB idle               │ 256 MB used in the historical test   │
+│             │ 38 MB @ 50k msgs queued  │ validate current peak memory first   │
+│             │                          │ no universal backlog threshold        │
 │ disk        │ ~0.4 KB / 256 B message  │ 1 GB volume  (~2M messages)           │
 │             │ + ~4 MB WAL (constant)   │   size = backlog × 0.6 KB × 1.5       │
-│ vCPU        │ tiny/op; 1000s/s batched │ 1 shared vCPU is ample                │
+│ vCPU        │ tiny/op; 1000s/s batched │ 1 shared vCPU in the measured setup   │
 │ image       │ 10.9 MiB static binary   │ distroless/scratch ≈ 15 MB image,     │
 │             │   (CGO-free)             │   cold start < 1 s (scale-to-zero ok) │
 └─────────────┴──────────────────────────┴──────────────────────────────────────┘
@@ -131,12 +134,12 @@ phase — "how much memory, and is it released?"
 | size_16KB | 33 → 29 MB | 27 → 23 MB |
 | drain_4c (200k msgs) | 33 → 28 MB | — (see §7) |
 
-**The footprint is flat at ~25–34 MB for *any* workload, on either box.** Draining
-200k messages or pushing 16 KB bodies doesn't move it, because SQLite streams to disk
-rather than holding the backlog in RAM. After load stops, RSS falls back and
-8–12 MB is returned to the OS: **bounded, reclaimed, no leak.** On the 256 MB cloud
-box that's **~8× headroom** — memory is a non-issue; mqlite is CPU/IO-bound there,
-never memory-bound.
+**Peak RSS was 27–34 MB across the scenarios listed above.** The local 200k-message
+drain and 16 KB body scenarios stayed within that measured range. SQLite stores
+the backlog on disk, but this does not bound all broker memory. RSS declined after
+load stopped; no sustained growth was observed in these runs. Larger messages,
+more concurrent requests or queues, and monitoring can change the footprint.
+Measure the current workload before choosing a memory limit.
 
 ## 3 · DB-file bloat vs reclamation
 
@@ -211,8 +214,9 @@ bodies. Default body cap is 1 MiB (`MaxMessageBytes`).
 
 The Fly `shared-cpu-1x` is `GOMAXPROCS=1` with CPU-steal. Versus the 12-core local box:
 
-1. **Memory: no change, no problem.** ~25–29 MB RSS, ~8× headroom in 256 MB. Same
-   reclamation. mqlite is never memory-bound here.
+1. **Memory stayed low in the measured scenarios.** Peak RSS was 27–29 MB for
+   the cloud scenarios in §2, with reclamation after load. This does not establish
+   the memory required by other workloads or current releases.
 2. **Write amplification: no change.** Within 3 % of local everywhere — portable
    capacity planning.
 3. **Throughput: core-bound, and concurrency backfires.** Single-send multi-producer
@@ -243,8 +247,9 @@ mqlite ships sensible defaults; most deployments change nothing. In rough order 
 
 ## Findings summary
 
-1. **Tiny, bounded, reclaimed memory** — ~25–34 MB RSS for *any* workload on either
-   box; ~8× headroom in 256 MB. No leaks under churn or ramp-down.
+1. **Low measured memory with reclamation** — peak RSS was 27–34 MB in the
+   scenarios in §2. No sustained growth was observed during the recorded churn
+   and ramp-down tests; validate the current workload separately.
 2. **Batch to go fast** — ~9× less write amplification, and on a single core the
    difference between *hundreds/s* and *thousands/s*.
 3. **Write amplification is a portable constant** (~9.7 KB/op single, ~1.1 KB batched)

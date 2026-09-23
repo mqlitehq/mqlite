@@ -19,7 +19,9 @@ mqlite <command> [flags] [args]
 | `MQLITE_DB` | embedded DB DSN: `file:./mq.db` / `:memory:` / `libsql://<db>.turso.io` |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: a running broker + its Bearer token |
+| `MQLITE_MONITOR_TOKENS` | optional comma-separated read-only credentials for `observe` and `/metrics`; requires administrator auth and credentials distinct from administrators |
 | `MQLITE_TOKENS` | broker (`serve`) administrator Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth; additional managed keys live in the database |
+| `MQLITE_METRICS` | authenticated Prometheus `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
@@ -77,6 +79,7 @@ MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :6754
 | Flag | Default | |
 |---|---|---|
 | `--addr` | `:6754` | listen address |
+| `--metrics` | `false` | enable authenticated `/metrics` on the API port; overrides `MQLITE_METRICS`; `--metrics=false` disables |
 | `--insecure-allow-remote` | `false` | with auth disabled, allow a non-loopback bind (otherwise refused) |
 
 The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
@@ -84,8 +87,28 @@ The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
 (`MQLITE_TOKENS=off`) the broker **refuses a non-loopback bind** unless
 `--insecure-allow-remote` is passed, and **`MQLITE_CORS` defaults to off**.
 
-Serves the RPC API, `/metrics`, the open `/` + `/healthz`, and — unless
-`MQLITE_UI=off` — the embedded admin console at `/ui`.
+Serves the RPC API, the open `/` + `/healthz`, and — unless `MQLITE_UI=off` —
+the embedded admin console at `/ui`. Enable Prometheus on the same API port with
+one flag:
+
+```bash
+MQLITE_DB=file:./mq.db MQLITE_TOKENS=mqk_dev mqlite serve \
+  --addr 127.0.0.1:6754 --metrics
+```
+
+Equivalent environment configuration is `MQLITE_METRICS=on`. Values
+`on`/`true`/`1` enable metrics; `off`/`false`/`0` disable it. Values are
+case-insensitive; unset or empty disables metrics. Invalid values fail startup.
+`--metrics=false` overrides an environment-provided enabled value.
+Administrator auth must remain enabled. Scrapes accept configured administrators,
+managed `manage` keys, or configured monitor credentials; send/listen keys cannot
+scrape metrics.
+
+When enabled, the open discovery card includes `"metrics":"/metrics"`, which
+resolves against the same origin. When disabled, the field is omitted and the
+route returns `404` even with valid credentials. No separate address or URL
+configuration is needed. If the API is publicly reachable, so is this route;
+keep metrics off public ingress with path filtering or a private-only broker.
 
 ### `key create|list|revoke` — manage persistent access keys
 
@@ -284,6 +307,34 @@ Cancel a scheduled message before it activates with **`cancel <queue> <seq>`**.
 ```bash
 mqlite receive-deferred orders --seq 42,57      # re-locks them and prints tokens to settle
 ```
+
+### `observe` — canonical observation
+
+Available in **v0.3.2 and later**. Remote mode requires a v0.3.2 or later broker;
+configured monitor credentials are also new in v0.3.2.
+
+```bash
+mqlite observe --output json
+MQLITE_ENDPOINT=http://127.0.0.1:6754 MQLITE_TOKEN="$MONITOR_TOKEN" mqlite observe
+```
+
+Both output modes print the complete canonical JSON snapshot, including collection
+availability/freshness, queue gauges, committed message effects, storage operations,
+maintenance, filter failures, and HTTP request/authentication measurements. It is the
+same data contract as SDK `Observe`, MCP `observe`, and the HTTP `Observe` route;
+`/metrics` serializes these measurements for Prometheus.
+
+Check `collection.state` before interpreting queue counts. An unavailable collection
+has `queues: null`, not zero messages; process counters remain usable when the
+configured credential can authenticate. Durations use seconds, timestamps use epoch
+milliseconds, and process counters reset on restart. Embedded mode marks HTTP as
+`not_applicable`. Runtime `read_available` and `db_size_available` distinguish unknown
+or unsupported measurements from real zeroes. See [observability.md](observability.md).
+
+A configured `MQLITE_MONITOR_TOKENS` credential can call only `observe` and `/metrics`.
+It also opens the console's read-only overview/metrics views. `manage` includes
+observation; managed `send`/`listen` keys do not gain broker-wide monitoring. Monitor
+credentials are configured at startup and cannot be created through `key create`.
 
 ### `status` — backend snapshot
 ```bash

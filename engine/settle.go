@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync/atomic"
 )
 
 // settlementTTLMs bounds how long a settle receipt survives — long enough to
@@ -102,6 +101,10 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 			}
 			return err
 		}
+		tx.record(queue, op, n)
+		if op == "dead_lettered" {
+			tx.record(queue, "rejected", n)
+		}
 		now := e.now() // the receipt's retention starts when it is recorded
 		_, err = tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at)
@@ -110,29 +113,16 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 	})
 }
 
-// markCompleted bumps the per-queue lifetime "completed" counter by n. It is
-// called only after a settle's transaction has committed AND actually removed
-// rows (n>0), so an idempotent lost-response replay — which deletes nothing —
-// never double-counts. (MQLITE-54)
-func (e *Engine) markCompleted(queue string, n int64) {
-	if n <= 0 {
-		return
-	}
-	v, ok := e.processed.Load(queue)
-	if !ok {
-		v, _ = e.processed.LoadOrStore(queue, new(atomic.Uint64))
-	}
-	v.(*atomic.Uint64).Add(uint64(n))
-}
-
-// CompletedCounts snapshots the lifetime completed-message count per queue.
-// In-process and rough (resets on restart); surfaced as mqlite_messages_completed_total.
+// CompletedCounts is a legacy projection of the canonical committed event counters.
 func (e *Engine) CompletedCounts() map[string]uint64 {
 	out := map[string]uint64{}
-	e.processed.Range(func(k, v any) bool {
-		out[k.(string)] = v.(*atomic.Uint64).Load()
-		return true
-	})
+	e.observation.mu.Lock()
+	defer e.observation.mu.Unlock()
+	for k, n := range e.observation.events {
+		if k.event == "completed" {
+			out[k.queue] = n
+		}
+	}
 	return out
 }
 
@@ -150,9 +140,6 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 		removed, err = res.RowsAffected()
 		return removed, err
 	})
-	if err == nil {
-		e.markCompleted(queue, removed)
-	}
 	return err
 }
 
@@ -167,7 +154,8 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 	// The delay is part of the request's identity: replaying Abandon with a DIFFERENT delay is a
 	// different request, not a lost-response retry, and must not inherit the first one's success.
 	err := e.settleOp(ctx, queue, seq, token, "abandoned", settleArgs(strconv.FormatInt(delayMs, 10)), func(ctx context.Context, tx *txn, now int64) (int64, error) {
-		res, err := tx.ExecContext(ctx, `
+		var state string
+		err := tx.QueryRowContext(ctx, `
 			UPDATE messages SET
 			    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 			                 THEN 'dead_lettered'
@@ -179,12 +167,18 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 			                      THEN visible_at ELSE ? END,
 			    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 			                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
-			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`,
-			delayMs, now+delayMs, seq, queue, token, now)
+			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? RETURNING state`,
+			delayMs, now+delayMs, seq, queue, token, now).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
 		if err != nil {
 			return 0, err
 		}
-		return res.RowsAffected()
+		if state == "dead_lettered" {
+			tx.record(queue, "dead_lettered", 1)
+		}
+		return 1, nil
 	})
 	if err != nil {
 		return err
@@ -612,6 +606,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 			rec.Close()
 		}
 
+		tx.record(queue, "completed", removed)
 		// 3. One receipt per Complete request this call settled — a replay must match the queue,
 		//    seq, token, completed verb, and empty args to succeed instead of ErrLockLost.
 		return chunkPairs(rows, func(group []SettleItem, _ string) error {
@@ -650,6 +645,5 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		k := settleKey(it.SeqNumber, it.LockToken)
 		out[i].Ok = settled[k] || replayed[k]
 	}
-	e.markCompleted(queue, removed)
 	return out, nil
 }

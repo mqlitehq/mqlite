@@ -1,0 +1,19 @@
+# Strategic merge patch for an existing Deployment named mqlite, container mqlite.
+# Adjust those two names before use. Preserve the existing administrator config.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqlite
+spec:
+  template:
+    spec:
+      containers:
+        - name: mqlite
+          env:
+            - name: MQLITE_METRICS
+              value: "on"
+            - name: MQLITE_MONITOR_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: mqlite-monitor-token
+                  key: token

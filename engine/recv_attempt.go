@@ -99,6 +99,7 @@ func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, 
 				`DELETE FROM messages WHERE id=? AND lock_token=?`, m.SeqNumber, m.LockToken); err != nil {
 				return out, err
 			}
+			tx.record(q.name, "receive_deleted", 1)
 			m.LockToken = ""
 			m.LockedUntilMs = 0 // The row is gone; neither response nor attempt replay grants a lease.
 		}
@@ -133,6 +134,10 @@ func (e *Engine) claimOneTx(ctx context.Context, tx *txn, q queueRow) (*Message,
 			return nil, nil
 		}
 		return nil, err
+	}
+	tx.record(q.name, "delivered", 1)
+	if m.DeliveryCount > 1 {
+		tx.record(q.name, "redelivered", 1)
 	}
 	m.LockToken = token
 	m.GroupID = groupID.String

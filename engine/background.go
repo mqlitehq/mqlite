@@ -13,18 +13,18 @@ func (e *Engine) startBackground(ctx context.Context) {
 	// reaper at 1s bounds visibility-timeout redelivery to lock_duration + ≤1s
 	// (expired locks are reclaimed here, not on the claim hot path, so claims stay
 	// O(log n) on a deep backlog — see claim.go / the stress report).
-	e.spawn(ctx, 1*time.Second, e.reapLocks)          // lock-expiry reaper
-	e.spawn(ctx, 1*time.Second, e.activateScheduled)  // scheduled -> active
-	e.spawn(ctx, 10*time.Second, e.expireTTL)         // active TTL -> DLQ/discard
-	e.spawn(ctx, 60*time.Second, e.cleanupDedup)      // drop out-of-window dedup rows
-	e.spawn(ctx, 60*time.Second, e.cleanupExpiredAux) // drop expired settle/receive receipts
+	e.spawn(ctx, 1*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "locks", e.reapLocks) })             // lock-expiry reaper
+	e.spawn(ctx, 1*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "scheduled", e.activateScheduled) }) // scheduled -> active
+	e.spawn(ctx, 10*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "ttl", e.expireTTL) })              // active TTL -> DLQ/discard
+	e.spawn(ctx, 60*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "dedup", e.cleanupDedup) })         // drop out-of-window dedup rows
+	e.spawn(ctx, 60*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "receipts", e.cleanupExpiredAux) }) // drop expired settle/receive receipts
 	// DLQ retention (MQLITE-21/29): always run when background loops are on. A
 	// per-queue bound may exist even with no engine-global default, and the pass is
 	// a cheap no-op when nothing is bounded (it just lists DLQ queues and skips).
-	e.spawn(ctx, 60*time.Second, e.reapDLQ) // drop-oldest past age/count/bytes
+	e.spawn(ctx, 60*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "retention", e.reapDLQ) }) // drop-oldest past age/count/bytes
 	// free-page reclamation (MQLITE-53): hand deleted pages back to the OS so a
 	// churning queue's file doesn't bloat — no manual stop-the-broker VACUUM.
-	e.spawn(ctx, 60*time.Second, e.reclaimFreePages)
+	e.spawn(ctx, 60*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "reclaim", e.reclaimFreePages) })
 }
 
 func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(context.Context)) {
@@ -56,6 +56,7 @@ func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) 
 			}
 			return rows.Err()
 		}, args...); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("background: list affected queues failed", "err", err)
 		return nil
 	}
@@ -66,7 +67,7 @@ func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) 
 func (e *Engine) reapLocks(ctx context.Context) {
 	now := e.now()
 	qs := e.distinctQueues(ctx, `state='locked' AND locked_until<=?`, now)
-	_, err := e.db.exec(ctx, `
+	err := e.mutateMessages(ctx, "lock_expired", `
 		UPDATE messages SET
 		    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                 THEN 'dead_lettered' ELSE 'active' END,
@@ -75,6 +76,7 @@ func (e *Engine) reapLocks(ctx context.Context) {
 		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
 		 WHERE state='locked' AND locked_until<=?`, now)
 	if err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("reaper: reclaim expired locks failed", "err", err)
 		return
 	}
@@ -87,8 +89,9 @@ func (e *Engine) reapLocks(ctx context.Context) {
 func (e *Engine) activateScheduled(ctx context.Context) {
 	now := e.now()
 	qs := e.distinctQueues(ctx, `state='scheduled' AND visible_at<=?`, now)
-	if _, err := e.db.exec(ctx,
+	if err := e.mutateMessages(ctx, "activated",
 		`UPDATE messages SET state='active' WHERE state='scheduled' AND visible_at<=?`, now); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("scheduler: activate scheduled messages failed", "err", err)
 		return
 	}
@@ -104,17 +107,19 @@ func (e *Engine) activateScheduled(ctx context.Context) {
 // (MQLITE-61; the discard branch always had it).
 func (e *Engine) expireTTL(ctx context.Context) {
 	now := e.now()
-	if _, err := e.db.exec(ctx, `
-		UPDATE messages SET state='dead_lettered', dead_letter_reason='TTLExpired',
+	if err := e.mutateMessages(ctx, "dead_lettered", `
+			UPDATE messages SET state='dead_lettered', dead_letter_reason='TTLExpired',
 		    locked_until=0, lock_token=NULL
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
 		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1)`, now); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("ttl: dead-letter expired messages failed", "err", err)
 	}
-	if _, err := e.db.exec(ctx, `
+	if err := e.mutateMessages(ctx, "ttl_discarded", `
 		DELETE FROM messages
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
 		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=0)`, now); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("ttl: discard expired messages failed", "err", err)
 	}
 }
@@ -123,6 +128,7 @@ func (e *Engine) expireTTL(ctx context.Context) {
 func (e *Engine) cleanupDedup(ctx context.Context) {
 	var maxWindow sql.NullInt64
 	if err := e.db.queryRowScan(ctx, []any{&maxWindow}, `SELECT MAX(dedup_window_ms) FROM queues`); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("janitor: read max dedup window failed", "err", err)
 		return
 	}
@@ -130,6 +136,7 @@ func (e *Engine) cleanupDedup(ctx context.Context) {
 		return
 	}
 	if _, err := e.db.exec(ctx, `DELETE FROM dedup WHERE seen_at < ?`, e.now()-maxWindow.Int64); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("janitor: prune dedup rows failed", "err", err)
 	}
 }
@@ -140,9 +147,11 @@ func (e *Engine) cleanupDedup(ctx context.Context) {
 func (e *Engine) cleanupExpiredAux(ctx context.Context) {
 	now := e.now()
 	if _, err := e.db.exec(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?`, now); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("janitor: prune settlement receipts failed", "err", err)
 	}
 	if _, err := e.db.exec(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?`, now); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("janitor: prune receive attempts failed", "err", err)
 	}
 }
@@ -174,6 +183,7 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 	for _, q := range e.distinctQueues(ctx, `state='dead_lettered'`) {
 		qr, err := e.loadQueue(ctx, q)
 		if err != nil {
+			markMaintenanceFailure(ctx, err)
 			e.log.Error("dlq-retention: load queue failed", "queue", q, "err", err)
 			continue
 		}
@@ -189,10 +199,13 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND enqueued_at < ?
 					ORDER BY id LIMIT ?)`, q, cutoff, batch)
 				if err != nil {
+					markMaintenanceFailure(ctx, err)
 					e.log.Error("dlq-retention: age purge failed", "queue", q, "err", err)
 					break
 				}
-				if n, _ := res.RowsAffected(); n < batch {
+				n, _ := res.RowsAffected()
+				e.recordMessage(q, "retention_deleted", n)
+				if n < batch {
 					break
 				}
 			}
@@ -212,6 +225,7 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 			switch {
 			case errors.Is(err, sql.ErrNoRows): // under the cap: no surplus, no work
 			case err != nil:
+				markMaintenanceFailure(ctx, err)
 				e.log.Error("dlq-retention: count cutoff failed", "queue", q, "err", err)
 			}
 			if err == nil && cutoffID.Valid {
@@ -232,6 +246,7 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 			switch {
 			case errors.Is(err, sql.ErrNoRows): // under the cap: no surplus, no work
 			case err != nil:
+				markMaintenanceFailure(ctx, err)
 				e.log.Error("dlq-retention: bytes cutoff failed", "queue", q, "err", err)
 			}
 			if err == nil && cutoffID.Valid {
@@ -250,10 +265,13 @@ func (e *Engine) purgeDLQUpToID(ctx context.Context, q string, cutoffID int64, b
 			SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
 			ORDER BY id LIMIT ?)`, q, cutoffID, batch)
 		if err != nil {
+			markMaintenanceFailure(ctx, err)
 			e.log.Error("dlq-retention: "+label+" purge failed", "queue", q, "err", err)
 			return
 		}
-		if n, _ := res.RowsAffected(); n < int64(batch) {
+		n, _ := res.RowsAffected()
+		e.recordMessage(q, "retention_deleted", n)
+		if n < int64(batch) {
 			return
 		}
 	}
@@ -278,6 +296,7 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 	}
 	var free int
 	if err := e.db.queryRowScan(ctx, []any{&free}, `PRAGMA freelist_count`); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("janitor: read freelist_count failed", "err", err)
 		return
 	}
@@ -285,6 +304,7 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 		return
 	}
 	if err := e.reclaimPages(ctx); err != nil {
+		markMaintenanceFailure(ctx, err)
 		e.log.Error("janitor: reclaim failed", "err", err)
 	}
 }
@@ -353,11 +373,11 @@ func (e *Engine) reclaimPages(ctx context.Context) error {
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
 // DisableBackground use this to drive time-based transitions deterministically.
 func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
-	e.reapLocks(ctx)
-	e.activateScheduled(ctx)
-	e.expireTTL(ctx)
-	e.cleanupDedup(ctx)
-	e.cleanupExpiredAux(ctx)
-	e.reapDLQ(ctx)
-	e.reclaimFreePages(ctx)
+	e.runMaintenance(ctx, "locks", e.reapLocks)
+	e.runMaintenance(ctx, "scheduled", e.activateScheduled)
+	e.runMaintenance(ctx, "ttl", e.expireTTL)
+	e.runMaintenance(ctx, "dedup", e.cleanupDedup)
+	e.runMaintenance(ctx, "receipts", e.cleanupExpiredAux)
+	e.runMaintenance(ctx, "retention", e.reapDLQ)
+	e.runMaintenance(ctx, "reclaim", e.reclaimFreePages)
 }

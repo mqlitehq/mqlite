@@ -8,10 +8,11 @@ and the Go SDK, so the two can't drift) and the server's error mapping.
 
 ## Conventions
 
-- **Transport:** HTTP `POST`, `Content-Type: application/json`. (The open discovery,
-  health, and metrics endpoints below are `GET`.)
+- **Transport:** HTTP `POST`, `Content-Type: application/json`. Discovery and
+  health use open `GET` endpoints; opt-in metrics uses authenticated `GET` on the same port.
 - **`body`** is **base64** in JSON (Go marshals `[]byte` as base64).
-- **Timestamps** are **epoch milliseconds** (UTC) integers; so are durations (`*_ms`).
+- **Timestamps** are **epoch milliseconds** (UTC) integers. Message durations use
+  `*_ms`; observability durations explicitly named `*_seconds` retain fractional seconds.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
@@ -47,7 +48,8 @@ loud now.
 
 ```bash
 # Talking to the broker directly. mqlite serves JSON-over-HTTP on TCP 6754 and terminates
-# no TLS of its own, so this is plain http.
+# no TLS of its own, so this is plain http. When enabled, /metrics uses the
+# same listener; terminate TLS in a reverse proxy when required.
 BASE_URL=http://127.0.0.1:6754
 
 # Behind a reverse proxy. Public HTTPS on 443 (which the URL omits, as usual) terminates at
@@ -61,6 +63,8 @@ same JSON-over-HTTP API listens on when nothing is proxying for you.
 The discovery card's `endpoints` are route **paths**, deliberately relative: they resolve
 against the origin that served the card, so they inherit its scheme, host and port. Fetch the
 card from `$BASE_URL` and the paths are usable as-is.
+The optional `metrics` field is the same-origin path `/metrics` when enabled;
+it is omitted by default. Resolve it against `$BASE_URL` like the other paths.
 
 ## Auth
 
@@ -95,11 +99,22 @@ receiving, settling and renewing change message state.
 | `send` | `QueueService/Send`, `Schedule`, `Cancel` |
 | `listen` | `QueueService/Receive`, `ReceiveDeferred`, `Peek`, `Stats`, `Complete`, `CompleteBatch`, `Abandon`, `Reject`, `Defer`, `Renew`, `RenewBatch` |
 | `manage` | All `AdminService` methods, all `AuthService` methods, and `/metrics` |
+| configured monitor | `AdminService/Observe` and `/metrics` only |
 
 Both receive modes require `listen`, including receive-and-delete. Batch and
 idempotent replay paths use the same permission checks as the original operation.
-The current web console requires `manage` because it lists and manages the whole
-broker. The public static page alone grants no access to its API.
+The console's administration views require `manage`. A configured monitor token
+opens only its observability views. The public static page alone grants no API access.
+
+In v0.3.2 and later, `MQLITE_MONITOR_TOKENS` configures comma-separated read-only
+monitoring credentials alongside administrator authentication. The embedded equivalent is
+`WithMonitorTokens`. Monitor and administrator credentials must be distinct;
+configuring monitor tokens with authentication disabled is rejected. Monitor
+credentials authenticate without querying the key database, so collection failures
+remain observable. They cannot peek at bodies, receive, send, change configuration
+or issue keys. They are rotated through configuration and a broker restart, not
+the managed-key API; `monitor` is not a managed-key permission. See
+[observability](observability.md) for a ready-to-run monitoring stack.
 
 Configured administrators and managed `manage` keys have identical operation
 rights. Configured credentials are checked first: explicitly placing an existing
@@ -107,6 +122,52 @@ managed token in `MQLITE_TOKENS` grants it administrator rights independently of
 its database permissions, expiry or revocation. Remove it from configuration to
 withdraw that static grant. Database key operations never alter environment
 configuration.
+
+### Observe
+
+Available in **v0.3.2 and later**; older brokers do not implement this route.
+
+`POST /mqlite.v1.AdminService/Observe` with `{}` returns the canonical broker
+observation used by `/metrics`, the SDK `Observe`, CLI `observe`, MCP `observe`
+and console. Requires `manage` or a configured monitor credential.
+
+| Field | Meaning |
+|---|---|
+| `sampled_at_ms`, `started_at_ms`, `backend`, `version` | Queue sampling instant, engine lifetime and non-sensitive identity |
+| `access` | Request capability: `manage`, `monitor` or `anonymous`; SDK embedded mode uses `embedded` |
+| `collection` | Queue collection `state`, `last_success_at_ms`, `duration_seconds`, bounded `error_code` |
+| `queue_count`, `subscription_count`, `queues` | Actual retained state counts and age; counts are usable only when collection is `available` |
+| `runtime` | Schema version, read-probe availability/latency and local footprint availability/bytes; no DSN or path |
+| `messages` | Engine-lifetime `{queue,event,count}` effects, recorded after confirmed commits |
+| `storage` | Bounded operation outcomes, durations, retries and database connection pool measurements |
+| `maintenance`, `filters` | Maintenance enablement, results/durations/last success and filter failures |
+| `http` | Request outcomes/full elapsed time, final authentication outcomes and post-auth handler histograms |
+
+Successful authentication returns HTTP 200 even if queue collection is
+`unavailable`: `queues` is then `null`, with an explicit failure code and the
+last successful collection time. In-memory counters remain available. Never
+interpret absent queues or unavailable sizes/probes as zero. Authentication itself
+still fails closed; a managed key may be unusable while its database is unavailable.
+Pure embedded observations mark the HTTP domain `not_applicable`.
+
+The observation is sampled over an interval, not a transaction spanning every
+runtime counter. Its queue gauges share one aggregate SQL read and one engine
+clock value. Counters reset on engine/process restart; they are not a durable
+message ledger. Histograms contain cumulative finite buckets and a total count
+that is also the Prometheus `+Inf` bucket. The existing handler histogram excludes
+authentication; whole-request duration includes it and normal Receive long polls.
+
+The shared decoder bounds observations to 32 MiB and rejects incomplete objects,
+inconsistent availability and malformed histogram data. The complete JSON schema
+is represented by [`wire/observability.go`](../wire/observability.go) and
+[`engine/observability.go`](../engine/observability.go); metric semantics and
+compatibility aliases are specified in [observability](observability.md).
+
+```bash
+curl -fsS "$BASE_URL/mqlite.v1.AdminService/Observe" \
+  -H "Authorization: Bearer $MQLITE_TOKEN" \
+  -H 'Content-Type: application/json' -d '{}'
+```
 
 ### CreateKey / ListKeys / RevokeKey
 
@@ -172,14 +233,18 @@ curl "$BASE_URL/"                    # what is this? (no auth)
 # → {"name":"mqlite","version":"<the broker's version>","description":"...","status":"ok",
 #    "auth":"bearer","docs":"https://github.com/mqlitehq/mqlite",
 #    "endpoints":["/mqlite.v1.QueueService/Send", ...every RPC route...],
-#    "health":"/healthz","metrics":"/metrics"}
+#    "health":"/healthz","ui":"/ui"}
 curl "$BASE_URL/healthz"             # ok
 ```
 
 The card's `auth` is `"bearer"` when RPCs require a token or `"none"` when auth is off,
 so an agent can branch on it directly. `endpoints` is the **complete** list of RPC route
-paths (it always matches what the broker serves — a pinned contract), while `health` and
-`metrics` are the well-known non-RPC routes.
+paths (it always matches what the broker serves — a pinned contract). `health` is
+the relative liveness path. The optional `metrics` field is `"/metrics"` when
+`--metrics` or `MQLITE_METRICS=on` enables the exporter on the API port. It is
+omitted when disabled, and the route returns `404` even with valid credentials.
+Enabling metrics requires administrator auth; the advertised route still requires
+a monitor or administrator credential. No separate URL configuration is needed.
 
 `/ui` serves the **embedded admin console** (a static single-page app baked into the
 binary) and is auth-exempt — the page itself loads without a token; its API calls
@@ -190,7 +255,7 @@ which case `/ui` 404s and the card's optional `ui` field is omitted.
 
 | Method | Path | Auth | Returns |
 |---|---|---|---|
-| `GET` | `/metrics` | Bearer with `manage` | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
+| `GET` | `/metrics` (when enabled) | Bearer with `manage` or configured monitor | Prometheus text: `mqlite_queue_messages{queue,state}` gauges |
 
 ## QueueService
 

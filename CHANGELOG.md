@@ -10,6 +10,44 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
+## v0.3.2 — 2026-09-23
+
+> **Upgrade from v0.3.1:** port **6754**, schema token **5**, message data and
+> managed-key storage are unchanged. Stop the broker and take a consistent backup
+> before replacing it. Prometheus scraping now requires `MQLITE_METRICS=on` or
+> `--metrics`; it is disabled by default. Process counters restart from zero.
+> Rolling back to v0.3.1 also requires its previous monitoring configuration: `Observe` and
+> configured monitor credentials require v0.3.2. See the
+> [upgrade and rollback procedure](docs/operations.md#upgrade-and-rollback).
+
+### Unified observability (MQLITE-124)
+
+- One typed engine observation supplies native `Observe`, SDK/CLI/MCP/console
+  views and Prometheus. Queue aggregation uses a fixed number of reads, with
+  explicit availability; failed reads never become healthy zero counts.
+- Track confirmed message effects, storage outcomes/retries/pool waits,
+  maintenance results and filter failures. HTTP measurements include missing,
+  expired and revoked credentials and permission rejection, while retaining the
+  existing post-authentication handler histogram semantics.
+- Add configured read-only `MQLITE_MONITOR_TOKENS` / `WithMonitorTokens` for
+  `Observe` and `/metrics`, independently of the managed-key database. The
+  managed-key permissions and database schema remain unchanged.
+- Make Prometheus `/metrics` opt-in on the existing API port with
+  `MQLITE_METRICS=on`, `--metrics` or SDK `WithMetrics(true)`. Administrator auth
+  must remain enabled; monitor and administrator credentials can scrape it.
+  Disabled requests return `404`, and discovery omits `metrics`. Enabling it
+  automatically adds `"metrics":"/metrics"` to discovery. No extra port, URL
+  setting, process or VM is required.
+- Include a runnable MQLite, Prometheus and Grafana starter with a provisioned
+  dashboard, rules, repeatable verification scenarios and cloud deployment guidance.
+- Preserve old metrics as exact compatibility projections. Prefer
+  `mqlite_queue_retained_messages` to the misleading gauge name
+  `mqlite_queue_total`, and seconds to the legacy millisecond age family. The
+  two old names are deprecated for removal in v0.4.0.
+- Fix Prometheus escaping for special queue names and coherent histogram
+  snapshots under concurrent requests. Cross-queue redrive now preserves a legal
+  empty message body instead of binding SQL NULL.
+
 ## v0.3.1 — 2026-09-20
 
 > **Upgrade from v0.3.0:** port **6754** and schema token **5** are unchanged.

@@ -320,7 +320,23 @@ func (b *batch) expectError(op, q string, m *mq.Message, actual, expected error)
 }
 
 func (b *batch) excluded(ctx context.Context, q string, opts mq.RecvOpts) error {
+	return b.excludedBefore(ctx, q, opts, time.Time{})
+}
+
+func (b *batch) excludedBefore(ctx context.Context, q string, opts mq.RecvOpts, until time.Time) error {
+	started := time.Now()
+	if !until.IsZero() {
+		if !started.Before(until) {
+			return errors.New("exclusion assertion window elapsed before probe")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, until)
+		defer cancel()
+	}
 	rows, err := b.api.Receive(ctx, q, opts)
+	// Capture the observation before journal fsync: a slow evidence write cannot
+	// change when the broker response arrived, but a late response proves nothing.
+	observed := time.Now()
 	if err != nil {
 		return err
 	}
@@ -332,7 +348,14 @@ func (b *batch) excluded(ctx context.Context, q string, opts mq.RecvOpts) error 
 	if len(rows) != 0 {
 		return fmt.Errorf("%s delivered excluded/head-blocked messages", q)
 	}
-	return b.ledger.observed.add(map[string]any{"kind": "excluded", "queue": q, "at_ms": time.Now().UnixMilli()})
+	if !until.IsZero() && !observed.Before(until) {
+		return errors.New("exclusion assertion window elapsed during probe")
+	}
+	record := map[string]any{"kind": "excluded", "queue": q, "started_at_ms": started.UnixMilli(), "at_ms": observed.UnixMilli()}
+	if !until.IsZero() {
+		record["before_ms"] = until.UnixMilli()
+	}
+	return b.ledger.observed.add(record)
 }
 
 func emptyStore(ctx context.Context, api queueAPI, q string) error {
@@ -521,8 +544,14 @@ func (b *batch) group(ctx context.Context, q string) error {
 	if err != nil {
 		return err
 	}
-	until := time.Now().Add(2 * time.Second)
-	if err := b.settle(ctx, q, head, "abandon-backoff", func() error { return head.Abandon(ctx, mq.AbandonOpts{Delay: 2 * time.Second}) }, false); err != nil {
+	var until time.Time
+	if err := b.settle(ctx, q, head, "abandon-backoff", func() error {
+		// Start after the requested-operation journal is synced. The broker sets
+		// visible_at after this request starts; millisecond alignment keeps this
+		// a conservative lower bound on that deadline.
+		until = time.UnixMilli(time.Now().UnixMilli()).Add(temporalWindow)
+		return head.Abandon(ctx, mq.AbandonOpts{Delay: temporalWindow})
+	}, false); err != nil {
 		return err
 	}
 	// Input order is A0,A1,B0,B1. B progresses while A0 holds A1 back.
@@ -535,10 +564,7 @@ func (b *batch) group(ctx context.Context, q string) error {
 			return err
 		}
 	}
-	if !time.Now().Before(until) {
-		return errors.New("group backoff assertion window elapsed before probe")
-	}
-	if err := b.excluded(ctx, q, mq.RecvOpts{}); err != nil {
+	if err := b.excludedBefore(ctx, q, mq.RecvOpts{}, until); err != nil {
 		return err
 	}
 	if err := waitUntil(ctx, until); err != nil {
@@ -579,11 +605,14 @@ func (b *batch) strict(ctx context.Context, q string) error {
 	if err != nil {
 		return err
 	}
-	until := time.Now().Add(2 * time.Second)
-	if err := b.settle(ctx, q, head, "abandon-backoff", func() error { return head.Abandon(ctx, mq.AbandonOpts{Delay: 2 * time.Second}) }, false); err != nil {
+	var until time.Time
+	if err := b.settle(ctx, q, head, "abandon-backoff", func() error {
+		until = time.UnixMilli(time.Now().UnixMilli()).Add(temporalWindow)
+		return head.Abandon(ctx, mq.AbandonOpts{Delay: temporalWindow})
+	}, false); err != nil {
 		return err
 	}
-	if err := b.excluded(ctx, q, mq.RecvOpts{}); err != nil {
+	if err := b.excludedBefore(ctx, q, mq.RecvOpts{}, until); err != nil {
 		return err
 	}
 	if err := waitUntil(ctx, until); err != nil {
@@ -747,10 +776,7 @@ func (b *batch) retry(ctx context.Context, q string) error {
 
 func (b *batch) scheduled(ctx context.Context, q string) error {
 	at := time.UnixMilli(b.plan.Inputs[0].ScheduledAt)
-	if !time.Now().Before(at) {
-		return errors.New("schedule not-before assertion window elapsed")
-	}
-	if err := b.excluded(ctx, q, mq.RecvOpts{}); err != nil {
+	if err := b.excludedBefore(ctx, q, mq.RecvOpts{}, at); err != nil {
 		return err
 	}
 	if err := waitUntil(ctx, at); err != nil {

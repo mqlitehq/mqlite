@@ -187,11 +187,24 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   `internal`. *(server/errors_test.go; see [api-reference.md](api-reference.md))*
 - **9.3** Every registered RPC MUST bind a permission in the route registration.
   Send/Schedule/Cancel require send; all other QueueService methods require listen;
-  AdminService, AuthService and `/metrics` require manage. Manage includes both
-  data permissions. Configured and managed administrators MUST have identical
-  operation rights, including issuing manage keys. Insufficient permission MUST
+  AdminService and AuthService require manage, except Observe and the opt-in
+  `/metrics` endpoint also accept configured read-only monitor credentials. Metrics
+  MUST be disabled by default, return 404 while disabled, and appear as `/metrics`
+  in discovery only while enabled. Enabling metrics MUST require administrator
+  auth. Manage includes both data permissions. Configured and managed
+  administrators MUST have identical operation rights, including issuing manage
+  keys. Insufficient permission MUST
   fail before the handler can read or change protected data.
-  *(server/errors_test.go: TestAccessKeyCompletePermissionMatrix)*
+  *(server/errors_test.go: TestAccessKeyCompletePermissionMatrix;
+  server/metrics_test.go: TestMetricsDefaultOffAndAnonymousObserveDenied,
+  TestMetricsEnabledRequiresAdministratorAuthentication, TestMetricsPermissionMatrix,
+  TestMetricsDisabledSkipsDatabaseAuthentication)*
+- Configured monitor credentials MUST NOT grant message access or administration,
+  MUST be distinct from administrators, and MUST remain usable for fault telemetry
+  without database-backed authentication. Failed collection MUST omit queue gauges
+  and explicitly report unavailable data, preserving real in-memory counters.
+  *(server/metrics_test.go: TestMonitorConfigurationFailsClosed,
+  TestObserveStorageFailureAvailability, TestObserveAuthOutcomesAndWholeRequestCoverage)*
 - **9.4** Managed keys MUST survive restart and store only a SHA-256 digest of
   their token. New tokens MUST be `mqk_` plus 64 lowercase hex characters from
   a secure random source. Existing configured tokens remain accepted exactly.

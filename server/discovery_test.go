@@ -1,9 +1,11 @@
 package server_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
 
@@ -26,7 +30,7 @@ var wantRPCRoutes = []string{
 	wire.PathAbandon, wire.PathReject, wire.PathDefer, wire.PathReceiveDeferred,
 	wire.PathRenew, wire.PathSchedule, wire.PathCancel, wire.PathPeek, wire.PathStats,
 	wire.PathCreateQueue, wire.PathSubscribe, wire.PathListQueues, wire.PathListSubscriptions,
-	wire.PathTestFilter, wire.PathRedrive, wire.PathPurge, wire.PathStatus,
+	wire.PathTestFilter, wire.PathRedrive, wire.PathPurge, wire.PathStatus, wire.PathObserve,
 	wire.PathCreateKey, wire.PathListKeys, wire.PathRevokeKey,
 }
 
@@ -61,48 +65,84 @@ func getCard(t *testing.T, url string) (wire.DiscoveryCard, []string) {
 // auth ("bearer"/"none"), a complete endpoints[] catalog, and a fixed field set — so
 // the server can't silently drift from the documented shape (MQLITE-87 / D4).
 func TestDiscoveryCardPinned(t *testing.T) {
-	// Auth on, console off.
-	ts := consoleServer(t, false, []string{"secret"})
-	card, keys := getCard(t, ts.URL+"/")
-
-	wantKeys := []string{"auth", "description", "docs", "endpoints", "health", "metrics", "name", "status", "version"}
-	if !reflect.DeepEqual(keys, wantKeys) {
-		t.Errorf("card field set = %v\n            want %v", keys, wantKeys)
-	}
-	if card.Name != "mqlite" || card.Status != "ok" || card.Health != "/healthz" || card.Metrics != "/metrics" {
-		t.Errorf("card metadata drift: %+v", card)
-	}
-	if card.Auth != "bearer" {
-		t.Errorf("auth (tokens set) = %q, want \"bearer\"", card.Auth)
-	}
-	if card.UI != "" {
-		t.Errorf("ui = %q, want empty when console is off", card.UI)
-	}
-	if !reflect.DeepEqual(card.Endpoints, wantRPCRoutes) {
-		t.Errorf("endpoints catalog drift:\n got  %v\n want %v", card.Endpoints, wantRPCRoutes)
-	}
-
-	// Auth off + console on: auth downgrades to "none" and ui appears.
-	ts2 := consoleServer(t, true, nil)
-	card2, keys2 := getCard(t, ts2.URL+"/")
-	if card2.Auth != "none" {
-		t.Errorf("auth (no tokens) = %q, want \"none\"", card2.Auth)
-	}
-	if card2.UI != "/ui" {
-		t.Errorf("ui (console on) = %q, want \"/ui\"", card2.UI)
-	}
-	if !contains(keys2, "ui") {
-		t.Errorf("field set with console on missing \"ui\": %v", keys2)
-	}
-}
-
-func contains(ss []string, want string) bool {
-	for _, s := range ss {
-		if s == want {
-			return true
+	// Pin both optional fields independently. Metrics require authentication;
+	// that invalid combination fails closed rather than publishing a card.
+	for _, auth := range []bool{false, true} {
+		for _, ui := range []bool{false, true} {
+			for _, metrics := range []bool{false, true} {
+				name := "anonymous"
+				if auth {
+					name = "bearer"
+				}
+				if ui {
+					name += "/console"
+				}
+				if metrics {
+					name += "/metrics"
+				}
+				t.Run(name, func(t *testing.T) {
+					eng, err := engine.Open(context.Background(), engine.Options{DB: ":memory:", DisableBackground: true})
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { eng.Close() })
+					var tokens []string
+					wantAuth := "none"
+					if auth {
+						tokens = []string{"secret"}
+						wantAuth = "bearer"
+					}
+					srv := server.New(eng, tokens)
+					srv.UI, srv.Metrics = ui, metrics
+					h := srv.Handler()
+					if metrics && !auth {
+						keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/", "", nil), http.StatusInternalServerError, "internal")
+						return
+					}
+					ts := httptest.NewServer(h)
+					t.Cleanup(ts.Close)
+					card, keys := getCard(t, ts.URL+"/")
+					wantKeys := []string{"auth", "description", "docs", "endpoints", "health", "name", "status", "version"}
+					wantUI, wantMetrics := "", ""
+					if ui {
+						wantKeys = append(wantKeys, "ui")
+						wantUI = "/ui"
+					}
+					if metrics {
+						wantKeys = append(wantKeys, "metrics")
+						wantMetrics = "/metrics"
+					}
+					sort.Strings(wantKeys)
+					if !reflect.DeepEqual(keys, wantKeys) {
+						t.Errorf("card field set = %v\n            want %v", keys, wantKeys)
+					}
+					if card.Name != "mqlite" || card.Status != "ok" || card.Health != "/healthz" || card.Metrics != wantMetrics || card.UI != wantUI || card.Auth != wantAuth {
+						t.Errorf("card metadata drift: %+v", card)
+					}
+					if !reflect.DeepEqual(card.Endpoints, wantRPCRoutes) {
+						t.Errorf("endpoints catalog drift:\n got  %v\n want %v", card.Endpoints, wantRPCRoutes)
+					}
+					// The advertised relative URL is live on this same handler, and
+					// the exporter remains independent of the optional console.
+					for _, credential := range []string{"", "secret"} {
+						want := http.StatusNotFound
+						if metrics {
+							want = http.StatusUnauthorized
+							if credential != "" {
+								want = http.StatusOK
+							}
+						}
+						keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/metrics", credential, nil), want, "")
+					}
+					wantUIStatus := http.StatusNotFound
+					if ui {
+						wantUIStatus = http.StatusOK
+					}
+					keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/ui/", "", nil), wantUIStatus, "")
+				})
+			}
 		}
 	}
-	return false
 }
 
 // Round-3 §3.3: the docs named `/mqlite.v1.Queue/Receive`, a route that does not exist (it is

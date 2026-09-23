@@ -114,6 +114,43 @@ func TestResolveListenAddr(t *testing.T) {
 	}
 }
 
+func TestResolveMetrics(t *testing.T) {
+	for _, value := range []string{"on", "true", "1", " ON ", "True"} {
+		if got, err := resolveMetrics(false, false, value); err != nil || !got {
+			t.Errorf("enable %q: got %v, err %v", value, got, err)
+		}
+	}
+	for _, value := range []string{"", "off", "false", "0", " OFF ", "False"} {
+		if got, err := resolveMetrics(true, false, value); err != nil || got {
+			t.Errorf("disable %q: got %v, err %v", value, got, err)
+		}
+	}
+	for _, value := range []string{" ", "enabled", "disabled", "2", ":9091", "on,off"} {
+		if _, err := resolveMetrics(false, false, value); err == nil {
+			t.Errorf("invalid metrics setting %q accepted", value)
+		}
+	}
+	for _, env := range []string{"", "on", "off", "invalid"} {
+		for _, flag := range []bool{false, true} {
+			if got, err := resolveMetrics(flag, true, env); err != nil || got != flag {
+				t.Errorf("explicit flag %v with env %q: got %v, err %v", flag, env, got, err)
+			}
+		}
+	}
+}
+
+func TestServeMetricsRequiresAuth(t *testing.T) {
+	t.Setenv("MQLITE_TOKENS", "off")
+	t.Setenv("MQLITE_MONITOR_TOKENS", "")
+	t.Setenv("MQLITE_METRICS", "on")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := cmdServe(ctx, []string{"--addr", "127.0.0.1:0"}); err == nil ||
+		!strings.Contains(err.Error(), "metrics require administrator authentication") {
+		t.Fatalf("enabled metrics without auth must fail before opening DB: %v", err)
+	}
+}
+
 // TestReadCapped: an over-limit stdin body must error, never be silently truncated (MQLITE-79).
 func TestReadCapped(t *testing.T) {
 	if b, err := readCapped(strings.NewReader("hello"), 16); err != nil || string(b) != "hello" {

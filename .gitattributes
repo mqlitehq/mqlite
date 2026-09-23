@@ -5,3 +5,5 @@
 *.mod text eol=lf
 *.sum text eol=lf
 *.sh  text eol=lf
+# Prometheus exposition is a byte-exact LF contract on every platform.
+*.prom text eol=lf

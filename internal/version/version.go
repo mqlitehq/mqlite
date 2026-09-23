@@ -7,4 +7,4 @@ package version
 // Version is the semantic version of this source tree, without the tag's "v"
 // prefix. Bump it in the release PR; the tag must match (CI-enforced — a
 // pre-release tag like v0.3.0-rc.1 is checked against its base version).
-const Version = "0.3.1"
+const Version = "0.3.2"

@@ -51,8 +51,10 @@ func (e *Engine) insertOne(ctx context.Context, tx *txn, q queueRow, m OutMessag
 		switch {
 		case err == nil:
 			if existHash.Valid && existHash.String != reqHash {
+				tx.record(q.name, "dedup_conflict", 1)
 				return 0, false, ErrDedupConflict // D23: same key, different body
 			}
+			tx.record(q.name, "deduplicated", 1)
 			return existSeq, true, nil // in-window duplicate -> silent drop
 		case errors.Is(err, sql.ErrNoRows):
 			// fall through to insert
@@ -101,5 +103,11 @@ func (e *Engine) rawInsert(ctx context.Context, tx *txn, queue string, m OutMess
 		nz(m.MessageID), nz(m.CorrelationID), nz(m.ReplyTo), nz(m.GroupID),
 		nz(m.ContentType), nz(m.Subject), props, body,
 	).Scan(&seq)
+	if err == nil {
+		tx.record(queue, "enqueued", 1)
+		if forced == StateScheduled {
+			tx.record(queue, "scheduled", 1)
+		}
+	}
 	return seq, err
 }

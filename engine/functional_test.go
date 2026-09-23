@@ -1684,3 +1684,237 @@ func TestReceiveDeferredMixedItemsAndCommittedPrefix(t *testing.T) {
 		})
 	}
 }
+
+// ─── Canonical observations (MQLITE-124) ─────────────────────────────────────
+
+func observedEvents(t *testing.T, e *Engine, queue string) map[string]uint64 {
+	t.Helper()
+	out := map[string]uint64{}
+	for _, c := range e.Observability(context.Background()).Messages {
+		if c.Queue == queue {
+			out[c.Event] = c.Count
+		}
+	}
+	return out
+}
+
+func requireEvents(t *testing.T, e *Engine, queue string, want map[string]uint64) {
+	t.Helper()
+	got := observedEvents(t, e, queue)
+	for _, event := range MessageEventNames() {
+		if got[event] != want[event] {
+			t.Fatalf("%s event %s=%d, want %d; all=%v", queue, event, got[event], want[event], got)
+		}
+	}
+}
+
+func TestObservabilityCommitReplayAndDelivery(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.Send(ctx, "q", OutMessage{Body: []byte("one")}, OutMessage{Body: []byte("two")}); err != nil {
+		t.Fatal(err)
+	}
+	opts := ReceiveOptions{MaxMessages: 2, AttemptID: "attempt"}
+	ms, err := e.Receive(ctx, "q", opts)
+	if err != nil || len(ms) != 2 {
+		t.Fatalf("receive=%d %v", len(ms), err)
+	}
+	if _, err = e.Receive(ctx, "q", opts); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err = e.Abandon(ctx, "q", ms[0].SeqNumber, ms[0].LockToken, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	again := recvOne(t, e, "q")
+	if again == nil {
+		t.Fatal("missing redelivery")
+	}
+	for i := 0; i < 2; i++ {
+		if err = e.Defer(ctx, "q", again.SeqNumber, again.LockToken); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deferred, err := e.ReceiveDeferred(ctx, "q", again.SeqNumber)
+	if err != nil || len(deferred) != 1 {
+		t.Fatalf("deferred=%d %v", len(deferred), err)
+	}
+	items := []SettleItem{{SeqNumber: deferred[0].SeqNumber, LockToken: deferred[0].LockToken}, {SeqNumber: ms[1].SeqNumber, LockToken: ms[1].LockToken}}
+	for i := 0; i < 2; i++ {
+		if _, err = e.CompleteBatch(ctx, "q", items); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireEvents(t, e, "q", map[string]uint64{"enqueued": 2, "delivered": 4, "redelivered": 2, "abandoned": 1, "deferred": 1, "completed": 2})
+	if e.CompletedCounts()["q"] != 2 {
+		t.Fatal("legacy completion projection drift")
+	}
+	mustQueue(t, e, "deleted", QueueConfig{})
+	if _, err = e.SendOne(ctx, "deleted", OutMessage{}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err = e.Receive(ctx, "deleted", ReceiveOptions{Mode: ReceiveAndDelete, AttemptID: "delete"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireEvents(t, e, "deleted", map[string]uint64{"enqueued": 1, "delivered": 1, "receive_deleted": 1})
+}
+
+func TestObservabilityEnqueueDedupFanoutOutbox(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "dedup", QueueConfig{DedupWindowMs: 10000})
+	for _, body := range []string{"one", "one"} {
+		if _, err := e.SendOne(ctx, "dedup", OutMessage{MessageID: "id", Body: []byte(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.Send(ctx, "dedup", OutMessage{MessageID: "id", Body: []byte("different")}, OutMessage{MessageID: "two"}); err != nil {
+		t.Fatal(err)
+	}
+	requireEvents(t, e, "dedup", map[string]uint64{"enqueued": 2, "deduplicated": 1, "dedup_conflict": 1})
+	if err := e.Subscribe(ctx, "topic", "a", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Subscribe(ctx, "topic", "b", &Filter{Expr: `subject == "yes"`}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "topic", OutMessage{Subject: "no"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Tx(ctx, func(tx *EngineTx) error { _, err := tx.SendOne("topic", OutMessage{Subject: "yes"}); return err }); err != nil {
+		t.Fatal(err)
+	}
+	requireEvents(t, e, "a", map[string]uint64{"enqueued": 2})
+	requireEvents(t, e, "b", map[string]uint64{"enqueued": 1})
+	if err := e.Tx(ctx, func(tx *EngineTx) error {
+		if _, err := tx.SendOne("topic", OutMessage{Subject: "yes"}); err != nil {
+			return err
+		}
+		return ErrInvalidArgument
+	}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatal(err)
+	}
+	requireEvents(t, e, "a", map[string]uint64{"enqueued": 2})
+	requireEvents(t, e, "b", map[string]uint64{"enqueued": 1})
+	// A later invalid group rolls the complete batch back, including earlier counters.
+	mustQueue(t, e, "group", QueueConfig{Ordering: OrderGroupFIFO})
+	if _, err := e.Send(ctx, "group", OutMessage{GroupID: "g"}, OutMessage{}); !errors.Is(err, ErrGroupRequired) {
+		t.Fatal(err)
+	}
+	requireEvents(t, e, "group", nil)
+}
+
+func TestObservabilityMessageLifecycleInventory(t *testing.T) {
+	wantNames := []string{"enqueued", "scheduled", "deduplicated", "dedup_conflict", "delivered", "redelivered", "completed", "receive_deleted", "abandoned", "deferred", "rejected", "dead_lettered", "ttl_discarded", "retention_deleted", "purged", "canceled", "redriven", "lock_expired", "recovered", "activated"}
+	if !reflect.DeepEqual(MessageEventNames(), wantNames) {
+		t.Fatal("event inventory changed; extend lifecycle matrix")
+	}
+	ctx := context.Background()
+	t.Run("schedule cancel and activate", func(t *testing.T) {
+		e, clock := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{})
+		first, err := e.Schedule(ctx, "q", OutMessage{}, *clock+1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = e.Schedule(ctx, "q", OutMessage{}, *clock+1000); err != nil {
+			t.Fatal(err)
+		}
+		if err = e.Cancel(ctx, "q", first); err != nil {
+			t.Fatal(err)
+		}
+		advance(clock, time.Second)
+		e.RunMaintenanceOnce(ctx)
+		requireEvents(t, e, "q", map[string]uint64{"enqueued": 2, "scheduled": 2, "canceled": 1, "activated": 1})
+	})
+	t.Run("reject redrive and purge", func(t *testing.T) {
+		e, _ := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{})
+		mustQueue(t, e, "target", QueueConfig{})
+		if _, err := e.SendOne(ctx, "q", OutMessage{}); err != nil {
+			t.Fatal(err)
+		}
+		m := recvOne(t, e, "q")
+		for i := 0; i < 2; i++ {
+			if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "", ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n, err := e.Redrive(ctx, "q", RedriveOptions{}); err != nil || n != 1 {
+			t.Fatalf("redrive %d %v", n, err)
+		}
+		m = recvOne(t, e, "q")
+		if err := e.Reject(ctx, "q", m.SeqNumber, m.LockToken, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := e.Redrive(ctx, "q", RedriveOptions{Target: "target"}); err != nil || n != 1 {
+			t.Fatalf("cross redrive %d %v", n, err)
+		}
+		m = recvOne(t, e, "target")
+		if err := e.Reject(ctx, "target", m.SeqNumber, m.LockToken, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := e.Purge(ctx, "target", RedriveOptions{}); err != nil || n != 1 {
+			t.Fatalf("purge %d %v", n, err)
+		}
+		requireEvents(t, e, "q", map[string]uint64{"enqueued": 1, "delivered": 2, "rejected": 2, "dead_lettered": 2, "redriven": 2})
+		requireEvents(t, e, "target", map[string]uint64{"enqueued": 1, "delivered": 1, "rejected": 1, "dead_lettered": 1, "purged": 1})
+	})
+	t.Run("lease expiry and max-delivery abandon", func(t *testing.T) {
+		e, clock := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1, MaxDeliveryCount: 2})
+		if _, err := e.SendOne(ctx, "q", OutMessage{}); err != nil {
+			t.Fatal(err)
+		}
+		if recvOne(t, e, "q") == nil {
+			t.Fatal("claim")
+		}
+		advance(clock, time.Millisecond)
+		e.RunMaintenanceOnce(ctx)
+		m := recvOne(t, e, "q")
+		if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 0); err != nil {
+			t.Fatal(err)
+		}
+		requireEvents(t, e, "q", map[string]uint64{"enqueued": 1, "delivered": 2, "redelivered": 1, "lock_expired": 1, "abandoned": 1, "dead_lettered": 1})
+	})
+	t.Run("TTL discard DLQ and retention", func(t *testing.T) {
+		e, clock := testEngine(t)
+		no := false
+		mustQueue(t, e, "discard", QueueConfig{DefaultTTLMs: 1, DeadLetterOnExpire: &no})
+		mustQueue(t, e, "retain", QueueConfig{DefaultTTLMs: 1, DLQMaxCount: 1})
+		if _, err := e.SendOne(ctx, "discard", OutMessage{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.Send(ctx, "retain", OutMessage{}, OutMessage{}); err != nil {
+			t.Fatal(err)
+		}
+		advance(clock, time.Millisecond)
+		e.RunMaintenanceOnce(ctx)
+		requireEvents(t, e, "discard", map[string]uint64{"enqueued": 1, "ttl_discarded": 1})
+		requireEvents(t, e, "retain", map[string]uint64{"enqueued": 2, "dead_lettered": 2, "retention_deleted": 1})
+	})
+	t.Run("restart recovery", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "observe.db")
+		e, clock := testEngineAt(t, path)
+		mustQueue(t, e, "q", QueueConfig{MaxDeliveryCount: 1})
+		if _, err := e.SendOne(ctx, "q", OutMessage{}); err != nil {
+			t.Fatal(err)
+		}
+		if recvOne(t, e, "q") == nil {
+			t.Fatal("claim")
+		}
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := Open(ctx, Options{DB: "file:" + path, Now: func() int64 { return *clock }, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		requireEvents(t, reopened, "q", map[string]uint64{"recovered": 1, "dead_lettered": 1})
+	})
+}

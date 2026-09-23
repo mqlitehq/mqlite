@@ -90,7 +90,7 @@ Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/wi
   and image workflows. The real tag must resolve locally and remotely to the
   same commit and match that commit's version constant. The latest eligible
   `push` or `workflow_dispatch` CI run for that exact commit must have completed
-  successfully with all 12 expected jobs successful in the same run attempt;
+  successfully with all 13 expected jobs successful in the same run attempt;
   skipped, missing, failed, or pending jobs block publishing. A PR merge-ref run
   does not qualify. Rerun **all jobs** after a failure, or dispatch `ci.yml` on the
   intended source ref, and wait for completion before requesting tag approval.

@@ -34,6 +34,7 @@ const (
 	PathRedrive           = "/mqlite.v1.AdminService/Redrive"
 	PathPurge             = "/mqlite.v1.AdminService/Purge"
 	PathStatus            = "/mqlite.v1.AdminService/Status"
+	PathObserve           = "/mqlite.v1.AdminService/Observe"
 
 	PathCreateKey = "/mqlite.v1.AuthService/CreateKey"
 	PathListKeys  = "/mqlite.v1.AuthService/ListKeys"
@@ -276,8 +277,8 @@ type DiscoveryCard struct {
 	Docs        string   `json:"docs"`
 	Endpoints   []string `json:"endpoints"`
 	Health      string   `json:"health"`
-	Metrics     string   `json:"metrics"`
-	UI          string   `json:"ui,omitempty"` // present only when the console is enabled
+	Metrics     string   `json:"metrics,omitempty"` // present only when the authenticated metrics endpoint is enabled
+	UI          string   `json:"ui,omitempty"`      // present only when the console is enabled
 }
 
 type Empty struct{}

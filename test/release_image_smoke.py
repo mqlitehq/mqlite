@@ -34,6 +34,7 @@ def smoke(args):
     run_id = "mqlite-image-smoke-" + uuid.uuid4().hex
     volume = run_id + "-data"
     token = "mqk_" + uuid.uuid4().hex
+    monitor_token = "mqk_" + uuid.uuid4().hex
     containers = [run_id + "-first", run_id + "-restart"]
     live_containers = set()
     volume_created = False
@@ -73,21 +74,24 @@ def smoke(args):
         check(status == 200, f"{method}: HTTP {status}")
         return json.loads(raw)
 
-    def start(container):
+    def start(container, metrics_enabled=True, metrics_setting="on", cli_args=()):
         nonlocal endpoint
         live_containers.add(container)
+        metrics_env = [] if metrics_setting is None else ["--env", "MQLITE_METRICS=" + metrics_setting]
         docker(
             "run", "--detach", "--platform", args.platform, "--pull", "never",
             "--name", container, "--publish", "127.0.0.1::6754",
             "--mount", f"type=volume,source={volume},target=/data",
             "--env", "MQLITE_TOKENS=" + token,
-            "--env", "MQLITE_SYNC=FULL", args.image,
+            "--env", "MQLITE_MONITOR_TOKENS=" + monitor_token,
+            *metrics_env, "--env", "MQLITE_SYNC=FULL", args.image, *cli_args,
         )
         binding = json.loads(docker("inspect", container).stdout)[0]
-        ports = binding["NetworkSettings"]["Ports"]["6754/tcp"]
-        check(len(ports) == 1 and ports[0]["HostIp"] == "127.0.0.1",
-              f"unexpected published ports: {ports!r}")
-        endpoint = "http://127.0.0.1:" + ports[0]["HostPort"]
+        ports = binding["NetworkSettings"]["Ports"]
+        api_ports = ports["6754/tcp"]
+        check(len(api_ports) == 1 and api_ports[0]["HostIp"] == "127.0.0.1",
+              f"unexpected API published ports: {api_ports!r}")
+        endpoint = "http://127.0.0.1:" + api_ports[0]["HostPort"]
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
@@ -99,6 +103,18 @@ def smoke(args):
             time.sleep(0.25)
         else:
             raise RuntimeError("broker did not become healthy within 30 seconds")
+        if metrics_enabled:
+            metrics_deadline = time.monotonic() + 30
+            while time.monotonic() < metrics_deadline:
+                try:
+                    status, raw = request("/metrics", None, monitor_token, timeout=2)
+                    if status == 200 and b"mqlite_storage_read_available" in raw:
+                        break
+                except (OSError, urllib.error.URLError):
+                    pass
+                time.sleep(0.25)
+            else:
+                raise RuntimeError("metrics endpoint did not become ready within 30 seconds")
 
         status, raw = request("/")
         check(status == 200, f"discovery: HTTP {status}")
@@ -106,6 +122,10 @@ def smoke(args):
         check(card.get("name") == "mqlite" and card.get("status") == "ok"
               and card.get("auth") == "bearer" and card.get("health") == "/healthz",
               f"unexpected discovery metadata: {card!r}")
+        if metrics_enabled:
+            check(card.get("metrics") == "/metrics", f"enabled metrics missing from discovery: {card!r}")
+        else:
+            check("metrics" not in card, f"disabled metrics advertised in discovery: {card!r}")
         version = card.get("version", "")
         check(re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version),
               f"invalid image version: {version!r}")
@@ -119,12 +139,24 @@ def smoke(args):
 
         paths = card.get("endpoints", [])
         check(isinstance(paths, list) and paths, "discovery has no RPC endpoints")
-        # Check every advertised RPC and metrics with both absent and wrong tokens.
-        for path in [*paths, "/metrics"]:
+        # Every advertised RPC must reject absent and wrong credentials on the public API.
+        for path in paths:
             for auth in (None, "invalid-" + token):
-                status, raw = request(path, None if path == "/metrics" else {}, auth)
+                status, raw = request(path, {}, auth)
                 check(status == 401 and json.loads(raw).get("code") == "unauthenticated",
                       f"{path} accepted absent/invalid credentials: HTTP {status}")
+        # Metrics share the API listener only when explicitly enabled, and still
+        # require a monitor or administrator credential before doing any work.
+        for auth in (None, "invalid-" + monitor_token, monitor_token, token):
+            status, raw = request("/metrics", None, auth)
+            if not metrics_enabled:
+                check(status == 404, f"disabled metrics endpoint exposed: HTTP {status}")
+            elif auth in (monitor_token, token):
+                check(status == 200 and b"mqlite_storage_read_available" in raw,
+                      f"authenticated metrics scrape failed: HTTP {status}")
+            else:
+                check(status == 401 and json.loads(raw).get("code") == "unauthenticated",
+                      f"metrics accepted absent/invalid credentials: HTTP {status}")
 
         runtime = rpc("Admin", "Status", {})
         check(runtime.get("version") == version and runtime.get("auth") is True
@@ -197,6 +229,16 @@ def smoke(args):
         print("PASS OCI image identity", flush=True)
         docker("volume", "create", volume)
         volume_created = True
+        for suffix, setting, cli_args in (
+            ("default-off", None, ()),
+            ("explicit-off", "on", ("serve", "--metrics=false")),
+        ):
+            container = run_id + "-" + suffix
+            start(container, metrics_enabled=False, metrics_setting=setting, cli_args=cli_args)
+            docker("stop", "--time", "10", container)
+            docker("rm", container)
+            live_containers.remove(container)
+            print("PASS metrics " + suffix + ": route hidden and discovery field absent", flush=True)
         initial = start(containers[0])
         created = rpc("Admin", "CreateQueue", {
             "name": queue, "config": {"lock_duration_ms": 300000},
@@ -217,11 +259,17 @@ def smoke(args):
             ("/mqlite.v1.QueueService/Receive", {"queue": queue}, sender),
             ("/mqlite.v1.QueueService/Send", {"queue": queue, "messages": [message("denied")]}, listener),
             ("/mqlite.v1.AuthService/ListKeys", {}, listener),
-            ("/metrics", None, sender),
         ):
             status, raw = request(path, body, auth)
             check(status == 403 and json.loads(raw).get("code") == "permission_denied",
                   path + " did not enforce managed permissions")
+        for auth in (sender, listener):
+            status, raw = request("/metrics", None, auth)
+            check(status == 403 and json.loads(raw).get("code") == "permission_denied",
+                  "send/listen-only managed key could scrape metrics")
+        status, raw = request("/metrics", None, manager)
+        check(status == 200 and b"mqlite_storage_read_available" in raw,
+              "managed administrator could not scrape metrics")
         first = message("complete-before-restart")
         sent = rpc("Queue", "Send", {"queue": queue, "messages": [first]}, sender)["seq_numbers"]
         check(len(sent) == 1 and sent[0] > 0, f"invalid send result: {sent!r}")
@@ -251,6 +299,9 @@ def smoke(args):
         status, raw = request("/mqlite.v1.QueueService/Send", {"queue": queue, "messages": [first]}, sender)
         check(status == 401 and json.loads(raw).get("code") == "unauthenticated",
               "revoked key became valid after container replacement")
+        status, raw = request("/metrics", None, sender)
+        check(status == 401 and json.loads(raw).get("code") == "unauthenticated",
+              "revoked key could scrape metrics after container replacement")
         key_page = rpc("Auth", "ListKeys", {}, manager)
         metadata = {key["id"]: key for key in key_page["keys"]}
         check(set(metadata) == {key["key"]["id"] for key in keys.values()} and

@@ -228,6 +228,10 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 			}
 			return out, err
 		}
+		e.recordMessage(queue, "delivered", 1)
+		if m.DeliveryCount > 1 {
+			e.recordMessage(queue, "redelivered", 1)
+		}
 		m.LockToken = token
 		m.GroupID = groupID.String
 		m.MessageID = messageID.String

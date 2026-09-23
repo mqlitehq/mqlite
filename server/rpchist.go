@@ -1,21 +1,19 @@
 package server
 
 import (
-	"fmt"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // rpcLatency is a per-RPC latency histogram exposed at /metrics, so a slow dequeue
 // (the kind of regression this project cares about) shows up in monitoring, not just in
 // tests. Hand-rolled — no Prometheus client dependency, keeping the binary dependency-light:
-// per-RPC atomic bucket counters; the RWMutex is taken only to lazily create a method's
-// entry, so the hot path is an RLock + a few atomic adds.
+// A per-method mutex makes count, sum and buckets one coherent observation.
 type rpcLatency struct {
 	mu   sync.RWMutex
 	rpcs map[string]*rpcCounters
@@ -27,9 +25,10 @@ type rpcLatency struct {
 var latencyBuckets = []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20}
 
 type rpcCounters struct {
-	bucket []atomic.Uint64 // len = len(latencyBuckets)+1; the last is the +Inf bucket
-	sumUs  atomic.Uint64   // sum of observed durations, in microseconds
-	count  atomic.Uint64
+	mu     sync.Mutex
+	bucket []uint64 // noncumulative; last bucket is greater than the largest bound
+	sumUs  uint64
+	count  uint64
 }
 
 func newRPCLatency() *rpcLatency { return &rpcLatency{rpcs: map[string]*rpcCounters{}} }
@@ -42,49 +41,46 @@ func (h *rpcLatency) observe(rpc string, d time.Duration) {
 	if c == nil {
 		h.mu.Lock()
 		if c = h.rpcs[rpc]; c == nil {
-			c = &rpcCounters{bucket: make([]atomic.Uint64, len(latencyBuckets)+1)}
+			c = &rpcCounters{bucket: make([]uint64, len(latencyBuckets)+1)}
 			h.rpcs[rpc] = c
 		}
 		h.mu.Unlock()
 	}
 	// SearchFloat64s returns the first bucket whose upper bound >= the duration (le
 	// semantics); past the last bound that's len(latencyBuckets) — the +Inf bucket.
-	c.bucket[sort.SearchFloat64s(latencyBuckets, d.Seconds())].Add(1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bucket[sort.SearchFloat64s(latencyBuckets, d.Seconds())]++
 	if us := d.Microseconds(); us > 0 {
-		c.sumUs.Add(uint64(us))
+		c.sumUs += uint64(us)
 	}
-	c.count.Add(1)
+	c.count++
 }
 
-// write renders the histogram in Prometheus text format (cumulative buckets).
-func (h *rpcLatency) write(b *strings.Builder) {
+// snapshot supplies both native and Prometheus output from the same counters.
+func (h *rpcLatency) snapshot() []wire.RPCLatencyObservation {
 	h.mu.RLock()
+	defer h.mu.RUnlock()
 	names := make([]string, 0, len(h.rpcs))
 	for n := range h.rpcs {
 		names = append(names, n)
 	}
-	h.mu.RUnlock()
-	if len(names) == 0 {
-		return
-	}
 	sort.Strings(names)
-	b.WriteString("# HELP mqlite_rpc_duration_seconds RPC handler latency by method.\n")
-	b.WriteString("# TYPE mqlite_rpc_duration_seconds histogram\n")
+	out := make([]wire.RPCLatencyObservation, 0, len(names))
 	for _, rpc := range names {
-		h.mu.RLock()
 		c := h.rpcs[rpc]
-		h.mu.RUnlock()
+		c.mu.Lock()
+		v := wire.RPCLatencyObservation{RPC: rpc, Count: c.count, SumSeconds: float64(c.sumUs) / 1e6,
+			Buckets: make([]wire.LatencyBucket, len(latencyBuckets))}
 		var cum uint64
 		for i, ub := range latencyBuckets {
-			cum += c.bucket[i].Load()
-			fmt.Fprintf(b, "mqlite_rpc_duration_seconds_bucket{rpc=%q,le=%q} %d\n",
-				rpc, strconv.FormatFloat(ub, 'g', -1, 64), cum)
+			cum += c.bucket[i]
+			v.Buckets[i] = wire.LatencyBucket{UpperBoundSeconds: ub, Count: cum}
 		}
-		cum += c.bucket[len(latencyBuckets)].Load() // +Inf bucket = total count
-		fmt.Fprintf(b, "mqlite_rpc_duration_seconds_bucket{rpc=%q,le=\"+Inf\"} %d\n", rpc, cum)
-		fmt.Fprintf(b, "mqlite_rpc_duration_seconds_sum{rpc=%q} %g\n", rpc, float64(c.sumUs.Load())/1e6)
-		fmt.Fprintf(b, "mqlite_rpc_duration_seconds_count{rpc=%q} %d\n", rpc, c.count.Load())
+		c.mu.Unlock()
+		out = append(out, v)
 	}
+	return out
 }
 
 // observe is the always-on middleware that times every RPC (/mqlite.v1.*) and feeds the

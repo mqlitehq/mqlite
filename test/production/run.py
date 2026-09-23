@@ -185,7 +185,9 @@ def execute(args, out):
     (out / "outbox-data").mkdir()
     network_created, started, monitors = False, [], {}
     token = "mqk_" + uuid.uuid4().hex
-    env = dict(os.environ, MQLITE_TOKENS=token, MQLITE_TOKEN=token)
+    monitor_token = "mqk_" + uuid.uuid4().hex
+    env = dict(os.environ, MQLITE_TOKENS=token, MQLITE_TOKEN=token,
+               MQLITE_MONITOR_TOKENS=monitor_token)
     begin = time.monotonic()
     previous = begin
     max_gap = 0
@@ -220,7 +222,8 @@ def execute(args, out):
         started.append("broker")
         docker("run", *limits, "--name", names["broker"], "--network-alias", "broker",
                "--mount", "type=bind,src=" + str(out / "broker-data") + ",dst=/data",
-               "--env", "MQLITE_TOKENS", "--env", "MQLITE_SYNC=FULL",
+               "--env", "MQLITE_TOKENS", "--env", "MQLITE_MONITOR_TOKENS",
+               "--env", "MQLITE_METRICS=on", "--env", "MQLITE_SYNC=FULL",
                images["broker"]["id"], env=env)
         monitors["broker"] = Logs(args.docker, names["broker"], out / "broker-log-summary.json")
         def status():
@@ -232,9 +235,29 @@ def execute(args, out):
         def scrape_metrics():
             metrics = docker("exec", "--env", "MQLITE_TOKEN", names["broker"], "sh", "-c",
                              'wget -q -O - --header "Authorization: Bearer $MQLITE_TOKEN" '
-                             'http://127.0.0.1:6754/metrics', env=env).stdout
+                             'http://127.0.0.1:6754/metrics', env=dict(env, MQLITE_TOKEN=monitor_token)).stdout
             require("mqlite_rpc_duration_seconds_bucket" in metrics, "RPC histogram scrape missing")
             return metrics
+
+        def wait_for_metrics():
+            deadline = time.monotonic() + 45
+            while True:
+                try:
+                    return scrape_metrics()
+                except RuntimeError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.25)
+
+        def metrics_require_authentication():
+            # Enabling metrics on the API listener must never enable anonymous
+            # scrapes. Test both missing and invalid credentials before load starts.
+            for auth in ("", "invalid-" + monitor_token):
+                result = docker("exec", "--env", "MQLITE_TOKEN", names["broker"], "sh", "-c",
+                                'wget -S -O /dev/null --header "Authorization: Bearer $MQLITE_TOKEN" '
+                                'http://127.0.0.1:6754/metrics 2>&1 | grep -q " 401 "',
+                                env=dict(env, MQLITE_TOKEN=auth), required=False)
+                require(result.returncode == 0, "metrics accepted missing or invalid credentials")
 
         deadline = time.monotonic() + 45
         while True:
@@ -249,6 +272,10 @@ def execute(args, out):
         require(state.get("version") == args.expected_version and state.get("schema_version") == "5"
                 and state.get("backend") == "local file" and state.get("auth") is True,
                 "unexpected broker version/schema/storage/auth")
+        metrics_require_authentication()
+        # Verify authenticated scraping before starting the long-running workload;
+        # otherwise a later scrape failure could be mistaken for a workload failure.
+        wait_for_metrics()
         metadata["status_at_start"] = state
         metadata["broker_binary_sha256"] = docker("exec", names["broker"], "sha256sum", "/usr/local/bin/mqlite").stdout.split()[0]
         metadata["runner_binary_sha256"] = docker("run", "--rm", "--platform", "linux/amd64", "--pull", "never",

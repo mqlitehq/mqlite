@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // Re-exported sentinel errors so callers can use errors.Is on either mode.
@@ -126,6 +127,10 @@ func (c QueueConfig) toEngine() engine.QueueConfig {
 
 // Metrics mirrors engine.Metrics with the same fields.
 type Metrics = engine.Metrics
+
+// Observation is the canonical broker and engine observation. Check Collection.State
+// before interpreting queue gauges; process counters reset when the engine restarts.
+type Observation = wire.ObserveResponse
 
 // QueueInfo mirrors engine.QueueInfo.
 type QueueInfo = engine.QueueInfo

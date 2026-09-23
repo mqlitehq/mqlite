@@ -15,7 +15,11 @@ import (
 	mq "github.com/mqlitehq/mqlite"
 )
 
-const recipeVersion = 1
+const recipeVersion = 2
+
+// Leave room for HTTP round trips and synchronous evidence writes before a
+// time-sensitive probe. This is a fixture duration, not a broker latency SLO.
+const temporalWindow = 10 * time.Second
 
 var laneNames = []string{"ordinary", "group", "strict", "retry", "scheduled", "deferred", "topics", "outbox"}
 
@@ -89,10 +93,10 @@ func makePlan(seed string, lane int, batch uint64, created int64) plan {
 			m.Group = fmt.Sprintf("%s/group/%d/%d", seed, batch, i/2)
 		}
 		if lane == 4 {
-			m.ScheduledAt = created + 2000
+			m.ScheduledAt = created + temporalWindow.Milliseconds()
 		}
 		if lane == 5 && i == 1 {
-			m.TTLMillis = 1500
+			m.TTLMillis = temporalWindow.Milliseconds()
 			m.Outcome = "ttl-dlq"
 			if batch%2 == 1 {
 				m.Targets = []string{queue(seed, "ttl-discard")}

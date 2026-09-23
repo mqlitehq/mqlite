@@ -246,20 +246,33 @@ func (e *Engine) RevokeAccessKey(ctx context.Context, id string) error {
 // AuthenticateAccessKey validates a database credential without caching it or
 // updating the record. A request starting after a successful revocation is denied.
 func (e *Engine) AuthenticateAccessKey(ctx context.Context, token string) (AccessKey, error) {
+	key, _, err := e.AuthenticateAccessKeyWithOutcome(ctx, token)
+	return key, err
+}
+
+// AuthenticateAccessKeyWithOutcome exposes only a bounded internal observation
+// reason. HTTP adapters must continue returning generic authentication errors.
+func (e *Engine) AuthenticateAccessKeyWithOutcome(ctx context.Context, token string) (AccessKey, string, error) {
 	if !authkey.ValidToken(token) {
-		return AccessKey{}, ErrUnauthenticated
+		return AccessKey{}, "invalid", ErrUnauthenticated
 	}
 	digest := sha256.Sum256([]byte(token))
 	var key AccessKey
 	err := e.db.queryRowScan(ctx, []any{&key.ID, &key.Name, &key.Permissions, &key.CreatedAtMs, &key.ExpiresAtMs, &key.RevokedAtMs}, `SELECT `+accessKeyColumns+` FROM access_keys WHERE token_hash = ?`, digest[:])
 	if errors.Is(err, sql.ErrNoRows) {
-		return AccessKey{}, ErrUnauthenticated
+		return AccessKey{}, "invalid", ErrUnauthenticated
 	}
 	if err != nil {
-		return AccessKey{}, err
+		return AccessKey{}, "backend_error", err
 	}
-	if !key.Permissions.valid() || key.RevokedAtMs != 0 || key.ExpiresAtMs != 0 && key.ExpiresAtMs <= e.now() {
-		return AccessKey{}, ErrUnauthenticated
+	if !key.Permissions.valid() {
+		return AccessKey{}, "invalid", ErrUnauthenticated
 	}
-	return key, nil
+	if key.RevokedAtMs != 0 {
+		return AccessKey{}, "revoked", ErrUnauthenticated
+	}
+	if key.ExpiresAtMs != 0 && key.ExpiresAtMs <= e.now() {
+		return AccessKey{}, "expired", ErrUnauthenticated
+	}
+	return key, "success", nil
 }

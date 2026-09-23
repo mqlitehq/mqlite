@@ -23,10 +23,11 @@ import (
 // (design D3): database/sql serializes every caller onto one connection, so
 // there is zero file-level write-lock contention and claims stay atomic.
 type db struct {
-	sql    *sql.DB
-	remote bool
-	dsn    string    // the user-facing DB string (no auth token — that's only in the conn string)
-	lock   io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
+	storage storageObservations
+	sql     *sql.DB
+	remote  bool
+	dsn     string    // the user-facing DB string (no auth token — that's only in the conn string)
+	lock    io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
 
 	// The close gate serializes every local operation against Close so Close cannot release the
 	// single-writer file lock — nor close the pool — while a write is still in flight. Without it,
@@ -262,9 +263,12 @@ func (d *db) validateAccessKeySchema(ctx context.Context) error {
 
 // recordedSchemaVersion returns the schema_version stored in meta, or ok=false for
 // a fresh database (the meta table or its row does not exist yet).
-func (d *db) recordedSchemaVersion(ctx context.Context) (string, bool, error) {
+func (d *db) recordedSchemaVersion(ctx context.Context) (version string, found bool, resultErr error) {
+	ctx, attempt := startStorage(ctx, "read")
+	// A missing meta table is an expected fresh-database probe, not a storage failure.
+	defer func() { d.finishStorage(attempt, resultErr) }()
 	var v string
-	err := d.queryRowScan(ctx, []any{&v}, `SELECT value FROM meta WHERE key='schema_version'`)
+	err := d.queryRowScanUnobserved(ctx, []any{&v}, `SELECT value FROM meta WHERE key='schema_version'`)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || isNoSuchTable(err) {
 			return "", false, nil
@@ -380,6 +384,9 @@ func isBusyErr(err error) bool {
 // backoff pauses before a retry so a contended remote write doesn't immediately
 // re-collide; it escalates a little per attempt and honors ctx cancellation.
 func (d *db) backoff(ctx context.Context, attempt int) {
+	if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
+		a.retries.Add(1)
+	}
 	t := time.NewTimer(time.Duration(attempt) * 40 * time.Millisecond)
 	defer t.Stop()
 	select {
@@ -494,7 +501,7 @@ func (d *db) retryableWrite(err error) bool {
 	return d.remote && (errors.Is(err, driver.ErrBadConn) || isBusyErr(err))
 }
 
-func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if !d.remote { // local: no retries; the wait is cancellable, the running statement is not
 		var res sql.Result
 		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
@@ -548,7 +555,7 @@ func (d *db) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 // For a lock deadline (`locked_until = now + lockDuration`) this is not cosmetic: the write can
 // otherwise commit a lease that has ALREADY EXPIRED, while still reporting success, and the
 // reaper then reclaims the message immediately (MQLITE-97).
-func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any) (sql.Result, error) {
+func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs func() []any) (sql.Result, error) {
 	if !d.remote { // local: one attempt; the wait is cancellable, the running statement is not
 		var res sql.Result
 		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
@@ -599,7 +606,7 @@ func (d *db) execFresh(ctx context.Context, query string, buildArgs func() []any
 // queryFresh hands its rows to scan rather than returning them, because the rows are bound to the
 // connection this attempt holds: the caller cannot be trusted to consume them before we release
 // it.
-func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+func (d *db) queryFreshUnobserved(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			args := buildArgs() // then look again — see execFresh
@@ -655,7 +662,7 @@ func (d *db) queryFresh(ctx context.Context, query string, buildArgs func() []an
 // queryRows is query for a LOCAL store: the rows are consumed inside scan, which is what lets the
 // connection be reserved — a cancellable wait, then an uninterruptible statement (see stmtCtx).
 // Returning *sql.Rows cannot do that: the rows would outlive the reservation.
-func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
+func (d *db) queryRowsUnobserved(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
 	if d.remote {
 		// Gate the WHOLE read — the query, the scan, and Rows.Close — not just the query call: the
 		// rows outlive d.query, so releasing the admission when query returns would let Close tear
@@ -700,7 +707,7 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 
 // queryRowScan runs a single-row query and scans it, retrying connection errors.
 // Returns sql.ErrNoRows when there is no row.
-func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ...any) error {
+func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query string, args ...any) error {
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			rows, qerr := c.QueryContext(ec, query, args...)
@@ -773,13 +780,15 @@ func (d *db) queryRowScan(ctx context.Context, dest []any, query string, args ..
 //     and fn unwinds into the rollback below instead of grinding through the rest of a transaction
 //     nobody is waiting for (codex, round-6).
 //
-// The methods mirror *sql.Tx's signatures — including the ctx parameter they deliberately ignore —
-// so the 28 statement sites read exactly as they did, and so a future one cannot pick the wrong
-// context even by trying.
+// The methods retain the *sql.Tx call shape, including the ctx parameter they deliberately
+// ignore. QueryRowContext returns a Scan-compatible row that also records statement failures.
+// Existing statement sites therefore cannot pick the wrong execution context.
 type txn struct {
-	tx     *sql.Tx
-	caller context.Context // may be cancelled
-	exec   context.Context // protected on a local store; the caller's on a remote one
+	tx             *sql.Tx
+	caller         context.Context // may be cancelled
+	exec           context.Context // protected on a local store; the caller's on a remote one
+	events         map[eventKey]uint64
+	statementError error
 }
 
 func (t *txn) ctx() context.Context {
@@ -790,13 +799,34 @@ func (t *txn) ctx() context.Context {
 }
 
 func (t *txn) ExecContext(_ context.Context, q string, args ...any) (sql.Result, error) {
-	return t.tx.ExecContext(t.ctx(), q, args...)
+	res, err := t.tx.ExecContext(t.ctx(), q, args...)
+	if err != nil {
+		t.statementError = err
+	}
+	return res, err
 }
 func (t *txn) QueryContext(_ context.Context, q string, args ...any) (*sql.Rows, error) {
-	return t.tx.QueryContext(t.ctx(), q, args...)
+	rows, err := t.tx.QueryContext(t.ctx(), q, args...)
+	if err != nil {
+		t.statementError = err
+	}
+	return rows, err
 }
-func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) *sql.Row {
-	return t.tx.QueryRowContext(t.ctx(), q, args...)
+
+type transactionRow struct {
+	row   *sql.Row
+	owner *txn
+}
+
+func (r transactionRow) Scan(dest ...any) error {
+	err := r.row.Scan(dest...)
+	if err != nil {
+		r.owner.statementError = err
+	}
+	return err
+}
+func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) transactionRow {
+	return transactionRow{row: t.tx.QueryRowContext(t.ctx(), q, args...), owner: t}
 }
 
 // SQL exposes the raw transaction for the one caller that needs it: Embedded.Tx, whose user
@@ -806,7 +836,7 @@ func (t *txn) SQL() *sql.Tx { return t.tx }
 
 // inTx runs fn inside a transaction, retrying the whole transaction on a
 // connection error (the aborted tx leaves nothing committed, so retry is safe).
-func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error) error {
+func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) error {
 	if !e.db.remote {
 		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
 		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
@@ -833,7 +863,8 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 			// the caller and the process's one writer is wedged for good (codex). Rollback after a
 			// successful Commit is a no-op (ErrTxDone).
 			defer func() { _ = tx.Rollback() }()
-			if ferr := fn(ec, &txn{tx: tx, caller: ctx, exec: ec}); ferr != nil {
+			attempt := &txn{tx: tx, caller: ctx, exec: ec}
+			if ferr := fn(ec, attempt); ferr != nil {
 				return ferr
 			}
 			// The statements are protected from interruption; the TRANSACTION is not. A callback
@@ -845,7 +876,11 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr // the deferred rollback undoes it
 			}
-			return tx.Commit()
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			e.observation.add(attempt.events)
+			return nil
 		})
 	}
 	var err error
@@ -857,6 +892,9 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 	for i := 0; i < e.db.attempts(); i++ {
 		if i > 0 {
 			e.db.backoff(ctx, i)
+		}
+		if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
+			a.callbackRejected.Store(false)
 		}
 		var tx *sql.Tx
 		tx, err = e.db.sql.BeginTx(ctx, nil)
@@ -877,12 +915,16 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
 		// replayable statement failures into ErrOutcomeUnknown.
 		var ferr, cerr error
+		attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx)}
 		func() {
 			defer func() { _ = tx.Rollback() }()
-			if ferr = fn(e.db.stmtCtx(ctx), &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx)}); ferr != nil {
+			if ferr = fn(e.db.stmtCtx(ctx), attempt); ferr != nil {
 				return
 			}
 			cerr = tx.Commit()
+			if cerr == nil {
+				e.observation.add(attempt.events)
+			}
 		}()
 		if ferr != nil {
 			err = ferr
