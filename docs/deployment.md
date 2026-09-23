@@ -140,9 +140,11 @@ and [proxy](https://fly.io/docs/flyctl/proxy/) references.
 
 **Cost:** with `auto_stop_machines="stop"` + `min_machines_running=0` the machine
 runs only while serving requests (cold-starts in seconds, stops when idle), so the
-steady-state cost is essentially the 1 GB volume. mqlite uses ~25–34 MB RSS for any
-workload, so 256 MB has ~8× headroom — see [benchmark.md](benchmark.md). For sizing
-and a full cost note, [benchmark.md](benchmark.md).
+idle storage charges remain while the machine is stopped. The historical workloads
+in [benchmark.md](benchmark.md) measured roughly 25–34 MB RSS; these are not memory
+limits for other workloads or versions. Size the current broker using your message
+sizes, concurrency, queue count and monitoring load, and measure peak memory under
+that traffic. Continuous requests, including monitoring, can keep the machine active.
 
 ## systemd (bare metal)
 
