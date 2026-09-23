@@ -10,7 +10,7 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## v0.3.2
+## v0.3.2 — 2026-09-23
 
 > **Upgrade from v0.3.1:** port **6754**, schema token **5**, message data and
 > managed-key storage are unchanged. Stop the broker and take a consistent backup
