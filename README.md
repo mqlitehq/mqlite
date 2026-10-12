@@ -401,12 +401,17 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-This source tree targets **v0.3.2**: default broker port **6754**, schema token **5**,
+This source tree targets **v0.3.3**: default broker port **6754**, schema token **5**,
 runtime-managed access keys and unified observability. See [CHANGELOG.md](CHANGELOG.md)
 for release and upgrade notes.
 Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
-or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.2`; see
+or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.3`; see
 [deployment](docs/deployment.md) for configuration.
+
+**Upgrading from v0.3.2 preserves message and managed-key data.** This release adds
+maintenance diagnostics and generation-checked empty-queue deletion without a schema
+change. Stop clients before retiring a queue name and retain its generation when
+retrying deletion. See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
 
 **Upgrading from v0.3.1 preserves message and managed-key data.** Back up first;
 process counters reset at restart. A rollback to v0.3.1 also needs compatible

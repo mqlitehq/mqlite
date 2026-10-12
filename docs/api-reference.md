@@ -426,6 +426,8 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 
 ### DeleteQueue
 
+Available in **v0.3.3 and later**.
+
 Removes an **empty plain queue**. Requires administrator/manage permission.
 
 - POST `/mqlite.v1.AdminService/DeleteQueue`

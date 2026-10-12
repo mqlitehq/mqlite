@@ -1,6 +1,6 @@
 # Production operations
 
-This runbook covers v0.3.2 and upgrades from v0.3.0/v0.3.1 (port 6754, schema token 5).
+This runbook covers v0.3.3 and upgrades from v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5).
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -191,6 +191,15 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Different schema token | Keep the old database with its old binary. Account for all retained work, then create a new database using the candidate. Do not edit the schema token or point the candidate at the old file as a migration. |
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
+
+For **v0.3.2 → v0.3.3**, schema token **5**, port **6754**, message data and
+managed keys remain compatible. Queue generations use additive rows in the existing
+metadata table; no table migration is required. New diagnostics do not change the
+storage retry policy. If enabled, keep the private diagnostic log on persistent storage
+and retain it separately from database backups. Rolling back to v0.3.2 preserves data
+but does not support DeleteQueue or detailed diagnostics; remove `--diagnostic-log`
+from older CLI invocations. Stop clients before retiring a queue name and keep the
+original deletion generation when reconciling uncertain outcomes.
 
 For **v0.3.1 → v0.3.2**, schema token **5**, port **6754**, message data and
 managed-key storage remain unchanged. Follow the same-schema procedure above;
