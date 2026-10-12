@@ -113,10 +113,6 @@ RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
 // Receive claims up to opts.MaxMessages messages (Peek-Lock by default), with
 // long-poll up to opts.WaitMs (clamped to 20s, §11.3).
 func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions) ([]*Message, error) {
-	q, err := e.loadQueue(ctx, queue)
-	if err != nil {
-		return nil, err
-	}
 	max := opts.MaxMessages
 	if max <= 0 {
 		max = 1
@@ -134,6 +130,10 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 	deadline := e.now() + wait
 
 	for {
+		q, err := e.loadQueue(ctx, queue)
+		if err != nil {
+			return nil, err
+		}
 		msgs, err := e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
 		if err != nil {
 			return nil, err
@@ -143,6 +143,10 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		}
 		// register a waiter, then re-check to avoid a lost wakeup.
 		ch := e.note.wait(queue)
+		q, err = e.loadQueue(ctx, queue)
+		if err != nil {
+			return nil, err
+		}
 		msgs, err = e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
 		if err != nil {
 			return nil, err

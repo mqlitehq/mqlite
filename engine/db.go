@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 // (design D3): database/sql serializes every caller onto one connection, so
 // there is zero file-level write-lock contention and claims stay atomic.
 type db struct {
+	log     *slog.Logger
 	storage storageObservations
 	sql     *sql.DB
 	remote  bool

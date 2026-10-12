@@ -148,6 +148,7 @@ func (s *Server) routes() {
 	h(wire.PathCreateKey, engine.KeyManage, s.authEnabled(s.handleCreateKey))
 	h(wire.PathListKeys, engine.KeyManage, s.authEnabled(s.handleListKeys))
 	h(wire.PathRevokeKey, engine.KeyManage, s.authEnabled(s.handleRevokeKey))
+	h(wire.PathDeleteQueue, engine.KeyManage, s.handleDeleteQueue)
 	s.mux.HandleFunc("/metrics", s.authorize(monitorPermission, s.handleMetrics))
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -393,6 +394,10 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, engine.ErrDedupConflict):
 		writeErr(w, http.StatusConflict, "already_exists", err.Error())
+	case errors.Is(err, engine.ErrQueueChanged):
+		writeErr(w, http.StatusConflict, "queue_changed", err.Error())
+	case errors.Is(err, engine.ErrQueueNotEmpty):
+		writeErr(w, http.StatusConflict, "queue_not_empty", err.Error())
 	case errors.Is(err, engine.ErrNameConflict):
 		writeErr(w, http.StatusConflict, "name_conflict", err.Error())
 	case errors.Is(err, engine.ErrGroupRequired):
@@ -717,6 +722,20 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // ── AdminService handlers ───────────────────────────────────────────────────
 
+func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
+	var req wire.DeleteQueueRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	logf(w, "queue", req.Name)
+	if err := s.eng.DeleteQueue(r.Context(), req.Name, req.Generation); err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, wire.DeleteQueueResponse{Deleted: true})
+}
+
 func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 	var req wire.CreateQueueRequest
 	if err := decode(r, &req); err != nil {
@@ -754,7 +773,7 @@ func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 	resp := wire.ListQueuesResponse{Queues: make([]wire.QueueInfoJSON, len(qs))}
 	for i, q := range qs {
 		resp.Queues[i] = wire.QueueInfoJSON{
-			Name: q.Name, Kind: q.Kind, LockDurationMs: q.LockDurationMs,
+			Name: q.Name, Kind: q.Kind, Generation: q.Generation, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs,
 		}
 	}

@@ -11,14 +11,18 @@ package engine
 // The live remote round-trip lives in turso_test.go (creds-gated).
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -30,6 +34,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mqlitehq/mqlite/internal/authkey"
 )
@@ -2313,6 +2318,84 @@ func TestObservabilityMaintenanceFailuresAndFilterOutcomes(t *testing.T) {
 	}
 }
 
+// A database failure after part of a maintenance statement has executed must
+// roll back all its message changes. The next pass must recover the same rows.
+// This exercises the three tasks seen failing in the idle remote incident;
+// it does not simulate a lost remote COMMIT acknowledgement (covered above).
+func TestMaintenanceDatabaseFailurePreservesMessagesAndRecovers(t *testing.T) {
+	for _, tc := range []struct {
+		task, before, after, event string
+	}{
+		{"locks", "locked", "active", "lock_expired"},
+		{"scheduled", "scheduled", "active", "activated"},
+		{"ttl", "active", "dead_lettered", "dead_lettered"},
+	} {
+		t.Run(tc.task, func(t *testing.T) {
+			e, clock := testEngine(t)
+			ctx := context.Background()
+			deadLetterOnExpire := true
+			mustQueue(t, e, "q", QueueConfig{DeadLetterOnExpire: &deadLetterOnExpire})
+			seqs, err := e.Send(ctx, "q", OutMessage{Body: []byte("first")}, OutMessage{Body: []byte("second")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			expires := int64(0)
+			if tc.task == "ttl" {
+				expires = *clock - 1
+			}
+			if _, err := e.db.exec(ctx, `UPDATE messages SET state=?,locked_until=?,visible_at=?,expires_at=?`, tc.before, *clock-1, *clock-1, expires); err != nil {
+				t.Fatal(err)
+			}
+			// Reject the second row, after SQLite has visited the first row.
+			trigger := fmt.Sprintf(`CREATE TRIGGER fail_maintenance BEFORE UPDATE ON messages
+				WHEN OLD.id=%d BEGIN SELECT RAISE(ABORT,'injected maintenance database failure'); END`, seqs[1])
+			if _, err := e.db.exec(ctx, trigger); err != nil {
+				t.Fatal(err)
+			}
+			pass := map[string]func(context.Context){"locks": e.reapLocks, "scheduled": e.activateScheduled, "ttl": e.expireTTL}[tc.task]
+			checkMessages := func(state string) {
+				t.Helper()
+				var got []string
+				err := e.db.queryRows(ctx, `SELECT id,state,body FROM messages ORDER BY id`, func(rows *sql.Rows) error {
+					for rows.Next() {
+						var id int64
+						var s string
+						var body []byte
+						if err := rows.Scan(&id, &s, &body); err != nil {
+							return err
+						}
+						got = append(got, fmt.Sprintf("%d:%s:%s", id, s, body))
+					}
+					return rows.Err()
+				})
+				want := []string{fmt.Sprintf("%d:%s:first", seqs[0], state), fmt.Sprintf("%d:%s:second", seqs[1], state)}
+				if err != nil || !reflect.DeepEqual(got, want) {
+					t.Fatalf("messages=%v want=%v err=%v", got, want, err)
+				}
+			}
+			e.runMaintenance(ctx, tc.task, pass)
+			checkMessages(tc.before)
+			failed := e.observation.maintenance[tc.task]
+			if failed.Diagnostics == nil || failed.Diagnostics.LastOutcome != "failed" || len(failed.Diagnostics.RecentFailures) == 0 || failed.Diagnostics.RecentFailures[0].Error.Category != "constraint" {
+				t.Fatalf("missing concrete SQLite cause: %+v", failed.Diagnostics)
+			}
+			if failed.Failures != 1 || failed.LastSuccessAtMs != 0 || e.observation.events[eventKey{"q", tc.event}] != 0 {
+				t.Fatalf("failed pass reported success: %+v", failed)
+			}
+			if _, err := e.db.exec(ctx, `DROP TRIGGER fail_maintenance`); err != nil {
+				t.Fatal(err)
+			}
+			advance(clock, time.Second)
+			e.runMaintenance(ctx, tc.task, pass)
+			checkMessages(tc.after)
+			recovered := e.observation.maintenance[tc.task]
+			if recovered.Runs != 2 || recovered.Failures != 1 || recovered.LastSuccessAtMs != *clock || e.observation.events[eventKey{"q", tc.event}] != 2 {
+				t.Fatalf("recovery or historical failure was lost: %+v", recovered)
+			}
+		})
+	}
+}
+
 func TestObservabilityAuthenticationReasons(t *testing.T) {
 	e, clock := testEngine(t)
 	ctx := context.Background()
@@ -2605,6 +2688,136 @@ func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
 		joined := strings.Join(plan, "\n")
 		if !strings.Contains(joined, "MATERIALIZE m") || strings.Count(joined, "SCAN messages") != 1 || strings.Index(joined, "SCAN messages") > strings.Index(joined, "LEFT-JOIN") {
 			t.Fatalf("messages must be aggregated once before inventory join:\n%s", joined)
+		}
+	}
+}
+
+func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
+	for _, tc := range []struct {
+		err      error
+		category string
+		status   int
+	}{
+		{errors.New("remote: error code 503: private provider message https://secret.example/?token=hidden"), "provider_unavailable", 503},
+		{errors.New("error code 401: token=hidden"), "provider_auth", 401},
+		{errors.New("error code 429: slow down"), "provider_rate_limit", 429},
+		{errors.New("error code 400: private SQL"), "provider_http", 400},
+		{&net.DNSError{Err: "private lookup", Name: "secret.example"}, "dns", 0},
+		{x509.UnknownAuthorityError{}, "tls", 0},
+		{netTimeout{}, "timeout", 0},
+		{context.DeadlineExceeded, "timeout", 0},
+		{&json.SyntaxError{Offset: 12}, "protocol", 0},
+		{errors.New("SQLITE_CONSTRAINT private SQL"), "constraint", 0},
+		{errors.New("SQLITE_READONLY"), "readonly", 0},
+		{errors.New("no such table: private_table"), "schema", 0},
+		{errors.New("SQLITE_FULL"), "full", 0},
+		{errors.New("unknown private explanation mqk_hidden"), "unclassified", 0},
+		{errors.Join(ErrOutcomeUnknown, errors.New("error code 503: unknown commit")), "outcome_unknown", 0},
+		{fmt.Errorf("%w: error code 503: unknown commit", ErrOutcomeUnknown), "outcome_unknown", 503},
+	} {
+		t.Run(tc.category+fmt.Sprint(tc.status), func(t *testing.T) {
+			detail := describeError(tc.err, 123)
+			if detail.Category != tc.category || detail.HTTPStatus != tc.status || detail.AtMs != 123 || len(detail.Fingerprint) != 24 || detail.Message == "" {
+				t.Fatalf("detail=%+v", detail)
+			}
+			if again := describeError(tc.err, 456); again.Fingerprint != detail.Fingerprint {
+				t.Fatal("fingerprint changed with time")
+			}
+			for _, secret := range []string{"private", "secret.example", "hidden", "private_table"} {
+				// The generic unclassified description intentionally names the private log.
+				if secret == "private" {
+					continue
+				}
+				if strings.Contains(detail.Message, secret) {
+					t.Fatalf("public detail leaked %q", secret)
+				}
+			}
+		})
+	}
+	raw := errors.New("provider overloaded\nhttps://secret.example/?token=abc auth_token=topsecret mqk_hidden \x1b[31m " + strings.Repeat("\u754c", 2000))
+	private := privateDiagnosticError(raw)
+	for _, secret := range []string{"secret.example", "topsecret", "mqk_hidden", "\n", "\x1b"} {
+		if strings.Contains(private, secret) {
+			t.Fatalf("private log retained %q", secret)
+		}
+	}
+	if !strings.Contains(private, "provider overloaded") || len(private) > 2060 || !utf8.ValidString(private) {
+		t.Fatalf("invalid bounded private log (%d bytes)", len(private))
+	}
+}
+
+func TestMaintenanceDiagnosticHistoryRecoveryAndLogCorrelation(t *testing.T) {
+	e, clock := testEngine(t)
+	var log bytes.Buffer
+	e.log = slog.New(slog.NewJSONHandler(&log, nil))
+	ctx := context.Background()
+	failure := errors.New("error code 503: provider temporarily overloaded token=private-credential")
+	for n := 0; n < 10; n++ {
+		advance(clock, time.Second)
+		e.runMaintenance(ctx, "locks", func(ctx context.Context) { e.maintenanceFailure(ctx, "reclaim_locks", failure) })
+	}
+	var captured MaintenanceDiagnostics
+	for _, row := range e.Observability(ctx).Maintenance {
+		if row.Task == "locks" {
+			captured = *row.Diagnostics
+		}
+	}
+	if captured.LastOutcome != "failed" || captured.ConsecutiveFailures != 10 || len(captured.RecentFailures) != 8 || captured.RecoveredAtMs != 0 {
+		t.Fatalf("failed diagnostics=%+v", captured)
+	}
+	fingerprint := captured.RecentFailures[0].Error.Fingerprint
+	if !strings.Contains(log.String(), fingerprint) || !strings.Contains(log.String(), "provider temporarily overloaded") || strings.Contains(log.String(), "private-credential") {
+		t.Fatal("operator log lost useful correlation or leaked credential")
+	}
+	// Graceful interruption is neither a failure nor a recovery.
+	e.runMaintenance(ctx, "locks", func(ctx context.Context) { e.maintenanceFailure(ctx, "list_affected_queues", context.Canceled) })
+	row := e.observation.maintenance["locks"]
+	if row.Failures != 10 || row.Interrupted != 1 || row.Diagnostics.LastOutcome != "interrupted" || row.Diagnostics.ConsecutiveFailures != 10 {
+		t.Fatalf("interruption=%+v", row)
+	}
+	advance(clock, time.Second)
+	e.runMaintenance(ctx, "locks", func(context.Context) {})
+	recoveredAt := *clock
+	advance(clock, time.Second)
+	e.runMaintenance(ctx, "locks", func(context.Context) {})
+	row = e.observation.maintenance["locks"]
+	if row.Diagnostics.LastOutcome != "ok" || row.Diagnostics.ConsecutiveFailures != 0 || row.Diagnostics.RecoveredAtMs != recoveredAt || row.Failures != 10 || len(row.Diagnostics.RecentFailures) != 8 {
+		t.Fatalf("recovery=%+v", row.Diagnostics)
+	}
+	if strings.Count(log.String(), `"msg":"maintenance.recovered"`) != 1 || strings.Count(log.String(), `"msg":"maintenance.failure"`) != 10 {
+		t.Fatal("duplicate recovery or interruption mislabeled failure")
+	}
+	captured.RecentFailures[0].Stage = "mutated"
+	if row.Diagnostics.RecentFailures[0].Stage != "reclaim_locks" || captured.LastOutcome != "failed" {
+		t.Fatal("snapshot aliases mutable diagnostics")
+	}
+}
+
+func TestStorageLastErrorKeepsCoarseCountersAndPrivateCause(t *testing.T) {
+	e, _ := testEngine(t)
+	var log bytes.Buffer
+	e.db.log = slog.New(slog.NewJSONHandler(&log, nil))
+	for _, status := range []int{401, 503} {
+		_, attempt := startStorage(context.Background(), "read")
+		e.db.finishStorage(attempt, fmt.Errorf("error code %d: specific upstream explanation", status))
+	}
+	snapshot := e.db.storage.snapshot(e.db.sql.Stats())
+	var detail *ErrorDetail
+	for _, row := range snapshot.Operations {
+		if row.Operation == "read" && row.ErrorCode == "other" {
+			detail = row.LastError
+			if row.Duration.Count != 2 || detail == nil || detail.Category != "provider_unavailable" || detail.HTTPStatus != 503 {
+				t.Fatalf("error bucket=%+v", row)
+			}
+		}
+	}
+	if detail == nil || !strings.Contains(log.String(), detail.Fingerprint) || !strings.Contains(log.String(), "specific upstream explanation") {
+		t.Fatal("missing operator log detail")
+	}
+	detail.Message = "mutated"
+	for _, row := range e.db.storage.snapshot(e.db.sql.Stats()).Operations {
+		if row.LastError != nil && row.LastError.Message == "mutated" {
+			t.Fatal("storage snapshot aliases error detail")
 		}
 	}
 }

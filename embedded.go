@@ -305,6 +305,22 @@ func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]
 
 // ── admin ───────────────────────────────────────────────────────────────────
 
+// DeleteQueue removes an empty plain queue. All message states prevent deletion.
+func (e *Embedded) DeleteQueue(ctx context.Context, name string, opts ...DeleteQueueOpts) error {
+	generation := firstOpt(opts).Generation
+	if generation == "" {
+		queues, err := e.ListQueues(ctx)
+		if err != nil {
+			return err
+		}
+		generation, err = queueGeneration(queues, name)
+		if err != nil {
+			return err
+		}
+	}
+	return e.eng.DeleteQueue(ctx, name, generation)
+}
+
 func (e *Embedded) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {
 	return e.eng.CreateQueue(ctx, name, cfg.toEngine())
 }

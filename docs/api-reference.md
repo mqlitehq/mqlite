@@ -424,6 +424,43 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 
 All paths are `/mqlite.v1.AdminService/<Method>`.
 
+### DeleteQueue
+
+Removes an **empty plain queue**. Requires administrator/manage permission.
+
+- POST `/mqlite.v1.AdminService/DeleteQueue`
+- Read the queue's `generation` from `ListQueues`, then send
+  `{"name":"orders","generation":"<value from ListQueues>"}`.
+  Response: `{"deleted":true}`. Missing generation returns HTTP 400.
+- The generation must still match inside the deletion transaction. HTTP 409,
+  `queue_changed`, means the name now identifies a replacement; the request did
+  not delete it. Preserve the original generation when retrying/reconciling.
+- All message states block deletion, including locked, scheduled, deferred and
+  dead-lettered messages: HTTP 409, `queue_not_empty`. Drain or settle them first.
+- Subscription backing queues are rejected with HTTP 400, `invalid_argument`;
+  this operation does not remove topic subscriptions.
+- Missing queues return HTTP 404, `not_found`. Queue configuration and per-queue
+  deduplication, settlement receipts and receive-attempt records are removed in
+  the same transaction. Recreating the name starts with fresh auxiliary records;
+  message sequence numbers are not reset. Process event counters remain historical.
+- Stop producers and consumers before retiring a queue. The transactional
+  emptiness check prevents deletion of a concurrent acknowledged send. Requests
+  still addressing a retired name fail; an existing long poll is woken.
+- If the result is `outcome_unknown` or the response is lost, inspect `ListQueues`
+  before retrying. Queue names are reusable. Keep the original generation; never automatically
+  look up a replacement generation and retry a previous deletion against it.
+
+Go SDK: `client.DeleteQueue(ctx, name)` / `embedded.DeleteQueue(ctx, name)`.
+These resolve the current generation once per invocation. For retained requests,
+pass `DeleteQueueOpts{Generation: originalGeneration}` to fence later retries.
+`ListQueues` adds the optional `generation` field; existing response fields and
+all prior RPC contracts remain unchanged. New queue generations are opaque IDs
+stored in the existing `meta` table. Existing queues use a stable legacy identity
+until deleted; reconfiguration preserves identity. No schema-version change or
+migration is required.
+The console exposes **delete queue** in a plain queue's detail page and requires
+an exact name confirmation. Older brokers report the operation as unsupported.
+
 ### CreateQueue
 
 Create a queue, or **update** one (idempotent **upsert** on `name`: calling it again

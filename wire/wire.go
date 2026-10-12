@@ -26,6 +26,7 @@ const (
 	PathPeek            = "/mqlite.v1.QueueService/Peek"
 	PathStats           = "/mqlite.v1.QueueService/Stats"
 
+	PathDeleteQueue       = "/mqlite.v1.AdminService/DeleteQueue"
 	PathCreateQueue       = "/mqlite.v1.AdminService/CreateQueue"
 	PathSubscribe         = "/mqlite.v1.AdminService/Subscribe"
 	PathListQueues        = "/mqlite.v1.AdminService/ListQueues"
@@ -181,6 +182,15 @@ type QueueConfigJSON struct {
 	DLQMaxCount int   `json:"dlq_max_count,omitempty"`
 	DLQMaxBytes int64 `json:"dlq_max_bytes,omitempty"`
 }
+type DeleteQueueResponse struct {
+	Deleted bool `json:"deleted"`
+}
+
+type DeleteQueueRequest struct {
+	Generation string `json:"generation"`
+	Name       string `json:"name"`
+}
+
 type CreateQueueRequest struct {
 	Name   string          `json:"name"`
 	Config QueueConfigJSON `json:"config"`
@@ -194,6 +204,7 @@ type ListQueuesResponse struct {
 	Queues []QueueInfoJSON `json:"queues"`
 }
 type QueueInfoJSON struct {
+	Generation       string `json:"generation,omitempty"`
 	Name             string `json:"name"`
 	Kind             string `json:"kind"`
 	LockDurationMs   int64  `json:"lock_duration_ms"`

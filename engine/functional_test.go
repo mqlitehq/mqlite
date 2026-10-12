@@ -1918,3 +1918,246 @@ func TestObservabilityMessageLifecycleInventory(t *testing.T) {
 		requireEvents(t, reopened, "q", map[string]uint64{"recovered": 1, "dead_lettered": 1})
 	})
 }
+
+// ─── Queue deletion ────────────────────────────────────────────────────────
+
+func TestDeleteQueueProtectsEveryMessageState(t *testing.T) {
+	for _, state := range []State{StateActive, StateLocked, StateScheduled, StateDeferred, StateDeadLettered, "completed"} {
+		t.Run(string(state), func(t *testing.T) {
+			e, _ := testEngine(t)
+			ctx := context.Background()
+			mustQueue(t, e, "q", QueueConfig{})
+			seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("keep this body")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.db.exec(ctx, `UPDATE messages SET state=? WHERE id=?`, string(state), seq); err != nil {
+				t.Fatal(err)
+			}
+			if err := deleteCurrentQueue(ctx, e, "q"); !errors.Is(err, ErrQueueNotEmpty) {
+				t.Fatalf("delete: %v", err)
+			}
+			var body []byte
+			var got string
+			if err := e.db.queryRowScan(ctx, []any{&body, &got}, `SELECT body,state FROM messages WHERE id=?`, seq); err != nil || string(body) != "keep this body" || got != string(state) {
+				t.Fatalf("message changed: %q %q %v", body, got, err)
+			}
+		})
+	}
+}
+
+func TestDeleteQueueCleanupRollbackAndNameReuse(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	for _, q := range []string{"q", "other"} {
+		mustQueue(t, e, q, QueueConfig{DedupWindowMs: 600000})
+		if _, err := e.SendOne(ctx, q, OutMessage{MessageID: "same", Body: []byte("old")}); err != nil {
+			t.Fatal(err)
+		}
+		ms, err := e.Receive(ctx, q, ReceiveOptions{AttemptID: "attempt"})
+		if err != nil || len(ms) != 1 {
+			t.Fatalf("receive: %v %v", ms, err)
+		}
+		if err := e.Complete(ctx, q, ms[0].SeqNumber, ms[0].LockToken); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := func(table, q string) int {
+		t.Helper()
+		var n int
+		if err := e.db.queryRowScan(ctx, []any{&n}, `SELECT COUNT(*) FROM `+table+` WHERE queue=?`, q); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if _, err := e.db.exec(ctx, `CREATE TRIGGER fail_queue_delete BEFORE DELETE ON queues BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteCurrentQueue(ctx, e, "q"); err == nil {
+		t.Fatal("wanted rollback")
+	}
+	for _, table := range []string{"dedup", "settlement_receipts", "receive_attempts"} {
+		if count(table, "q") != 1 {
+			t.Fatalf("%s cleanup escaped rollback", table)
+		}
+	}
+	if _, err := e.db.exec(ctx, `DROP TRIGGER fail_queue_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteCurrentQueue(ctx, e, "q"); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"dedup", "settlement_receipts", "receive_attempts"} {
+		if count(table, "q") != 0 || count(table, "other") != 1 {
+			t.Fatalf("%s cleanup crossed queue boundary", table)
+		}
+	}
+	if _, err := e.Receive(ctx, "q", ReceiveOptions{}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("deleted queue still cached: %v", err)
+	}
+	if err := deleteCurrentQueue(ctx, e, "q"); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("missing delete: %v", err)
+	}
+	mustQueue(t, e, "q", QueueConfig{DedupWindowMs: 600000, LockDurationMs: 12345})
+	seq, err := e.SendOne(ctx, "q", OutMessage{MessageID: "same", Body: []byte("new")})
+	if err != nil || seq == 0 {
+		t.Fatalf("stale dedup: %d %v", seq, err)
+	}
+	ms, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: "attempt"})
+	if err != nil || len(ms) != 1 || ms[0].SeqNumber != seq || string(ms[0].Body) != "new" || ms[0].LockedUntilMs-e.now() != 12345 {
+		t.Fatalf("stale receipt/config: %+v %v", ms, err)
+	}
+	if err := deleteCurrentQueue(ctx, e, ""); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty name: %v", err)
+	}
+	if err := e.Subscribe(ctx, "topic", "sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteCurrentQueue(ctx, e, "sub"); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("subscription: %v", err)
+	}
+	subs, err := e.ListSubscriptions(ctx)
+	if err != nil || len(subs) != 1 {
+		t.Fatalf("subscription changed: %v %v", subs, err)
+	}
+}
+
+func TestDeleteQueueWakesLongPoll(t *testing.T) {
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := e.Receive(ctx, "q", ReceiveOptions{WaitMs: 20000}); done <- err }()
+	for {
+		e.note.mu.Lock()
+		waiting := e.note.chans["q"] != nil
+		e.note.mu.Unlock()
+		if waiting {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("receiver did not park")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := deleteCurrentQueue(ctx, e, "q"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrQueueNotFound) {
+			t.Fatalf("receive: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("deleted queue left receiver waiting")
+	}
+}
+
+func TestDeleteQueueConcurrentSendNeverLosesAcknowledgedMessage(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	for i := 0; i < 40; i++ {
+		q := fmt.Sprintf("q-%d", i)
+		mustQueue(t, e, q, QueueConfig{})
+		start := make(chan struct{})
+		sent := make(chan error, 1)
+		deleted := make(chan error, 1)
+		go func() { <-start; _, err := e.SendOne(ctx, q, OutMessage{Body: []byte("must survive")}); sent <- err }()
+		go func() { <-start; deleted <- deleteCurrentQueue(ctx, e, q) }()
+		close(start)
+		sendErr, deleteErr := <-sent, <-deleted
+		if sendErr == nil {
+			if !errors.Is(deleteErr, ErrQueueNotEmpty) {
+				t.Fatalf("acknowledged send with deletion: %v", deleteErr)
+			}
+			ms, err := e.Receive(ctx, q, ReceiveOptions{})
+			if err != nil || len(ms) != 1 || string(ms[0].Body) != "must survive" {
+				t.Fatalf("acknowledged message lost: %v %v", ms, err)
+			}
+		} else if deleteErr != nil {
+			t.Fatalf("neither operation succeeded: send=%v delete=%v", sendErr, deleteErr)
+		}
+	}
+}
+
+func deleteCurrentQueue(ctx context.Context, e *Engine, name string) error {
+	qs, err := e.ListQueues(ctx)
+	if err != nil {
+		return err
+	}
+	generation := "missing"
+	for _, q := range qs {
+		if q.Name == name {
+			generation = q.Generation
+		}
+	}
+	return e.DeleteQueue(ctx, name, generation)
+}
+
+func TestDeleteQueueGenerationFencesReplacement(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprint("legacy=", legacy), func(t *testing.T) {
+			ctx := context.Background()
+			path := "file:" + filepath.Join(t.TempDir(), "queue.db")
+			opts := Options{DB: path, DisableBackground: true, Now: func() int64 { return 1700000000000 }}
+			e, err := Open(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = e.Close() }()
+			mustQueue(t, e, "q", QueueConfig{})
+			if legacy {
+				if _, err := e.db.exec(ctx, `DELETE FROM meta WHERE key='queue-generation:q'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			generation := func() string {
+				t.Helper()
+				qs, err := e.ListQueues(ctx)
+				if err != nil || len(qs) != 1 {
+					t.Fatalf("inventory: %v %v", qs, err)
+				}
+				return qs[0].Generation
+			}
+			original := generation()
+			if original == "" {
+				t.Fatal("missing generation")
+			}
+			mustQueue(t, e, "q", QueueConfig{LockDurationMs: 54321})
+			if generation() != original {
+				t.Fatal("configuration update replaced queue identity")
+			}
+			if err := e.DeleteQueue(ctx, "q", ""); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("missing generation: %v", err)
+			}
+			if err := e.DeleteQueue(ctx, "q", original); err != nil {
+				t.Fatal(err)
+			}
+			mustQueue(t, e, "q", QueueConfig{}) // same name, config and injected millisecond
+			replacement := generation()
+			if replacement == original {
+				t.Fatal("queue identity reused")
+			}
+			if err := e.DeleteQueue(ctx, "q", original); !errors.Is(err, ErrQueueChanged) {
+				t.Fatalf("stale delete reached replacement: %v", err)
+			}
+			if err := e.Close(); err != nil {
+				t.Fatal(err)
+			}
+			e, err = Open(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if generation() != replacement {
+				t.Fatal("restart changed queue identity")
+			}
+			if err := e.DeleteQueue(ctx, "q", original); !errors.Is(err, ErrQueueChanged) {
+				t.Fatalf("stale delete after restart: %v", err)
+			}
+			if err := e.DeleteQueue(ctx, "q", replacement); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

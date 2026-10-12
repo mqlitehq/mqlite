@@ -22,6 +22,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_MONITOR_TOKENS` | optional comma-separated read-only credentials for `observe` and `/metrics`; requires administrator auth and credentials distinct from administrators |
 | `MQLITE_TOKENS` | broker (`serve`) administrator Bearer tokens; **unset → a `mqk_…` token is generated + printed**, `=off` disables auth; additional managed keys live in the database |
 | `MQLITE_METRICS` | authenticated Prometheus `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
+| `MQLITE_DIAGNOSTIC_LOG` | optional private rotating JSONL failure/recovery log path for `serve`; parent must exist; use persistent storage |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
@@ -79,6 +80,7 @@ MQLITE_DB=file:/data/mq.db MQLITE_TOKENS=mqk_dev mqlite serve --addr :6754
 | Flag | Default | |
 |---|---|---|
 | `--addr` | `:6754` | listen address |
+| `--diagnostic-log <path>` | `MQLITE_DIAGNOSTIC_LOG` (otherwise disabled) | private failure/recovery log; 4 MiB × 4 files; see [diagnostics](observability.md#private-diagnostic-log) |
 | `--metrics` | `false` | enable authenticated `/metrics` on the API port; overrides `MQLITE_METRICS`; `--metrics=false` disables |
 | `--insecure-allow-remote` | `false` | with auth disabled, allow a non-loopback bind (otherwise refused) |
 

@@ -154,6 +154,10 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, eb.Message)
 	case "already_exists":
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
+	case "queue_changed":
+		return fmt.Errorf("%w: %s", ErrQueueChanged, eb.Message)
+	case "queue_not_empty":
+		return fmt.Errorf("%w: %s", ErrQueueNotEmpty, eb.Message)
 	case "name_conflict":
 		return fmt.Errorf("%w: %s", ErrNameConflict, eb.Message)
 	case "group_required":
@@ -421,6 +425,29 @@ func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	}, &wire.Empty{})
 }
 
+// DeleteQueue removes an empty plain queue. All message states prevent deletion.
+func (c *Client) DeleteQueue(ctx context.Context, name string, opts ...DeleteQueueOpts) error {
+	generation := firstOpt(opts).Generation
+	if generation == "" {
+		queues, err := c.ListQueues(ctx)
+		if err != nil {
+			return err
+		}
+		generation, err = queueGeneration(queues, name)
+		if err != nil {
+			return err
+		}
+	}
+	var resp wire.DeleteQueueResponse
+	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name, Generation: generation}, &resp); err != nil {
+		return err
+	}
+	if !resp.Deleted {
+		return fmt.Errorf("%w: deletion acknowledgement missing; inspect ListQueues before retrying", ErrOutcomeUnknown)
+	}
+	return nil
+}
+
 // Subscribe registers a subscription under a topic with an optional filter.
 func (c *Client) Subscribe(ctx context.Context, topic, name string, f *Filter) error {
 	return c.post(ctx, wire.PathSubscribe, wire.SubscribeRequest{Topic: topic, Name: name, Filter: f}, &wire.Empty{})
@@ -434,7 +461,7 @@ func (c *Client) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	}
 	out := make([]QueueInfo, len(resp.Queues))
 	for i, q := range resp.Queues {
-		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, LockDurationMs: q.LockDurationMs,
+		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, Generation: q.Generation, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs}
 	}
 	return out, nil
