@@ -47,27 +47,27 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> These instructions target **v0.3.2**, with default port **6754** and schema token **5**.
-> Existing v0.3.0/v0.3.1 databases remain compatible; back up before upgrading and
+> These instructions target **v0.3.3**, with default port **6754** and schema token **5**.
+> Existing v0.3.0/v0.3.1/v0.3.2 databases remain compatible; back up before upgrading and
 > retain a configured administrator. Existing Prometheus scrapers require
 > `MQLITE_METRICS=on` after upgrading; metrics is now disabled by default.
 > Rolling back to v0.3.1 also requires its
 > previous monitoring configuration; v0.3.0 additionally ignores managed keys.
 > **v0.2.0 uses port 8080 and schema token 2.** Its database cannot be opened by
-> v0.3.2: preserve the old binary/database pair and follow the
+> v0.3.3: preserve the old binary/database pair and follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before replacing it.
 
 The published image is multi-arch (amd64 + arm64):
 
 ```bash
-# v0.3.2, default port 6754
+# v0.3.3, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.3.2
+  ghcr.io/mqlitehq/mqlite:0.3.3
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
@@ -89,7 +89,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.3.2"   # pinned image, no build on Fly
+  image = "ghcr.io/mqlitehq/mqlite:0.3.3"   # pinned image, no build on Fly
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -202,11 +202,11 @@ Follow the [production runbook](operations.md#consistent-backups) for read-only
 online snapshots, offline directory copies, isolated restore validation and rollback.
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
-**v0.2.0 databases use schema 2; v0.3.0 through v0.3.2 use schema 5.** There is no
+**v0.2.0 databases use schema 2; v0.3.0 through v0.3.3 use schema 5.** There is no
 in-place migration from schema 2. Before upgrading from v0.2.0, account for retained
-work in every state, keep the old binary/database pair, and create the v0.3.2
+work in every state, keep the old binary/database pair, and create the v0.3.3
 database separately. Upgrading from v0.3.0 reuses the existing database and adds
-managed-key storage; upgrading from v0.3.1 leaves the schema unchanged. Take a
+managed-key storage; upgrading from v0.3.1/v0.3.2 leaves the schema unchanged. Take a
 consistent backup first. `Observe` and configured monitor credentials require
 v0.3.2; restore compatible monitoring configuration when rolling back.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).

@@ -43,7 +43,7 @@ platform, use the [cloud and Kubernetes guide](observability-cloud.md).
 
 ## Maintenance failure diagnosis
 
-Brokers with diagnostic support add optional `maintenance[].diagnostics` and
+Brokers running v0.3.3 or later add optional `maintenance[].diagnostics` and
 `storage.operations[].last_error` fields to Observe. Older snapshots remain valid;
 missing diagnostics mean **not reported**, not healthy. Existing Prometheus labels
 and cumulative error buckets are unchanged.
