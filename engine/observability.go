@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ type StorageOperation struct {
 	ErrorCode string            `json:"error_code"`
 	Duration  DurationHistogram `json:"duration"`
 	Retries   uint64            `json:"retries"`
+	LastError *ErrorDetail      `json:"last_error,omitempty"`
 }
 
 type PoolObservation struct {
@@ -66,13 +68,14 @@ type StorageObservation struct {
 }
 
 type MaintenanceObservation struct {
-	Enabled         bool              `json:"enabled"`
-	Task            string            `json:"task"`
-	Runs            uint64            `json:"runs"`
-	Interrupted     uint64            `json:"interrupted"`
-	Failures        uint64            `json:"failures"`
-	LastSuccessAtMs int64             `json:"last_success_at_ms"`
-	Duration        DurationHistogram `json:"duration"`
+	Enabled         bool                    `json:"enabled"`
+	Task            string                  `json:"task"`
+	Runs            uint64                  `json:"runs"`
+	Interrupted     uint64                  `json:"interrupted"`
+	Failures        uint64                  `json:"failures"`
+	LastSuccessAtMs int64                   `json:"last_success_at_ms"`
+	Duration        DurationHistogram       `json:"duration"`
+	Diagnostics     *MaintenanceDiagnostics `json:"diagnostics,omitempty"`
 }
 
 type FilterCounter struct {
@@ -285,6 +288,13 @@ func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 		m.Task = task
 		m.Enabled = e.observation.background && (task != "reclaim" || s.Backend == "local")
 		m.Duration = cloneHistogram(m.Duration)
+		if m.Diagnostics == nil {
+			m.Diagnostics = &MaintenanceDiagnostics{LastOutcome: "never", RecentFailures: []MaintenanceFailure{}}
+		} else {
+			copy := *m.Diagnostics
+			copy.RecentFailures = append([]MaintenanceFailure{}, copy.RecentFailures...)
+			m.Diagnostics = &copy
+		}
 		s.Maintenance = append(s.Maintenance, m)
 	}
 	s.Filters = []FilterCounter{{Stage: "compile", Count: e.observation.filters[0]}, {Stage: "evaluate", Count: e.observation.filters[1]}}
@@ -385,7 +395,7 @@ func storageErrorCode(err error) string {
 	case isConnErr(err):
 		return "connection"
 	}
-	for _, expected := range []error{ErrQueueNotFound, ErrLockLost, ErrUnauthenticated, ErrPermissionDenied, ErrKeyConflict, ErrDedupConflict, ErrNotFound, ErrUnsupported, ErrMessageTooLarge, ErrNameConflict, ErrGroupRequired, ErrInvalidFilter, ErrInvalidArgument} {
+	for _, expected := range []error{ErrQueueNotFound, ErrLockLost, ErrUnauthenticated, ErrPermissionDenied, ErrKeyConflict, ErrDedupConflict, ErrNotFound, ErrUnsupported, ErrMessageTooLarge, ErrNameConflict, ErrQueueNotEmpty, ErrQueueChanged, ErrGroupRequired, ErrInvalidFilter, ErrInvalidArgument} {
 		if errors.Is(err, expected) {
 			return "application"
 		}
@@ -429,7 +439,6 @@ func (d *db) finishStorage(a *storageAttempt, err error) {
 	}
 	k := storageKey{a.operation, outcome, code}
 	d.storage.mu.Lock()
-	defer d.storage.mu.Unlock()
 	d.storage.initialize()
 	o := d.storage.operations[k]
 	o.Operation = a.operation
@@ -437,7 +446,22 @@ func (d *db) finishStorage(a *storageAttempt, err error) {
 	o.ErrorCode = code
 	o.Retries += a.retries.Load()
 	o.Duration.observe(time.Since(a.start))
+	if outcome == "error" || outcome == "outcome_unknown" {
+		detail := describeError(err, time.Now().UnixMilli())
+		o.LastError = &detail
+	}
 	d.storage.operations[k] = o
+	d.storage.mu.Unlock()
+	if o.LastError != nil && d.log != nil {
+		detail := o.LastError
+		event, level := "storage.failure", slog.LevelError
+		if code == "canceled" || code == "closed" {
+			event, level = "storage.interrupted", slog.LevelInfo
+		}
+		d.log.Log(context.Background(), level, event, "operation", a.operation, "outcome", outcome, "at_ms", detail.AtMs,
+			"category", detail.Category, "cause", detail.Message, "fingerprint", detail.Fingerprint,
+			"http_status", detail.HTTPStatus, "sqlite_code", detail.SQLiteCode, "retries", a.retries.Load(), "error", privateDiagnosticError(err))
+	}
 }
 
 func (o *storageObservations) snapshot(stats sql.DBStats) StorageObservation {
@@ -446,6 +470,10 @@ func (o *storageObservations) snapshot(stats sql.DBStats) StorageObservation {
 	o.initialize()
 	for _, v := range o.operations {
 		v.Duration = cloneHistogram(v.Duration)
+		if v.LastError != nil {
+			copy := *v.LastError
+			v.LastError = &copy
+		}
 		s.Operations = append(s.Operations, v)
 	}
 	o.mu.Unlock()
@@ -534,7 +562,11 @@ func (e *Engine) mutateMessages(ctx context.Context, event, query string, args .
 }
 
 type maintenanceContextKey struct{}
-type maintenanceAttempt struct{ failed, interrupted bool }
+type maintenanceAttempt struct {
+	failed, interrupted bool
+	task                string
+	failures            []MaintenanceFailure
+}
 
 func markMaintenanceFailure(ctx context.Context, err error) {
 	if a, ok := ctx.Value(maintenanceContextKey{}).(*maintenanceAttempt); ok {
@@ -552,24 +584,48 @@ func (e *Engine) runMaintenance(ctx context.Context, task string, fn func(contex
 		}
 	}
 	start := time.Now()
-	a := &maintenanceAttempt{}
+	a := &maintenanceAttempt{task: task}
 	fn(context.WithValue(ctx, maintenanceContextKey{}, a))
 	e.observation.mu.Lock()
-	defer e.observation.mu.Unlock()
 	if e.observation.maintenance == nil {
 		e.observation.maintenance = make(map[string]MaintenanceObservation)
 	}
 	m := e.observation.maintenance[task]
+	if m.Diagnostics == nil {
+		m.Diagnostics = &MaintenanceDiagnostics{LastOutcome: "never", RecentFailures: []MaintenanceFailure{}}
+	}
+	diag := m.Diagnostics
+	diag.LastRunAtMs = e.now()
+	var recoveredFailures uint64
 	m.Runs++
 	if a.failed {
 		m.Failures++
+		diag.LastOutcome = "failed"
+		diag.ConsecutiveFailures++
+		diag.RecoveredAtMs = 0
+		diag.RecentFailures = append(diag.RecentFailures, a.failures...)
+		if len(diag.RecentFailures) > maintenanceHistoryLimit {
+			diag.RecentFailures = append([]MaintenanceFailure{}, diag.RecentFailures[len(diag.RecentFailures)-maintenanceHistoryLimit:]...)
+		}
 	} else if a.interrupted || ctx.Err() != nil {
 		m.Interrupted++
+		diag.LastOutcome = "interrupted"
 	} else {
+		if diag.ConsecutiveFailures > 0 {
+			diag.RecoveredAtMs = e.now()
+			recoveredFailures = diag.ConsecutiveFailures
+		}
+		diag.LastOutcome = "ok"
+		diag.ConsecutiveFailures = 0
 		m.LastSuccessAtMs = e.now()
 	}
 	m.Duration.observe(time.Since(start))
 	e.observation.maintenance[task] = m
+	recoveredAt := diag.RecoveredAtMs
+	e.observation.mu.Unlock()
+	if recoveredFailures > 0 && e.log != nil {
+		e.log.Info("maintenance.recovered", "task", task, "at_ms", recoveredAt, "consecutive_failures", recoveredFailures)
+	}
 }
 
 func storageQueryOperation(query string) string {

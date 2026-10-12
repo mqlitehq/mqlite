@@ -33,6 +33,7 @@ type Engine struct {
 
 	qmu    sync.RWMutex
 	qcache map[string]queueRow
+	qepoch uint64 // invalidates cache fills racing metadata changes
 
 	filterMu    sync.Mutex              // guards filterCache
 	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
@@ -99,6 +100,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if lg == nil {
 		lg = slog.Default()
 	}
+	d.log = lg
 	e := &Engine{
 		db:          d,
 		note:        newNotifier(),
@@ -207,9 +209,82 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	}
 	e.qmu.Lock()
 	delete(e.qcache, name)
+	e.qepoch++
 	e.qmu.Unlock()
 	e.rememberQueue(name)
 	return nil
+}
+
+// DeleteQueue removes an empty plain queue and its deduplication/replay records.
+// Every message state, including scheduled and dead-lettered, prevents deletion.
+// The check and cleanup share one transaction; concurrent sends cannot be lost.
+// A missing queue returns ErrQueueNotFound. Subscription lifecycle is separate.
+// generation must be the identity returned by ListQueues; a stale request cannot
+// delete a replacement with the same name (ErrQueueChanged).
+func (e *Engine) DeleteQueue(ctx context.Context, name, generation string) error {
+	if generation == "" {
+		return fmt.Errorf("%w: queue generation required", ErrInvalidArgument)
+	}
+	if name == "" {
+		return fmt.Errorf("%w: queue name required", ErrInvalidArgument)
+	}
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		var kind, actualGeneration string
+		if err := tx.QueryRowContext(ctx, `SELECT kind,
+			COALESCE((SELECT value FROM meta WHERE key='queue-generation:' || queues.name), 'legacy:' || created_at)
+			FROM queues WHERE name=?`, name).Scan(&kind, &actualGeneration); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrQueueNotFound
+			}
+			return err
+		}
+		if generation != actualGeneration {
+			return ErrQueueChanged
+		}
+		if kind != "queue" {
+			return fmt.Errorf("%w: DeleteQueue only supports plain queues, not subscriptions", ErrInvalidArgument)
+		}
+		var occupied bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM messages WHERE queue=?)`, name).Scan(&occupied); err != nil {
+			return err
+		}
+		if occupied {
+			return ErrQueueNotEmpty
+		}
+		// These tables deliberately have no foreign keys. Remove them atomically so
+		// reusing a queue name cannot replay old deliveries or deduplicate new sends.
+		for _, statement := range []string{
+			`DELETE FROM dedup WHERE queue=?`,
+			`DELETE FROM settlement_receipts WHERE queue=?`,
+			`DELETE FROM receive_attempts WHERE queue=?`,
+			`DELETE FROM meta WHERE key='queue-generation:' || ?`,
+		} {
+			if _, err := tx.ExecContext(ctx, statement, name); err != nil {
+				return err
+			}
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM queues WHERE name=? AND kind='queue'
+			AND NOT EXISTS(SELECT 1 FROM messages WHERE queue=?)`, name, name)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return ErrQueueNotEmpty
+		}
+		return nil
+	})
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		e.qmu.Lock()
+		delete(e.qcache, name)
+		e.qepoch++
+		e.qmu.Unlock()
+		e.note.notify(name)
+	}
+	return err
 }
 
 // createQueueTx is CreateQueue's body bound to a transaction so callers
@@ -258,6 +333,7 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	newQueue := errors.Is(err, sql.ErrNoRows)
 	lock := cfg.LockDurationMs
 	if lock <= 0 {
 		lock = 30000
@@ -298,6 +374,14 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`+conflict,
 		name, kind, lock, maxdc, cfg.DefaultTTLMs, dle, cfg.DedupWindowMs, string(ordering),
 		cfg.DLQMaxAgeMs, cfg.DLQMaxCount, cfg.DLQMaxBytes, now, now)
+	if err != nil {
+		return err
+	}
+	if newQueue {
+		// Additive metadata in the existing meta table; schema and old readers stay compatible.
+		_, err = tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES(?,?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, "queue-generation:"+name, randToken())
+	}
 	return err
 }
 
@@ -392,6 +476,7 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 	}
 	e.qmu.Lock()
 	delete(e.qcache, name)
+	e.qepoch++
 	e.qmu.Unlock()
 	e.rememberQueue(name)
 	// A re-subscribe may have changed the filter — drop any cached program so the
@@ -436,44 +521,52 @@ func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, err
 }
 
 func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
-	e.qmu.RLock()
-	q, ok := e.qcache[name]
-	e.qmu.RUnlock()
-	if ok {
-		return q, nil
-	}
-	var dle int
-	var ordering string
-	if err := e.db.queryRowScan(ctx,
-		[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering,
-			&q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes}, `
+	for {
+		e.qmu.RLock()
+		q, ok := e.qcache[name]
+		epoch := e.qepoch
+		e.qmu.RUnlock()
+		if ok {
+			return q, nil
+		}
+		var dle int
+		var ordering string
+		if err := e.db.queryRowScan(ctx,
+			[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering,
+				&q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes}, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
 		       dead_letter_on_expire,dedup_window_ms,ordering_mode,
 		       dlq_max_age_ms,dlq_max_count,dlq_max_bytes FROM queues WHERE name=?`, name); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return queueRow{}, ErrQueueNotFound
+			if errors.Is(err, sql.ErrNoRows) {
+				return queueRow{}, ErrQueueNotFound
+			}
+			return queueRow{}, err
 		}
-		return queueRow{}, err
+		q.deadLetterOnExp = dle != 0
+		q.ordering = OrderingMode(ordering)
+		e.qmu.Lock()
+		if e.qepoch != epoch {
+			e.qmu.Unlock()
+			continue
+		}
+		e.qcache[name] = q
+		e.qmu.Unlock()
+		return q, nil
 	}
-	q.deadLetterOnExp = dle != 0
-	q.ordering = OrderingMode(ordering)
-	e.qmu.Lock()
-	e.qcache[name] = q
-	e.qmu.Unlock()
-	return q, nil
 }
 
 // ListQueues lists all queues/subscriptions.
 func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	var out []QueueInfo
 	err := e.db.queryRows(ctx, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms
+		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms,
+		       COALESCE((SELECT value FROM meta WHERE key='queue-generation:' || queues.name), 'legacy:' || created_at)
 		FROM queues ORDER BY name`,
 		func(rows *sql.Rows) error {
 			for rows.Next() {
 				var qi QueueInfo
 				if err := rows.Scan(&qi.Name, &qi.Kind, &qi.LockDurationMs, &qi.MaxDeliveryCount,
-					&qi.DefaultTTLMs, &qi.DedupWindowMs); err != nil {
+					&qi.DefaultTTLMs, &qi.DedupWindowMs, &qi.Generation); err != nil {
 					return err
 				}
 				out = append(out, qi)

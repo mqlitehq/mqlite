@@ -41,6 +41,66 @@ For a runnable broker, Prometheus and Grafana stack, see
 [the local observability demo](../ops/observability/README.md). For an existing
 platform, use the [cloud and Kubernetes guide](observability-cloud.md).
 
+## Maintenance failure diagnosis
+
+Brokers with diagnostic support add optional `maintenance[].diagnostics` and
+`storage.operations[].last_error` fields to Observe. Older snapshots remain valid;
+missing diagnostics mean **not reported**, not healthy. Existing Prometheus labels
+and cumulative error buckets are unchanged.
+
+Each maintenance task reports its latest outcome (`never`, `ok`, `failed`, or
+`interrupted`), last run time, consecutive failed passes, recovery time, and the
+latest eight failed steps. One pass can fail at several steps but increments the
+failure counter only once. Canceled/closed operations remain interruptions. A
+successful pass clears the consecutive streak and records recovery; it does not
+clear cumulative failures or history. All snapshot counters/history reset when the
+broker process restarts. A failed poll makes the console's previous data stale.
+
+Error details include a timestamp, generated explanation, category, HTTP status or
+SQLite code where available, and an opaque fingerprint. Categories distinguish
+provider authentication, rate limits, provider availability, DNS, TLS, timeouts,
+protocol, constraints, schema, and storage failures. These descriptions summarize
+the observed error; an HTTP 503 alone cannot establish the provider's root cause.
+Unknown commit outcomes remain explicitly ambiguous and must be reconciled before
+retrying. Diagnostic changes do not broaden write retries.
+
+A storage bucket's count covers **all** occurrences in that legacy bucket;
+`last_error` describes only its latest failure. Neither a historical count nor a
+successful maintenance pass proves message integrity or high availability. Empty
+queues still run background database maintenance, so failures can occur while no
+clients are sending or receiving.
+
+### Private diagnostic log
+
+Structured stderr events `maintenance.failure`, `maintenance.interrupted`,
+`maintenance.recovered`, `storage.interrupted`, and `storage.failure` record the task/step or operation.
+Failure events include the same fingerprint as Observe and a bounded provider
+explanation with common credentials and URLs redacted. Public monitor responses
+contain generated explanations only, never the raw provider/SQL error. Private
+logs may still contain sensitive database error context; keep them operator-only.
+
+To retain evidence beyond the platform's stderr retention, enable a separate file:
+
+```sh
+MQLITE_DIAGNOSTIC_LOG=/data/mqlite-diagnostics.jsonl mqlite serve
+# Equivalent: mqlite serve --diagnostic-log /data/mqlite-diagnostics.jsonl
+```
+
+The parent directory must exist. The file is disabled by default; an invalid
+configured path fails startup. It appends across restarts, uses mode `0600`, syncs
+each record, and rotates at 4 MiB with three archives (`.1` through `.3`, newest
+first): at most 16 MiB of retained diagnostic records, not a time-based retention
+promise. Routine requests and successful maintenance passes are excluded. A
+successful recovery is logged once per failure streak. A disk write failure still
+emits the original event to stderr plus one warning per logging failure streak.
+
+Mount the file on persistent storage to survive machine replacement/deployment;
+Fly's ephemeral root filesystem is insufficient. Export archives elsewhere if
+evidence must survive volume loss or sustained errors filling the rotation budget.
+The file is independent of the queue database, and is not replayed into Observe
+history after restart. It is diagnostic evidence, not a message backup or failover
+mechanism. Embedded applications can supply their own logger with `WithLogger`.
+
 ## Read-only monitoring access
 
 Configure a separate scraper credential in `MQLITE_MONITOR_TOKENS`, alongside
@@ -337,3 +397,8 @@ invalid queries and missing datasources verify that the checker rejects failures
 interrupts only that isolated stack to verify scrape-auth recovery, Grafana
 connection failure/recovery and persistence/counter reset after broker restart.
 Managed-cloud/Kubernetes deployment validation remains environment-specific.
+
+DeleteQueue is an additive RPC observation extension. New brokers include its
+request counters and the `queue_not_empty` and `queue_changed` outcomes. The required decoder baseline
+is unchanged so new clients continue to accept observations from older brokers.
+An occupied-queue rejection is an application outcome, not a storage failure.

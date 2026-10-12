@@ -136,6 +136,9 @@ func DecodeObserveResponse(data []byte) (ObserveResponse, error) {
 		dimension := engine.StorageDimension{Operation: o.Operation, Outcome: o.Outcome, ErrorCode: o.ErrorCode}
 		valid = valid && o.Operation != "" && o.Outcome != "" && !storageDimensions[dimension] && validHistogram(o.Duration)
 		storageDimensions[dimension] = true
+		if o.LastError != nil {
+			valid = valid && validErrorDetail(*o.LastError) && o.Duration.Count > 0 && (o.Outcome == "error" || o.Outcome == "outcome_unknown")
+		}
 	}
 	for _, dimension := range engine.StorageDimensions() {
 		valid = valid && storageDimensions[dimension]
@@ -143,6 +146,24 @@ func DecodeObserveResponse(data []byte) (ObserveResponse, error) {
 	tasks := make([]string, 0, len(out.Maintenance))
 	for _, m := range out.Maintenance {
 		valid = valid && m.Failures <= m.Runs && m.Interrupted <= m.Runs-m.Failures && validHistogram(m.Duration) && m.Duration.Count == m.Runs
+		if d := m.Diagnostics; d != nil {
+			valid = valid && d.LastRunAtMs >= 0 && d.RecoveredAtMs >= 0 && d.ConsecutiveFailures <= m.Failures && d.RecentFailures != nil && len(d.RecentFailures) <= 8
+			switch d.LastOutcome {
+			case "never":
+				valid = valid && m.Runs == 0 && d.ConsecutiveFailures == 0
+			case "ok":
+				valid = valid && m.Runs > 0 && d.ConsecutiveFailures == 0
+			case "failed":
+				valid = valid && m.Runs > 0 && d.ConsecutiveFailures > 0 && d.RecoveredAtMs == 0
+			case "interrupted":
+				valid = valid && m.Runs > 0
+			default:
+				valid = false
+			}
+			for _, failure := range d.RecentFailures {
+				valid = valid && failure.Stage != "" && len(failure.Stage) <= 64 && validErrorDetail(failure.Error)
+			}
+		}
 		tasks = append(tasks, m.Task)
 	}
 	valid = valid && completeDomain(tasks, engine.MaintenanceTaskNames())
@@ -195,8 +216,8 @@ func DecodeObserveResponse(data []byte) (ObserveResponse, error) {
 	return out, nil
 }
 
-// ObservationRPCNames returns the required registered RPC observation vocabulary.
-// A server inventory test pins this contract against actual route registration.
+// ObservationRPCNames returns the baseline required RPC observation vocabulary.
+// New routes are additive so newer clients can still observe older brokers.
 func ObservationRPCNames() []string {
 	paths := []string{PathSend, PathReceive, PathComplete, PathCompleteBatch, PathRenewBatch,
 		PathAbandon, PathReject, PathDefer, PathReceiveDeferred, PathRenew, PathSchedule,
@@ -261,6 +282,8 @@ func requiredObservationFields(data []byte, typ reflect.Type) error {
 		return errors.New("null measurement")
 	}
 	switch typ.Kind() {
+	case reflect.Pointer:
+		return requiredObservationFields(data, typ.Elem())
 	case reflect.Struct:
 		var object map[string]json.RawMessage
 		if json.Unmarshal(data, &object) != nil || object == nil {
@@ -274,9 +297,13 @@ func requiredObservationFields(data []byte, typ reflect.Type) error {
 				}
 				continue
 			}
-			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			tag := strings.Split(field.Tag.Get("json"), ",")
+			name := tag[0]
 			value, ok := object[name]
 			if !ok {
+				if len(tag) > 1 && tag[1] == "omitempty" {
+					continue
+				}
 				return fmt.Errorf("missing %s", name)
 			}
 			if err := requiredObservationFields(value, field.Type); err != nil {
@@ -295,4 +322,16 @@ func requiredObservationFields(data []byte, typ reflect.Type) error {
 		}
 	}
 	return nil
+}
+
+func validErrorDetail(d engine.ErrorDetail) bool {
+	if d.AtMs < 0 || d.Category == "" || len(d.Category) > 64 || d.Message == "" || len(d.Message) > 512 || d.SQLiteCode < 0 || (d.HTTPStatus != 0 && (d.HTTPStatus < 100 || d.HTTPStatus > 599)) || len(d.Fingerprint) != 24 {
+		return false
+	}
+	for _, c := range d.Fingerprint {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
 }

@@ -135,9 +135,9 @@ jobs:
           go-version: stable
       - uses: golangci/golangci-lint-action@v9
         with:
-          # v2.13.0 is the first release with go1.27 support (#6642); Go `stable`
-          # on the runners moved to 1.27.0 on 2026-08-23 and older pins panic.
-          version: v2.13.1
+          # v2.13.1 cannot decode the Go 1.27.2 export format used by stable.
+          # Keep the analyzer current without reducing the stable test matrix.
+          version: v2.14.0
 
   govulncheck:
     name: govulncheck

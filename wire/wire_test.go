@@ -549,3 +549,79 @@ func TestObserveResponseRequiresCompleteCounterMatrices(t *testing.T) {
 	v.HTTP.HandlerLatency = []wire.RPCLatencyObservation{}
 	check(v, true)
 }
+
+func TestObserveOptionalDiagnosticsCompatibility(t *testing.T) {
+	data, err := os.ReadFile("../server/testdata/observability.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := wire.DecodeObserveResponse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail := engine.ErrorDetail{AtMs: 123, Category: "provider_unavailable", Message: "Database provider returned HTTP 503 (Service Unavailable).", Fingerprint: strings.Repeat("a", 24), HTTPStatus: 503}
+	base.Maintenance[0].Diagnostics = &engine.MaintenanceDiagnostics{LastOutcome: "ok", LastRunAtMs: 123, RecentFailures: []engine.MaintenanceFailure{{Stage: "reclaim_locks", Error: detail}}}
+	var failedIndex int
+	for i, row := range base.Storage.Operations {
+		if row.Outcome == "error" && row.Duration.Count > 0 {
+			failedIndex = i
+			break
+		}
+	}
+	base.Storage.Operations[failedIndex].LastError = &detail
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.DecodeObserveResponse(encoded); err != nil {
+		t.Fatal(err)
+	}
+	decode := func() map[string]any {
+		var v map[string]any
+		if err := json.Unmarshal(encoded, &v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	maintenance := func(v map[string]any) map[string]any { return v["maintenance"].([]any)[0].(map[string]any) }
+	storage := func(v map[string]any) map[string]any {
+		return v["storage"].(map[string]any)["operations"].([]any)[failedIndex].(map[string]any)
+	}
+	reject := func(v any) {
+		t.Helper()
+		b, _ := json.Marshal(v)
+		if _, err := wire.DecodeObserveResponse(b); err == nil {
+			t.Fatal("accepted malformed optional diagnostics")
+		}
+	}
+	// Optional extension can be absent, but present objects must be complete.
+	for _, selectRow := range []func(map[string]any) map[string]any{maintenance, storage} {
+		key := "diagnostics"
+		if selectRow(decode())[key] == nil {
+			key = "last_error"
+		}
+		row := selectRow(decode())[key].(map[string]any)
+		for field := range row {
+			v := decode()
+			delete(selectRow(v)[key].(map[string]any), field)
+			reject(v)
+		}
+		v := decode()
+		selectRow(v)[key] = nil
+		reject(v)
+	}
+	for _, mutate := range []func(map[string]any){
+		func(v map[string]any) { maintenance(v)["diagnostics"].(map[string]any)["last_outcome"] = "healthy" },
+		func(v map[string]any) { maintenance(v)["diagnostics"].(map[string]any)["consecutive_failures"] = 999 },
+		func(v map[string]any) { maintenance(v)["diagnostics"].(map[string]any)["recent_failures"] = nil },
+		func(v map[string]any) { storage(v)["last_error"].(map[string]any)["fingerprint"] = "<private>" },
+		func(v map[string]any) { storage(v)["last_error"].(map[string]any)["http_status"] = 999 },
+		func(v map[string]any) {
+			storage(v)["last_error"].(map[string]any)["message"] = strings.Repeat("x", 513)
+		},
+	} {
+		v := decode()
+		mutate(v)
+		reject(v)
+	}
+}

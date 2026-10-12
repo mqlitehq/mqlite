@@ -50,6 +50,7 @@ import (
 
 	"github.com/mqlitehq/mqlite"
 	"github.com/mqlitehq/mqlite/internal/defaults"
+	"github.com/mqlitehq/mqlite/internal/diagnosticlog"
 	ver "github.com/mqlitehq/mqlite/internal/version"
 )
 
@@ -448,11 +449,12 @@ func stripEndpointCredentials(ep string) string {
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
+	diagnosticPath := fs.String("diagnostic-log", os.Getenv("MQLITE_DIAGNOSTIC_LOG"), "private rotating JSONL failure/recovery log (or MQLITE_DIAGNOSTIC_LOG; disabled by default)")
 	metrics := fs.Bool("metrics", false, "enable authenticated /metrics on the API listener (default off; or set MQLITE_METRICS)")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote", false, "allow a non-loopback bind while auth is disabled (MQLITE_TOKENS=off)")
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 { // exact arity: serve takes flags only (round-3 §3.4)
-		return fmt.Errorf("usage: serve [--addr host:port] [--metrics] [--insecure-allow-remote]   (no positional arguments, got %q)",
+		return fmt.Errorf("usage: serve [--addr host:port] [--metrics] [--diagnostic-log path] [--insecure-allow-remote]   (no positional arguments, got %q)",
 			strings.Join(fs.Args(), " "))
 	}
 
@@ -497,6 +499,14 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	lg := serveLogger()
 	slogger := slog.New(lg)
+	if *diagnosticPath != "" {
+		handler, err := diagnosticlog.New(lg, *diagnosticPath)
+		if err != nil {
+			return err
+		}
+		defer handler.Close()
+		slogger = slog.New(handler)
+	}
 
 	db := os.Getenv("MQLITE_DB")
 	if db == "" {

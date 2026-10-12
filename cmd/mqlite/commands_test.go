@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -400,5 +401,31 @@ func TestCLIParseHelpers(t *testing.T) {
 	}
 	if props, _ := parseProps(""); props != nil {
 		t.Error("empty --prop should be nil")
+	}
+}
+
+func TestServeDiagnosticLogRejectsInvalidDestinationBeforeOpeningDatabase(t *testing.T) {
+	for _, flag := range []bool{false, true} {
+		t.Run(strconv.FormatBool(flag), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "must-not-open.db")
+			t.Setenv("MQLITE_DB", "file:"+dbPath)
+			t.Setenv("MQLITE_TOKENS", "off")
+			t.Setenv("MQLITE_MONITOR_TOKENS", "")
+			t.Setenv("MQLITE_METRICS", "off")
+			invalid := filepath.Join(t.TempDir(), "missing", "diagnostics.jsonl")
+			args := []string{"--addr", "127.0.0.1:0"}
+			if flag {
+				t.Setenv("MQLITE_DIAGNOSTIC_LOG", "")
+				args = append(args, "--diagnostic-log", invalid)
+			} else {
+				t.Setenv("MQLITE_DIAGNOSTIC_LOG", invalid)
+			}
+			if err := cmdServe(context.Background(), args); err == nil || !strings.Contains(err.Error(), "open diagnostic log") {
+				t.Fatalf("startup error=%v", err)
+			}
+			if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+				t.Fatalf("database opened before validation: %v", err)
+			}
+		})
 	}
 }

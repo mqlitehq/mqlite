@@ -1999,3 +1999,68 @@ func TestSDKMonitorTokenServeValidation(t *testing.T) {
 		t.Fatalf("valid monitor configuration: %v", err)
 	}
 }
+
+func TestRemoteDeleteQueue(t *testing.T) {
+	c, e := newBroker(t, "delete-test")
+	ctx := context.Background()
+	if err := c.CreateQueue(ctx, "delete-me", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	original, err := c.ListQueues(ctx)
+	if err != nil || len(original) != 1 {
+		t.Fatalf("inventory: %v %v", original, err)
+	}
+	if _, err := c.Send(ctx, "delete-me", mqlite.OutMessage{Body: []byte("keep")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteQueue(ctx, "delete-me"); !errors.Is(err, mqlite.ErrQueueNotEmpty) {
+		t.Fatalf("typed conflict: %v", err)
+	}
+	ms, err := c.Receive(ctx, "delete-me", mqlite.RecvOpts{})
+	if err != nil || len(ms) != 1 || string(ms[0].Body) != "keep" {
+		t.Fatalf("protected message: %v %v", ms, err)
+	}
+	if err := ms[0].Complete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteQueue(ctx, "delete-me"); err != nil {
+		t.Fatal(err)
+	}
+	qs, err := c.ListQueues(ctx)
+	if err != nil || len(qs) != 0 {
+		t.Fatalf("deleted queue still listed: %v %v", qs, err)
+	}
+	if err := c.DeleteQueue(ctx, "delete-me"); !errors.Is(err, mqlite.ErrNotFound) {
+		t.Fatalf("typed not found: %v", err)
+	}
+	if err := c.CreateQueue(ctx, "delete-me", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteQueue(ctx, "delete-me", mqlite.DeleteQueueOpts{Generation: original[0].Generation}); !errors.Is(err, mqlite.ErrQueueChanged) {
+		t.Fatalf("stale request: %v", err)
+	}
+	if err := c.DeleteQueue(ctx, "delete-me"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "embedded", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeleteQueue(ctx, "embedded"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteQueueRequiresAcknowledgement(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	c, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteQueue(context.Background(), "q", mqlite.DeleteQueueOpts{Generation: "fixture"}); !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("missing acknowledgement: %v", err)
+	}
+}
