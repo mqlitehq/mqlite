@@ -95,6 +95,8 @@ func TestServerAuthAndErrors(t *testing.T) {
 	// to 400 invalid_argument instead of faulting a SQLite CHECK into a 500.
 	check("unknown field", http.MethodPost, wire.PathSend, "secret",
 		[]byte(`{"queue":"q","messsages":[]}`), http.StatusBadRequest, "invalid_argument")
+	check("removed delete generation", http.MethodPost, wire.PathDeleteQueue, "secret",
+		[]byte(`{"name":"q","generation":"retired"}`), http.StatusBadRequest, "invalid_argument")
 	check("trailing data after body", http.MethodPost, wire.PathSend, "secret",
 		[]byte(`{"queue":"q","messages":[]}{"queue":"q"}`), http.StatusBadRequest, "invalid_argument")
 	check("empty queue name", http.MethodPost, wire.PathCreateQueue, "secret",
@@ -341,15 +343,7 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 				case wire.PathStats:
 					body = wire.MetricsRequest{Queue: "q"}
 				case wire.PathDeleteQueue:
-					qs, listErr := eng.ListQueues(ctx)
-					if listErr != nil {
-						t.Fatal(listErr)
-					}
-					for _, q := range qs {
-						if q.Name == "target" {
-							body = wire.DeleteQueueRequest{Name: "target", Generation: q.Generation}
-						}
-					}
+					body = wire.DeleteQueueRequest{Name: "target"}
 				case wire.PathCreateQueue:
 					body = wire.CreateQueueRequest{Name: "new"}
 				case wire.PathSubscribe:

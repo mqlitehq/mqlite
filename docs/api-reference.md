@@ -426,17 +426,13 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 
 ### DeleteQueue
 
-Available in **v0.3.3 and later**.
+Available in the current unreleased source. The incompatible request shape from
+v0.3.3 was withdrawn and that module version is retracted.
 
 Removes an **empty plain queue**. Requires administrator/manage permission.
 
 - POST `/mqlite.v1.AdminService/DeleteQueue`
-- Read the queue's `generation` from `ListQueues`, then send
-  `{"name":"orders","generation":"<value from ListQueues>"}`.
-  Response: `{"deleted":true}`. Missing generation returns HTTP 400.
-- The generation must still match inside the deletion transaction. HTTP 409,
-  `queue_changed`, means the name now identifies a replacement; the request did
-  not delete it. Preserve the original generation when retrying/reconciling.
+- Request: `{"name":"orders"}`. Response: `{"deleted":true}`.
 - All message states block deletion, including locked, scheduled, deferred and
   dead-lettered messages: HTTP 409, `queue_not_empty`. Drain or settle them first.
 - Subscription backing queues are rejected with HTTP 400, `invalid_argument`;
@@ -448,18 +444,18 @@ Removes an **empty plain queue**. Requires administrator/manage permission.
 - Stop producers and consumers before retiring a queue. The transactional
   emptiness check prevents deletion of a concurrent acknowledged send. Requests
   still addressing a retired name fail; an existing long poll is woken.
-- If the result is `outcome_unknown` or the response is lost, inspect `ListQueues`
-  before retrying. Queue names are reusable. Keep the original generation; never automatically
-  look up a replacement generation and retry a previous deletion against it.
+- Queue names are reusable, and the public API deliberately has no lifetime token.
+  One owner must serialize deletion and same-name recreation. Wait for a successful
+  response and confirm that `ListQueues` no longer contains the name before creating
+  its replacement. Never replay an old deletion after recreation.
+- If the result is `outcome_unknown` or the response is lost, keep the name reserved
+  and inspect `ListQueues`. Under the single-owner rule, an absent row confirms the
+  deletion; a present row is still the original and may be reconciled before any
+  replacement is allowed. Concurrent delete/recreate controllers are unsupported.
 
 Go SDK: `client.DeleteQueue(ctx, name)` / `embedded.DeleteQueue(ctx, name)`.
-These resolve the current generation once per invocation. For retained requests,
-pass `DeleteQueueOpts{Generation: originalGeneration}` to fence later retries.
-`ListQueues` adds the optional `generation` field; existing response fields and
-all prior RPC contracts remain unchanged. New queue generations are opaque IDs
-stored in the existing `meta` table. Existing queues use a stable legacy identity
-until deleted; reconfiguration preserves identity. No schema-version change or
-migration is required.
+No additional deletion options or queue identity field are part of the public
+contract. No schema-version change or migration is required.
 The console exposes **delete queue** in a plain queue's detail page and requires
 an exact name confirmation. Older brokers report the operation as unsupported.
 
@@ -620,6 +616,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 409 | `name_conflict` | a queue/subscription/topic name collision at creation time — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
 | 409 | `key_conflict` | a managed key ID or token digest is already registered (`mqlite.ErrKeyConflict`); no existing secret is returned |
 | 409 | `lock_lost` | settle with an expired or wrong `lock_token` |
+| 409 | `queue_not_empty` | deletion found retained messages in at least one state |
 | 413 | `message_too_large` | body over `MaxMessageBytes` (default 1 MiB) |
 | 499 | `canceled` | the client canceled the request |
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |

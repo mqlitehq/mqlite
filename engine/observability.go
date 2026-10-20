@@ -395,7 +395,7 @@ func storageErrorCode(err error) string {
 	case isConnErr(err):
 		return "connection"
 	}
-	for _, expected := range []error{ErrQueueNotFound, ErrLockLost, ErrUnauthenticated, ErrPermissionDenied, ErrKeyConflict, ErrDedupConflict, ErrNotFound, ErrUnsupported, ErrMessageTooLarge, ErrNameConflict, ErrQueueNotEmpty, ErrQueueChanged, ErrGroupRequired, ErrInvalidFilter, ErrInvalidArgument} {
+	for _, expected := range []error{ErrQueueNotFound, ErrLockLost, ErrUnauthenticated, ErrPermissionDenied, ErrKeyConflict, ErrDedupConflict, ErrNotFound, ErrUnsupported, ErrMessageTooLarge, ErrNameConflict, ErrQueueNotEmpty, ErrGroupRequired, ErrInvalidFilter, ErrInvalidArgument} {
 		if errors.Is(err, expected) {
 			return "application"
 		}

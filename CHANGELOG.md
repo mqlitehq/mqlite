@@ -10,13 +10,34 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## v0.3.3 — 2026-10-13
+## Unreleased
+
+### Remove public queue generations (MQLITE-125)
+
+- Remove `Generation`, `DeleteQueueOpts`, and `queue_changed` from the engine,
+  HTTP API, Go SDK, CLI, MCP server, console, and documentation. `DeleteQueue`
+  now takes only the queue name and `ListQueues` returns configuration fields only.
+- This is an intentional breaking correction for v0.3.3 clients. The v0.3.3 Go
+  module is retracted; v0.3.2 clients are unaffected. The database schema token
+  remains **5**, and the stored queue data stays compatible.
+- Make the name-reuse boundary explicit. Queue deletion and same-name recreation
+  must be serialized by one owner. Do not replay an old deletion after recreation;
+  reconcile an uncertain result before allowing the name to be reused.
+- Treat every temporary subscription name as a globally unique, one-use identity.
+  Use `correlation_id` to match replies. For frequent request/reply traffic, keep a
+  stable shared reply subscription and dispatch replies by correlation ID instead
+  of creating one subscription per request.
+
+## v0.3.3 — 2026-10-13 (retracted)
+
+> **Retracted:** this release exposed queue lifetime metadata as a public API and
+> spread it through deletion clients. That contract was removed on `main` before
+> the next release. Use v0.3.2 until a replacement release is published.
 
 > **Upgrade from v0.3.2:** port **6754**, schema token **5**, message data and
 > managed-key storage remain compatible. Keep one active broker per database and
-> take a consistent backup before replacing it. Existing queues retain their identity;
-> newly created queues receive additive generation metadata. Downgrading to v0.3.2
-> preserves data but removes queue deletion and detailed maintenance diagnostics.
+> take a consistent backup before replacing it. Downgrading to v0.3.2 preserves
+> data but removes queue deletion and detailed maintenance diagnostics.
 > Remove `--diagnostic-log` from CLI arguments when running an older binary.
 
 ### Maintenance diagnostics and queue lifecycle (MQLITE-124)
@@ -30,10 +51,8 @@ upgrade notes before replacing a broker.
 - Add manage-only `DeleteQueue` to the HTTP API and Go SDK. Only empty plain queues
   can be deleted; messages in any retained state prevent deletion. Queue removal and
   cleanup of deduplication and replay metadata commit in one transaction.
-- Require the queue generation on deletion so a stale request cannot delete a
-  same-name replacement, including after restart. SDK retries must retain the
-  original `DeleteQueueOpts.Generation`. Stop producers and consumers before
-  retiring a name; Send and Receive continue to address queues by name.
+- The deletion request shape shipped in this release is withdrawn and incompatible
+  with the corrected name-only contract described above.
 - Add exact-name deletion confirmation to the console, make canonical snapshots
   compact, collapse cumulative message activity by default and fix mobile overflow.
 - Update the console build dependency `source-map-js` to its patched release and

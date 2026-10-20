@@ -394,8 +394,6 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, engine.ErrDedupConflict):
 		writeErr(w, http.StatusConflict, "already_exists", err.Error())
-	case errors.Is(err, engine.ErrQueueChanged):
-		writeErr(w, http.StatusConflict, "queue_changed", err.Error())
 	case errors.Is(err, engine.ErrQueueNotEmpty):
 		writeErr(w, http.StatusConflict, "queue_not_empty", err.Error())
 	case errors.Is(err, engine.ErrNameConflict):
@@ -729,7 +727,7 @@ func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logf(w, "queue", req.Name)
-	if err := s.eng.DeleteQueue(r.Context(), req.Name, req.Generation); err != nil {
+	if err := s.eng.DeleteQueue(r.Context(), req.Name); err != nil {
 		s.fail(w, err)
 		return
 	}
@@ -773,7 +771,7 @@ func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 	resp := wire.ListQueuesResponse{Queues: make([]wire.QueueInfoJSON, len(qs))}
 	for i, q := range qs {
 		resp.Queues[i] = wire.QueueInfoJSON{
-			Name: q.Name, Kind: q.Kind, Generation: q.Generation, LockDurationMs: q.LockDurationMs,
+			Name: q.Name, Kind: q.Kind, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs,
 		}
 	}

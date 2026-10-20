@@ -53,7 +53,6 @@ var (
 	ErrUnsupported           = errors.New("mqlite: operation not supported by this broker")
 	ErrClosed                = errors.New("mqlite: engine closed")
 	ErrMessageTooLarge       = errors.New("mqlite: message body exceeds max size")
-	ErrQueueChanged          = errors.New("mqlite: queue was replaced; refresh before deleting")
 	ErrQueueNotEmpty         = errors.New("mqlite: queue still contains messages; drain all states before deleting")
 	ErrNameConflict          = errors.New("mqlite: name already in use by another queue or topic")
 	ErrGroupRequired         = errors.New("mqlite: group id required for group_fifo queue")
@@ -162,7 +161,6 @@ type Metrics struct {
 
 // QueueInfo describes a queue for listing.
 type QueueInfo struct {
-	Generation       string `json:"generation,omitempty"`
 	Name             string `json:"name"`
 	Kind             string `json:"kind"`
 	LockDurationMs   int64  `json:"lock_duration_ms"`

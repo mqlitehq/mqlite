@@ -1,6 +1,8 @@
 # Production operations
 
-This runbook covers v0.3.3 and upgrades from v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5).
+This runbook covers the current unreleased source and released
+v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5). v0.3.3 is retracted; use
+v0.3.2 until its replacement is published.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -30,6 +32,11 @@ for metric definitions and alerts.
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
   when retrying within their documented retention windows; do not treat an HTTP
   timeout as proof that a write failed.
+- Give one controller exclusive ownership of queue deletion and same-name
+  recreation. Quiesce producers and consumers, wait for deletion to succeed, and
+  confirm the name is absent before recreating it. Keep the name reserved while
+  reconciling an uncertain result, and never replay an old delete after a
+  replacement exists.
 
 Choose and record the application's recovery objectives before launch: acceptable
 snapshot age (RPO), recovery time (RTO), backlog age, and capacity limits. Measure
@@ -192,14 +199,14 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
-For **v0.3.2 → v0.3.3**, schema token **5**, port **6754**, message data and
-managed keys remain compatible. Queue generations use additive rows in the existing
-metadata table; no table migration is required. New diagnostics do not change the
-storage retry policy. If enabled, keep the private diagnostic log on persistent storage
-and retain it separately from database backups. Rolling back to v0.3.2 preserves data
-but does not support DeleteQueue or detailed diagnostics; remove `--diagnostic-log`
-from older CLI invocations. Stop clients before retiring a queue name and keep the
-original deletion generation when reconciling uncertain outcomes.
+For **v0.3.2 → current unreleased source**, schema token **5**, port **6754**,
+message data and managed keys remain compatible; no table migration is required.
+New diagnostics do not change the storage retry policy. If enabled, keep the
+private diagnostic log on persistent storage and retain it separately from database
+backups. Rolling back to v0.3.2 preserves data but does not support `DeleteQueue`
+or detailed diagnostics; remove `--diagnostic-log` from older CLI invocations.
+The retracted v0.3.3 deletion request is incompatible with current clients: update
+both sides together, and follow the serialized name-reuse rule above.
 
 For **v0.3.1 → v0.3.2**, schema token **5**, port **6754**, message data and
 managed-key storage remain unchanged. Follow the same-schema procedure above;
