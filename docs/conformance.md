@@ -327,7 +327,8 @@ changelog, because a caller can observe every one of them.
 - **13.4** Inside a local transaction, **mqlite-owned statements** (including `EngineTx.SendOne`)
   check the caller's context before each statement: one already running finishes, and a statement
   whose check observes cancellation MUST NOT begin. `EngineTx.SQL()` exposes a raw `*sql.Tx`
-  outside those guards. Its statements MUST use `tx.Context()` to avoid interrupting local SQLite;
+  outside those guards for caller-owned tables; directly modifying mqlite-owned tables is outside
+  the supported contract. Its statements MUST use `tx.Context()` to avoid interrupting local SQLite;
   that context is deliberately not cancellable, so raw SQL can still execute after the caller
   cancels. Callers MUST check the original context between their own statements and return promptly.
   Mqlite cannot interrupt the callback or release the single writer before it returns. Cancellation

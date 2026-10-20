@@ -41,6 +41,36 @@ func (e *Engine) signalLifecycle() {
 	}
 }
 
+// A remote lifecycle commit acknowledgement can be lost before its durable state
+// is visible to a new connection. One immediate inventory pass is therefore not
+// enough after ErrOutcomeUnknown. Keep a bounded 30-second reconciliation window;
+// this cost exists only after an ambiguous destructive request, never in the
+// ordinary idle state. Concurrent ambiguous deletes extend (rather than multiply)
+// the window and still share the capacity-one wake.
+const lifecycleUncertainPasses int32 = 30
+
+func (e *Engine) signalUncertainLifecycle() {
+	for {
+		current := e.uncertainLifecycleProbes.Load()
+		if current >= lifecycleUncertainPasses || e.uncertainLifecycleProbes.CompareAndSwap(current, lifecycleUncertainPasses) {
+			break
+		}
+	}
+	e.signalLifecycle()
+}
+
+func (e *Engine) takeUncertainLifecycleProbe() bool {
+	for {
+		current := e.uncertainLifecycleProbes.Load()
+		if current <= 0 {
+			return false
+		}
+		if e.uncertainLifecycleProbes.CompareAndSwap(current, current-1) {
+			return true
+		}
+	}
+}
+
 // startLifecycle runs cleanup only after durable work is discovered. Unfinished
 // passes are paced at one per second so a large forced deletion cannot monopolize
 // the single writer. A signal arriving during a pass remains buffered for the next
@@ -64,6 +94,9 @@ func (e *Engine) startLifecycle(ctx context.Context) {
 				})
 				if ctx.Err() != nil {
 					return
+				}
+				if e.takeUncertainLifecycleProbe() {
+					retry = true
 				}
 				if !retry {
 					break

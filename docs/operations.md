@@ -128,6 +128,8 @@ MQ_SNAPSHOT="$MQ_BACKUP_DIR/mq-$(date -u +%Y%m%dT%H%M%SZ).db"
 sqlite3 -readonly "$MQ_DB" '.timeout 10000' "VACUUM INTO '$MQ_SNAPSHOT'"
 test "$(sqlite3 -readonly "$MQ_SNAPSHOT" 'PRAGMA integrity_check')" = ok
 test -z "$(sqlite3 -readonly "$MQ_SNAPSHOT" 'PRAGMA foreign_key_check')"
+test "$(sqlite3 -readonly "$MQ_SNAPSHOT" \
+  'SELECT COUNT(*) FROM messages m LEFT JOIN queues q ON q.name=m.queue WHERE q.name IS NULL')" = 0
 sqlite3 -readonly "$MQ_SNAPSHOT" "SELECT value FROM meta WHERE key='schema_version'"
 sha256sum "$MQ_SNAPSHOT" > "$MQ_SNAPSHOT.sha256"
 ```
@@ -161,8 +163,11 @@ is still writing needs its own documented consistency guarantees.
 ## Restore into a fresh directory
 
 1. Keep the original data and backup unchanged. Verify the backup checksum and
-   run `integrity_check` and `foreign_key_check` on the saved snapshot or a working
-   copy. Record its schema token and the binary version that created it.
+   run `integrity_check`, `foreign_key_check`, and the documented message-parent
+   orphan query on the saved snapshot or a working copy. Engine writes enforce
+   the message relation transactionally and indexed triggers guard parent
+   retirement, so it is outside SQLite's `foreign_key_check` report. Record the
+   schema token and the binary version that created it.
 2. Create an empty restore directory or volume. An online `VACUUM INTO` snapshot is
    a standalone DB; copy that file into the empty directory. For an offline copy,
    restore the complete matching directory. Never place a snapshot beside WAL/SHM

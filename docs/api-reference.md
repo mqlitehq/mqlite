@@ -481,8 +481,10 @@ work.
   acknowledgements are `outcome_unknown`. Keep the name reserved and inspect
   `ListQueues`. Under the single-owner rule, an absent row confirms the deletion;
   a `deleting` row means cleanup is still running. Never use another delete as a
-  status check or automatically retry it. Concurrent delete/recreate controllers
-  are unsupported.
+  status check or automatically retry it. The engine performs up to 30 one-second
+  discovery passes after an uncertain remote database commit so a late-visible
+  retirement can enter normal cleanup; startup recovery is the durable fallback.
+  Concurrent delete/recreate controllers are unsupported.
 
 Go SDK: `client.DeleteQueue(ctx, name) error` and the equivalent embedded method
 retain their empty-only signature. They return `nil` once deletion is accepted,

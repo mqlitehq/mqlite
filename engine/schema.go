@@ -60,6 +60,11 @@ var schemaStmts = []string{
 	    FOREIGN KEY (subscription) REFERENCES queues(name) ON DELETE CASCADE
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_subs_by_topic ON subscriptions(topic)`,
+	// Subscription names are globally unique in the public model. Besides pinning
+	// that invariant in storage, this is the child-key index SQLite needs to check
+	// subscriptions(subscription)->queues(name) without scanning every topic when
+	// an empty queue row is retired.
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_by_subscription ON subscriptions(subscription)`,
 
 	// core message table. id (INTEGER PRIMARY KEY AUTOINCREMENT = rowid) is the
 	// broker-assigned seq_number (ASB SequenceNumber analogue): strictly increasing for
@@ -70,7 +75,7 @@ var schemaStmts = []string{
 	// message is settled/cancelled its seq is gone for good.
 	`CREATE TABLE IF NOT EXISTS messages (
 	    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-	    queue          TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
+	    queue          TEXT NOT NULL,
 	    state          TEXT NOT NULL DEFAULT 'active'
 	                       CHECK (state IN ('active','locked','deferred','scheduled','completed','dead_lettered')),
 	    visible_at     INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +133,28 @@ var schemaStmts = []string{
 	// Keeping these indexes partial avoids charging every active Send for a second
 	// queue-wide index solely to support rare resource deletion.
 	`CREATE INDEX IF NOT EXISTS idx_msg_completed ON messages(queue, id) WHERE state='completed'`,
+	// A normal messages(queue) foreign key makes every parent DELETE perform an
+	// unbounded child-table scan unless we maintain a second full queue index. That
+	// duplicate index materially taxes message writes and settlement. Supported
+	// message inserts already resolve an active parent inside the same transaction;
+	// the guards below protect the rare key mutation and parent operations without
+	// adding a trigger lookup to every Send:
+	//   - changing a child's queue requires an existing parent;
+	//   - parent DELETE / name UPDATE is RESTRICT while any message remains.
+	// Lifecycle cleanup removes children explicitly and in bounded batches, so the
+	// final metadata DELETE executes only after these indexed guards are empty.
+	`CREATE TRIGGER IF NOT EXISTS trg_messages_queue_update
+	 BEFORE UPDATE OF queue ON messages
+	 WHEN NOT EXISTS (SELECT 1 FROM queues WHERE name=NEW.queue)
+	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`,
+	`CREATE TRIGGER IF NOT EXISTS trg_queues_messages_delete
+	 BEFORE DELETE ON queues
+	 WHEN EXISTS (` + messageExistenceUnion("OLD.name") + `)
+	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`,
+	`CREATE TRIGGER IF NOT EXISTS trg_queues_messages_rename
+	 BEFORE UPDATE OF name ON queues
+	 WHEN NEW.name<>OLD.name AND EXISTS (` + messageExistenceUnion("OLD.name") + `)
+	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`,
 
 	// optional dedup table (message_id + sliding window). active only when dedup_window_ms>0.
 	`CREATE TABLE IF NOT EXISTS dedup (

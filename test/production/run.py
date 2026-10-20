@@ -438,6 +438,10 @@ def execute(args, out):
         with closing(sqlite3.connect(uri, uri=True)) as conn:
             require(conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)], role + " integrity failed")
             require(not conn.execute("PRAGMA foreign_key_check").fetchall(), role + " foreign-key errors")
+            require(conn.execute(
+                "SELECT 1 FROM messages m LEFT JOIN queues q ON q.name=m.queue "
+                "WHERE q.name IS NULL LIMIT 1").fetchone() is None,
+                role + " message-parent invariant failed")
             require(conn.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,), role + " retained messages")
             if role == "outbox":
                 require(conn.execute("SELECT COUNT(*) FROM soak_business").fetchone() == (0,),
@@ -447,7 +451,9 @@ def execute(args, out):
             "final host free space or evidence budget exceeded")
     for directory in ("broker-data", "outbox-data"):
         require(tree_size(out / directory) <= 512 * MIB, "final data directory budget: " + directory)
-    report["final_database_checks"] = "integrity_check, foreign_key_check, zero messages: both stores; zero outbox business rows"
+    report["final_database_checks"] = (
+        "integrity_check, foreign_key_check, message-parent invariant, zero messages: "
+        "both stores; zero outbox business rows")
     report["runner_result_sha256"] = file_hash(out / "runner" / "result.json")
     return report
 

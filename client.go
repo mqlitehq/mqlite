@@ -92,7 +92,7 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 			// Once RoundTrip starts, a transport error cannot prove whether the
 			// broker committed the name-addressed deletion. Do not invite an
 			// automatic replay that could hit a later same-name queue.
-			return fmt.Errorf("%w: deletion response unavailable; inspect ListQueues to reconcile: %v", ErrOutcomeUnknown, err)
+			return fmt.Errorf("%w: deletion response unavailable; inspect ListQueues to reconcile: %s", ErrOutcomeUnknown, err.Error())
 		}
 		return err
 	}

@@ -27,6 +27,14 @@ upgrade notes before replacing a broker.
   one queue per pass so network round trips do not extend one write transaction
   across a large resource batch; the durable cursor still rotates fairly. One
   individually oversized row may exceed the byte target so cleanup always progresses.
+  An uncertain remote delete commit arms a bounded 30-second discovery window;
+  normal idle brokers perform no lifecycle polling.
+- Keep the final queue-row retirement bounded even beside an unrelated deep
+  backlog. Transactional target resolution and indexed parent guards preserve the
+  queue/message relationship without an unindexed foreign-key scan or a trigger on
+  every message insert; subscription child lookups gain a unique `subscription`
+  index. `EngineTx.SQL` remains for caller-owned tables; direct writes to
+  mqlite-owned tables are unsupported.
 - Add force and deletion outcomes consistently to HTTP (`{name,force?}` and
   `{deleted,state}`), the Go SDK, `mqlite delete-queue --force`, MCP `delete_queue`
   and the console. The console requires exact-name confirmation and a separate
@@ -34,7 +42,8 @@ upgrade notes before replacing a broker.
   external effects cannot be undone. The existing Go
   `DeleteQueue(ctx, name) error` method stays empty-only and returns `nil` for
   either accepted state; callers use `DeleteQueueWithOptions` for force and the
-  detailed result.
+  detailed result. `QueueInfo` gains `State`; external Go code using positional
+  composite literals must add the field or switch to keyed literals.
 - Advance the canonical database guard to schema token **6** for durable lifecycle
   columns and cleanup indexes. Schema-5 databases are rejected rather than
   migrated: preserve the matching old binary and a consistent backup, account for

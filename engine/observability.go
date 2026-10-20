@@ -196,6 +196,26 @@ func (o *observations) forgetLocked(name string) {
 	o.epoch++
 }
 
+// reconcileTopologyLocked applies a successful database inventory only if no
+// confirmed topology callback committed after that inventory began. It also
+// repairs in-memory topology after an outcome-unknown remote commit, whose
+// callback deliberately did not run because the commit acknowledgement was lost.
+// The caller holds o.mu.
+func (o *observations) reconcileTopologyLocked(live map[string]bool, collectionEpoch uint64) {
+	if collectionEpoch != o.epoch {
+		return
+	}
+	if o.known == nil {
+		o.known = make(map[string]bool)
+	}
+	for name := range o.known {
+		if !live[name] {
+			o.forgetLocked(name)
+		}
+	}
+	o.known = live
+}
+
 // initializeObservations runs before startup recovery so existing queues receive
 // their process-local recovery counters without later retaining deleted names.
 func (e *Engine) initializeObservations(ctx context.Context) error {
@@ -360,22 +380,14 @@ func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 		e.observation.lastSuccess = s.SampledAtMs
 	}
 	s.Collection.LastSuccessAtMs = e.observation.lastSuccess
-	if e.observation.known == nil {
-		e.observation.known = make(map[string]bool)
-	}
 	// A snapshot that raced retirement must not restore a stale name. A later
 	// successful snapshot also reconciles delayed remote commit callbacks.
-	if err == nil && collectionEpoch == e.observation.epoch {
+	if err == nil {
 		live := make(map[string]bool, len(s.Queues))
 		for _, q := range s.Queues {
 			live[q.Queue] = true
 		}
-		for name := range e.observation.known {
-			if !live[name] {
-				e.observation.forgetLocked(name)
-			}
-		}
-		e.observation.known = live
+		e.observation.reconcileTopologyLocked(live, collectionEpoch)
 	}
 	for queue := range e.observation.known {
 		for _, event := range MessageEventNames() {

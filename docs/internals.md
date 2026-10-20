@@ -49,7 +49,7 @@ The heart, abridged:
 ```sql
 CREATE TABLE messages (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- SQLite rowid = the sequence number
-    queue          TEXT NOT NULL REFERENCES queues(name),
+    queue          TEXT NOT NULL,
     state          TEXT NOT NULL DEFAULT 'active'
                        CHECK (state IN ('active','locked','deferred',
                                         'scheduled','completed','dead_lettered')),
@@ -63,7 +63,7 @@ CREATE TABLE messages (
 ) STRICT;
 ```
 
-Three deliberate choices hide in this table:
+Four deliberate choices hide in this table:
 
 - **`id INTEGER PRIMARY KEY AUTOINCREMENT` *is* SQLite's rowid** — strictly increasing
   and never reused, even after the row is deleted (it may gap). That single column gives
@@ -73,6 +73,16 @@ Three deliberate choices hide in this table:
   broker-side object or a TCP connection. Kill the process at any instant and the
   queue's exact state survives in the file — recovery (§6) is a `SELECT`, not a
   reconstruction.
+- **Queue retirement has indexed parent guards.** Every supported message insert
+  first resolves an active `queues` row in the same transaction. A queue-key update
+  also requires a parent, and parent rename or deletion is restricted while any
+  message remains. The parent guards use one literal state probe per queue-prefix
+  partial index. A conventional foreign key would make SQLite scan the entire
+  `messages` table on every parent delete unless every message also paid for a
+  duplicate full `(queue, id)` index; a per-insert trigger likewise adds cost to
+  every Send. Direct writes to mqlite-owned tables are outside the supported
+  `EngineTx.SQL` contract. Subscription references remain native foreign keys and
+  have a child-key index.
 - **Every timestamp is epoch milliseconds** in plain `INTEGER` columns, and the
   clock is injectable — which is why the failure paths in the test suite run
   deterministically instead of with `sleep()`.
@@ -242,7 +252,11 @@ an operator to re-authorize discard. A single oversized row may exceed the byte
 target to guarantee forward progress. Accepted pending deletes wake the worker;
 bursts coalesce into one signal, and unfinished passes schedule another after one
 second. With no deleting resource the worker opens no transaction, which avoids an
-idle polling round trip on remote stores.
+idle polling round trip on remote stores. The one exception is a remote deletion
+or cleanup transaction whose commit acknowledgement is uncertain: after the
+immediate pass, the worker performs 30 delayed probes one second apart so a commit
+that becomes visible after the first inventory snapshot is still discovered.
+Restart recovery remains the durable fallback after that window.
 
 **Crash recovery is one statement.** On `Open`, every `locked` row is an orphan
 of a previous process (locks are rows, remember) and is reclaimed — back to

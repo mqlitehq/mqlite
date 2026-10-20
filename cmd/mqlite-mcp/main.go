@@ -573,7 +573,7 @@ func post(path string, body any) (string, error) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		if isLifecycleDeletePath(path) {
-			return "", fmt.Errorf("outcome unknown: deletion response unavailable; inspect list_queues to reconcile: %v", err)
+			return "", fmt.Errorf("outcome unknown: deletion response unavailable; inspect list_queues to reconcile: %s", err.Error())
 		}
 		return "", err
 	}

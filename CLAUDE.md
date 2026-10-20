@@ -236,6 +236,12 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   (`Filter{Expr}`), compiled+type-checked at Subscribe (cached per subscription) and
   run fail-closed at publish — see `docs/concepts.md` (§ Subscription filters).
   Receive/Redrive/Stats target the subscription by name.
+- **Message parent checks are transactional.** Every supported `messages` insert
+  must resolve or check an active queue inside the same transaction. Parent
+  deletion/rename and child queue-key updates have indexed schema guards, but
+  there is deliberately no per-insert trigger: it caused a material Send/Batch
+  regression. `EngineTx.SQL` is for caller-owned tables and must not modify
+  mqlite's internal schema.
 
 ### Conventions specific to this repo
 

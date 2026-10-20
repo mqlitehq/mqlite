@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,9 +39,10 @@ type Engine struct {
 	filterMu    sync.Mutex              // guards filterCache
 	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
 
-	commitMu      sync.Mutex    // orders confirmed commits and their in-memory topology effects
-	lifecycleWake chan struct{} // coalesced durable-cleanup work; never closed
-	observation   observations
+	commitMu                 sync.Mutex    // orders confirmed commits and their in-memory topology effects
+	lifecycleWake            chan struct{} // coalesced durable-cleanup work; never closed
+	uncertainLifecycleProbes atomic.Int32  // delayed discovery after an ambiguous remote delete commit
+	observation              observations
 }
 
 // Options configures Open.
@@ -509,6 +511,7 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 
 // ListQueues lists all queues/subscriptions.
 func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
+	collectionEpoch := e.observationEpoch()
 	var out []QueueInfo
 	err := e.db.queryRows(ctx, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms,lifecycle_state
@@ -524,6 +527,15 @@ func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 			}
 			return rows.Err()
 		})
+	if err == nil {
+		live := make(map[string]bool, len(out))
+		for _, q := range out {
+			live[q.Name] = true
+		}
+		e.observation.mu.Lock()
+		e.observation.reconcileTopologyLocked(live, collectionEpoch)
+		e.observation.mu.Unlock()
+	}
 	return out, err
 }
 

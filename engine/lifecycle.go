@@ -158,7 +158,9 @@ func (e *Engine) DeleteQueueWithOptions(ctx context.Context, name string, opts D
 	if err == nil || errors.Is(err, ErrOutcomeUnknown) {
 		e.invalidateLifecycle(name)
 	}
-	if (err == nil && !result.Deleted) || errors.Is(err, ErrOutcomeUnknown) {
+	if errors.Is(err, ErrOutcomeUnknown) {
+		e.signalUncertainLifecycle()
+	} else if err == nil && !result.Deleted {
 		e.signalLifecycle()
 	}
 	return result, err
@@ -432,6 +434,12 @@ func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
 	})
 	if err != nil {
 		e.maintenanceFailure(ctx, "resource_cleanup", err)
+	}
+	if errors.Is(err, ErrOutcomeUnknown) {
+		// The cleanup commit may have landed even though its acknowledgement did
+		// not. A different remote connection can briefly return an older empty
+		// inventory, so keep probing through the bounded uncertainty window.
+		e.signalUncertainLifecycle()
 	}
 	if err == nil || errors.Is(err, ErrOutcomeUnknown) {
 		for _, name := range touched {

@@ -242,7 +242,9 @@ Maintenance tasks are `locks`, `scheduled`, `ttl`,
 `dedup`, `receipts`, `retention`, `reclaim`, `lifecycle`. `lifecycle` is the
 event-driven bounded cleanup pass for queues already marked deleting. Unfinished
 work is paced at one continuation pass per second; an idle store does not run the
-task, so a quiet `last_success` timestamp is expected. Check enabled status and
+task, so a quiet `last_success` timestamp is expected. An uncertain remote delete
+commit temporarily schedules up to 30 one-second discovery passes even when the
+first inventory read is empty. Check enabled status and
 each task's actual cadence before alerting on its last-success time.
 Canceled passes during normal shutdown are `interrupted`, not successful passes
 or maintenance errors; they do not advance the last-success timestamp.
@@ -268,10 +270,9 @@ name starts a fresh named series while the prior counts remain in the aggregate.
 Include `queue=""` when querying total process activity, or filter it out when a
 query is intended to describe current named queues only.
 
-Custom raw SQL through `EngineTx.SQL` is not attributed to message-effect events.
-Queue gauges still report the actual retained database rows, including unexpected
-states; do not use event counters to reconstruct changes made outside the normal
-message operations.
+Raw SQL through `EngineTx.SQL` is supported only for caller-owned tables; those
+writes produce no message-effect events. Direct access to mqlite-owned tables is
+unsupported and can bypass lifecycle and observability invariants.
 
 | Event | Meaning |
 | --- | --- |

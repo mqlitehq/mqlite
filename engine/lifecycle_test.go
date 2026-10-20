@@ -425,6 +425,73 @@ func TestForceDeleteConcurrentSendIsSerialized(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotRetryRechecksParentAfterConcurrentDelete(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: filepath.Join(t.TempDir(), "snapshot-race.db"), DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	mustQueue(t, e, "q", QueueConfig{})
+
+	// Exercise the remote retry policy against real SQLite snapshot semantics:
+	// the first callback reads an active parent, another connection deletes it,
+	// then the stale callback's write must fail and replay from the beginning.
+	e.db.remote = true
+	e.db.sql.SetMaxOpenConns(4)
+	firstSnapshot := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	txDone := make(chan error, 1)
+	callbacks := 0
+	go func() {
+		txDone <- e.Tx(ctx, func(tx *EngineTx) error {
+			callbacks++
+			if callbacks == 1 {
+				var state string
+				if err := tx.tx.QueryRowContext(tx.ctx,
+					`SELECT lifecycle_state FROM queues WHERE name='q'`).Scan(&state); err != nil {
+					return err
+				}
+				if state != "active" {
+					return fmt.Errorf("first snapshot state=%q, want active", state)
+				}
+				close(firstSnapshot)
+				<-releaseFirst
+			}
+			_, err := tx.SendOne("q", OutMessage{Body: []byte("must not become orphaned")})
+			return err
+		})
+	}()
+
+	select {
+	case <-firstSnapshot:
+	case <-time.After(2 * time.Second):
+		t.Fatal("transaction did not establish its first queue snapshot")
+	}
+	result, err := e.DeleteQueueWithOptions(ctx, "q", DeleteOptions{Force: true})
+	if err != nil || !result.Deleted {
+		close(releaseFirst)
+		t.Fatalf("concurrent delete=%+v, %v", result, err)
+	}
+	close(releaseFirst)
+	select {
+	case err := <-txDone:
+		if !errors.Is(err, ErrQueueNotFound) {
+			t.Fatalf("retried send error=%v, want ErrQueueNotFound", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("snapshot-conflicted transaction did not finish")
+	}
+	if callbacks != 2 {
+		t.Fatalf("transaction callbacks=%d, want one conflicted attempt plus one recheck", callbacks)
+	}
+	var orphans int
+	if err := e.db.queryRowScan(ctx, []any{&orphans}, `SELECT COUNT(*) FROM messages m
+		LEFT JOIN queues q ON q.name=m.queue WHERE q.name IS NULL`); err != nil || orphans != 0 {
+		t.Fatalf("orphan messages=%d, error=%v", orphans, err)
+	}
+}
+
 func TestDeletingQueueRejectsDataPlaneFromStaleCache(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
@@ -635,6 +702,60 @@ func TestObservabilityRetiredAggregateHasCompleteEventDomain(t *testing.T) {
 	}
 }
 
+func TestListQueuesReconcilesUnknownRetirementBeforeNameReuse(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "reused", QueueConfig{})
+	if _, err := e.SendOne(ctx, "reused", OutMessage{Body: []byte("old lifetime")}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model a remote delete commit whose acknowledgement was lost: the durable
+	// rows changed, but commitAttempt could not publish forgetQueue in memory.
+	if _, err := e.db.exec(ctx, `DELETE FROM messages WHERE queue='reused'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `DELETE FROM queues WHERE name='reused'`); err != nil {
+		t.Fatal(err)
+	}
+	queues, err := e.ListQueues(ctx)
+	if err != nil || len(queues) != 0 {
+		t.Fatalf("reconciliation inventory=%+v, %v", queues, err)
+	}
+
+	mustQueue(t, e, "reused", QueueConfig{})
+	if _, err := e.SendOne(ctx, "reused", OutMessage{Body: []byte("new lifetime")}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := e.Observability(ctx)
+	counts := make(map[eventKey]uint64)
+	for _, counter := range snapshot.Messages {
+		counts[eventKey{counter.Queue, counter.Event}] = counter.Count
+	}
+	if got := counts[eventKey{"", "enqueued"}]; got != 1 {
+		t.Fatalf("retired enqueue count=%d, want 1", got)
+	}
+	if got := counts[eventKey{"reused", "enqueued"}]; got != 1 {
+		t.Fatalf("replacement enqueue count=%d, want 1", got)
+	}
+}
+
+func TestTopologyReconciliationRejectsStaleInventory(t *testing.T) {
+	o := observations{initialized: true, known: map[string]bool{"existing": true}}
+	collectionEpoch := o.epoch
+
+	// A creation commits after inventory collection begins. Its topology callback
+	// advances the epoch before the stale empty result is applied.
+	o.commit(&txn{observationEpoch: o.epoch, rememberedQueues: map[string]bool{"created": true}})
+	o.mu.Lock()
+	o.reconcileTopologyLocked(map[string]bool{}, collectionEpoch)
+	o.mu.Unlock()
+
+	if !o.known["existing"] || !o.known["created"] || len(o.known) != 2 {
+		t.Fatalf("stale inventory replaced newer topology: %v", o.known)
+	}
+}
+
 func TestLifecycleCleanupQueriesUseQueuePrefixIndexes(t *testing.T) {
 	e, _ := testEngine(t)
 	for _, state := range lifecycleMessageStates {
@@ -780,5 +901,222 @@ func BenchmarkForceDeleteBoundedBatch(b *testing.B) {
 		if err != nil || !result.Deleted {
 			b.Fatalf("delete=%+v, %v", result, err)
 		}
+	}
+}
+
+// ─── indexed message-parent guards ──────────────────────────────────────────
+
+func requireMessageParentFailure(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("operation succeeded without a message queue parent")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "foreign key constraint failed") {
+		t.Fatalf("error=%v, want FOREIGN KEY constraint failed", err)
+	}
+}
+
+func insertLifecycleTestMessage(t *testing.T, e *Engine, queue, state string) int64 {
+	t.Helper()
+	result, err := e.db.execUnobserved(context.Background(),
+		`INSERT INTO messages(queue,state,enqueued_at,body) VALUES(?,?,1,x'')`, queue, state)
+	if err != nil {
+		t.Fatalf("insert %s message for %q: %v", state, queue, err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("message id for %q: %v", queue, err)
+	}
+	return id
+}
+
+func TestMessageQueueUpdateTriggerRejectsOrphan(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+
+	mustQueue(t, e, "source", QueueConfig{})
+	mustQueue(t, e, "destination", QueueConfig{})
+	id := insertLifecycleTestMessage(t, e, "source", "active")
+	_, err := e.db.execUnobserved(ctx, `UPDATE messages SET queue='missing' WHERE id=?`, id)
+	requireMessageParentFailure(t, err)
+
+	var queue string
+	if err := e.db.queryRowScanUnobserved(ctx, []any{&queue}, `SELECT queue FROM messages WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if queue != "source" {
+		t.Fatalf("failed child update moved message to %q", queue)
+	}
+	if _, err := e.db.execUnobserved(ctx, `UPDATE messages SET queue='destination' WHERE id=?`, id); err != nil {
+		t.Fatalf("child update to an existing parent: %v", err)
+	}
+}
+
+func TestMessageQueueTriggersRestrictParentRenameAndDelete(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "parent", QueueConfig{})
+	id := insertLifecycleTestMessage(t, e, "parent", "active")
+
+	_, err := e.db.execUnobserved(ctx, `UPDATE queues SET name='renamed' WHERE name='parent'`)
+	requireMessageParentFailure(t, err)
+	_, err = e.db.execUnobserved(ctx, `DELETE FROM queues WHERE name='parent'`)
+	requireMessageParentFailure(t, err)
+
+	if _, err := e.db.execUnobserved(ctx, `DELETE FROM messages WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.execUnobserved(ctx, `UPDATE queues SET name='renamed' WHERE name='parent'`); err != nil {
+		t.Fatalf("rename after clearing children: %v", err)
+	}
+	result, err := e.db.execUnobserved(ctx, `DELETE FROM queues WHERE name='renamed'`)
+	if err != nil {
+		t.Fatalf("delete after clearing children: %v", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		t.Fatalf("cleared parent rows=%d, error=%v; want 1", rows, err)
+	}
+}
+
+func TestEveryMessageStateRestrictsParentDeleteUntilCleared(t *testing.T) {
+	if len(lifecycleMessageStates) != 6 {
+		t.Fatalf("message state inventory=%d, want 6", len(lifecycleMessageStates))
+	}
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	for _, state := range lifecycleMessageStates {
+		state := state
+		t.Run(state.name, func(t *testing.T) {
+			name := "parent-" + state.name
+			mustQueue(t, e, name, QueueConfig{})
+			id := insertLifecycleTestMessage(t, e, name, state.name)
+
+			_, err := e.db.execUnobserved(ctx, `DELETE FROM queues WHERE name=?`, name)
+			requireMessageParentFailure(t, err)
+			if _, err := e.db.execUnobserved(ctx, `DELETE FROM messages WHERE id=?`, id); err != nil {
+				t.Fatal(err)
+			}
+			result, err := e.db.execUnobserved(ctx, `DELETE FROM queues WHERE name=?`, name)
+			if err != nil {
+				t.Fatalf("delete cleared %s parent: %v", state.name, err)
+			}
+			if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+				t.Fatalf("delete cleared %s parent rows=%d, error=%v; want 1", state.name, rows, err)
+			}
+		})
+	}
+}
+
+func TestMessageParentDeleteStaysIndexedBesideDeepUnrelatedBacklog(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "backlog", QueueConfig{})
+	mustQueue(t, e, "empty-target", QueueConfig{})
+
+	const backlogRows = 30_000
+	if _, err := e.db.execUnobserved(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO messages(queue,state,enqueued_at,body)
+	  SELECT 'backlog', CASE i%6
+	    WHEN 0 THEN 'active' WHEN 1 THEN 'locked' WHEN 2 THEN 'deferred'
+	    WHEN 3 THEN 'scheduled' WHEN 4 THEN 'completed' ELSE 'dead_lettered' END,
+	    1,x'' FROM n`, backlogRows); err != nil {
+		t.Fatalf("seed unrelated backlog: %v", err)
+	}
+	if _, err := e.db.execUnobserved(ctx, `ANALYZE`); err != nil {
+		t.Fatalf("analyze backlog: %v", err)
+	}
+
+	// This is the exact predicate embedded in both parent triggers. Pinning every
+	// branch to its queue-prefix partial index is deterministic evidence that an
+	// empty target does six bounded seeks instead of scanning the unrelated rows.
+	plan := explainPlan(t, e, `SELECT EXISTS(`+messageExistenceUnion("?")+`)`, repeatedQueueArgs("empty-target")...)
+	for _, state := range lifecycleMessageStates {
+		if !strings.Contains(plan, state.index) {
+			t.Errorf("parent guard for %s does not use %s:\n%s", state.name, state.index, plan)
+		}
+	}
+	if strings.Contains(plan, "SCAN messages") || strings.Contains(plan, "USE TEMP B-TREE") {
+		t.Fatalf("parent guard became backlog-dependent:\n%s", plan)
+	}
+
+	result, err := e.db.execUnobserved(ctx, `DELETE FROM queues WHERE name='empty-target'`)
+	if err != nil {
+		t.Fatalf("delete empty target beside deep backlog: %v", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		t.Fatalf("empty target rows=%d, error=%v; want 1", rows, err)
+	}
+	var retained int
+	if err := e.db.queryRowScanUnobserved(ctx, []any{&retained},
+		`SELECT COUNT(*) FROM messages WHERE queue='backlog'`); err != nil || retained != backlogRows {
+		t.Fatalf("unrelated backlog=%d, error=%v; want %d", retained, err, backlogRows)
+	}
+}
+
+func TestSubscriptionChildIndexIsUniqueAndUsedForParentDelete(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "subscription-child", QueueConfig{Kind: "subscription"})
+
+	var unique int
+	if err := e.db.queryRowScanUnobserved(ctx, []any{&unique},
+		`SELECT "unique" FROM pragma_index_list('subscriptions') WHERE name='idx_subs_by_subscription'`); err != nil {
+		t.Fatalf("inspect idx_subs_by_subscription: %v", err)
+	}
+	if unique != 1 {
+		t.Fatalf("idx_subs_by_subscription unique=%d, want 1", unique)
+	}
+	if _, err := e.db.execUnobserved(ctx,
+		`INSERT INTO subscriptions(topic,subscription,created_at) VALUES('topic-a','subscription-child',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.execUnobserved(ctx,
+		`INSERT INTO subscriptions(topic,subscription,created_at) VALUES('topic-b','subscription-child',1)`); err == nil ||
+		!strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		t.Fatalf("duplicate subscription child error=%v, want unique constraint", err)
+	}
+
+	plan := explainPlan(t, e, `DELETE FROM queues WHERE name=?`, "subscription-child")
+	if !strings.Contains(plan, "SEARCH subscriptions USING COVERING INDEX idx_subs_by_subscription") || strings.Contains(plan, "SCAN subscriptions") {
+		t.Fatalf("queue parent delete does not use the subscription child index:\n%s", plan)
+	}
+
+	result, err := e.db.execUnobserved(ctx, `DELETE FROM queues WHERE name='subscription-child'`)
+	if err != nil {
+		t.Fatalf("delete subscription parent: %v", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		t.Fatalf("subscription parent rows=%d, error=%v; want 1", rows, err)
+	}
+	var children int
+	if err := e.db.queryRowScanUnobserved(ctx, []any{&children},
+		`SELECT COUNT(*) FROM subscriptions WHERE subscription='subscription-child'`); err != nil || children != 0 {
+		t.Fatalf("cascaded subscription children=%d, error=%v; want 0", children, err)
+	}
+}
+
+func TestMessageQueueTriggerInventory(t *testing.T) {
+	e, _ := testEngine(t)
+	want := []string{
+		"trg_messages_queue_update",
+		"trg_queues_messages_delete",
+		"trg_queues_messages_rename",
+	}
+	for _, name := range want {
+		var count int
+		if err := e.db.queryRowScanUnobserved(context.Background(), []any{&count},
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, name); err != nil || count != 1 {
+			t.Errorf("trigger %s count=%d, error=%v; want 1", name, count, err)
+		}
+	}
+
+	var physicalFKs int
+	if err := e.db.queryRowScanUnobserved(context.Background(), []any{&physicalFKs},
+		`SELECT COUNT(*) FROM pragma_foreign_key_list('messages')`); err != nil || physicalFKs != 0 {
+		t.Fatalf("messages physical foreign keys=%d, error=%v; want 0", physicalFKs, err)
+	}
+	if testing.Verbose() {
+		t.Logf("pinned %d message-parent guards without a per-insert trigger or duplicate full queue index", len(want))
 	}
 }

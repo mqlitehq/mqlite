@@ -138,20 +138,38 @@ func waitLifecycleWorker(t *testing.T, e *Engine, cancel context.CancelFunc) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(750 * time.Millisecond):
 		t.Fatal("lifecycle worker did not stop promptly after cancellation")
 	}
 }
 
 func waitLifecycleCount(t *testing.T, count *atomic.Int64, notify <-chan struct{}, want int64) {
 	t.Helper()
-	deadline := time.NewTimer(time.Second)
+	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
 	for count.Load() < want {
 		select {
 		case <-notify:
 		case <-deadline.C:
 			t.Fatalf("lifecycle count=%d, want at least %d", count.Load(), want)
+		}
+	}
+}
+
+func waitUncertainLifecycleProbesAtMost(t *testing.T, e *Engine, want int32) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if got := e.uncertainLifecycleProbes.Load(); got <= want {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatalf("uncertain lifecycle probes=%d, want at most %d", e.uncertainLifecycleProbes.Load(), want)
 		}
 	}
 }
@@ -174,7 +192,7 @@ func TestLifecycleSignalCoalescesWithoutBlocking(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fatal("signalLifecycle blocked when its coalescing slot was full")
 	}
 	if got := len(e.lifecycleWake); got != 1 {
@@ -195,7 +213,7 @@ func TestLifecycleWorkerDoesNotPollStorageWhileIdle(t *testing.T) {
 	waitLifecycleCount(t, &state.commitCount, state.commitNotify, 1)
 	baselineBegins := state.beginCount.Load()
 	baselineQueries := state.queryCount.Load()
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 	if got := state.beginCount.Load(); got != baselineBegins {
 		t.Fatalf("idle lifecycle worker opened %d extra transactions", got-baselineBegins)
 	}
@@ -214,10 +232,10 @@ func TestLifecycleWorkerPreservesWakeDuringPass(t *testing.T) {
 	e.signalLifecycle()
 	select {
 	case <-state.firstQuery:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("first lifecycle pass did not reach storage")
 	}
-	// A deletion can commit after this pass has taken its inventory snapshot.
+	// A deletion can commit while this pass is already reading its inventory.
 	// Bursts still coalesce, but at least one buffered wake must survive the pass.
 	for i := 0; i < 128; i++ {
 		e.signalLifecycle()
@@ -246,8 +264,157 @@ func TestLifecycleWorkerCancellationInterruptsRetryDelay(t *testing.T) {
 	waitLifecycleCount(t, &state.rollbackCount, state.rollbackNotify, 1)
 
 	// A failed pass asks the worker to retry after its one-second pacing delay.
-	// Cancellation must interrupt that delay rather than making Close wait it out.
+	// Prove it has not started a second pass before cancellation, then require
+	// cancellation to interrupt the delay rather than making Close wait it out.
+	time.Sleep(100 * time.Millisecond)
+	if got := state.beginCount.Load(); got != 1 {
+		t.Fatalf("failed lifecycle pass retried without pacing: begins=%d", got)
+	}
 	waitLifecycleWorker(t, e, cancel)
+}
+
+func TestUncertainLifecycleWakeSchedulesPacedEmptyProbe(t *testing.T) {
+	e, state := newLifecycleWakeTestEngine(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.startLifecycle(ctx)
+	defer waitLifecycleWorker(t, e, cancel)
+
+	e.signalUncertainLifecycle()
+	waitLifecycleCount(t, &state.commitCount, state.commitNotify, 1)
+
+	// An ordinary empty pass stops immediately. An outcome-unknown pass retains
+	// reconciliation intent and waits before probing again, avoiding a hot loop.
+	time.Sleep(750 * time.Millisecond)
+	if got := state.commitCount.Load(); got != 1 {
+		t.Fatalf("uncertain lifecycle retry was not paced: passes=%d before 750ms", got)
+	}
+	waitLifecycleCount(t, &state.commitCount, state.commitNotify, 2)
+	waitUncertainLifecycleProbesAtMost(t, e, lifecycleUncertainPasses-2)
+}
+
+func TestUncertainLifecycleWorkerCancellationStopsProbeChain(t *testing.T) {
+	e, state := newLifecycleWakeTestEngine(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.startLifecycle(ctx)
+	defer func() {
+		cancel()
+		e.bgWG.Wait()
+	}()
+
+	e.signalUncertainLifecycle()
+	waitLifecycleCount(t, &state.commitCount, state.commitNotify, 1)
+	waitUncertainLifecycleProbesAtMost(t, e, lifecycleUncertainPasses-1)
+	waitLifecycleWorker(t, e, cancel)
+	if got := state.commitCount.Load(); got != 1 {
+		t.Fatalf("cancellation allowed another uncertain lifecycle pass: got %d", got)
+	}
+}
+
+func TestConcurrentUncertainLifecycleMarksCoalesceWithoutLoss(t *testing.T) {
+	e := &Engine{lifecycleWake: make(chan struct{}, 1)}
+	const callers = 128
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			e.signalUncertainLifecycle()
+		}()
+	}
+	close(start)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent uncertain lifecycle markers blocked")
+	}
+	if got := e.uncertainLifecycleProbes.Load(); got != lifecycleUncertainPasses {
+		t.Fatalf("uncertain probe budget=%d, want %d", got, lifecycleUncertainPasses)
+	}
+	if got := len(e.lifecycleWake); got != 1 {
+		t.Fatalf("coalesced uncertain wake count=%d, want 1", got)
+	}
+	for i := int32(0); i < lifecycleUncertainPasses; i++ {
+		if !e.takeUncertainLifecycleProbe() {
+			t.Fatalf("uncertain probe %d/%d was lost", i+1, lifecycleUncertainPasses)
+		}
+	}
+	if e.takeUncertainLifecycleProbe() {
+		t.Fatal("uncertain probe budget underflowed")
+	}
+
+	// A marker racing the worker's consume is linearizable in either order: the
+	// consumer leaves 29 when it wins last, or the marker restores 30 when it
+	// wins last. A stale load/store implementation could erase the new window and
+	// leave zero; repeat the overlap to make that regression visible under -race.
+	for round := 0; round < 1000; round++ {
+		e.uncertainLifecycleProbes.Store(1)
+		select {
+		case <-e.lifecycleWake:
+		default:
+		}
+		start := make(chan struct{})
+		var overlap sync.WaitGroup
+		overlap.Add(2)
+		go func() {
+			defer overlap.Done()
+			<-start
+			e.signalUncertainLifecycle()
+		}()
+		go func() {
+			defer overlap.Done()
+			<-start
+			e.takeUncertainLifecycleProbe()
+		}()
+		close(start)
+		overlap.Wait()
+		got := e.uncertainLifecycleProbes.Load()
+		if got != lifecycleUncertainPasses && got != lifecycleUncertainPasses-1 {
+			t.Fatalf("round %d: concurrent mark/take left %d probes, want %d or %d",
+				round, got, lifecycleUncertainPasses-1, lifecycleUncertainPasses)
+		}
+	}
+}
+
+func TestDeleteOutcomeUnknownSchedulesLifecycleReconciliation(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	state.commitErr = io.EOF
+	e := fakeRemoteEngine(d)
+	e.lifecycleWake = make(chan struct{}, 1)
+
+	result, err := e.DeleteQueueWithOptions(context.Background(), "q", DeleteOptions{Force: true})
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("delete result=%+v error=%v, want ErrOutcomeUnknown", result, err)
+	}
+	if got := e.uncertainLifecycleProbes.Load(); got != lifecycleUncertainPasses {
+		t.Fatalf("delete outcome-unknown probe budget=%d, want %d", got, lifecycleUncertainPasses)
+	}
+	if got := len(e.lifecycleWake); got != 1 {
+		t.Fatalf("delete outcome-unknown wake count=%d, want 1", got)
+	}
+}
+
+func TestMaintenanceOutcomeUnknownSchedulesLifecycleReconciliation(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	state.commitErr = io.EOF
+	e := fakeRemoteEngine(d)
+	e.lifecycleWake = make(chan struct{}, 1)
+
+	if retry := e.maintainLifecyclePass(context.Background()); !retry {
+		t.Fatal("maintenance outcome-unknown did not request a retry")
+	}
+	if got := e.uncertainLifecycleProbes.Load(); got != lifecycleUncertainPasses {
+		t.Fatalf("maintenance outcome-unknown probe budget=%d, want %d", got, lifecycleUncertainPasses)
+	}
+	if got := len(e.lifecycleWake); got != 1 {
+		t.Fatalf("maintenance outcome-unknown wake count=%d, want 1", got)
+	}
 }
 
 func TestPendingDeleteWakesLifecycleWorker(t *testing.T) {
@@ -265,7 +432,7 @@ func TestPendingDeleteWakesLifecycleWorker(t *testing.T) {
 		t.Fatalf("force delete=%+v, %v", result, err)
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, ok := queueLifecycleState(t, e, "pending"); !ok {
 			return

@@ -20,7 +20,9 @@ type EngineTx struct {
 }
 
 // SQL returns the underlying *sql.Tx so callers can run their business writes
-// in the same transaction as the enqueue.
+// in the same transaction as the enqueue. It is for caller-owned tables;
+// directly modifying mqlite's internal tables is unsupported and can bypass
+// engine invariants.
 //
 // These are YOUR statements: mqlite cannot see where one ends and the next begins, so it cannot
 // stop issuing them on your behalf the way it does for its own (see txn in db.go). Two things

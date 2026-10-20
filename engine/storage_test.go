@@ -137,7 +137,7 @@ func TestSchemaVersionGuard(t *testing.T) {
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
 		wantVersion = "6"
-		wantHash    = "8f9fa090ac2df24c756051f36c496b247a4438d22b0e7282e5f36c5967524ef4"
+		wantHash    = "d3265e30bf62c91a0956a51b664aaabaa487a798a333fa28fcd90e883646c0a4"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -148,12 +148,15 @@ func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	}
 }
 
-// Version 5 had no queue lifecycle columns or completed-state cleanup index. Open
-// must reject it before applying any schema statement or changing retained data.
+// Version 5 had no queue lifecycle columns, bounded-cleanup indexes, or indexed
+// message-parent guards. Open must reject it before applying any schema
+// statement or changing retained data.
 func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
 	var previous []string
 	for _, statement := range schemaStmts {
-		if strings.Contains(statement, "idx_queue_deleting") || strings.Contains(statement, "idx_msg_completed") {
+		if strings.Contains(statement, "idx_queue_deleting") || strings.Contains(statement, "idx_msg_completed") ||
+			strings.Contains(statement, "idx_subs_by_subscription") || strings.Contains(statement, "trg_messages_queue_") ||
+			strings.Contains(statement, "trg_queues_messages_") {
 			continue
 		}
 		if strings.HasPrefix(statement, "CREATE TABLE IF NOT EXISTS queues") {
@@ -166,6 +169,10 @@ func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
 				kept = append(kept, line)
 			}
 			statement = strings.Join(kept, "\n")
+		}
+		if strings.HasPrefix(statement, "CREATE TABLE IF NOT EXISTS messages") {
+			statement = strings.Replace(statement, "queue          TEXT NOT NULL,",
+				"queue          TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,", 1)
 		}
 		previous = append(previous, statement)
 	}
@@ -217,7 +224,9 @@ func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
 	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM pragma_table_info('queues') WHERE name='lifecycle_state'`); err != nil || count != 0 {
 		t.Fatalf("previous layout mutated: %d %v", count, err)
 	}
-	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM sqlite_master WHERE name IN ('idx_queue_deleting','idx_msg_completed')`); err != nil || count != 0 {
+	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+		'idx_queue_deleting','idx_msg_completed','idx_subs_by_subscription',
+		'trg_messages_queue_update','trg_queues_messages_delete','trg_queues_messages_rename')`); err != nil || count != 0 {
 		t.Fatalf("version 6 indexes leaked into version 5: %d %v", count, err)
 	}
 }
@@ -2052,7 +2061,7 @@ func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
 			oldSchema = append(oldSchema, stmt)
 		}
 	}
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "6ef92069473c29ebda6a1eb84fef2ee808d9f2fe8fbed3a7170e74a7fd537686" || schemaVersion != "6" {
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "ecee379192637620d94c38137f23956ae517adc3bfc5934743f7a32ab3daa55e" || schemaVersion != "6" {
 		t.Fatalf("schema without access-key objects changed: hash=%s token=%s", got, schemaVersion)
 	}
 	ctx := context.Background()

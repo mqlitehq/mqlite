@@ -476,8 +476,8 @@ def t_queue_deletion():
 
     busy = f"{RUNID}_py_delete_busy"
     create_queue(busy)
-    # Leave work after the foreground 1,000-row batch and one 4,096-row
-    # background pass, so the immediately following inventory remains stable.
+    # Leave work after the foreground 1,000-row batch so the acknowledgement is
+    # pending. The background worker may finish any time after that response.
     send_batch(busy, ["discard"] * 6000)
     status, protected = call(admin + "DeleteQueue", {"name": busy})
     check(status == 409 and protected.get("code") == "queue_not_empty",
@@ -487,8 +487,9 @@ def t_queue_deletion():
           "force retires the queue and reports bounded cleanup")
     status, inventory = call(admin + "ListQueues", {})
     deleting = [q for q in inventory.get("queues", []) if q["name"] == busy]
-    check(status == 200 and len(deleting) == 1 and deleting[0].get("state") == "deleting",
-          "pending cleanup stays visible in queue inventory")
+    check(status == 200 and (not deleting or
+          (len(deleting) == 1 and deleting[0].get("state") == "deleting")),
+          "queue inventory shows deleting or already-converged cleanup")
     status, _ = call(queue + "Send", {"queue": busy, "messages": [{"body": b64("late")}]})
     check(status == 404, "retired queue rejects new messages immediately")
     # Reconcile with reads only. Replaying a name-only deletion as a status check
