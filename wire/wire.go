@@ -187,8 +187,7 @@ type DeleteQueueResponse struct {
 }
 
 type DeleteQueueRequest struct {
-	Generation string `json:"generation"`
-	Name       string `json:"name"`
+	Name string `json:"name"`
 }
 
 type CreateQueueRequest struct {
@@ -204,7 +203,6 @@ type ListQueuesResponse struct {
 	Queues []QueueInfoJSON `json:"queues"`
 }
 type QueueInfoJSON struct {
-	Generation       string `json:"generation,omitempty"`
 	Name             string `json:"name"`
 	Kind             string `json:"kind"`
 	LockDurationMs   int64  `json:"lock_duration_ms"`

@@ -2,6 +2,8 @@ module github.com/mqlitehq/mqlite
 
 go 1.21
 
+retract v0.3.3 // Exposed an unstable public queue Generation API; use v0.3.2 until a replacement release.
+
 require (
 	github.com/charmbracelet/log v1.0.0
 	github.com/expr-lang/expr v1.17.8

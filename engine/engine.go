@@ -219,27 +219,19 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 // Every message state, including scheduled and dead-lettered, prevents deletion.
 // The check and cleanup share one transaction; concurrent sends cannot be lost.
 // A missing queue returns ErrQueueNotFound. Subscription lifecycle is separate.
-// generation must be the identity returned by ListQueues; a stale request cannot
-// delete a replacement with the same name (ErrQueueChanged).
-func (e *Engine) DeleteQueue(ctx context.Context, name, generation string) error {
-	if generation == "" {
-		return fmt.Errorf("%w: queue generation required", ErrInvalidArgument)
-	}
+// The name resolves when this call enters its transaction. If a deleted name is
+// later reused, a later call with that name operates on the replacement.
+func (e *Engine) DeleteQueue(ctx context.Context, name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: queue name required", ErrInvalidArgument)
 	}
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		var kind, actualGeneration string
-		if err := tx.QueryRowContext(ctx, `SELECT kind,
-			COALESCE((SELECT value FROM meta WHERE key='queue-generation:' || queues.name), 'legacy:' || created_at)
-			FROM queues WHERE name=?`, name).Scan(&kind, &actualGeneration); err != nil {
+		var kind string
+		if err := tx.QueryRowContext(ctx, `SELECT kind FROM queues WHERE name=?`, name).Scan(&kind); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrQueueNotFound
 			}
 			return err
-		}
-		if generation != actualGeneration {
-			return ErrQueueChanged
 		}
 		if kind != "queue" {
 			return fmt.Errorf("%w: DeleteQueue only supports plain queues, not subscriptions", ErrInvalidArgument)
@@ -257,7 +249,6 @@ func (e *Engine) DeleteQueue(ctx context.Context, name, generation string) error
 			`DELETE FROM dedup WHERE queue=?`,
 			`DELETE FROM settlement_receipts WHERE queue=?`,
 			`DELETE FROM receive_attempts WHERE queue=?`,
-			`DELETE FROM meta WHERE key='queue-generation:' || ?`,
 		} {
 			if _, err := tx.ExecContext(ctx, statement, name); err != nil {
 				return err
@@ -333,7 +324,6 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	newQueue := errors.Is(err, sql.ErrNoRows)
 	lock := cfg.LockDurationMs
 	if lock <= 0 {
 		lock = 30000
@@ -376,11 +366,6 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 		cfg.DLQMaxAgeMs, cfg.DLQMaxCount, cfg.DLQMaxBytes, now, now)
 	if err != nil {
 		return err
-	}
-	if newQueue {
-		// Additive metadata in the existing meta table; schema and old readers stay compatible.
-		_, err = tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES(?,?)
-			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, "queue-generation:"+name, randToken())
 	}
 	return err
 }
@@ -559,14 +544,13 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	var out []QueueInfo
 	err := e.db.queryRows(ctx, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms,
-		       COALESCE((SELECT value FROM meta WHERE key='queue-generation:' || queues.name), 'legacy:' || created_at)
+		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms
 		FROM queues ORDER BY name`,
 		func(rows *sql.Rows) error {
 			for rows.Next() {
 				var qi QueueInfo
 				if err := rows.Scan(&qi.Name, &qi.Kind, &qi.LockDurationMs, &qi.MaxDeliveryCount,
-					&qi.DefaultTTLMs, &qi.DedupWindowMs, &qi.Generation); err != nil {
+					&qi.DefaultTTLMs, &qi.DedupWindowMs); err != nil {
 					return err
 				}
 				out = append(out, qi)

@@ -154,8 +154,6 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, eb.Message)
 	case "already_exists":
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
-	case "queue_changed":
-		return fmt.Errorf("%w: %s", ErrQueueChanged, eb.Message)
 	case "queue_not_empty":
 		return fmt.Errorf("%w: %s", ErrQueueNotEmpty, eb.Message)
 	case "name_conflict":
@@ -426,20 +424,9 @@ func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 }
 
 // DeleteQueue removes an empty plain queue. All message states prevent deletion.
-func (c *Client) DeleteQueue(ctx context.Context, name string, opts ...DeleteQueueOpts) error {
-	generation := firstOpt(opts).Generation
-	if generation == "" {
-		queues, err := c.ListQueues(ctx)
-		if err != nil {
-			return err
-		}
-		generation, err = queueGeneration(queues, name)
-		if err != nil {
-			return err
-		}
-	}
+func (c *Client) DeleteQueue(ctx context.Context, name string) error {
 	var resp wire.DeleteQueueResponse
-	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name, Generation: generation}, &resp); err != nil {
+	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name}, &resp); err != nil {
 		return err
 	}
 	if !resp.Deleted {
@@ -461,7 +448,7 @@ func (c *Client) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	}
 	out := make([]QueueInfo, len(resp.Queues))
 	for i, q := range resp.Queues {
-		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, Generation: q.Generation, LockDurationMs: q.LockDurationMs,
+		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs}
 	}
 	return out, nil

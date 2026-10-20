@@ -827,8 +827,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "16e881e9aada134254a2dff0f517591a91b76fd73b4beca26943160feadd5ff1",
-		"concepts.html": "82bcc5f06357c17ce19a8efd5c2cdd9f63887a0aaa5dbb9990cf424216e3e6ef",
+		"concepts.md":   "e445da85405f5ee661a0f628889f8a2a6807be96955342e1c23e6e0b57876205",
+		"concepts.html": "02fa2c15ab8477db197d04cb80d0e3c5ca4de8211878ee2f12d99af997b20b84",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {
@@ -2006,10 +2006,6 @@ func TestRemoteDeleteQueue(t *testing.T) {
 	if err := c.CreateQueue(ctx, "delete-me", mqlite.QueueConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	original, err := c.ListQueues(ctx)
-	if err != nil || len(original) != 1 {
-		t.Fatalf("inventory: %v %v", original, err)
-	}
 	if _, err := c.Send(ctx, "delete-me", mqlite.OutMessage{Body: []byte("keep")}); err != nil {
 		t.Fatal(err)
 	}
@@ -2036,9 +2032,6 @@ func TestRemoteDeleteQueue(t *testing.T) {
 	if err := c.CreateQueue(ctx, "delete-me", mqlite.QueueConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.DeleteQueue(ctx, "delete-me", mqlite.DeleteQueueOpts{Generation: original[0].Generation}); !errors.Is(err, mqlite.ErrQueueChanged) {
-		t.Fatalf("stale request: %v", err)
-	}
 	if err := c.DeleteQueue(ctx, "delete-me"); err != nil {
 		t.Fatal(err)
 	}
@@ -2051,7 +2044,16 @@ func TestRemoteDeleteQueue(t *testing.T) {
 }
 
 func TestDeleteQueueRequiresAcknowledgement(t *testing.T) {
+	type capturedRequest struct {
+		path string
+		body map[string]any
+		err  error
+	}
+	request := make(chan capturedRequest, 1)
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		err := json.NewDecoder(r.Body).Decode(&body)
+		request <- capturedRequest{path: r.URL.Path, body: body, err: err}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -2060,7 +2062,11 @@ func TestDeleteQueueRequiresAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.DeleteQueue(context.Background(), "q", mqlite.DeleteQueueOpts{Generation: "fixture"}); !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+	if err := c.DeleteQueue(context.Background(), "q"); !errors.Is(err, mqlite.ErrOutcomeUnknown) {
 		t.Fatalf("missing acknowledgement: %v", err)
+	}
+	got := <-request
+	if got.err != nil || got.path != wire.PathDeleteQueue || !reflect.DeepEqual(got.body, map[string]any{"name": "q"}) {
+		t.Fatalf("delete request = path %q body %v err %v", got.path, got.body, got.err)
 	}
 }

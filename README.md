@@ -401,17 +401,18 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-This source tree targets **v0.3.3**: default broker port **6754**, schema token **5**,
-runtime-managed access keys and unified observability. See [CHANGELOG.md](CHANGELOG.md)
-for release and upgrade notes.
-Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
-or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.3`; see
-[deployment](docs/deployment.md) for configuration.
+This source tree contains the unreleased replacement for **retracted v0.3.3**. It
+keeps the default broker port **6754** and schema token **5**. The public queue
+identity experiment has been removed; queue operations address a queue by name.
+See [CHANGELOG.md](CHANGELOG.md) for the breaking correction and upgrade notes.
+For a tagged deployment, use **v0.3.2** until a replacement release is published;
+see [deployment](docs/deployment.md) for configuration.
 
-**Upgrading from v0.3.2 preserves message and managed-key data.** This release adds
-maintenance diagnostics and generation-checked empty-queue deletion without a schema
-change. Stop clients before retiring a queue name and retain its generation when
-retrying deletion. See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
+**Upgrading from v0.3.2 to the current source preserves message and managed-key
+data.** It adds maintenance diagnostics and empty-queue deletion without a schema
+change. Queue names are reusable, so serialize deletion and same-name recreation;
+never replay an old deletion after a replacement exists. See
+[upgrade and rollback](docs/operations.md#upgrade-and-rollback).
 
 **Upgrading from v0.3.1 preserves message and managed-key data.** Back up first;
 process counters reset at restart. A rollback to v0.3.1 also needs compatible

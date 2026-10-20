@@ -15,7 +15,7 @@ import (
 type requestKey struct{ rpc, code string }
 
 // New outcomes are additive; the wire decoder keeps the older required baseline.
-var requestCodes = append(wire.ObservationRequestCodes(), "queue_not_empty", "queue_changed")
+var requestCodes = append(wire.ObservationRequestCodes(), "queue_not_empty")
 
 type transportMetrics struct {
 	mu       sync.Mutex
@@ -35,7 +35,7 @@ func requestCode(rec *statusRecorder) string {
 	switch rec.code {
 	case "unauthenticated", "permission_denied", "key_conflict", "not_found",
 		"already_exists", "name_conflict", "group_required", "invalid_argument",
-		"message_too_large", "outcome_unknown", "canceled", "internal", "lock_lost", "unimplemented", "queue_not_empty", "queue_changed":
+		"message_too_large", "outcome_unknown", "canceled", "internal", "lock_lost", "unimplemented", "queue_not_empty":
 		return rec.code
 	}
 	if rec.status >= 200 && rec.status < 400 {

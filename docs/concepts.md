@@ -192,6 +192,31 @@ You only ever do two kinds of "create":
 > explicitly; MQLite makes "create topic" implicit and "create the subscription's
 > queue" automatic — two fewer steps.
 
+### Resource names, reuse, and request/reply
+
+Queue and subscription names are routing addresses, not immutable lifetime IDs.
+`DeleteQueue` acts on the current empty plain queue with that name. A controller
+must therefore serialize deletion and same-name recreation: stop users of the old
+queue, wait for deletion to succeed, confirm the name is absent from `ListQueues`,
+and only then create the replacement. Once a replacement exists, never replay a
+request that belonged to the old queue. After an uncertain response, keep the name
+reserved and reconcile it before proceeding. This is the API's explicit ABA
+boundary.
+
+Subscriptions are durable in the current contract; there is no subscription
+deletion or subscription TTL API in this release. Creating a subscription per
+request will accumulate retained subscriptions and backing queues. For frequent
+request/reply traffic, create one stable reply subscription per application
+instance and use a globally unique `correlation_id` for each request. A dispatcher
+receives from that subscription, delivers each reply to its waiter, and handles
+duplicates or replies that arrive after the waiter timed out.
+
+If an application treats a subscription as temporary, its name is a one-use
+application identity: generate a globally unique name for that lifetime and never
+reuse it. Create the receiver before sending the request. Put the address in
+`reply_to`, copy the request's `correlation_id` into the reply, and do not assume
+the broker implements an RPC waiter or rejects late replies for you.
+
 ### Message ID vs Sequence Number (the two ids people conflate)
 | | Who assigns it | When fanned out to N subs | Purpose |
 |---|---|---|---|

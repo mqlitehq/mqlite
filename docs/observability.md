@@ -43,10 +43,10 @@ platform, use the [cloud and Kubernetes guide](observability-cloud.md).
 
 ## Maintenance failure diagnosis
 
-Brokers running v0.3.3 or later add optional `maintenance[].diagnostics` and
-`storage.operations[].last_error` fields to Observe. Older snapshots remain valid;
-missing diagnostics mean **not reported**, not healthy. Existing Prometheus labels
-and cumulative error buckets are unchanged.
+The current unreleased source adds optional `maintenance[].diagnostics` and
+`storage.operations[].last_error` fields to Observe. v0.3.2 and older snapshots
+remain valid; missing diagnostics mean **not reported**, not healthy. Existing
+Prometheus labels and cumulative error buckets are unchanged.
 
 Each maintenance task reports its latest outcome (`never`, `ok`, `failed`, or
 `interrupted`), last run time, consecutive failed passes, recovery time, and the
@@ -399,6 +399,6 @@ connection failure/recovery and persistence/counter reset after broker restart.
 Managed-cloud/Kubernetes deployment validation remains environment-specific.
 
 DeleteQueue is an additive RPC observation extension. New brokers include its
-request counters and the `queue_not_empty` and `queue_changed` outcomes. The required decoder baseline
-is unchanged so new clients continue to accept observations from older brokers.
+request counters and the `queue_not_empty` outcome. The required decoder baseline
+is unchanged, so new clients continue to accept observations from older brokers.
 An occupied-queue rejection is an application outcome, not a storage failure.

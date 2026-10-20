@@ -239,6 +239,12 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 
 - **All times are epoch milliseconds** (INTEGER, UTC) end to end. The clock is
   injectable (`Options.Now` / `WithClock`) for tests.
+- **Resource names are the public address.** Do not expose an internal incarnation,
+  generation or storage token through engine, wire, SDK, CLI, MCP or console types.
+  Name-only deletion cannot fence an ABA delete/recreate race, so callers must own
+  and serialize deletion with same-name recreation. Keep this limitation explicit
+  in API and operational documentation rather than spreading identity metadata
+  through otherwise unrelated send and receive paths.
 - **One SQL statement per `exec`** — remote Hrana (libSQL) requires it; schema is a
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
 - **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do

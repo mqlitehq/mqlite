@@ -2082,82 +2082,51 @@ func TestDeleteQueueConcurrentSendNeverLosesAcknowledgedMessage(t *testing.T) {
 }
 
 func deleteCurrentQueue(ctx context.Context, e *Engine, name string) error {
-	qs, err := e.ListQueues(ctx)
-	if err != nil {
-		return err
-	}
-	generation := "missing"
-	for _, q := range qs {
-		if q.Name == name {
-			generation = q.Generation
-		}
-	}
-	return e.DeleteQueue(ctx, name, generation)
+	return e.DeleteQueue(ctx, name)
 }
 
-func TestDeleteQueueGenerationFencesReplacement(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		t.Run(fmt.Sprint("legacy=", legacy), func(t *testing.T) {
-			ctx := context.Background()
-			path := "file:" + filepath.Join(t.TempDir(), "queue.db")
-			opts := Options{DB: path, DisableBackground: true, Now: func() int64 { return 1700000000000 }}
-			e, err := Open(ctx, opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = e.Close() }()
-			mustQueue(t, e, "q", QueueConfig{})
-			if legacy {
-				if _, err := e.db.exec(ctx, `DELETE FROM meta WHERE key='queue-generation:q'`); err != nil {
-					t.Fatal(err)
-				}
-			}
-			generation := func() string {
-				t.Helper()
-				qs, err := e.ListQueues(ctx)
-				if err != nil || len(qs) != 1 {
-					t.Fatalf("inventory: %v %v", qs, err)
-				}
-				return qs[0].Generation
-			}
-			original := generation()
-			if original == "" {
-				t.Fatal("missing generation")
-			}
-			mustQueue(t, e, "q", QueueConfig{LockDurationMs: 54321})
-			if generation() != original {
-				t.Fatal("configuration update replaced queue identity")
-			}
-			if err := e.DeleteQueue(ctx, "q", ""); !errors.Is(err, ErrInvalidArgument) {
-				t.Fatalf("missing generation: %v", err)
-			}
-			if err := e.DeleteQueue(ctx, "q", original); err != nil {
-				t.Fatal(err)
-			}
-			mustQueue(t, e, "q", QueueConfig{}) // same name, config and injected millisecond
-			replacement := generation()
-			if replacement == original {
-				t.Fatal("queue identity reused")
-			}
-			if err := e.DeleteQueue(ctx, "q", original); !errors.Is(err, ErrQueueChanged) {
-				t.Fatalf("stale delete reached replacement: %v", err)
-			}
-			if err := e.Close(); err != nil {
-				t.Fatal(err)
-			}
-			e, err = Open(ctx, opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if generation() != replacement {
-				t.Fatal("restart changed queue identity")
-			}
-			if err := e.DeleteQueue(ctx, "q", original); !errors.Is(err, ErrQueueChanged) {
-				t.Fatalf("stale delete after restart: %v", err)
-			}
-			if err := e.DeleteQueue(ctx, "q", replacement); err != nil {
-				t.Fatal(err)
-			}
-		})
+func TestDeleteQueueNameTargetsCurrentQueue(t *testing.T) {
+	ctx := context.Background()
+	path := "file:" + filepath.Join(t.TempDir(), "queue.db")
+	opts := Options{DB: path, DisableBackground: true, Now: func() int64 { return 1700000000000 }}
+	e, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close() }()
+
+	mustQueue(t, e, "q", QueueConfig{})
+	if err := e.DeleteQueue(ctx, "q"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Queue names are resolved by each operation. Reusing a deleted name makes
+	// subsequent calls address the replacement, even with an identical clock.
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 54321})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("replacement")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeleteQueue(ctx, "q"); !errors.Is(err, ErrQueueNotEmpty) {
+		t.Fatalf("replacement was not addressed by name: %v", err)
+	}
+	msg := recvOne(t, e, "q")
+	if msg == nil || string(msg.Body) != "replacement" || msg.LockedUntilMs-e.now() != 54321 {
+		t.Fatalf("wrong replacement contents or configuration: %+v", msg)
+	}
+	if err := e.Complete(ctx, "q", msg.SeqNumber, msg.LockToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err = Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeleteQueue(ctx, "q"); err != nil {
+		t.Fatalf("delete current queue after restart: %v", err)
+	}
+	if err := e.DeleteQueue(ctx, "q"); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("missing queue: %v", err)
 	}
 }

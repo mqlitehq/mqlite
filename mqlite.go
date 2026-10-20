@@ -33,7 +33,6 @@ var (
 	ErrMessageTooLarge  = engine.ErrMessageTooLarge
 	ErrNameConflict     = engine.ErrNameConflict
 	ErrQueueNotEmpty    = engine.ErrQueueNotEmpty
-	ErrQueueChanged     = engine.ErrQueueChanged
 	ErrGroupRequired    = engine.ErrGroupRequired
 	// ErrDBLocked is returned by OpenEmbedded when the local file DB is already open
 	// in another process: embedded mode is single-process, single-writer (MQLITE-6).
@@ -136,23 +135,6 @@ type Observation = wire.ObserveResponse
 
 // QueueInfo mirrors engine.QueueInfo.
 type QueueInfo = engine.QueueInfo
-
-// DeleteQueueOpts binds deletion to a queue incarnation obtained from ListQueues.
-// Keep Generation unchanged when reconciling or retrying a previous request.
-// If omitted, the SDK looks up the current generation once before deletion.
-type DeleteQueueOpts struct{ Generation string }
-
-func queueGeneration(queues []QueueInfo, name string) (string, error) {
-	for _, q := range queues {
-		if q.Name == name {
-			if q.Generation == "" {
-				return "", ErrUnsupported
-			}
-			return q.Generation, nil
-		}
-	}
-	return "", ErrNotFound
-}
 
 // SubscriptionInfo mirrors engine.SubscriptionInfo (topic, name, filter expression).
 type SubscriptionInfo = engine.SubscriptionInfo
