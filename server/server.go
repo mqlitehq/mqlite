@@ -827,12 +827,12 @@ func (s *Server) handleListSubscriptionsPage(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	resp := wire.ListSubscriptionsPageResponse{
-		Subscriptions: make([]wire.SubscriptionJSON, len(page.Subscriptions)),
+		Subscriptions: make([]wire.SubscriptionPageJSON, len(page.Subscriptions)),
 		Total:         page.Total,
 		NextAfter:     page.NextAfter,
 	}
 	for i, su := range page.Subscriptions {
-		resp.Subscriptions[i] = wire.SubscriptionJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr, State: su.State}
+		resp.Subscriptions[i] = wire.SubscriptionPageJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr, State: su.State}
 	}
 	writeJSON(w, resp)
 }

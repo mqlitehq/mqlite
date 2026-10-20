@@ -212,8 +212,9 @@ authorization to discard them. Acceptance durably marks the backing queue
 `deleting`, immediately removes it from topic fan-out and the data plane, and
 keeps its name reserved while bounded cleanup runs. The mapping disappears with
 the final backing-queue row. Consequently, an implicit topic becomes unavailable
-as soon as its last active subscription is retired, even if physical cleanup is
-pending.
+for fan-out as soon as its last active subscription is retired, even if physical
+cleanup is pending. Its address remains reserved by a deleting mapping until that
+cleanup completes.
 
 There is no subscription TTL API in this release. Creating a subscription per
 request still requires explicit cleanup and makes request latency depend on

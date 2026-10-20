@@ -110,7 +110,8 @@ queue work and reserves the name while physical cleanup proceeds. For a
 subscription it also removes the entry from topic fan-out; the topic mapping stays
 available for reconciliation until final removal deletes it in the same
 transaction as the backing queue. Retiring the last active subscription therefore
-makes the implicit topic unavailable immediately.
+makes the implicit topic unavailable for fan-out immediately, while a deleting
+mapping keeps the topic address reserved until physical cleanup completes.
 The foreground request removes at most 1,000 physical rows and targets about
 8 MiB. Every
 one-second background pass globally caps cleanup at 4,096 rows and targets about

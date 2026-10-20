@@ -251,10 +251,17 @@ type SubscriptionJSON struct {
 	Topic string `json:"topic"`
 	Name  string `json:"name"`
 	Expr  string `json:"expr,omitempty"`
-	State string `json:"state,omitempty"`
 }
 type ListSubscriptionsResponse struct {
 	Subscriptions []SubscriptionJSON `json:"subscriptions"`
+}
+
+// SubscriptionPageJSON is one lifecycle-aware paged subscription entry.
+type SubscriptionPageJSON struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"`
+	State string `json:"state"`
 }
 type ListSubscriptionsPageRequest struct {
 	Topic           string `json:"topic,omitempty"`
@@ -263,9 +270,9 @@ type ListSubscriptionsPageRequest struct {
 	IncludeDeleting bool   `json:"include_deleting,omitempty"`
 }
 type ListSubscriptionsPageResponse struct {
-	Subscriptions []SubscriptionJSON `json:"subscriptions"`
-	Total         int                `json:"total"`
-	NextAfter     string             `json:"next_after,omitempty"`
+	Subscriptions []SubscriptionPageJSON `json:"subscriptions"`
+	Total         int                    `json:"total"`
+	NextAfter     string                 `json:"next_after,omitempty"`
 }
 
 // TestFilter dry-runs a filter expression: it compiles `expr` and, if `message` is

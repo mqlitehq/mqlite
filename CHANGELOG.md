@@ -23,9 +23,10 @@ upgrade notes before replacing a broker.
   removes its roster mapping. The implicit topic therefore becomes unavailable
   as soon as its last active subscription is retired.
 - Keep the existing `ListSubscriptions` API as a complete, active-only inventory
-  for compatibility, including its three-field Go `SubscriptionInfo` and JSON
-  shape. Add `ListSubscriptionsPage` with lifecycle-aware
-  `SubscriptionPageItem` entries, topic filtering, opaque scope-bound keyset
+  for compatibility, including its three-field Go `SubscriptionInfo`,
+  `wire.SubscriptionJSON`, and JSON shape. Add `ListSubscriptionsPage` with
+  lifecycle-aware `SubscriptionPageItem` / `wire.SubscriptionPageJSON` entries,
+  topic filtering, opaque scope-bound keyset
   cursors, a 100-item default / 1,000-item maximum page, an exact per-request
   `total`, and an explicit `include_deleting` reconciliation view. A page series
   is not a frozen multi-request snapshot when the roster is changing.

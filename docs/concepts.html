@@ -335,9 +335,10 @@
     <p>Subscriptions can also be deleted, empty-only by default or with explicit
       force. Acceptance marks the backing queue <code>deleting</code>, removes it from
       topic fan-out immediately, and keeps its mapping and name for reconciliation
-      until bounded cleanup completes. The implicit topic becomes unavailable when
-      its last active subscription is retired. There is no subscription TTL API in this
-      release.</p>
+      until bounded cleanup completes. The implicit topic becomes unavailable for
+      fan-out when its last active subscription is retired, while a deleting mapping
+      reserves its address until cleanup completes. There is no subscription TTL API
+      in this release.</p>
     <p>A subscription per request still creates metadata and cleanup work. For
       frequent request/reply traffic, use one stable reply subscription per
       application instance and dispatch replies with a globally unique

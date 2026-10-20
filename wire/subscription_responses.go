@@ -68,7 +68,7 @@ func DecodeListSubscriptionsPageResponse(data []byte, request ListSubscriptionsP
 	}
 
 	page := ListSubscriptionsPageResponse{
-		Subscriptions: make([]SubscriptionJSON, len(rawSubscriptions)),
+		Subscriptions: make([]SubscriptionPageJSON, len(rawSubscriptions)),
 		Total:         total,
 	}
 	var previousTopic, previousName string
@@ -81,7 +81,7 @@ func DecodeListSubscriptionsPageResponse(data []byte, request ListSubscriptionsP
 		if expr, ok := itemFields["expr"]; ok && bytes.Equal(bytes.TrimSpace(expr), []byte("null")) {
 			return ListSubscriptionsPageResponse{}, errListSubscriptionsPageResponse
 		}
-		var item SubscriptionJSON
+		var item SubscriptionPageJSON
 		if json.Unmarshal(raw, &item) != nil || item.Topic == "" || item.Name == "" ||
 			item.State != "active" && item.State != "deleting" ||
 			!request.IncludeDeleting && item.State != "active" ||

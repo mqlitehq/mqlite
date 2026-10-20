@@ -13,6 +13,14 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
+// Keep the released legacy wire type's exact field order, tags and arity. This
+// preserves external unkeyed SubscriptionJSON literals at compile time.
+var _ struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"`
+} = wire.SubscriptionJSON{}
+
 // The JSON field names ARE the contract between the broker and every client
 // (curl, the Go SDK, future SDKs). Pin them so a struct-tag edit can't silently
 // break the wire format (MQLITE-26).
@@ -110,7 +118,7 @@ func TestSubscriptionLifecycleJSONContract(t *testing.T) {
 		t.Fatalf("page request = %s", pageRequest)
 	}
 	pageResponse, err := json.Marshal(wire.ListSubscriptionsPageResponse{
-		Subscriptions: []wire.SubscriptionJSON{{Topic: "events", Name: "worker", State: "deleting"}},
+		Subscriptions: []wire.SubscriptionPageJSON{{Topic: "events", Name: "worker", State: "deleting"}},
 		Total:         1, NextAfter: "next",
 	})
 	if err != nil {

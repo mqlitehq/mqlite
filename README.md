@@ -367,9 +367,11 @@ scheduled, deferred and dead-letter work. Acceptance first persists a `deleting`
 state, which immediately blocks the backing queue, removes a subscription from
 topic fan-out, and reserves the name. The response reports either `deleted` or
 `deleting`; background cleanup resumes after restart. The final removal of a
-subscription backing queue also removes its topic mapping, so an implicit topic
-is gone once it has no active subscriptions. A locked delivery may already have
-produced an external side effect, which deletion cannot undo. Serialize deletion
+subscription backing queue also removes its topic mapping. An implicit topic
+becomes unavailable for fan-out once it has no active subscriptions, while its
+address remains reserved by any deleting mapping until physical cleanup
+completes. A locked delivery may already have produced an external side effect,
+which deletion cannot undo. Serialize deletion
 and same-name recreation, use globally unique one-use names for temporary
 subscriptions, and wait until the relevant inventory no longer shows the name
 before reusing it.

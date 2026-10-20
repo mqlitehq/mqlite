@@ -55,8 +55,7 @@ func TestListSubscriptionsAndTestFilter(t *testing.T) {
 	var ls wire.ListSubscriptionsResponse
 	legacyBody := post(wire.PathListSubscriptions, wire.Empty{}, &ls)
 	if len(ls.Subscriptions) != 1 || ls.Subscriptions[0].Topic != "events" ||
-		ls.Subscriptions[0].Name != "gold" || ls.Subscriptions[0].Expr != `properties["tier"]=="gold"` ||
-		ls.Subscriptions[0].State != "" {
+		ls.Subscriptions[0].Name != "gold" || ls.Subscriptions[0].Expr != `properties["tier"]=="gold"` {
 		t.Fatalf("ListSubscriptions = %+v", ls.Subscriptions)
 	}
 	var legacyWire struct {

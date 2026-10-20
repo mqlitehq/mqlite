@@ -525,8 +525,9 @@ subscription's backing queue.
   excluded from topic fan-out and direct queue operations immediately, while its
   mapping and name remain available for reconciliation. Final physical removal
   removes the mapping in the same transaction. Retiring the last active
-  subscription therefore makes the implicit topic unavailable immediately, even
-  while cleanup is pending.
+  subscription therefore makes the implicit topic unavailable for fan-out
+  immediately. A deleting mapping keeps the topic address reserved until physical
+  cleanup completes.
 - The SDK methods are `DeleteSubscription` (empty-only) and
   `DeleteSubscriptionWithOptions(..., DeleteSubscriptionOpts{Force:true})`.
   The built-in destructive clients call their HTTP transport once and classify
