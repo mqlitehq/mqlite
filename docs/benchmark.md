@@ -123,6 +123,41 @@ converged in one 30.707 ms maintenance pass. These control-plane measurements
 found no strong lifecycle regression, but the exact count scales with inventory;
 do not treat the 10,000-subscription safety ceiling as a low-latency guarantee.
 
+MQLITE-128 extends that native suite with fixed-lifetime fan-out and indexed
+subscription-expiry passes:
+
+```bash
+go test ./engine -run '^$' \
+  -bench 'Benchmark(TopicFanoutTTL32|SubscriptionExpiry)' \
+  -benchmem -count=5
+```
+
+On the same Apple M1 Pro with Go 1.26.9, seven alternating one-second rounds
+compared the final TTL engine with the merged MQLITE-127 baseline. Median latency
+changed by +6.52% for `SendOne`, +0.67% for `SendBatch64`, +1.14% for 32-way
+topic fan-out, +0.31% for 256-way fan-out, and -0.28% for receive plus complete.
+All remained below the 10% investigation threshold. The 32-way fixed-lifetime
+fan-out median was 1.456 ms; it added 32 allocations and 257 bytes per publish
+relative to permanent subscriptions in the same run, with no measured latency
+penalty beyond host variation.
+
+An indexed expiry scan over 10,000 future deadlines took 63.468 µs per no-work
+pass (15,756 passes/s). Transitioning a full 1,000-subscription due batch took
+3.562 ms (280,749 subscriptions/s). A controlled burst created 10,000
+subscriptions with one 5,000-message backlog, then advanced them to one common
+deadline. Data-plane fencing was immediate; 19 manually driven bounded passes
+discarded the backlog and removed all metadata in 338 ms. With normal background
+workers, 10,000 empty subscriptions converged in 1.292 s. A permanent queue had
+no send errors during cleanup; its send p50 stayed near 0.1 ms, while p99 rose
+from 0.687 ms before expiry to 12.003 ms during the burst (34.499 ms maximum).
+This is the expected bounded tail-latency cost of many simultaneous expirations,
+not a capacity promise; stagger deadlines and load-test the target backend.
+
+Adding required lifecycle timestamps to 100-item subscription pages changed the
+1,000-item inventory median from 0.658 ms to 0.717 ms (+8.87%) and the 10,000-item
+median from 5.187 ms to 5.376 ms (+3.65%). Page memory fell from about 39 KB to
+30 KB after exact preallocation; allocation counts stayed effectively flat.
+
 ## 1 · Throughput & write amplification
 
 256 B bodies unless noted. `wB/op` = bytes physically written to disk per op (write
