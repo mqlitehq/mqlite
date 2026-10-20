@@ -99,6 +99,12 @@ func TestServerAuthAndErrors(t *testing.T) {
 		[]byte(`{"name":"q","generation":"retired"}`), http.StatusBadRequest, "invalid_argument")
 	check("invalid delete force", http.MethodPost, wire.PathDeleteQueue, "secret",
 		[]byte(`{"name":"q","force":"true"}`), http.StatusBadRequest, "invalid_argument")
+	check("removed subscription delete generation", http.MethodPost, wire.PathDeleteSubscription, "secret",
+		[]byte(`{"topic":"ev","name":"ok","generation":"retired"}`), http.StatusBadRequest, "invalid_argument")
+	check("invalid subscription delete force", http.MethodPost, wire.PathDeleteSubscription, "secret",
+		[]byte(`{"topic":"ev","name":"ok","force":"true"}`), http.StatusBadRequest, "invalid_argument")
+	check("unknown subscription page field", http.MethodPost, wire.PathListSubscriptionsPage, "secret",
+		[]byte(`{"topic":"ev","offset":1}`), http.StatusBadRequest, "invalid_argument")
 	check("trailing data after body", http.MethodPost, wire.PathSend, "secret",
 		[]byte(`{"queue":"q","messages":[]}{"queue":"q"}`), http.StatusBadRequest, "invalid_argument")
 	check("empty queue name", http.MethodPost, wire.PathCreateQueue, "secret",
@@ -238,6 +244,7 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 		{"/mqlite.v1.AdminService/Subscribe", engine.KeyManage},
 		{"/mqlite.v1.AdminService/ListQueues", engine.KeyManage},
 		{"/mqlite.v1.AdminService/ListSubscriptions", engine.KeyManage},
+		{wire.PathListSubscriptionsPage, engine.KeyManage},
 		{"/mqlite.v1.AdminService/TestFilter", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Redrive", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Purge", engine.KeyManage},
@@ -247,6 +254,7 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 		{"/mqlite.v1.AuthService/ListKeys", engine.KeyManage},
 		{"/mqlite.v1.AuthService/RevokeKey", engine.KeyManage},
 		{wire.PathDeleteQueue, engine.KeyManage},
+		{wire.PathDeleteSubscription, engine.KeyManage},
 	}
 	inventory := keyTestRequest(server.New(keyTestEngine(t, nil), []string{"admin"}).Handler(), http.MethodGet, "/", "", nil)
 	var card wire.DiscoveryCard
@@ -302,6 +310,9 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				if err := eng.Subscribe(ctx, "topic", "sub", nil); err != nil {
+					t.Fatal(err)
+				}
 				_, err := eng.Send(ctx, "q", engine.OutMessage{Body: []byte("locked")}, engine.OutMessage{Body: []byte("deferred")}, engine.OutMessage{Body: []byte("dead")}, engine.OutMessage{Body: []byte("active")})
 				if err != nil {
 					t.Fatal(err)
@@ -346,10 +357,14 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 					body = wire.MetricsRequest{Queue: "q"}
 				case wire.PathDeleteQueue:
 					body = wire.DeleteQueueRequest{Name: "target", Force: true}
+				case wire.PathDeleteSubscription:
+					body = wire.DeleteSubscriptionRequest{Topic: "topic", Name: "sub", Force: true}
 				case wire.PathCreateQueue:
 					body = wire.CreateQueueRequest{Name: "new"}
 				case wire.PathSubscribe:
 					body = wire.SubscribeRequest{Topic: "topic", Name: "sub"}
+				case wire.PathListSubscriptionsPage:
+					body = wire.ListSubscriptionsPageRequest{Limit: 1}
 				case wire.PathTestFilter:
 					body = wire.TestFilterRequest{Expr: "true"}
 				case wire.PathRedrive:

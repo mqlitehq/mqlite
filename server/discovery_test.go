@@ -30,8 +30,10 @@ var wantRPCRoutes = []string{
 	wire.PathAbandon, wire.PathReject, wire.PathDefer, wire.PathReceiveDeferred,
 	wire.PathRenew, wire.PathSchedule, wire.PathCancel, wire.PathPeek, wire.PathStats,
 	wire.PathCreateQueue, wire.PathSubscribe, wire.PathListQueues, wire.PathListSubscriptions,
+	wire.PathListSubscriptionsPage,
 	wire.PathTestFilter, wire.PathRedrive, wire.PathPurge, wire.PathStatus, wire.PathObserve,
 	wire.PathCreateKey, wire.PathListKeys, wire.PathRevokeKey, wire.PathDeleteQueue,
+	wire.PathDeleteSubscription,
 }
 
 func getCard(t *testing.T, url string) (wire.DiscoveryCard, []string) {

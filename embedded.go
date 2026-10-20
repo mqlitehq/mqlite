@@ -33,6 +33,7 @@ type embeddedConfig struct {
 	dlqMaxAgeMs       int64
 	dlqMaxCount       int
 	dlqMaxBytes       int64
+	maxSubscriptions  int
 }
 
 // EmbeddedOption configures OpenEmbedded.
@@ -57,6 +58,12 @@ func WithClock(now func() int64) EmbeddedOption {
 // WithMaxMessageBytes caps message body size (0 -> 1 MiB default).
 func WithMaxMessageBytes(n int64) EmbeddedOption {
 	return func(c *embeddedConfig) { c.maxMessageBytes = n }
+}
+
+// WithMaxSubscriptions caps the total active and deleting subscriptions.
+// Zero uses the engine default.
+func WithMaxSubscriptions(n int) EmbeddedOption {
+	return func(c *embeddedConfig) { c.maxSubscriptions = n }
 }
 
 // WithLogger routes background-loop failures to lg (nil -> slog.Default()).
@@ -101,6 +108,7 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 		Now:               cfg.now,
 		DisableBackground: cfg.disableBackground,
 		MaxMessageBytes:   cfg.maxMessageBytes,
+		MaxSubscriptions:  cfg.maxSubscriptions,
 		Logger:            cfg.logger,
 		Synchronous:       cfg.synchronous,
 		DLQMaxAgeMs:       cfg.dlqMaxAgeMs,
@@ -321,6 +329,21 @@ func (e *Embedded) DeleteQueueWithOptions(ctx context.Context, name string, opts
 	return e.eng.DeleteQueueWithOptions(ctx, name, engine.DeleteOptions{Force: o.Force})
 }
 
+// DeleteSubscription removes an empty subscription. An accepted deletion returns
+// nil whether bounded physical cleanup completed in this call or continues in the
+// background. Use DeleteSubscriptionWithOptions to force-discard retained messages
+// or inspect the accepted deletion state.
+func (e *Embedded) DeleteSubscription(ctx context.Context, topic, name string) error {
+	_, err := e.DeleteSubscriptionWithOptions(ctx, topic, name)
+	return err
+}
+
+// DeleteSubscriptionWithOptions reports whether physical cleanup is complete.
+func (e *Embedded) DeleteSubscriptionWithOptions(ctx context.Context, topic, name string, opts ...DeleteSubscriptionOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	return e.eng.DeleteSubscriptionWithOptions(ctx, topic, name, engine.DeleteOptions{Force: o.Force})
+}
+
 func (e *Embedded) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {
 	return e.eng.CreateQueue(ctx, name, cfg.toEngine())
 }
@@ -373,6 +396,12 @@ func (e *Embedded) Observe(ctx context.Context) (Observation, error) {
 // ListSubscriptions returns every subscription with its topic and filter expression.
 func (e *Embedded) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
 	return e.eng.ListSubscriptions(ctx)
+}
+
+// ListSubscriptionsWithOptions returns one internally consistent subscription
+// page. Separate page requests may observe concurrent roster changes.
+func (e *Embedded) ListSubscriptionsWithOptions(ctx context.Context, opts ListSubscriptionsOptions) (SubscriptionPage, error) {
+	return e.eng.ListSubscriptionsWithOptions(ctx, opts)
 }
 
 // TestFilter dry-runs a subscription filter expression against an optional sample message

@@ -87,12 +87,70 @@ func TestBlackboxDeleteQueueRejectsUnknownAndMalformedFlags(t *testing.T) {
 	}{
 		{args: []string{"delete-queue", "q", "--discard"}, want: "flag provided but not defined"},
 		{args: []string{"delete-queue", "q", "--force=eventually"}, want: "invalid boolean value"},
+		{args: []string{"delete-subscription", "topic", "sub", "--discard"}, want: "flag provided but not defined"},
+		{args: []string{"delete-subscription", "topic", "sub", "--force=eventually"}, want: "invalid boolean value"},
 	} {
 		cmd := exec.Command(mqliteBin, tc.args...)
 		code, stderr := exitCode(cmd)
 		if code == 0 || !strings.Contains(stderr, tc.want) {
 			t.Errorf("mqlite %v: code=%d stderr=%q", tc.args, code, stderr)
 		}
+	}
+}
+
+func TestBlackboxSubscriptionDeleteAndPagedInventory(t *testing.T) {
+	ctx := context.Background()
+	url, eng := bbBroker(t, "tok")
+	if err := eng.Subscribe(ctx, "events", "temporary", nil); err != nil {
+		t.Fatal(err)
+	}
+	backlog := make([]engine.OutMessage, 5000)
+	for i := range backlog {
+		backlog[i].Body = []byte("x")
+	}
+	if _, err := eng.Send(ctx, "events", backlog...); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN=tok")
+
+	nonForce := exec.Command(mqliteBin, "delete-subscription", "events", "temporary")
+	nonForce.Env = env
+	if code, stderr := exitCode(nonForce); code == 0 || !strings.Contains(stderr, "subscription still contains messages") {
+		t.Fatalf("non-force delete: code=%d stderr=%q", code, stderr)
+	}
+
+	force := exec.Command(mqliteBin, "delete-subscription", "events", "temporary", "--force", "--output", "json")
+	force.Env = env
+	var forceOut, forceErr bytes.Buffer
+	force.Stdout, force.Stderr = &forceOut, &forceErr
+	if err := force.Run(); err != nil {
+		t.Fatalf("force delete: %v stderr=%q", err, forceErr.String())
+	}
+	var ack struct {
+		Topic   string `json:"topic"`
+		Name    string `json:"name"`
+		Deleted bool   `json:"deleted"`
+		State   string `json:"state"`
+	}
+	if err := json.Unmarshal(forceOut.Bytes(), &ack); err != nil || ack.Topic != "events" || ack.Name != "temporary" || ack.Deleted || ack.State != "deleting" {
+		t.Fatalf("force acknowledgement = %q (%v)", forceOut.String(), err)
+	}
+
+	legacy := exec.Command(mqliteBin, "list-subscriptions", "--output", "json")
+	legacy.Env = env
+	legacyOut, err := legacy.Output()
+	if err != nil || strings.TrimSpace(string(legacyOut)) != "[]" {
+		t.Fatalf("legacy active-only inventory = %q (%v)", legacyOut, err)
+	}
+	page := exec.Command(mqliteBin, "list-subscriptions", "--topic", "events", "--include-deleting", "--output", "json")
+	page.Env = env
+	pageOut, err := page.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inventory wire.ListSubscriptionsPageResponse
+	if err := json.Unmarshal(pageOut, &inventory); err != nil || inventory.Total != 1 || len(inventory.Subscriptions) != 1 || inventory.Subscriptions[0].State != "deleting" {
+		t.Fatalf("paged deleting inventory = %q (%v)", pageOut, err)
 	}
 }
 

@@ -2,11 +2,62 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mqlitehq/mqlite"
 )
+
+func TestEmbeddedOptsMaxSubscriptions(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "bounded.db"))
+	t.Setenv("MQLITE_MAX_SUBSCRIPTIONS", "1")
+	c, err := dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Subscribe(ctx, "topic", "first", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Subscribe(ctx, "topic", "second", nil); !errors.Is(err, mqlite.ErrSubscriptionLimit) {
+		t.Fatalf("second subscription = %v, want ErrSubscriptionLimit", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "default.db"))
+	t.Setenv("MQLITE_MAX_SUBSCRIPTIONS", "not-a-number")
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	c, openErr := dial(ctx)
+	_ = w.Close()
+	os.Stderr = oldStderr
+	warning, _ := io.ReadAll(r)
+	_ = r.Close()
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer c.Close()
+	if !strings.Contains(string(warning), `ignoring unparseable MQLITE_MAX_SUBSCRIPTIONS="not-a-number"`) {
+		t.Fatalf("malformed limit warning = %q", warning)
+	}
+	for _, name := range []string{"first", "second"} {
+		if err := c.Subscribe(ctx, "topic", name, nil); err != nil {
+			t.Fatalf("default limit subscription %q: %v", name, err)
+		}
+	}
+}
 
 // TestCmdPurgeDLQ exercises the purge-dlq command end to end against an embedded
 // DB: dead-letter a message, then confirm the command clears it (MQLITE-9).

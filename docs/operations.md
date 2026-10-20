@@ -32,13 +32,22 @@ for metric definitions and alerts.
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
   when retrying within their documented retention windows; do not treat an HTTP
   timeout as proof that a write failed.
-- Give one controller exclusive ownership of queue deletion and same-name
-  recreation. Quiesce producers and consumers. Use the empty-only default unless
-  permanent loss is intended; force also discards locked work whose external
-  effects may already have happened. An accepted queue enters durable `deleting`,
-  stops serving data and reserves its name. Confirm the name is absent before
+- Give one controller exclusive ownership of queue or subscription deletion and
+  same-name recreation. Quiesce producers and consumers. Use the empty-only
+  default unless permanent loss is intended; force also discards locked work whose
+  external effects may already have happened. An accepted resource enters durable
+  `deleting`, stops serving data and reserves its name; an accepted subscription
+  also leaves topic fan-out immediately. Confirm the name is absent before
   recreating it. Keep the name reserved while reconciling an uncertain result,
   and never replay an old delete after a replacement exists.
+- Treat the default 10,000 active-plus-deleting subscription limit as a metadata
+  safety ceiling. Choose a lower limit when the application needs a stricter
+  bound. Measure fan-out latency, database growth and observation cost at the
+  expected active count; each matching subscription creates another message copy.
+  Stable reply subscriptions plus `correlation_id` scale better than one
+  subscription per request. If temporary subscriptions are required, use globally
+  unique one-use names and rate-limit creation/deletion so bounded cleanup can keep
+  up.
 
 Choose and record the application's recovery objectives before launch: acceptable
 snapshot age (RPO), recovery time (RTO), backlog age, and capacity limits. Measure
@@ -272,7 +281,9 @@ in this release, so do not improvise a direct SQL table copy between schemas.
 | Full disk / `SQLITE_FULL` | Stop ingress, preserve logs and acknowledged message identities. Expand storage or remove unrelated expired logs/backups; never remove the live DB or WAL. A full `VACUUM` needs working space and is unsuitable as an emergency first step. | Backend status, a fresh canary, successful replay/reconciliation of ambiguous requests, and retained-message integrity. |
 | Repeated broker crashes | Stop restart loops long enough to preserve the complete DB directory and logs. Check disk, memory/OOM and configuration. Restart only one owner. | Recovery of orphaned locks, DLQ reason/count, canary and consumer idempotency. |
 | Old backlog / growing DLQ | Check consumers, lock expiry/renewal and handler failures. Inspect reasons and payloads; fix the cause before bounded redrive. | Backlog age falls and verified redriven identities complete. |
-| Queue remains `deleting` | Keep producers stopped and the name reserved. Check storage availability, free disk and `resource_cleanup` maintenance failures; do not remove lifecycle rows with SQL. Cleanup is deliberately bounded and resumes after restart. | `list` no longer contains the name; only then may the owner recreate it. Logical free pages can be reused before the DB/WAL files shrink. |
+| Queue or subscription remains `deleting` | Keep producers stopped and the name reserved. Check storage availability, free disk and `resource_cleanup` maintenance failures; do not remove lifecycle rows or subscription mappings with SQL. Cleanup is deliberately bounded and resumes after restart. | `list` or `list-subscriptions --include-deleting` no longer contains the name; only then may the owner recreate it. Logical free pages can be reused before the DB/WAL files shrink. |
+| Subscription creation returns `resource_exhausted` | Stop creation churn and inspect active plus deleting subscriptions with paged listing. Drain or explicitly force-retire abandoned entries, then let bounded cleanup finish. Raising the limit also raises metadata, fan-out and observation costs. | Deleting entries disappear, capacity becomes available and publish/observe latency remains within the workload's measured bound. |
+| An older database exposes a `kind=subscription` queue with no subscription mapping | Wait for a capacity slot, call `Subscribe` with the intended topic and existing backing-queue name to restore the mapping, then keep it or retire it through `DeleteSubscription`. Never repair MQLite-owned tables with direct SQL. | The exact topic/name appears in `list-subscriptions`; if retired, it disappears after bounded cleanup. |
 | Storage/remote timeouts | Check backend reachability and latency. Treat lost write responses as ambiguous; keep retries within the idempotency contract. | Authenticated status plus a write/consume canary. |
 | `ErrSchemaVersionMismatch` | Stop the attempted cutover. Recover the matching binary/database pair. | Schema token and the correct old or new port; no token restamping. |
 

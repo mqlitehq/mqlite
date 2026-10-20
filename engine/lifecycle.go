@@ -357,7 +357,7 @@ func (e *Engine) cleanEntityTx(ctx context.Context, tx *txn, name, kind string, 
 }
 
 // deleteEntityMetadataTx performs the final metadata retirement without relying
-// on ON DELETE CASCADE. When requireEmpty is true, the subscription mapping is
+// on a foreign-key cascade. When requireEmpty is true, the subscription mapping is
 // removed only if its backing queue has no owned rows, so an unfinished fast-path
 // probe cannot expose an orphan backing queue. Any failure after mapping deletion
 // rolls the surrounding transaction back.

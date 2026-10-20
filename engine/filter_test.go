@@ -621,9 +621,6 @@ func TestListSubscriptions(t *testing.T) {
 	if by["all"].Topic != "events" || by["all"].Expr != "" {
 		t.Errorf("all: %+v", by["all"])
 	}
-	if by["all"].State != "active" || by["gold"].State != "active" {
-		t.Errorf("active subscription states: all=%+v gold=%+v", by["all"], by["gold"])
-	}
 	if by["gold"].Expr != `properties["tier"]=="gold"` {
 		t.Errorf("gold expr: %+v", by["gold"])
 	}
@@ -688,7 +685,7 @@ func TestListSubscriptionsWithOptionsPaginationAndDeletingScope(t *testing.T) {
 		t.Fatalf("legacy active inventory=%+v, error=%v", legacy, err)
 	}
 	for _, sub := range legacy {
-		if sub.Name == "a0" || sub.State != "active" {
+		if sub.Name == "a0" {
 			t.Fatalf("legacy inventory exposed deleting subscription: %+v", legacy)
 		}
 	}

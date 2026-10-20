@@ -15,6 +15,7 @@
 //	MQLITE_UI=on|off            (serve the embedded admin console at /ui for `serve`;
 //	                             UNSET => on; =off runs headless — /ui 404s)
 //	MQLITE_MAX_MESSAGE_BYTES=<n>                                  (reject larger bodies)
+//	MQLITE_MAX_SUBSCRIPTIONS=<n>                                  (active + deleting limit)
 //	MQLITE_SYNC=NORMAL|FULL|OFF|EXTRA        (durability; embedded/serve; unknown value
 //	                                          is rejected at startup, never silently NORMAL)
 //	MQLITE_DLQ_MAX_AGE=14d-ish (e.g. 336h) · MQLITE_DLQ_MAX_COUNT=1000000 · MQLITE_DLQ_RETENTION=off
@@ -90,6 +91,8 @@ func main() {
 		err = cmdCreateQueue(ctx, args)
 	case "subscribe", "create-subscription":
 		err = cmdCreateSubscription(ctx, args)
+	case "delete-subscription":
+		err = cmdDeleteSubscription(ctx, args)
 	case "send":
 		err = cmdSend(ctx, args)
 	case "schedule":
@@ -167,8 +170,9 @@ usage: mqlite <command> [flags]
   create-queue <name>       create/update a queue
   delete-queue <name>       delete an empty queue (--force discards retained data)
   subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate')
+  delete-subscription <topic> <name>  delete an empty subscription (--force discards retained data)
   list                      list queues
-  list-subscriptions        list subscriptions with their topic + filter
+  list-subscriptions        list subscriptions; pagination flags return a page object
   peek <queue>              browse messages without locking (--state --from --max)
   test-filter <expr>        dry-run a filter expression against an optional sample
   metrics <queue>           show queue counters
@@ -211,8 +215,10 @@ type api interface {
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
 	DeleteQueueWithOptions(ctx context.Context, name string, opts ...mqlite.DeleteQueueOpts) (mqlite.DeleteResult, error)
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
+	DeleteSubscriptionWithOptions(ctx context.Context, topic, name string, opts ...mqlite.DeleteSubscriptionOpts) (mqlite.DeleteResult, error)
 	ListQueues(ctx context.Context) ([]mqlite.QueueInfo, error)
 	ListSubscriptions(ctx context.Context) ([]mqlite.SubscriptionInfo, error)
+	ListSubscriptionsWithOptions(ctx context.Context, opts mqlite.ListSubscriptionsOptions) (mqlite.SubscriptionPage, error)
 	TestFilter(ctx context.Context, expr string, sample *mqlite.OutMessage, enqueuedAtMs, visibleAtMs int64) (mqlite.FilterTestResult, error)
 	Stats(ctx context.Context, queue string) (mqlite.Metrics, error)
 	Status(ctx context.Context) (mqlite.StatusInfo, error)
@@ -280,10 +286,10 @@ func warnEnv(name, val string) {
 }
 
 // embeddedOpts builds the common embedded options EVERY CLI command shares: DB auth
-// token, message size cap, durability. DLQ retention is deliberately NOT here — it is a
-// broker-lifecycle policy (serveRetentionOpts), and a one-shot command like `send` or
-// `receive` must not start the retention janitor (docs/cli.md documents it as
-// serve-only; MQLITE-88 / P2-3).
+// token, message size and subscription caps, and durability. DLQ retention is deliberately
+// NOT here — it is a broker-lifecycle policy (serveRetentionOpts), and a one-shot command
+// like `send` or `receive` must not start the retention janitor (docs/cli.md documents it
+// as serve-only; MQLITE-88 / P2-3).
 func embeddedOpts() []mqlite.EmbeddedOption {
 	opts := []mqlite.EmbeddedOption{mqlite.WithDBAuthToken(os.Getenv("MQLITE_DB_AUTH_TOKEN"))}
 	if v := os.Getenv("MQLITE_MAX_MESSAGE_BYTES"); v != "" {
@@ -291,6 +297,13 @@ func embeddedOpts() []mqlite.EmbeddedOption {
 			opts = append(opts, mqlite.WithMaxMessageBytes(n))
 		} else {
 			warnEnv("MQLITE_MAX_MESSAGE_BYTES", v)
+		}
+	}
+	if v := os.Getenv("MQLITE_MAX_SUBSCRIPTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			opts = append(opts, mqlite.WithMaxSubscriptions(n))
+		} else {
+			warnEnv("MQLITE_MAX_SUBSCRIPTIONS", v)
 		}
 	}
 	if v := os.Getenv("MQLITE_SYNC"); v != "" { // NORMAL (default) | FULL | OFF | EXTRA — validated at Open

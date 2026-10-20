@@ -507,10 +507,18 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 
 // SubscriptionInfo describes one topic→subscription mapping and its filter.
 type SubscriptionInfo struct {
-	State string `json:"state"`
 	Topic string `json:"topic"`
 	Name  string `json:"name"`
 	Expr  string `json:"expr,omitempty"` // the filter expression; "" = match all
+}
+
+// SubscriptionPageItem is one subscription in the lifecycle-aware paged
+// inventory. State is active or deleting.
+type SubscriptionPageItem struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"` // the filter expression; "" = match all
+	State string `json:"state"`
 }
 
 // ListSubscriptionsOptions controls a bounded subscription inventory page.
@@ -527,9 +535,9 @@ type ListSubscriptionsOptions struct {
 // current snapshot. Total is the exact number of subscriptions in the requested
 // scope before applying After; separate page requests do not share a snapshot.
 type SubscriptionPage struct {
-	Subscriptions []SubscriptionInfo `json:"subscriptions"`
-	Total         int                `json:"total"`
-	NextAfter     string             `json:"next_after,omitempty"`
+	Subscriptions []SubscriptionPageItem `json:"subscriptions"`
+	Total         int                    `json:"total"`
+	NextAfter     string                 `json:"next_after,omitempty"`
 }
 
 const (
@@ -568,8 +576,8 @@ func decodeSubscriptionCursor(encoded string) (subscriptionCursor, error) {
 	return cursor, nil
 }
 
-func subscriptionInfo(topic, name, state string, filterJSON sql.NullString) SubscriptionInfo {
-	info := SubscriptionInfo{State: state, Topic: topic, Name: name}
+func subscriptionInfo(topic, name string, filterJSON sql.NullString) SubscriptionInfo {
+	info := SubscriptionInfo{Topic: topic, Name: name}
 	if filterJSON.Valid && filterJSON.String != "" {
 		var filter Filter
 		if json.Unmarshal([]byte(filterJSON.String), &filter) == nil {
@@ -579,24 +587,29 @@ func subscriptionInfo(topic, name, state string, filterJSON sql.NullString) Subs
 	return info
 }
 
+func subscriptionPageItem(topic, name, state string, filterJSON sql.NullString) SubscriptionPageItem {
+	legacy := subscriptionInfo(topic, name, filterJSON)
+	return SubscriptionPageItem{Topic: legacy.Topic, Name: legacy.Name, Expr: legacy.Expr, State: state}
+}
+
 // ListSubscriptions returns every subscription with its topic and filter expression,
 // ordered by topic then name. (ListQueues shows the backing queues; this exposes the
 // topic membership + filter that ListQueues does not.)
 func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
 	var out []SubscriptionInfo
 	err := e.db.queryRows(ctx, `
-		SELECT s.topic,s.subscription,s.filter_json,q.lifecycle_state
+		SELECT s.topic,s.subscription,s.filter_json
 		FROM subscriptions s JOIN queues q ON q.name=s.subscription
 		WHERE q.lifecycle_state='active'
 		ORDER BY s.topic,s.subscription`,
 		func(rows *sql.Rows) error {
 			for rows.Next() {
-				var topic, sub, state string
+				var topic, sub string
 				var fj sql.NullString
-				if err := rows.Scan(&topic, &sub, &fj, &state); err != nil {
+				if err := rows.Scan(&topic, &sub, &fj); err != nil {
 					return err
 				}
-				out = append(out, subscriptionInfo(topic, sub, state, fj))
+				out = append(out, subscriptionInfo(topic, sub, fj))
 			}
 			return rows.Err()
 		})
@@ -625,9 +638,9 @@ func (e *Engine) ListSubscriptionsWithOptions(ctx context.Context, opts ListSubs
 		}
 	}
 
-	page := SubscriptionPage{Subscriptions: []SubscriptionInfo{}}
+	page := SubscriptionPage{Subscriptions: []SubscriptionPageItem{}}
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		page = SubscriptionPage{Subscriptions: []SubscriptionInfo{}}
+		page = SubscriptionPage{Subscriptions: []SubscriptionPageItem{}}
 		where := ` WHERE 1=1`
 		args := make([]any, 0, 7)
 		if opts.Topic != "" {
@@ -666,7 +679,7 @@ func (e *Engine) ListSubscriptionsWithOptions(ctx context.Context, opts ListSubs
 				_ = rows.Close()
 				return err
 			}
-			page.Subscriptions = append(page.Subscriptions, subscriptionInfo(topic, name, state, filterJSON))
+			page.Subscriptions = append(page.Subscriptions, subscriptionPageItem(topic, name, state, filterJSON))
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()

@@ -22,6 +22,7 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_MONITOR_TOKENS` | v0.3.2+: optional comma-separated credentials for `Observe` and `/metrics` only; requires auth and distinct administrator credentials |
 | `MQLITE_METRICS` | v0.3.2+: opt-in authenticated `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
+| `MQLITE_MAX_SUBSCRIPTIONS` | active plus deleting subscription capacity (default 10,000); pending cleanup continues to occupy a slot |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
 | `MQLITE_UI` | serve the embedded admin console at `/ui` (default on; `off` runs headless) |

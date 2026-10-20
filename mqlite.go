@@ -20,20 +20,23 @@ import (
 
 // Re-exported sentinel errors so callers can use errors.Is on either mode.
 var (
-	ErrLockLost         = engine.ErrLockLost
-	ErrUnauthenticated  = engine.ErrUnauthenticated
-	ErrPermissionDenied = engine.ErrPermissionDenied
-	ErrKeyConflict      = engine.ErrKeyConflict
-	ErrOutcomeUnknown   = engine.ErrOutcomeUnknown
-	ErrInvalidArgument  = engine.ErrInvalidArgument
-	ErrNotFound         = engine.ErrNotFound
-	ErrUnsupported      = engine.ErrUnsupported
-	ErrQueueNotFound    = engine.ErrQueueNotFound
-	ErrDedupConflict    = engine.ErrDedupConflict
-	ErrMessageTooLarge  = engine.ErrMessageTooLarge
-	ErrNameConflict     = engine.ErrNameConflict
-	ErrQueueNotEmpty    = engine.ErrQueueNotEmpty
-	ErrGroupRequired    = engine.ErrGroupRequired
+	ErrLockLost             = engine.ErrLockLost
+	ErrUnauthenticated      = engine.ErrUnauthenticated
+	ErrPermissionDenied     = engine.ErrPermissionDenied
+	ErrKeyConflict          = engine.ErrKeyConflict
+	ErrOutcomeUnknown       = engine.ErrOutcomeUnknown
+	ErrInvalidArgument      = engine.ErrInvalidArgument
+	ErrNotFound             = engine.ErrNotFound
+	ErrUnsupported          = engine.ErrUnsupported
+	ErrQueueNotFound        = engine.ErrQueueNotFound
+	ErrDedupConflict        = engine.ErrDedupConflict
+	ErrMessageTooLarge      = engine.ErrMessageTooLarge
+	ErrNameConflict         = engine.ErrNameConflict
+	ErrQueueNotEmpty        = engine.ErrQueueNotEmpty
+	ErrSubscriptionNotFound = engine.ErrSubscriptionNotFound
+	ErrSubscriptionNotEmpty = engine.ErrSubscriptionNotEmpty
+	ErrSubscriptionLimit    = engine.ErrSubscriptionLimit
+	ErrGroupRequired        = engine.ErrGroupRequired
 	// ErrDBLocked is returned by OpenEmbedded when the local file DB is already open
 	// in another process: embedded mode is single-process, single-writer (MQLITE-6).
 	ErrDBLocked = engine.ErrDBLocked
@@ -141,11 +144,29 @@ type DeleteQueueOpts struct {
 	Force bool // retire immediately and discard retained messages during bounded cleanup
 }
 
+// DeleteSubscriptionOpts configures subscription deletion.
+type DeleteSubscriptionOpts struct {
+	Force bool // retire immediately and discard retained messages during bounded cleanup
+}
+
 // DeleteResult reports whether physical removal is complete or cleanup is pending.
 type DeleteResult = engine.DeleteResult
 
-// SubscriptionInfo mirrors engine.SubscriptionInfo (topic, name, filter expression).
+// SubscriptionInfo mirrors engine.SubscriptionInfo for the legacy complete,
+// active-only inventory.
 type SubscriptionInfo = engine.SubscriptionInfo
+
+// SubscriptionPageItem is one lifecycle-aware entry in SubscriptionPage.
+// State is active or deleting.
+type SubscriptionPageItem = engine.SubscriptionPageItem
+
+// ListSubscriptionsOptions configures a consistent subscription inventory page.
+// Separate page requests may observe concurrent roster changes.
+type ListSubscriptionsOptions = engine.ListSubscriptionsOptions
+
+// SubscriptionPage is one current-snapshot page plus its exact scoped total and
+// continuation cursor. A multi-request traversal is not a frozen snapshot.
+type SubscriptionPage = engine.SubscriptionPage
 
 // FilterTestResult mirrors engine.FilterTestResult — the dry-run of a filter expression.
 type FilterTestResult = engine.FilterTestResult

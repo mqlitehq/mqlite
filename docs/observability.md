@@ -175,9 +175,12 @@ make transitions visible; choose production cadence from measured workload needs
 
 RPC/result and storage/error dimensions have fixed vocabularies, but their
 zero-initialized counters and histogram buckets still produce many series. Queue
-dimensions grow with the configured inventory. Measure scrape response size,
-duration and series count before increasing inventory or polling frequency; a
-working small demo does not establish a large-deployment capacity limit.
+dimensions grow with the configured inventory, including active subscription
+backing queues. The default 10,000-subscription ceiling is a metadata guard, not a
+promise that a 10,000-entity observation is cheap. Measure scrape response size,
+duration, memory and series count before increasing inventory or polling
+frequency; a working small demo does not establish a large-deployment capacity
+limit.
 
 ## Metric contract
 
@@ -240,7 +243,8 @@ event can be detected after an earlier successful scrape. Use `rate`/`increase`
 across observed samples; a first scrape after an event cannot reconstruct its time.
 Maintenance tasks are `locks`, `scheduled`, `ttl`,
 `dedup`, `receipts`, `retention`, `reclaim`, `lifecycle`. `lifecycle` is the
-event-driven bounded cleanup pass for queues already marked deleting. Unfinished
+event-driven bounded cleanup pass for queue and subscription backing queues
+already marked deleting. Unfinished
 work is paced at one continuation pass per second; an idle store does not run the
 task, so a quiet `last_success` timestamp is expected. An uncertain remote delete
 commit temporarily schedules up to 30 one-second discovery passes even when the
@@ -261,8 +265,9 @@ rollback. Counters are process-local and reset at restart; unobserved activity
 before a crash can be lost. They are operational measurements, not a durable
 billing or business audit ledger.
 
-After physical queue deletion completes, MQLite removes that queue's named counter
-series and folds its existing counts into one bounded retired aggregate. Native
+After physical queue or subscription deletion completes, MQLite removes that
+backing queue's named counter series and folds its existing counts into one bounded
+retired aggregate. Native
 observations and Prometheus expose this aggregate with `queue=""`; the empty label
 does not name an addressable queue. It combines all retired queue names and any
 late transaction effects from an older queue-topology epoch. Recreating the same
@@ -412,11 +417,14 @@ interrupts only that isolated stack to verify scrape-auth recovery, Grafana
 connection failure/recovery and persistence/counter reset after broker restart.
 Managed-cloud/Kubernetes deployment validation remains environment-specific.
 
-DeleteQueue is an additive RPC observation extension. New brokers include its
-request counters and the `queue_not_empty` outcome. `ListQueues.state`, rather
-than the canonical observation's queue gauges, identifies a queue whose cleanup
-is pending. The lifecycle maintenance row reports cleanup pass health; a force
-discard does not masquerade as normal completion or retention message effects.
-The required decoder baseline is unchanged, so new clients continue to accept
-observations from older brokers. An occupied-queue rejection is an application
-outcome, not a storage failure.
+DeleteQueue, DeleteSubscription and ListSubscriptionsPage are additive RPC
+observation extensions. New brokers include their request counters plus the
+`queue_not_empty`, `subscription_not_empty` and `resource_exhausted` outcomes.
+`ListQueues.state` and the paged subscription inventory with
+`include_deleting=true`, rather than the canonical observation's queue gauges,
+identify resources whose cleanup is pending. The lifecycle maintenance row
+reports cleanup pass health; a force discard does not masquerade as normal
+completion or retention message effects. The required decoder baseline is
+unchanged, so new clients continue to accept observations from older brokers.
+An occupied-resource or capacity rejection is an application outcome, not a
+storage failure.

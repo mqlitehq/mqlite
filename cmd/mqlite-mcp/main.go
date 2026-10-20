@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/internal/authkey"
 	"github.com/mqlitehq/mqlite/internal/defaults"
 	ver "github.com/mqlitehq/mqlite/internal/version"
@@ -238,8 +239,16 @@ func intArr(a map[string]any, k string) []int64 {
 	return out
 }
 
-// Key expiry and pagination must not silently treat an invalid number as zero.
-func validKeyInteger(args map[string]any, name string) bool {
+func subscriptionFilter(a map[string]any) *engine.Filter {
+	expr := str(a, "expr")
+	if expr == "" {
+		return nil
+	}
+	return &engine.Filter{Expr: expr}
+}
+
+// Integer tool arguments must not silently treat an invalid number as zero.
+func validInteger(args map[string]any, name string) bool {
 	value, present := args[name]
 	if !present {
 		return true
@@ -291,6 +300,34 @@ var tools = []tool{
 		},
 	},
 	{
+		name: "subscribe", desc: "Create or update a named subscription under a topic.",
+		schema: keyObj(map[string]any{
+			"topic": strProp("topic name"),
+			"name":  strProp("subscription name"),
+			"expr":  strProp("optional expr-lang filter; omitted or empty matches all messages"),
+		}, "topic", "name"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathSubscribe, wire.SubscribeRequest{
+				Topic: str(a, "topic"), Name: str(a, "name"), Filter: subscriptionFilter(a),
+			}
+		},
+	},
+	{
+		name: "list_subscriptions", desc: "List one bounded page of subscriptions, optionally scoped to a topic.",
+		schema: keyObj(map[string]any{
+			"topic":            strProp("optional topic scope; keep it unchanged while paging"),
+			"after":            strProp("opaque next_after cursor from the previous page"),
+			"limit":            intProp("page size, default 100, maximum 1000"),
+			"include_deleting": boolProp("include subscriptions whose deletion is pending"),
+		}),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathListSubscriptionsPage, wire.ListSubscriptionsPageRequest{
+				Topic: str(a, "topic"), After: str(a, "after"), Limit: int(num(a, "limit")),
+				IncludeDeleting: boolean(a, "include_deleting"),
+			}
+		},
+	},
+	{
 		name: "delete_queue", desc: "Delete an empty queue; force discards retained messages and may leave bounded cleanup pending.",
 		schema: keyObj(map[string]any{
 			"name":  strProp("queue name"),
@@ -298,6 +335,19 @@ var tools = []tool{
 		}, "name"),
 		forward: func(a map[string]any) (string, any) {
 			return wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: str(a, "name"), Force: boolean(a, "force")}
+		},
+	},
+	{
+		name: "delete_subscription", desc: "Delete an empty subscription; force discards retained messages and may leave bounded cleanup pending.",
+		schema: keyObj(map[string]any{
+			"topic": strProp("topic name"),
+			"name":  strProp("subscription name"),
+			"force": boolProp("discard retained messages while deleting the subscription"),
+		}, "topic", "name"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{
+				Topic: str(a, "topic"), Name: str(a, "name"), Force: boolean(a, "force"),
+			}
 		},
 	},
 	{
@@ -446,21 +496,8 @@ var tools = []tool{
 func callTool(name string, args map[string]any) map[string]any {
 	for _, t := range tools {
 		if t.name == name {
-			if name == "delete_queue" {
-				properties := t.schema["properties"].(map[string]any)
-				for key := range args {
-					if _, ok := properties[key]; !ok {
-						return textResult("error: unknown delete_queue argument", true)
-					}
-				}
-				if _, ok := args["name"].(string); !ok {
-					return textResult("error: delete_queue name must be a string", true)
-				}
-				if value, present := args["force"]; present {
-					if _, ok := value.(bool); !ok {
-						return textResult("error: delete_queue force must be a boolean", true)
-					}
-				}
+			if err := validateStrictToolArgs(t, args); err != nil {
+				return textResult("error: "+err.Error(), true)
 			}
 			path, body := t.forward(args)
 			create, creating := body.(wire.CreateKeyRequest)
@@ -484,10 +521,10 @@ func callTool(name string, args map[string]any) map[string]any {
 					}
 				}
 			}
-			if creating && !validKeyInteger(args, "expires_at_ms") {
+			if creating && !validInteger(args, "expires_at_ms") {
 				return textResult("error: create key ID "+create.ID+": expires_at_ms must be an integer", true)
 			}
-			if path == wire.PathListKeys && !validKeyInteger(args, "limit") {
+			if path == wire.PathListKeys && !validInteger(args, "limit") {
 				return textResult("error: limit must be an integer", true)
 			}
 			if path == wire.PathListKeys {
@@ -503,10 +540,24 @@ func callTool(name string, args map[string]any) map[string]any {
 					validated, err = wire.DecodeObserveResponse([]byte(text))
 				case wire.DeleteQueueRequest:
 					var response wire.DeleteQueueResponse
-					response, err = wire.DecodeDeleteQueueResponse([]byte(text))
+					response, err = wire.DecodeDeleteResponse([]byte(text))
 					if err != nil {
 						err = fmt.Errorf("outcome unknown: invalid deletion acknowledgement; inspect list_queues to reconcile")
 					} else {
+						validated = response
+					}
+				case wire.DeleteSubscriptionRequest:
+					var response wire.DeleteSubscriptionResponse
+					response, err = wire.DecodeDeleteResponse([]byte(text))
+					if err != nil {
+						err = fmt.Errorf("outcome unknown: invalid deletion acknowledgement; inspect list_subscriptions to reconcile")
+					} else {
+						validated = response
+					}
+				case wire.ListSubscriptionsPageRequest:
+					var response wire.ListSubscriptionsPageResponse
+					response, err = wire.DecodeListSubscriptionsPageResponse([]byte(text), request)
+					if err == nil {
 						validated = response
 					}
 				case wire.CreateKeyRequest:
@@ -541,12 +592,98 @@ func callTool(name string, args map[string]any) map[string]any {
 	return textResult("unknown tool: "+name, true)
 }
 
+func validateStrictToolArgs(t tool, args map[string]any) error {
+	switch t.name {
+	case "delete_queue", "subscribe", "list_subscriptions", "delete_subscription":
+	default:
+		return nil
+	}
+	properties := t.schema["properties"].(map[string]any)
+	for key := range args {
+		if _, ok := properties[key]; !ok {
+			return fmt.Errorf("unknown %s argument", t.name)
+		}
+	}
+	requireString := func(key string) error {
+		if _, ok := args[key].(string); !ok {
+			return fmt.Errorf("%s %s must be a string", t.name, key)
+		}
+		return nil
+	}
+	optionalString := func(key string) error {
+		if value, present := args[key]; present {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("%s %s must be a string", t.name, key)
+			}
+		}
+		return nil
+	}
+	optionalBool := func(key string) error {
+		if value, present := args[key]; present {
+			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("%s %s must be a boolean", t.name, key)
+			}
+		}
+		return nil
+	}
+	switch t.name {
+	case "delete_queue":
+		if err := requireString("name"); err != nil {
+			return err
+		}
+		return optionalBool("force")
+	case "subscribe":
+		if err := requireString("topic"); err != nil {
+			return err
+		}
+		if err := requireString("name"); err != nil {
+			return err
+		}
+		return optionalString("expr")
+	case "delete_subscription":
+		if err := requireString("topic"); err != nil {
+			return err
+		}
+		if err := requireString("name"); err != nil {
+			return err
+		}
+		return optionalBool("force")
+	case "list_subscriptions":
+		if err := optionalString("topic"); err != nil {
+			return err
+		}
+		if err := optionalString("after"); err != nil {
+			return err
+		}
+		if err := optionalBool("include_deleting"); err != nil {
+			return err
+		}
+		if !validInteger(args, "limit") {
+			return fmt.Errorf("list_subscriptions limit must be an integer")
+		}
+		if _, present := args["limit"]; present {
+			limit := num(args, "limit")
+			if limit < 1 || limit > 1000 {
+				return fmt.Errorf("list_subscriptions limit must be between 1 and 1000")
+			}
+		}
+	}
+	return nil
+}
+
 func textResult(text string, isErr bool) map[string]any {
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr}
 }
 
 func isLifecycleDeletePath(path string) bool {
-	return path == wire.PathDeleteQueue
+	return path == wire.PathDeleteQueue || path == wire.PathDeleteSubscription
+}
+
+func deletionReconcileHint(path string) string {
+	if path == wire.PathDeleteSubscription {
+		return "inspect list_subscriptions to reconcile"
+	}
+	return "inspect list_queues to reconcile"
 }
 
 func post(path string, body any) (string, error) {
@@ -573,13 +710,18 @@ func post(path string, body any) (string, error) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		if isLifecycleDeletePath(path) {
-			return "", fmt.Errorf("outcome unknown: deletion response unavailable; inspect list_queues to reconcile: %s", err.Error())
+			return "", fmt.Errorf("outcome unknown: deletion response unavailable; %s: %s", deletionReconcileHint(path), err.Error())
 		}
 		return "", err
 	}
 	defer resp.Body.Close()
 	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 3 {
-		return "", fmt.Errorf("outcome unknown: deletion received HTTP redirect %d; inspect list_queues to reconcile", resp.StatusCode)
+		return "", fmt.Errorf("outcome unknown: deletion received HTTP redirect %d; %s", resp.StatusCode, deletionReconcileHint(path))
+	}
+	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 5 {
+		// A gateway can return a 5xx after the broker committed but before its
+		// acknowledgement arrived. Never expose its body as replay guidance.
+		return "", fmt.Errorf("outcome unknown: deletion received HTTP %d; %s", resp.StatusCode, deletionReconcileHint(path))
 	}
 	var rb []byte
 	switch path {
@@ -587,14 +729,16 @@ func post(path string, body any) (string, error) {
 		rb, err = wire.ReadKeyResponse(resp.Body)
 	case wire.PathObserve:
 		rb, err = wire.ReadObserveResponse(resp.Body)
-	case wire.PathDeleteQueue:
-		rb, err = wire.ReadDeleteQueueResponse(resp.Body)
+	case wire.PathListSubscriptionsPage:
+		rb, err = wire.ReadListSubscriptionsPageResponse(resp.Body)
+	case wire.PathDeleteQueue, wire.PathDeleteSubscription:
+		rb, err = wire.ReadDeleteResponse(resp.Body)
 	default:
 		rb, err = io.ReadAll(resp.Body)
 	}
 	if err != nil {
 		if isLifecycleDeletePath(path) {
-			return "", fmt.Errorf("outcome unknown: invalid deletion acknowledgement; inspect list_queues to reconcile")
+			return "", fmt.Errorf("outcome unknown: invalid deletion acknowledgement; %s", deletionReconcileHint(path))
 		}
 		return "", err
 	}

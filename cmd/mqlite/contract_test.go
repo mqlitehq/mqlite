@@ -235,11 +235,150 @@ func TestDeleteQueueCommandReportsAcceptedState(t *testing.T) {
 	}
 }
 
+func TestDeleteSubscriptionCommandReportsAcceptedState(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	db := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", db)
+
+	embedded, err := mqlite.OpenEmbedded(ctx, db, mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.Subscribe(ctx, "empty-topic", "empty-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.Subscribe(ctx, "busy-topic", "busy-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	backlog := make([]mqlite.OutMessage, 5000)
+	for i := range backlog {
+		backlog[i].Body = []byte("x")
+	}
+	if _, err := embedded.Send(ctx, "busy-topic", backlog...); err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	empty, err := captureStdout(t, func() error {
+		return cmdDeleteSubscription(ctx, []string{"empty-topic", "empty-sub", "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emptyResult map[string]any
+	if err := json.Unmarshal([]byte(empty), &emptyResult); err != nil || !reflect.DeepEqual(emptyResult, map[string]any{
+		"topic": "empty-topic", "name": "empty-sub", "deleted": true, "state": "deleted",
+	}) {
+		t.Fatalf("empty subscription delete = %q (%v), want deleted acknowledgement", empty, err)
+	}
+	if err := cmdDeleteSubscription(ctx, []string{"busy-topic", "busy-sub"}); !errors.Is(err, mqlite.ErrSubscriptionNotEmpty) {
+		t.Fatalf("non-force subscription delete = %v, want ErrSubscriptionNotEmpty", err)
+	}
+	pending, err := captureStdout(t, func() error {
+		return cmdDeleteSubscription(ctx, []string{"busy-topic", "busy-sub", "--force", "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pendingResult map[string]any
+	if err := json.Unmarshal([]byte(pending), &pendingResult); err != nil || !reflect.DeepEqual(pendingResult, map[string]any{
+		"topic": "busy-topic", "name": "busy-sub", "deleted": false, "state": "deleting",
+	}) {
+		t.Fatalf("force subscription delete = %q (%v), want accepted pending acknowledgement", pending, err)
+	}
+}
+
+func TestListSubscriptionsLegacyAndPageJSON(t *testing.T) {
+	embeddedEnv(t)
+	ctx := context.Background()
+	c, err := dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range [][2]string{{"alpha", "a"}, {"alpha", "b"}, {"beta", "c"}} {
+		if err := c.Subscribe(ctx, pair[0], pair[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyJSON, err := captureStdout(t, func() error {
+		return cmdListSubscriptions(ctx, []string{"--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantLegacyJSON = `[
+  {
+    "topic": "alpha",
+    "name": "a"
+  },
+  {
+    "topic": "alpha",
+    "name": "b"
+  },
+  {
+    "topic": "beta",
+    "name": "c"
+  }
+]` + "\n"
+	if legacyJSON != wantLegacyJSON {
+		t.Fatalf("legacy output changed shape:\n%s\nwant:\n%s", legacyJSON, wantLegacyJSON)
+	}
+	var legacy []mqlite.SubscriptionInfo
+	if err := json.Unmarshal([]byte(legacyJSON), &legacy); err != nil || len(legacy) != 3 {
+		t.Fatalf("legacy output must remain a full JSON array: %q (%v)", legacyJSON, err)
+	}
+
+	pageJSON, err := captureStdout(t, func() error {
+		return cmdListSubscriptions(ctx, []string{"--limit", "2", "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first mqlite.SubscriptionPage
+	if err := json.Unmarshal([]byte(pageJSON), &first); err != nil || len(first.Subscriptions) != 2 || first.Total != 3 || first.NextAfter == "" {
+		t.Fatalf("first page = %q (%v)", pageJSON, err)
+	}
+	secondJSON, err := captureStdout(t, func() error {
+		return cmdListSubscriptions(ctx, []string{"--after", first.NextAfter, "--limit", "2", "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second mqlite.SubscriptionPage
+	if err := json.Unmarshal([]byte(secondJSON), &second); err != nil || len(second.Subscriptions) != 1 || second.Total != 3 || second.NextAfter != "" {
+		t.Fatalf("second page = %q (%v)", secondJSON, err)
+	}
+	topicJSON, err := captureStdout(t, func() error {
+		return cmdListSubscriptions(ctx, []string{"--topic", "alpha", "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var topicPage mqlite.SubscriptionPage
+	if err := json.Unmarshal([]byte(topicJSON), &topicPage); err != nil || len(topicPage.Subscriptions) != 2 || topicPage.Total != 2 {
+		t.Fatalf("topic page = %q (%v)", topicJSON, err)
+	}
+
+	for _, args := range [][]string{{"--limit", "0"}, {"--limit", "1001"}, {"extra"}} {
+		if err := cmdListSubscriptions(ctx, args); err == nil {
+			t.Errorf("list-subscriptions %v must reject invalid arguments", args)
+		}
+	}
+}
+
 // P2-5: the top-level help must list every dispatched command, so one can't silently vanish.
 func TestUsageListsAllCommands(t *testing.T) {
 	out, _ := captureStdout(t, func() error { usage(); return nil })
 	for _, cmd := range []string{
-		"serve", "create-queue", "delete-queue", "subscribe", "send", "schedule", "cancel", "receive",
+		"serve", "create-queue", "delete-queue", "subscribe", "delete-subscription", "send", "schedule", "cancel", "receive",
 		"receive-deferred", "complete", "abandon", "reject", "defer", "renew", "peek",
 		"metrics", "status", "observe", "list", "list-subscriptions", "test-filter", "redrive",
 		"purge-dlq", "vacuum",
@@ -268,6 +407,8 @@ func TestExactArity(t *testing.T) {
 		{"create-queue", cmdCreateQueue, []string{"q", "extra"}},
 		{"delete-queue", cmdDeleteQueue, []string{"q", "extra"}},
 		{"subscribe", cmdCreateSubscription, []string{"topic", "sub", "extra"}},
+		{"delete-subscription", cmdDeleteSubscription, []string{"topic", "sub", "extra"}},
+		{"list-subscriptions", cmdListSubscriptions, []string{"extra"}},
 		{"peek", cmdPeek, []string{"q", "extra"}},
 		{"metrics", cmdMetrics, []string{"q", "extra"}},
 		{"observe", cmdObserve, []string{"extra"}},

@@ -26,16 +26,18 @@ const (
 	PathPeek            = "/mqlite.v1.QueueService/Peek"
 	PathStats           = "/mqlite.v1.QueueService/Stats"
 
-	PathDeleteQueue       = "/mqlite.v1.AdminService/DeleteQueue"
-	PathCreateQueue       = "/mqlite.v1.AdminService/CreateQueue"
-	PathSubscribe         = "/mqlite.v1.AdminService/Subscribe"
-	PathListQueues        = "/mqlite.v1.AdminService/ListQueues"
-	PathListSubscriptions = "/mqlite.v1.AdminService/ListSubscriptions"
-	PathTestFilter        = "/mqlite.v1.AdminService/TestFilter"
-	PathRedrive           = "/mqlite.v1.AdminService/Redrive"
-	PathPurge             = "/mqlite.v1.AdminService/Purge"
-	PathStatus            = "/mqlite.v1.AdminService/Status"
-	PathObserve           = "/mqlite.v1.AdminService/Observe"
+	PathDeleteQueue           = "/mqlite.v1.AdminService/DeleteQueue"
+	PathCreateQueue           = "/mqlite.v1.AdminService/CreateQueue"
+	PathSubscribe             = "/mqlite.v1.AdminService/Subscribe"
+	PathListQueues            = "/mqlite.v1.AdminService/ListQueues"
+	PathListSubscriptions     = "/mqlite.v1.AdminService/ListSubscriptions"
+	PathListSubscriptionsPage = "/mqlite.v1.AdminService/ListSubscriptionsPage"
+	PathDeleteSubscription    = "/mqlite.v1.AdminService/DeleteSubscription"
+	PathTestFilter            = "/mqlite.v1.AdminService/TestFilter"
+	PathRedrive               = "/mqlite.v1.AdminService/Redrive"
+	PathPurge                 = "/mqlite.v1.AdminService/Purge"
+	PathStatus                = "/mqlite.v1.AdminService/Status"
+	PathObserve               = "/mqlite.v1.AdminService/Observe"
 
 	PathCreateKey = "/mqlite.v1.AuthService/CreateKey"
 	PathListKeys  = "/mqlite.v1.AuthService/ListKeys"
@@ -182,10 +184,15 @@ type QueueConfigJSON struct {
 	DLQMaxCount int   `json:"dlq_max_count,omitempty"`
 	DLQMaxBytes int64 `json:"dlq_max_bytes,omitempty"`
 }
-type DeleteQueueResponse struct {
+type DeleteResponse struct {
 	Deleted bool   `json:"deleted"`
 	State   string `json:"state"`
 }
+
+// Queue and subscription deletion deliberately share one strict lifecycle
+// acknowledgement. The aliases preserve the resource-specific public names.
+type DeleteQueueResponse = DeleteResponse
+type DeleteSubscriptionResponse = DeleteResponse
 
 type DeleteQueueRequest struct {
 	Name  string `json:"name"`
@@ -200,6 +207,11 @@ type SubscribeRequest struct {
 	Topic  string         `json:"topic"`
 	Name   string         `json:"name"`
 	Filter *engine.Filter `json:"filter,omitempty"`
+}
+type DeleteSubscriptionRequest struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Force bool   `json:"force,omitempty"`
 }
 type ListQueuesResponse struct {
 	Queues []QueueInfoJSON `json:"queues"`
@@ -239,9 +251,21 @@ type SubscriptionJSON struct {
 	Topic string `json:"topic"`
 	Name  string `json:"name"`
 	Expr  string `json:"expr,omitempty"`
+	State string `json:"state,omitempty"`
 }
 type ListSubscriptionsResponse struct {
 	Subscriptions []SubscriptionJSON `json:"subscriptions"`
+}
+type ListSubscriptionsPageRequest struct {
+	Topic           string `json:"topic,omitempty"`
+	After           string `json:"after,omitempty"`
+	Limit           int    `json:"limit,omitempty"`
+	IncludeDeleting bool   `json:"include_deleting,omitempty"`
+}
+type ListSubscriptionsPageResponse struct {
+	Subscriptions []SubscriptionJSON `json:"subscriptions"`
+	Total         int                `json:"total"`
+	NextAfter     string             `json:"next_after,omitempty"`
 }
 
 // TestFilter dry-runs a filter expression: it compiles `expr` and, if `message` is

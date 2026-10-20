@@ -76,7 +76,7 @@ func TestToolsList(t *testing.T) {
 			t.Fatalf("tool %v has no inputSchema", td["name"])
 		}
 	}
-	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "delete_queue", "list_keys", "list_queues", "observe", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats"}
+	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "delete_queue", "delete_subscription", "list_keys", "list_queues", "list_subscriptions", "observe", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats", "subscribe"}
 	got := make([]string, 0, len(names))
 	for name := range names {
 		got = append(got, name)
@@ -191,54 +191,246 @@ func TestDeleteQueueToolContract(t *testing.T) {
 	<-requests
 }
 
-func TestDeleteQueueToolTransportFailureIsUnknownAndNotRetried(t *testing.T) {
+func TestSubscriptionToolsContract(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	type capturedRequest struct {
+		path string
+		body []byte
+	}
+	requests := make(chan capturedRequest, 8)
+	var requestCount atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		requests <- capturedRequest{path: r.URL.Path, body: body}
+		switch r.URL.Path {
+		case wire.PathSubscribe:
+			_, _ = w.Write([]byte(`{}`))
+		case wire.PathListSubscriptionsPage:
+			_, _ = w.Write([]byte(`{"subscriptions":[],"total":0,"future":"not forwarded"}`))
+		case wire.PathDeleteSubscription:
+			var request wire.DeleteSubscriptionRequest
+			_ = json.Unmarshal(body, &request)
+			if request.Name == "bad-ack" {
+				_, _ = w.Write([]byte(`{}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"deleted":false,"state":"deleting","future":"not forwarded"}`))
+		}
+	}))
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "", ts.Client()
+
+	result := callTool("subscribe", map[string]any{"topic": "events", "name": "audit", "expr": `subject == "order"`})
+	if result["isError"] != false {
+		t.Fatalf("subscribe failed: %v", result)
+	}
+	got := <-requests
+	var subscribe wire.SubscribeRequest
+	if err := json.Unmarshal(got.body, &subscribe); err != nil || got.path != wire.PathSubscribe ||
+		subscribe.Topic != "events" || subscribe.Name != "audit" || subscribe.Filter == nil || subscribe.Filter.Expr != `subject == "order"` {
+		t.Fatalf("forwarded subscribe = path %q body %s err %v", got.path, got.body, err)
+	}
+
+	result = callTool("list_subscriptions", map[string]any{
+		"topic": "events", "after": "cursor", "limit": float64(25), "include_deleting": true,
+	})
+	if result["isError"] != false {
+		t.Fatalf("list_subscriptions failed: %v", result)
+	}
+	got = <-requests
+	var list wire.ListSubscriptionsPageRequest
+	if err := json.Unmarshal(got.body, &list); err != nil || got.path != wire.PathListSubscriptionsPage ||
+		list.Topic != "events" || list.After != "cursor" || list.Limit != 25 || !list.IncludeDeleting {
+		t.Fatalf("forwarded list = path %q body %s err %v", got.path, got.body, err)
+	}
+	if text := result["content"].([]map[string]any)[0]["text"].(string); text != `{"subscriptions":[],"total":0}`+"\n" {
+		t.Fatalf("normalized page = %q", text)
+	}
+
+	result = callTool("delete_subscription", map[string]any{"topic": "events", "name": "audit", "force": true})
+	if result["isError"] != false {
+		t.Fatalf("delete_subscription failed: %v", result)
+	}
+	got = <-requests
+	var deletion wire.DeleteSubscriptionRequest
+	if err := json.Unmarshal(got.body, &deletion); err != nil || got.path != wire.PathDeleteSubscription ||
+		deletion.Topic != "events" || deletion.Name != "audit" || !deletion.Force {
+		t.Fatalf("forwarded deletion = path %q body %s err %v", got.path, got.body, err)
+	}
+	if text := result["content"].([]map[string]any)[0]["text"].(string); text != `{"deleted":false,"state":"deleting"}`+"\n" {
+		t.Fatalf("normalized deletion = %q", text)
+	}
+
+	malformedArgs := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"subscribe", map[string]any{"topic": "events", "name": true}},
+		{"subscribe", map[string]any{"topic": "events", "name": "audit", "filter": "typo"}},
+		{"list_subscriptions", map[string]any{"limit": 1.5}},
+		{"list_subscriptions", map[string]any{"limit": float64(1001)}},
+		{"list_subscriptions", map[string]any{"include_deleting": "true"}},
+		{"delete_subscription", map[string]any{"name": "audit"}},
+		{"delete_subscription", map[string]any{"topic": "events", "name": "audit", "force": "true"}},
+		{"delete_subscription", map[string]any{"topic": "events", "name": "audit", "discard": true}},
+	}
+	for _, tc := range malformedArgs {
+		if malformed := callTool(tc.tool, tc.args); malformed["isError"] != true {
+			t.Fatalf("malformed %s args accepted: %v", tc.tool, tc.args)
+		}
+	}
+	if requestCount.Load() != 3 {
+		t.Fatal("malformed subscription tool arguments reached the broker")
+	}
+
+	malformed := callTool("delete_subscription", map[string]any{"topic": "events", "name": "bad-ack"})
+	text := malformed["content"].([]map[string]any)[0]["text"].(string)
+	if malformed["isError"] != true || !strings.Contains(text, "outcome unknown") || !strings.Contains(text, "list_subscriptions") {
+		t.Fatalf("malformed acknowledgement presented as success: %v", malformed)
+	}
+	<-requests
+}
+
+func TestLifecycleDeleteToolTransportFailureIsUnknownAndNotRetried(t *testing.T) {
 	old := broker
 	defer func() { broker = old }()
 	transportFailure := errors.New("connection dropped")
-	var calls atomic.Int32
-	broker.endpoint = "http://broker.invalid"
-	broker.token = ""
-	broker.http = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		calls.Add(1)
-		return nil, transportFailure
-	})}
-
-	_, err := post(wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: "orders", Force: true})
-	if err == nil || errors.Is(err, transportFailure) || !strings.Contains(err.Error(), transportFailure.Error()) ||
-		!strings.Contains(err.Error(), "outcome unknown") || !strings.Contains(err.Error(), "list_queues") {
-		t.Fatalf("delete transport failure = %v; want textual cause outside the error chain", err)
-	}
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("delete made %d transport attempts, want one", got)
+	for _, tc := range []struct {
+		path string
+		body any
+		hint string
+	}{
+		{wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: "orders", Force: true}, "list_queues"},
+		{wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: "events", Name: "audit", Force: true}, "list_subscriptions"},
+	} {
+		var calls atomic.Int32
+		broker.endpoint = "http://broker.invalid"
+		broker.token = ""
+		broker.http = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return nil, transportFailure
+		})}
+		_, err := post(tc.path, tc.body)
+		if err == nil || errors.Is(err, transportFailure) || !strings.Contains(err.Error(), transportFailure.Error()) ||
+			!strings.Contains(err.Error(), "outcome unknown") || !strings.Contains(err.Error(), tc.hint) {
+			t.Errorf("delete %s transport failure = %v; want textual cause outside the error chain", tc.path, err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Errorf("delete %s made %d transport attempts, want one", tc.path, got)
+		}
 	}
 }
 
-func TestDeleteQueueToolDoesNotFollowRedirect(t *testing.T) {
+func TestLifecycleDeleteToolServerErrorsAreUnknownAndNotRetried(t *testing.T) {
 	old := broker
 	defer func() { broker = old }()
-	var sourceCalls atomic.Int32
-	var targetCalls atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		targetCalls.Add(1)
-	}))
-	defer target.Close()
-	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sourceCalls.Add(1)
-		http.Redirect(w, r, target.URL+wire.PathDeleteQueue, http.StatusPermanentRedirect)
-	}))
-	defer source.Close()
-	broker.endpoint, broker.token, broker.http = source.URL, "", source.Client()
+	const untrusted = "gateway body must not be echoed"
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		path string
+		hint string
+	}{
+		{"delete_queue", map[string]any{"name": "orders", "force": true}, wire.PathDeleteQueue, "list_queues"},
+		{"delete_subscription", map[string]any{"topic": "events", "name": "audit", "force": true}, wire.PathDeleteSubscription, "list_subscriptions"},
+	} {
+		var calls atomic.Int32
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if r.URL.Path != tc.path {
+				t.Errorf("path = %q, want %q", r.URL.Path, tc.path)
+			}
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(untrusted))
+		}))
+		broker.endpoint, broker.token, broker.http = stub.URL, "", stub.Client()
+		result := callTool(tc.name, tc.args)
+		text := result["content"].([]map[string]any)[0]["text"].(string)
+		if result["isError"] != true || !strings.Contains(text, "outcome unknown") ||
+			!strings.Contains(text, "HTTP 502") || !strings.Contains(text, tc.hint) || strings.Contains(text, untrusted) {
+			t.Errorf("gateway failure for %s = %v", tc.name, result)
+		}
+		if calls.Load() != 1 {
+			t.Errorf("gateway failure made %d %s requests, want one", calls.Load(), tc.name)
+		}
+		stub.Close()
+	}
+}
 
-	result := callTool("delete_queue", map[string]any{"name": "orders"})
-	text := result["content"].([]map[string]any)[0]["text"].(string)
-	if result["isError"] != true || !strings.Contains(text, "outcome unknown") {
-		t.Fatalf("redirected delete = %v", result)
+func TestListSubscriptionsToolRejectsMalformedSuccess(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	for _, tc := range []struct {
+		name     string
+		response string
+	}{
+		{"null root", `null`},
+		{"missing fields", `{}`},
+		{"null subscriptions", `{"subscriptions":null,"total":0}`},
+		{"missing item state", `{"subscriptions":[{"topic":"events","name":"a"}],"total":1}`},
+		{"wrong scope", `{"subscriptions":[{"topic":"other","name":"a","state":"active"}],"total":1}`},
+		{"unordered", `{"subscriptions":[{"topic":"events","name":"b","state":"active"},{"topic":"events","name":"a","state":"active"}],"total":2}`},
+		{"trailing JSON", `{"subscriptions":[],"total":0} {}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Path != wire.PathListSubscriptionsPage {
+					t.Errorf("path = %q", r.URL.Path)
+				}
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			defer stub.Close()
+			broker.endpoint, broker.token, broker.http = stub.URL, "", stub.Client()
+			result := callTool("list_subscriptions", map[string]any{"topic": "events", "limit": float64(2)})
+			if result["isError"] != true {
+				t.Fatalf("accepted malformed subscription page: %v", result)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("inventory made %d requests, want one", calls.Load())
+			}
+		})
 	}
-	if got := sourceCalls.Load(); got != 1 {
-		t.Fatalf("source received %d deletion requests, want one", got)
-	}
-	if got := targetCalls.Load(); got != 0 {
-		t.Fatalf("redirect target received %d deletion requests, want zero", got)
+}
+
+func TestLifecycleDeleteToolDoesNotFollowRedirect(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		path string
+		hint string
+	}{
+		{"delete_queue", map[string]any{"name": "orders"}, wire.PathDeleteQueue, "list_queues"},
+		{"delete_subscription", map[string]any{"topic": "events", "name": "audit"}, wire.PathDeleteSubscription, "list_subscriptions"},
+	} {
+		var sourceCalls atomic.Int32
+		var targetCalls atomic.Int32
+		target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			targetCalls.Add(1)
+		}))
+		source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sourceCalls.Add(1)
+			http.Redirect(w, r, target.URL+tc.path, http.StatusPermanentRedirect)
+		}))
+		broker.endpoint, broker.token, broker.http = source.URL, "", source.Client()
+		result := callTool(tc.name, tc.args)
+		text := result["content"].([]map[string]any)[0]["text"].(string)
+		if result["isError"] != true || !strings.Contains(text, "outcome unknown") || !strings.Contains(text, tc.hint) {
+			t.Errorf("redirected %s = %v", tc.name, result)
+		}
+		if got := sourceCalls.Load(); got != 1 {
+			t.Errorf("source received %d %s requests, want one", got, tc.name)
+		}
+		if got := targetCalls.Load(); got != 0 {
+			t.Errorf("redirect target received %d %s requests, want zero", got, tc.name)
+		}
+		source.Close()
+		target.Close()
 	}
 }
 
@@ -318,7 +510,18 @@ func TestToolForwardsHitRealBrokerRoutes(t *testing.T) {
 		"id": strings.Repeat("a", 32), "permissions": []any{"manage"},
 	}
 	for _, tl := range tools {
-		res := callTool(tl.name, args)
+		toolArgs := args
+		switch tl.name {
+		case "delete_queue":
+			toolArgs = map[string]any{"name": "q"}
+		case "subscribe":
+			toolArgs = map[string]any{"topic": "topic", "name": "sub"}
+		case "list_subscriptions":
+			toolArgs = map[string]any{}
+		case "delete_subscription":
+			toolArgs = map[string]any{"topic": "topic", "name": "sub"}
+		}
+		res := callTool(tl.name, toolArgs)
 		text := res["content"].([]map[string]any)[0]["text"].(string)
 		if strings.Contains(text, "no such path") {
 			t.Errorf("tool %q forwards to a route the broker does not serve: %s", tl.name, text)
@@ -386,7 +589,12 @@ var goldenWireShapes = map[string][]string{
 		"config.dlq_max_age_ms", "config.dlq_max_bytes", "config.dlq_max_count", "config.kind",
 		"config.lock_duration_ms", "config.max_delivery_count", "config.ordering_mode", "name",
 	},
-	"wire.DeleteQueueRequest": {"force", "name"},
+	"wire.DeleteQueueRequest":        {"force", "name"},
+	"wire.DeleteSubscriptionRequest": {"force", "name", "topic"},
+	"wire.SubscribeRequest":          {"filter.expr", "name", "topic"},
+	"wire.ListSubscriptionsPageRequest": {
+		"after", "include_deleting", "limit", "topic",
+	},
 	"wire.SendRequest": {
 		"messages[].body", "messages[].content_type", "messages[].correlation_id",
 		"messages[].dead_letter_description", "messages[].dead_letter_reason",
@@ -822,7 +1030,7 @@ func TestKeyToolRejectsInvalidNumbers(t *testing.T) {
 	if calls.Load() != 0 {
 		t.Fatal("invalid numbers must fail before issuing requests")
 	}
-	if !validKeyInteger(map[string]any{"n": int64(123)}, "n") {
+	if !validInteger(map[string]any{"n": int64(123)}, "n") {
 		t.Fatal("int64 helper input must be accepted")
 	}
 }

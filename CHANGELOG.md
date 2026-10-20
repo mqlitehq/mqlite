@@ -12,6 +12,44 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Delete and inventory subscriptions safely (MQLITE-127)
+
+- Add empty-only subscription deletion and an explicit `force` option that
+  durably authorizes discarding every retained message state. An accepted
+  subscription becomes `deleting` in the same transaction, immediately leaves
+  topic fan-out and the data plane, keeps its globally unique name reserved, and
+  finishes through the same bounded, restart-safe cleanup worker as a queue.
+  The topic/name pair must match exactly. The final backing-queue removal also
+  removes its roster mapping. The implicit topic therefore becomes unavailable
+  as soon as its last active subscription is retired.
+- Keep the existing `ListSubscriptions` API as a complete, active-only inventory
+  for compatibility, including its three-field Go `SubscriptionInfo` and JSON
+  shape. Add `ListSubscriptionsPage` with lifecycle-aware
+  `SubscriptionPageItem` entries, topic filtering, opaque scope-bound keyset
+  cursors, a 100-item default / 1,000-item maximum page, an exact per-request
+  `total`, and an explicit `include_deleting` reconciliation view. A page series
+  is not a frozen multi-request snapshot when the roster is changing.
+- Bound active plus deleting subscriptions to 10,000 by default. New creation is
+  rejected with `429 resource_exhausted` until physical cleanup releases a slot;
+  an existing active subscription may still update its filter. Configure the
+  bound with `Options.MaxSubscriptions`, `WithMaxSubscriptions`, or
+  `MQLITE_MAX_SUBSCRIPTIONS`. The bound protects broker metadata, not fan-out
+  latency: publishing remains proportional to messages times matching
+  subscriptions.
+- `CreateQueue` and `Subscribe` now require every queue, topic, and subscription
+  name they create or update to be valid UTF-8 between 1 and 128 bytes. Existing
+  valid UTF-8 names above 128 bytes remain readable and deletable through the
+  management APIs, subject to the existing request/response size limits, but
+  cannot be reconfigured under their old name after upgrading.
+- Expose the lifecycle consistently through HTTP, the Go SDK, embedded mode,
+  CLI, MCP, and the console. Destructive clients call their configured transport
+  once; redirects, transport failures, every HTTP 5xx, and malformed
+  acknowledgements require read-only reconciliation with the paged inventory.
+  The SDK and MCP also validate complete, bounded, ordered subscription pages
+  before using inventory as reconciliation evidence. This change retains schema
+  token **6** and adds neither a Generation field nor subscription TTL; fixed TTL
+  follows separately.
+
 ### Force-delete queues with bounded cleanup (MQLITE-126)
 
 - Keep queue deletion empty-only by default. `force=true` is an explicit,

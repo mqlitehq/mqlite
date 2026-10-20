@@ -24,6 +24,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_METRICS` | authenticated Prometheus `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_DIAGNOSTIC_LOG` | optional private rotating JSONL failure/recovery log path for `serve`; parent must exist; use persistent storage |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
+| `MQLITE_MAX_SUBSCRIPTIONS` | active plus deleting subscription capacity (default 10,000; embedded/serve and direct embedded CLI commands) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
 The DB string is **never compiled in** — it comes from the environment. The endpoint comes
@@ -200,8 +201,10 @@ Both output modes report whether bounded cleanup finished. Text prints
 A deleting queue stops accepting data-plane work immediately and keeps its name
 reserved. Use `mqlite list` to watch its `state`; do not use another delete as a
 status check. The original force authorization was persisted when deletion was
-accepted, and background cleanup continues without another request. Recreate the
-name only after it disappears from the list.
+accepted. A running broker or embedded engine continues cleanup without another
+delete. A one-shot embedded CLI process exits after the command; each later open
+runs a bounded recovery pass. Recreate the name only after it disappears from the
+list.
 
 ### `subscribe <topic> <name>` — create a subscription
 *(alias: `create-subscription`)*
@@ -211,6 +214,22 @@ mqlite subscribe orders eu-orders --expr 'subject_parts[0]=="orders" && properti
 | Flag | | |
 |---|---|---|
 | `--expr` | "" | subscription filter — an [expr](concepts.md#subscription-filters-expr) boolean predicate; empty = match all |
+
+### `delete-subscription <topic> <name>` — retire a subscription
+
+```bash
+mqlite delete-subscription orders eu-orders
+mqlite delete-subscription orders eu-orders --force
+```
+
+The topic and globally unique subscription name must match exactly. Empty-only is
+the default; `--force` permanently discards every retained state in the backing
+queue. An accepted subscription leaves fan-out immediately and reports
+`state=deleted` or `state=deleting`. Pending cleanup keeps the mapping and name
+reserved. Reconcile with
+`mqlite list-subscriptions --topic orders --include-deleting`; never replay a
+delete after a transport failure, redirect, HTTP 5xx response, or malformed
+acknowledgement. Configure proxies not to retry lifecycle-delete routes.
 
 ### `send <queue> <body>` — enqueue a message
 `body` of `-` reads stdin; or use `--file`.
@@ -376,8 +395,18 @@ mqlite status                 # backend, location, schema, ping, size, queue/sub
 
 ### `list-subscriptions` — subscriptions with topic + filter
 ```bash
-mqlite list-subscriptions
+mqlite list-subscriptions                                      # all active (legacy-compatible)
+mqlite list-subscriptions --topic orders --limit 100
+mqlite list-subscriptions --topic orders --include-deleting
 ```
+
+With no pagination flags, the command preserves the original complete active-only
+output and JSON array. Supplying `--topic`, `--after`, `--limit`, or
+`--include-deleting` selects the paged API and returns a page object containing
+`subscriptions`, `total`, and optional `next_after`. The default page size is 100
+and the maximum is 1,000. Cursors are opaque and bound to the topic/deleting
+scope. Each page is a current snapshot; concurrent roster changes can affect later
+pages.
 
 ### `test-filter <expr>` — dry-run a subscription filter
 Compiles the expression and, with a sample, reports whether it would match (nothing is

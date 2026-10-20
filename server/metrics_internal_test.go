@@ -76,7 +76,7 @@ func TestObservabilityFullContract(t *testing.T) {
 }
 
 func TestRequestOutcomeVocabulary(t *testing.T) {
-	want := []string{"ok", "unauthenticated", "permission_denied", "key_conflict", "not_found", "already_exists", "name_conflict", "group_required", "invalid_argument", "message_too_large", "outcome_unknown", "canceled", "internal", "lock_lost", "unimplemented", "queue_not_empty"}
+	want := []string{"ok", "unauthenticated", "permission_denied", "key_conflict", "not_found", "already_exists", "name_conflict", "group_required", "invalid_argument", "message_too_large", "outcome_unknown", "canceled", "internal", "lock_lost", "unimplemented", "queue_not_empty", "subscription_not_empty", "resource_exhausted"}
 	if !reflect.DeepEqual(requestCodes[:], want) {
 		t.Fatal("complete RPC outcome vocabulary drift")
 	}
@@ -99,7 +99,15 @@ func TestFirstAuthenticationFailuresHaveZeroBaselines(t *testing.T) {
 	for _, path := range s.rpcPaths {
 		registered = append(registered, strings.TrimPrefix(path, "/mqlite.v1."))
 	}
-	if !reflect.DeepEqual(registered, append(wire.ObservationRPCNames(), "AdminService/DeleteQueue")) {
+	wantRegistered := make([]string, 0, len(registered))
+	for _, rpc := range wire.ObservationRPCNames() {
+		wantRegistered = append(wantRegistered, rpc)
+		if rpc == "AdminService/ListSubscriptions" {
+			wantRegistered = append(wantRegistered, "AdminService/ListSubscriptionsPage")
+		}
+	}
+	wantRegistered = append(wantRegistered, "AdminService/DeleteQueue", "AdminService/DeleteSubscription")
+	if !reflect.DeepEqual(registered, wantRegistered) {
 		t.Fatal("complete RPC observation vocabulary differs from registered routes")
 	}
 	before := s.httpSnapshot()

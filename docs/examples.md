@@ -153,7 +153,40 @@ func main() {
 func process(body []byte) error { log.Printf("got: %s", body); return nil }
 ```
 
-## 4. curl (raw HTTP)
+## 4. Topic subscription lifecycle
+
+Use one stable subscription for high-rate request/reply traffic and route replies
+inside the consumer by a globally unique `correlation_id`. A subscription per
+request adds metadata and cleanup work to the single writer.
+
+```go
+if err := cli.Subscribe(ctx, "replies", "checkout-instance-7", nil); err != nil {
+	log.Fatal(err)
+}
+
+page, err := cli.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{
+	Topic: "replies",
+	Limit: 100,
+})
+if err != nil {
+	log.Fatal(err)
+}
+log.Printf("subscriptions=%d first-page=%d", page.Total, len(page.Subscriptions))
+
+// Empty-only by default. Drain and settle retained replies before retirement.
+if err := cli.DeleteSubscription(ctx, "replies", "checkout-instance-7"); err != nil {
+	log.Fatal(err)
+}
+```
+
+For intentional abandonment, call `DeleteSubscriptionWithOptions` with
+`mqlite.DeleteSubscriptionOpts{Force: true}`. Force can discard locked work whose
+external side effects already happened. The operation may finish as `deleting`;
+keep ownership of the globally unique, one-use name and reconcile it through a
+paged list with `IncludeDeleting: true`. Do not replay a destructive request after
+an unknown transport outcome.
+
+## 5. curl (raw HTTP)
 
 Any language can drive the broker — it's one POST per operation. (`body` is base64.)
 

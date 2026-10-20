@@ -206,19 +206,37 @@ request that belonged to the old queue. After an uncertain response, keep the na
 reserved and reconcile it before proceeding. This is the API's explicit ABA
 boundary.
 
-Subscriptions are durable in the current contract; there is no subscription
-deletion or subscription TTL API in this release. Creating a subscription per
-request will accumulate retained subscriptions and backing queues. For frequent
-request/reply traffic, create one stable reply subscription per application
-instance and use a globally unique `correlation_id` for each request. A dispatcher
-receives from that subscription, delivers each reply to its waiter, and handles
-duplicates or replies that arrive after the waiter timed out.
+Subscriptions can be deleted explicitly. The default operation succeeds only
+when the backing queue has no retained message in any state; force is a deliberate
+authorization to discard them. Acceptance durably marks the backing queue
+`deleting`, immediately removes it from topic fan-out and the data plane, and
+keeps its name reserved while bounded cleanup runs. The mapping disappears with
+the final backing-queue row. Consequently, an implicit topic becomes unavailable
+as soon as its last active subscription is retired, even if physical cleanup is
+pending.
+
+There is no subscription TTL API in this release. Creating a subscription per
+request still requires explicit cleanup and makes request latency depend on
+metadata churn. For frequent request/reply traffic, create one stable reply
+subscription per application instance and use a globally unique `correlation_id`
+for each request. A dispatcher receives from that subscription, delivers each
+reply to its waiter, and handles duplicates or replies that arrive after the
+waiter timed out.
 
 If an application treats a subscription as temporary, its name is a one-use
 application identity: generate a globally unique name for that lifetime and never
-reuse it. Create the receiver before sending the request. Put the address in
-`reply_to`, copy the request's `correlation_id` into the reply, and do not assume
-the broker implements an RPC waiter or rejects late replies for you.
+reuse it. Create the receiver before sending the request, then delete the
+subscription after the reply or timeout and reconcile a `deleting`/unknown result
+before releasing ownership. Put the address in `reply_to`, copy the request's
+`correlation_id` into the reply, and do not assume the broker implements an RPC
+waiter or rejects late replies for you. For high request rates, prefer the stable
+dispatcher pattern above.
+
+The broker accepts at most 10,000 active plus deleting subscriptions by default.
+Deleting entries continue to count until physical cleanup completes, which puts
+backpressure on churn instead of letting forgotten work bypass the bound. This is
+a metadata safety ceiling, not a throughput claim: one publish still performs
+work and stores copies proportional to the number of matching subscriptions.
 
 ### Message ID vs Sequence Number (the two ids people conflate)
 | | Who assigns it | When fanned out to N subs | Purpose |

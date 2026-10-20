@@ -97,17 +97,22 @@ producers. Rules:
 - **WAL-friendly.** Many small commits let WAL checkpoints interleave; one giant
   DELETE balloons the WAL and blocks checkpointing.
 
-## Forced queue retirement
+## Forced resource retirement
 
-Queue deletion is empty-only by default and is separate from automatic retention.
-`force=true` is operator authorization to discard every message state, including
-locked deliveries, plus queue-owned deduplication and replay records. A locked
-delivery may already have caused an external side effect; deleting its stored row
-cannot undo that effect.
+Queue and subscription deletion are empty-only by default and are separate from
+automatic retention. `force=true` is operator authorization to discard every
+message state, including locked deliveries, plus the backing queue's deduplication
+and replay records. A locked delivery may already have caused an external side
+effect; deleting its stored row cannot undo that effect.
 
 An accepted delete first commits `state=deleting`. That immediately rejects new
-queue work and reserves the name while physical cleanup proceeds. The foreground
-request removes at most 1,000 physical rows and targets about 8 MiB. Every
+queue work and reserves the name while physical cleanup proceeds. For a
+subscription it also removes the entry from topic fan-out; the topic mapping stays
+available for reconciliation until final removal deletes it in the same
+transaction as the backing queue. Retiring the last active subscription therefore
+makes the implicit topic unavailable immediately.
+The foreground request removes at most 1,000 physical rows and targets about
+8 MiB. Every
 one-second background pass globally caps cleanup at 4,096 rows and targets about
 8 MiB, across at most 32
 deleting queues locally or one queue on remote Turso/libSQL. The smaller remote
@@ -117,13 +122,24 @@ bounds keep one large retirement from holding the single writer indefinitely and
 make a crash restartable. One individually oversized row may exceed the byte
 target so it cannot block cleanup forever.
 
-Bursts of forced deletion across deep queues can still create a cleanup backlog, grow
-the WAL and delay name reuse. Prefer draining and reusing stable queues for routine
-traffic; reserve force for intentional abandonment. List queues and wait for the
-`deleting` row to disappear before reusing its name. The accepted discard
-permission is already durable and background cleanup continues on its own. Do not
+Bursts of forced deletion across deep queues or subscriptions can still create a
+cleanup backlog, grow the WAL, consume subscription-capacity slots and delay name
+reuse. Prefer draining and reusing stable resources for routine traffic; reserve
+force for intentional abandonment. List the relevant inventory, including
+deleting subscriptions, and wait for the row to disappear before reusing its name.
+The accepted discard permission is already durable. Cleanup continues while the
+engine stays open and resumes with a bounded startup pass after a restart. Do not
 use another delete as a status check or automatically replay a lifecycle write
-after a transport failure, redirect or malformed acknowledgement.
+after a transport failure, redirect, HTTP 5xx response or malformed
+acknowledgement. Configure custom transports and proxies not to retry these routes.
+
+The default global subscription capacity is 10,000 active plus deleting entries.
+It bounds metadata growth, not publish cost: fan-out work and stored copies remain
+proportional to the matching subscription count. Deleting entries retain their
+slot until cleanup finishes, so sustained create/delete churn can apply temporary
+backpressure instead of growing metadata without a bound. Use stable subscriptions
+for routine request/reply traffic and globally unique, one-use names when a
+temporary subscription is unavoidable.
 
 ## Space reclamation
 

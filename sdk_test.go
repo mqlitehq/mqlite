@@ -36,6 +36,14 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
+// Keep the released public type's exact field order, tags and arity. This also
+// preserves external unkeyed SubscriptionInfo literals at compile time.
+var _ struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"`
+} = mqlite.SubscriptionInfo{}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -833,8 +841,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "9578bd27860e471fcf75e6557a2acf30c3aca5a2ce6f75a2ebf8830476a3a3aa",
-		"concepts.html": "f51ba99b26b1aef2131a5b47456f2fabcba8aa1bdf12d454e1d520392df36772",
+		"concepts.md":   "28740393533cc67db1de6794cb5d5a7ec1fd11e748e933cfb142f86992314f67",
+		"concepts.html": "146d49b3e180f6ca73c015927bd24b37285d3cc3530deb25d3a06ea0901dce48",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {
@@ -2069,6 +2077,163 @@ func TestRemoteListQueuesDefaultsLegacyStateToActive(t *testing.T) {
 	}
 }
 
+func TestRemoteListSubscriptionsPreservesLegacyShape(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case wire.PathListSubscriptions:
+			_, _ = w.Write([]byte(`{"subscriptions":[{"topic":"events","name":"legacy"}]}`))
+		case wire.PathListSubscriptionsPage:
+			_, _ = w.Write([]byte(`{"subscriptions":[{"topic":"events","name":"legacy","state":"active"}],"total":1}`))
+		default:
+			t.Errorf("path = %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	subs, err := client.ListSubscriptions(context.Background())
+	if err != nil || len(subs) != 1 || subs[0].Topic != "events" || subs[0].Name != "legacy" {
+		t.Fatalf("legacy subscription inventory = %+v, %v", subs, err)
+	}
+	encoded, err := json.Marshal(subs)
+	if err != nil || string(encoded) != `[{"topic":"events","name":"legacy"}]` {
+		t.Fatalf("legacy subscription JSON = %s, %v", encoded, err)
+	}
+	page, err := client.ListSubscriptionsWithOptions(context.Background(), mqlite.ListSubscriptionsOptions{Topic: "events"})
+	if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 || page.Subscriptions[0].State != "active" {
+		t.Fatalf("legacy paged inventory = %+v, %v", page, err)
+	}
+	encoded, err = json.Marshal(page)
+	if err != nil || string(encoded) != `{"subscriptions":[{"topic":"events","name":"legacy","state":"active"}],"total":1}` {
+		t.Fatalf("paged subscription JSON = %s, %v", encoded, err)
+	}
+}
+
+func TestRemoteListSubscriptionsPageRejectsMalformedSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+		opts     mqlite.ListSubscriptionsOptions
+	}{
+		{"null root", `null`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"missing fields", `{}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"null subscriptions", `{"subscriptions":null,"total":0}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"missing item state", `{"subscriptions":[{"topic":"events","name":"a"}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"wrong scope", `{"subscriptions":[{"topic":"other","name":"a","state":"active"}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"unordered", `{"subscriptions":[{"topic":"events","name":"b","state":"active"},{"topic":"events","name":"a","state":"active"}],"total":2}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"invalid state", `{"subscriptions":[{"topic":"events","name":"a","state":"deleting"}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"incomplete first page", `{"subscriptions":[{"topic":"events","name":"a","state":"active"}],"total":2}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"over page size", `{"subscriptions":[{"topic":"events","name":"a","state":"active"},{"topic":"events","name":"b","state":"active"}],"total":2,"next_after":"cursor"}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 1}},
+		{"trailing JSON", `{"subscriptions":[],"total":0} {}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Path != wire.PathListSubscriptionsPage {
+					t.Errorf("path = %q", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if page, err := client.ListSubscriptionsWithOptions(context.Background(), tc.opts); err == nil {
+				t.Fatalf("accepted malformed page: %+v", page)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("inventory made %d requests, want one", calls.Load())
+			}
+		})
+	}
+}
+
+func TestSubscriptionLifecycleSDK(t *testing.T) {
+	type subscriptionAPI interface {
+		Subscribe(context.Context, string, string, *mqlite.Filter) error
+		Send(context.Context, string, ...mqlite.OutMessage) ([]int64, error)
+		DeleteSubscription(context.Context, string, string) error
+		DeleteSubscriptionWithOptions(context.Context, string, string, ...mqlite.DeleteSubscriptionOpts) (mqlite.DeleteResult, error)
+		ListSubscriptions(context.Context) ([]mqlite.SubscriptionInfo, error)
+		ListSubscriptionsWithOptions(context.Context, mqlite.ListSubscriptionsOptions) (mqlite.SubscriptionPage, error)
+	}
+	for _, remote := range []bool{false, true} {
+		t.Run(fmt.Sprintf("remote=%t", remote), func(t *testing.T) {
+			ctx := context.Background()
+			embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground(), mqlite.WithMaxSubscriptions(2))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer embedded.Close()
+			var api subscriptionAPI = embedded
+			if remote {
+				ts := httptest.NewServer(server.New(embedded.Engine(), nil).Handler())
+				defer ts.Close()
+				client, err := mqlite.Open(ctx, ts.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				api = client
+			}
+
+			for _, name := range []string{"a", "b"} {
+				if err := api.Subscribe(ctx, "events", name, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := api.Subscribe(ctx, "events", "overflow", nil); !errors.Is(err, mqlite.ErrSubscriptionLimit) {
+				t.Fatalf("subscription limit = %v", err)
+			}
+			legacy, err := api.ListSubscriptions(ctx)
+			if err != nil || len(legacy) != 2 {
+				t.Fatalf("active inventory = %+v, %v", legacy, err)
+			}
+			first, err := api.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 1})
+			if err != nil || first.Total != 2 || len(first.Subscriptions) != 1 || first.NextAfter == "" {
+				t.Fatalf("first page = %+v, %v", first, err)
+			}
+			second, err := api.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{Topic: "events", After: first.NextAfter, Limit: 1})
+			if err != nil || second.Total != 2 || len(second.Subscriptions) != 1 || second.NextAfter != "" || second.Subscriptions[0].Name == first.Subscriptions[0].Name {
+				t.Fatalf("second page = %+v, %v", second, err)
+			}
+
+			if _, err := api.Send(ctx, "events", mqlite.OutMessage{Body: []byte("retained")}); err != nil {
+				t.Fatal(err)
+			}
+			if err := api.DeleteSubscription(ctx, "events", "a"); !errors.Is(err, mqlite.ErrSubscriptionNotEmpty) {
+				t.Fatalf("nonempty delete = %v", err)
+			}
+			if _, err := api.DeleteSubscriptionWithOptions(ctx, "wrong", "a", mqlite.DeleteSubscriptionOpts{Force: true}); !errors.Is(err, mqlite.ErrSubscriptionNotFound) {
+				t.Fatalf("wrong-topic delete = %v", err)
+			}
+			result, err := api.DeleteSubscriptionWithOptions(ctx, "events", "a", mqlite.DeleteSubscriptionOpts{Force: true})
+			if err != nil || !result.Deleted || result.State != "deleted" {
+				t.Fatalf("force delete = %+v, %v", result, err)
+			}
+			active, err := api.ListSubscriptions(ctx)
+			if err != nil || len(active) != 1 || active[0].Name != "b" {
+				t.Fatalf("post-delete active inventory = %+v, %v", active, err)
+			}
+		})
+	}
+	if embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithMaxSubscriptions(-1)); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		if embedded != nil {
+			_ = embedded.Close()
+		}
+		t.Fatalf("negative subscription limit = %v", err)
+	}
+}
+
 func TestQueueForceDeleteSDK(t *testing.T) {
 	type deleteAPI interface {
 		CreateQueue(context.Context, string, mqlite.QueueConfig) error
@@ -2225,6 +2390,48 @@ func TestRemoteDeleteQueueTransportFailureIsOutcomeUnknown(t *testing.T) {
 	}
 }
 
+func TestRemoteLifecycleDeleteServerErrorsAreOutcomeUnknown(t *testing.T) {
+	const untrusted = "upstream secret must not be echoed"
+	for _, tc := range []struct {
+		name string
+		path string
+		hint string
+	}{
+		{"queue", wire.PathDeleteQueue, "ListQueues"},
+		{"subscription", wire.PathDeleteSubscription, "ListSubscriptionsPage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Path != tc.path {
+					t.Errorf("path = %q, want %q", r.URL.Path, tc.path)
+				}
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"code":"internal","message":"` + untrusted + `"}`))
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if tc.path == wire.PathDeleteQueue {
+				_, err = client.DeleteQueueWithOptions(context.Background(), "orders", mqlite.DeleteQueueOpts{Force: true})
+			} else {
+				_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker", mqlite.DeleteSubscriptionOpts{Force: true})
+			}
+			if !errors.Is(err, mqlite.ErrOutcomeUnknown) || !strings.Contains(err.Error(), "HTTP 502") ||
+				!strings.Contains(err.Error(), tc.hint) || strings.Contains(err.Error(), untrusted) {
+				t.Fatalf("delete server error = %v", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("delete made %d requests, want one", calls.Load())
+			}
+		})
+	}
+}
+
 func TestRemoteDeleteQueueDoesNotFollowRedirect(t *testing.T) {
 	var sourceCalls atomic.Int32
 	var targetCalls atomic.Int32
@@ -2252,6 +2459,101 @@ func TestRemoteDeleteQueueDoesNotFollowRedirect(t *testing.T) {
 	if got := targetCalls.Load(); got != 0 {
 		t.Fatalf("redirect target received %d deletion requests, want zero", got)
 	}
+}
+
+func TestRemoteDeleteSubscriptionTransportSafety(t *testing.T) {
+	t.Run("older broker", func(t *testing.T) {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "not_found", Message: "no such path: " + r.URL.Path})
+		}))
+		defer stub.Close()
+		client, err := mqlite.Open(context.Background(), stub.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker")
+		if !errors.Is(err, mqlite.ErrUnsupported) || errors.Is(err, mqlite.ErrSubscriptionNotFound) {
+			t.Fatalf("older broker = %v, want only ErrUnsupported", err)
+		}
+	})
+
+	t.Run("transport failure", func(t *testing.T) {
+		transportFailure := errors.New("connection dropped")
+		var calls atomic.Int32
+		httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			if req.URL.Path != wire.PathDeleteSubscription {
+				t.Errorf("path = %q", req.URL.Path)
+			}
+			return nil, transportFailure
+		})}
+		client, err := mqlite.Open(context.Background(), "http://broker.invalid", mqlite.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker", mqlite.DeleteSubscriptionOpts{Force: true})
+		if !errors.Is(err, mqlite.ErrOutcomeUnknown) || errors.Is(err, transportFailure) ||
+			!strings.Contains(err.Error(), transportFailure.Error()) || !strings.Contains(err.Error(), "ListSubscriptionsPage") {
+			t.Fatalf("delete transport failure = %v", err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("delete made %d transport attempts, want one", got)
+		}
+	})
+
+	t.Run("redirect", func(t *testing.T) {
+		var sourceCalls atomic.Int32
+		var targetCalls atomic.Int32
+		target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			targetCalls.Add(1)
+		}))
+		defer target.Close()
+		source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sourceCalls.Add(1)
+			http.Redirect(w, r, target.URL+wire.PathDeleteSubscription, http.StatusTemporaryRedirect)
+		}))
+		defer source.Close()
+		client, err := mqlite.Open(context.Background(), source.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker", mqlite.DeleteSubscriptionOpts{Force: true})
+		if !errors.Is(err, mqlite.ErrOutcomeUnknown) || !strings.Contains(err.Error(), "ListSubscriptionsPage") {
+			t.Fatalf("redirected delete = %v", err)
+		}
+		if sourceCalls.Load() != 1 || targetCalls.Load() != 0 {
+			t.Fatalf("redirect calls source=%d target=%d, want 1/0", sourceCalls.Load(), targetCalls.Load())
+		}
+	})
+
+	t.Run("invalid acknowledgement", func(t *testing.T) {
+		var calls atomic.Int32
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if r.URL.Path != wire.PathDeleteSubscription {
+				t.Errorf("path = %q", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"deleted":true,"state":"deleting"}`))
+		}))
+		defer stub.Close()
+		client, err := mqlite.Open(context.Background(), stub.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker", mqlite.DeleteSubscriptionOpts{Force: true})
+		if !errors.Is(err, mqlite.ErrOutcomeUnknown) || !strings.Contains(err.Error(), "ListSubscriptionsPage") {
+			t.Fatalf("invalid acknowledgement = %v", err)
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("invalid acknowledgement made %d calls, want one", calls.Load())
+		}
+	})
 }
 
 func TestDeleteQueueAcknowledgementContract(t *testing.T) {
