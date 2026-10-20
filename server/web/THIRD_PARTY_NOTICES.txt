@@ -10,7 +10,7 @@ When updating bundled dependencies, update their versions and license texts
 from the corresponding packages in the npm lockfile.
 
 ==============================================================================
-MQLite console 0.1.1
+MQLite console 0.1.2
 License: MIT
 Source: LICENSE
 ==============================================================================
@@ -513,7 +513,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-vite (module-preload helper) 6.4.3
+vite (module-preload helper) 6.4.4
 License: MIT
 Source: node_modules/vite/LICENSE.md
 ==============================================================================
