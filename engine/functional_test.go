@@ -2413,6 +2413,51 @@ func TestResourceDeletionBoundsAuxiliaryRows(t *testing.T) {
 	}
 }
 
+func TestResourceDeletionBoundsMetadataBytes(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	queues, err := e.ListQueues(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each body is empty, but metadata totals slightly over 1 MiB per row.
+	// UTF-8 bytes (and bytes after NUL) must count rather than text characters.
+	columns := []string{"lock_token", "message_id", "correlation_id", "reply_to", "group_id", "content_type", "subject", "properties", "dead_letter_reason", "dead_letter_description"}
+	metadata := strings.Repeat("é\x00", (1<<20)/len(columns)/3+1)
+	args := make([]any, len(columns))
+	for i := range args {
+		args[i] = metadata
+	}
+	const rows = 9
+	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		for i := 0; i < rows; i++ {
+			_, err := tx.ExecContext(ctx, `INSERT INTO messages(queue,state,enqueued_at,body,`+strings.Join(columns, ",")+`)
+				VALUES('q','active',1,x'',`+strings.TrimRight(strings.Repeat("?,", len(columns)), ",")+`)`, args...)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.DeleteQueueWithOptions(ctx, "q", queues[0].Generation, DeleteOptions{Force: true})
+	if err != nil || result.Deleted || result.State != "deleting" {
+		t.Fatalf("metadata escaped foreground byte budget: %+v %v", result, err)
+	}
+	rowBytes := int64(len(metadata)*len(columns) + len("q") + len("active"))
+	wantRemaining := rows - int(lifecycleBatchBytes/rowBytes)
+	var remaining int
+	if err := e.db.queryRowScan(ctx, []any{&remaining}, `SELECT COUNT(*) FROM messages WHERE queue='q'`); err != nil || remaining != wantRemaining {
+		t.Fatalf("metadata byte budget: remaining=%d want=%d err=%v", remaining, wantRemaining, err)
+	}
+	e.maintainLifecycle(ctx)
+	if queues, err := e.ListQueues(ctx); err != nil || len(queues) != 0 {
+		t.Fatalf("metadata cleanup did not finish: %+v %v", queues, err)
+	}
+}
+
 func TestSubscriptionInventoryPaginationAndLogicalCounts(t *testing.T) {
 	ctx := context.Background()
 	e, clock := testEngine(t)

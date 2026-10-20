@@ -217,6 +217,17 @@ enabled. Include a large unrelated backlog, same-name replacement, delayed repli
 and restart with pending cleanup. Compare against a stable reply queue per instance
 before choosing a per-request subscription topology.
 
+The source benchmark `BenchmarkSubscriptionLifecycle` measures create, publish,
+receive and force-delete/expiry with zero or 10,000 unrelated retained messages:
+
+```sh
+go test ./engine -run '^$' -bench '^BenchmarkSubscriptionLifecycle$' -benchtime=200x -count=3
+```
+
+It uses a file-backed local database and an advancing test clock to prune creation
+receipts without sleeps. It measures per-operation cost, not a sustainable arrival
+rate under real-time receipt quotas, concurrent traffic, or remote storage.
+
 - **rampdown_4x4**: produce hard, then stop producing while consumers drain to idle.
   RSS peak 31 MB → 27 MB after the load goes away — memory tracks the workload *down*,
   not a one-way ratchet.

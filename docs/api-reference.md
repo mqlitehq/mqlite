@@ -46,6 +46,13 @@ reasonable (they count toward the JSON request you send, not toward the body cap
 The subscription limits are admission controls, not tested throughput guarantees.
 Exhaustion returns HTTP 429 `resource_limit`; cleanup or receipt expiry must free
 capacity before new requests are admitted. Negative configured limits are invalid.
+Creation receipts remain until their retry deadline even when the subscription is
+already deleted. Size that quota using creation rate × retry window: 10,000 receipts
+with a full five-minute window support roughly 33 creations/second on average before
+that admission bound is reached, independently of message throughput. Choose a
+shorter retry window only if it still covers the application's reconciliation needs,
+or configure a larger receipt limit. A stable reply queue with correlation IDs avoids
+this per-request creation cost.
 
 ## The base URL
 

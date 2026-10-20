@@ -198,11 +198,29 @@ type cleanupBudget struct {
 // cleanEntityTx never cascades a message backlog. The reserved queues row is
 // removed only after bounded deletion has emptied every owned auxiliary table.
 func (e *Engine) cleanEntityTx(ctx context.Context, tx *txn, name string, budget *cleanupBudget) (bool, error) {
+	// Count stored payload bytes, including metadata and UTF-8 text. SQLite's
+	// length(TEXT) counts characters; BLOB casts also count embedded NUL bytes.
+	// Index entries, row headers and WAL pages remain outside this estimate.
 	for _, table := range []struct{ name, size string }{
-		{"messages", "length(body)+COALESCE(length(properties),0)"},
-		{"dedup", "length(message_id)+COALESCE(length(request_hash),0)"},
-		{"settlement_receipts", "length(lock_token)+length(operation)+length(args)"},
-		{"receive_attempts", "length(response)+length(attempt_id)"},
+		{"messages", `length(body)
+			+COALESCE(length(CAST(queue AS BLOB)),0)
+			+COALESCE(length(CAST(state AS BLOB)),0)
+			+COALESCE(length(CAST(lock_token AS BLOB)),0)
+			+COALESCE(length(CAST(message_id AS BLOB)),0)
+			+COALESCE(length(CAST(correlation_id AS BLOB)),0)
+			+COALESCE(length(CAST(reply_to AS BLOB)),0)
+			+COALESCE(length(CAST(group_id AS BLOB)),0)
+			+COALESCE(length(CAST(content_type AS BLOB)),0)
+			+COALESCE(length(CAST(subject AS BLOB)),0)
+			+COALESCE(length(CAST(properties AS BLOB)),0)
+			+COALESCE(length(CAST(dead_letter_reason AS BLOB)),0)
+			+COALESCE(length(CAST(dead_letter_description AS BLOB)),0)`},
+		{"dedup", `length(CAST(queue AS BLOB))+length(CAST(message_id AS BLOB))
+			+COALESCE(length(CAST(request_hash AS BLOB)),0)`},
+		{"settlement_receipts", `length(CAST(queue AS BLOB))+length(CAST(lock_token AS BLOB))
+			+length(CAST(operation AS BLOB))+length(CAST(args AS BLOB))`},
+		{"receive_attempts", `length(CAST(queue AS BLOB))+length(CAST(response AS BLOB))
+			+length(CAST(attempt_id AS BLOB))`},
 	} {
 		if budget.rows <= 0 || budget.bytes <= 0 {
 			return false, nil
