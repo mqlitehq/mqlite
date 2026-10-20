@@ -50,12 +50,12 @@ func repeatedQueueArgs(name string) []any {
 	return args
 }
 
-// DeleteOptions controls explicit destruction of a queue. Force discards every
-// message state, including deliveries already in flight.
+// DeleteOptions controls explicit destruction of a queue or subscription. Force
+// discards every message state, including deliveries already in flight.
 type DeleteOptions struct{ Force bool }
 
 // DeleteResult distinguishes logical deletion from completed physical cleanup.
-// A deleting queue cannot receive work and keeps its name until cleanup finishes.
+// A deleting entity cannot receive work and keeps its name until cleanup finishes.
 type DeleteResult struct {
 	Deleted bool   `json:"deleted"`
 	State   string `json:"state"`
@@ -119,15 +119,57 @@ func (e *Engine) DeleteQueueWithOptions(ctx context.Context, name string, opts D
 	if name == "" {
 		return DeleteResult{}, fmt.Errorf("%w: queue name required", ErrInvalidArgument)
 	}
+	return e.deleteEntity(ctx, "", name, "queue", opts)
+}
+
+// DeleteSubscription removes an empty subscription and its topic membership.
+func (e *Engine) DeleteSubscription(ctx context.Context, topic, name string) error {
+	_, err := e.DeleteSubscriptionWithOptions(ctx, topic, name, DeleteOptions{})
+	return err
+}
+
+// DeleteSubscriptionWithOptions logically retires the exact topic/name mapping.
+// Force is explicit permission to discard every retained message state.
+func (e *Engine) DeleteSubscriptionWithOptions(ctx context.Context, topic, name string, opts DeleteOptions) (DeleteResult, error) {
+	if topic == "" || name == "" {
+		return DeleteResult{}, fmt.Errorf("%w: topic and subscription name required", ErrInvalidArgument)
+	}
+	return e.deleteEntity(ctx, topic, name, "subscription", opts)
+}
+
+func (e *Engine) deleteEntity(ctx context.Context, topic, name, kind string, opts DeleteOptions) (DeleteResult, error) {
+	notFound := ErrQueueNotFound
+	notEmpty := ErrQueueNotEmpty
+	if kind == "subscription" {
+		notFound = ErrSubscriptionNotFound
+		notEmpty = ErrSubscriptionNotEmpty
+	}
 	result := DeleteResult{}
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		result = DeleteResult{}
 		q, err := e.readQueueTx(ctx, tx, name)
 		if err != nil {
+			if kind == "subscription" && errors.Is(err, ErrQueueNotFound) {
+				return notFound
+			}
 			return err
 		}
-		if q.kind != "queue" {
+		if q.kind != kind {
+			if kind == "subscription" {
+				return notFound
+			}
 			return fmt.Errorf("%w: DeleteQueue only supports plain queues, not subscriptions", ErrInvalidArgument)
+		}
+		if kind == "subscription" {
+			var mapped int
+			err := tx.QueryRowContext(ctx,
+				`SELECT 1 FROM subscriptions WHERE topic=? AND subscription=?`, topic, name).Scan(&mapped)
+			if errors.Is(err, sql.ErrNoRows) {
+				return notFound
+			}
+			if err != nil {
+				return err
+			}
 		}
 		if q.lifecycleState == "active" && !opts.Force {
 			var occupied bool
@@ -135,7 +177,7 @@ func (e *Engine) DeleteQueueWithOptions(ctx context.Context, name string, opts D
 				return err
 			}
 			if occupied {
-				return ErrQueueNotEmpty
+				return notEmpty
 			}
 		}
 		if q.lifecycleState == "active" {
@@ -144,7 +186,7 @@ func (e *Engine) DeleteQueueWithOptions(ctx context.Context, name string, opts D
 			}
 		}
 		budget := cleanupBudget{rows: lifecycleBatchRows, bytes: lifecycleBatchBytes}
-		done, err := e.cleanQueueTx(ctx, tx, name, &budget)
+		done, err := e.cleanEntityTx(ctx, tx, name, kind, &budget)
 		if err != nil {
 			return err
 		}
@@ -178,33 +220,33 @@ func lifecycleResourceLimit(remote bool) int {
 	return lifecyclePassResources
 }
 
-// cleanQueueTx never cascades a message backlog. The queues row reserves the
-// name until bounded deletion has emptied every queue-owned table.
-func (e *Engine) cleanQueueTx(ctx context.Context, tx *txn, name string, budget *cleanupBudget) (bool, error) {
+// cleanEntityTx never cascades a message backlog. The queues row reserves the
+// name until bounded deletion has emptied every entity-owned table. Subscription
+// metadata is retired explicitly as mapping then backing queue in this transaction;
+// remote libSQL deployments need not enforce SQLite foreign keys for correctness.
+// A normal subscription therefore consumes two physical rows from the shared budget.
+func (e *Engine) cleanEntityTx(ctx context.Context, tx *txn, name, kind string, budget *cleanupBudget) (bool, error) {
 	if budget.rows <= 0 || budget.bytes <= 0 {
 		return false, nil
 	}
+	metadataRows := 1
+	if kind == "subscription" {
+		metadataRows = 2
+	}
 	// Empty resources are common (for example a request queue drained before
-	// deletion). Retire one in a single round trip instead of probing all four
-	// owned tables separately. The queue row remains the name reservation until
-	// every table is empty.
-	res, err := tx.ExecContext(ctx, `DELETE FROM queues
-		WHERE name=? AND kind='queue' AND lifecycle_state='deleting'
-		  AND NOT EXISTS (`+messageExistenceUnion("queues.name")+`)
-		  AND NOT EXISTS (SELECT 1 FROM dedup WHERE queue=queues.name)
-		  AND NOT EXISTS (SELECT 1 FROM settlement_receipts WHERE queue=queues.name)
-		  AND NOT EXISTS (SELECT 1 FROM receive_attempts WHERE queue=queues.name)`, name)
-	if err != nil {
-		return false, err
-	}
-	removed, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if removed == 1 {
-		budget.rows--
-		tx.forgetQueue(name)
-		return true, nil
+	// deletion). Retire one directly instead of probing all four owned tables
+	// separately. The queue row remains the name reservation until every table
+	// is empty.
+	if budget.rows >= metadataRows {
+		done, removed, err := e.deleteEntityMetadataTx(ctx, tx, name, kind, true)
+		if err != nil {
+			return false, err
+		}
+		if done {
+			budget.rows -= removed
+			tx.forgetQueue(name)
+			return true, nil
+		}
 	}
 
 	// Count stored payload bytes, including metadata and UTF-8 text. SQLite's
@@ -296,26 +338,92 @@ func (e *Engine) cleanQueueTx(ctx context.Context, tx *txn, name string, budget 
 			return false, nil
 		}
 	}
-	// The metadata row counts toward the physical row cap. If the final owned
-	// table consumed the last slot, leave the reservation for the next pass;
-	// its empty-resource fast path will retire that one row.
-	if budget.rows <= 0 {
+	// Metadata counts toward the physical row cap. If the final owned table left
+	// too few slots, keep the reservation for the next pass. A subscription needs
+	// one slot for queues plus one for its explicit subscriptions row.
+	if budget.rows < metadataRows {
 		return false, nil
 	}
-	res, err = tx.ExecContext(ctx, `DELETE FROM queues WHERE name=? AND kind='queue' AND lifecycle_state='deleting'`, name)
+	done, removed, err := e.deleteEntityMetadataTx(ctx, tx, name, kind, false)
 	if err != nil {
 		return false, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if n != 1 {
+	if !done {
 		return false, ErrQueueNotFound
 	}
-	budget.rows--
+	budget.rows -= removed
 	tx.forgetQueue(name)
 	return true, nil
+}
+
+// deleteEntityMetadataTx performs the final metadata retirement without relying
+// on ON DELETE CASCADE. When requireEmpty is true, the subscription mapping is
+// removed only if its backing queue has no owned rows, so an unfinished fast-path
+// probe cannot expose an orphan backing queue. Any failure after mapping deletion
+// rolls the surrounding transaction back.
+func (e *Engine) deleteEntityMetadataTx(ctx context.Context, tx *txn, name, kind string, requireEmpty bool) (bool, int, error) {
+	removed := int64(0)
+	if kind == "subscription" {
+		query := `DELETE FROM subscriptions WHERE subscription=?`
+		args := []any{name}
+		if requireEmpty {
+			query += ` AND EXISTS (
+				SELECT 1 FROM queues
+				WHERE name=? AND kind='subscription' AND lifecycle_state='deleting'
+				  AND NOT EXISTS (` + messageExistenceUnion("queues.name") + `)
+				  AND NOT EXISTS (SELECT 1 FROM dedup WHERE queue=queues.name)
+				  AND NOT EXISTS (SELECT 1 FROM settlement_receipts WHERE queue=queues.name)
+				  AND NOT EXISTS (SELECT 1 FROM receive_attempts WHERE queue=queues.name))`
+			args = append(args, name)
+		}
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return false, 0, err
+		}
+		removed, err = res.RowsAffected()
+		if err != nil {
+			return false, 0, err
+		}
+		if requireEmpty && removed == 0 {
+			return false, 0, nil
+		}
+		if removed != 1 {
+			return false, 0, ErrSubscriptionNotFound
+		}
+	}
+
+	query := `DELETE FROM queues WHERE name=? AND kind=? AND lifecycle_state='deleting'`
+	if requireEmpty && kind != "subscription" {
+		query += `
+			AND NOT EXISTS (` + messageExistenceUnion("queues.name") + `)
+			AND NOT EXISTS (SELECT 1 FROM dedup WHERE queue=queues.name)
+			AND NOT EXISTS (SELECT 1 FROM settlement_receipts WHERE queue=queues.name)
+			AND NOT EXISTS (SELECT 1 FROM receive_attempts WHERE queue=queues.name)`
+	}
+	res, err := tx.ExecContext(ctx, query, name, kind)
+	if err != nil {
+		return false, 0, err
+	}
+	queueRows, err := res.RowsAffected()
+	if err != nil {
+		return false, 0, err
+	}
+	if queueRows == 0 {
+		if removed != 0 {
+			// Returning an error is essential: it rolls back the mapping DELETE.
+			return false, 0, ErrQueueNotFound
+		}
+		return false, 0, nil
+	}
+	if queueRows != 1 {
+		return false, 0, ErrQueueNotFound
+	}
+	if kind == "subscription" && removed != 1 {
+		// A subscription is exactly two physical metadata rows. Treat a missing
+		// mapping as corruption rather than committing a one-row retirement.
+		return false, 0, ErrSubscriptionNotFound
+	}
+	return true, int(queueRows + removed), nil
 }
 
 // maintainLifecycle applies one global row/byte/resource budget, so a burst of
@@ -329,6 +437,7 @@ func (e *Engine) cleanQueueTx(ctx context.Context, tx *txn, name string, budget 
 func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
 	type resource struct {
 		name      string
+		kind      string
 		startedAt int64
 	}
 	var touched []string
@@ -360,7 +469,7 @@ func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
 			}
 			for rows.Next() {
 				var r resource
-				if err := rows.Scan(&r.name, &r.startedAt); err != nil {
+				if err := rows.Scan(&r.name, &r.kind, &r.startedAt); err != nil {
 					_ = rows.Close()
 					return err
 				}
@@ -372,13 +481,13 @@ func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
 			}
 			return err
 		}
-		if err := read(`SELECT name,delete_started_at FROM queues
+		if err := read(`SELECT name,kind,delete_started_at FROM queues
 			WHERE lifecycle_state='deleting' AND (delete_started_at,name)>(?,?)
 			ORDER BY delete_started_at,name LIMIT ?`, cursorAt, cursorName, resourceLimit); err != nil {
 			return err
 		}
 		if remaining := resourceLimit - len(resources); remaining > 0 {
-			if err := read(`SELECT name,delete_started_at FROM queues
+			if err := read(`SELECT name,kind,delete_started_at FROM queues
 				WHERE lifecycle_state='deleting' AND (delete_started_at,name)<=(?,?)
 				ORDER BY delete_started_at,name LIMIT ?`, cursorAt, cursorName, remaining); err != nil {
 				return err
@@ -405,7 +514,7 @@ func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
 					local.bytes = 1
 				}
 				before := local
-				done, err := e.cleanQueueTx(ctx, tx, r.name, &local)
+				done, err := e.cleanEntityTx(ctx, tx, r.name, r.kind, &local)
 				if err != nil {
 					return err
 				}
