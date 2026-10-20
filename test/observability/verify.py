@@ -348,8 +348,6 @@ def verify():
     for name in ("obsdemo-backlog", "obsdemo-deferred", "obsdemo-scheduled"):
         check(value(f'mqlite_queue_retained_messages{{queue="{name}"}}') == queues[name]["total"],
               "native and Prometheus retained values agree: " + name)
-        check(value(f'mqlite_queue_total{{queue="{name}"}}') == queues[name]["total"],
-              "legacy total alias uses same value: " + name)
     status, targets = request(PROM + "/api/v1/targets")
     check(status == 200 and any(t["labels"].get("job") == "mqlite" and t["health"] == "up" and not t["lastError"]
                                for t in targets["data"]["activeTargets"]), "Prometheus target has no scrape error")

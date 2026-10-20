@@ -2,7 +2,7 @@
 
 The canonical `Observe` interface, configured monitor credentials and the
 monitoring starter require **v0.3.2 or later**. Earlier releases expose only the
-legacy metrics described under [compatibility](#compatibility-from-v031).
+original metrics described under [compatibility](#compatibility-and-v040-migration).
 
 MQLite exposes one canonical observation through `AdminService/Observe`, the Go
 SDK, CLI, MCP, console and Prometheus `/metrics`. Queue snapshots and committed
@@ -377,26 +377,33 @@ and completion means the consumer reported success, not independently verified
 business-side processing. Broker redelivery, client HTTP retry and storage retry
 are separate concepts.
 
-### Compatibility from v0.3.1
+### Compatibility and v0.4.0 migration
 
-Prometheus scraping is now disabled by default. On upgrade, enable
+Prometheus scraping has been disabled by default since v0.3.2. On upgrade, enable
 `MQLITE_METRICS=on` or `--metrics` to keep scraping the same API port, and configure
-a monitor token for the collector. All five pre-existing families remain available
-when enabled. These compatibility views read canonical values; they do not
-maintain separate counters:
+a monitor token for the collector.
+
+v0.4.0 removes the two ambiguous aliases whose removal was announced in v0.3.2.
+Update recording rules, alerts, dashboards and direct PromQL before replacing the
+broker:
+
+| Removed in v0.4.0 | Replacement |
+| --- | --- |
+| `mqlite_queue_total` | `mqlite_queue_retained_messages` (same gauge value) |
+| `mqlite_queue_oldest_message_age_ms` | `mqlite_queue_oldest_message_age_seconds` (divide old thresholds by 1,000) |
+
+The native `Observe` JSON contract is unchanged: `queues[].oldest_message_age_ms`
+still uses milliseconds. The following original Prometheus families remain as
+compatibility projections of canonical measurements; they do not maintain
+separate counters:
 
 | Existing family | Canonical mapping |
 | --- | --- |
 | `mqlite_queue_messages` | Same queue state gauges |
-| `mqlite_queue_total` | Same value as `mqlite_queue_retained_messages`; still a gauge |
-| `mqlite_queue_oldest_message_age_ms` | Canonical seconds multiplied by 1000 |
 | `mqlite_messages_completed_total` | `mqlite_message_events_total{event="completed"}` |
 | `mqlite_rpc_duration_seconds` | Same post-authentication handler histogram |
 
-The ambiguous `queue_total` and millisecond age names are deprecated for new
-consumers; use the canonical names. They are retained until the next minor version
-(v0.4.0), when any removal requires an explicit migration. No independent lifetime
-completion counter is introduced.
+No independent lifetime completion counter is introduced.
 
 ## Dashboard and useful queries
 

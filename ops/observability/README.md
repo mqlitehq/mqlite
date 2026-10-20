@@ -195,8 +195,8 @@ python3 test/observability/check_config.py
 
 After initialization, this uses the pinned `promtool` to validate Compose,
 Prometheus configuration, operating/demo rules and the entire exposition fixture.
-It accepts exactly the two legacy-name warnings documented in the compatibility
-contract, and verifies that malformed exposition is rejected. Run the real-stack
+It requires the v0.4.0 exposition contract to pass metric-name validation without
+warnings, and verifies that malformed exposition is rejected. Run the real-stack
 driver as well: parsing configuration alone cannot prove credentials, networking,
 scrapes, alert transitions or Grafana queries work.
 
