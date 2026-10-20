@@ -237,6 +237,8 @@ mqlite list-subscriptions ; mqlite test-filter 'subject == "x"'
 mqlite metrics orders --output json              # machine-readable: the same keys as the HTTP API
 mqlite redrive orders --max 100                  # DLQ → active
 mqlite purge-dlq orders --older-than 24h         # delete dead-lettered (unbounded needs --all)
+mqlite delete-queue orders                        # empty-only
+mqlite delete-queue orders --force                # explicitly discard every retained state
 ```
 
 The data and admin commands take the global flags `--endpoint <url>` / `--token <t>` (override
@@ -285,8 +287,9 @@ can run locally or in an existing platform; no second MQLite VM is required. See
 ### 6. MCP (drive it from an AI agent)
 
 `mqlite-mcp` is a Model Context Protocol server that exposes the broker as agent
-tools (create_queue, send, receive, complete, …) — a thin, dependency-free stdio
-forwarder, in keeping with mqlite's "friendly to AI agents" goal. Point it at a
+tools (create_queue, delete_queue, send, receive, complete, …) — a thin,
+dependency-free stdio forwarder, in keeping with mqlite's "friendly to AI agents"
+goal. Point it at a
 broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 
 ## Documentation
@@ -353,6 +356,15 @@ hands them back to the OS via `incremental_vacuum`, so the file grows to the pea
 and then shrinks back gradually as the queue drains (a full `VACUUM` rewrite stays
 manual-only, via `mqlite vacuum`). See [docs/retention.md](docs/retention.md).
 
+Queue deletion follows the same bounded-storage principle. It is empty-only by
+default; `--force` explicitly discards active, locked, scheduled, deferred and
+dead-letter work. Acceptance first persists a `deleting` state, which immediately
+blocks queue operations and reserves the name. The response reports either
+`deleted` or `deleting`; background cleanup resumes after restart. A locked
+delivery may already have produced an external side effect, which deletion cannot
+undo. Serialize deletion and same-name recreation, and wait until `list` no longer
+shows the name before reusing it.
+
 ## Docker
 
 ```bash
@@ -402,26 +414,18 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 ## Status
 
 This source tree contains the unreleased replacement for **retracted v0.3.3**. It
-keeps the default broker port **6754** and schema token **5**. The public queue
+keeps the default broker port **6754** and uses schema token **6**. The public queue
 identity experiment has been removed; queue operations address a queue by name.
 See [CHANGELOG.md](CHANGELOG.md) for the breaking correction and upgrade notes.
 For a tagged deployment, use **v0.3.2** until a replacement release is published;
 see [deployment](docs/deployment.md) for configuration.
 
-**Upgrading from v0.3.2 to the current source preserves message and managed-key
-data.** It adds maintenance diagnostics and empty-queue deletion without a schema
-change. Queue names are reusable, so serialize deletion and same-name recreation;
-never replay an old deletion after a replacement exists. See
+**Moving from v0.3.0/v0.3.1/v0.3.2 or retracted v0.3.3 to the current source
+requires a fresh database.** Those builds use schema token 5; MQLite deliberately
+has no in-place schema migration. Stop writers, take a consistent backup, account
+for retained work in every state, and keep the old binary/database pair for
+rollback. Do not restamp or point schema-6 code at the old file. See
 [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
-
-**Upgrading from v0.3.1 preserves message and managed-key data.** Back up first;
-process counters reset at restart. A rollback to v0.3.1 also needs compatible
-scraper/rule configuration because `Observe` and configured monitor credentials
-are new in v0.3.2. See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
-
-**Upgrading from v0.3.0 preserves existing queue data.** Back up first and retain a
-configured administrator token if you need to roll back; v0.3.0 cannot authenticate
-managed keys.
 
 **Upgrading from v0.2.0 requires a new database.** There is no in-place schema
 migration. Account for retained messages in every state, preserve the old binary

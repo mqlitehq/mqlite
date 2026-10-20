@@ -1,8 +1,8 @@
 # Production operations
 
-This runbook covers the current unreleased source and released
-v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5). v0.3.3 is retracted; use
-v0.3.2 until its replacement is published.
+This runbook covers the current unreleased source (port 6754, schema token 6) and
+released v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5). v0.3.3 is retracted;
+use v0.3.2 until its replacement is published.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -33,10 +33,12 @@ for metric definitions and alerts.
   when retrying within their documented retention windows; do not treat an HTTP
   timeout as proof that a write failed.
 - Give one controller exclusive ownership of queue deletion and same-name
-  recreation. Quiesce producers and consumers, wait for deletion to succeed, and
-  confirm the name is absent before recreating it. Keep the name reserved while
-  reconciling an uncertain result, and never replay an old delete after a
-  replacement exists.
+  recreation. Quiesce producers and consumers. Use the empty-only default unless
+  permanent loss is intended; force also discards locked work whose external
+  effects may already have happened. An accepted queue enters durable `deleting`,
+  stops serving data and reserves its name. Confirm the name is absent before
+  recreating it. Keep the name reserved while reconciling an uncertain result,
+  and never replay an old delete after a replacement exists.
 
 Choose and record the application's recovery objectives before launch: acceptable
 snapshot age (RPO), recovery time (RTO), backlog age, and capacity limits. Measure
@@ -172,8 +174,10 @@ is still writing needs its own documented consistency guarantees.
    recorded expectations. On startup every orphaned lock is reclaimed: below the
    queue's delivery limit it becomes active; at the limit it goes to DLQ with
    `MaxDeliveryCountExceeded`. Delivery count and payload survive, and the old lock
-   token is invalid. Old receive-attempt snapshots may replay old handles; that
-   does not give those handles ownership of a recovered message.
+   token is invalid. A queue already marked `deleting` never participates in lock
+   recovery; startup first continues one bounded cleanup pass, then the background
+   loop resumes it. Old receive-attempt snapshots may replay old handles for active
+   queues; that does not give those handles ownership of a recovered message.
 5. Check deferred/scheduled/DLQ work and topic filters, then run the authenticated
    canary. A restore replays the snapshot's state: later completions, sends, dedup
    records and external business effects require reconciliation against the
@@ -199,14 +203,21 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
-For **v0.3.2 → current unreleased source**, schema token **5**, port **6754**,
-message data and managed keys remain compatible; no table migration is required.
-New diagnostics do not change the storage retry policy. If enabled, keep the
-private diagnostic log on persistent storage and retain it separately from database
-backups. Rolling back to v0.3.2 preserves data but does not support `DeleteQueue`
-or detailed diagnostics; remove `--diagnostic-log` from older CLI invocations.
-The retracted v0.3.3 deletion request is incompatible with current clients: update
-both sides together, and follow the serialized name-reuse rule above.
+For **v0.3.2 or retracted v0.3.3 → current unreleased source**, schema changes
+from **5 → 6** while port **6754** stays unchanged. Durable queue lifecycle columns
+and cleanup indexes make the database incompatible; there is no in-place migration.
+Follow the different-token procedure above: stop producers and consumers, take a
+consistent schema-5 backup, account for every retained message state and managed
+key, preserve the matching old binary/database pair, and start current source with
+a fresh database. Do not edit the schema token or point schema-6 code at the old
+file. Move work through an application-level drain/replay process with stable
+business identities if it must survive the cutover.
+
+Current clients also change the deletion contract to `{name,force?}` with a typed
+`{deleted,state}` result; update broker, SDK, CLI, MCP and console together. A
+rollback after schema-6 accepts writes requires preserving and reconciling those
+writes before restoring the schema-5 snapshot. If enabled, retain the private
+diagnostic log separately from database backups.
 
 For **v0.3.1 → v0.3.2**, schema token **5**, port **6754**, message data and
 managed-key storage remain unchanged. Follow the same-schema procedure above;
@@ -256,6 +267,7 @@ in this release, so do not improvise a direct SQL table copy between schemas.
 | Full disk / `SQLITE_FULL` | Stop ingress, preserve logs and acknowledged message identities. Expand storage or remove unrelated expired logs/backups; never remove the live DB or WAL. A full `VACUUM` needs working space and is unsuitable as an emergency first step. | Backend status, a fresh canary, successful replay/reconciliation of ambiguous requests, and retained-message integrity. |
 | Repeated broker crashes | Stop restart loops long enough to preserve the complete DB directory and logs. Check disk, memory/OOM and configuration. Restart only one owner. | Recovery of orphaned locks, DLQ reason/count, canary and consumer idempotency. |
 | Old backlog / growing DLQ | Check consumers, lock expiry/renewal and handler failures. Inspect reasons and payloads; fix the cause before bounded redrive. | Backlog age falls and verified redriven identities complete. |
+| Queue remains `deleting` | Keep producers stopped and the name reserved. Check storage availability, free disk and `resource_cleanup` maintenance failures; do not remove lifecycle rows with SQL. Cleanup is deliberately bounded and resumes after restart. | `list` no longer contains the name; only then may the owner recreate it. Logical free pages can be reused before the DB/WAL files shrink. |
 | Storage/remote timeouts | Check backend reachability and latency. Treat lost write responses as ambiguous; keep retries within the idempotency contract. | Authenticated status plus a write/consume canary. |
 | `ErrSchemaVersionMismatch` | Stop the attempted cutover. Recover the matching binary/database pair. | Schema token and the correct old or new port; no token restamping. |
 

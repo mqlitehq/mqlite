@@ -31,12 +31,22 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	args = append(args, max)
 	var out []*PeekedMessage
 	var bytes int64
-	err := e.db.queryRows(ctx, `
-		SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
-		       properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
-		       dead_letter_reason,dead_letter_description
-		FROM messages WHERE queue=? AND id>=?`+stateClause+`
-		ORDER BY id ASC LIMIT ?`, func(rows *sql.Rows) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		out = nil
+		bytes = 0
+		if _, err := e.checkQueueLiveTx(ctx, tx, queue); err != nil {
+			return err
+		}
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
+			       properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
+			       dead_letter_reason,dead_letter_description
+			FROM messages WHERE queue=? AND id>=?`+stateClause+`
+			ORDER BY id ASC LIMIT ?`, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
 		for rows.Next() {
 			var p PeekedMessage
 			var st string
@@ -64,7 +74,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 			}
 		}
 		return rows.Err()
-	}, args...)
+	})
 	return out, err
 }
 

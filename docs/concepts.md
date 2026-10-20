@@ -173,13 +173,15 @@ publish.
   (a plain `CreateQueue` over a subscription's backing queue, or `kind=subscription`
   over a plain queue) — a deliberate same-kind reconfig stays open. (ASB behaves the
   same way: queues and topics share one entity namespace, so a same-name create
-  conflicts instead of silently rerouting sends.) The guards apply to creations from
-  this version on; a pre-existing colliding pair in an old DB keeps resolving
-  topic-first and now fails loud on any attempt to re-create either side.
-- Name resolution at publish/send: a name with subscription rows → **topic** (fan-out);
-  otherwise it must be an **existing queue**; otherwise the call errors. Because the
-  namespace is disjoint, this resolution is **unambiguous** — a name can never be a
-  topic and a queue at the same time, so a `Send` is never silently rerouted.
+  conflicts instead of silently rerouting sends.) The guards and their creation
+  transaction preserve this invariant. A database manually altered to contain a
+  queue/topic collision is outside the supported public contract; routing behavior
+  for that invalid internal state is not specified.
+- Name resolution at publish/send is unambiguous in the supported namespace: an
+  active plain-queue or backing-queue name addresses that queue; an implicit topic
+  name addresses its active subscription rows; any other name returns
+  `ErrQueueNotFound`. A valid name can never be both a queue and a topic, so a
+  `Send` is never silently rerouted.
 
 ```
 You only ever do two kinds of "create":
@@ -195,7 +197,8 @@ You only ever do two kinds of "create":
 ### Resource names, reuse, and request/reply
 
 Queue and subscription names are routing addresses, not immutable lifetime IDs.
-`DeleteQueue` acts on the current empty plain queue with that name. A controller
+`DeleteQueue` acts on the current plain queue with that name. It is empty-only by
+default; explicit force authorizes discarding every retained message state. A controller
 must therefore serialize deletion and same-name recreation: stop users of the old
 queue, wait for deletion to succeed, confirm the name is absent from `ListQueues`,
 and only then create the replacement. Once a replacement exists, never replay a

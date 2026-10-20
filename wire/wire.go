@@ -183,11 +183,13 @@ type QueueConfigJSON struct {
 	DLQMaxBytes int64 `json:"dlq_max_bytes,omitempty"`
 }
 type DeleteQueueResponse struct {
-	Deleted bool `json:"deleted"`
+	Deleted bool   `json:"deleted"`
+	State   string `json:"state"`
 }
 
 type DeleteQueueRequest struct {
-	Name string `json:"name"`
+	Name  string `json:"name"`
+	Force bool   `json:"force,omitempty"`
 }
 
 type CreateQueueRequest struct {
@@ -203,6 +205,7 @@ type ListQueuesResponse struct {
 	Queues []QueueInfoJSON `json:"queues"`
 }
 type QueueInfoJSON struct {
+	State            string `json:"state"`
 	Name             string `json:"name"`
 	Kind             string `json:"kind"`
 	LockDurationMs   int64  `json:"lock_duration_ms"`

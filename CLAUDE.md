@@ -219,9 +219,11 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 
 ### Other engine subsystems
 
-- **Background loops** (`engine/background.go`): reaper (1s, expired locks→active or
-  DLQ), scheduler (1s, scheduled→active), TTL (10s, →DLQ/discard), dedup janitor
-  (60s), aux janitor (60s, prunes receipts). All write through the single conn.
+- **Background loops** (`engine/background.go`): lifecycle cleanup (1s, globally
+  bounded to 4,096 rows / about 8 MiB / 32 deleting queues locally, one remotely), reaper (1s, expired
+  locks→active or DLQ), scheduler (1s, scheduled→active), TTL (10s, →DLQ/discard),
+  dedup and aux janitors (60s), plus local free-page reclaim (60s, threshold 256
+  pages, at most 256 pages per pass). All write through the single conn.
   Tests use `WithoutBackground()` + `RunMaintenanceOnce(ctx)` for deterministic time.
 - **Long-poll notifier** (`engine/notify.go`): close-and-rotate channel per queue.
   Waiter takes the channel **before** re-checking the queue to avoid a lost wakeup.
@@ -242,9 +244,11 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 - **Resource names are the public address.** Do not expose an internal incarnation,
   generation or storage token through engine, wire, SDK, CLI, MCP or console types.
   Name-only deletion cannot fence an ABA delete/recreate race, so callers must own
-  and serialize deletion with same-name recreation. Keep this limitation explicit
-  in API and operational documentation rather than spreading identity metadata
-  through otherwise unrelated send and receive paths.
+  and serialize deletion with same-name recreation. An accepted deletion first
+  persists `deleting`; queue operations are rejected without taking effect and
+  creation returns name-conflict until bounded cleanup removes the row. Keep this
+  limitation explicit in API and operational documentation rather than spreading
+  identity metadata through otherwise unrelated send and receive paths.
 - **One SQL statement per `exec`** — remote Hrana (libSQL) requires it; schema is a
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
 - **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do

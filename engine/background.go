@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"time"
 )
 
-// startBackground launches the four maintenance loops (§8.8). All run as writes
+// startBackground launches the maintenance loops (§8.8). All run as writes
 // through the single connection, so they serialize behind foreground work.
 func (e *Engine) startBackground(ctx context.Context) {
+	e.startLifecycle(ctx)
 	// reaper at 1s bounds visibility-timeout redelivery to lock_duration + ≤1s
 	// (expired locks are reclaimed here, not on the claim hot path, so claims stay
 	// O(log n) on a deep backlog — see claim.go / the stress report).
@@ -25,6 +27,60 @@ func (e *Engine) startBackground(ctx context.Context) {
 	// free-page reclamation (MQLITE-53): hand deleted pages back to the OS so a
 	// churning queue's file doesn't bloat — no manual stop-the-broker VACUUM.
 	e.spawn(ctx, 60*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "reclaim", e.reclaimFreePages) })
+}
+
+// signalLifecycle records cleanup work without blocking the caller. A capacity-one
+// channel coalesces bursts of deletions; each pass reports whether it must continue,
+// so one wake is enough to drain every durable deleting resource. The channel is
+// deliberately never closed: a concurrent outcome-unknown delete may signal while
+// Close is cancelling the worker.
+func (e *Engine) signalLifecycle() {
+	select {
+	case e.lifecycleWake <- struct{}{}:
+	default:
+	}
+}
+
+// startLifecycle runs cleanup only after durable work is discovered. Unfinished
+// passes are paced at one per second so a large forced deletion cannot monopolize
+// the single writer. A signal arriving during a pass remains buffered for the next
+// outer iteration, which prevents a deletion committed after an empty inventory
+// snapshot from being lost.
+func (e *Engine) startLifecycle(ctx context.Context) {
+	e.bgWG.Add(1)
+	go func() {
+		defer e.bgWG.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-e.lifecycleWake:
+			}
+
+			for {
+				retry := false
+				e.runMaintenance(ctx, "lifecycle", func(ctx context.Context) {
+					retry = e.maintainLifecyclePass(ctx)
+				})
+				if ctx.Err() != nil {
+					return
+				}
+				if !retry {
+					break
+				}
+
+				timer := time.NewTimer(time.Second)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
+			}
+		}
+	}()
 }
 
 func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(context.Context)) {
@@ -46,7 +102,8 @@ func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(cont
 
 func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) []string {
 	var qs []string
-	if err := e.db.queryRows(ctx, `SELECT DISTINCT queue FROM messages WHERE `+where,
+	if err := e.db.queryRows(ctx, `SELECT DISTINCT messages.queue FROM messages JOIN queues ON queues.name=messages.queue
+		WHERE queues.lifecycle_state='active' AND `+where,
 		func(rows *sql.Rows) error {
 			for rows.Next() {
 				var q string
@@ -73,7 +130,8 @@ func (e *Engine) reapLocks(ctx context.Context) {
 		    locked_until = 0, lock_token = NULL,
 		    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
-		 WHERE state='locked' AND locked_until<=?`, now)
+		 WHERE state='locked' AND locked_until<=?
+		   AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now)
 	if err != nil {
 		e.maintenanceFailure(ctx, "reclaim_locks", err)
 		return
@@ -88,7 +146,8 @@ func (e *Engine) activateScheduled(ctx context.Context) {
 	now := e.now()
 	qs := e.distinctQueues(ctx, `state='scheduled' AND visible_at<=?`, now)
 	if err := e.mutateMessages(ctx, "activated",
-		`UPDATE messages SET state='active' WHERE state='scheduled' AND visible_at<=?`, now); err != nil {
+		`UPDATE messages SET state='active' WHERE state='scheduled' AND visible_at<=?
+		 AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now); err != nil {
 		e.maintenanceFailure(ctx, "activate_scheduled", err)
 		return
 	}
@@ -108,13 +167,13 @@ func (e *Engine) expireTTL(ctx context.Context) {
 			UPDATE messages SET state='dead_lettered', dead_letter_reason='TTLExpired',
 		    locked_until=0, lock_token=NULL
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
-		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1)`, now); err != nil {
+		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1 AND lifecycle_state='active')`, now); err != nil {
 		e.maintenanceFailure(ctx, "expire_to_dlq", err)
 	}
 	if err := e.mutateMessages(ctx, "ttl_discarded", `
 		DELETE FROM messages
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
-		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=0)`, now); err != nil {
+		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=0 AND lifecycle_state='active')`, now); err != nil {
 		e.maintenanceFailure(ctx, "expire_discard", err)
 	}
 }
@@ -122,14 +181,15 @@ func (e *Engine) expireTTL(ctx context.Context) {
 // cleanupDedup drops dedup rows older than the widest configured window.
 func (e *Engine) cleanupDedup(ctx context.Context) {
 	var maxWindow sql.NullInt64
-	if err := e.db.queryRowScan(ctx, []any{&maxWindow}, `SELECT MAX(dedup_window_ms) FROM queues`); err != nil {
+	if err := e.db.queryRowScan(ctx, []any{&maxWindow}, `SELECT MAX(dedup_window_ms) FROM queues WHERE lifecycle_state='active'`); err != nil {
 		e.maintenanceFailure(ctx, "read_dedup_window", err)
 		return
 	}
 	if !maxWindow.Valid || maxWindow.Int64 <= 0 {
 		return
 	}
-	if _, err := e.db.exec(ctx, `DELETE FROM dedup WHERE seen_at < ?`, e.now()-maxWindow.Int64); err != nil {
+	if _, err := e.db.exec(ctx, `DELETE FROM dedup WHERE seen_at < ?
+		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, e.now()-maxWindow.Int64); err != nil {
 		e.maintenanceFailure(ctx, "prune_dedup", err)
 	}
 }
@@ -139,10 +199,12 @@ func (e *Engine) cleanupDedup(ctx context.Context) {
 // low-frequency pass so the feature ships with its own retention.
 func (e *Engine) cleanupExpiredAux(ctx context.Context) {
 	now := e.now()
-	if _, err := e.db.exec(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?`, now); err != nil {
+	if _, err := e.db.exec(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?
+		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now); err != nil {
 		e.maintenanceFailure(ctx, "prune_settlement_receipts", err)
 	}
-	if _, err := e.db.exec(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?`, now); err != nil {
+	if _, err := e.db.exec(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?
+		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now); err != nil {
 		e.maintenanceFailure(ctx, "prune_receive_attempts", err)
 	}
 }
@@ -174,6 +236,9 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 	for _, q := range e.distinctQueues(ctx, `state='dead_lettered'`) {
 		qr, err := e.loadQueue(ctx, q)
 		if err != nil {
+			if errors.Is(err, ErrQueueNotFound) {
+				continue // deleted after the active-queue inventory snapshot
+			}
 			e.maintenanceFailure(ctx, "load_retention_queue", err)
 			continue
 		}
@@ -185,15 +250,17 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 		if maxAge > 0 {
 			cutoff := e.now() - maxAge
 			for i := 0; i < maxBatches; i++ {
+				epoch := e.observationEpoch()
 				res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
 					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND enqueued_at < ?
+					  AND `+liveMessageQueueSQL+`
 					ORDER BY id LIMIT ?)`, q, cutoff, batch)
 				if err != nil {
 					e.maintenanceFailure(ctx, "purge_retention_age", err)
 					break
 				}
 				n, _ := res.RowsAffected()
-				e.recordMessage(q, "retention_deleted", n)
+				e.recordMessage(q, "retention_deleted", n, epoch)
 				if n < batch {
 					break
 				}
@@ -248,15 +315,17 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 // delete it and everything older).
 func (e *Engine) purgeDLQUpToID(ctx context.Context, q string, cutoffID int64, batch, maxBatches int, label string) {
 	for i := 0; i < maxBatches; i++ {
+		epoch := e.observationEpoch()
 		res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
 			SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
+			  AND `+liveMessageQueueSQL+`
 			ORDER BY id LIMIT ?)`, q, cutoffID, batch)
 		if err != nil {
 			e.maintenanceFailure(ctx, "purge_retention_"+label, err)
 			return
 		}
 		n, _ := res.RowsAffected()
-		e.recordMessage(q, "retention_deleted", n)
+		e.recordMessage(q, "retention_deleted", n, epoch)
 		if n < int64(batch) {
 			return
 		}
@@ -288,7 +357,7 @@ func (e *Engine) reclaimFreePages(ctx context.Context) {
 	if free < freePageReclaimMin {
 		return
 	}
-	if err := e.reclaimPages(ctx); err != nil {
+	if err := e.reclaimPagesBounded(ctx, 256); err != nil {
 		e.maintenanceFailure(ctx, "reclaim_pages", err)
 	}
 }
@@ -312,6 +381,12 @@ var afterFirstCheckpoint func()
 // leaks the local connection and wedges the database exactly as a settle would, and this one runs
 // unattended on the janitor's clock (round-6 §4).
 func (e *Engine) reclaimPages(ctx context.Context) error {
+	return e.reclaimPagesBounded(ctx, 0)
+}
+
+// Background reclamation limits page movement; explicit Compact retains its
+// documented full incremental reclaim. A zero limit means the whole freelist.
+func (e *Engine) reclaimPagesBounded(ctx context.Context, pages int) error {
 	// caller is the context that may be cancelled; ec is the protected one the statements run on.
 	// The rule is the same one *txn enforces inside a transaction, and it has to be applied by hand
 	// here because this is a multi-statement sequence pinned to a connection: the statement already
@@ -330,7 +405,11 @@ func (e *Engine) reclaimPages(ctx context.Context) error {
 		if err := checkCtx(caller); err != nil {
 			return err
 		}
-		rows, err := conn.QueryContext(ec, `PRAGMA incremental_vacuum`)
+		query := `PRAGMA incremental_vacuum`
+		if pages > 0 {
+			query += "(" + strconv.Itoa(pages) + ")"
+		}
+		rows, err := conn.QueryContext(ec, query)
 		if err != nil {
 			return err
 		}
@@ -357,6 +436,7 @@ func (e *Engine) reclaimPages(ctx context.Context) error {
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
 // DisableBackground use this to drive time-based transitions deterministically.
 func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
+	e.runMaintenance(ctx, "lifecycle", e.maintainLifecycle)
 	e.runMaintenance(ctx, "locks", e.reapLocks)
 	e.runMaintenance(ctx, "scheduled", e.activateScheduled)
 	e.runMaintenance(ctx, "ttl", e.expireTTL)

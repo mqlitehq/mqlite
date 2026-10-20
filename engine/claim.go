@@ -134,28 +134,21 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		if err != nil {
 			return nil, err
 		}
+		// Register before the transactional recheck. Release on every exit so
+		// timeouts and high-cardinality queue churn cannot retain notifier keys.
+		var ch <-chan struct{}
+		release := func() {}
+		if wait > 0 {
+			ch, release = e.note.subscribe(queue)
+		}
 		msgs, err := e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
-		if err != nil {
-			return nil, err
-		}
-		if len(msgs) > 0 || wait == 0 {
-			return msgs, nil
-		}
-		// register a waiter, then re-check to avoid a lost wakeup.
-		ch := e.note.wait(queue)
-		q, err = e.loadQueue(ctx, queue)
-		if err != nil {
-			return nil, err
-		}
-		msgs, err = e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
-		if err != nil {
-			return nil, err
-		}
-		if len(msgs) > 0 {
-			return msgs, nil
+		if err != nil || len(msgs) > 0 || wait == 0 {
+			release()
+			return msgs, err
 		}
 		remaining := deadline - e.now()
 		if remaining <= 0 {
+			release()
 			return nil, nil
 		}
 		timer := time.NewTimer(time.Duration(remaining) * time.Millisecond)
@@ -165,6 +158,7 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
+			release()
 			return nil, ctx.Err()
 		case <-e.closed:
 			// Close() wakes every long-poll waiter. Without this arm the waiter slept out its
@@ -172,8 +166,10 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 			// torn down (round-8). The claim rounds themselves are covered by the admission gate;
 			// this covers the one place a Receive parks outside it.
 			timer.Stop()
+			release()
 			return nil, ErrClosed
 		}
+		release()
 	}
 }
 
@@ -199,8 +195,7 @@ func (e *Engine) claimUpTo(ctx context.Context, q queueRow, max int, mode Receiv
 
 // ReceiveDeferred locks previously-deferred messages by seq_number (§8.7).
 func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int64) ([]*Message, error) {
-	q, err := e.loadQueue(ctx, queue)
-	if err != nil {
+	if _, err := e.loadQueue(ctx, queue); err != nil {
 		return nil, err
 	}
 	var out []*Message
@@ -214,8 +209,12 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 		// Each item keeps its existing independent commit. Read the clock only after
 		// acquiring the writer, and again if a remote transaction must retry (MQLITE-108).
 		err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			q, err := e.checkQueueLiveTx(ctx, tx, queue)
+			if err != nil {
+				return err
+			}
 			now := e.now()
-			return tx.QueryRowContext(ctx, `
+			err = tx.QueryRowContext(ctx, `
 			UPDATE messages
 			   SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
 			 WHERE id=? AND queue=? AND state='deferred'
@@ -225,16 +224,19 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 				now+q.lockDurationMs, token, seq, queue, now).Scan(
 				&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
 				&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs)
+			if err == nil {
+				tx.record(queue, "delivered", 1)
+				if m.DeliveryCount > 1 {
+					tx.record(queue, "redelivered", 1)
+				}
+			}
+			return err
 		})
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
 			return out, err
-		}
-		e.recordMessage(queue, "delivered", 1)
-		if m.DeliveryCount > 1 {
-			e.recordMessage(queue, "redelivered", 1)
 		}
 		m.LockToken = token
 		m.GroupID = groupID.String

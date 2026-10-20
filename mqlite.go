@@ -133,8 +133,16 @@ type Metrics = engine.Metrics
 // before interpreting queue gauges; process counters reset when the engine restarts.
 type Observation = wire.ObserveResponse
 
-// QueueInfo mirrors engine.QueueInfo.
+// QueueInfo mirrors engine.QueueInfo. State is active or deleting.
 type QueueInfo = engine.QueueInfo
+
+// DeleteQueueOpts configures queue deletion.
+type DeleteQueueOpts struct {
+	Force bool // retire immediately and discard retained messages during bounded cleanup
+}
+
+// DeleteResult reports whether physical removal is complete or cleanup is pending.
+type DeleteResult = engine.DeleteResult
 
 // SubscriptionInfo mirrors engine.SubscriptionInfo (topic, name, filter expression).
 type SubscriptionInfo = engine.SubscriptionInfo

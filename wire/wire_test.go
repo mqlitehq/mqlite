@@ -50,6 +50,65 @@ func TestMessageJSONContract(t *testing.T) {
 	}
 }
 
+func TestDeleteQueueJSONContract(t *testing.T) {
+	request, err := json.Marshal(wire.DeleteQueueRequest{Name: "orders", Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(request) != `{"name":"orders","force":true}` {
+		t.Fatalf("request = %s", request)
+	}
+	response, err := json.Marshal(wire.DeleteQueueResponse{Deleted: false, State: "deleting"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != `{"deleted":false,"state":"deleting"}` {
+		t.Fatalf("response = %s", response)
+	}
+	for _, tc := range []struct {
+		body string
+		want wire.DeleteQueueResponse
+		ok   bool
+	}{
+		{body: `{"deleted":true,"state":"deleted"}`, want: wire.DeleteQueueResponse{Deleted: true, State: "deleted"}, ok: true},
+		{body: `{"deleted":false,"state":"deleting"}`, want: wire.DeleteQueueResponse{State: "deleting"}, ok: true},
+		{body: `{"deleted":false,"state":"deleting","future":true}`, want: wire.DeleteQueueResponse{State: "deleting"}, ok: true},
+		{body: `{}`},
+		{body: `{"state":"deleting"}`},
+		{body: `{"deleted":false}`},
+		{body: `{"deleted":true,"state":"deleting"}`},
+		{body: `{"deleted":false,"state":"deleted"}`},
+		{body: `{"deleted":false,"state":"other"}`},
+		{body: `{"deleted":"false","state":"deleting"}`},
+		{body: `{"deleted":false,"state":"deleting"}{}`},
+	} {
+		got, decodeErr := wire.DecodeDeleteQueueResponse([]byte(tc.body))
+		if tc.ok && (decodeErr != nil || got != tc.want) {
+			t.Errorf("DecodeDeleteQueueResponse(%s) = %+v, %v; want %+v", tc.body, got, decodeErr, tc.want)
+		}
+		if !tc.ok && decodeErr == nil {
+			t.Errorf("DecodeDeleteQueueResponse(%s) accepted %+v", tc.body, got)
+		}
+	}
+}
+
+func TestReadDeleteQueueResponseBound(t *testing.T) {
+	for _, size := range []int{0, 1, wire.MaxDeleteQueueResponseBytes, wire.MaxDeleteQueueResponseBytes + 1} {
+		data, err := wire.ReadDeleteQueueResponse(strings.NewReader(strings.Repeat("x", size)))
+		if size > wire.MaxDeleteQueueResponseBytes {
+			if err == nil || data != nil {
+				t.Fatal("oversized response accepted or partially returned")
+			}
+		} else if err != nil || len(data) != size {
+			t.Fatalf("bounded response rejected: size=%d err=%v", size, err)
+		}
+	}
+	data, err := wire.ReadDeleteQueueResponse(failedKeyResponseReader{})
+	if err == nil || data != nil || strings.Contains(err.Error(), "partial-secret") {
+		t.Fatal("truncated response returned partial content")
+	}
+}
+
 func TestObserveResponseCompleteShape(t *testing.T) {
 	data, err := os.ReadFile("../server/testdata/observability.json")
 	if err != nil {

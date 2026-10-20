@@ -58,6 +58,10 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 // Close releases client resources (no-op for HTTP).
 func (c *Client) Close() error { return nil }
 
+func isLifecycleDeletePath(path string) bool {
+	return path == wire.PathDeleteQueue
+}
+
 func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) error {
 	b, err := json.Marshal(reqBody)
 	if err != nil {
@@ -71,11 +75,31 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-	resp, err := c.http.Do(req)
+	httpClient := c.http
+	if isLifecycleDeletePath(path) {
+		// net/http follows 307/308 with the original POST when GetBody is set.
+		// A destructive, name-addressed write must be sent at most once by this
+		// client; a redirect is an unknown outcome for the caller to reconcile.
+		clone := *c.http
+		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		httpClient = &clone
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
+		if isLifecycleDeletePath(path) {
+			// Once RoundTrip starts, a transport error cannot prove whether the
+			// broker committed the name-addressed deletion. Do not invite an
+			// automatic replay that could hit a later same-name queue.
+			return fmt.Errorf("%w: deletion response unavailable; inspect ListQueues to reconcile: %v", ErrOutcomeUnknown, err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
+	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 3 {
+		return fmt.Errorf("%w: deletion received HTTP redirect %d; inspect ListQueues to reconcile", ErrOutcomeUnknown, resp.StatusCode)
+	}
 	keyResponse := path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey
 	var keyData []byte
 	if keyResponse {
@@ -139,6 +163,14 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 			data, err := wire.ReadObserveResponse(resp.Body)
 			if err != nil {
 				return err
+			}
+			*raw = data
+			return nil
+		}
+		if raw, ok := respOut.(*json.RawMessage); ok && isLifecycleDeletePath(path) {
+			data, err := wire.ReadDeleteQueueResponse(resp.Body)
+			if err != nil {
+				return fmt.Errorf("%w: invalid deletion acknowledgement; inspect ListQueues to reconcile", ErrOutcomeUnknown)
 			}
 			*raw = data
 			return nil
@@ -423,16 +455,27 @@ func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	}, &wire.Empty{})
 }
 
-// DeleteQueue removes an empty plain queue. All message states prevent deletion.
+// DeleteQueue removes an empty plain queue. An accepted deletion returns nil
+// whether bounded physical cleanup completed in this call or continues in the
+// background. Use DeleteQueueWithOptions to force-discard retained messages or
+// inspect the accepted deletion state.
 func (c *Client) DeleteQueue(ctx context.Context, name string) error {
-	var resp wire.DeleteQueueResponse
-	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name}, &resp); err != nil {
-		return err
+	_, err := c.DeleteQueueWithOptions(ctx, name)
+	return err
+}
+
+// DeleteQueueWithOptions returns the accepted deletion state.
+func (c *Client) DeleteQueueWithOptions(ctx context.Context, name string, opts ...DeleteQueueOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	var data json.RawMessage
+	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name, Force: o.Force}, &data); err != nil {
+		return DeleteResult{}, err
 	}
-	if !resp.Deleted {
-		return fmt.Errorf("%w: deletion acknowledgement missing; inspect ListQueues before retrying", ErrOutcomeUnknown)
+	resp, err := wire.DecodeDeleteQueueResponse(data)
+	if err != nil {
+		return DeleteResult{}, fmt.Errorf("%w: invalid deletion acknowledgement; inspect ListQueues to reconcile", ErrOutcomeUnknown)
 	}
-	return nil
+	return DeleteResult{Deleted: resp.Deleted, State: resp.State}, nil
 }
 
 // Subscribe registers a subscription under a topic with an optional filter.
@@ -448,7 +491,13 @@ func (c *Client) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	}
 	out := make([]QueueInfo, len(resp.Queues))
 	for i, q := range resp.Queues {
-		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, LockDurationMs: q.LockDurationMs,
+		state := q.State
+		if state == "" {
+			// Brokers released before queue lifecycle support omitted state; every
+			// queue they could list was active.
+			state = "active"
+		}
+		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, State: state, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs}
 	}
 	return out, nil

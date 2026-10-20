@@ -22,6 +22,11 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 	}
 	var out []*Message
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		current, err := e.checkQueueLiveTx(ctx, tx, q.name)
+		if err != nil {
+			return err
+		}
+		q = current
 		// Writer admission and remote retries can outlive an attempt record. Evaluate
 		// its expiry inside this transaction, never against the pre-wait time.
 		if msgs, ok, err := lookupAttempt(ctx, tx, q.name, attemptID, e.now()); err != nil {
@@ -30,7 +35,7 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 			out = msgs
 			return nil
 		}
-		msgs, err := e.claimUpToTx(ctx, tx, q, max, mode)
+		msgs, err := e.claimUpToLiveTx(ctx, tx, q, max, mode)
 		if err != nil {
 			return err
 		}
@@ -84,6 +89,17 @@ func storeAttempt(ctx context.Context, tx *txn, queue, attemptID string, msgs []
 
 // claimUpToTx is claimUpTo bound to an explicit transaction (idempotent receive).
 func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, mode ReceiveMode) ([]*Message, error) {
+	current, err := e.checkQueueLiveTx(ctx, tx, q.name)
+	if err != nil {
+		return nil, err
+	}
+	return e.claimUpToLiveTx(ctx, tx, current, max, mode)
+}
+
+// claimUpToLiveTx runs after its caller has refreshed lifecycle and queue
+// configuration in this transaction. The attempt-id path needs that same read
+// before replay lookup, so sharing the loop avoids a second remote round trip.
+func (e *Engine) claimUpToLiveTx(ctx context.Context, tx *txn, q queueRow, max int, mode ReceiveMode) ([]*Message, error) {
 	var out []*Message
 	var bytes int64
 	for i := 0; i < max; i++ {

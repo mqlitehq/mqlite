@@ -157,7 +157,7 @@ class Drill:
         check(status.get("version") == self.args.expected_version.partition("-rc.")[0]
               and status.get("auth") is True and status.get("backend") == "local file"
               and status.get("location") == "/fault/db/mq.db"
-              and status.get("schema_version") == "5" and status.get("ping_ms", -1) >= 0,
+              and status.get("schema_version") == "6" and status.get("ping_ms", -1) >= 0,
               f"unexpected candidate runtime metadata: {status}")
         self.record("runtime.jsonl", status)
         check(self.shell("cat /fault/identity").stdout == self.run_id,

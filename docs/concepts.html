@@ -317,7 +317,8 @@
                                      (the topic comes into being as a side effect)
 
   Send target resolution:
-    name has subscription rows -> topic, fan out  ·  else -> existing queue  ·  else -> error
+    existing queue name -> that queue  ·  implicit topic name -> active subscriptions  ·  else -> error
+    (public creation keeps queue and topic names disjoint, so every valid name is unambiguous)
   Receive / settle / Stats address a plain queue or subscription by its own name.</pre>
     <div class="callout"><div class="i">🧭</div><div>
       Difference from ASB: in ASB both the Topic and the Subscription are created explicitly;
@@ -460,7 +461,7 @@
         <li>Assuming fan-out copies share one <code>seq_number</code> — they don't; settle each separately.</li>
         <li>Assuming a new subscription back-fills history — it can't.</li>
         <li>Treating the DLQ as a queue you create separately — it is a state of the same queue.</li>
-        <li>Publishing to a zero-subscription topic name expecting a buffer — it looks for a same-named queue, or errors.</li>
+        <li>Publishing to a zero-subscription topic expecting a buffer — the old topic retains nothing; the name either addresses a separately created queue or errors.</li>
       </ul>
     </div>
     <div class="tag-row">

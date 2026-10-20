@@ -36,7 +36,7 @@ machinery; one carries your data:
 | Table | Job |
 |---|---|
 | `messages` | **the queue itself** — every message, in every state |
-| `queues` | per-queue config: lock duration, retry bound, TTL, dedup window, ordering mode, DLQ retention |
+| `queues` | per-queue config plus durable `active` / `deleting` lifecycle state and deletion start time |
 | `subscriptions` | the topic fan-out roster (`topic → subscription` + optional filter) |
 | `dedup` | duplicate-detection window |
 | `settlement_receipts` | makes acknowledgements idempotent (§7) |
@@ -217,10 +217,32 @@ it is small and boring on purpose:
 
 | Loop | Cadence | Job |
 |---|---|---|
+| lifecycle | event-driven; 1 s between continuation passes | continue bounded physical cleanup for queues durably marked `deleting` |
 | reaper | 1 s | expired locks → back to `active` — or to the DLQ once `delivery_count ≥ max` |
 | scheduler | 1 s | `scheduled` rows whose time arrived → `active` |
 | TTL sweep | 10 s | expired messages → DLQ (or discard), from *any* non-terminal state |
-| janitors | 60 s | prune old receipts, dedup entries; return freed pages to the OS |
+| janitors | 60 s | prune old receipts and dedup entries; reclaim up to 256 local free pages once 256 accumulate |
+
+**Queue deletion is a durable state machine.** An empty-only delete verifies every
+message state in the same transaction that changes `queues.lifecycle_state` from
+`active` to `deleting`; force skips the empty check because its caller explicitly
+authorized discard. The state change invalidates cached configuration, wakes long
+polls, rejects further queue work and keeps the namespace occupied. Physical
+cleanup then removes messages, dedup rows and both receipt tables before deleting
+the queue row itself.
+
+The accepting call removes no more than 1,000 physical rows and targets about
+8 MiB. Each lifecycle pass globally caps cleanup at 4,096 rows and targets about
+8 MiB, across at most 32 queues
+locally or one queue on remote Turso/libSQL. The remote cap bounds Hrana round
+trips inside one write transaction; the persisted cursor provides fair rotation.
+`Open` runs a pass before lock recovery. The marker is therefore both the restart
+cursor and the force authorization. A crash cannot reactivate the queue or require
+an operator to re-authorize discard. A single oversized row may exceed the byte
+target to guarantee forward progress. Accepted pending deletes wake the worker;
+bursts coalesce into one signal, and unfinished passes schedule another after one
+second. With no deleting resource the worker opens no transaction, which avoids an
+idle polling round trip on remote stores.
 
 **Crash recovery is one statement.** On `Open`, every `locked` row is an orphan
 of a previous process (locks are rows, remember) and is reclaimed — back to
@@ -317,8 +339,10 @@ Every claim in this document is enforced by something that fails loudly:
 - **A schema golden test** — the complete canonical DDL is pinned. A database
   with a different guard token is refused (`ErrSchemaVersionMismatch`); existing
   table layouts are never migrated. Incompatible changes require a token change.
-  The independent `access_keys` addition preserves token 5, with a separate golden
-  for its DDL, the unchanged prior DDL and actual old-binary compatibility checks.
+  The independent `access_keys` addition originally preserved token 5 and remains
+  independently additive inside token 6, with a separate golden for its DDL.
+  Durable queue lifecycle metadata advances the current canonical schema to token
+  6; real schema-5 files are refused in both directions.
 - **An integrity sweep** — a randomized send/receive/crash workload asserting
   every message arrives (no loss), arrives intact (content hash), and never
   exceeds its delivery bound.

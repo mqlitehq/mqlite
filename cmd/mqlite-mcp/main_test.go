@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,12 @@ import (
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // TestResolveEndpoint pins the MCP endpoint fallback to the shared loopback default and the
 // trailing-slash trim (MQLITE-84), without any network call.
@@ -69,7 +76,7 @@ func TestToolsList(t *testing.T) {
 			t.Fatalf("tool %v has no inputSchema", td["name"])
 		}
 	}
-	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "list_keys", "list_queues", "observe", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats"}
+	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "delete_queue", "list_keys", "list_queues", "observe", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats"}
 	got := make([]string, 0, len(names))
 	for name := range names {
 		got = append(got, name)
@@ -127,6 +134,114 @@ func TestToolsCallForwards(t *testing.T) {
 	}
 }
 
+func TestDeleteQueueToolContract(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	type capturedRequest struct {
+		path string
+		body wire.DeleteQueueRequest
+		err  error
+	}
+	requests := make(chan capturedRequest, 2)
+	var requestCount atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		var body wire.DeleteQueueRequest
+		err := json.NewDecoder(r.Body).Decode(&body)
+		requests <- capturedRequest{path: r.URL.Path, body: body, err: err}
+		if body.Name == "bad-ack" {
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"deleted":false,"state":"deleting","future":"not forwarded"}`))
+	}))
+	defer ts.Close()
+	broker.endpoint, broker.token, broker.http = ts.URL, "", ts.Client()
+
+	result := callTool("delete_queue", map[string]any{"name": "orders", "force": true})
+	if result["isError"] != false {
+		t.Fatalf("force delete failed: %v", result)
+	}
+	got := <-requests
+	if got.err != nil || got.path != wire.PathDeleteQueue || got.body.Name != "orders" || !got.body.Force {
+		t.Fatalf("forwarded delete = %+v", got)
+	}
+	text := result["content"].([]map[string]any)[0]["text"].(string)
+	if text != `{"deleted":false,"state":"deleting"}`+"\n" {
+		t.Fatalf("normalized result = %q", text)
+	}
+
+	for _, args := range []map[string]any{
+		{"force": true},
+		{"name": "orders", "force": "true"},
+		{"name": "orders", "discard": true},
+	} {
+		if malformed := callTool("delete_queue", args); malformed["isError"] != true {
+			t.Fatalf("malformed delete_queue args accepted: %v", args)
+		}
+	}
+	if requestCount.Load() != 1 {
+		t.Fatal("malformed tool arguments reached the broker")
+	}
+
+	malformed := callTool("delete_queue", map[string]any{"name": "bad-ack"})
+	if malformed["isError"] != true || !strings.Contains(malformed["content"].([]map[string]any)[0]["text"].(string), "outcome unknown") {
+		t.Fatalf("malformed acknowledgement presented as success: %v", malformed)
+	}
+	<-requests
+}
+
+func TestDeleteQueueToolTransportFailureIsUnknownAndNotRetried(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	transportFailure := errors.New("connection dropped")
+	var calls atomic.Int32
+	broker.endpoint = "http://broker.invalid"
+	broker.token = ""
+	broker.http = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, transportFailure
+	})}
+
+	_, err := post(wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: "orders", Force: true})
+	if err == nil || errors.Is(err, transportFailure) || !strings.Contains(err.Error(), transportFailure.Error()) ||
+		!strings.Contains(err.Error(), "outcome unknown") || !strings.Contains(err.Error(), "list_queues") {
+		t.Fatalf("delete transport failure = %v; want textual cause outside the error chain", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("delete made %d transport attempts, want one", got)
+	}
+}
+
+func TestDeleteQueueToolDoesNotFollowRedirect(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	var sourceCalls atomic.Int32
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetCalls.Add(1)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sourceCalls.Add(1)
+		http.Redirect(w, r, target.URL+wire.PathDeleteQueue, http.StatusPermanentRedirect)
+	}))
+	defer source.Close()
+	broker.endpoint, broker.token, broker.http = source.URL, "", source.Client()
+
+	result := callTool("delete_queue", map[string]any{"name": "orders"})
+	text := result["content"].([]map[string]any)[0]["text"].(string)
+	if result["isError"] != true || !strings.Contains(text, "outcome unknown") {
+		t.Fatalf("redirected delete = %v", result)
+	}
+	if got := sourceCalls.Load(); got != 1 {
+		t.Fatalf("source received %d deletion requests, want one", got)
+	}
+	if got := targetCalls.Load(); got != 0 {
+		t.Fatalf("redirect target received %d deletion requests, want zero", got)
+	}
+}
+
 // ─── schema ↔ forward ↔ wire consistency ────────────────────────────────────
 //
 // Closes the gap noted in docs/mcp-wire-compat-notes.md: a tool's hand-written
@@ -159,6 +274,8 @@ func TestToolSchemaForwardConsistency(t *testing.T) {
 			switch typ, _ := spec.(map[string]any)["type"].(string); typ {
 			case "integer":
 				sentinel = float64(987654) // JSON numbers decode to float64 in args
+			case "boolean":
+				sentinel = true
 			case "array":
 				sentinel = []any{float64(987654)} // JSON arrays decode to []any
 				items, _ := spec.(map[string]any)["items"].(map[string]any)
@@ -269,6 +386,7 @@ var goldenWireShapes = map[string][]string{
 		"config.dlq_max_age_ms", "config.dlq_max_bytes", "config.dlq_max_count", "config.kind",
 		"config.lock_duration_ms", "config.max_delivery_count", "config.ordering_mode", "name",
 	},
+	"wire.DeleteQueueRequest": {"force", "name"},
 	"wire.SendRequest": {
 		"messages[].body", "messages[].content_type", "messages[].correlation_id",
 		"messages[].dead_letter_description", "messages[].dead_letter_reason",

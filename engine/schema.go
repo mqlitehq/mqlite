@@ -5,10 +5,10 @@ package engine
 // whose recorded version differs is refused with ErrSchemaVersionMismatch (see db.go)
 // rather than running today's DDL against a layout it doesn't match. Change the token
 // whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
-const schemaVersion = "5"
+const schemaVersion = "6"
 
-// MQLITE-121: this independent table is additive to schema 5. Existing queue data
-// and indexes remain unchanged; a v0.3.0 broker ignores and preserves these rows.
+// MQLITE-121 introduced this independently additive table. It remains part of
+// the canonical schema and can be restored when absent without changing queues.
 const accessKeySchema = `CREATE TABLE IF NOT EXISTS access_keys (
 	    id           TEXT PRIMARY KEY CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),
 	    name         TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 128),
@@ -43,9 +43,12 @@ var schemaStmts = []string{
 	    dlq_max_age_ms        INTEGER NOT NULL DEFAULT 0,
 	    dlq_max_count         INTEGER NOT NULL DEFAULT 0,
 	    dlq_max_bytes         INTEGER NOT NULL DEFAULT 0,
+	    lifecycle_state       TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle_state IN ('active','deleting')),
+	    delete_started_at     INTEGER NOT NULL DEFAULT 0,
 	    created_at            INTEGER NOT NULL,
 	    updated_at            INTEGER NOT NULL
 	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS idx_queue_deleting ON queues(delete_started_at, name) WHERE lifecycle_state='deleting'`,
 
 	// topic -> subscription fan-out roster.
 	`CREATE TABLE IF NOT EXISTS subscriptions (
@@ -87,7 +90,6 @@ var schemaStmts = []string{
 	    dead_letter_reason      TEXT,
 	    dead_letter_description TEXT
 	) STRICT`,
-
 	// Hot claim path: a partial index over ACTIVE rows only, ordered by (queue,id).
 	// claim seeks straight to the queue's smallest active id regardless of how many
 	// locked / dead-lettered / backlogged rows exist — deep-backlog drain stays
@@ -120,6 +122,12 @@ var schemaStmts = []string{
 	// sparse, so these stay tiny.
 	`CREATE INDEX IF NOT EXISTS idx_msg_sched_head  ON messages(queue, id) WHERE state='scheduled'`,
 	`CREATE INDEX IF NOT EXISTS idx_msg_locked_head ON messages(queue, id) WHERE state='locked'`,
+	// Lifecycle cleanup walks one literal state at a time, sharing one bounded
+	// row/byte budget. Every other state already has a queue-prefix partial index;
+	// completed is retained only for schema completeness and is normally empty.
+	// Keeping these indexes partial avoids charging every active Send for a second
+	// queue-wide index solely to support rare resource deletion.
+	`CREATE INDEX IF NOT EXISTS idx_msg_completed ON messages(queue, id) WHERE state='completed'`,
 
 	// optional dedup table (message_id + sliding window). active only when dedup_window_ms>0.
 	`CREATE TABLE IF NOT EXISTS dedup (

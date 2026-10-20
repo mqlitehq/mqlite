@@ -305,9 +305,19 @@ func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]
 
 // ── admin ───────────────────────────────────────────────────────────────────
 
-// DeleteQueue removes an empty plain queue. All message states prevent deletion.
+// DeleteQueue removes an empty plain queue. An accepted deletion returns nil
+// whether bounded physical cleanup completed in this call or continues in the
+// background. Use DeleteQueueWithOptions to force-discard retained messages or
+// inspect the accepted deletion state.
 func (e *Embedded) DeleteQueue(ctx context.Context, name string) error {
-	return e.eng.DeleteQueue(ctx, name)
+	_, err := e.DeleteQueueWithOptions(ctx, name)
+	return err
+}
+
+// DeleteQueueWithOptions reports whether physical cleanup is complete.
+func (e *Embedded) DeleteQueueWithOptions(ctx context.Context, name string, opts ...DeleteQueueOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	return e.eng.DeleteQueueWithOptions(ctx, name, engine.DeleteOptions{Force: o.Force})
 }
 
 func (e *Embedded) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {

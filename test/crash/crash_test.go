@@ -119,6 +119,18 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 		runLocker(ctx, e)
 	case "delivery-limit":
 		runDeliveryLimitLocker(ctx, e)
+	case "queue-delete":
+		messages, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 1})
+		if err != nil || len(messages) != 1 || messages[0].MessageID != "locked-delete" {
+			fail("lock queue deletion fixture", fmt.Errorf("messages=%+v err=%v", messages, err))
+		}
+		result, err := e.DeleteQueueWithOptions(ctx, "q", mqlite.DeleteQueueOpts{Force: true})
+		if err != nil || result.Deleted || result.State != "deleting" {
+			fail("start bounded queue deletion", fmt.Errorf("result=%+v err=%v", result, err))
+		}
+		fmt.Println(readyMarker)
+		_ = os.Stdout.Sync()
+		select {}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown crash role %q\n", role)
 		os.Exit(2)
@@ -599,6 +611,73 @@ func TestCrashRecoveryDeadLettersLastDelivery(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A force-delete acknowledgement may precede physical cleanup. Killing the
+// process after that acknowledgement must preserve retirement: restart cannot
+// expose the remaining backlog, and maintenance must finish cleanly.
+func TestCrashQueueDeletionResumes(t *testing.T) {
+	ctx := context.Background()
+	db := dbPath(t)
+	func() {
+		e := openWithRetry(ctx, db)
+		defer e.Close()
+		ensureQueue(ctx, e, "q")
+		// Foreground deletion removes at most 1,000 rows and startup cleanup at
+		// most 4,096. Keep a small tail beyond their combined budget, with all
+		// early rows scheduled so Receive locks the final, named row.
+		backlog := make([]engine.OutMessage, 6000)
+		for i := range backlog {
+			backlog[i].Body = []byte("scheduled discard")
+		}
+		if _, err := e.Engine().ScheduleBatch(ctx, "q", backlog, time.Now().Add(time.Hour).UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{MessageID: "locked-delete", Body: []byte("locked discard")}); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	_, _ = killLoop(t, db, "queue-delete", readyMarker, true, 1)
+	e := openWithRetry(ctx, db)
+	defer e.Close()
+	queues, err := e.ListQueues(ctx)
+	if err != nil || len(queues) != 1 || queues[0].Name != "q" || queues[0].State != "deleting" {
+		t.Fatalf("retirement did not survive restart: %+v, %v", queues, err)
+	}
+	var lockedState, lockToken string
+	var deliveries int
+	if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
+		return tx.SQL().QueryRowContext(tx.Context(),
+			`SELECT state,lock_token,delivery_count FROM messages WHERE message_id='locked-delete'`).
+			Scan(&lockedState, &lockToken, &deliveries)
+	}); err != nil || lockedState != "locked" || lockToken == "" || deliveries != 1 {
+		t.Fatalf("deleting lock was recovered instead of left for cleanup: state=%q token=%q deliveries=%d err=%v",
+			lockedState, lockToken, deliveries, err)
+	}
+	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("late")}); !errors.Is(err, mqlite.ErrQueueNotFound) {
+		t.Fatalf("retired queue accepted a message after restart: %v", err)
+	}
+	for pass := 0; pass < 10; pass++ {
+		e.Engine().RunMaintenanceOnce(ctx)
+		queues, err = e.ListQueues(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(queues) == 0 {
+			break
+		}
+	}
+	if len(queues) != 0 {
+		t.Fatalf("cleanup did not complete after restart: %+v", queues)
+	}
+	if err := e.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+		t.Fatalf("cleaned name was not reusable: %v", err)
+	}
+	stats, err := e.Stats(ctx, "q")
+	if err != nil || stats.Total != 0 {
+		t.Fatalf("replacement inherited retired data: %+v, %v", stats, err)
 	}
 }
 

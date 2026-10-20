@@ -10,30 +10,49 @@ import "sync"
 // queue, then selects on the channel; notify() closes+rotates it, waking all.
 type notifier struct {
 	mu    sync.Mutex
-	chans map[string]chan struct{}
+	chans map[string]*notification
 }
 
-func newNotifier() *notifier { return &notifier{chans: map[string]chan struct{}{}} }
+type notification struct {
+	ch      chan struct{}
+	waiters int
+}
 
-// wait returns the current wake channel for a queue. Take it BEFORE re-checking
-// the queue so a Send racing in between cannot be missed.
-func (n *notifier) wait(queue string) <-chan struct{} {
+func newNotifier() *notifier { return &notifier{chans: map[string]*notification{}} }
+
+// subscribe registers a waiter before its queue recheck. release must run on
+// every exit. An old release cannot remove a newer registration installed after
+// notify closed the previous channel.
+func (n *notifier) subscribe(queue string) (<-chan struct{}, func()) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	ch, ok := n.chans[queue]
+	entry, ok := n.chans[queue]
 	if !ok {
-		ch = make(chan struct{})
-		n.chans[queue] = ch
+		entry = &notification{ch: make(chan struct{})}
+		n.chans[queue] = entry
 	}
-	return ch
+	entry.waiters++
+	n.mu.Unlock()
+	released := false
+	return entry.ch, func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if released {
+			return
+		}
+		released = true
+		entry.waiters--
+		if entry.waiters == 0 && n.chans[queue] == entry {
+			delete(n.chans, queue)
+		}
+	}
 }
 
 // notify wakes everyone currently waiting on the queue.
 func (n *notifier) notify(queue string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if ch, ok := n.chans[queue]; ok {
-		close(ch)
+	if entry, ok := n.chans[queue]; ok {
+		close(entry.ch)
 		delete(n.chans, queue)
 	}
 }

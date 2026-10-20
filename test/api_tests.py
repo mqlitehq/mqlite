@@ -463,12 +463,52 @@ def t_access_keys():
             check(status in (200, 404), "test credential revoked or never committed")
 
 
+def t_queue_deletion():
+    section("queue deletion: empty-only default and explicit forced discard")
+    admin = "/mqlite.v1.AdminService/"
+    queue = "/mqlite.v1.QueueService/"
+
+    empty = f"{RUNID}_py_delete_empty"
+    create_queue(empty)
+    status, result = call(admin + "DeleteQueue", {"name": empty})
+    check(status == 200 and result == {"deleted": True, "state": "deleted"},
+          "empty queue deletion returns a complete acknowledgement")
+
+    busy = f"{RUNID}_py_delete_busy"
+    create_queue(busy)
+    # Leave work after the foreground 1,000-row batch and one 4,096-row
+    # background pass, so the immediately following inventory remains stable.
+    send_batch(busy, ["discard"] * 6000)
+    status, protected = call(admin + "DeleteQueue", {"name": busy})
+    check(status == 409 and protected.get("code") == "queue_not_empty",
+          "nonempty queue is protected without force")
+    status, pending = call(admin + "DeleteQueue", {"name": busy, "force": True})
+    check(status == 200 and pending == {"deleted": False, "state": "deleting"},
+          "force retires the queue and reports bounded cleanup")
+    status, inventory = call(admin + "ListQueues", {})
+    deleting = [q for q in inventory.get("queues", []) if q["name"] == busy]
+    check(status == 200 and len(deleting) == 1 and deleting[0].get("state") == "deleting",
+          "pending cleanup stays visible in queue inventory")
+    status, _ = call(queue + "Send", {"queue": busy, "messages": [{"body": b64("late")}]})
+    check(status == 404, "retired queue rejects new messages immediately")
+    # Reconcile with reads only. Replaying a name-only deletion as a status check
+    # could target a replacement if ownership rules were violated elsewhere.
+    for _ in range(24):
+        status, inventory = call(admin + "ListQueues", {})
+        if status == 200 and all(q["name"] != busy for q in inventory.get("queues", [])):
+            break
+        time.sleep(0.25)
+    check(status == 200 and all(q["name"] != busy for q in inventory.get("queues", [])),
+          "read-only reconciliation observes background cleanup completion")
+
+
 def main():
     print(f"Python behavioural suite — endpoint={ENDPOINT} runid={RUNID}")
     for fn in (t_lifecycle, t_batch, t_visibility_timeout, t_dlq_redrive,
                t_explicit_deadletter, t_defer, t_schedule, t_dedup, t_sessions,
                t_receive_and_delete, t_fencing,
-               t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled, t_access_keys):
+               t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled, t_access_keys,
+               t_queue_deletion):
         try:
             fn()
         except Exception as e:  # noqa

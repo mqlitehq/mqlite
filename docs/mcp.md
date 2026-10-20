@@ -51,6 +51,7 @@ models misuse them):
 | `observe` | complete canonical observation; takes no arguments; requires monitor or manage |
 | `list_queues` | list queues/subscriptions |
 | `create_queue` | create/update a queue by name |
+| `delete_queue` | delete a plain queue; optional `force` explicitly discards retained work |
 | `send` | send a message (`queue`, `body`, optional `message_id`/`group_id`) |
 | `receive` | peek-lock messages → returns `seq_number` + `lock_token` |
 | `complete` | acknowledge a message (`queue`, `seq_number`, `lock_token`) |
@@ -69,6 +70,24 @@ models misuse them):
 
 Settlement is by `lock_token` from `receive` — delivery is at-least-once, so an agent
 should treat handlers as idempotent. Full HTTP semantics: [api-reference.md](api-reference.md).
+
+## Queue deletion
+
+`delete_queue` takes `{"name":"orders"}` for empty-only deletion or
+`{"name":"orders","force":true}` to authorize permanent discard of every message
+state. Do not infer force from a prior observation. Locked work may already have
+caused an external side effect that deletion cannot undo.
+
+The result is `{"deleted":true,"state":"deleted"}` when physical removal finishes
+in the call, or `{"deleted":false,"state":"deleting"}` after durable retirement
+while bounded background cleanup continues. In the latter state, data-plane calls
+fail, `list_queues` keeps the row with `state:"deleting"`, and the name cannot be
+reused. The original discard authorization is already durable and background
+cleanup needs no follow-up write. Serialize deletion and same-name recreation;
+use `list_queues` as the read-only status check and wait until it no longer contains
+the name before creating a replacement. Treat a transport failure, redirect or
+malformed success response as an unknown outcome. Keep the name reserved and
+reconcile through `list_queues`; never automatically replay `delete_queue`.
 
 ## Read-only observation
 

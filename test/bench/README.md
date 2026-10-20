@@ -17,6 +17,7 @@ runs system monitoring inside **Docker**, and uses an in-process probe reading
 cd mqlite
 ./test/bench/run-bench.sh                                 # 5s/scenario, 256B
 BENCH_DUR=10s BENCH_MSG=1024 ./test/bench/run-bench.sh    # custom duration / body size
+BENCH_ONLY=lifecycle_churn BENCH_DUR=2s ./test/bench/run-bench.sh
 ```
 
 Artifacts land in `test/bench/out/`: `results.json`, `iostat.log`, `vmstat.log`,
@@ -48,6 +49,18 @@ comparison:
 produce ×{1,4,8 producers} · batch ×{16,64} · e2e(4×4) · drain(200k prefill, then empty)
 · sessions(64 groups) · produce FULL (fsync control) · message properties · body-size
 sweep · fill/drain reclamation · load ramp-down · consumer churn.
+
+`lifecycle_churn` is opt-in because create/delete churn is expensive on a remote
+backend. Each cycle reuses a fixed 64-name working set only after the previous
+lifetime is absent: create, batch-send small messages, force-delete, then run
+bounded maintenance to convergence. Four queues exceed the foreground cleanup
+batch so the result records both immediate and pending deletion acknowledgements.
+The scenario caps bodies at 128 bytes and keeps live body payload below 1 MiB per
+cycle. Its JSON result adds accepted/pending delete counts, maintenance passes,
+convergence latency, and peak live payload; the standard sampler records DB/WAL,
+RSS, CPU, and write amplification. Generic `ops/s` is fully converged queue
+lifecycles per second, while the generic latency columns are force-delete
+acknowledgement latency.
 
 For the full results and analysis, see the stress report in the design repo
 (`mqlite-stress-report.{md,html}`).
