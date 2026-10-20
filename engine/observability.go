@@ -660,12 +660,6 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 	return err
 }
 
-// mutateMessages records the exact returned rows after a confirmed transaction.
-// The predicate is unchanged; no preflight read races the actual mutation.
-func (e *Engine) mutateMessages(ctx context.Context, event, query string, args ...any) error {
-	return e.mutateMessagesFresh(ctx, event, query, func() []any { return args })
-}
-
 // mutateMessagesFresh rebuilds time-sensitive arguments inside every transaction
 // attempt. Remote retries may back off across an expiry boundary, so the fence
 // must use the clock observed by the attempt that can actually commit.

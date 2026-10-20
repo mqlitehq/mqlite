@@ -276,7 +276,7 @@ func queueLockUntil(q queueRow, now int64) int64 {
 // then applies an optional absolute lifetime. Callers validate their durations;
 // handling both signs here keeps the arithmetic safe for persisted values too.
 func boundedDeadlineMs(now, durationMs, expiresAtMs int64) int64 {
-	deadline := now
+	var deadline int64
 	switch {
 	case durationMs > 0 && now > math.MaxInt64-durationMs:
 		deadline = math.MaxInt64
