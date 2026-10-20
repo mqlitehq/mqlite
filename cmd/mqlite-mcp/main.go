@@ -195,6 +195,13 @@ func strProp(desc string) map[string]any {
 func intProp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
 }
+func boolProp(desc string) map[string]any {
+	return map[string]any{"type": "boolean", "description": desc}
+}
+func boolean(a map[string]any, k string) bool {
+	v, _ := a[k].(bool)
+	return v
+}
 
 func str(a map[string]any, k string) string {
 	if v, ok := a[k].(string); ok {
@@ -281,6 +288,16 @@ var tools = []tool{
 		schema: obj(map[string]any{"name": strProp("queue name")}, "name"),
 		forward: func(a map[string]any) (string, any) {
 			return wire.PathCreateQueue, wire.CreateQueueRequest{Name: str(a, "name")}
+		},
+	},
+	{
+		name: "delete_queue", desc: "Delete an empty queue; force discards retained messages and may leave bounded cleanup pending.",
+		schema: keyObj(map[string]any{
+			"name":  strProp("queue name"),
+			"force": boolProp("discard retained messages while deleting the queue"),
+		}, "name"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: str(a, "name"), Force: boolean(a, "force")}
 		},
 	},
 	{
@@ -429,6 +446,22 @@ var tools = []tool{
 func callTool(name string, args map[string]any) map[string]any {
 	for _, t := range tools {
 		if t.name == name {
+			if name == "delete_queue" {
+				properties := t.schema["properties"].(map[string]any)
+				for key := range args {
+					if _, ok := properties[key]; !ok {
+						return textResult("error: unknown delete_queue argument", true)
+					}
+				}
+				if _, ok := args["name"].(string); !ok {
+					return textResult("error: delete_queue name must be a string", true)
+				}
+				if value, present := args["force"]; present {
+					if _, ok := value.(bool); !ok {
+						return textResult("error: delete_queue force must be a boolean", true)
+					}
+				}
+			}
 			path, body := t.forward(args)
 			create, creating := body.(wire.CreateKeyRequest)
 			if creating && !authkey.ValidID(create.ID) {
@@ -468,6 +501,14 @@ func callTool(name string, args map[string]any) map[string]any {
 				switch request := body.(type) {
 				case wire.ObserveRequest:
 					validated, err = wire.DecodeObserveResponse([]byte(text))
+				case wire.DeleteQueueRequest:
+					var response wire.DeleteQueueResponse
+					response, err = wire.DecodeDeleteQueueResponse([]byte(text))
+					if err != nil {
+						err = fmt.Errorf("outcome unknown: invalid deletion acknowledgement; inspect list_queues to reconcile")
+					} else {
+						validated = response
+					}
 				case wire.CreateKeyRequest:
 					validated, err = wire.DecodeCreateKeyResponse([]byte(text), request)
 					if err != nil {
@@ -504,6 +545,10 @@ func textResult(text string, isErr bool) map[string]any {
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr}
 }
 
+func isLifecycleDeletePath(path string) bool {
+	return path == wire.PathDeleteQueue
+}
+
 func post(path string, body any) (string, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -517,21 +562,40 @@ func post(path string, body any) (string, error) {
 	if broker.token != "" {
 		req.Header.Set("Authorization", "Bearer "+broker.token)
 	}
-	resp, err := broker.http.Do(req)
+	httpClient := broker.http
+	if isLifecycleDeletePath(path) {
+		clone := *broker.http
+		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		httpClient = &clone
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
+		if isLifecycleDeletePath(path) {
+			return "", fmt.Errorf("outcome unknown: deletion response unavailable; inspect list_queues to reconcile: %s", err.Error())
+		}
 		return "", err
 	}
 	defer resp.Body.Close()
+	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 3 {
+		return "", fmt.Errorf("outcome unknown: deletion received HTTP redirect %d; inspect list_queues to reconcile", resp.StatusCode)
+	}
 	var rb []byte
 	switch path {
 	case wire.PathCreateKey, wire.PathListKeys, wire.PathRevokeKey:
 		rb, err = wire.ReadKeyResponse(resp.Body)
 	case wire.PathObserve:
 		rb, err = wire.ReadObserveResponse(resp.Body)
+	case wire.PathDeleteQueue:
+		rb, err = wire.ReadDeleteQueueResponse(resp.Body)
 	default:
 		rb, err = io.ReadAll(resp.Body)
 	}
 	if err != nil {
+		if isLifecycleDeletePath(path) {
+			return "", fmt.Errorf("outcome unknown: invalid deletion acknowledgement; inspect list_queues to reconcile")
+		}
 		return "", err
 	}
 	if resp.StatusCode >= 300 {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,7 +39,10 @@ type Engine struct {
 	filterMu    sync.Mutex              // guards filterCache
 	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
 
-	observation observations
+	commitMu                 sync.Mutex    // orders confirmed commits and their in-memory topology effects
+	lifecycleWake            chan struct{} // coalesced durable-cleanup work; never closed
+	uncertainLifecycleProbes atomic.Int32  // delayed discovery after an ambiguous remote delete commit
+	observation              observations
 }
 
 // Options configures Open.
@@ -64,6 +68,7 @@ const DefaultMaxMessageBytes = 1 << 20
 type queueRow struct {
 	name             string
 	kind             string
+	lifecycleState   string
 	lockDurationMs   int64
 	maxDeliveryCount int
 	defaultTTLMs     int64
@@ -102,19 +107,28 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	}
 	d.log = lg
 	e := &Engine{
-		db:          d,
-		note:        newNotifier(),
-		now:         nowFn,
-		log:         lg,
-		closed:      make(chan struct{}),
-		qcache:      map[string]queueRow{},
-		filterCache: map[string]*filterEntry{},
-		maxMsgBytes: maxMsg,
-		observation: observations{started: nowFn(), background: !opts.DisableBackground},
-		dlqMaxAgeMs: opts.DLQMaxAgeMs,
-		dlqMaxCount: opts.DLQMaxCount,
-		dlqMaxBytes: opts.DLQMaxBytes,
+		db:            d,
+		note:          newNotifier(),
+		now:           nowFn,
+		log:           lg,
+		closed:        make(chan struct{}),
+		lifecycleWake: make(chan struct{}, 1),
+		qcache:        map[string]queueRow{},
+		filterCache:   map[string]*filterEntry{},
+		maxMsgBytes:   maxMsg,
+		observation:   observations{started: nowFn(), background: !opts.DisableBackground},
+		dlqMaxAgeMs:   opts.DLQMaxAgeMs,
+		dlqMaxCount:   opts.DLQMaxCount,
+		dlqMaxBytes:   opts.DLQMaxBytes,
 	}
+	if err := e.initializeObservations(ctx); err != nil {
+		_ = d.close()
+		return nil, err
+	}
+	// A forced deletion is durable. Resume one bounded pass before crash recovery
+	// so deleting queues never have their old locks revived on restart. Remember
+	// unfinished/error work for the event-driven worker started below.
+	lifecyclePending := e.maintainLifecyclePass(ctx)
 
 	// Single-broker crash recovery (§4.4): any 'locked' row is an orphan from a
 	// previous process — reclaim it immediately (delivery_count was already
@@ -129,7 +143,8 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		    locked_until = 0, lock_token = NULL,
 		    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
-		 WHERE state='locked'`); err != nil {
+		 WHERE state='locked'
+		   AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`); err != nil {
 		_ = d.close()
 		return nil, fmt.Errorf("crash recovery: %w", err)
 	}
@@ -138,6 +153,9 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		var bgctx context.Context
 		bgctx, e.bgCancel = context.WithCancel(context.Background())
 		e.startBackground(bgctx)
+		if lifecyclePending {
+			e.signalLifecycle()
+		}
 	}
 	return e, nil
 }
@@ -211,70 +229,15 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	delete(e.qcache, name)
 	e.qepoch++
 	e.qmu.Unlock()
-	e.rememberQueue(name)
 	return nil
 }
 
-// DeleteQueue removes an empty plain queue and its deduplication/replay records.
-// Every message state, including scheduled and dead-lettered, prevents deletion.
-// The check and cleanup share one transaction; concurrent sends cannot be lost.
-// A missing queue returns ErrQueueNotFound. Subscription lifecycle is separate.
-// The name resolves when this call enters its transaction. If a deleted name is
-// later reused, a later call with that name operates on the replacement.
+// DeleteQueue removes an empty plain queue. An accepted deletion returns nil
+// whether bounded physical cleanup completed in this call or continues in the
+// background. DeleteQueueWithOptions exposes the detailed state and the explicit
+// force-discard option.
 func (e *Engine) DeleteQueue(ctx context.Context, name string) error {
-	if name == "" {
-		return fmt.Errorf("%w: queue name required", ErrInvalidArgument)
-	}
-	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		var kind string
-		if err := tx.QueryRowContext(ctx, `SELECT kind FROM queues WHERE name=?`, name).Scan(&kind); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrQueueNotFound
-			}
-			return err
-		}
-		if kind != "queue" {
-			return fmt.Errorf("%w: DeleteQueue only supports plain queues, not subscriptions", ErrInvalidArgument)
-		}
-		var occupied bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM messages WHERE queue=?)`, name).Scan(&occupied); err != nil {
-			return err
-		}
-		if occupied {
-			return ErrQueueNotEmpty
-		}
-		// These tables deliberately have no foreign keys. Remove them atomically so
-		// reusing a queue name cannot replay old deliveries or deduplicate new sends.
-		for _, statement := range []string{
-			`DELETE FROM dedup WHERE queue=?`,
-			`DELETE FROM settlement_receipts WHERE queue=?`,
-			`DELETE FROM receive_attempts WHERE queue=?`,
-		} {
-			if _, err := tx.ExecContext(ctx, statement, name); err != nil {
-				return err
-			}
-		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM queues WHERE name=? AND kind='queue'
-			AND NOT EXISTS(SELECT 1 FROM messages WHERE queue=?)`, name, name)
-		if err != nil {
-			return err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if n != 1 {
-			return ErrQueueNotEmpty
-		}
-		return nil
-	})
-	if err == nil || errors.Is(err, ErrOutcomeUnknown) {
-		e.qmu.Lock()
-		delete(e.qcache, name)
-		e.qepoch++
-		e.qmu.Unlock()
-		e.note.notify(name)
-	}
+	_, err := e.DeleteQueueWithOptions(ctx, name, DeleteOptions{})
 	return err
 }
 
@@ -282,10 +245,9 @@ func (e *Engine) DeleteQueue(ctx context.Context, name string) error {
 // (CreateQueue, Subscribe) keep the name guards and the insert atomic.
 //
 // Queue, subscription and topic names share ONE flat namespace and must stay
-// disjoint (review F2 / MQLITE-57): resolveTargets resolves a name with
-// subscription rows as a topic FIRST, so a queue sharing a live topic's name
-// could never be reached by Send. Refuse to create the unreachable queue
-// (fail loud at creation) instead of letting sends silently fan out past it.
+// disjoint (review F2 / MQLITE-57): a queue and topic sharing one address would
+// make Send routing ambiguous. Refuse the collision at creation so every valid
+// name has exactly one meaning.
 // The upsert path for an existing queue of the same name stays open ONLY for
 // the same kind: a plain CreateQueue over a subscription's backing queue (or a
 // kind='subscription' request over a plain queue) is rejected rather than
@@ -315,14 +277,18 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	var existingKind string
+	var existingKind, lifecycleState string
 	err = tx.QueryRowContext(ctx,
-		`SELECT kind FROM queues WHERE name=?`, name).Scan(&existingKind)
+		`SELECT kind,lifecycle_state FROM queues WHERE name=?`, name).Scan(&existingKind, &lifecycleState)
 	if err == nil && existingKind != kind {
 		return fmt.Errorf("%w: %q is already a %s", ErrNameConflict, name, existingKind)
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
+	}
+	newQueue := errors.Is(err, sql.ErrNoRows)
+	if !newQueue && lifecycleState != "active" {
+		return fmt.Errorf("%w: queue name is reserved until cleanup completes", ErrNameConflict)
 	}
 	lock := cfg.LockDurationMs
 	if lock <= 0 {
@@ -367,6 +333,9 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 	if err != nil {
 		return err
 	}
+	if newQueue {
+		tx.rememberQueue(name)
+	}
 	return err
 }
 
@@ -381,9 +350,8 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 //     targets into one backing queue (pub/sub isolation breach, eval report r2
 //     §architecture/P0-3);
 //   - the TOPIC name must not belong to any existing queue or subscription —
-//     resolveTargets resolves a subscribed name as a topic first, so a topic
-//     shadowing a live queue would silently reroute every Send for that name
-//     to the fan-out and starve the queue (review F2);
+//     otherwise queue and fan-out routing would share one address and a Send
+//     could not resolve it unambiguously (review F2);
 //   - topic == name is rejected: it would make the backing queue's own name
 //     resolve as the topic.
 //
@@ -463,7 +431,6 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 	delete(e.qcache, name)
 	e.qepoch++
 	e.qmu.Unlock()
-	e.rememberQueue(name)
 	// A re-subscribe may have changed the filter — drop any cached program so the
 	// next publish recompiles from the freshly stored expression.
 	e.invalidateFilter(name)
@@ -512,23 +479,25 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 		epoch := e.qepoch
 		e.qmu.RUnlock()
 		if ok {
-			return q, nil
+			return q, queueLive(q)
 		}
 		var dle int
 		var ordering string
-		if err := e.db.queryRowScan(ctx,
+		err := e.db.queryRowScan(ctx,
 			[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering,
-				&q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes}, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms,ordering_mode,
-		       dlq_max_age_ms,dlq_max_count,dlq_max_bytes FROM queues WHERE name=?`, name); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return queueRow{}, ErrQueueNotFound
-			}
+				&q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes, &q.lifecycleState},
+			`SELECT `+queueSelectColumns+` FROM queues WHERE name=?`, name)
+		if errors.Is(err, sql.ErrNoRows) {
+			return queueRow{}, ErrQueueNotFound
+		}
+		if err != nil {
 			return queueRow{}, err
 		}
 		q.deadLetterOnExp = dle != 0
 		q.ordering = OrderingMode(ordering)
+		if err := queueLive(q); err != nil {
+			return queueRow{}, err
+		}
 		e.qmu.Lock()
 		if e.qepoch != epoch {
 			e.qmu.Unlock()
@@ -542,21 +511,31 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 
 // ListQueues lists all queues/subscriptions.
 func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
+	collectionEpoch := e.observationEpoch()
 	var out []QueueInfo
 	err := e.db.queryRows(ctx, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms
+		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms,lifecycle_state
 		FROM queues ORDER BY name`,
 		func(rows *sql.Rows) error {
 			for rows.Next() {
 				var qi QueueInfo
 				if err := rows.Scan(&qi.Name, &qi.Kind, &qi.LockDurationMs, &qi.MaxDeliveryCount,
-					&qi.DefaultTTLMs, &qi.DedupWindowMs); err != nil {
+					&qi.DefaultTTLMs, &qi.DedupWindowMs, &qi.State); err != nil {
 					return err
 				}
 				out = append(out, qi)
 			}
 			return rows.Err()
 		})
+	if err == nil {
+		live := make(map[string]bool, len(out))
+		for _, q := range out {
+			live[q.Name] = true
+		}
+		e.observation.mu.Lock()
+		e.observation.reconcileTopologyLocked(live, collectionEpoch)
+		e.observation.mu.Unlock()
+	}
 	return out, err
 }
 
@@ -634,17 +613,24 @@ func validateScheduleTime(atMs, nowMs int64) error {
 // retry/DLQ discipline (max_delivery_count, Reject); Cancel must not silently remove
 // them (MQLITE-66).
 func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
-	res, err := e.db.exec(ctx,
-		`DELETE FROM messages WHERE id=? AND queue=? AND state='scheduled' AND delivery_count=0`, seq, queue)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	} else {
-		e.recordMessage(queue, "canceled", n)
-	}
-	return nil
+	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		if _, err := e.checkQueueLiveTx(ctx, tx, queue); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE id=? AND queue=? AND state='scheduled' AND delivery_count=0`, seq, queue)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		tx.record(queue, "canceled", n)
+		return nil
+	})
 }
 
 // Compact reclaims free database pages to the OS (MQLITE-31). New local DBs use
@@ -685,10 +671,6 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 			return nil, nil, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(ms[i].Body), e.maxMsgBytes)
 		}
 	}
-	targets, err := e.resolveTargets(ctx, name)
-	if err != nil {
-		return nil, nil, err
-	}
 	now := e.now()
 	// visible_at for the filter env: the scheduled time for a delayed send, else now.
 	visibleAt := now
@@ -699,7 +681,17 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 	conflicts := make([]bool, len(ms))
 	woke := map[string]bool{}
 
-	err = e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		targets, err := e.resolveTargetsTx(ctx, tx, name)
+		if err != nil {
+			return err
+		}
+		// Remote transaction retries must refresh both routing and timestamps.
+		now = e.now()
+		visibleAt = now
+		if atMs > 0 {
+			visibleAt = atMs
+		}
 		// reset per-attempt accumulators (inTx may retry the whole closure).
 		for i := range seqs {
 			seqs[i] = 0
@@ -713,10 +705,7 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 				if !e.filterAccepts(t, m, now, visibleAt) { // empty/nil filter matches all
 					continue
 				}
-				q, err := e.loadQueueTx(ctx, tx, t.name)
-				if err != nil {
-					return err
-				}
+				q := t.queue
 				if q.ordering == OrderGroupFIFO && m.GroupID == "" {
 					return ErrGroupRequired
 				}
@@ -755,72 +744,21 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 // entry is nil for a plain queue or an empty filter (match all).
 type target struct {
 	name  string
+	queue queueRow
 	entry *filterEntry
 }
 
 // targetFor builds a fan-out target from a subscription row, compiling and caching
 // its filter expression (empty or absent → entry nil → match all).
-func (e *Engine) targetFor(sub string, fj sql.NullString) target {
-	t := target{name: sub}
+func (e *Engine) targetFor(q queueRow, fj sql.NullString) target {
+	t := target{name: q.name, queue: q}
 	if fj.Valid && fj.String != "" {
 		var f Filter
 		if json.Unmarshal([]byte(fj.String), &f) == nil && f.Expr != "" {
-			t.entry = e.compiledFilter(sub, f.Expr)
+			t.entry = e.compiledFilter(q.name, f.Expr)
 		}
 	}
 	return t
-}
-
-// resolveTargets expands a topic to its subscriptions, else validates the queue.
-func (e *Engine) resolveTargets(ctx context.Context, name string) ([]target, error) {
-	var subs []target
-	if err := e.db.queryRows(ctx,
-		`SELECT subscription, filter_json FROM subscriptions WHERE topic=? ORDER BY subscription`,
-		func(rows *sql.Rows) error {
-			for rows.Next() {
-				var s string
-				var fj sql.NullString
-				if err := rows.Scan(&s, &fj); err != nil {
-					return err
-				}
-				subs = append(subs, e.targetFor(s, fj))
-			}
-			return rows.Err()
-		}, name); err != nil {
-		return nil, err
-	}
-	if len(subs) > 0 {
-		return subs, nil
-	}
-	// not a topic — must be an existing queue.
-	if _, err := e.loadQueue(ctx, name); err != nil {
-		return nil, err
-	}
-	return []target{{name: name}}, nil
-}
-
-func (e *Engine) loadQueueTx(ctx context.Context, tx *txn, name string) (queueRow, error) {
-	e.qmu.RLock()
-	q, ok := e.qcache[name]
-	e.qmu.RUnlock()
-	if ok {
-		return q, nil
-	}
-	row := tx.QueryRowContext(ctx, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms,ordering_mode FROM queues WHERE name=?`, name)
-	var dle int
-	var ordering string
-	if err := row.Scan(&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount,
-		&q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return queueRow{}, ErrQueueNotFound
-		}
-		return queueRow{}, err
-	}
-	q.deadLetterOnExp = dle != 0
-	q.ordering = OrderingMode(ordering)
-	return q, nil
 }
 
 func propsJSON(p map[string]string) (sql.NullString, error) {

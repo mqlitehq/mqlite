@@ -36,7 +36,7 @@ machinery; one carries your data:
 | Table | Job |
 |---|---|
 | `messages` | **the queue itself** — every message, in every state |
-| `queues` | per-queue config: lock duration, retry bound, TTL, dedup window, ordering mode, DLQ retention |
+| `queues` | per-queue config plus durable `active` / `deleting` lifecycle state and deletion start time |
 | `subscriptions` | the topic fan-out roster (`topic → subscription` + optional filter) |
 | `dedup` | duplicate-detection window |
 | `settlement_receipts` | makes acknowledgements idempotent (§7) |
@@ -49,7 +49,7 @@ The heart, abridged:
 ```sql
 CREATE TABLE messages (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- SQLite rowid = the sequence number
-    queue          TEXT NOT NULL REFERENCES queues(name),
+    queue          TEXT NOT NULL,
     state          TEXT NOT NULL DEFAULT 'active'
                        CHECK (state IN ('active','locked','deferred',
                                         'scheduled','completed','dead_lettered')),
@@ -63,7 +63,7 @@ CREATE TABLE messages (
 ) STRICT;
 ```
 
-Three deliberate choices hide in this table:
+Four deliberate choices hide in this table:
 
 - **`id INTEGER PRIMARY KEY AUTOINCREMENT` *is* SQLite's rowid** — strictly increasing
   and never reused, even after the row is deleted (it may gap). That single column gives
@@ -73,6 +73,16 @@ Three deliberate choices hide in this table:
   broker-side object or a TCP connection. Kill the process at any instant and the
   queue's exact state survives in the file — recovery (§6) is a `SELECT`, not a
   reconstruction.
+- **Queue retirement has indexed parent guards.** Every supported message insert
+  first resolves an active `queues` row in the same transaction. A queue-key update
+  also requires a parent, and parent rename or deletion is restricted while any
+  message remains. The parent guards use one literal state probe per queue-prefix
+  partial index. A conventional foreign key would make SQLite scan the entire
+  `messages` table on every parent delete unless every message also paid for a
+  duplicate full `(queue, id)` index; a per-insert trigger likewise adds cost to
+  every Send. Direct writes to mqlite-owned tables are outside the supported
+  `EngineTx.SQL` contract. Subscription references remain native foreign keys and
+  have a child-key index.
 - **Every timestamp is epoch milliseconds** in plain `INTEGER` columns, and the
   clock is injectable — which is why the failure paths in the test suite run
   deterministically instead of with `sleep()`.
@@ -217,10 +227,36 @@ it is small and boring on purpose:
 
 | Loop | Cadence | Job |
 |---|---|---|
+| lifecycle | event-driven; 1 s between continuation passes | continue bounded physical cleanup for queues durably marked `deleting` |
 | reaper | 1 s | expired locks → back to `active` — or to the DLQ once `delivery_count ≥ max` |
 | scheduler | 1 s | `scheduled` rows whose time arrived → `active` |
 | TTL sweep | 10 s | expired messages → DLQ (or discard), from *any* non-terminal state |
-| janitors | 60 s | prune old receipts, dedup entries; return freed pages to the OS |
+| janitors | 60 s | prune old receipts and dedup entries; reclaim up to 256 local free pages once 256 accumulate |
+
+**Queue deletion is a durable state machine.** An empty-only delete verifies every
+message state in the same transaction that changes `queues.lifecycle_state` from
+`active` to `deleting`; force skips the empty check because its caller explicitly
+authorized discard. The state change invalidates cached configuration, wakes long
+polls, rejects further queue work and keeps the namespace occupied. Physical
+cleanup then removes messages, dedup rows and both receipt tables before deleting
+the queue row itself.
+
+The accepting call removes no more than 1,000 physical rows and targets about
+8 MiB. Each lifecycle pass globally caps cleanup at 4,096 rows and targets about
+8 MiB, across at most 32 queues
+locally or one queue on remote Turso/libSQL. The remote cap bounds Hrana round
+trips inside one write transaction; the persisted cursor provides fair rotation.
+`Open` runs a pass before lock recovery. The marker is therefore both the restart
+cursor and the force authorization. A crash cannot reactivate the queue or require
+an operator to re-authorize discard. A single oversized row may exceed the byte
+target to guarantee forward progress. Accepted pending deletes wake the worker;
+bursts coalesce into one signal, and unfinished passes schedule another after one
+second. With no deleting resource the worker opens no transaction, which avoids an
+idle polling round trip on remote stores. The one exception is a remote deletion
+or cleanup transaction whose commit acknowledgement is uncertain: after the
+immediate pass, the worker performs 30 delayed probes one second apart so a commit
+that becomes visible after the first inventory snapshot is still discovered.
+Restart recovery remains the durable fallback after that window.
 
 **Crash recovery is one statement.** On `Open`, every `locked` row is an orphan
 of a previous process (locks are rows, remember) and is reclaimed — back to
@@ -317,8 +353,10 @@ Every claim in this document is enforced by something that fails loudly:
 - **A schema golden test** — the complete canonical DDL is pinned. A database
   with a different guard token is refused (`ErrSchemaVersionMismatch`); existing
   table layouts are never migrated. Incompatible changes require a token change.
-  The independent `access_keys` addition preserves token 5, with a separate golden
-  for its DDL, the unchanged prior DDL and actual old-binary compatibility checks.
+  The independent `access_keys` addition originally preserved token 5 and remains
+  independently additive inside token 6, with a separate golden for its DDL.
+  Durable queue lifecycle metadata advances the current canonical schema to token
+  6; real schema-5 files are refused in both directions.
 - **An integrity sweep** — a randomized send/receive/crash workload asserting
   every message arrives (no loss), arrives intact (content hash), and never
   exceeds its delivery bound.

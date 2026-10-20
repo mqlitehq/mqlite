@@ -80,6 +80,22 @@ func exitCode(cmd *exec.Cmd) (int, string) {
 	return -1, errb.String() + err.Error()
 }
 
+func TestBlackboxDeleteQueueRejectsUnknownAndMalformedFlags(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"delete-queue", "q", "--discard"}, want: "flag provided but not defined"},
+		{args: []string{"delete-queue", "q", "--force=eventually"}, want: "invalid boolean value"},
+	} {
+		cmd := exec.Command(mqliteBin, tc.args...)
+		code, stderr := exitCode(cmd)
+		if code == 0 || !strings.Contains(stderr, tc.want) {
+			t.Errorf("mqlite %v: code=%d stderr=%q", tc.args, code, stderr)
+		}
+	}
+}
+
 // P1-1: if stdout is a broken pipe, `receive` must exit non-zero AND must NOT acknowledge
 // the message — otherwise a Peek-Lock consumer silently loses data.
 func TestBlackboxReceiveBrokenPipe(t *testing.T) {

@@ -5,12 +5,14 @@
 #
 #   ./test/bench/run-bench.sh                 # 5s/scenario, 256B messages
 #   BENCH_DUR=10s BENCH_MSG=1024 ./test/bench/run-bench.sh
+#   BENCH_ONLY=lifecycle_churn BENCH_DUR=2s ./test/bench/run-bench.sh
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 OUT="$HERE/out"
 DUR="${BENCH_DUR:-5s}"
 MSG="${BENCH_MSG:-256}"
+ONLY="${BENCH_ONLY:-}"
 NAME="mqlite-bench-run"
 
 rm -rf "$OUT"; mkdir -p "$OUT"
@@ -19,8 +21,8 @@ echo "==> building bench image (linux/amd64)"
 docker build --platform linux/amd64 -f "$HERE/Dockerfile" -t mqlite-bench:latest "$ROOT"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
-echo "==> running matrix (dur=$DUR msg=${MSG}B) — DB on container fs"
-docker run --platform linux/amd64 --name "$NAME" -e BENCH_DUR="$DUR" -e BENCH_MSG="$MSG" mqlite-bench:latest
+echo "==> running matrix (dur=$DUR msg=${MSG}B only=${ONLY:-default}) — DB on container fs"
+docker run --platform linux/amd64 --name "$NAME" -e BENCH_DUR="$DUR" -e BENCH_MSG="$MSG" -e BENCH_ONLY="$ONLY" mqlite-bench:latest
 
 echo "==> copying results out"
 docker cp "$NAME:/data/." "$OUT/"

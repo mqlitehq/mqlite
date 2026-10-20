@@ -128,6 +128,14 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 	inClause := "(" + strings.Join(ph, ",") + ")"
 
 	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		if _, err := e.checkQueueLiveTx(ctx, tx, dlq); err != nil {
+			return err
+		}
+		if crossQueue {
+			if _, err := e.checkQueueLiveTx(ctx, tx, target); err != nil {
+				return err
+			}
+		}
 		if !crossQueue {
 			res, err := tx.ExecContext(ctx, `
 				UPDATE messages SET state='active', delivery_count=0, lock_token=NULL,
@@ -184,11 +192,23 @@ func (e *Engine) Purge(ctx context.Context, queue string, opts RedriveOptions) (
 		query = `DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ` + where + ` ORDER BY id LIMIT ?)`
 		args = append(args, opts.Max)
 	}
-	res, err := e.db.exec(ctx, query, args...)
+	var n int64
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		if _, err := e.checkQueueLiveTx(ctx, tx, queue); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		if err == nil {
+			tx.record(queue, "purged", n)
+		}
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	e.recordMessage(queue, "purged", n)
 	return int(n), nil
 }

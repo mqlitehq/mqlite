@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -9,6 +11,186 @@ import (
 
 	"github.com/mqlitehq/mqlite/engine"
 )
+
+const (
+	lifecycleQueueCount    = 64
+	lifecycleHeavyQueues   = 4
+	lifecycleLightMessages = 16
+	lifecycleHeavyMessages = 1024 // exceeds the 1,000-row foreground cleanup budget
+	lifecycleMaxPasses     = 64
+	lifecycleMaxMessage    = 128 // < 1 MiB live body payload per 64-queue cycle
+)
+
+type lifecycleRunResult struct {
+	cycles, created, messages                      int64
+	deleteAttempts, deleteAccepted, deletePending  int64
+	maintenancePasses, converged, peakPayloadBytes int64
+	deleteLatency                                  *hist
+	convergeLatency                                durationSamples
+}
+
+// durationSamples retains the small number of per-cycle convergence durations.
+// The generic histogram intentionally caps percentiles at 100ms, while remote
+// lifecycle convergence can take longer and must remain exact in the result.
+type durationSamples struct {
+	values []time.Duration
+	sum    time.Duration
+	max    time.Duration
+}
+
+func (s *durationSamples) add(d time.Duration) {
+	s.values = append(s.values, d)
+	s.sum += d
+	if d > s.max {
+		s.max = d
+	}
+}
+
+func (s durationSamples) meanMs() float64 {
+	if len(s.values) == 0 {
+		return 0
+	}
+	return float64(s.sum) / float64(len(s.values)) / float64(time.Millisecond)
+}
+
+func (s durationSamples) pctMs(p float64) float64 {
+	if len(s.values) == 0 {
+		return 0
+	}
+	values := append([]time.Duration(nil), s.values...)
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	index := int(float64(len(values)) * p)
+	if index < 1 {
+		index = 1
+	}
+	if index > len(values) {
+		index = len(values)
+	}
+	return float64(values[index-1]) / float64(time.Millisecond)
+}
+
+func (s durationSamples) maxMs() float64 {
+	return float64(s.max) / float64(time.Millisecond)
+}
+
+func lifecycleMessageSize(requested int) int {
+	if requested < 1 {
+		return 1
+	}
+	if requested > lifecycleMaxMessage {
+		return lifecycleMaxMessage
+	}
+	return requested
+}
+
+// lifecycleChurnRun repeatedly creates a fixed 64-name working set, batch-sends
+// small messages, force-deletes every queue, and explicitly drives bounded
+// maintenance until all names disappear. Four queues exceed the 1,000-row
+// foreground budget, so every healthy cycle observes both immediate and pending
+// acknowledgements without retaining a large payload. Names are reused only
+// after ListQueues confirms convergence, matching the documented ABA boundary.
+func lifecycleChurnRun(ctx context.Context, eng *engine.Engine, prefix string, d time.Duration, msgSize int, samp *sampler) (lifecycleRunResult, error) {
+	result := lifecycleRunResult{deleteLatency: newHist()}
+	body := body(lifecycleMessageSize(msgSize))
+	deadline := time.Now().Add(d)
+	queuePrefix := fmt.Sprintf("%s-lifecycle-%d", prefix, time.Now().UnixNano())
+	names := make([]string, lifecycleQueueCount)
+	for i := range names {
+		names[i] = fmt.Sprintf("%s-%02d", queuePrefix, i)
+	}
+	lightBatch := lifecycleBatch(body, lifecycleLightMessages)
+	heavyBatch := lifecycleBatch(body, lifecycleHeavyMessages)
+
+	for first := true; first || time.Now().Before(deadline); first = false {
+		for _, name := range names {
+			if err := eng.CreateQueue(ctx, name, engine.QueueConfig{}); err != nil {
+				return result, fmt.Errorf("create %q: %w", name, err)
+			}
+			result.created++
+		}
+
+		var livePayload int64
+		for i, name := range names {
+			messages := lightBatch
+			if i < lifecycleHeavyQueues {
+				messages = heavyBatch
+			}
+			if _, err := eng.Send(ctx, name, messages...); err != nil {
+				return result, fmt.Errorf("send batch to %q: %w", name, err)
+			}
+			result.messages += int64(len(messages))
+			livePayload += int64(len(messages) * len(body))
+		}
+		if livePayload > result.peakPayloadBytes {
+			result.peakPayloadBytes = livePayload
+		}
+		// Capture the populated database before fast local deletion can make the
+		// periodic sampler miss its peak.
+		if samp != nil {
+			samp.snap()
+		}
+
+		convergeStart := time.Now()
+		for _, name := range names {
+			started := time.Now()
+			result.deleteAttempts++
+			ack, err := eng.DeleteQueueWithOptions(ctx, name, engine.DeleteOptions{Force: true})
+			if err != nil {
+				return result, fmt.Errorf("force delete %q: %w", name, err)
+			}
+			result.deleteLatency.add(time.Since(started))
+			result.deleteAccepted++
+			if !ack.Deleted {
+				result.deletePending++
+			}
+		}
+
+		for pass := 0; ; pass++ {
+			remaining, err := lifecycleQueuesPresent(ctx, eng, names)
+			if err != nil {
+				return result, err
+			}
+			if remaining == 0 {
+				break
+			}
+			if pass >= lifecycleMaxPasses {
+				return result, fmt.Errorf("%d queues remain after %d maintenance passes", remaining, lifecycleMaxPasses)
+			}
+			eng.RunMaintenanceOnce(ctx)
+			result.maintenancePasses++
+		}
+		result.convergeLatency.add(time.Since(convergeStart))
+		result.converged += int64(len(names))
+		result.cycles++
+	}
+	return result, nil
+}
+
+func lifecycleBatch(body []byte, count int) []engine.OutMessage {
+	messages := make([]engine.OutMessage, count)
+	for i := range messages {
+		messages[i] = engine.OutMessage{Body: body}
+	}
+	return messages
+}
+
+func lifecycleQueuesPresent(ctx context.Context, eng *engine.Engine, names []string) (int, error) {
+	listed, err := eng.ListQueues(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list queues during lifecycle convergence: %w", err)
+	}
+	want := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		want[name] = struct{}{}
+	}
+	remaining := 0
+	for _, queue := range listed {
+		if _, ok := want[queue.Name]; ok {
+			remaining++
+		}
+	}
+	return remaining, nil
+}
 
 // propMsg builds a realistically-enriched message: a body plus a typical set of
 // KV properties (headers) + ASB-style metadata — the shape a real producer sends

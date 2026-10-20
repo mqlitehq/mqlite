@@ -72,6 +72,9 @@ across platforms.
 # local — builds the bench image, runs the matrix on the container's own fs
 BENCH_DUR=3s ./test/bench/run-bench.sh          # → test/bench/out/results.json
 
+# opt-in queue create/send/force-delete/converge churn
+BENCH_ONLY=lifecycle_churn BENCH_DUR=2s ./test/bench/run-bench.sh
+
 # cloud — Fly remote-builds test/bench/Dockerfile, runs once on a 256MB machine
 cd mqlite && FLY_API_TOKEN=... flyctl deploy . \
   --config ../deploy-fly/bench.toml --dockerfile test/bench/Dockerfile \
@@ -84,6 +87,23 @@ phase so we can measure what is *reclaimed*. A 200 ms background sampler records
 RSS + Go heap + DB/WAL file sizes the whole time; each scenario prints a `[done]`
 line as it finishes (so a constrained box that runs out of time still yields the
 scenarios that completed).
+
+The opt-in `lifecycle_churn` scenario uses a fixed set of 64 queue names and never
+reuses a name until deletion has converged. Each cycle creates the queues, sends
+small batches, accepts forced deletion, and runs bounded maintenance until every
+name is absent. Four queues carry 1,024 messages so the test covers pending cleanup;
+the other 60 carry 16 messages. The live message-body payload stays below 1 MiB.
+Its result reports immediate and pending acknowledgements, maintenance passes,
+convergence latency, peak payload, and DB/WAL size. Here `ops/s` means fully
+converged queue lifecycles per second; the generic latency columns measure the
+initial delete acknowledgement.
+
+A 2-second native smoke run on an Apple M1 Pro while developing MQLITE-126 completed
+640 queue lifecycles (10 cycles) at about 312 lifecycles/s. All 640 deletions were
+accepted, 40 required background-style cleanup, convergence p99/max was
+42.9/43.0 ms, and DB+WAL peaked at 5.7 MiB before ending at 0.8 MiB. This short run
+is a regression signal, not a deployment capacity claim; reproduce it on the target
+CPU, filesystem, durability mode, message sizes, and remote backend when applicable.
 
 ## 1 · Throughput & write amplification
 

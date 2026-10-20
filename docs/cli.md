@@ -178,6 +178,31 @@ mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering st
 | `--dlq-max-count` | 0 (inherit) | per-queue: keep at most N dead letters (`-1` = unbounded) |
 | `--dlq-max-bytes` | 0 (inherit) | per-queue: cap dead-letter body bytes (`-1` = unbounded) |
 
+### `delete-queue <name>` — retire a queue
+
+```bash
+mqlite delete-queue orders             # succeeds only when every state is empty
+mqlite delete-queue orders --force     # explicitly discard every retained state
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--force` | false | retire the queue even when it contains active, locked, scheduled, deferred, completed or dead-lettered rows |
+
+The default returns `queue_not_empty` without changing the queue if any retained
+row exists. Force permanently discards those rows and queue-owned deduplication /
+retry records. A locked delivery may already have caused an external side effect;
+deletion cannot undo it.
+
+Both output modes report whether bounded cleanup finished. Text prints
+`ok: name=orders deleted=true state=deleted` or
+`ok: name=orders deleted=false state=deleting`; JSON prints the same three fields.
+A deleting queue stops accepting data-plane work immediately and keeps its name
+reserved. Use `mqlite list` to watch its `state`; do not use another delete as a
+status check. The original force authorization was persisted when deletion was
+accepted, and background cleanup continues without another request. Recreate the
+name only after it disappears from the list.
+
 ### `subscribe <topic> <name>` — create a subscription
 *(alias: `create-subscription`)*
 ```bash
@@ -246,6 +271,10 @@ mqlite metrics orders --output json   # machine-readable
 mqlite list
 ```
 
+Each row includes `state=active` or `state=deleting`. A deleting plain queue is
+listed because its name remains reserved, but queue operations are rejected and
+cannot take effect.
+
 ### `redrive <queue>` — move dead letters back to active
 ```bash
 mqlite redrive orders --max 100              # back to source
@@ -273,9 +302,11 @@ mqlite purge-dlq orders --all               # delete the entire DLQ (explicit)
 
 ### `vacuum` — reclaim free DB pages to the OS
 Local maintenance (embedded; **stop the broker first** — the single-writer lock will
-reject it otherwise). New local DBs use `auto_vacuum=INCREMENTAL`, so the default is a
-no-lock `PRAGMA incremental_vacuum`; `--full` runs a full `VACUUM` (rewrites the file,
-global lock). Not applicable to a remote Turso/libSQL store.
+reject it otherwise). New local DBs use `auto_vacuum=INCREMENTAL`, so the default
+checkpoints and exhausts the current incremental freelist; `--full` runs a full
+`VACUUM` (rewrites the file, global lock). The running broker also performs a
+bounded pass every 60 seconds once at least 256 pages are free. Not applicable to
+a remote Turso/libSQL store.
 ```bash
 MQLITE_DB=file:/data/mq.db mqlite vacuum          # incremental
 MQLITE_DB=file:/data/mq.db mqlite vacuum --full   # full rewrite

@@ -429,35 +429,80 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 Available in the current unreleased source. The incompatible request shape from
 v0.3.3 was withdrawn and that module version is retracted.
 
-Removes an **empty plain queue**. Requires administrator/manage permission.
+Deletes a **plain queue**. Requires administrator/manage permission. The default
+is empty-only; force is a separate, explicit authorization to discard retained
+work.
 
 - POST `/mqlite.v1.AdminService/DeleteQueue`
-- Request: `{"name":"orders"}`. Response: `{"deleted":true}`.
-- All message states block deletion, including locked, scheduled, deferred and
-  dead-lettered messages: HTTP 409, `queue_not_empty`. Drain or settle them first.
+- Request: `{"name":"orders"}` or `{"name":"orders","force":true}`.
+- A completed deletion returns `{"deleted":true,"state":"deleted"}`. If bounded
+  cleanup remains, acceptance returns
+  `{"deleted":false,"state":"deleting"}`. Both are successful, authoritative
+  outcomes; any other acknowledgement shape is `outcome_unknown` to a client.
+- Without force, any retained message row blocks deletion, including active,
+  locked, scheduled, deferred, completed and dead-lettered states: HTTP 409,
+  `queue_not_empty`. Drain or settle them first. With force, all of those rows are
+  permanently discarded. A locked delivery may already have caused an external
+  side effect; deleting its broker record cannot undo that effect.
 - Subscription backing queues are rejected with HTTP 400, `invalid_argument`;
   this operation does not remove topic subscriptions.
-- Missing queues return HTTP 404, `not_found`. Queue configuration and per-queue
-  deduplication, settlement receipts and receive-attempt records are removed in
-  the same transaction. Recreating the name starts with fresh auxiliary records;
-  message sequence numbers are not reset. Process event counters remain historical.
+- Acceptance durably changes the queue to `deleting` before cleanup. From that
+  point, queue operations are rejected without taking effect. Name-addressed
+  operations such as Send, Receive, Peek and Stats return `not_found`; a stale
+  lock settlement may instead report `lock_lost`. An existing long poll is woken,
+  `CreateQueue` with that name returns
+  `name_conflict`, and `ListQueues` continues to expose the reserved name with
+  `state:"deleting"`. The discard authorization is durable, and background
+  cleanup needs no follow-up delete.
+- One foreground call removes at most 1,000 physical queue-owned rows and targets
+  about 8 MiB. A single larger row is still removed so cleanup can progress. A
+  pending delete wakes a background pass that globally caps cleanup at 4,096 rows,
+  about 8 MiB and 32 queues on a local store. Further passes are paced one second
+  apart; an idle broker does not poll for lifecycle work. A remote Turso/libSQL pass handles one queue,
+  which bounds network round trips inside the write transaction. The persisted
+  cursor rotates through pending names fairly on both backends, so a large or
+  bursty deletion cannot monopolize the single writer.
+  Startup resumes one bounded pass before crash recovery. The row and name vanish
+  only after messages, deduplication, settlement receipts and receive-attempt
+  records are gone. Message sequence numbers are not reset, and process event
+  counters remain historical.
+- Missing queues return HTTP 404, `not_found`. Once a deleting name disappears,
+  this is also the completed state observed by a later reconciliation request.
 - Stop producers and consumers before retiring a queue. The transactional
-  emptiness check prevents deletion of a concurrent acknowledged send. Requests
-  still addressing a retired name fail; an existing long poll is woken.
+  empty-only check prevents deletion of a concurrent acknowledged send. Force
+  deliberately replaces that protection with discard permission.
 - Queue names are reusable, and the public API deliberately has no lifetime token.
   One owner must serialize deletion and same-name recreation. Wait for a successful
-  response and confirm that `ListQueues` no longer contains the name before creating
-  its replacement. Never replay an old deletion after recreation.
-- If the result is `outcome_unknown` or the response is lost, keep the name reserved
-  and inspect `ListQueues`. Under the single-owner rule, an absent row confirms the
-  deletion; a present row is still the original and may be reconciled before any
-  replacement is allowed. Concurrent delete/recreate controllers are unsupported.
+  `state:"deleted"` response, or confirm that `ListQueues` no longer contains a
+  previously deleting name, before creating its replacement. Never replay an old
+  deletion after recreation.
+- The SDK and MCP client send a lifecycle delete at most once: they do not follow
+  HTTP redirects, and transport failures, redirects or invalid successful
+  acknowledgements are `outcome_unknown`. Keep the name reserved and inspect
+  `ListQueues`. Under the single-owner rule, an absent row confirms the deletion;
+  a `deleting` row means cleanup is still running. Never use another delete as a
+  status check or automatically retry it. The engine performs up to 30 one-second
+  discovery passes after an uncertain remote database commit so a late-visible
+  retirement can enter normal cleanup; startup recovery is the durable fallback.
+  Concurrent delete/recreate controllers are unsupported.
 
-Go SDK: `client.DeleteQueue(ctx, name)` / `embedded.DeleteQueue(ctx, name)`.
-No additional deletion options or queue identity field are part of the public
-contract. No schema-version change or migration is required.
+Go SDK: `client.DeleteQueue(ctx, name) error` and the equivalent embedded method
+retain their empty-only signature. They return `nil` once deletion is accepted,
+including when bounded cleanup continues in the background. Use
+`DeleteQueueWithOptions(ctx, name, mqlite.DeleteQueueOpts{Force: true})` to
+authorize discard and receive the `Deleted` / `State` outcome. Reconcile a
+`deleting` or unknown outcome read-only via `ListQueues`; background cleanup
+progresses without another delete.
+
+The public identity remains the queue name; force does not introduce a lifetime
+token. Durable deletion metadata advances the current source to schema token 6,
+which refuses schema-5 files rather than migrating them.
 The console exposes **delete queue** in a plain queue's detail page and requires
-an exact name confirmation. Older brokers report the operation as unsupported.
+an exact name confirmation. A nonempty queue additionally requires a force
+checkbox and shows the locked-delivery side-effect warning. If an accepted deletion
+is still cleaning up, the console reconciles with `ListQueues`; it does not issue a
+second delete that could target a same-name replacement. Older brokers report the
+operation as unsupported.
 
 ### CreateQueue
 
@@ -514,7 +559,9 @@ Register subscription `name` under `topic` (creates its backing queue).
 ### ListQueues
 
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
-  `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`, `dedup_window_ms`}]).
+  `state`, `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`,
+  `dedup_window_ms`}]). `state` is `active` or `deleting`. Deleting queues remain
+  listed while their name is reserved, but their data plane is unavailable.
 
 ### ListSubscriptions
 
@@ -613,7 +660,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 403 | `permission_denied` | a valid key lacks permission, or key management was attempted with auth disabled (`mqlite.ErrPermissionDenied`) |
 | 404 | `not_found` | the queue or message doesn't exist; or an unknown path |
 | 409 | `already_exists` | single-message dedup conflict (same id, different body) |
-| 409 | `name_conflict` | a queue/subscription/topic name collision at creation time — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
+| 409 | `name_conflict` | a queue/subscription/topic name collision at creation time, including a name reserved by a deleting queue — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
 | 409 | `key_conflict` | a managed key ID or token digest is already registered (`mqlite.ErrKeyConflict`); no existing secret is returned |
 | 409 | `lock_lost` | settle with an expired or wrong `lock_token` |
 | 409 | `queue_not_empty` | deletion found retained messages in at least one state |
@@ -622,6 +669,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
 
-The Go SDK re-exports the sentinel errors (`mqlite.ErrLockLost`, `ErrDedupConflict`,
-`ErrInvalidArgument`, `ErrOutcomeUnknown`, …) so `errors.Is` works in both embedded and
-client mode.
+The Go SDK re-exports sentinel errors such as `mqlite.ErrLockLost`,
+`ErrDedupConflict`, `ErrInvalidArgument` and `ErrOutcomeUnknown`, so `errors.Is`
+works in both embedded and client mode. An accepted queue deletion is a successful
+operation even when its typed HTTP result is `state:"deleting"`.

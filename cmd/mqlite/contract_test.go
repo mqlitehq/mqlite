@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -179,11 +180,66 @@ func TestCLIContractGuards(t *testing.T) {
 	}
 }
 
+func TestDeleteQueueCommandReportsAcceptedState(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	db := "file:" + filepath.Join(t.TempDir(), "mq.db")
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", db)
+
+	embedded, err := mqlite.OpenEmbedded(ctx, db, mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.CreateQueue(ctx, "empty", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.CreateQueue(ctx, "busy", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	backlog := make([]mqlite.OutMessage, 5000)
+	for i := range backlog {
+		backlog[i].Body = []byte("x")
+	}
+	if _, err := embedded.Send(ctx, "busy", backlog...); err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	empty, err := captureStdout(t, func() error {
+		return cmdDeleteQueue(ctx, []string{"empty", "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emptyResult map[string]any
+	if err := json.Unmarshal([]byte(empty), &emptyResult); err != nil ||
+		!reflect.DeepEqual(emptyResult, map[string]any{"name": "empty", "deleted": true, "state": "deleted"}) {
+		t.Fatalf("empty delete = %q (%v), want deleted acknowledgement", empty, err)
+	}
+	if err := cmdDeleteQueue(ctx, []string{"busy"}); !errors.Is(err, mqlite.ErrQueueNotEmpty) {
+		t.Fatalf("non-force delete = %v, want ErrQueueNotEmpty", err)
+	}
+	pending, err := captureStdout(t, func() error {
+		return cmdDeleteQueue(ctx, []string{"busy", "--force", "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pendingResult map[string]any
+	if err := json.Unmarshal([]byte(pending), &pendingResult); err != nil ||
+		!reflect.DeepEqual(pendingResult, map[string]any{"name": "busy", "deleted": false, "state": "deleting"}) {
+		t.Fatalf("force delete = %q (%v), want accepted pending acknowledgement", pending, err)
+	}
+}
+
 // P2-5: the top-level help must list every dispatched command, so one can't silently vanish.
 func TestUsageListsAllCommands(t *testing.T) {
 	out, _ := captureStdout(t, func() error { usage(); return nil })
 	for _, cmd := range []string{
-		"serve", "create-queue", "subscribe", "send", "schedule", "cancel", "receive",
+		"serve", "create-queue", "delete-queue", "subscribe", "send", "schedule", "cancel", "receive",
 		"receive-deferred", "complete", "abandon", "reject", "defer", "renew", "peek",
 		"metrics", "status", "observe", "list", "list-subscriptions", "test-filter", "redrive",
 		"purge-dlq", "vacuum",
@@ -210,6 +266,7 @@ func TestExactArity(t *testing.T) {
 		args []string
 	}{
 		{"create-queue", cmdCreateQueue, []string{"q", "extra"}},
+		{"delete-queue", cmdDeleteQueue, []string{"q", "extra"}},
 		{"subscribe", cmdCreateSubscription, []string{"topic", "sub", "extra"}},
 		{"peek", cmdPeek, []string{"q", "extra"}},
 		{"metrics", cmdMetrics, []string{"q", "extra"}},

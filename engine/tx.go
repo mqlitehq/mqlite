@@ -20,7 +20,9 @@ type EngineTx struct {
 }
 
 // SQL returns the underlying *sql.Tx so callers can run their business writes
-// in the same transaction as the enqueue.
+// in the same transaction as the enqueue. It is for caller-owned tables;
+// directly modifying mqlite's internal tables is unsupported and can bypass
+// engine invariants.
 //
 // These are YOUR statements: mqlite cannot see where one ends and the next begins, so it cannot
 // stop issuing them on your behalf the way it does for its own (see txn in db.go). Two things
@@ -65,10 +67,7 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 		if !t.e.filterAccepts(tg, m, t.now, t.now) { // immediate send: visible_at == enqueued_at
 			continue
 		}
-		q, err := t.e.loadQueueTx(t.ctx, t.tx, tg.name)
-		if err != nil {
-			return 0, err
-		}
+		q := tg.queue
 		if q.ordering == OrderGroupFIFO && m.GroupID == "" {
 			return 0, ErrGroupRequired
 		}
@@ -130,30 +129,62 @@ func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
 	return nil
 }
 
+const resolveDirectTargetSQL = `
+	SELECT name,default_ttl_ms,dedup_window_ms,ordering_mode,lifecycle_state
+	  FROM queues WHERE name=?`
+
+const resolveTopicTargetsSQL = `
+	SELECT q.name,q.default_ttl_ms,q.dedup_window_ms,q.ordering_mode,s.filter_json
+	  FROM subscriptions s JOIN queues q ON q.name=s.subscription
+	 WHERE s.topic=? AND q.lifecycle_state='active'
+	 ORDER BY s.subscription`
+
 func (e *Engine) resolveTargetsTx(ctx context.Context, tx *txn, name string) ([]target, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT subscription, filter_json FROM subscriptions WHERE topic=? ORDER BY subscription`, name)
+	// Public creation keeps queue and topic names in one disjoint namespace, so a
+	// queue hit resolves the route completely. This read and every resulting insert
+	// share one transaction: deletion either follows this send, or this attempt sees
+	// no live target and writes nothing.
+	var q queueRow
+	var ordering string
+	err := tx.QueryRowContext(ctx, resolveDirectTargetSQL, name).Scan(
+		&q.name, &q.defaultTTLMs, &q.dedupWindowMs, &ordering, &q.lifecycleState)
+	if err == nil {
+		q.ordering = OrderingMode(ordering)
+		if err := queueLive(q); err != nil {
+			return nil, err
+		}
+		return []target{{name: q.name, queue: q}}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	rows, err := tx.QueryContext(ctx, resolveTopicTargetsSQL, name)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var subs []target
 	for rows.Next() {
-		var s string
+		var q queueRow
+		var ordering string
 		var fj sql.NullString
-		if err := rows.Scan(&s, &fj); err != nil {
+		if err := rows.Scan(&q.name, &q.defaultTTLMs, &q.dedupWindowMs, &ordering, &fj); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
-		subs = append(subs, e.targetFor(s, fj))
+		q.ordering = OrderingMode(ordering)
+		q.lifecycleState = "active"
+		subs = append(subs, e.targetFor(q, fj))
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return nil, err
 	}
-	if len(subs) > 0 {
-		return subs, nil
-	}
-	if _, err := e.loadQueueTx(ctx, tx, name); err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	return []target{{name: name}}, nil
+	if len(subs) == 0 {
+		return nil, ErrQueueNotFound
+	}
+	return subs, nil
 }

@@ -97,6 +97,8 @@ func TestServerAuthAndErrors(t *testing.T) {
 		[]byte(`{"queue":"q","messsages":[]}`), http.StatusBadRequest, "invalid_argument")
 	check("removed delete generation", http.MethodPost, wire.PathDeleteQueue, "secret",
 		[]byte(`{"name":"q","generation":"retired"}`), http.StatusBadRequest, "invalid_argument")
+	check("invalid delete force", http.MethodPost, wire.PathDeleteQueue, "secret",
+		[]byte(`{"name":"q","force":"true"}`), http.StatusBadRequest, "invalid_argument")
 	check("trailing data after body", http.MethodPost, wire.PathSend, "secret",
 		[]byte(`{"queue":"q","messages":[]}{"queue":"q"}`), http.StatusBadRequest, "invalid_argument")
 	check("empty queue name", http.MethodPost, wire.PathCreateQueue, "secret",
@@ -343,7 +345,7 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 				case wire.PathStats:
 					body = wire.MetricsRequest{Queue: "q"}
 				case wire.PathDeleteQueue:
-					body = wire.DeleteQueueRequest{Name: "target"}
+					body = wire.DeleteQueueRequest{Name: "target", Force: true}
 				case wire.PathCreateQueue:
 					body = wire.CreateQueueRequest{Name: "new"}
 				case wire.PathSubscribe:

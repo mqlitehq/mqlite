@@ -731,14 +731,11 @@ func TestTopicSubscriptionIsolation(t *testing.T) {
 }
 
 // Queue, subscription and topic names are ONE disjoint namespace (MQLITE-57).
-// resolveTargets resolves a subscribed name as a topic FIRST, so before the
-// symmetric guards a topic could shadow a live queue and every Send for that
-// name silently rerouted to the fan-out (review F2) — and, in reverse, a queue
-// created under a live topic's name could never be reached by Send. Conflicts
-// must fail loud (ErrNameConflict, HTTP 409) at creation time, in BOTH
-// directions, including against subscription backing queues and the degenerate
-// self-reference. Legal upserts (same-name queue reconfig, same (topic,name)
-// re-subscribe) stay open.
+// Without the symmetric guards, a queue and topic could share an address and a
+// Send would have no unambiguous route. Conflicts must fail loud
+// (ErrNameConflict, HTTP 409) at creation time, in BOTH directions, including
+// against subscription backing queues and the degenerate self-reference. Legal
+// upserts (same-name queue reconfig, same (topic,name) re-subscribe) stay open.
 // CreateQueue/Subscribe must reject a request that would otherwise fault a SQLite
 // CHECK / NOT NULL into an opaque 500: an empty name or an unknown kind/ordering enum
 // comes back as the typed ErrInvalidArgument (→ 400) on BOTH paths (MQLITE-86 / D5).

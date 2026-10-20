@@ -137,7 +137,7 @@ const clkTck = 100.0 // _SC_CLK_TCK on Linux
 
 type scen struct {
 	Name                              string
-	Kind                              string // produce|batch|e2e|drain|sessions
+	Kind                              string // produce|batch|e2e|drain|sessions|lifecycle
 	P, C, Batch, Groups, Prefill, Msg int
 	Sync                              string
 }
@@ -180,6 +180,21 @@ type Result struct {
 	FileBytesPerMsg float64  `json:"file_bytes_per_msg"`
 	Series          []sample `json:"series,omitempty"`
 	Note            string   `json:"note,omitempty"`
+
+	// Lifecycle churn counters are populated only by lifecycle_churn. Generic
+	// Ops/OpsPerSec count fully converged queue lifecycles; the generic latency
+	// histogram measures force-delete acknowledgement latency.
+	LifecycleCycles            int64   `json:"lifecycle_cycles,omitempty"`
+	LifecycleCreates           int64   `json:"lifecycle_creates,omitempty"`
+	LifecycleMessages          int64   `json:"lifecycle_messages,omitempty"`
+	LifecycleDeleteAttempts    int64   `json:"lifecycle_delete_attempts,omitempty"`
+	LifecycleDeleteAccepted    int64   `json:"lifecycle_delete_accepted,omitempty"`
+	LifecycleDeletePending     int64   `json:"lifecycle_delete_pending,omitempty"`
+	LifecycleMaintenancePasses int64   `json:"lifecycle_maintenance_passes,omitempty"`
+	LifecycleConvergeMeanMs    float64 `json:"lifecycle_converge_mean_ms,omitempty"`
+	LifecycleConvergeP99Ms     float64 `json:"lifecycle_converge_p99_ms,omitempty"`
+	LifecycleConvergeMaxMs     float64 `json:"lifecycle_converge_max_ms,omitempty"`
+	LifecyclePeakPayloadBytes  int64   `json:"lifecycle_peak_payload_bytes,omitempty"`
 }
 
 var dir = flag.String("dir", "/data", "data directory for bench DBs (local-file mode)")
@@ -226,6 +241,9 @@ func main() {
 		// ── Load ramp: load up then down; memory/file reclamation after idle ──
 		{Name: "rampdown_4x4", Kind: "rampdown", P: 4, C: 4, Msg: *msg},
 		{Name: "churn_consumers", Kind: "churn", P: 4, C: 4, Msg: *msg},
+		// Queue lifecycle churn is opt-in through -only. It deliberately creates
+		// pending deletions and is too write-heavy for the default remote matrix.
+		{Name: "lifecycle_churn", Kind: "lifecycle", Msg: lifecycleMessageSize(*msg)},
 		// heaviest (200k prefill) LAST so a constrained box still gets all the rest
 		{Name: "drain_4c", Kind: "drain", C: 4, Prefill: 200_000, Batch: 64, Msg: *msg},
 	}
@@ -235,6 +253,9 @@ func main() {
 
 	var results []Result
 	for _, s := range scens {
+		if s.Kind == "lifecycle" && *only == "" {
+			continue
+		}
 		if *only != "" && !strings.Contains(s.Name, *only) {
 			continue
 		}
@@ -249,6 +270,7 @@ func main() {
 
 	printTable(results)
 	printResourceTable(results)
+	printLifecycleTable(results)
 	if b, err := json.MarshalIndent(map[string]any{
 		"meta": map[string]any{
 			"gomaxprocs": runtime.GOMAXPROCS(0), "duration_s": dur.Seconds(),
@@ -277,12 +299,19 @@ func run(s scen) Result {
 		dbArg, q = "file:"+dbPath, "bench"
 	}
 	ctx := context.Background()
-	eng, err := engine.Open(ctx, engine.Options{DB: dbArg, AuthToken: os.Getenv("MQLITE_DB_AUTH_TOKEN"), Synchronous: s.Sync})
+	eng, err := engine.Open(ctx, engine.Options{
+		DB:                dbArg,
+		AuthToken:         os.Getenv("MQLITE_DB_AUTH_TOKEN"),
+		DisableBackground: s.Kind == "lifecycle",
+		Synchronous:       s.Sync,
+	})
 	if err != nil {
 		return Result{Name: s.Name, Note: "open error: " + err.Error()}
 	}
 	defer eng.Close()
-	_ = eng.CreateQueue(ctx, q, engine.QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 1000})
+	if s.Kind != "lifecycle" {
+		_ = eng.CreateQueue(ctx, q, engine.QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 1000})
+	}
 
 	res := Result{Name: s.Name, Kind: s.Kind, Producers: s.P, Consumers: s.C,
 		Batch: s.Batch, MsgSize: s.Msg, Sync: orDefault(s.Sync, "NORMAL")}
@@ -306,6 +335,7 @@ func run(s scen) Result {
 
 	var ops int64
 	var h *hist
+	var workloadErr error
 	switch s.Kind {
 	case "produce":
 		ops, h = produce(ctx, eng, q, *dur, s.P, s.Msg, "")
@@ -325,6 +355,21 @@ func run(s scen) Result {
 		ops, h = rampDownRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
 	case "churn":
 		ops, h = churnRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+	case "lifecycle":
+		var lifecycle lifecycleRunResult
+		lifecycle, workloadErr = lifecycleChurnRun(ctx, eng, q, *dur, s.Msg, samp)
+		ops, h = lifecycle.converged, lifecycle.deleteLatency
+		res.LifecycleCycles = lifecycle.cycles
+		res.LifecycleCreates = lifecycle.created
+		res.LifecycleMessages = lifecycle.messages
+		res.LifecycleDeleteAttempts = lifecycle.deleteAttempts
+		res.LifecycleDeleteAccepted = lifecycle.deleteAccepted
+		res.LifecycleDeletePending = lifecycle.deletePending
+		res.LifecycleMaintenancePasses = lifecycle.maintenancePasses
+		res.LifecycleConvergeMeanMs = lifecycle.convergeLatency.meanMs()
+		res.LifecycleConvergeP99Ms = lifecycle.convergeLatency.pctMs(.99)
+		res.LifecycleConvergeMaxMs = lifecycle.convergeLatency.maxMs()
+		res.LifecyclePeakPayloadBytes = lifecycle.peakPayloadBytes
 	}
 
 	elapsed := time.Since(t0)
@@ -370,6 +415,15 @@ func run(s scen) Result {
 	res.DBPeakMB = float64(dbPeak) / (1 << 20)
 	res.DBFinalMB = float64(fin.DB+fin.WAL) / (1 << 20)
 	res.Series = samp.downsample(24)
+	if s.Kind == "lifecycle" {
+		res.Note = "ops count queues whose force deletion converged; latency columns measure delete acknowledgement"
+	}
+	if workloadErr != nil {
+		if res.Note != "" {
+			res.Note += "; "
+		}
+		res.Note += "workload error: " + workloadErr.Error()
+	}
 	switch s.Kind { // file bytes per resident message — only where messages stay resident
 	case "produce", "batch", "props":
 		if ops > 0 {
@@ -635,6 +689,34 @@ func printResourceTable(rs []Result) {
 		fmt.Printf("%-16s %7.1fM %7.1fM %8.1fM %7.1fM %7.1fM %7.1fM %10.0f\n",
 			r.Name, r.RSSPeakMB, r.RSSFinalMB, r.HeapInusePeakMB, r.HeapReleasedMB,
 			r.DBPeakMB, r.DBFinalMB, r.FileBytesPerMsg)
+	}
+}
+
+// printLifecycleTable exposes the lifecycle-specific acceptance and convergence
+// signals without widening the main throughput table for every other scenario.
+func printLifecycleTable(rs []Result) {
+	var lifecycle []Result
+	for _, r := range rs {
+		if r.Kind == "lifecycle" {
+			lifecycle = append(lifecycle, r)
+		}
+	}
+	if len(lifecycle) == 0 {
+		return
+	}
+	fmt.Printf("\n%-16s %6s %8s %9s %8s %8s %9s %10s %10s\n",
+		"scenario", "cycles", "creates", "accept%", "pending", "passes", "convP99", "convMax", "payload")
+	fmt.Println(strings.Repeat("-", 105))
+	for _, r := range lifecycle {
+		acceptPct := 0.0
+		if r.LifecycleDeleteAttempts > 0 {
+			acceptPct = 100 * float64(r.LifecycleDeleteAccepted) / float64(r.LifecycleDeleteAttempts)
+		}
+		fmt.Printf("%-16s %6d %8d %8.2f%% %8d %8d %8.1fms %8.1fms %8.2fM\n",
+			r.Name, r.LifecycleCycles, r.LifecycleCreates, acceptPct,
+			r.LifecycleDeletePending, r.LifecycleMaintenancePasses,
+			r.LifecycleConvergeP99Ms, r.LifecycleConvergeMaxMs,
+			float64(r.LifecyclePeakPayloadBytes)/(1<<20))
 	}
 }
 

@@ -110,12 +110,14 @@ func MessageEventNames() []string {
 }
 
 func MaintenanceTaskNames() []string {
-	return []string{"locks", "scheduled", "ttl", "dedup", "receipts", "retention", "reclaim"}
+	return []string{"locks", "scheduled", "ttl", "dedup", "receipts", "retention", "reclaim", "lifecycle"}
 }
 
 type eventKey struct{ queue, event string }
 type observations struct {
 	known       map[string]bool
+	initialized bool
+	epoch       uint64
 	background  bool
 	mu          sync.Mutex
 	started     int64
@@ -125,9 +127,7 @@ type observations struct {
 	filters     [2]uint64
 }
 
-func (o *observations) add(events map[eventKey]uint64) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+func (o *observations) addLocked(events map[eventKey]uint64, epoch uint64) {
 	if o.events == nil {
 		o.events = make(map[eventKey]uint64)
 	}
@@ -135,15 +135,108 @@ func (o *observations) add(events map[eventKey]uint64) {
 		o.known = make(map[string]bool)
 	}
 	for k, n := range events {
-		o.known[k.queue] = true
+		if epoch != o.epoch || (o.initialized && !o.known[k.queue]) {
+			k.queue = ""
+		} else {
+			o.known[k.queue] = true
+		}
 		o.events[k] += n
 	}
 }
 
-func (e *Engine) recordMessage(queue, event string, n int64) {
+func (e *Engine) observationEpoch() uint64 {
+	e.observation.mu.Lock()
+	defer e.observation.mu.Unlock()
+	return e.observation.epoch
+}
+
+func (e *Engine) recordMessage(queue, event string, n int64, epochs ...uint64) {
 	if n > 0 {
-		e.observation.add(map[eventKey]uint64{{queue, event}: uint64(n)})
+		o := &e.observation
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		epoch := o.epoch
+		if len(epochs) != 0 {
+			epoch = epochs[0]
+		}
+		o.addLocked(map[eventKey]uint64{{queue, event}: uint64(n)}, epoch)
 	}
+}
+
+// commit publishes topology changes and counters after the matching database
+// commit. Events from an older topology epoch are retained in one bounded
+// retired aggregate instead of recreating a deleted queue dimension.
+func (o *observations) commit(t *txn) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for name := range t.forgottenQueues {
+		o.forgetLocked(name)
+	}
+	if len(t.rememberedQueues) > 0 {
+		if o.known == nil {
+			o.known = make(map[string]bool)
+		}
+		for name := range t.rememberedQueues {
+			o.known[name] = true
+		}
+		o.epoch++
+	}
+	o.addLocked(t.events, t.observationEpoch)
+}
+
+func (o *observations) forgetLocked(name string) {
+	delete(o.known, name)
+	for _, event := range MessageEventNames() {
+		key := eventKey{name, event}
+		if count := o.events[key]; count != 0 {
+			o.events[eventKey{"", event}] += count
+		}
+		delete(o.events, key)
+	}
+	o.epoch++
+}
+
+// reconcileTopologyLocked applies a successful database inventory only if no
+// confirmed topology callback committed after that inventory began. It also
+// repairs in-memory topology after an outcome-unknown remote commit, whose
+// callback deliberately did not run because the commit acknowledgement was lost.
+// The caller holds o.mu.
+func (o *observations) reconcileTopologyLocked(live map[string]bool, collectionEpoch uint64) {
+	if collectionEpoch != o.epoch {
+		return
+	}
+	if o.known == nil {
+		o.known = make(map[string]bool)
+	}
+	for name := range o.known {
+		if !live[name] {
+			o.forgetLocked(name)
+		}
+	}
+	o.known = live
+}
+
+// initializeObservations runs before startup recovery so existing queues receive
+// their process-local recovery counters without later retaining deleted names.
+func (e *Engine) initializeObservations(ctx context.Context) error {
+	known := make(map[string]bool)
+	if err := e.db.queryRows(ctx, `SELECT name FROM queues`, func(rows *sql.Rows) error {
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			known[name] = true
+		}
+		return rows.Err()
+	}); err != nil {
+		return err
+	}
+	e.observation.mu.Lock()
+	e.observation.known = known
+	e.observation.initialized = true
+	e.observation.mu.Unlock()
+	return nil
 }
 
 // record accumulates only this transaction attempt. inTx publishes the attempt's
@@ -156,6 +249,20 @@ func (t *txn) record(queue, event string, n int64) {
 		t.events = make(map[eventKey]uint64)
 	}
 	t.events[eventKey{queue, event}] += uint64(n)
+}
+
+func (t *txn) rememberQueue(name string) {
+	if t.rememberedQueues == nil {
+		t.rememberedQueues = make(map[string]bool)
+	}
+	t.rememberedQueues[name] = true
+}
+
+func (t *txn) forgetQueue(name string) {
+	if t.forgottenQueues == nil {
+		t.forgottenQueues = make(map[string]bool)
+	}
+	t.forgottenQueues[name] = true
 }
 
 func newDurationHistogram() DurationHistogram {
@@ -207,7 +314,7 @@ func queueSnapshotQuery(queue *string) (string, []any) {
 	}
 	query += ` GROUP BY queue) m ON m.queue=q.name`
 	if queue != nil {
-		query += ` WHERE q.name=?`
+		query += ` WHERE q.name=? AND q.lifecycle_state='active'`
 		args = append(args, *queue)
 	}
 	query += ` ORDER BY q.name`
@@ -245,6 +352,7 @@ func (e *Engine) queueSnapshot(ctx context.Context, queue *string) ([]QueueObser
 
 func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 	start := time.Now()
+	collectionEpoch := e.observationEpoch()
 	s := ObservabilitySnapshot{Backend: "memory", Messages: []MessageCounter{}, Maintenance: []MaintenanceObservation{}, Filters: []FilterCounter{}}
 	if e.db.remote {
 		s.Backend = "remote"
@@ -272,15 +380,27 @@ func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 		e.observation.lastSuccess = s.SampledAtMs
 	}
 	s.Collection.LastSuccessAtMs = e.observation.lastSuccess
-	if e.observation.known == nil {
-		e.observation.known = make(map[string]bool)
-	}
-	for _, q := range s.Queues {
-		e.observation.known[q.Queue] = true
+	// A snapshot that raced retirement must not restore a stale name. A later
+	// successful snapshot also reconciles delayed remote commit callbacks.
+	if err == nil {
+		live := make(map[string]bool, len(s.Queues))
+		for _, q := range s.Queues {
+			live[q.Queue] = true
+		}
+		e.observation.reconcileTopologyLocked(live, collectionEpoch)
 	}
 	for queue := range e.observation.known {
 		for _, event := range MessageEventNames() {
 			s.Messages = append(s.Messages, MessageCounter{Queue: queue, Event: event, Count: e.observation.events[eventKey{queue, event}]})
+		}
+	}
+	hasRetired := false
+	for _, event := range MessageEventNames() {
+		hasRetired = hasRetired || e.observation.events[eventKey{"", event}] != 0
+	}
+	if hasRetired {
+		for _, event := range MessageEventNames() {
+			s.Messages = append(s.Messages, MessageCounter{Queue: "", Event: event, Count: e.observation.events[eventKey{"", event}]})
 		}
 	}
 	for _, task := range MaintenanceTaskNames() {
@@ -527,15 +647,6 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 	err := e.inTxUnobserved(ctx, fn)
 	e.db.finishStorage(a, err)
 	return err
-}
-
-func (e *Engine) rememberQueue(name string) {
-	e.observation.mu.Lock()
-	defer e.observation.mu.Unlock()
-	if e.observation.known == nil {
-		e.observation.known = make(map[string]bool)
-	}
-	e.observation.known[name] = true
 }
 
 // mutateMessages records the exact returned rows after a confirmed transaction.

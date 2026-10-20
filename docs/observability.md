@@ -200,7 +200,7 @@ use Unix seconds in Prometheus and epoch milliseconds in native JSON.
 | `mqlite_queue_retained_messages` | gauge | `queue`; all retained rows including unexpected states |
 | `mqlite_queue_unexpected_messages` | gauge | `queue`; retained rows outside the five normal states |
 | `mqlite_queue_oldest_message_age_seconds` | gauge | `queue`; original enqueue age of oldest active/locked row, 0 if none |
-| `mqlite_message_events_total` | counter | `queue`, `event`; confirmed effects defined below |
+| `mqlite_message_events_total` | counter | `queue`, `event`; confirmed effects defined below; `queue=""` combines retired queues |
 | `mqlite_rpc_requests_total` | counter | `rpc`, `code`; registered RPC requests including authentication rejection |
 | `mqlite_rpc_request_duration_seconds_total` | counter | Same labels; cumulative whole-request elapsed time, including authentication |
 | `mqlite_rpc_duration_seconds` | histogram | `rpc`; post-authentication handler latency, preserving the existing timing scope |
@@ -239,8 +239,13 @@ and registered RPC/result combinations are initialized to zero, so the first
 event can be detected after an earlier successful scrape. Use `rate`/`increase`
 across observed samples; a first scrape after an event cannot reconstruct its time.
 Maintenance tasks are `locks`, `scheduled`, `ttl`,
-`dedup`, `receipts`, `retention`, `reclaim`. Check enabled status and each task's
-actual cadence before alerting on its last-success time.
+`dedup`, `receipts`, `retention`, `reclaim`, `lifecycle`. `lifecycle` is the
+event-driven bounded cleanup pass for queues already marked deleting. Unfinished
+work is paced at one continuation pass per second; an idle store does not run the
+task, so a quiet `last_success` timestamp is expected. An uncertain remote delete
+commit temporarily schedules up to 30 one-second discovery passes even when the
+first inventory read is empty. Check enabled status and
+each task's actual cadence before alerting on its last-success time.
 Canceled passes during normal shutdown are `interrupted`, not successful passes
 or maintenance errors; they do not advance the last-success timestamp.
 Filter counters cover compilation/evaluation failures while routing published
@@ -255,10 +260,19 @@ committed effect. An uncertain remote outcome is not classified as a known
 rollback. Counters are process-local and reset at restart; unobserved activity
 before a crash can be lost. They are operational measurements, not a durable
 billing or business audit ledger.
-Custom raw SQL through `EngineTx.SQL` is not attributed to message-effect events.
-Queue gauges still report the actual retained database rows, including unexpected
-states; do not use event counters to reconstruct changes made outside the normal
-message operations.
+
+After physical queue deletion completes, MQLite removes that queue's named counter
+series and folds its existing counts into one bounded retired aggregate. Native
+observations and Prometheus expose this aggregate with `queue=""`; the empty label
+does not name an addressable queue. It combines all retired queue names and any
+late transaction effects from an older queue-topology epoch. Recreating the same
+name starts a fresh named series while the prior counts remain in the aggregate.
+Include `queue=""` when querying total process activity, or filter it out when a
+query is intended to describe current named queues only.
+
+Raw SQL through `EngineTx.SQL` is supported only for caller-owned tables; those
+writes produce no message-effect events. Direct access to mqlite-owned tables is
+unsupported and can bypass lifecycle and observability invariants.
 
 | Event | Meaning |
 | --- | --- |
@@ -399,6 +413,10 @@ connection failure/recovery and persistence/counter reset after broker restart.
 Managed-cloud/Kubernetes deployment validation remains environment-specific.
 
 DeleteQueue is an additive RPC observation extension. New brokers include its
-request counters and the `queue_not_empty` outcome. The required decoder baseline
-is unchanged, so new clients continue to accept observations from older brokers.
-An occupied-queue rejection is an application outcome, not a storage failure.
+request counters and the `queue_not_empty` outcome. `ListQueues.state`, rather
+than the canonical observation's queue gauges, identifies a queue whose cleanup
+is pending. The lifecycle maintenance row reports cleanup pass health; a force
+discard does not masquerade as normal completion or retention message effects.
+The required decoder baseline is unchanged, so new clients continue to accept
+observations from older brokers. An occupied-queue rejection is an application
+outcome, not a storage failure.

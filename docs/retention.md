@@ -97,20 +97,51 @@ producers. Rules:
 - **WAL-friendly.** Many small commits let WAL checkpoints interleave; one giant
   DELETE balloons the WAL and blocks checkpointing.
 
+## Forced queue retirement
+
+Queue deletion is empty-only by default and is separate from automatic retention.
+`force=true` is operator authorization to discard every message state, including
+locked deliveries, plus queue-owned deduplication and replay records. A locked
+delivery may already have caused an external side effect; deleting its stored row
+cannot undo that effect.
+
+An accepted delete first commits `state=deleting`. That immediately rejects new
+queue work and reserves the name while physical cleanup proceeds. The foreground
+request removes at most 1,000 physical rows and targets about 8 MiB. Every
+one-second background pass globally caps cleanup at 4,096 rows and targets about
+8 MiB, across at most 32
+deleting queues locally or one queue on remote Turso/libSQL. The smaller remote
+resource cap bounds network round trips inside one write transaction; a durable
+cursor rotates fairly on both backends. Startup runs one recovery pass. These
+bounds keep one large retirement from holding the single writer indefinitely and
+make a crash restartable. One individually oversized row may exceed the byte
+target so it cannot block cleanup forever.
+
+Bursts of forced deletion across deep queues can still create a cleanup backlog, grow
+the WAL and delay name reuse. Prefer draining and reusing stable queues for routine
+traffic; reserve force for intentional abandonment. List queues and wait for the
+`deleting` row to disappear before reusing its name. The accepted discard
+permission is already durable and background cleanup continues on its own. Do not
+use another delete as a status check or automatically replay a lifecycle write
+after a transport failure, redirect or malformed acknowledgement.
+
 ## Space reclamation
 
 Deleting rows frees SQLite *pages*. mqlite opens every DB with
 `auto_vacuum=INCREMENTAL` (set at creation), and a background janitor runs
-`PRAGMA incremental_vacuum` once enough pages free up — so the file grows to the peak
-backlog and then **shrinks back gradually** as the queue drains, without a full rewrite
-or a lock on the hot path. The mechanisms, in order of cost:
+`PRAGMA incremental_vacuum` once enough pages free up. Row deletion therefore
+makes pages logically free and immediately reusable, but it does not promise an
+immediate reduction in the database or WAL file visible to the OS. Local files
+**shrink back gradually** without a full rewrite. The mechanisms, in order of cost:
 
 - **Reuse + background incremental_vacuum (default).** Free pages are reused by later
-  inserts, and the janitor hands the surplus back to the OS a bounded chunk at a time.
+  inserts. Every 60 seconds, when the freelist contains at least 256 pages, the
+  janitor checkpoints and returns at most 256 pages to the OS.
   For a steady-state queue the file churns in place; after a one-off DLQ flush it recovers
-  the disk on its own. No action needed.
+  the disk over multiple passes. No action is normally needed.
 - **`mqlite vacuum`** runs the same checkpoint → `incremental_vacuum` → checkpoint
-  sequence on demand, to reclaim immediately instead of waiting for the janitor.
+  sequence on demand and exhausts the current freelist instead of using the
+  background 256-page bound.
 - **`mqlite vacuum --full`** (a full `VACUUM`) rewrites the whole DB and takes a
   **global write lock** for the duration — unacceptable on the hot path; only ever in an
   explicit maintenance window, never automatic.
@@ -233,6 +264,6 @@ MQLITE-31  incremental_vacuum maintenance step (CLI `vacuum`, --full) for disk  
 
 Status: **MQLITE-28 and MQLITE-29 are shipped** — the broker bounds its DLQ by age +
 count + bytes on by default (Tier 1), and each queue may override those bounds with its
-own age/count/bytes (Tier 2). **MQLITE-30** is a short README addition;
-**MQLITE-31** only when a deployment actually needs to return disk to the OS after a
-large DLQ flush.
+own age/count/bytes (Tier 2). **MQLITE-30** is a short README addition.
+**MQLITE-31 is shipped**: the broker performs bounded automatic reclaim, while
+`mqlite vacuum` remains the operator path for immediate full incremental reclaim.

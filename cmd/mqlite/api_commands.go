@@ -326,6 +326,29 @@ func cmdStatus(ctx context.Context, args []string) error {
 	return nil
 }
 
+// ─── delete-queue: empty-only by default, explicit discard with --force ─────────────
+func cmdDeleteQueue(ctx context.Context, args []string) error {
+	fs := newFlags("delete-queue")
+	force := fs.Bool("force", false, "discard retained messages while deleting the queue")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: delete-queue <name> [--force]")
+	}
+	c, err := dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	result, err := c.DeleteQueueWithOptions(ctx, pos[0], mqlite.DeleteQueueOpts{Force: *force})
+	if err != nil {
+		return err
+	}
+	return okResult(map[string]any{"name": pos[0], "deleted": result.Deleted, "state": result.State}, "name", "deleted", "state")
+}
+
 // ─── list-subscriptions: topic membership + filter expressions ──────────────────────
 func cmdListSubscriptions(ctx context.Context, args []string) error {
 	fs := newFlags("list-subscriptions")

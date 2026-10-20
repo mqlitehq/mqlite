@@ -64,7 +64,7 @@ func TestTursoIntegration(t *testing.T) {
 	}
 	token := os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	e, err := Open(ctx, Options{DB: dsn, AuthToken: token})
@@ -82,10 +82,65 @@ func TestTursoIntegration(t *testing.T) {
 
 	// unique queue per run so repeated runs don't collide.
 	q := fmt.Sprintf("itest_%d", time.Now().UnixNano())
-	cleanupTursoQueues(t, e, q)
+	deleteQ := q + "_delete"
+	raceQ := q + "_race"
+	cleanupTursoQueues(t, e, q, deleteQ, raceQ)
 	if err := e.CreateQueue(ctx, q, QueueConfig{LockDurationMs: 30000, MaxDeliveryCount: 5}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}
+	if err := e.CreateQueue(ctx, deleteQ, QueueConfig{}); err != nil {
+		t.Fatalf("create lifecycle queue: %v", err)
+	}
+	if _, err := e.SendOne(ctx, deleteQ, OutMessage{Body: []byte("discard")}); err != nil {
+		t.Fatalf("seed lifecycle queue: %v", err)
+	}
+	if _, err := e.db.exec(ctx, `DELETE FROM queues WHERE name=?`, deleteQ); err == nil {
+		t.Fatal("remote message-parent trigger allowed a non-empty queue delete")
+	} else {
+		requireMessageParentFailure(t, err)
+	}
+	deleted, err := e.DeleteQueueWithOptions(ctx, deleteQ, DeleteOptions{Force: true})
+	if err != nil || !deleted.Deleted || deleted.State != "deleted" {
+		t.Fatalf("force delete lifecycle queue: %+v %v", deleted, err)
+	}
+	t.Log("Turso lifecycle triggers OK: non-empty parent rejected and bounded force delete converged")
+
+	if err := e.CreateQueue(ctx, raceQ, QueueConfig{}); err != nil {
+		t.Fatalf("create lifecycle race queue: %v", err)
+	}
+	start := make(chan struct{})
+	sent := make(chan error, 1)
+	retired := make(chan struct {
+		result DeleteResult
+		err    error
+	}, 1)
+	go func() {
+		<-start
+		_, err := e.SendOne(ctx, raceQ, OutMessage{Body: []byte("race")})
+		sent <- err
+	}()
+	go func() {
+		<-start
+		result, err := e.DeleteQueueWithOptions(ctx, raceQ, DeleteOptions{Force: true})
+		retired <- struct {
+			result DeleteResult
+			err    error
+		}{result: result, err: err}
+	}()
+	close(start)
+	if err := <-sent; err != nil && !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("concurrent remote send: %v", err)
+	}
+	retirement := <-retired
+	if retirement.err != nil || !retirement.result.Deleted || retirement.result.State != "deleted" {
+		t.Fatalf("concurrent remote force delete: %+v %v", retirement.result, retirement.err)
+	}
+	var orphans int
+	if err := e.db.queryRowScan(ctx, []any{&orphans}, `SELECT COUNT(*) FROM messages m
+		LEFT JOIN queues q ON q.name=m.queue WHERE m.queue=? AND q.name IS NULL`, raceQ); err != nil || orphans != 0 {
+		t.Fatalf("concurrent remote lifecycle left %d orphan messages: %v", orphans, err)
+	}
+	t.Log("Turso lifecycle race smoke passed: concurrent send and force deletion left no orphan")
 
 	// send a batch
 	seqs, err := e.Send(ctx, q,

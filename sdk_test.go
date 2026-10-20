@@ -36,6 +36,12 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 // ─── Harness ────────────────────────────────────────────────────────────────
 
 // newBroker starts an in-memory broker over httptest and returns a connected client.
@@ -827,8 +833,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "e445da85405f5ee661a0f628889f8a2a6807be96955342e1c23e6e0b57876205",
-		"concepts.html": "02fa2c15ab8477db197d04cb80d0e3c5ca4de8211878ee2f12d99af997b20b84",
+		"concepts.md":   "9578bd27860e471fcf75e6557a2acf30c3aca5a2ce6f75a2ebf8830476a3a3aa",
+		"concepts.html": "f51ba99b26b1aef2131a5b47456f2fabcba8aa1bdf12d454e1d520392df36772",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {
@@ -2043,30 +2049,269 @@ func TestRemoteDeleteQueue(t *testing.T) {
 	}
 }
 
-func TestDeleteQueueRequiresAcknowledgement(t *testing.T) {
+func TestRemoteListQueuesDefaultsLegacyStateToActive(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wire.PathListQueues {
+			t.Errorf("path = %q, want %q", r.URL.Path, wire.PathListQueues)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"queues":[{"name":"legacy","kind":"queue","lock_duration_ms":30000,"max_delivery_count":10,"default_ttl_ms":0,"dedup_window_ms":0}]}`))
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	queues, err := client.ListQueues(context.Background())
+	if err != nil || len(queues) != 1 || queues[0].Name != "legacy" || queues[0].State != "active" {
+		t.Fatalf("legacy queue inventory = %+v, %v", queues, err)
+	}
+}
+
+func TestQueueForceDeleteSDK(t *testing.T) {
+	type deleteAPI interface {
+		CreateQueue(context.Context, string, mqlite.QueueConfig) error
+		Send(context.Context, string, ...mqlite.OutMessage) ([]int64, error)
+		SendOne(context.Context, string, mqlite.OutMessage, ...mqlite.SendOpts) (int64, error)
+		DeleteQueue(context.Context, string) error
+		DeleteQueueWithOptions(context.Context, string, ...mqlite.DeleteQueueOpts) (mqlite.DeleteResult, error)
+		ListQueues(context.Context) ([]mqlite.QueueInfo, error)
+	}
+	for _, remote := range []bool{false, true} {
+		t.Run(fmt.Sprintf("remote=%t", remote), func(t *testing.T) {
+			ctx := context.Background()
+			embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer embedded.Close()
+			var api deleteAPI = embedded
+			if remote {
+				ts := httptest.NewServer(server.New(embedded.Engine(), nil).Handler())
+				defer ts.Close()
+				client, err := mqlite.Open(ctx, ts.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				api = client
+			}
+
+			if err := api.CreateQueue(ctx, "discard", mqlite.QueueConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			backlog := make([]mqlite.OutMessage, 5000)
+			for i := range backlog {
+				backlog[i].Body = []byte("discard")
+			}
+			if _, err := api.Send(ctx, "discard", backlog...); err != nil {
+				t.Fatal(err)
+			}
+			result, err := api.DeleteQueueWithOptions(ctx, "discard", mqlite.DeleteQueueOpts{Force: true})
+			if err != nil || result.Deleted || result.State != "deleting" {
+				t.Fatalf("initial force delete = %+v, %v", result, err)
+			}
+			queues, err := api.ListQueues(ctx)
+			if err != nil || len(queues) != 1 || queues[0].Name != "discard" || queues[0].State != "deleting" {
+				t.Fatalf("pending inventory = %+v, %v", queues, err)
+			}
+			if _, err := api.SendOne(ctx, "discard", mqlite.OutMessage{Body: []byte("late")}); err == nil {
+				t.Fatal("retired queue accepted a new message")
+			}
+			for pass := 0; pass < 10 && len(queues) != 0; pass++ {
+				embedded.Engine().RunMaintenanceOnce(ctx)
+				queues, err = api.ListQueues(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(queues) != 0 {
+				t.Fatalf("deleted queue still listed = %+v, %v", queues, err)
+			}
+		})
+	}
+}
+
+func TestRemoteDeleteQueueLostAcknowledgementCanBeReconciled(t *testing.T) {
+	ctx := context.Background()
+	embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	if err := embedded.CreateQueue(ctx, "discard", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	backlog := make([]mqlite.OutMessage, 1500)
+	for i := range backlog {
+		backlog[i].Body = []byte("discard")
+	}
+	if _, err := embedded.Send(ctx, "discard", backlog...); err != nil {
+		t.Fatal(err)
+	}
+
+	realHandler := server.New(embedded.Engine(), nil).Handler()
+	var loseFirstAck atomic.Bool
+	var deleteCalls atomic.Int32
+	loseFirstAck.Store(true)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wire.PathDeleteQueue {
+			deleteCalls.Add(1)
+		}
+		if r.URL.Path == wire.PathDeleteQueue && loseFirstAck.CompareAndSwap(true, false) {
+			recorder := httptest.NewRecorder()
+			realHandler.ServeHTTP(recorder, r)
+			ack, decodeErr := wire.DecodeDeleteQueueResponse(recorder.Body.Bytes())
+			if recorder.Code != http.StatusOK || decodeErr != nil || ack.Deleted || ack.State != "deleting" {
+				t.Errorf("broker pending acknowledgement = status %d body %q: %v", recorder.Code, recorder.Body.String(), decodeErr)
+			}
+			partial := []byte(`{"deleted":false`)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", fmt.Sprint(len(partial)+32))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(partial)
+			return
+		}
+		realHandler.ServeHTTP(w, r)
+	}))
+	defer proxy.Close()
+	client, err := mqlite.Open(ctx, proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, err := client.DeleteQueueWithOptions(ctx, "discard", mqlite.DeleteQueueOpts{Force: true}); !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("lost acknowledgement = %v, want ErrOutcomeUnknown", err)
+	}
+	queues, err := client.ListQueues(ctx)
+	if err != nil || len(queues) != 1 || queues[0].Name != "discard" || queues[0].State != "deleting" {
+		t.Fatalf("reconciliation inventory = %+v, %v", queues, err)
+	}
+	embedded.Engine().RunMaintenanceOnce(ctx)
+	queues, err = client.ListQueues(ctx)
+	if err != nil || len(queues) != 0 {
+		t.Fatalf("completed deletion inventory = %+v, %v", queues, err)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("reconciliation issued %d deletion requests, want exactly one", got)
+	}
+}
+
+func TestRemoteDeleteQueueTransportFailureIsOutcomeUnknown(t *testing.T) {
+	transportFailure := errors.New("connection dropped")
+	var calls atomic.Int32
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, transportFailure
+	})}
+	client, err := mqlite.Open(context.Background(), "http://broker.invalid", mqlite.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.DeleteQueueWithOptions(context.Background(), "q", mqlite.DeleteQueueOpts{Force: true})
+	if !errors.Is(err, mqlite.ErrOutcomeUnknown) || errors.Is(err, transportFailure) || !strings.Contains(err.Error(), transportFailure.Error()) {
+		t.Fatalf("delete transport failure = %v, want only outcome unknown in the error chain and the transport cause as text", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("delete made %d transport attempts, want one", got)
+	}
+
+	err = client.CreateQueue(context.Background(), "q", mqlite.QueueConfig{})
+	if !errors.Is(err, transportFailure) || errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("non-delete transport failure = %v, want unchanged transport cause", err)
+	}
+}
+
+func TestRemoteDeleteQueueDoesNotFollowRedirect(t *testing.T) {
+	var sourceCalls atomic.Int32
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetCalls.Add(1)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sourceCalls.Add(1)
+		http.Redirect(w, r, target.URL+wire.PathDeleteQueue, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	client, err := mqlite.Open(context.Background(), source.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.DeleteQueueWithOptions(context.Background(), "q", mqlite.DeleteQueueOpts{Force: true})
+	if !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("redirected delete = %v, want outcome unknown", err)
+	}
+	if got := sourceCalls.Load(); got != 1 {
+		t.Fatalf("source received %d deletion requests, want one", got)
+	}
+	if got := targetCalls.Load(); got != 0 {
+		t.Fatalf("redirect target received %d deletion requests, want zero", got)
+	}
+}
+
+func TestDeleteQueueAcknowledgementContract(t *testing.T) {
 	type capturedRequest struct {
 		path string
 		body map[string]any
 		err  error
 	}
-	request := make(chan capturedRequest, 1)
-	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		err := json.NewDecoder(r.Body).Decode(&body)
-		request <- capturedRequest{path: r.URL.Path, body: body, err: err}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer stub.Close()
-	c, err := mqlite.Open(context.Background(), stub.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.DeleteQueue(context.Background(), "q"); !errors.Is(err, mqlite.ErrOutcomeUnknown) {
-		t.Fatalf("missing acknowledgement: %v", err)
-	}
-	got := <-request
-	if got.err != nil || got.path != wire.PathDeleteQueue || !reflect.DeepEqual(got.body, map[string]any{"name": "q"}) {
-		t.Fatalf("delete request = path %q body %v err %v", got.path, got.body, got.err)
+	for _, tc := range []struct {
+		name       string
+		response   string
+		force      bool
+		want       mqlite.DeleteResult
+		wantErr    error
+		useWrapper bool
+	}{
+		{name: "deleted", response: `{"deleted":true,"state":"deleted"}`, want: mqlite.DeleteResult{Deleted: true, State: "deleted"}},
+		{name: "pending", response: `{"deleted":false,"state":"deleting"}`, force: true, want: mqlite.DeleteResult{State: "deleting"}},
+		{name: "wrapper pending", response: `{"deleted":false,"state":"deleting"}`, useWrapper: true},
+		{name: "missing", response: `{}`, wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "mismatched deleted", response: `{"deleted":true,"state":"deleting"}`, wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "mismatched pending", response: `{"deleted":false,"state":"deleted"}`, wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "unknown state", response: `{"deleted":false,"state":"unknown"}`, wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "missing deleted", response: `{"state":"deleting"}`, wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "wrong deleted type", response: `{"deleted":"false","state":"deleting"}`, wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "trailing object", response: `{"deleted":false,"state":"deleting"}{}`, wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "oversized", response: strings.Repeat(" ", wire.MaxDeleteQueueResponseBytes+1), wantErr: mqlite.ErrOutcomeUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := make(chan capturedRequest, 1)
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				err := json.NewDecoder(r.Body).Decode(&body)
+				request <- capturedRequest{path: r.URL.Path, body: body, err: err}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			var result mqlite.DeleteResult
+			if tc.useWrapper {
+				err = client.DeleteQueue(context.Background(), "q")
+			} else {
+				result, err = client.DeleteQueueWithOptions(context.Background(), "q", mqlite.DeleteQueueOpts{Force: tc.force})
+			}
+			if !errors.Is(err, tc.wantErr) || tc.wantErr == nil && result != tc.want {
+				t.Fatalf("result = %+v, error = %v; want %+v, %v", result, err, tc.want, tc.wantErr)
+			}
+			got := <-request
+			wantBody := map[string]any{"name": "q"}
+			if tc.force {
+				wantBody["force"] = true
+			}
+			if got.err != nil || got.path != wire.PathDeleteQueue || !reflect.DeepEqual(got.body, wantBody) {
+				t.Fatalf("delete request = path %q body %v err %v", got.path, got.body, got.err)
+			}
+		})
 	}
 }

@@ -157,7 +157,7 @@ class Drill:
         check(status.get("version") == self.args.expected_version.partition("-rc.")[0]
               and status.get("auth") is True and status.get("backend") == "local file"
               and status.get("location") == "/fault/db/mq.db"
-              and status.get("schema_version") == "5" and status.get("ping_ms", -1) >= 0,
+              and status.get("schema_version") == "6" and status.get("ping_ms", -1) >= 0,
               f"unexpected candidate runtime metadata: {status}")
         self.record("runtime.jsonl", status)
         check(self.shell("cat /fault/identity").stdout == self.run_id,
@@ -262,6 +262,10 @@ class Drill:
             db.execute("PRAGMA query_only=ON")
             check(db.execute("PRAGMA integrity_check").fetchall() == [("ok",)], "integrity_check failed")
             check(db.execute("PRAGMA foreign_key_check").fetchall() == [], "foreign_key_check failed")
+            check(db.execute(
+                "SELECT 1 FROM messages m LEFT JOIN queues q ON q.name=m.queue "
+                "WHERE q.name IS NULL LIMIT 1").fetchone() is None,
+                "message-parent invariant failed")
             db.row_factory = sqlite3.Row
             rows = db.execute("SELECT * FROM messages ORDER BY id").fetchall()
             check({row["message_id"] for row in rows} == (set() if drained else set(self.acks))

@@ -107,7 +107,8 @@ For local transactions, `tx.Context()` is deliberately not cancellable. Raw `tx.
 statements can still execute after the original caller cancels: check `ctx.Err()` between
 business statements and return promptly. Mqlite-owned statements such as `tx.SendOne` have
 their own checks. Cancellation observed before commit rolls back all the transaction's
-writes, even if the callback returns nil. See the
+writes, even if the callback returns nil. Use raw SQL only with caller-owned tables;
+directly modifying mqlite's internal tables is unsupported. See the
 [cancellation contract](conformance.md#13--cancellation-context-deadlines).
 
 ## 3. Remote client + hands-off consumer

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -63,6 +64,32 @@ func BenchmarkSendBatch64(b *testing.B) {
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(b.N*batch)/b.Elapsed().Seconds(), "msg/s")
+}
+
+// BenchmarkTopicFanout32 exercises routing plus enqueue for a stable topic
+// roster. Queue configuration is carried by the roster JOIN; an accidental
+// per-subscription metadata lookup makes this path visibly regress as fanout
+// grows, especially on a remote store where every lookup is a round trip.
+func BenchmarkTopicFanout32(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	const subscriptions = 32
+	for i := 0; i < subscriptions; i++ {
+		if err := e.Subscribe(ctx, "topic", fmt.Sprintf("sub-%02d", i), nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+	body := make([]byte, 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.SendOne(ctx, "topic", OutMessage{Body: body}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "publish/s")
+	b.ReportMetric(float64(b.N*subscriptions)/b.Elapsed().Seconds(), "delivery/s")
 }
 
 func BenchmarkReceiveComplete(b *testing.B) {

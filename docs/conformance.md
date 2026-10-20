@@ -243,14 +243,20 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
   tests. The remote (Turso) path retries transient errors with backoff; the local
   path never retries. *(engine/storage_test.go, engine/turso_test.go)*
-- **10.4** Compatible access-key table and index additions MUST preserve schema token 5
-  and existing v0.3.0 data. Verify real upgrade/downgrade behavior and complete
-  backup/restore content, including active, expired and revoked credentials.
+- **10.4** Access-key table and index additions remain independently additive
+  within the current schema token 6. Verify complete backup/restore content,
+  including active, expired and revoked credentials.
   An incompatible existing object named `access_keys` or
   `idx_access_keys_created` MUST fail rather than be overwritten or silently trusted.
   *(engine/storage_test.go: TestAccessKeySchemaAdditiveCompatibility,
   TestAccessKeySchemaConflict, TestAccessKeyCreationIndexUpgradeAndConflicts;
   test/production/restore/run.py, compat.py)*
+- **10.5** Durable queue lifecycle columns and cleanup indexes make current schema
+  token 6 incompatible with the released schema-5 layout. Each binary MUST refuse
+  the other's database rather than adding columns, restamping the token or
+  partially opening it. Operators must create a fresh database and preserve the
+  matching old binary/backup pair. *(engine/storage_test.go:
+  TestSchemaVersionGuard, TestSchemaContentPinnedToVersionToken)*
 
 ## 11 · Subscription filters
 
@@ -288,9 +294,11 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   transaction).
   *(engine/functional_test.go: TestTopicQueueNamespaceDisjoint,
   TestTopicSubscriptionIsolation)*
-- **12.2** Because names are disjoint, send/publish resolution (topic-first, else
-  queue, else `ErrQueueNotFound`) is **unambiguous** — a `Send` can never be silently
-  rerouted between a queue and a same-named topic.
+- **12.2** Because names are disjoint, send/publish resolution is **unambiguous**:
+  an active plain-queue or backing-queue name addresses that queue; an implicit
+  topic name addresses its active subscription rows; any other name returns
+  `ErrQueueNotFound`. Behavior after directly altering internal tables to create a
+  queue/topic collision is outside the public contract.
   *(engine/functional_test.go: TestTopicQueueNamespaceDisjoint)*
 
 ## 13 · Cancellation (context deadlines)
@@ -319,7 +327,8 @@ changelog, because a caller can observe every one of them.
 - **13.4** Inside a local transaction, **mqlite-owned statements** (including `EngineTx.SendOne`)
   check the caller's context before each statement: one already running finishes, and a statement
   whose check observes cancellation MUST NOT begin. `EngineTx.SQL()` exposes a raw `*sql.Tx`
-  outside those guards. Its statements MUST use `tx.Context()` to avoid interrupting local SQLite;
+  outside those guards for caller-owned tables; directly modifying mqlite-owned tables is outside
+  the supported contract. Its statements MUST use `tx.Context()` to avoid interrupting local SQLite;
   that context is deliberately not cancellable, so raw SQL can still execute after the caller
   cancels. Callers MUST check the original context between their own statements and return promptly.
   Mqlite cannot interrupt the callback or release the single writer before it returns. Cancellation

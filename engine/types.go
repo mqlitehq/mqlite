@@ -161,6 +161,7 @@ type Metrics struct {
 
 // QueueInfo describes a queue for listing.
 type QueueInfo struct {
+	State            string `json:"state"`
 	Name             string `json:"name"`
 	Kind             string `json:"kind"`
 	LockDurationMs   int64  `json:"lock_duration_ms"`

@@ -12,6 +12,7 @@ MSG="${BENCH_MSG:-256}"
 EXTRA=""
 [ -n "${BENCH_PREFILLCAP:-}" ] && EXTRA="$EXTRA -prefillcap $BENCH_PREFILLCAP"
 [ -n "${BENCH_DB:-}" ] && EXTRA="$EXTRA -db $BENCH_DB"
+[ -n "${BENCH_ONLY:-}" ] && EXTRA="$EXTRA -only $BENCH_ONLY"
 
 # environment facts (so the report is reproducible / honest about the host)
 {

@@ -58,6 +58,9 @@ and error reference: [api-reference.md](api-reference.md).
 > **v0.2.0 uses port 8080 and schema token 2.** Its database cannot be opened by
 > v0.3.2: preserve the old binary/database pair and follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before replacing it.
+> The current unreleased source uses schema token **6** for durable queue deletion
+> state and does not open these schema-5 databases. Build it against a fresh
+> database after taking a consistent backup and accounting for retained work.
 
 The published image is multi-arch (amd64 + arm64):
 
@@ -205,15 +208,15 @@ Follow the [production runbook](operations.md#consistent-backups) for read-only
 online snapshots, offline directory copies, isolated restore validation and rollback.
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
-**v0.2.0 databases use schema 2; v0.3.0 and later source currently use schema 5.**
-v0.3.3 is retracted even though its database token is compatible. There is no
-in-place migration from schema 2. Before upgrading from v0.2.0, account for retained
-work in every state, keep the old binary/database pair, and create the v0.3.2
-database separately. Upgrading from v0.3.0 reuses the existing database and adds
-managed-key storage; upgrading from v0.3.1 leaves the schema unchanged. Take a
-consistent backup first. `Observe` and configured monitor credentials require
-v0.3.2; restore compatible monitoring configuration when rolling back. Follow the
-runbook when testing the current unreleased source.
+**v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and retracted
+v0.3.3 use schema 5; current unreleased source uses schema 6.** There is no
+in-place migration between these tokens. Before changing tokens, account for
+retained work in every state, keep the old binary/database pair and a consistent
+backup, and create the candidate database separately. Do not restamp an old file.
+Within the tagged schema-5 line, v0.3.0 → v0.3.1 adds compatible managed-key
+storage and v0.3.1 → v0.3.2 leaves the schema unchanged. `Observe` and configured
+monitor credentials require v0.3.2; restore compatible monitoring configuration
+when rolling back. Follow the runbook when testing the current unreleased source.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).
 
 ## Turso (remote libSQL)
@@ -249,9 +252,10 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 
 - [ ] `MQLITE_TOKENS` set (auth on); rotate by updating it.
 - [ ] HTTPS in front (Fly `force_https`, or a reverse proxy for systemd/Docker).
-- [ ] Persistent storage sized for the **peak** backlog — the file grows to peak, then a
-      background janitor returns freed pages to the OS (`incremental_vacuum`) so it shrinks
-      back gradually as the queue drains ([retention.md](retention.md)).
+- [ ] Persistent storage sized for the **peak** backlog — deleted pages are reusable
+      immediately, while local DB/WAL files shrink gradually. Every 60 seconds the
+      broker reclaims at most 256 pages once at least 256 are free
+      ([retention.md](retention.md)).
 - [ ] DLQ retention left on (default) or tuned for your volume.
 - [ ] Pinned image/binary version and recorded checksum/digest.
 - [ ] `MQLITE_SYNC=FULL` for acknowledged local commits that must survive power loss.

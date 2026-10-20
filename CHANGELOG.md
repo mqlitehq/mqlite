@@ -12,14 +12,56 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Force-delete queues with bounded cleanup (MQLITE-126)
+
+- Keep queue deletion empty-only by default. `force=true` is an explicit,
+  persisted authorization to discard every retained message state plus queue-owned
+  deduplication, settlement-receipt and receive-attempt records.
+- Retire an accepted queue durably as `deleting` before cleanup. Queue work is
+  immediately rejected without taking effect, its name remains reserved, and
+  `ListQueues` reports the state until bounded cleanup removes the row. Cleanup
+  resumes after a restart; one foreground request removes at most 1,000 physical
+  rows/about 8 MiB. Accepted pending deletes wake an event-driven worker, whose
+  continuation passes are one second apart and each globally caps cleanup at 4,096
+  rows/about 8 MiB across at most 32 queues locally; idle stores do not poll. Remote Turso/libSQL cleans
+  one queue per pass so network round trips do not extend one write transaction
+  across a large resource batch; the durable cursor still rotates fairly. One
+  individually oversized row may exceed the byte target so cleanup always progresses.
+  An uncertain remote delete commit arms a bounded 30-second discovery window;
+  normal idle brokers perform no lifecycle polling.
+- Keep the final queue-row retirement bounded even beside an unrelated deep
+  backlog. Transactional target resolution and indexed parent guards preserve the
+  queue/message relationship without an unindexed foreign-key scan or a trigger on
+  every message insert; subscription child lookups gain a unique `subscription`
+  index. `EngineTx.SQL` remains for caller-owned tables; direct writes to
+  mqlite-owned tables are unsupported.
+- Add force and deletion outcomes consistently to HTTP (`{name,force?}` and
+  `{deleted,state}`), the Go SDK, `mqlite delete-queue --force`, MCP `delete_queue`
+  and the console. The console requires exact-name confirmation and a separate
+  force checkbox for a nonempty queue, including a warning about locked work whose
+  external effects cannot be undone. The existing Go
+  `DeleteQueue(ctx, name) error` method stays empty-only and returns `nil` for
+  either accepted state; callers use `DeleteQueueWithOptions` for force and the
+  detailed result. `QueueInfo` gains `State`; external Go code using positional
+  composite literals must add the field or switch to keyed literals.
+- Advance the canonical database guard to schema token **6** for durable lifecycle
+  columns and cleanup indexes. Schema-5 databases are rejected rather than
+  migrated: preserve the matching old binary and a consistent backup, account for
+  retained work, and start this source with a fresh database.
+- Return logically freed pages to later inserts immediately. Local database/WAL
+  files shrink gradually: the 60-second reclaimer starts at 256 free pages and
+  returns at most 256 pages per pass; explicit `mqlite vacuum` retains full
+  incremental reclaim.
+
 ### Remove public queue generations (MQLITE-125)
 
-- Remove `Generation`, `DeleteQueueOpts`, and `queue_changed` from the engine,
-  HTTP API, Go SDK, CLI, MCP server, console, and documentation. `DeleteQueue`
-  now takes only the queue name and `ListQueues` returns configuration fields only.
+- Remove `Generation`, generation-bearing deletion options, and `queue_changed`
+  from the engine, HTTP API, Go SDK, CLI, MCP server, console, and documentation.
+  Queue identity remains name-only; MQLITE-126 later adds a force-only deletion
+  option without bringing lifetime identity into data-plane requests.
 - This is an intentional breaking correction for v0.3.3 clients. The v0.3.3 Go
-  module is retracted; v0.3.2 clients are unaffected. The database schema token
-  remains **5**, and the stored queue data stays compatible.
+  module is retracted; v0.3.2 clients are unaffected. This correction itself kept
+  schema token **5**; MQLITE-126 advances the current source to token 6.
 - Make the name-reuse boundary explicit. Queue deletion and same-name recreation
   must be serialized by one owner. Do not replay an old deletion after recreation;
   reconcile an uncertain result before allowing the name to be reused.

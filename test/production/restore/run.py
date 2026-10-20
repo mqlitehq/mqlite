@@ -68,6 +68,10 @@ def snapshot(db, stopped=False):
         conn.execute("BEGIN")
         require(conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)], "integrity_check failed: " + str(db))
         require(not conn.execute("PRAGMA foreign_key_check").fetchall(), "foreign_key_check failed: " + str(db))
+        require(conn.execute(
+            "SELECT 1 FROM messages m LEFT JOIN queues q ON q.name=m.queue "
+            "WHERE q.name IS NULL LIMIT 1").fetchone() is None,
+            "message-parent invariant failed: " + str(db))
         schema = conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").fetchall()
         tables = {}
         for kind, name, _, _ in schema:

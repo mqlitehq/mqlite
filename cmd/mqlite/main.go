@@ -84,6 +84,8 @@ func main() {
 	switch cmd {
 	case "serve":
 		err = cmdServe(ctx, args)
+	case "delete-queue":
+		err = cmdDeleteQueue(ctx, args)
 	case "create-queue":
 		err = cmdCreateQueue(ctx, args)
 	case "subscribe", "create-subscription":
@@ -163,6 +165,7 @@ usage: mqlite <command> [flags]
 
  admin
   create-queue <name>       create/update a queue
+  delete-queue <name>       delete an empty queue (--force discards retained data)
   subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate')
   list                      list queues
   list-subscriptions        list subscriptions with their topic + filter
@@ -206,6 +209,7 @@ type api interface {
 	RenewBatch(ctx context.Context, queue string, msgs ...*mqlite.Message) ([]mqlite.SettleResult, error)
 	Cancel(ctx context.Context, queue string, seq int64) error
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
+	DeleteQueueWithOptions(ctx context.Context, name string, opts ...mqlite.DeleteQueueOpts) (mqlite.DeleteResult, error)
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
 	ListQueues(ctx context.Context) ([]mqlite.QueueInfo, error)
 	ListSubscriptions(ctx context.Context) ([]mqlite.SubscriptionInfo, error)
@@ -963,8 +967,8 @@ func cmdList(ctx context.Context, args []string) error {
 		return nil
 	}
 	for _, q := range qs {
-		fmt.Printf("%-24s kind=%-12s lock=%dms maxdc=%d ttl=%dms dedup=%dms\n",
-			q.Name, q.Kind, q.LockDurationMs, q.MaxDeliveryCount, q.DefaultTTLMs, q.DedupWindowMs)
+		fmt.Printf("%-24s kind=%-12s state=%-8s lock=%dms maxdc=%d ttl=%dms dedup=%dms\n",
+			q.Name, q.Kind, q.State, q.LockDurationMs, q.MaxDeliveryCount, q.DefaultTTLMs, q.DedupWindowMs)
 	}
 	return nil
 }

@@ -727,11 +727,12 @@ func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logf(w, "queue", req.Name)
-	if err := s.eng.DeleteQueue(r.Context(), req.Name); err != nil {
+	result, err := s.eng.DeleteQueueWithOptions(r.Context(), req.Name, engine.DeleteOptions{Force: req.Force})
+	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, wire.DeleteQueueResponse{Deleted: true})
+	writeJSON(w, wire.DeleteQueueResponse{Deleted: result.Deleted, State: result.State})
 }
 
 func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
@@ -771,7 +772,7 @@ func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 	resp := wire.ListQueuesResponse{Queues: make([]wire.QueueInfoJSON, len(qs))}
 	for i, q := range qs {
 		resp.Queues[i] = wire.QueueInfoJSON{
-			Name: q.Name, Kind: q.Kind, LockDurationMs: q.LockDurationMs,
+			Name: q.Name, Kind: q.Kind, State: q.State, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs,
 		}
 	}

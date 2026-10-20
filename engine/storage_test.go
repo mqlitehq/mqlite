@@ -136,10 +136,8 @@ func TestSchemaVersionGuard(t *testing.T) {
 // the statements are the contract).
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
-		wantVersion = "5"
-		// MQLITE-121: the independent access_keys table is additive; all previous
-		// statements are pinned separately by TestAccessKeySchemaAdditiveCompatibility.
-		wantHash = "755981e5ff9dbd1e04a7e0f1152358452464053ff1a6276300f20135b5c21ec0"
+		wantVersion = "6"
+		wantHash    = "d3265e30bf62c91a0956a51b664aaabaa487a798a333fa28fcd90e883646c0a4"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -147,6 +145,89 @@ func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	}
 	if schemaVersion != wantVersion {
 		t.Fatalf("schemaVersion changed to %q without updating this pin (wantVersion %q): update both together", schemaVersion, wantVersion)
+	}
+}
+
+// Version 5 had no queue lifecycle columns, bounded-cleanup indexes, or indexed
+// message-parent guards. Open must reject it before applying any schema
+// statement or changing retained data.
+func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
+	var previous []string
+	for _, statement := range schemaStmts {
+		if strings.Contains(statement, "idx_queue_deleting") || strings.Contains(statement, "idx_msg_completed") ||
+			strings.Contains(statement, "idx_subs_by_subscription") || strings.Contains(statement, "trg_messages_queue_") ||
+			strings.Contains(statement, "trg_queues_messages_") {
+			continue
+		}
+		if strings.HasPrefix(statement, "CREATE TABLE IF NOT EXISTS queues") {
+			var kept []string
+			for _, line := range strings.Split(statement, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "lifecycle_state ") || strings.HasPrefix(trimmed, "delete_started_at ") {
+					continue
+				}
+				kept = append(kept, line)
+			}
+			statement = strings.Join(kept, "\n")
+		}
+		if strings.HasPrefix(statement, "CREATE TABLE IF NOT EXISTS messages") {
+			statement = strings.Replace(statement, "queue          TEXT NOT NULL,",
+				"queue          TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,", 1)
+		}
+		previous = append(previous, statement)
+	}
+	const previousHash = "755981e5ff9dbd1e04a7e0f1152358452464053ff1a6276300f20135b5c21ec0"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(previous, "\n")))); got != previousHash {
+		t.Fatalf("version 5 fixture drifted: %s", got)
+	}
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "version-five.db")
+	d, err := openDB(ctx, path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range previous {
+		if _, err := d.exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.exec(ctx, `INSERT INTO meta VALUES('schema_version','5')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.exec(ctx, `INSERT INTO queues(name,created_at,updated_at) VALUES('old',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.exec(ctx, `INSERT INTO messages(queue,enqueued_at,body) VALUES('old',1,?)`, []byte("preserve me")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if e, err := Open(ctx, Options{DB: path, DisableBackground: true}); !errors.Is(err, ErrSchemaVersionMismatch) || e != nil {
+		if e != nil {
+			_ = e.Close()
+		}
+		t.Fatalf("version 5 accepted: %v", err)
+	}
+	d, err = openDB(ctx, path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.close()
+	var body []byte
+	if err := d.queryRowScan(ctx, []any{&body}, `SELECT body FROM messages WHERE queue='old'`); err != nil || string(body) != "preserve me" {
+		t.Fatalf("previous data changed: %q %v", body, err)
+	}
+	var count int
+	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM pragma_table_info('queues') WHERE name='lifecycle_state'`); err != nil || count != 0 {
+		t.Fatalf("previous layout mutated: %d %v", count, err)
+	}
+	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+		'idx_queue_deleting','idx_msg_completed','idx_subs_by_subscription',
+		'trg_messages_queue_update','trg_queues_messages_delete','trg_queues_messages_rename')`); err != nil || count != 0 {
+		t.Fatalf("version 6 indexes leaked into version 5: %d %v", count, err)
 	}
 }
 
@@ -559,15 +640,14 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 	}
 	t.Logf("reclaim: freelist %d -> %d pages, file %d -> %d bytes (%.0f%% returned to OS)",
 		before, afterFree, sizeBefore, fi2.Size(), 100*float64(sizeBefore-fi2.Size())/float64(sizeBefore))
-	// A working reclaim returns essentially the WHOLE freelist to the OS, not a few
-	// pages. incremental_vacuum needs the freed pages on the main-DB freelist AND a
-	// checkpoint to truncate the file — a weak "shrank at all" check would pass even on
-	// a near-total leak, which is exactly what an empty-queue-but-10MB-file looks like.
-	if afterFree >= freePageReclaimMin {
-		t.Fatalf("reclaim left %d free pages on the freelist (was %d) — not returned to the OS", afterFree, before)
+	// The unattended janitor is deliberately bounded: one pass returns at most
+	// 256 pages so high churn cannot monopolize the only writer.
+	reclaimed := before - afterFree
+	if reclaimed <= 0 || reclaimed > 256 {
+		t.Fatalf("background reclaim moved %d pages (before=%d after=%d), want 1..256", reclaimed, before, afterFree)
 	}
-	if fi2.Size() > sizeBefore/2 {
-		t.Fatalf("reclaim returned only %d of %d bytes — expected most of the freelist back", sizeBefore-fi2.Size(), sizeBefore)
+	if fi2.Size() >= sizeBefore {
+		t.Fatalf("bounded reclaim did not shrink the database: %d -> %d", sizeBefore, fi2.Size())
 	}
 
 	// :memory: has no OS pages to return — reclaim must be a harmless no-op.
@@ -596,12 +676,20 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 type busyConn struct{ st *busyState }
 
 type busyState struct {
-	failsLeft int
-	args      [][]driver.NamedValue // the args of every attempt, in order
-	queries   []string
-	noEffect  bool // a fenced write matched no message; exercise receipt lookup instead
-	commitErr error
-	execErr   error
+	failsLeft       int
+	args            [][]driver.NamedValue // the args of every attempt, in order
+	queries         []string
+	noEffect        bool // a fenced write matched no message; exercise receipt lookup instead
+	commitErr       error
+	execErr         error
+	onCommit        func()
+	queueReads      int
+	rosterRows      int
+	rosterRead      int
+	lifecycleLimits []int64
+	insertIDs       bool
+	inserted        int64
+	insertQueues    []string
 }
 
 func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
@@ -615,6 +703,9 @@ func (c *busyConn) Begin() (driver.Tx, error) { return &busyTx{st: c.st}, nil }
 type busyTx struct{ st *busyState }
 
 func (t *busyTx) Commit() error {
+	if t.st.onCommit != nil {
+		t.st.onCommit()
+	}
 	if t.st.failsLeft > 0 {
 		t.st.failsLeft--
 		return errors.New("database is locked") // busy: the commit provably did not land
@@ -634,8 +725,50 @@ func (c *busyConn) record(query string, args []driver.NamedValue) bool {
 }
 
 func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	// Lifecycle guards read the current queue inside the mutation transaction.
+	// Keep that metadata probe outside the injected mutation failures so these
+	// tests still count retries of the time-sensitive statement itself.
+	if strings.Contains(query, "lifecycle_state") && strings.Contains(query, "FROM queues WHERE name=?") {
+		c.st.queueReads++
+		name := "q"
+		if len(args) > 0 {
+			name, _ = args[0].Value.(string)
+		}
+		if name == "topic" {
+			return emptyRows{}, nil
+		}
+		if strings.Contains(query, "name,default_ttl_ms,dedup_window_ms,ordering_mode,lifecycle_state") {
+			return &oneQueueRow{values: []driver.Value{name, int64(0), int64(0), "standard", "active"}}, nil
+		}
+		return &oneQueueRow{values: []driver.Value{name, "queue", int64(1000), int64(10), int64(0), int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "active"}}, nil
+	}
 	if !c.record(query, args) {
 		return nil, errors.New("database is locked") // isBusyErr => retryable
+	}
+	if c.st.rosterRows > 0 && strings.Contains(query, "FROM subscriptions s JOIN queues q") {
+		c.st.rosterRead++
+		values := make([][]driver.Value, c.st.rosterRows)
+		for i := range values {
+			name := fmt.Sprintf("sub-%04d", i)
+			values[i] = []driver.Value{name, int64(0), int64(0), "standard", nil}
+		}
+		return &valueRows{values: values}, nil
+	}
+	if strings.Contains(query, "ORDER BY delete_started_at,name LIMIT ?") {
+		if len(args) > 0 {
+			if limit, ok := args[len(args)-1].Value.(int64); ok {
+				c.st.lifecycleLimits = append(c.st.lifecycleLimits, limit)
+			}
+		}
+		return emptyRows{}, nil
+	}
+	if c.st.insertIDs && strings.Contains(query, "INSERT INTO messages") {
+		c.st.inserted++
+		if len(args) > 0 {
+			queue, _ := args[0].Value.(string)
+			c.st.insertQueues = append(c.st.insertQueues, queue)
+		}
+		return &oneQueueRow{values: []driver.Value{c.st.inserted}}, nil
 	}
 	return emptyRows{}, nil
 }
@@ -659,6 +792,53 @@ func (emptyRows) Columns() []string         { return []string{"id"} }
 func (emptyRows) Close() error              { return nil }
 func (emptyRows) Next([]driver.Value) error { return io.EOF }
 
+type oneQueueRow struct {
+	values []driver.Value
+	done   bool
+}
+
+func (r *oneQueueRow) Columns() []string {
+	columns := make([]string, len(r.values))
+	for i := range columns {
+		columns[i] = fmt.Sprint(i)
+	}
+	return columns
+}
+func (*oneQueueRow) Close() error { return nil }
+func (r *oneQueueRow) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	copy(dest, r.values)
+	return nil
+}
+
+type valueRows struct {
+	values [][]driver.Value
+	next   int
+}
+
+func (r *valueRows) Columns() []string {
+	if len(r.values) == 0 {
+		return nil
+	}
+	columns := make([]string, len(r.values[0]))
+	for i := range columns {
+		columns[i] = fmt.Sprint(i)
+	}
+	return columns
+}
+func (*valueRows) Close() error { return nil }
+func (r *valueRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.values) {
+		return io.EOF
+	}
+	copy(dest, r.values[r.next])
+	r.next++
+	return nil
+}
+
 type busyConnector struct{ st *busyState }
 
 func (c busyConnector) Connect(context.Context) (driver.Conn, error) { return &busyConn{st: c.st}, nil }
@@ -672,6 +852,159 @@ func remoteDBFailingFirst(t *testing.T, n int) (*db, *busyState) {
 	sdb := sql.OpenDB(busyConnector{st: st})
 	t.Cleanup(func() { _ = sdb.Close() })
 	return &db{sql: sdb, remote: true}, st
+}
+
+func fakeRemoteEngine(d *db) *Engine {
+	return &Engine{
+		db:          d,
+		note:        newNotifier(),
+		now:         func() int64 { return 1000 },
+		maxMsgBytes: DefaultMaxMessageBytes,
+		qcache:      map[string]queueRow{},
+		filterCache: map[string]*filterEntry{},
+	}
+}
+
+func TestSendLoadsPlainQueueMetadataOncePerTransactionAttempt(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retry=%t", retry), func(t *testing.T) {
+			d, state := remoteDBFailingFirst(t, 0)
+			state.insertIDs = true
+			commits := 0
+			state.onCommit = func() {
+				commits++
+				if retry && commits == 1 {
+					state.failsLeft = 1
+				}
+			}
+			e := fakeRemoteEngine(d)
+			const batchSize = 64
+			seqs, err := e.Send(context.Background(), "q", make([]OutMessage, batchSize)...)
+			if err != nil || len(seqs) != batchSize {
+				t.Fatalf("batch=%v, %v", seqs, err)
+			}
+			wantAttempts := 1
+			if retry {
+				wantAttempts = 2
+			}
+			if state.queueReads != wantAttempts || commits != wantAttempts || state.inserted != int64(batchSize*wantAttempts) {
+				t.Fatalf("metadata reads=%d commits=%d inserts=%d; want one metadata statement for each of %d attempts",
+					state.queueReads, commits, state.inserted, wantAttempts)
+			}
+		})
+	}
+}
+
+func TestTopicFanoutCarriesMetadataWithoutPerSubscriptionReads(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	state.rosterRows = 256
+	state.insertIDs = true
+	e := fakeRemoteEngine(d)
+	seq, err := e.SendOne(context.Background(), "topic", OutMessage{Body: []byte("fanout")})
+	if err != nil || seq == 0 {
+		t.Fatalf("fanout seq=%d, %v", seq, err)
+	}
+	if state.queueReads != 1 || state.rosterRead != 1 || state.inserted != int64(state.rosterRows) {
+		t.Fatalf("direct metadata reads=%d roster reads=%d inserts=%d, want 1/1/%d",
+			state.queueReads, state.rosterRead, state.inserted, state.rosterRows)
+	}
+	if len(state.insertQueues) != state.rosterRows {
+		t.Fatalf("fanout insert count=%d, want %d", len(state.insertQueues), state.rosterRows)
+	}
+	if state.insertQueues[0] != "sub-0000" || state.insertQueues[len(state.insertQueues)-1] != "sub-0255" {
+		t.Fatalf("fanout order changed: first/last=%q/%q count=%d",
+			state.insertQueues[0], state.insertQueues[len(state.insertQueues)-1], len(state.insertQueues))
+	}
+}
+
+func TestResolveTargetsUsesOnlyIndexedSeeks(t *testing.T) {
+	e, _ := testEngine(t)
+	directPlan := explainPlan(t, e, resolveDirectTargetSQL, "q")
+	if strings.Contains(directPlan, "SCAN ") || strings.Contains(directPlan, "USE TEMP B-TREE") || !strings.Contains(directPlan, "SEARCH queues USING") {
+		t.Fatalf("direct routing query must use a queue-key seek:\n%s", directPlan)
+	}
+	topicPlan := explainPlan(t, e, resolveTopicTargetsSQL, "topic")
+	if strings.Contains(topicPlan, "SCAN ") || strings.Contains(topicPlan, "USE TEMP B-TREE") {
+		t.Fatalf("topic routing query must not scan or sort in SQLite:\n%s", topicPlan)
+	}
+	if !strings.Contains(topicPlan, "SEARCH s USING") || !strings.Contains(topicPlan, "SEARCH q USING") {
+		t.Fatalf("topic routing query lost an indexed subscription or queue seek:\n%s", topicPlan)
+	}
+}
+
+func TestResolveTargetsKeepsStableTopicOrder(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	for _, name := range []string{"sub-z", "sub-a", "sub-m"} {
+		if err := e.Subscribe(ctx, "topic", name, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var targets []target
+	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		var err error
+		targets, err = e.resolveTargetsTx(ctx, tx, "topic")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(targets))
+	for i := range targets {
+		got[i] = targets[i].name
+	}
+	want := []string{"sub-a", "sub-m", "sub-z"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("targets=%v, want %v", got, want)
+	}
+}
+
+func TestAttemptReceiveReadsLifecycleMetadataOnce(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1000, maxDeliveryCount: 10, ordering: OrderStandard}
+	msgs, err := e.claimRound(context.Background(), q, 1, PeekLock, "attempt")
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("claim=%v, %v", msgs, err)
+	}
+	if state.queueReads != 1 {
+		t.Fatalf("attempt receive metadata reads=%d, want 1", state.queueReads)
+	}
+}
+
+func TestEmptyLifecycleCleanupUsesOneMutationStatement(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	var done bool
+	err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+		budget := cleanupBudget{rows: lifecyclePassRows, bytes: lifecycleBatchBytes}
+		var err error
+		done, err = e.cleanQueueTx(ctx, tx, "q", &budget)
+		return err
+	})
+	if err != nil || !done {
+		t.Fatalf("cleanup done=%t, %v", done, err)
+	}
+	if len(state.queries) != 1 || !strings.Contains(state.queries[0], "DELETE FROM queues") {
+		t.Fatalf("empty cleanup statements=%d, want one direct retirement: %v", len(state.queries), state.queries)
+	}
+}
+
+func TestRemoteLifecycleSelectionCapsEachPassToOneResource(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	e.maintainLifecycle(context.Background())
+	if len(state.lifecycleLimits) == 0 {
+		t.Fatal("lifecycle resource selection did not run")
+	}
+	for _, limit := range state.lifecycleLimits {
+		if limit != 1 {
+			t.Fatalf("remote lifecycle selection limit=%d, want 1", limit)
+		}
+	}
+	// Two cursor metadata probes and at most the forward+wrap range reads.
+	if len(state.queries) > 4 {
+		t.Fatalf("idle remote lifecycle pass used %d statements: %v", len(state.queries), state.queries)
+	}
 }
 
 // ─── the contract ──────────────────────────────────────────────────────────────
@@ -1145,7 +1478,7 @@ func TestClaimTimeRefreshesOnRemoteRetry(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			d, st := remoteDBFailingFirst(t, 2)
 			tick := int64(100_000)
-			q := queueRow{name: "q", lockDurationMs: 1_000}
+			q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1_000}
 			e := &Engine{db: d, qcache: map[string]queueRow{"q": q}, now: func() int64 {
 				tick += 2_000
 				return tick
@@ -1191,7 +1524,7 @@ func TestSettlementTimeRefreshesOnRemoteRetry(t *testing.T) {
 				d, st := remoteDBFailingFirst(t, 2)
 				st.noEffect = noEffect
 				var tick int64 = 100_000
-				q := queueRow{name: "q", lockDurationMs: 1_000}
+				q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1_000}
 				e := &Engine{db: d, note: newNotifier(), qcache: map[string]queueRow{"q": q}, now: func() int64 {
 					tick += 2_000
 					return tick
@@ -1721,15 +2054,15 @@ func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
 }
 
 func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
-	// Pin every pre-existing DDL byte, independent of the new table's golden.
+	// Access-key objects remain independently additive inside schema 6.
 	var oldSchema []string
 	for _, stmt := range schemaStmts {
 		if stmt != accessKeySchema && stmt != accessKeyCreatedIndex {
 			oldSchema = append(oldSchema, stmt)
 		}
 	}
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "9dcb13ddf1fbf11179a690e70d357dcfa1b87fa6f135a85db02164185d5854e6" || schemaVersion != "5" {
-		t.Fatalf("v0.3.0 queue schema changed: hash=%s token=%s", got, schemaVersion)
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "ecee379192637620d94c38137f23956ae517adc3bfc5934743f7a32ab3daa55e" || schemaVersion != "6" {
+		t.Fatalf("schema without access-key objects changed: hash=%s token=%s", got, schemaVersion)
 	}
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "old.db")
@@ -1742,7 +2075,7 @@ func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := d.exec(ctx, `INSERT INTO meta VALUES ('schema_version','5')`); err != nil {
+	if _, err := d.exec(ctx, `INSERT INTO meta VALUES ('schema_version','6')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.exec(ctx, `INSERT INTO queues(name, created_at, updated_at) VALUES ('existing', 1, 1)`); err != nil {
@@ -2278,7 +2611,7 @@ func TestObservabilityMaintenanceFailuresAndFilterOutcomes(t *testing.T) {
 	ctx := context.Background()
 	e.RunMaintenanceOnce(ctx)
 	s := e.Observability(ctx)
-	if len(s.Maintenance) != 7 {
+	if len(s.Maintenance) != 8 {
 		t.Fatalf("maintenance=%d", len(s.Maintenance))
 	}
 	for _, m := range s.Maintenance {
@@ -2686,7 +3019,11 @@ func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
 			t.Fatal(err)
 		}
 		joined := strings.Join(plan, "\n")
-		if !strings.Contains(joined, "MATERIALIZE m") || strings.Count(joined, "SCAN messages") != 1 || strings.Index(joined, "SCAN messages") > strings.Index(joined, "LEFT-JOIN") {
+		messageRead := strings.Index(joined, "SCAN messages")
+		if messageRead < 0 {
+			messageRead = strings.Index(joined, "SEARCH messages USING INDEX idx_msg_queue")
+		}
+		if !strings.Contains(joined, "MATERIALIZE m") || messageRead < 0 || messageRead > strings.Index(joined, "LEFT-JOIN") {
 			t.Fatalf("messages must be aggregated once before inventory join:\n%s", joined)
 		}
 	}

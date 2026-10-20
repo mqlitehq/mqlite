@@ -16,6 +16,10 @@ import (
 // (the janitor sweeps expired rows).
 const settlementTTLMs = 30 * 60 * 1000 // 30 min
 
+// Embedded in each mutation so logical deletion cannot race a preflight read.
+const liveMessageQueueSQL = `EXISTS (SELECT 1 FROM queues lq WHERE lq.name=messages.queue
+ AND lq.lifecycle_state='active')`
+
 func affected(res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
@@ -91,7 +95,8 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 			var one int
 			err := tx.QueryRowContext(ctx,
 				`SELECT 1 FROM settlement_receipts
-				   WHERE queue=? AND seq_number=? AND lock_token=? AND operation=? AND args=? AND expires_at>?`,
+				   WHERE queue=? AND seq_number=? AND lock_token=? AND operation=? AND args=? AND expires_at>?
+				     AND EXISTS (SELECT 1 FROM queues q WHERE q.name=settlement_receipts.queue AND q.lifecycle_state='active')`,
 				queue, seq, token, op, args, e.now()).Scan(&one)
 			if err == nil {
 				return nil // idempotent replay of the exact request that already succeeded
@@ -131,7 +136,7 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 	var removed int64
 	err := e.settleOp(ctx, queue, seq, token, "completed", "", func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx,
-			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`, seq, queue, token, now)
+			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL, seq, queue, token, now)
 		if err != nil {
 			return 0, err
 		}
@@ -167,7 +172,7 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 			                      THEN visible_at ELSE ? END,
 			    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 			                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
-			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? RETURNING state`,
+			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL+` RETURNING state`,
 			delayMs, now+delayMs, seq, queue, token, now).Scan(&state)
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil
@@ -200,7 +205,7 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 		res, err := tx.ExecContext(ctx, `
 			UPDATE messages SET state='dead_lettered', locked_until=0, lock_token=NULL,
 			    dead_letter_reason=?, dead_letter_description=?
-			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`,
+			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL,
 			reason, nz(desc), seq, queue, token, now)
 		if err != nil {
 			return 0, err
@@ -214,7 +219,7 @@ func (e *Engine) Defer(ctx context.Context, queue string, seq int64, token strin
 	return e.settleOp(ctx, queue, seq, token, "deferred", "", func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE messages SET state='deferred', locked_until=0, lock_token=NULL
-			   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`, seq, queue, token, now)
+			   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL, seq, queue, token, now)
 		if err != nil {
 			return 0, err
 		}
@@ -235,7 +240,7 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 		// MAX(): a renewal only ever extends a lease. A racing renewal writing an older deadline
 		// would otherwise shorten a lock that had already been pushed further out.
 		`UPDATE messages SET locked_until=MAX(locked_until, ?)
-		   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>?`,
+		   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL,
 		func() []any {
 			now := e.now()
 			return []any{now + q.lockDurationMs, seq, queue, token, now}
@@ -388,7 +393,7 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		// the clock AFTER the statement finished. Whether a lease is live is a fact about the
 		// moment we answer, not the moment we asked.
 		`UPDATE messages SET locked_until=MAX(locked_until, ?)
-		   WHERE state='locked' AND locked_until>? AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+		   WHERE state='locked' AND locked_until>? AND `+liveMessageQueueSQL+` AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
 		 RETURNING id, lock_token, locked_until`,
 		// The deadline is built per ATTEMPT, once a connection is already held — see queryFresh.
 		// Computed any earlier, a backoff (or a wait for a free connection) could leave it in the
@@ -526,7 +531,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 			// Each chunk has its own write time: later chunks cannot use leases
 			// that expired while an earlier statement was running.
 			sel, err := tx.QueryContext(ctx,
-				`DELETE FROM messages WHERE state='locked' AND locked_until>? AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
+				`DELETE FROM messages WHERE state='locked' AND locked_until>? AND `+liveMessageQueueSQL+` AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
 				 RETURNING id, lock_token`, append([]any{e.now()}, pairArgs(queue, group)...)...)
 			if err != nil {
 				return err
@@ -585,6 +590,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 			rec, err := tx.QueryContext(ctx,
 				`SELECT seq_number, lock_token FROM settlement_receipts
 				   WHERE expires_at>? AND operation=? AND args=? AND queue=?
+				     AND EXISTS (SELECT 1 FROM queues q WHERE q.name=settlement_receipts.queue AND q.lifecycle_state='active')
 				     AND (seq_number, lock_token) IN (VALUES `+
 					strings.Repeat(",(?,?)", len(group))[1:]+`)`, args...)
 			if err != nil {
