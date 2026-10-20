@@ -105,6 +105,14 @@ message state, including locked deliveries, plus the backing queue's deduplicati
 and replay records. A locked delivery may already have caused an external side
 effect; deleting its stored row cannot undo that effect.
 
+A fixed subscription deadline grants the same discard authorization in advance.
+The absolute deadline is stored once and never slides. At
+`now >= expires_at`, routing, receive, settlement, renewal, redrive, purge and
+direct observation reject the subscription immediately; a maintenance scan later
+persists `deleting` and resumes the same restart-safe cleanup. Leases and long
+polls are capped at the deadline. Normal completion should still call
+`DeleteSubscription`; TTL covers forgotten cleanup after a caller is lost.
+
 An accepted delete first commits `state=deleting`. That immediately rejects new
 queue work and reserves the name while physical cleanup proceeds. For a
 subscription it also removes the entry from topic fan-out; the topic mapping stays
@@ -122,6 +130,15 @@ cursor rotates fairly on both backends. Startup runs one recovery pass. These
 bounds keep one large retirement from holding the single writer indefinitely and
 make a crash restartable. One individually oversized row may exceed the byte
 target so it cannot block cleanup forever.
+
+Empty deleting subscriptions use an additional set-based metadata path. One
+transaction selects at most 512 mappings whose messages, dedup entries,
+settlement receipts and receive attempts are all empty, deletes the mappings
+first and their backing queues second, and verifies both affected-row counts.
+This stays correct when remote libSQL foreign-key enforcement is unavailable and
+releases bursts of empty temporary subscriptions without the one-resource remote
+rate. Each transaction releases the writer before continuing. Any subscription
+with retained state stays on the ordinary row/byte/resource-budgeted path.
 
 Bursts of forced deletion across deep queues or subscriptions can still create a
 cleanup backlog, grow the WAL, consume subscription-capacity slots and delay name
@@ -141,6 +158,14 @@ slot until cleanup finishes, so sustained create/delete churn can apply temporar
 backpressure instead of growing metadata without a bound. Use stable subscriptions
 for routine request/reply traffic and globally unique, one-use names when a
 temporary subscription is unavoidable.
+
+TTL does not make unconsumed work free. A simultaneous wave becomes logically
+unavailable at one deadline, but physical convergence depends on roster size,
+retained rows, body bytes, storage latency and competing writes. Expired and
+deleting rows keep their capacity slot until removal. Stagger deadlines when
+possible, drain before expiry, alert on sustained `deleting` counts and
+`subscription_expiry` / `lifecycle` maintenance failures, and load-test the
+largest planned expiry burst on the target backend.
 
 ## Space reclamation
 

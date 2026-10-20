@@ -8,12 +8,10 @@ import (
 	"time"
 )
 
-// dlqRec is a dead-lettered row carried across a cross-queue move.
-type dlqRec struct {
-	id                                                                int64
-	body                                                              []byte
-	messageID, correlationID, replyTo, groupID, ctype, subject, props sql.NullString
-}
+// dlqRec identifies a candidate discovered before a throttled move. Its state
+// is rechecked in each move transaction; carrying a body snapshot here could
+// resurrect a row another operation already purged or redrove.
+type dlqRec struct{ id int64 }
 
 // Redrive moves dead-lettered messages back to active for reprocessing (§11.2).
 //
@@ -45,47 +43,75 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 	if err := opts.validate(); err != nil {
 		return 0, err
 	}
-	if _, err := e.loadQueue(ctx, dlq); err != nil {
+	sourceQueue, err := e.loadQueue(ctx, dlq)
+	if err != nil {
 		return 0, err
 	}
 	crossQueue := opts.Target != "" && opts.Target != dlq
+	var targetQueue queueRow
 	if crossQueue {
-		if _, err := e.loadQueue(ctx, opts.Target); err != nil {
+		targetQueue, err = e.loadQueue(ctx, opts.Target)
+		if err != nil {
 			return 0, err
 		}
 	}
-	now := e.now()
-
+	operationExpiresAt := sourceQueue.expiresAtMs
+	if crossQueue && targetQueue.expiresAtMs > 0 &&
+		(operationExpiresAt == 0 || targetQueue.expiresAtMs < operationExpiresAt) {
+		operationExpiresAt = targetQueue.expiresAtMs
+	}
 	where := "queue=? AND state='dead_lettered'"
-	args := []any{dlq}
 	if opts.OlderThanMs > 0 {
 		where += " AND enqueued_at < ?"
-		args = append(args, now-opts.OlderThanMs)
 	}
 	limit := ""
 	if opts.Max > 0 {
 		limit = " LIMIT ?"
-		args = append(args, opts.Max)
 	}
 
-	// Select the candidate set up front (single writer → the set is stable).
-	selQuery := "SELECT id,body,message_id,correlation_id,reply_to,group_id,content_type,subject,properties" +
+	// Select a bounded candidate set up front. Every chunk revalidates these IDs
+	// transactionally because a throttled remote operation can observe other work.
+	selQuery := "SELECT id" +
 		" FROM messages WHERE " + where + " ORDER BY id" + limit
 	var recs []dlqRec
-	if err := e.db.queryRows(ctx, selQuery, func(rows *sql.Rows) error {
+	if err := e.db.queryFresh(ctx, selQuery, func() []any {
+		args := []any{dlq}
+		if opts.OlderThanMs > 0 {
+			// Build the cutoff only after acquiring a connection and again on
+			// every remote retry. A delayed attempt must not use an older view
+			// of a relative age boundary.
+			args = append(args, e.now()-opts.OlderThanMs)
+		}
+		if opts.Max > 0 {
+			args = append(args, opts.Max)
+		}
+		return args
+	}, func(rows *sql.Rows) error {
+		// A retry calls scan again, so discard any partial prior-attempt rows.
+		recs = recs[:0]
 		for rows.Next() {
 			var r dlqRec
-			if err := rows.Scan(&r.id, &r.body, &r.messageID, &r.correlationID, &r.replyTo, &r.groupID,
-				&r.ctype, &r.subject, &r.props); err != nil {
+			if err := rows.Scan(&r.id); err != nil {
 				return err
 			}
 			recs = append(recs, r)
 		}
 		return rows.Err()
-	}, args...); err != nil {
+	}); err != nil {
 		return 0, err
 	}
 	if len(recs) == 0 {
+		// The preflight may have raced the fixed expiration while the read was
+		// waiting for a remote connection. Preserve the queue-not-found boundary
+		// even for an otherwise empty redrive.
+		if _, err := e.loadQueue(ctx, dlq); err != nil {
+			return 0, err
+		}
+		if crossQueue {
+			if _, err := e.loadQueue(ctx, opts.Target); err != nil {
+				return 0, err
+			}
+		}
 		return 0, nil
 	}
 
@@ -100,12 +126,15 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 			end = len(recs)
 		}
 		batch := recs[start:end]
-		if err := e.moveBatch(ctx, opts.Target, dlq, crossQueue, batch, now); err != nil {
+		n, err := e.moveBatch(ctx, opts.Target, dlq, crossQueue, batch)
+		if err != nil {
 			return moved, err
 		}
-		moved += len(batch)
+		moved += n
 		if opts.RatePerSec > 0 && end < len(recs) {
-			time.Sleep(time.Second) // throttle to ~RatePerSec
+			if err := e.waitRedriveThrottle(ctx, operationExpiresAt); err != nil {
+				return moved, err
+			}
 		}
 	}
 
@@ -117,8 +146,40 @@ func (e *Engine) Redrive(ctx context.Context, dlq string, opts RedriveOptions) (
 	return moved, nil
 }
 
+// waitRedriveThrottle keeps rate limiting interruptible and never parks beyond
+// the fixed lifetime of either side of a cross-queue move. Each following chunk
+// still rechecks both queue rows transactionally.
+func (e *Engine) waitRedriveThrottle(ctx context.Context, expiresAtMs int64) error {
+	wait := time.Second
+	if expiresAtMs > 0 {
+		remaining := expiresAtMs - e.now()
+		if remaining <= 0 {
+			return ErrQueueNotFound
+		}
+		// Convert only when the result is below the one-second cap. A valid
+		// absolute lifetime can be near MaxInt64, where milliseconds converted
+		// directly to time.Duration would overflow and make NewTimer panic.
+		if remaining < int64(time.Second/time.Millisecond) {
+			wait = time.Duration(remaining) * time.Millisecond
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		if expiresAtMs > 0 && expiresAtMs <= e.now() {
+			return ErrQueueNotFound
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.closed:
+		return ErrClosed
+	}
+}
+
 // moveBatch atomically redrives one batch of dead-lettered rows.
-func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue bool, batch []dlqRec, now int64) error {
+func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue bool, batch []dlqRec) (int, error) {
 	ids := make([]any, len(batch))
 	ph := make([]string, len(batch))
 	for i, r := range batch {
@@ -127,47 +188,83 @@ func (e *Engine) moveBatch(ctx context.Context, target, dlq string, crossQueue b
 	}
 	inClause := "(" + strings.Join(ph, ",") + ")"
 
-	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		if _, err := e.checkQueueLiveTx(ctx, tx, dlq); err != nil {
+	var moved int64
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		moved = 0 // remote retries replay this closure
+		sourceQueue, err := e.checkQueueLiveTx(ctx, tx, dlq)
+		if err != nil {
+			return err
+		}
+		var targetQueue queueRow
+		if crossQueue {
+			targetQueue, err = e.checkQueueLiveTx(ctx, tx, target)
+			if err != nil {
+				return err
+			}
+		}
+		now := e.now()
+		if err := queueLiveAt(sourceQueue, now); err != nil {
 			return err
 		}
 		if crossQueue {
-			if _, err := e.checkQueueLiveTx(ctx, tx, target); err != nil {
+			if err := queueLiveAt(targetQueue, now); err != nil {
 				return err
 			}
 		}
 		if !crossQueue {
+			updateArgs := append([]any{dlq}, ids...)
 			res, err := tx.ExecContext(ctx, `
 				UPDATE messages SET state='active', delivery_count=0, lock_token=NULL,
 				    locked_until=0, visible_at=0, dead_letter_reason=NULL, dead_letter_description=NULL
-				 WHERE id IN `+inClause, ids...)
+				 WHERE queue=? AND state='dead_lettered' AND id IN `+inClause, updateArgs...)
 			if err == nil {
-				n, _ := res.RowsAffected()
-				tx.record(dlq, "redriven", n)
+				moved, err = res.RowsAffected()
+				if err == nil {
+					tx.record(dlq, "redriven", moved)
+				}
 			}
 			return err
 		}
-		for _, r := range batch {
-			if r.body == nil {
-				r.body = []byte{}
-			} // Preserve a legal empty BLOB, never bind SQL NULL.
-			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO messages
-				  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
-				   message_id,correlation_id,reply_to,group_id,content_type,subject,properties,body)
-				VALUES (?, 'active', 0, 0, NULL, 0, ?, 0, ?,?,?,?,?,?,?,?)`,
-				target, now, r.messageID, r.correlationID, r.replyTo, r.groupID, r.ctype, r.subject, r.props, r.body); err != nil {
-				return err
-			}
+
+		// Re-read candidates in this transaction. A throttled redrive deliberately
+		// sleeps between chunks, so a snapshot captured before that sleep is not
+		// authority to insert a message that has since left the source DLQ.
+		insertArgs := append([]any{target, now, dlq}, ids...)
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO messages
+			  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
+			   message_id,correlation_id,reply_to,group_id,content_type,subject,properties,body)
+			SELECT ?, 'active', 0, 0, NULL, 0, ?, 0,
+			       message_id,correlation_id,reply_to,group_id,content_type,subject,properties,body
+			  FROM messages
+			 WHERE queue=? AND state='dead_lettered' AND id IN `+inClause+`
+			 ORDER BY id`, insertArgs...)
+		if err != nil {
+			return err
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE id IN `+inClause, ids...)
-		if err == nil {
-			n, _ := res.RowsAffected()
-			tx.record(dlq, "redriven", n)
-			tx.record(target, "enqueued", int64(len(batch)))
+		moved, err = res.RowsAffected()
+		if err != nil {
+			return err
 		}
-		return err
+		deleteArgs := append([]any{dlq}, ids...)
+		res, err = tx.ExecContext(ctx,
+			`DELETE FROM messages WHERE queue=? AND state='dead_lettered' AND id IN `+inClause,
+			deleteArgs...)
+		if err != nil {
+			return err
+		}
+		removed, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if removed != moved {
+			return fmt.Errorf("redrive source changed inside transaction: inserted %d, removed %d", moved, removed)
+		}
+		tx.record(dlq, "redriven", moved)
+		tx.record(target, "enqueued", moved)
+		return nil
 	})
+	return int(moved), err
 }
 
 // Purge permanently deletes dead-lettered messages from a queue's DLQ (§7.3).
@@ -182,20 +279,29 @@ func (e *Engine) Purge(ctx context.Context, queue string, opts RedriveOptions) (
 		return 0, err
 	}
 	where := "queue=? AND state='dead_lettered'"
-	args := []any{queue}
 	if opts.OlderThanMs > 0 {
 		where += " AND enqueued_at < ?"
-		args = append(args, e.now()-opts.OlderThanMs)
 	}
 	query := `DELETE FROM messages WHERE ` + where
 	if opts.Max > 0 {
 		query = `DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ` + where + ` ORDER BY id LIMIT ?)`
-		args = append(args, opts.Max)
 	}
 	var n int64
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		if _, err := e.checkQueueLiveTx(ctx, tx, queue); err != nil {
+		q, err := e.checkQueueLiveTx(ctx, tx, queue)
+		if err != nil {
 			return err
+		}
+		now := e.now()
+		if err := queueLiveAt(q, now); err != nil {
+			return err
+		}
+		args := []any{queue}
+		if opts.OlderThanMs > 0 {
+			args = append(args, now-opts.OlderThanMs)
+		}
+		if opts.Max > 0 {
+			args = append(args, opts.Max)
 		}
 		res, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {

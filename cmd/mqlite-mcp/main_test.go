@@ -222,14 +222,17 @@ func TestSubscriptionToolsContract(t *testing.T) {
 	defer ts.Close()
 	broker.endpoint, broker.token, broker.http = ts.URL, "", ts.Client()
 
-	result := callTool("subscribe", map[string]any{"topic": "events", "name": "audit", "expr": `subject == "order"`})
+	result := callTool("subscribe", map[string]any{
+		"topic": "events", "name": "audit", "expr": `subject == "order"`, "ttl_ms": float64(60_000),
+	})
 	if result["isError"] != false {
 		t.Fatalf("subscribe failed: %v", result)
 	}
 	got := <-requests
-	var subscribe wire.SubscribeRequest
+	var subscribe wire.SubscribeWithOptionsRequest
 	if err := json.Unmarshal(got.body, &subscribe); err != nil || got.path != wire.PathSubscribe ||
-		subscribe.Topic != "events" || subscribe.Name != "audit" || subscribe.Filter == nil || subscribe.Filter.Expr != `subject == "order"` {
+		subscribe.Topic != "events" || subscribe.Name != "audit" || subscribe.Filter == nil ||
+		subscribe.Filter.Expr != `subject == "order"` || subscribe.TTLMs != 60_000 {
 		t.Fatalf("forwarded subscribe = path %q body %s err %v", got.path, got.body, err)
 	}
 
@@ -269,6 +272,10 @@ func TestSubscriptionToolsContract(t *testing.T) {
 	}{
 		{"subscribe", map[string]any{"topic": "events", "name": true}},
 		{"subscribe", map[string]any{"topic": "events", "name": "audit", "filter": "typo"}},
+		{"subscribe", map[string]any{"topic": "events", "name": "audit", "ttl_ms": 1.5}},
+		{"subscribe", map[string]any{"topic": "events", "name": "audit", "ttl_ms": "1000"}},
+		{"subscribe", map[string]any{"topic": "events", "name": "audit", "ttl_ms": float64(0)}},
+		{"subscribe", map[string]any{"topic": "events", "name": "audit", "ttl_ms": float64(-1)}},
 		{"list_subscriptions", map[string]any{"limit": 1.5}},
 		{"list_subscriptions", map[string]any{"limit": float64(1001)}},
 		{"list_subscriptions", map[string]any{"include_deleting": "true"}},
@@ -291,6 +298,60 @@ func TestSubscriptionToolsContract(t *testing.T) {
 		t.Fatalf("malformed acknowledgement presented as success: %v", malformed)
 	}
 	<-requests
+}
+
+func TestToolsCallPreservesExactJSONIntegers(t *testing.T) {
+	old := broker
+	defer func() { broker = old }()
+	requests := make(chan wire.SubscribeWithOptionsRequest, 4)
+	var requestCount atomic.Int32
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		var request wire.SubscribeWithOptionsRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode subscribe request: %v", err)
+		}
+		requests <- request
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	broker.endpoint, broker.token, broker.http = stub.URL, "", stub.Client()
+
+	const exact = int64(9_007_199_254_740_993)
+	response := call(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe","arguments":{"topic":"events","name":"audit","ttl_ms":9007199254740993}}}`)
+	result := response.Result.(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("exact int64 rejected: %v", result)
+	}
+	if got := (<-requests).TTLMs; got != exact {
+		t.Fatalf("forwarded ttl_ms = %d, want %d", got, exact)
+	}
+
+	for _, invalid := range []string{
+		`9223372036854775808`,
+		`1.5`,
+		`"1000"`,
+	} {
+		response := call(t, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subscribe","arguments":{"topic":"events","name":"audit","ttl_ms":`+invalid+`}}}`)
+		result := response.Result.(map[string]any)
+		if result["isError"] != true {
+			t.Errorf("invalid ttl_ms %s was accepted: %v", invalid, result)
+		}
+	}
+	if got := requestCount.Load(); got != 1 {
+		t.Fatalf("invalid integers reached the broker: %d total requests, want 1", got)
+	}
+
+	args := map[string]any{
+		"number":  json.Number("9007199254740993"),
+		"numbers": []any{json.Number("9007199254740993"), float64(2), int64(3)},
+	}
+	if !validInteger(args, "number") || num(args, "number") != exact {
+		t.Fatal("json.Number integer helper lost an exact int64")
+	}
+	if got, want := intArr(args, "numbers"), []int64{exact, 2, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("json.Number integer array = %v, want %v", got, want)
+	}
 }
 
 func TestLifecycleDeleteToolTransportFailureIsUnknownAndNotRetried(t *testing.T) {
@@ -369,9 +430,11 @@ func TestListSubscriptionsToolRejectsMalformedSuccess(t *testing.T) {
 		{"null root", `null`},
 		{"missing fields", `{}`},
 		{"null subscriptions", `{"subscriptions":null,"total":0}`},
-		{"missing item state", `{"subscriptions":[{"topic":"events","name":"a"}],"total":1}`},
-		{"wrong scope", `{"subscriptions":[{"topic":"other","name":"a","state":"active"}],"total":1}`},
-		{"unordered", `{"subscriptions":[{"topic":"events","name":"b","state":"active"},{"topic":"events","name":"a","state":"active"}],"total":2}`},
+		{"missing item state", `{"subscriptions":[{"topic":"events","name":"a","created_at_ms":10,"expires_at_ms":0}],"total":1}`},
+		{"missing created time", `{"subscriptions":[{"topic":"events","name":"a","state":"active","expires_at_ms":0}],"total":1}`},
+		{"invalid expiry", `{"subscriptions":[{"topic":"events","name":"a","state":"active","created_at_ms":10,"expires_at_ms":10}],"total":1}`},
+		{"wrong scope", `{"subscriptions":[{"topic":"other","name":"a","state":"active","created_at_ms":10,"expires_at_ms":0}],"total":1}`},
+		{"unordered", `{"subscriptions":[{"topic":"events","name":"b","state":"active","created_at_ms":10,"expires_at_ms":0},{"topic":"events","name":"a","state":"active","created_at_ms":10,"expires_at_ms":0}],"total":2}`},
 		{"trailing JSON", `{"subscriptions":[],"total":0} {}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -589,9 +652,9 @@ var goldenWireShapes = map[string][]string{
 		"config.dlq_max_age_ms", "config.dlq_max_bytes", "config.dlq_max_count", "config.kind",
 		"config.lock_duration_ms", "config.max_delivery_count", "config.ordering_mode", "name",
 	},
-	"wire.DeleteQueueRequest":        {"force", "name"},
-	"wire.DeleteSubscriptionRequest": {"force", "name", "topic"},
-	"wire.SubscribeRequest":          {"filter.expr", "name", "topic"},
+	"wire.DeleteQueueRequest":          {"force", "name"},
+	"wire.DeleteSubscriptionRequest":   {"force", "name", "topic"},
+	"wire.SubscribeWithOptionsRequest": {"filter.expr", "name", "topic", "ttl_ms"},
 	"wire.ListSubscriptionsPageRequest": {
 		"after", "include_deleting", "limit", "topic",
 	},

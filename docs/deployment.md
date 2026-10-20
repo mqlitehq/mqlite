@@ -59,8 +59,9 @@ and error reference: [api-reference.md](api-reference.md).
 > **v0.2.0 uses port 8080 and schema token 2.** Its database cannot be opened by
 > v0.3.2: preserve the old binary/database pair and follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before replacing it.
-> The current unreleased source uses schema token **6** for durable queue deletion
-> state and does not open these schema-5 databases. Build it against a fresh
+> The current unreleased source uses schema token **7** for durable resource
+> deletion and fixed subscription lifetimes, and does not open schema-5 or
+> intermediate unreleased schema-6 databases. Build it against a fresh
 > database after taking a consistent backup and accounting for retained work.
 
 The published image is multi-arch (amd64 + arm64):
@@ -210,7 +211,8 @@ online snapshots, offline directory copies, isolated restore validation and roll
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
 **v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and retracted
-v0.3.3 use schema 5; current unreleased source uses schema 6.** There is no
+v0.3.3 use schema 5; current unreleased source uses schema 7.** Intermediate
+unreleased lifecycle builds used schema 6. There is no
 in-place migration between these tokens. Before changing tokens, account for
 retained work in every state, keep the old binary/database pair and a consistent
 backup, and create the candidate database separately. Do not restamp an old file.

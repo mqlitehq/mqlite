@@ -452,7 +452,8 @@ func printSubscriptionPage(subs []mqlite.SubscriptionPageItem) {
 		if expr == "" {
 			expr = "(match all)"
 		}
-		fmt.Printf("%-20s topic=%-20s state=%-8s filter=%s\n", s.Name, s.Topic, s.State, expr)
+		fmt.Printf("%-20s topic=%-20s state=%-8s created_at_ms=%d expires_at_ms=%d filter=%s\n",
+			s.Name, s.Topic, s.State, s.CreatedAtMs, s.ExpiresAtMs, expr)
 	}
 }
 

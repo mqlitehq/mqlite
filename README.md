@@ -234,6 +234,7 @@ mqlite complete orders 42 <lock-token>           # settle a --no-ack message (al
 mqlite peek orders --state dead_lettered
 mqlite status                                    # backend / ping / counts
 mqlite observe --output json                     # unified observation; monitor or manage
+mqlite subscribe replies instance-7 --ttl 15m   # fixed lifetime; omit --ttl for permanent
 mqlite list-subscriptions --topic events --limit 100
 mqlite delete-subscription events worker                 # empty-only
 mqlite delete-subscription events worker --force         # explicitly discard retained work
@@ -376,6 +377,16 @@ and same-name recreation, use globally unique one-use names for temporary
 subscriptions, and wait until the relevant inventory no longer shows the name
 before reusing it.
 
+A subscription may also have a fixed lifetime. `SubscribeWithOptions`,
+`subscribe --ttl`, HTTP `ttl_ms`, MCP and the console all store one absolute
+deadline from the first successful creation. The deadline never moves when a
+client retries, edits the filter, publishes or receives messages. At
+`now >= expires_at_ms` the subscription immediately leaves fan-out and its data
+plane; expiry is advance authorization to discard retained messages through the
+same bounded cleanup path. Use explicit deletion when normal work finishes and
+TTL as a backstop for a lost caller. A large unconsumed backlog still needs time
+and disk to clean, and keeps its subscription-capacity slot until removal.
+
 The default 10,000-subscription ceiling counts both active and deleting entries;
 pending cleanup intentionally keeps its slot. It bounds metadata growth, while
 publish work and stored message copies still grow with
@@ -431,7 +442,7 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 ## Status
 
 This source tree contains the unreleased replacement for **retracted v0.3.3**. It
-keeps the default broker port **6754** and uses schema token **6**. The public queue
+keeps the default broker port **6754** and uses schema token **7**. The public queue
 identity experiment has been removed; queue operations address a queue by name.
 See [CHANGELOG.md](CHANGELOG.md) for the breaking correction and upgrade notes.
 For a tagged deployment, use **v0.3.2** until a replacement release is published;
@@ -441,7 +452,9 @@ see [deployment](docs/deployment.md) for configuration.
 requires a fresh database.** Those builds use schema token 5; MQLite deliberately
 has no in-place schema migration. Stop writers, take a consistent backup, account
 for retained work in every state, and keep the old binary/database pair for
-rollback. Do not restamp or point schema-6 code at the old file. See
+rollback. Do not restamp or point schema-7 code at the old file. A schema-6
+database made by an intermediate unreleased lifecycle build is refused as well.
+See
 [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
 
 **Upgrading from v0.2.0 requires a new database.** There is no in-place schema

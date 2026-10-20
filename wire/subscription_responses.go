@@ -74,7 +74,7 @@ func DecodeListSubscriptionsPageResponse(data []byte, request ListSubscriptionsP
 	var previousTopic, previousName string
 	seenNames := make(map[string]bool, len(rawSubscriptions))
 	for i, raw := range rawSubscriptions {
-		itemFields, err := subscriptionResponseObject(raw, "topic", "name", "state")
+		itemFields, err := subscriptionResponseObject(raw, "topic", "name", "state", "created_at_ms", "expires_at_ms")
 		if err != nil {
 			return ListSubscriptionsPageResponse{}, err
 		}
@@ -84,6 +84,8 @@ func DecodeListSubscriptionsPageResponse(data []byte, request ListSubscriptionsP
 		var item SubscriptionPageJSON
 		if json.Unmarshal(raw, &item) != nil || item.Topic == "" || item.Name == "" ||
 			item.State != "active" && item.State != "deleting" ||
+			item.CreatedAtMs < 0 || item.ExpiresAtMs < 0 ||
+			item.ExpiresAtMs != 0 && item.ExpiresAtMs <= item.CreatedAtMs ||
 			!request.IncludeDeleting && item.State != "active" ||
 			request.Topic != "" && item.Topic != request.Topic ||
 			seenNames[item.Name] ||

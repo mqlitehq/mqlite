@@ -164,6 +164,13 @@ if err := cli.Subscribe(ctx, "replies", "checkout-instance-7", nil); err != nil 
 	log.Fatal(err)
 }
 
+// For a genuinely temporary owner, TTL is a cleanup backstop. It is fixed at
+// first creation and does not replace explicit deletion after normal success.
+if err := cli.SubscribeWithOptions(ctx, "replies", "checkout-request-01J...", nil,
+	mqlite.SubscribeOptions{TTL: 15 * time.Minute}); err != nil {
+	log.Fatal(err)
+}
+
 page, err := cli.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{
 	Topic: "replies",
 	Limit: 100,
@@ -184,7 +191,10 @@ For intentional abandonment, call `DeleteSubscriptionWithOptions` with
 external side effects already happened. The operation may finish as `deleting`;
 keep ownership of the globally unique, one-use name and reconcile it through a
 paged list with `IncludeDeleting: true`. Do not replay a destructive request after
-an unknown transport outcome.
+an unknown transport outcome. At a fixed deadline the temporary subscription is
+unavailable immediately and expiry preauthorizes force cleanup. Use globally
+unique one-use names; after physical cleanup, same-name creation begins a new
+lifetime and the name-only API cannot distinguish it from a delayed old retry.
 
 ## 5. curl (raw HTTP)
 

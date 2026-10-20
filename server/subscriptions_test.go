@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mqlitehq/mqlite/engine"
@@ -73,7 +75,8 @@ func TestListSubscriptionsAndTestFilter(t *testing.T) {
 		page.Subscriptions[0].Topic != ls.Subscriptions[0].Topic ||
 		page.Subscriptions[0].Name != ls.Subscriptions[0].Name ||
 		page.Subscriptions[0].Expr != ls.Subscriptions[0].Expr ||
-		page.Subscriptions[0].State != "active" {
+		page.Subscriptions[0].State != "active" || page.Subscriptions[0].CreatedAtMs <= 0 ||
+		page.Subscriptions[0].ExpiresAtMs != 0 {
 		t.Fatalf("ListSubscriptionsPage = %+v", page)
 	}
 
@@ -173,5 +176,125 @@ func TestSubscriptionLifecycleRoutes(t *testing.T) {
 	ack, decodeErr := wire.DecodeDeleteResponse(deleted.Body.Bytes())
 	if deleted.Code != http.StatusOK || decodeErr != nil || !ack.Deleted || ack.State != "deleted" {
 		t.Fatalf("force delete = %d %s: %v", deleted.Code, deleted.Body.String(), decodeErr)
+	}
+}
+
+func TestSubscriptionTTLRouteContract(t *testing.T) {
+	ctx := context.Background()
+	const createdAt = int64(1_700_000_000_000)
+	var now atomic.Int64
+	now.Store(createdAt)
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, Now: now.Load})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	h := server.New(eng, nil).Handler()
+	call := func(body any) *httptest.ResponseRecorder {
+		t.Helper()
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe, bytes.NewReader(data)))
+		return rec
+	}
+	errorCode := func(rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		var body wire.ErrorBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Code
+	}
+
+	if rec := call(wire.SubscribeRequest{Topic: "events", Name: "durable"}); rec.Code != http.StatusOK {
+		t.Fatalf("legacy subscribe = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := call(wire.SubscribeWithOptionsRequest{
+		Topic: "events", Name: "temporary", Filter: &engine.Filter{Expr: `subject == "kept"`}, TTLMs: 5000,
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("TTL subscribe = %d: %s", rec.Code, rec.Body.String())
+	}
+	conflict := call(wire.SubscribeWithOptionsRequest{
+		Topic: "events", Name: "temporary", Filter: &engine.Filter{Expr: `subject == "discarded"`}, TTLMs: 1000,
+	})
+	if conflict.Code != http.StatusConflict || errorCode(conflict) != "name_conflict" {
+		t.Fatalf("changed TTL = %d: %s", conflict.Code, conflict.Body.String())
+	}
+	page, err := eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "events", IncludeDeleting: true})
+	if err != nil || page.Total != 2 {
+		t.Fatalf("inventory = %+v, %v", page, err)
+	}
+	var temporary engine.SubscriptionPageItem
+	for _, item := range page.Subscriptions {
+		if item.Name == "temporary" {
+			temporary = item
+		}
+	}
+	if temporary.Expr != `subject == "kept"` || temporary.CreatedAtMs != createdAt || temporary.ExpiresAtMs != createdAt+5000 {
+		t.Fatalf("temporary = %+v", temporary)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe, bytes.NewBufferString(
+		`{"topic":"events","name":"temporary","filter":{"expr":"subject == \"zero\""},"ttl_ms":0}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit zero TTL update = %d: %s", rec.Code, rec.Body.String())
+	}
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "events", IncludeDeleting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary = engine.SubscriptionPageItem{}
+	for _, item := range page.Subscriptions {
+		if item.Name == "temporary" {
+			temporary = item
+		}
+	}
+	if temporary.Name == "" || temporary.Expr != `subject == "zero"` ||
+		temporary.CreatedAtMs != createdAt || temporary.ExpiresAtMs != createdAt+5000 {
+		t.Fatalf("zero TTL moved the fixed deadline: %+v", temporary)
+	}
+
+	negative := call(wire.SubscribeWithOptionsRequest{Topic: "events", Name: "negative", TTLMs: -1})
+	if negative.Code != http.StatusBadRequest || errorCode(negative) != "invalid_argument" {
+		t.Fatalf("negative TTL = %d: %s", negative.Code, negative.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe,
+		bytes.NewBufferString(`{"topic":"events","name":"fractional","ttl_ms":1.5}`)))
+	if rec.Code != http.StatusBadRequest || errorCode(rec) != "invalid_argument" {
+		t.Fatalf("fractional TTL = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe,
+		bytes.NewBufferString(`{"topic":"events","name":"zero","ttl_ms":0}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("zero TTL = %d: %s", rec.Code, rec.Body.String())
+	}
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "events", IncludeDeleting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zero engine.SubscriptionPageItem
+	for _, item := range page.Subscriptions {
+		if item.Name == "zero" {
+			zero = item
+		}
+	}
+	if zero.Name != "zero" || zero.ExpiresAtMs != 0 {
+		t.Fatalf("zero TTL subscription = %+v", zero)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe,
+		bytes.NewBufferString(`{"topic":"events","name":"null","ttl_ms":null}`)))
+	if rec.Code != http.StatusBadRequest || errorCode(rec) != "invalid_argument" {
+		t.Fatalf("null TTL = %d: %s", rec.Code, rec.Body.String())
+	}
+	now.Store(math.MaxInt64 - 100)
+	overflow := call(wire.SubscribeWithOptionsRequest{Topic: "events", Name: "overflow", TTLMs: 1000})
+	if overflow.Code != http.StatusBadRequest || errorCode(overflow) != "invalid_argument" {
+		t.Fatalf("overflow TTL = %d: %s", overflow.Code, overflow.Body.String())
 	}
 }

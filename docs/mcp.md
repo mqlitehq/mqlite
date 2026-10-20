@@ -52,7 +52,7 @@ models misuse them):
 | `list_queues` | list queues/subscriptions |
 | `create_queue` | create/update a queue by name |
 | `delete_queue` | delete a plain queue; optional `force` explicitly discards retained work |
-| `subscribe` | create a topic subscription or update its filter |
+| `subscribe` | create a topic subscription or update its filter; optional `ttl_ms` sets a fixed lifetime |
 | `list_subscriptions` | page subscriptions by topic, with total/count and optional deleting entries |
 | `delete_subscription` | delete one exact topic/subscription pair; optional `force` discards retained work |
 | `send` | send a message (`queue`, `body`, optional `message_id`/`group_id`) |
@@ -116,6 +116,24 @@ a metadata safety ceiling. Publish work and stored copies still grow with the
 number of matching subscriptions, so an agent should not create a subscription
 per request at high rates; use a stable reply subscription and dispatch by
 `correlation_id`.
+
+`subscribe` accepts an optional positive integer `ttl_ms`. On first creation, it
+sets a fixed lifetime measured from that creation time. Omit `ttl_ms` to create a
+permanent subscription or preserve an existing subscription's lifetime; the MCP
+tool rejects an explicit zero. Repeating the original positive TTL is idempotent;
+supplying a different positive TTL for the same subscription returns a conflict
+before changing its filter. Updates, retries, traffic, and receives never extend
+the deadline.
+
+At the deadline, the broker makes the subscription unavailable and treats the TTL
+as advance authorization to discard its retained messages. Physical cleanup is
+bounded and asynchronous, so the name remains reserved until inventory with
+`include_deleting:true` no longer returns it. A later creation with the same name
+starts a new lifecycle; serialize deletion or expiry with same-name recreation.
+Each list item includes `created_at_ms` and `expires_at_ms`; zero expiry means the
+subscription is permanent. Prefer unique one-use names for genuinely temporary
+work. For high-rate request/reply traffic, prefer a stable reply subscription per
+service instance and route replies by `correlation_id`.
 
 ## Read-only observation
 

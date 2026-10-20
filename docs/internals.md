@@ -36,7 +36,7 @@ machinery; one carries your data:
 | Table | Job |
 |---|---|
 | `messages` | **the queue itself** — every message, in every state |
-| `queues` | per-queue config plus durable `active` / `deleting` lifecycle state and deletion start time |
+| `queues` | per-queue config plus durable `active` / `deleting` lifecycle state, deletion start time, and a subscription's fixed absolute expiry |
 | `subscriptions` | the topic fan-out roster (`topic → subscription` + optional filter) |
 | `dedup` | duplicate-detection window |
 | `settlement_receipts` | makes acknowledgements idempotent (§7) |
@@ -227,7 +227,8 @@ it is small and boring on purpose:
 
 | Loop | Cadence | Job |
 |---|---|---|
-| lifecycle | event-driven; 1 s between continuation passes | continue bounded physical cleanup for queues and subscription backing queues durably marked `deleting` |
+| lifecycle | event-driven; 10 ms after a full empty-subscription batch, otherwise 1 s between continuation passes | continue bounded physical cleanup for queues and subscription backing queues durably marked `deleting` |
+| subscription expiry | 1 s discovery; 10 ms between full due batches | transition a bounded indexed batch whose fixed absolute deadline has arrived; data-plane fencing does not wait for this scan |
 | reaper | 1 s | expired locks → back to `active` — or to the DLQ once `delivery_count ≥ max` |
 | scheduler | 1 s | `scheduled` rows whose time arrived → `active` |
 | TTL sweep | 10 s | expired messages → DLQ (or discard), from *any* non-terminal state |
@@ -242,6 +243,13 @@ work and keeps the namespace occupied. A subscription stops participating in
 fan-out in that same committed state transition. Physical cleanup then removes
 messages, dedup rows and both receipt tables before deleting the queue row itself;
 the subscription mapping and backing queue are removed explicitly in one transaction.
+
+A temporary subscription stores one `queues.expires_at` value at first creation.
+Every operation checks it against fresh broker time at its transactional effect;
+the equality boundary is expired. Locks are capped at that instant and long polls
+wake there. The indexed expiry loop durably marks due rows `deleting`, but it is a
+cleanup mechanism rather than the correctness fence. Expiry itself is the saved
+force authorization and never changes on retry, filter update or message activity.
 
 The accepting call removes no more than 1,000 physical rows and targets about
 8 MiB. Each lifecycle pass globally caps cleanup at 4,096 rows and targets about
@@ -260,7 +268,10 @@ immediate pass, the worker performs 30 delayed probes one second apart so a comm
 that becomes visible after the first inventory snapshot is still discovered.
 Restart recovery remains the durable fallback after that window. Metadata work
 uses the same global budget: finalizing a subscription consumes two rows in the
-pass budget, one queue row and one subscription mapping.
+pass budget, one queue row and one subscription mapping. The common empty case
+deletes up to 512 mappings and backing rows with two set-based statements in one
+transaction, checking exact affected-row counts even when foreign keys are off.
+Subscriptions with any retained state remain on the ordinary fair row/byte path.
 
 **Crash recovery is one statement.** On `Open`, every `locked` row is an orphan
 of a previous process (locks are rows, remember) and is reclaimed — back to
@@ -358,9 +369,10 @@ Every claim in this document is enforced by something that fails loudly:
   with a different guard token is refused (`ErrSchemaVersionMismatch`); existing
   table layouts are never migrated. Incompatible changes require a token change.
   The independent `access_keys` addition originally preserved token 5 and remains
-  independently additive inside token 6, with a separate golden for its DDL.
-  Durable queue lifecycle metadata advances the current canonical schema to token
-  6; real schema-5 files are refused in both directions.
+  part of the canonical schema, with a separate golden for its DDL. Durable
+  resource lifecycle and fixed subscription expiry advance the current canonical
+  schema to token 7; real schema-5 and intermediate schema-6 files are refused in
+  both directions.
 - **An integrity sweep** — a randomized send/receive/crash workload asserting
   every message arrives (no loss), arrives intact (content hash), and never
   exceeds its delivery bound.

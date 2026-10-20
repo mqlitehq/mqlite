@@ -17,7 +17,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +45,12 @@ var _ struct {
 	Name  string `json:"name"`
 	Expr  string `json:"expr,omitempty"`
 } = mqlite.SubscriptionInfo{}
+
+// Keep the original Subscribe method while the options-bearing form evolves
+// independently for fixed-lifetime creation.
+var _ interface {
+	Subscribe(context.Context, string, string, *mqlite.Filter) error
+} = (*mqlite.Client)(nil)
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -841,8 +849,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "c09f4d453929713d677458f593ee1e8eb79d6beb373378598f4cbb7d6b776fe4",
-		"concepts.html": "1e9cb2a19cf2a1e2515003123998b5c34ae440d0dea7f1aeb551981bd42b4019",
+		"concepts.md":   "1f13c5f8ac38b46507ddb10896fa8efa90caf48568fbd6860bbd765ea02ff3b6",
+		"concepts.html": "5da9df1dab87539cde39340e1cfa0430858c4be292722804b9599a8b318014c4",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {
@@ -2077,6 +2085,46 @@ func TestRemoteListQueuesDefaultsLegacyStateToActive(t *testing.T) {
 	}
 }
 
+func TestRemoteSubscribeKeepsLegacyWireShapeAndValidatesTTL(t *testing.T) {
+	var bodies [][]byte
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wire.PathSubscribe {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		bodies = append(bodies, body)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx := context.Background()
+	if err := client.Subscribe(ctx, "events", "durable", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SubscribeWithOptions(ctx, "events", "temporary", &mqlite.Filter{Expr: "true"}, mqlite.SubscribeOptions{TTL: 1500 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 || string(bodies[0]) != `{"topic":"events","name":"durable"}` ||
+		string(bodies[1]) != `{"topic":"events","name":"temporary","filter":{"expr":"true"},"ttl_ms":1500}` {
+		t.Fatalf("subscribe bodies = %q", bodies)
+	}
+	for _, ttl := range []time.Duration{-1, 1, time.Millisecond - 1} {
+		if err := client.SubscribeWithOptions(ctx, "events", "invalid", nil, mqlite.SubscribeOptions{TTL: ttl}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+			t.Fatalf("TTL %s = %v", ttl, err)
+		}
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("invalid TTL reached broker: %d requests", len(bodies))
+	}
+}
+
 func TestRemoteListSubscriptionsPreservesLegacyShape(t *testing.T) {
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2084,7 +2132,7 @@ func TestRemoteListSubscriptionsPreservesLegacyShape(t *testing.T) {
 		case wire.PathListSubscriptions:
 			_, _ = w.Write([]byte(`{"subscriptions":[{"topic":"events","name":"legacy"}]}`))
 		case wire.PathListSubscriptionsPage:
-			_, _ = w.Write([]byte(`{"subscriptions":[{"topic":"events","name":"legacy","state":"active"}],"total":1}`))
+			_, _ = w.Write([]byte(`{"subscriptions":[{"topic":"events","name":"legacy","state":"active","created_at_ms":100,"expires_at_ms":0}],"total":1}`))
 		default:
 			t.Errorf("path = %q", r.URL.Path)
 			http.NotFound(w, r)
@@ -2105,11 +2153,12 @@ func TestRemoteListSubscriptionsPreservesLegacyShape(t *testing.T) {
 		t.Fatalf("legacy subscription JSON = %s, %v", encoded, err)
 	}
 	page, err := client.ListSubscriptionsWithOptions(context.Background(), mqlite.ListSubscriptionsOptions{Topic: "events"})
-	if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 || page.Subscriptions[0].State != "active" {
+	if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 || page.Subscriptions[0].State != "active" ||
+		page.Subscriptions[0].CreatedAtMs != 100 || page.Subscriptions[0].ExpiresAtMs != 0 {
 		t.Fatalf("legacy paged inventory = %+v, %v", page, err)
 	}
 	encoded, err = json.Marshal(page)
-	if err != nil || string(encoded) != `{"subscriptions":[{"topic":"events","name":"legacy","state":"active"}],"total":1}` {
+	if err != nil || string(encoded) != `{"subscriptions":[{"topic":"events","name":"legacy","state":"active","created_at_ms":100,"expires_at_ms":0}],"total":1}` {
 		t.Fatalf("paged subscription JSON = %s, %v", encoded, err)
 	}
 }
@@ -2123,12 +2172,14 @@ func TestRemoteListSubscriptionsPageRejectsMalformedSuccess(t *testing.T) {
 		{"null root", `null`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
 		{"missing fields", `{}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
 		{"null subscriptions", `{"subscriptions":null,"total":0}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
-		{"missing item state", `{"subscriptions":[{"topic":"events","name":"a"}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
-		{"wrong scope", `{"subscriptions":[{"topic":"other","name":"a","state":"active"}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
-		{"unordered", `{"subscriptions":[{"topic":"events","name":"b","state":"active"},{"topic":"events","name":"a","state":"active"}],"total":2}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
-		{"invalid state", `{"subscriptions":[{"topic":"events","name":"a","state":"deleting"}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
-		{"incomplete first page", `{"subscriptions":[{"topic":"events","name":"a","state":"active"}],"total":2}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
-		{"over page size", `{"subscriptions":[{"topic":"events","name":"a","state":"active"},{"topic":"events","name":"b","state":"active"}],"total":2,"next_after":"cursor"}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 1}},
+		{"missing item state", `{"subscriptions":[{"topic":"events","name":"a","created_at_ms":10,"expires_at_ms":0}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"missing created time", `{"subscriptions":[{"topic":"events","name":"a","state":"active","expires_at_ms":0}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"invalid expiry", `{"subscriptions":[{"topic":"events","name":"a","state":"active","created_at_ms":10,"expires_at_ms":10}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"wrong scope", `{"subscriptions":[{"topic":"other","name":"a","state":"active","created_at_ms":10,"expires_at_ms":0}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"unordered", `{"subscriptions":[{"topic":"events","name":"b","state":"active","created_at_ms":10,"expires_at_ms":0},{"topic":"events","name":"a","state":"active","created_at_ms":10,"expires_at_ms":0}],"total":2}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"invalid state", `{"subscriptions":[{"topic":"events","name":"a","state":"deleting","created_at_ms":10,"expires_at_ms":0}],"total":1}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"incomplete first page", `{"subscriptions":[{"topic":"events","name":"a","state":"active","created_at_ms":10,"expires_at_ms":0}],"total":2}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
+		{"over page size", `{"subscriptions":[{"topic":"events","name":"a","state":"active","created_at_ms":10,"expires_at_ms":0},{"topic":"events","name":"b","state":"active","created_at_ms":10,"expires_at_ms":0}],"total":2,"next_after":"cursor"}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 1}},
 		{"trailing JSON", `{"subscriptions":[],"total":0} {}`, mqlite.ListSubscriptionsOptions{Topic: "events", Limit: 2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2231,6 +2282,126 @@ func TestSubscriptionLifecycleSDK(t *testing.T) {
 			_ = embedded.Close()
 		}
 		t.Fatalf("negative subscription limit = %v", err)
+	}
+}
+
+func TestSubscriptionFixedLifetimeSDK(t *testing.T) {
+	type subscriptionTTLAPI interface {
+		Subscribe(context.Context, string, string, *mqlite.Filter) error
+		SubscribeWithOptions(context.Context, string, string, *mqlite.Filter, mqlite.SubscribeOptions) error
+		ListSubscriptions(context.Context) ([]mqlite.SubscriptionInfo, error)
+		ListSubscriptionsWithOptions(context.Context, mqlite.ListSubscriptionsOptions) (mqlite.SubscriptionPage, error)
+		SendOne(context.Context, string, mqlite.OutMessage, ...mqlite.SendOpts) (int64, error)
+		Receive(context.Context, string, ...mqlite.RecvOpts) ([]*mqlite.Message, error)
+		Stats(context.Context, string) (mqlite.Metrics, error)
+	}
+	for _, remote := range []bool{false, true} {
+		t.Run(fmt.Sprintf("remote=%t", remote), func(t *testing.T) {
+			ctx := context.Background()
+			const createdAt = int64(1_700_000_000_000)
+			var now atomic.Int64
+			now.Store(createdAt)
+			embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground(), mqlite.WithClock(now.Load))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer embedded.Close()
+			var api subscriptionTTLAPI = embedded
+			if remote {
+				ts := httptest.NewServer(server.New(embedded.Engine(), nil).Handler())
+				defer ts.Close()
+				client, err := mqlite.Open(ctx, ts.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				api = client
+			}
+
+			oneSecond := mqlite.SubscribeOptions{TTL: time.Second}
+			if err := api.SubscribeWithOptions(ctx, "requests", "temporary", &mqlite.Filter{Expr: `subject == "one"`}, oneSecond); err != nil {
+				t.Fatal(err)
+			}
+			assertPage := func(wantExpr, wantState string, wantCreated, wantExpires int64) {
+				t.Helper()
+				page, err := api.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{
+					Topic: "requests", IncludeDeleting: true,
+				})
+				if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 {
+					t.Fatalf("inventory = %+v, %v", page, err)
+				}
+				got := page.Subscriptions[0]
+				if got.Topic != "requests" || got.Name != "temporary" || got.Expr != wantExpr ||
+					got.State != wantState || got.CreatedAtMs != wantCreated || got.ExpiresAtMs != wantExpires {
+					t.Fatalf("subscription = %+v", got)
+				}
+			}
+			assertPage(`subject == "one"`, "active", createdAt, createdAt+1000)
+
+			// Neither a legacy update, an idempotent retry, nor message activity
+			// moves the original absolute deadline.
+			now.Store(createdAt + 100)
+			if err := api.Subscribe(ctx, "requests", "temporary", &mqlite.Filter{Expr: `subject == "two"`}); err != nil {
+				t.Fatal(err)
+			}
+			if err := api.SubscribeWithOptions(ctx, "requests", "temporary", &mqlite.Filter{Expr: `subject == "three"`}, oneSecond); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := api.SendOne(ctx, "requests", mqlite.OutMessage{Body: []byte("reply"), Subject: "three"}); err != nil {
+				t.Fatal(err)
+			}
+			messages, err := api.Receive(ctx, "temporary", mqlite.RecvOpts{AtMostOnce: true})
+			if err != nil || len(messages) != 1 {
+				t.Fatalf("receive = %d, %v", len(messages), err)
+			}
+			assertPage(`subject == "three"`, "active", createdAt, createdAt+1000)
+
+			// A different positive TTL is a name conflict and must not apply the
+			// accompanying filter update.
+			if err := api.SubscribeWithOptions(ctx, "requests", "temporary", &mqlite.Filter{Expr: `subject == "wrong"`}, mqlite.SubscribeOptions{TTL: 2 * time.Second}); !errors.Is(err, mqlite.ErrNameConflict) {
+				t.Fatalf("changed TTL = %v", err)
+			}
+			assertPage(`subject == "three"`, "active", createdAt, createdAt+1000)
+
+			for _, ttl := range []time.Duration{-time.Second, time.Nanosecond, time.Millisecond - 1} {
+				if err := api.SubscribeWithOptions(ctx, "requests", "invalid", nil, mqlite.SubscribeOptions{TTL: ttl}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+					t.Fatalf("TTL %s = %v", ttl, err)
+				}
+			}
+			now.Store(math.MaxInt64 - 500)
+			if err := api.SubscribeWithOptions(ctx, "requests", "overflow", nil, oneSecond); !errors.Is(err, mqlite.ErrInvalidArgument) {
+				t.Fatalf("overflow TTL = %v", err)
+			}
+
+			// Expiration is a logical force delete at the exact deadline, even
+			// before bounded physical cleanup runs.
+			now.Store(createdAt + 1000)
+			if _, err := api.Stats(ctx, "temporary"); !errors.Is(err, mqlite.ErrQueueNotFound) && !errors.Is(err, mqlite.ErrNotFound) {
+				t.Fatalf("expired stats = %v", err)
+			}
+			if active, err := api.ListSubscriptions(ctx); err != nil || len(active) != 0 {
+				t.Fatalf("expired active inventory = %+v, %v", active, err)
+			}
+			assertPage(`subject == "three"`, "deleting", createdAt, createdAt+1000)
+			if err := api.Subscribe(ctx, "requests", "temporary", nil); !errors.Is(err, mqlite.ErrNameConflict) {
+				t.Fatalf("reuse before cleanup = %v", err)
+			}
+
+			embedded.Engine().RunMaintenanceOnce(ctx)
+			page, err := api.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{Topic: "requests", IncludeDeleting: true})
+			if err != nil || page.Total != 0 || len(page.Subscriptions) != 0 {
+				t.Fatalf("post-cleanup inventory = %+v, %v", page, err)
+			}
+			now.Store(createdAt + 1001)
+			if err := api.Subscribe(ctx, "requests", "temporary", nil); err != nil {
+				t.Fatal(err)
+			}
+			assertPage("", "active", createdAt+1001, 0)
+			if err := api.SubscribeWithOptions(ctx, "requests", "temporary", &mqlite.Filter{Expr: "true"}, oneSecond); !errors.Is(err, mqlite.ErrNameConflict) {
+				t.Fatalf("permanent to temporary = %v", err)
+			}
+			assertPage("", "active", createdAt+1001, 0)
+		})
 	}
 }
 

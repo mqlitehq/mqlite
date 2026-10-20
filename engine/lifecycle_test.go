@@ -1671,3 +1671,237 @@ func TestMessageQueueTriggerInventory(t *testing.T) {
 		t.Logf("pinned %d message-parent guards without a per-insert trigger or duplicate full queue index", len(want))
 	}
 }
+func TestExpiredSubscriptionTransitionAndEmptyBatchCleanup(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	const count = 10_000
+	now := *clock
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,delete_started_at,expires_at,created_at,updated_at)
+	  SELECT printf('ttl-%05d',i),'subscription','active',0,?,?,? FROM n`, count-1, now, now-1, now-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'burst',name,created_at FROM queues WHERE kind='subscription'`); err != nil {
+		t.Fatal(err)
+	}
+
+	for pass := 1; pass <= 24; pass++ {
+		changed, _, err := e.transitionExpiredSubscriptionsPass(ctx)
+		if err != nil {
+			t.Fatalf("transition pass %d: %v", pass, err)
+		}
+		e.maintainLifecycle(ctx)
+		var retained int
+		if err := e.db.queryRowScan(ctx, []any{&retained}, `SELECT COUNT(*) FROM subscriptions`); err != nil {
+			t.Fatal(err)
+		}
+		if retained == 0 {
+			if pass > 20 {
+				t.Fatalf("10k empty expirations required %d cleanup passes, want at most 20", pass)
+			}
+			if changed == 0 && pass == 1 {
+				t.Fatal("due transition did not find subscriptions")
+			}
+			return
+		}
+	}
+	t.Fatal("10k empty expirations did not converge within 24 bounded passes")
+}
+
+func TestEmptySubscriptionBatchLeavesBudgetForLoadedResource(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	if err := e.Subscribe(ctx, "topic", "heavy", nil); err != nil {
+		t.Fatal(err)
+	}
+	insertLifecycleMessages(t, e, "heavy", lifecyclePassRows+1000, 1)
+	if _, err := e.DeleteSubscriptionWithOptions(ctx, "topic", "heavy", DeleteOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	before := lifecycleRows(t, e, "messages", "heavy")
+	// Thousands of earlier, nonempty reservations must not prevent the indexed
+	// candidate scan from finding an empty batch later in lifecycle order.
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<2047
+	) INSERT INTO queues(name,kind,lifecycle_state,delete_started_at,created_at,updated_at)
+	  SELECT printf('blocked-%04d',i),'subscription','deleting',?,1,1 FROM n`, *clock+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'blocked',name,1 FROM queues WHERE name LIKE 'blocked-%'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO messages(queue,state,enqueued_at,body)
+		SELECT name,'active',1,x'01' FROM queues WHERE name LIKE 'blocked-%'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,delete_started_at,created_at,updated_at)
+	  SELECT printf('empty-%04d',i),'subscription','deleting',?,1,1 FROM n`, lifecycleEmptySubBatch-1, *clock+2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'empty',name,1 FROM queues WHERE name LIKE 'empty-%'`); err != nil {
+		t.Fatal(err)
+	}
+	e.maintainLifecycle(ctx)
+	if after := lifecycleRows(t, e, "messages", "heavy"); after >= before {
+		t.Fatalf("set-based empty cleanup starved loaded resource: messages %d -> %d", before, after)
+	}
+	var empty int
+	if err := e.db.queryRowScan(ctx, []any{&empty}, `SELECT COUNT(*) FROM subscriptions WHERE topic='empty'`); err != nil || empty != 0 {
+		t.Fatalf("empty batch retained=%d err=%v", empty, err)
+	}
+	plan := explainPlan(t, e, emptySubscriptionCandidatesSQL, lifecycleEmptySubBatch)
+	if !strings.Contains(plan, "idx_queue_deleting") || strings.Contains(plan, "USE TEMP B-TREE") || strings.Contains(plan, "SCAN messages") {
+		t.Fatalf("empty subscription candidate scan lost bounded indexes:\n%s", plan)
+	}
+}
+
+func TestLifecycleWorkerFastContinuesFullEmptyBatches(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	const count = lifecycleEmptySubBatch * 4
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,delete_started_at,created_at,updated_at)
+	  SELECT printf('fast-%04d',i),'subscription','deleting',?,1,1 FROM n`, count-1, *clock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'fast',name,1 FROM queues WHERE name LIKE 'fast-%'`); err != nil {
+		t.Fatal(err)
+	}
+
+	workerCtx, cancel := context.WithCancel(context.Background())
+	e.startLifecycle(workerCtx)
+	e.signalLifecycle()
+	foreground, foregroundCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	if err := e.CreateQueue(foreground, "foreground", QueueConfig{}); err != nil {
+		foregroundCancel()
+		cancel()
+		e.bgWG.Wait()
+		t.Fatalf("foreground writer could not enter between bounded cleanup transactions: %v", err)
+	}
+	foregroundCancel()
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for {
+		var retained int
+		if err := e.db.queryRowScan(ctx, []any{&retained}, `SELECT COUNT(*) FROM subscriptions WHERE topic='fast'`); err != nil {
+			cancel()
+			e.bgWG.Wait()
+			t.Fatal(err)
+		}
+		if retained == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			e.bgWG.Wait()
+			t.Fatalf("fast continuation retained %d subscriptions past deadline", retained)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	e.bgWG.Wait()
+}
+
+func TestSubscriptionExpiryWorkerFastContinuesFullBatches(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	const count = subscriptionExpiryBatch*2 + 500
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,expires_at,created_at,updated_at)
+	  SELECT printf('due-%04d',i),'subscription','active',?,?,? FROM n`, count-1, *clock, *clock-1, *clock-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'due',name,created_at FROM queues WHERE name LIKE 'due-%'`); err != nil {
+		t.Fatal(err)
+	}
+
+	workerCtx, cancel := context.WithCancel(context.Background())
+	e.startSubscriptionExpiry(workerCtx)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var active int
+		if err := e.db.queryRowScan(ctx, []any{&active}, `SELECT COUNT(*) FROM queues
+			WHERE name LIKE 'due-%' AND lifecycle_state='active'`); err != nil {
+			cancel()
+			e.bgWG.Wait()
+			t.Fatal(err)
+		}
+		if active == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			e.bgWG.Wait()
+			t.Fatalf("fast expiry continuation retained %d active subscriptions", active)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	foreground, foregroundCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	if err := e.CreateQueue(foreground, "expiry-foreground", QueueConfig{}); err != nil {
+		foregroundCancel()
+		cancel()
+		e.bgWG.Wait()
+		t.Fatalf("expiry batches monopolized foreground writer: %v", err)
+	}
+	foregroundCancel()
+	cancel()
+	e.bgWG.Wait()
+}
+
+func TestSubscriptionExpiryFailureDoesNotRequestFastRetry(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	if err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{TTLMs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Millisecond)
+	if _, err := e.db.exec(ctx, `CREATE TRIGGER fail_expiry_transition BEFORE UPDATE OF lifecycle_state ON queues
+		WHEN OLD.name='sub' BEGIN SELECT RAISE(ABORT,'injected expiry transition failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	changed, fastRetry, err := e.transitionExpiredSubscriptionsPass(ctx)
+	if err == nil {
+		t.Fatal("expiry transition unexpectedly succeeded")
+	}
+	if changed != 0 || fastRetry {
+		t.Fatalf("failed transition changed=%d fast-retry=%t, want 0/false", changed, fastRetry)
+	}
+}
+
+func TestEmptySubscriptionBatchRollsBackWithoutForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	if err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{TTLMs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Millisecond)
+	if changed, _, err := e.transitionExpiredSubscriptionsPass(ctx); err != nil || changed != 1 {
+		t.Fatalf("transition changed=%d err=%v", changed, err)
+	}
+	disableForeignKeys(t, e)
+	if _, err := e.db.exec(ctx, `CREATE TRIGGER fail_expired_queue BEFORE DELETE ON queues
+		WHEN OLD.name='sub' BEGIN SELECT RAISE(ABORT,'injected queue delete failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	e.maintainLifecycle(ctx)
+	if mappings, queues := subscriptionMetadataRows(t, e, "sub"); mappings != 1 || queues != 1 {
+		t.Fatalf("failed set cleanup committed partial metadata mapping/queue=%d/%d", mappings, queues)
+	}
+	if _, err := e.db.exec(ctx, `DROP TRIGGER fail_expired_queue`); err != nil {
+		t.Fatal(err)
+	}
+	e.maintainLifecycle(ctx)
+	if mappings, queues := subscriptionMetadataRows(t, e, "sub"); mappings != 0 || queues != 0 {
+		t.Fatalf("retry did not clean metadata mapping/queue=%d/%d", mappings, queues)
+	}
+}

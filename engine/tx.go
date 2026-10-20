@@ -15,7 +15,6 @@ type EngineTx struct {
 	e    *Engine
 	tx   *txn
 	ctx  context.Context
-	now  int64
 	woke map[string]bool
 }
 
@@ -58,20 +57,32 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 	if int64(len(m.Body)) > t.e.maxMsgBytes {
 		return 0, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(m.Body), t.e.maxMsgBytes)
 	}
-	targets, err := t.e.resolveTargetsTx(t.ctx, t.tx, queue)
+	// A callback may keep its transaction open for arbitrary business work. Each
+	// SendOne therefore gets a fresh publish timestamp, shared by all fan-out copies.
+	publishNow := t.e.now()
+	targets, err := t.e.resolveTargetsTx(t.ctx, t.tx, queue, publishNow)
 	if err != nil {
 		return 0, err
 	}
 	var last int64
 	for _, tg := range targets {
-		if !t.e.filterAccepts(tg, m, t.now, t.now) { // immediate send: visible_at == enqueued_at
+		if !t.e.filterAccepts(tg, m, publishNow, publishNow) { // immediate send: visible_at == enqueued_at
 			continue
+		}
+		if tg.queue.expiresAtMs > 0 {
+			fenceNow := t.e.now()
+			if err := queueLiveAt(tg.queue, fenceNow); err != nil {
+				if tg.fanout {
+					continue
+				}
+				return 0, err
+			}
 		}
 		q := tg.queue
 		if q.ordering == OrderGroupFIFO && m.GroupID == "" {
 			return 0, ErrGroupRequired
 		}
-		seq, deduped, err := t.e.insertOne(t.ctx, t.tx, q, m, 0, StateActive, t.now)
+		seq, deduped, err := t.e.insertOne(t.ctx, t.tx, q, m, 0, StateActive, publishNow)
 		if err != nil {
 			return 0, err
 		}
@@ -105,7 +116,7 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
 	var woke map[string]bool
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		et := &EngineTx{e: e, tx: tx, ctx: ctx, now: e.now(), woke: map[string]bool{}}
+		et := &EngineTx{e: e, tx: tx, ctx: ctx, woke: map[string]bool{}}
 		if err := fn(et); err != nil {
 			// An arbitrary application callback error is a rollback, not evidence of
 			// storage failure. Retain database errors observed by MQLite's guarded SQL.
@@ -130,36 +141,37 @@ func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
 }
 
 const resolveDirectTargetSQL = `
-	SELECT name,default_ttl_ms,dedup_window_ms,ordering_mode,lifecycle_state
-	  FROM queues WHERE name=?`
+	SELECT name,default_ttl_ms,dedup_window_ms,ordering_mode,expires_at
+	  FROM queues
+	 WHERE name=? AND lifecycle_state='active'
+	   AND (expires_at=0 OR expires_at>?)`
 
 const resolveTopicTargetsSQL = `
-	SELECT q.name,q.default_ttl_ms,q.dedup_window_ms,q.ordering_mode,s.filter_json
+	SELECT q.name,q.default_ttl_ms,q.dedup_window_ms,q.ordering_mode,s.filter_json,q.expires_at
 	  FROM subscriptions s JOIN queues q ON q.name=s.subscription
 	 WHERE s.topic=? AND q.lifecycle_state='active'
+	   AND (q.expires_at=0 OR q.expires_at>?)
 	 ORDER BY s.subscription`
 
-func (e *Engine) resolveTargetsTx(ctx context.Context, tx *txn, name string) ([]target, error) {
+func (e *Engine) resolveTargetsTx(ctx context.Context, tx *txn, name string, now int64) ([]target, error) {
 	// Public creation keeps queue and topic names in one disjoint namespace, so a
 	// queue hit resolves the route completely. This read and every resulting insert
 	// share one transaction: deletion either follows this send, or this attempt sees
 	// no live target and writes nothing.
 	var q queueRow
 	var ordering string
-	err := tx.QueryRowContext(ctx, resolveDirectTargetSQL, name).Scan(
-		&q.name, &q.defaultTTLMs, &q.dedupWindowMs, &ordering, &q.lifecycleState)
+	err := tx.QueryRowContext(ctx, resolveDirectTargetSQL, name, now).Scan(
+		&q.name, &q.defaultTTLMs, &q.dedupWindowMs, &ordering, &q.expiresAtMs)
 	if err == nil {
 		q.ordering = OrderingMode(ordering)
-		if err := queueLive(q); err != nil {
-			return nil, err
-		}
+		q.lifecycleState = "active"
 		return []target{{name: q.name, queue: q}}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 
-	rows, err := tx.QueryContext(ctx, resolveTopicTargetsSQL, name)
+	rows, err := tx.QueryContext(ctx, resolveTopicTargetsSQL, name, now)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +180,7 @@ func (e *Engine) resolveTargetsTx(ctx context.Context, tx *txn, name string) ([]
 		var q queueRow
 		var ordering string
 		var fj sql.NullString
-		if err := rows.Scan(&q.name, &q.defaultTTLMs, &q.dedupWindowMs, &ordering, &fj); err != nil {
+		if err := rows.Scan(&q.name, &q.defaultTTLMs, &q.dedupWindowMs, &ordering, &fj, &q.expiresAtMs); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}

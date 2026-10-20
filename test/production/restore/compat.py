@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Prove schema-6 refusal leaves a released schema-5 database recoverable.
+"""Prove schema-7 refusal leaves a released schema-5 database recoverable.
 
 Use the released v0.3.0 binary and source to create the full schema-5 fixture.
 The candidate must reject it without changing schema or data. The matching old
 binary must then reopen that same database and complete a read/write round trip.
-The reverse check proves the old binary also rejects a fresh schema-6 database
+The reverse check proves the old binary also rejects a fresh schema-7 database
 without changing it; cross-schema use requires a new database or restored backup.
 """
 
@@ -95,7 +95,7 @@ def run(args, out):
 
     refusal = cli(args.new_binary, db, out, "candidate-refuses-schema5",
                   "metrics", "active", refusal=True)
-    require_schema_refusal(refusal, "5", "6", "candidate")
+    require_schema_refusal(refusal, "5", "7", "candidate")
     after_refusal = snapshot(db, stopped=True)
     save(out / "03-schema5-after-refusal.json", after_refusal)
     compare(after_refusal, before, "candidate refusal modified schema-5 database")
@@ -128,23 +128,23 @@ def run(args, out):
             rows(recovered, "sqlite_sequence") == [{"name": "messages", "seq": sequence}],
             "old recovery lost the sequence high-water mark")
 
-    # Pin the other side of the boundary: a fresh candidate creates schema 6,
+    # Pin the other side of the boundary: a fresh candidate creates schema 7,
     # and the released schema-5 binary refuses it without altering it.
-    fresh = out / "schema6.db"
-    cli(args.new_binary, fresh, out, "candidate-create-schema6", "create-queue", "fresh")
-    schema6 = snapshot(fresh, stopped=True)
-    save(out / "05-schema6-fresh.json", schema6)
-    require(rows(schema6, "meta") == [{"key": "schema_version", "value": "6"}],
-            "candidate did not create schema 6")
-    queue_columns = {column[1] for column in schema6["tables"]["queues"]["columns"]}
-    require({"lifecycle_state", "delete_started_at"}.issubset(queue_columns),
-            "schema 6 is missing queue lifecycle columns")
-    reverse = cli(args.old_binary, fresh, out, "old-refuses-schema6",
+    fresh = out / "schema7.db"
+    cli(args.new_binary, fresh, out, "candidate-create-schema7", "create-queue", "fresh")
+    schema7 = snapshot(fresh, stopped=True)
+    save(out / "05-schema7-fresh.json", schema7)
+    require(rows(schema7, "meta") == [{"key": "schema_version", "value": "7"}],
+            "candidate did not create schema 7")
+    queue_columns = {column[1] for column in schema7["tables"]["queues"]["columns"]}
+    require({"lifecycle_state", "delete_started_at", "expires_at"}.issubset(queue_columns),
+            "schema 7 is missing queue lifecycle or expiration columns")
+    reverse = cli(args.old_binary, fresh, out, "old-refuses-schema7",
                   "metrics", "fresh", refusal=True)
-    require_schema_refusal(reverse, "6", "5", "released binary")
-    schema6_after = snapshot(fresh, stopped=True)
-    save(out / "06-schema6-after-old-refusal.json", schema6_after)
-    compare(schema6_after, schema6, "old refusal modified schema-6 database")
+    require_schema_refusal(reverse, "7", "5", "released binary")
+    schema7_after = snapshot(fresh, stopped=True)
+    save(out / "06-schema7-after-old-refusal.json", schema7_after)
+    compare(schema7_after, schema7, "old refusal modified schema-7 database")
 
     return {
         "status": "PASS",
@@ -155,12 +155,12 @@ def run(args, out):
         "new_binary_sha256": digest(args.new_binary),
         "fixture_binary_sha256": digest(fixture),
         "old_schema_version": "5",
-        "new_schema_version": "6",
+        "new_schema_version": "7",
         "old_tables_verified": sorted(before["tables"]),
         "snapshots": 6,
         "candidate_refusal_preserved_schema5": True,
         "matching_old_runtime_read_write": True,
-        "old_refusal_preserved_schema6": True,
+        "old_refusal_preserved_schema7": True,
     }
 
 

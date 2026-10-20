@@ -352,6 +352,17 @@ func (e *Embedded) Subscribe(ctx context.Context, topic, name string, f *Filter)
 	return e.eng.Subscribe(ctx, topic, name, f)
 }
 
+// SubscribeWithOptions creates or updates a subscription and optionally assigns
+// a fixed lifetime on first creation. Supplying zero TTL preserves the lifetime
+// of an existing subscription.
+func (e *Embedded) SubscribeWithOptions(ctx context.Context, topic, name string, f *Filter, opts SubscribeOptions) error {
+	o, err := opts.toEngine()
+	if err != nil {
+		return err
+	}
+	return e.eng.SubscribeWithOptions(ctx, topic, name, f, o)
+}
+
 func (e *Embedded) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	return e.eng.ListQueues(ctx)
 }

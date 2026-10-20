@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -354,6 +355,71 @@ func TestCompleteBatchRefreshesTimeBetweenChunks(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestCompleteBatchRefreshesSubscriptionExpiryBetweenChunks(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	expires := mustDataPlaneSubscriptionTTL(t, e, "events", "ephemeral", 1_000)
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO messages(queue,state,locked_until,lock_token,delivery_count,enqueued_at,body)
+	  SELECT 'ephemeral','locked',?,printf('token-%d',i),1,?,x'01' FROM n`,
+		settleChunk+1, expires+10_000, atomic.LoadInt64(clock)); err != nil {
+		t.Fatal(err)
+	}
+	items := make([]SettleItem, 0, settleChunk+1)
+	if err := e.db.queryRows(ctx, `SELECT id,lock_token FROM messages WHERE queue='ephemeral' ORDER BY id`, func(rows *sql.Rows) error {
+		for rows.Next() {
+			var item SettleItem
+			if err := rows.Scan(&item.SeqNumber, &item.LockToken); err != nil {
+				return err
+			}
+			items = append(items, item)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != settleChunk+1 {
+		t.Fatalf("fixture items=%d, want %d", len(items), settleChunk+1)
+	}
+
+	// The first DELETE chunk starts one millisecond before the subscription
+	// lifetime, while the second reaches the exact (expired) boundary.
+	atomic.StoreInt64(clock, expires-2)
+	e.now = func() int64 { return atomic.AddInt64(clock, 1) }
+	results, err := e.CompleteBatch(ctx, "ephemeral", items)
+	e.now = func() int64 { return atomic.LoadInt64(clock) }
+	if err != nil || len(results) != len(items) {
+		t.Fatalf("complete batch results=%d err=%v", len(results), err)
+	}
+	for i, result := range results {
+		want := i < settleChunk
+		if result.Ok != want {
+			t.Fatalf("item %d ok=%t, want %t", i, result.Ok, want)
+		}
+	}
+	var remaining int
+	if err := e.db.queryRowScan(ctx, []any{&remaining},
+		`SELECT COUNT(*) FROM messages WHERE queue='ephemeral' AND state='locked'`); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatalf("expired final chunk changed messages: remaining=%d, want 1", remaining)
+	}
+
+	// Receipts from the live first chunk cannot vouch for a replay once the
+	// subscription itself is expired.
+	replay, err := e.CompleteBatch(ctx, "ephemeral", items)
+	if err != nil || len(replay) != len(items) {
+		t.Fatalf("expired replay results=%d err=%v", len(replay), err)
+	}
+	for i, result := range replay {
+		if result.Ok {
+			t.Fatalf("expired receipt replay item %d succeeded", i)
+		}
 	}
 }
 
@@ -930,13 +996,17 @@ func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
 	}
 	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
 
-	// The old lease is still live when the write begins. Only the following read,
-	// after RETURNING reaches EOF, crosses the newly committed deadline.
+	// The old lease is still live through the subscription-lifetime cache check
+	// and when the write begins. Only the following read, after RETURNING reaches
+	// EOF, crosses the newly committed deadline.
 	var reads int
 	e.now = func() int64 {
 		reads++
 		if reads == 1 {
 			return atomic.AddInt64(&ms, 500)
+		}
+		if reads == 2 {
+			return atomic.LoadInt64(&ms)
 		}
 		return atomic.AddInt64(&ms, time.Hour.Milliseconds())
 	}

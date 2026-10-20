@@ -12,6 +12,7 @@ package mqlite
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
@@ -147,6 +148,24 @@ type DeleteQueueOpts struct {
 // DeleteSubscriptionOpts configures subscription deletion.
 type DeleteSubscriptionOpts struct {
 	Force bool // retire immediately and discard retained messages during bounded cleanup
+}
+
+// SubscribeOptions configures a subscription's fixed lifetime. TTL is applied
+// only when the subscription is first created: retries, filter updates and
+// message activity never extend it. Zero leaves a new subscription permanent
+// and preserves an existing subscription's lifetime.
+type SubscribeOptions struct {
+	TTL time.Duration
+}
+
+func (o SubscribeOptions) toEngine() (engine.SubscribeOptions, error) {
+	if o.TTL < 0 {
+		return engine.SubscribeOptions{}, fmt.Errorf("%w: subscription TTL cannot be negative", ErrInvalidArgument)
+	}
+	if o.TTL > 0 && o.TTL < time.Millisecond {
+		return engine.SubscribeOptions{}, fmt.Errorf("%w: subscription TTL must be at least 1ms", ErrInvalidArgument)
+	}
+	return engine.SubscribeOptions{TTLMs: o.TTL.Milliseconds()}, nil
 }
 
 // DeleteResult reports whether physical removal is complete or cleanup is pending.

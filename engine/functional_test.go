@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -2125,5 +2126,278 @@ func TestDeleteQueueNameTargetsCurrentQueue(t *testing.T) {
 	}
 	if err := e.DeleteQueue(ctx, "q"); !errors.Is(err, ErrQueueNotFound) {
 		t.Fatalf("missing queue: %v", err)
+	}
+}
+func subscriptionTimes(t *testing.T, e *Engine, name string) (createdAt, expiresAt int64, filter string) {
+	t.Helper()
+	var filterJSON *string
+	if err := e.db.queryRowScan(context.Background(), []any{&createdAt, &expiresAt, &filterJSON}, `
+		SELECT s.created_at,q.expires_at,s.filter_json
+		  FROM subscriptions s JOIN queues q ON q.name=s.subscription
+		 WHERE s.subscription=?`, name); err != nil {
+		t.Fatalf("read subscription %q: %v", name, err)
+	}
+	if filterJSON != nil {
+		filter = *filterJSON
+	}
+	return createdAt, expiresAt, filter
+}
+
+func TestSubscribeFixedLifetimeIsCreationAnchored(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	created := *clock
+	if err := e.SubscribeWithOptions(ctx, "events", "worker", &Filter{Expr: "true"}, SubscribeOptions{TTLMs: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	createdAt, expiresAt, _ := subscriptionTimes(t, e, "worker")
+	if createdAt != created || expiresAt != created+1000 {
+		t.Fatalf("created/expires=%d/%d, want %d/%d", createdAt, expiresAt, created, created+1000)
+	}
+
+	advance(clock, 200*time.Millisecond)
+	if err := e.Subscribe(ctx, "events", "worker", &Filter{Expr: `subject == "zero-preserves"`}); err != nil {
+		t.Fatalf("zero TTL retry: %v", err)
+	}
+	if gotCreated, gotExpires, _ := subscriptionTimes(t, e, "worker"); gotCreated != createdAt || gotExpires != expiresAt {
+		t.Fatalf("zero TTL extended lifetime: created/expires=%d/%d", gotCreated, gotExpires)
+	}
+
+	advance(clock, 200*time.Millisecond)
+	if err := e.SubscribeWithOptions(ctx, "events", "worker", &Filter{Expr: `subject == "same"`}, SubscribeOptions{TTLMs: 1000}); err != nil {
+		t.Fatalf("same TTL retry: %v", err)
+	}
+	_, gotExpires, beforeConflict := subscriptionTimes(t, e, "worker")
+	if gotExpires != expiresAt {
+		t.Fatalf("same TTL retry extended expiry to %d, want %d", gotExpires, expiresAt)
+	}
+	if err := e.SubscribeWithOptions(ctx, "events", "worker", &Filter{Expr: "false"}, SubscribeOptions{TTLMs: 999}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("different fixed TTL=%v, want ErrNameConflict", err)
+	}
+	_, gotExpires, afterConflict := subscriptionTimes(t, e, "worker")
+	if gotExpires != expiresAt || afterConflict != beforeConflict {
+		t.Fatalf("TTL conflict mutated expiry/filter: expiry=%d filter=%q, want %d/%q", gotExpires, afterConflict, expiresAt, beforeConflict)
+	}
+
+	if err := e.Subscribe(ctx, "permanent-topic", "permanent", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SubscribeWithOptions(ctx, "permanent-topic", "permanent", nil, SubscribeOptions{TTLMs: 1000}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("permanent-to-temporary retry=%v, want ErrNameConflict", err)
+	}
+	if err := e.SubscribeWithOptions(ctx, "negative", "negative-sub", nil, SubscribeOptions{TTLMs: -1}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("negative TTL=%v, want ErrInvalidArgument", err)
+	}
+	atomic.StoreInt64(clock, -2)
+	if err := e.SubscribeWithOptions(ctx, "pre-epoch", "pre-epoch-sub", nil, SubscribeOptions{TTLMs: 1}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("negative creation time=%v, want ErrInvalidArgument", err)
+	}
+	var preEpochRows int
+	if err := e.db.queryRowScan(ctx, []any{&preEpochRows}, `
+		SELECT (SELECT COUNT(*) FROM queues WHERE name='pre-epoch-sub')+
+		       (SELECT COUNT(*) FROM subscriptions WHERE subscription='pre-epoch-sub')`); err != nil {
+		t.Fatal(err)
+	}
+	if preEpochRows != 0 {
+		t.Fatalf("negative creation time left %d queue/mapping rows", preEpochRows)
+	}
+	atomic.StoreInt64(clock, math.MaxInt64)
+	if err := e.SubscribeWithOptions(ctx, "overflow", "overflow-sub", nil, SubscribeOptions{TTLMs: 1}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("overflow TTL=%v, want ErrInvalidArgument", err)
+	}
+}
+
+func TestSubscribeTTLUsesOneCreationTimestamp(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	var clock int64 = 1700000000000
+	e.now = func() int64 { return atomic.AddInt64(&clock, 1) }
+
+	// A one-millisecond TTL remains valid even when the injected clock advances
+	// on every read. Creation and expiration must derive from the same sample.
+	if err := e.SubscribeWithOptions(ctx, "moving-clock", "moving-sub", nil, SubscribeOptions{TTLMs: 1}); err != nil {
+		t.Fatalf("subscribe with advancing clock: %v", err)
+	}
+	createdAt, expiresAt, _ := subscriptionTimes(t, e, "moving-sub")
+	if expiresAt-createdAt != 1 {
+		t.Fatalf("created/expires=%d/%d, want one-millisecond fixed lifetime", createdAt, expiresAt)
+	}
+}
+
+func TestSubscriptionExpiryIsImmediateInCacheAndInventory(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	created := *clock
+	if err := e.SubscribeWithOptions(ctx, "events", "worker", nil, SubscribeOptions{TTLMs: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.loadQueue(ctx, "worker"); err != nil { // warm qcache
+		t.Fatal(err)
+	}
+	before, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "events"})
+	if err != nil || before.Total != 1 || len(before.Subscriptions) != 1 {
+		t.Fatalf("before expiry page=%+v err=%v", before, err)
+	}
+	item := before.Subscriptions[0]
+	if item.State != "active" || item.CreatedAtMs != created || item.ExpiresAtMs != created+100 {
+		t.Fatalf("before expiry item=%+v", item)
+	}
+
+	advance(clock, 100*time.Millisecond) // the boundary is expired (now >= expires_at)
+	if _, err := e.loadQueue(ctx, "worker"); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("cached queue at expiry=%v, want ErrQueueNotFound", err)
+	}
+	if _, err := e.Stats(ctx, "worker"); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("stats at expiry=%v, want ErrQueueNotFound", err)
+	}
+	legacy, err := e.ListSubscriptions(ctx)
+	if err != nil || len(legacy) != 0 {
+		t.Fatalf("legacy inventory exposed expired subscription: %+v err=%v", legacy, err)
+	}
+	active, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "events"})
+	if err != nil || active.Total != 0 || len(active.Subscriptions) != 0 {
+		t.Fatalf("active inventory exposed expired subscription: %+v err=%v", active, err)
+	}
+	retained, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "events", IncludeDeleting: true})
+	if err != nil || retained.Total != 1 || len(retained.Subscriptions) != 1 || retained.Subscriptions[0].State != "deleting" {
+		t.Fatalf("retained expiry inventory=%+v err=%v", retained, err)
+	}
+	if state, ok := queueLifecycleState(t, e, "worker"); !ok || state != "deleting" {
+		t.Fatalf("ListQueues state=%q present=%t, want deleting", state, ok)
+	}
+	if err := e.Subscribe(ctx, "events", "worker", &Filter{Expr: "false"}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("expired name retry=%v, want reserved ErrNameConflict", err)
+	}
+}
+
+func TestExpiredSubscriptionCannotBeReconfiguredThroughCreateQueue(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	if err := e.SubscribeWithOptions(ctx, "events", "worker", nil, SubscribeOptions{TTLMs: 100}); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, 100*time.Millisecond) // equality is expired
+	if err := e.CreateQueue(ctx, "worker", QueueConfig{Kind: "subscription", LockDurationMs: 99_999}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("expired subscription reconfiguration=%v, want ErrNameConflict", err)
+	}
+	var lockDuration int64
+	var state string
+	if err := e.db.queryRowScan(ctx, []any{&lockDuration, &state},
+		`SELECT lock_duration_ms,lifecycle_state FROM queues WHERE name='worker'`); err != nil {
+		t.Fatal(err)
+	}
+	if lockDuration != 30_000 || state != "active" {
+		t.Fatalf("reconfiguration mutated expired subscription: lock=%d state=%q", lockDuration, state)
+	}
+}
+
+func TestExpiredSubscriptionAuthorizesForcedDiscard(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	if err := e.SubscribeWithOptions(ctx, "requests", "reply", nil, SubscribeOptions{TTLMs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "requests", OutMessage{Body: []byte("pending")}); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Millisecond)
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "requests", "reply", DeleteOptions{})
+	if err != nil || !result.Deleted || result.State != "deleted" {
+		t.Fatalf("pre-authorized expiry delete=%+v err=%v", result, err)
+	}
+	if mappings, queues := subscriptionMetadataRows(t, e, "reply"); mappings != 0 || queues != 0 {
+		t.Fatalf("expired subscription retained metadata mapping/queue=%d/%d", mappings, queues)
+	}
+}
+
+func TestExpiredSubscriptionIsFencedFromBackgroundMessageMutation(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	if err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{TTLMs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `UPDATE queues SET dlq_max_count=1,dedup_window_ms=100 WHERE name='sub'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO messages(queue,state,visible_at,locked_until,enqueued_at,expires_at,body) VALUES
+		('sub','locked',0,?,1,0,x'01'),
+		('sub','scheduled',?,0,1,0,x'02'),
+		('sub','active',0,0,1,?,x'03'),
+		('sub','dead_lettered',0,0,1,0,x'04'),
+		('sub','dead_lettered',0,0,2,0,x'05'),
+		('sub','dead_lettered',0,0,3,0,x'06')`, *clock, *clock, *clock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO dedup(queue,message_id,seq_number,seen_at) VALUES('sub','id',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at)
+		VALUES('token','sub',1,'complete','',1,2)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at)
+		VALUES('sub','attempt','[]',1,2)`); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Millisecond)
+
+	e.reapLocks(ctx)
+	e.activateScheduled(ctx)
+	e.expireTTL(ctx)
+	e.cleanupDedup(ctx)
+	e.cleanupExpiredAux(ctx)
+	e.reapDLQ(ctx)
+
+	for state, want := range map[string]int{"locked": 1, "scheduled": 1, "active": 1, "dead_lettered": 3} {
+		var got int
+		if err := e.db.queryRowScan(ctx, []any{&got}, `SELECT COUNT(*) FROM messages WHERE queue='sub' AND state=?`, state); err != nil || got != want {
+			t.Fatalf("expired background state %s=%d want=%d err=%v", state, got, want, err)
+		}
+	}
+	for _, table := range []string{"dedup", "settlement_receipts", "receive_attempts"} {
+		if got := lifecycleRows(t, e, table, "sub"); got != 1 {
+			t.Fatalf("expired background pruned %s: rows=%d", table, got)
+		}
+	}
+}
+
+func TestBackgroundMutationNotifiesOnlyQueuesChangedAtExpiryBoundary(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	if err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{TTLMs: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateQueue(ctx, "live", QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO messages(queue,state,locked_until,enqueued_at,body)
+		VALUES('sub','locked',?,1,x'01'),('live','locked',?,1,x'02')`, *clock, *clock); err != nil {
+		t.Fatal(err)
+	}
+	expiredWake, releaseExpired := e.note.subscribe("sub")
+	defer releaseExpired()
+	liveWake, releaseLive := e.note.subscribe("live")
+	defer releaseLive()
+	advance(clock, 100*time.Millisecond) // equality is expired
+
+	e.reapLocks(ctx)
+	select {
+	case <-expiredWake:
+		t.Fatal("expired subscription was notified without a committed mutation")
+	default:
+	}
+	select {
+	case <-liveWake:
+	default:
+		t.Fatal("changed live queue was not notified")
+	}
+	for queue, want := range map[string]string{"sub": string(StateLocked), "live": string(StateActive)} {
+		var state string
+		if err := e.db.queryRowScan(ctx, []any{&state}, `SELECT state FROM messages WHERE queue=?`, queue); err != nil {
+			t.Fatal(err)
+		}
+		if state != want {
+			t.Fatalf("queue %q state=%q, want %q", queue, state, want)
+		}
 	}
 }

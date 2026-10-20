@@ -210,10 +210,18 @@ list.
 *(alias: `create-subscription`)*
 ```bash
 mqlite subscribe orders eu-orders --expr 'subject_parts[0]=="orders" && properties["region"]=="eu"'
+mqlite subscribe replies instance-7 --ttl 15m
 ```
 | Flag | | |
 |---|---|---|
 | `--expr` | "" | subscription filter — an [expr](concepts.md#subscription-filters-expr) boolean predicate; empty = match all |
+| `--ttl` | `0` | fixed lifetime from the first successful creation; zero creates a permanent subscription or preserves an existing lifetime |
+
+On an existing subscription, omitting `--ttl` or passing zero preserves its lifetime. Repeating
+the original positive value is idempotent; a different positive value returns a
+name conflict before changing the filter. Expiry is advance authorization to
+discard retained messages during bounded cleanup. Explicit deletion remains the
+normal completion path.
 
 ### `delete-subscription <topic> <name>` — retire a subscription
 
@@ -406,7 +414,9 @@ output and JSON array. Supplying `--topic`, `--after`, `--limit`, or
 `subscriptions`, `total`, and optional `next_after`. The default page size is 100
 and the maximum is 1,000. Cursors are opaque and bound to the topic/deleting
 scope. Each page is a current snapshot; concurrent roster changes can affect later
-pages.
+pages. Every page entry includes required `created_at_ms` and `expires_at_ms`
+fields; zero expiry means permanent. With `--include-deleting`, an expired row is
+visible as `deleting` even before physical cleanup removes it.
 
 ### `test-filter <expr>` — dry-run a subscription filter
 Compiles the expression and, with a sample, reports whether it would match (nothing is

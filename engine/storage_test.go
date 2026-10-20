@@ -136,8 +136,8 @@ func TestSchemaVersionGuard(t *testing.T) {
 // the statements are the contract).
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
-		wantVersion = "6"
-		wantHash    = "d3265e30bf62c91a0956a51b664aaabaa487a798a333fa28fcd90e883646c0a4"
+		wantVersion = "7"
+		wantHash    = "623db1d9c1f74775cced0fd73494dc8a04d4921de415d617139f0e84b75e0bc8"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -148,12 +148,114 @@ func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	}
 }
 
+func schemaVersionSixFixture(t *testing.T) []string {
+	t.Helper()
+	const expiryColumns = `
+	    -- Subscription lifetime is fixed when the mapping is first created. Plain
+	    -- queues never expire; zero keeps a subscription permanent.
+	    expires_at            INTEGER NOT NULL DEFAULT 0 CHECK (
+	                              expires_at=0 OR (kind='subscription' AND expires_at>created_at)),`
+	var previous []string
+	for _, statement := range schemaStmts {
+		if strings.Contains(statement, "idx_subscription_expiry") {
+			continue
+		}
+		if strings.HasPrefix(statement, "CREATE TABLE IF NOT EXISTS queues") {
+			statement = strings.Replace(statement, expiryColumns, "", 1)
+		}
+		previous = append(previous, statement)
+	}
+	const previousHash = "d3265e30bf62c91a0956a51b664aaabaa487a798a333fa28fcd90e883646c0a4"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(previous, "\n")))); got != previousHash {
+		t.Fatalf("version 6 fixture drifted: %s", got)
+	}
+	return previous
+}
+
+// Version 6 has no fixed subscription lifetime column or expiry index. Refuse
+// it before any current DDL runs so a stale broker cannot silently ignore TTLs
+// and a current broker cannot reinterpret the old queue layout.
+func TestSubscriptionExpirySchemaRejectsVersionSixWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "version-six.db")
+	d, err := openDB(ctx, path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range schemaVersionSixFixture(t) {
+		if _, err := d.exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.exec(ctx, `INSERT INTO meta VALUES('schema_version','6')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.exec(ctx, `INSERT INTO queues(name,created_at,updated_at) VALUES('preserved',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if e, err := Open(ctx, Options{DB: path, DisableBackground: true}); !errors.Is(err, ErrSchemaVersionMismatch) || e != nil {
+		if e != nil {
+			_ = e.Close()
+		}
+		t.Fatalf("version 6 accepted: %v", err)
+	}
+	d, err = openDB(ctx, path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.close()
+	var count int
+	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM queues WHERE name='preserved'`); err != nil || count != 1 {
+		t.Fatalf("version 6 data changed: count=%d err=%v", count, err)
+	}
+	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM pragma_table_info('queues') WHERE name='expires_at'`); err != nil || count != 0 {
+		t.Fatalf("current column leaked into version 6: count=%d err=%v", count, err)
+	}
+	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM sqlite_master WHERE name='idx_subscription_expiry'`); err != nil || count != 0 {
+		t.Fatalf("current expiry index leaked into version 6: count=%d err=%v", count, err)
+	}
+}
+
+func TestSubscriptionExpirySchemaConstraintsAndIndex(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	for _, tc := range []struct {
+		name, kind         string
+		created, expiresAt int64
+	}{
+		{"plain-positive", "queue", 1, 2},
+		{"subscription-negative", "subscription", 1, -1},
+		{"subscription-equal", "subscription", 2, 2},
+		{"subscription-before", "subscription", 3, 2},
+	} {
+		if _, err := e.db.exec(ctx, `INSERT INTO queues(name,kind,expires_at,created_at,updated_at) VALUES(?,?,?,?,?)`,
+			tc.name, tc.kind, tc.expiresAt, tc.created, tc.created); err == nil {
+			t.Fatalf("invalid expiry row %+v passed schema CHECK", tc)
+		}
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO queues(name,kind,expires_at,created_at,updated_at)
+		VALUES('valid-temporary','subscription',2,1,1)`); err != nil {
+		t.Fatalf("valid temporary subscription row: %v", err)
+	}
+	var indexSQL string
+	if err := e.db.queryRowScan(ctx, []any{&indexSQL}, `SELECT sql FROM sqlite_master WHERE name='idx_subscription_expiry'`); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(indexSQL, "kind='subscription'") || !strings.Contains(indexSQL, "lifecycle_state='active'") || !strings.Contains(indexSQL, "expires_at>0") {
+		t.Fatalf("expiry index is not the bounded active-subscription partial index: %s", indexSQL)
+	}
+}
+
 // Version 5 had no queue lifecycle columns, bounded-cleanup indexes, or indexed
 // message-parent guards. Open must reject it before applying any schema
 // statement or changing retained data.
 func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
 	var previous []string
-	for _, statement := range schemaStmts {
+	for _, statement := range schemaVersionSixFixture(t) {
 		if strings.Contains(statement, "idx_queue_deleting") || strings.Contains(statement, "idx_msg_completed") ||
 			strings.Contains(statement, "idx_subs_by_subscription") || strings.Contains(statement, "trg_messages_queue_") ||
 			strings.Contains(statement, "trg_queues_messages_") {
@@ -684,6 +786,7 @@ type busyState struct {
 	execErr         error
 	onCommit        func()
 	queueReads      int
+	queueExpiresAt  int64
 	rosterRows      int
 	rosterRead      int
 	lifecycleLimits []int64
@@ -728,7 +831,8 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 	// Lifecycle guards read the current queue inside the mutation transaction.
 	// Keep that metadata probe outside the injected mutation failures so these
 	// tests still count retries of the time-sensitive statement itself.
-	if strings.Contains(query, "lifecycle_state") && strings.Contains(query, "FROM queues WHERE name=?") {
+	normalized := strings.Join(strings.Fields(query), " ")
+	if strings.Contains(normalized, "lifecycle_state") && strings.Contains(normalized, "FROM queues WHERE name=?") {
 		c.st.queueReads++
 		name := "q"
 		if len(args) > 0 {
@@ -737,10 +841,10 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		if name == "topic" {
 			return emptyRows{}, nil
 		}
-		if strings.Contains(query, "name,default_ttl_ms,dedup_window_ms,ordering_mode,lifecycle_state") {
-			return &oneQueueRow{values: []driver.Value{name, int64(0), int64(0), "standard", "active"}}, nil
+		if strings.Contains(normalized, "name,default_ttl_ms,dedup_window_ms,ordering_mode,expires_at") {
+			return &oneQueueRow{values: []driver.Value{name, int64(0), int64(0), "standard", c.st.queueExpiresAt}}, nil
 		}
-		return &oneQueueRow{values: []driver.Value{name, "queue", int64(1000), int64(10), int64(0), int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "active"}}, nil
+		return &oneQueueRow{values: []driver.Value{name, "queue", int64(1000), int64(10), int64(0), int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "active", c.st.queueExpiresAt}}, nil
 	}
 	if !c.record(query, args) {
 		return nil, errors.New("database is locked") // isBusyErr => retryable
@@ -750,7 +854,7 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		values := make([][]driver.Value, c.st.rosterRows)
 		for i := range values {
 			name := fmt.Sprintf("sub-%04d", i)
-			values[i] = []driver.Value{name, int64(0), int64(0), "standard", nil}
+			values[i] = []driver.Value{name, int64(0), int64(0), "standard", nil, int64(0)}
 		}
 		return &valueRows{values: values}, nil
 	}
@@ -895,6 +999,30 @@ func TestSendLoadsPlainQueueMetadataOncePerTransactionAttempt(t *testing.T) {
 	}
 }
 
+func TestSendRejectsSubscriptionExpiryOnRemoteRetry(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	state.insertIDs = true
+	state.queueExpiresAt = 2_000
+	var clock int64 = 1_000
+	commits := 0
+	state.onCommit = func() {
+		commits++
+		if commits == 1 {
+			atomic.StoreInt64(&clock, state.queueExpiresAt)
+			state.failsLeft = 1
+		}
+	}
+	e := fakeRemoteEngine(d)
+	e.now = func() int64 { return atomic.LoadInt64(&clock) }
+
+	if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("payload")}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("send retry at subscription expiry=%v, want ErrQueueNotFound", err)
+	}
+	if state.queueReads != 2 || state.inserted != 1 || commits != 1 {
+		t.Fatalf("metadata reads=%d inserts=%d commits=%d, want 2/1/1", state.queueReads, state.inserted, commits)
+	}
+}
+
 func TestTopicFanoutCarriesMetadataWithoutPerSubscriptionReads(t *testing.T) {
 	d, state := remoteDBFailingFirst(t, 0)
 	state.rosterRows = 256
@@ -919,11 +1047,11 @@ func TestTopicFanoutCarriesMetadataWithoutPerSubscriptionReads(t *testing.T) {
 
 func TestResolveTargetsUsesOnlyIndexedSeeks(t *testing.T) {
 	e, _ := testEngine(t)
-	directPlan := explainPlan(t, e, resolveDirectTargetSQL, "q")
+	directPlan := explainPlan(t, e, resolveDirectTargetSQL, "q", e.now())
 	if strings.Contains(directPlan, "SCAN ") || strings.Contains(directPlan, "USE TEMP B-TREE") || !strings.Contains(directPlan, "SEARCH queues USING") {
 		t.Fatalf("direct routing query must use a queue-key seek:\n%s", directPlan)
 	}
-	topicPlan := explainPlan(t, e, resolveTopicTargetsSQL, "topic")
+	topicPlan := explainPlan(t, e, resolveTopicTargetsSQL, "topic", e.now())
 	if strings.Contains(topicPlan, "SCAN ") || strings.Contains(topicPlan, "USE TEMP B-TREE") {
 		t.Fatalf("topic routing query must not scan or sort in SQLite:\n%s", topicPlan)
 	}
@@ -974,7 +1102,7 @@ func TestResolveTargetsKeepsStableTopicOrder(t *testing.T) {
 	var targets []target
 	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		var err error
-		targets, err = e.resolveTargetsTx(ctx, tx, "topic")
+		targets, err = e.resolveTargetsTx(ctx, tx, "topic", e.now())
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -999,6 +1127,32 @@ func TestAttemptReceiveReadsLifecycleMetadataOnce(t *testing.T) {
 	}
 	if state.queueReads != 1 {
 		t.Fatalf("attempt receive metadata reads=%d, want 1", state.queueReads)
+	}
+}
+
+func TestRedriveOlderThanRefreshesOnRemoteRetry(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 2)
+	e := fakeRemoteEngine(d)
+	var clock int64 = 10_000
+	e.now = func() int64 { return atomic.AddInt64(&clock, 100) }
+
+	moved, err := e.Redrive(context.Background(), "q", RedriveOptions{OlderThanMs: 1_000})
+	if err != nil || moved != 0 {
+		t.Fatalf("redrive=%d, %v", moved, err)
+	}
+	if len(state.args) != 3 {
+		t.Fatalf("candidate attempts=%d, want two failures and one success: %v", len(state.args), state.args)
+	}
+	var previous int64
+	for i, args := range state.args {
+		if len(args) != 2 || args[0].Value != "q" {
+			t.Fatalf("attempt %d args=%v", i, args)
+		}
+		cutoff, ok := args[1].Value.(int64)
+		if !ok || cutoff <= previous {
+			t.Fatalf("attempt %d reused OlderThan cutoff %v after %d", i, args[1].Value, previous)
+		}
+		previous = cutoff
 	}
 }
 
@@ -1032,8 +1186,9 @@ func TestRemoteLifecycleSelectionCapsEachPassToOneResource(t *testing.T) {
 			t.Fatalf("remote lifecycle selection limit=%d, want 1", limit)
 		}
 	}
-	// Two cursor metadata probes and at most the forward+wrap range reads.
-	if len(state.queries) > 4 {
+	// One indexed empty-subscription probe, two cursor metadata probes, and at
+	// most the forward+wrap range reads.
+	if len(state.queries) > 5 {
 		t.Fatalf("idle remote lifecycle pass used %d statements: %v", len(state.queries), state.queries)
 	}
 }
@@ -1568,6 +1723,7 @@ func TestSettlementTimeRefreshesOnRemoteRetry(t *testing.T) {
 					t.Fatalf("fewer than two failures and a final attempt: %v", st.args)
 				}
 				clockIndex := map[string]int{"Complete": 3, "Abandon": 5, "Reject": 5, "Defer": 3, "Renew": 4, "RenewBatch": 1, "CompleteBatch": 0}[op]
+				queueClockIndex := map[string]int{"Complete": 4, "Abandon": 6, "Reject": 6, "Defer": 4, "Renew": 5, "RenewBatch": 2, "CompleteBatch": 1}[op]
 				var previous int64
 				for i, args := range st.args[:3] {
 					if !strings.Contains(st.queries[i], "locked_until>?") || !strings.Contains(st.queries[i], "state='locked'") {
@@ -1576,6 +1732,9 @@ func TestSettlementTimeRefreshesOnRemoteRetry(t *testing.T) {
 					now, ok := args[clockIndex].Value.(int64)
 					if !ok || now <= previous {
 						t.Fatalf("attempt %d reused stale time: %v (previous=%d)", i, args, previous)
+					}
+					if args[queueClockIndex].Value != now {
+						t.Fatalf("attempt %d used different lease and subscription clocks: %v", i, args)
 					}
 					if (op == "Renew" || op == "RenewBatch") && args[0].Value != now+q.lockDurationMs {
 						t.Fatalf("renewal deadline and eligibility used different clocks: %v", args)
@@ -2085,14 +2244,14 @@ func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
 }
 
 func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
-	// Access-key objects remain independently additive inside schema 6.
+	// Access-key objects remain independently additive inside schema 7.
 	var oldSchema []string
 	for _, stmt := range schemaStmts {
 		if stmt != accessKeySchema && stmt != accessKeyCreatedIndex {
 			oldSchema = append(oldSchema, stmt)
 		}
 	}
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "ecee379192637620d94c38137f23956ae517adc3bfc5934743f7a32ab3daa55e" || schemaVersion != "6" {
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "2b99d1faf9b9942fd015ad7e1dc3486300a9a4ff350485632e5b4e468dbf340d" || schemaVersion != "7" {
 		t.Fatalf("schema without access-key objects changed: hash=%s token=%s", got, schemaVersion)
 	}
 	ctx := context.Background()
@@ -2106,7 +2265,7 @@ func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := d.exec(ctx, `INSERT INTO meta VALUES ('schema_version','6')`); err != nil {
+	if _, err := d.exec(ctx, `INSERT INTO meta VALUES ('schema_version','7')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.exec(ctx, `INSERT INTO queues(name, created_at, updated_at) VALUES ('existing', 1, 1)`); err != nil {
@@ -2642,7 +2801,7 @@ func TestObservabilityMaintenanceFailuresAndFilterOutcomes(t *testing.T) {
 	ctx := context.Background()
 	e.RunMaintenanceOnce(ctx)
 	s := e.Observability(ctx)
-	if len(s.Maintenance) != 8 {
+	if len(s.Maintenance) != len(MaintenanceTaskNames()) {
 		t.Fatalf("maintenance=%d", len(s.Maintenance))
 	}
 	for _, m := range s.Maintenance {
@@ -2811,6 +2970,38 @@ func TestObservabilityAgeUsesPostReadClock(t *testing.T) {
 	snapshot := e.Observability(ctx)
 	if snapshot.SampledAtMs != *clock || snapshot.Queues[0].OldestMessageAgeMs != 3000 {
 		t.Fatalf("sampling clock mismatch sampled=%d clock=%d age=%d", snapshot.SampledAtMs, *clock, snapshot.Queues[0].OldestMessageAgeMs)
+	}
+}
+
+func TestSubscriptionInventoriesSampleClockAfterConnectionAcquisition(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	if err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{TTLMs: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	expires := *clock + 1000
+	afterConnAcquired = func() { atomic.StoreInt64(clock, expires) }
+	t.Cleanup(func() { afterConnAcquired = nil })
+
+	subscriptions, err := e.ListSubscriptions(ctx)
+	if err != nil || len(subscriptions) != 0 {
+		t.Fatalf("post-acquisition expiry exposed subscriptions=%+v err=%v", subscriptions, err)
+	}
+	queues, err := e.ListQueues(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, queue := range queues {
+		if queue.Name == "sub" {
+			found = true
+			if queue.State != "deleting" {
+				t.Fatalf("post-acquisition expiry queue state=%q, want deleting", queue.State)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ListQueues omitted logically deleting subscription")
 	}
 }
 
@@ -3033,7 +3224,7 @@ func TestObservabilityStorageStartsAtZeroForFirstFailure(t *testing.T) {
 func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
 	e, _ := testEngine(t)
 	for _, queue := range []*string{nil, func() *string { q := "q"; return &q }()} {
-		query, args := queueSnapshotQuery(queue)
+		query, args := queueSnapshotQuery(queue, 1_700_000_000_000)
 		var plan []string
 		err := e.db.queryRows(context.Background(), "EXPLAIN QUERY PLAN "+query, func(rows *sql.Rows) error {
 			for rows.Next() {
@@ -3187,5 +3378,45 @@ func TestStorageLastErrorKeepsCoarseCountersAndPrivateCause(t *testing.T) {
 		if row.LastError != nil && row.LastError.Message == "mutated" {
 			t.Fatal("storage snapshot aliases error detail")
 		}
+	}
+}
+func TestOpenExpiresBeforeCrashRecovery(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "expiry-recovery.db")
+	var clock int64 = 1_700_000_000_000
+	open := func() *Engine {
+		e, err := Open(ctx, Options{
+			DB: "file:" + path, Now: func() int64 { return atomic.LoadInt64(&clock) }, DisableBackground: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	e := open()
+	if err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{TTLMs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<5000
+	) INSERT INTO messages(queue,state,locked_until,lock_token,delivery_count,enqueued_at,body)
+	  SELECT 'sub','locked',?,printf('token-%d',i),1,?,x'01' FROM n`, clock+30_000, clock); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	atomic.AddInt64(&clock, 1)
+	e = open()
+	defer e.Close()
+	var locked, active int
+	if err := e.db.queryRowScan(ctx, []any{&locked}, `SELECT COUNT(*) FROM messages WHERE queue='sub' AND state='locked'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.queryRowScan(ctx, []any{&active}, `SELECT COUNT(*) FROM messages WHERE queue='sub' AND state='active'`); err != nil {
+		t.Fatal(err)
+	}
+	if locked == 0 || active != 0 {
+		t.Fatalf("startup revived expired locks: locked=%d active=%d", locked, active)
 	}
 }

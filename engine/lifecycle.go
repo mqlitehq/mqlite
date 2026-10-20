@@ -11,12 +11,14 @@ import (
 )
 
 const (
-	lifecycleBatchRows           = 1000
-	lifecyclePassRows            = 4096
-	lifecyclePassResources       = 32
-	lifecycleBatchBytes    int64 = 8 << 20
-	lifecycleCursorAtKey         = "lifecycle-cleanup-cursor-at"
-	lifecycleCursorNameKey       = "lifecycle-cleanup-cursor-name"
+	lifecycleBatchRows            = 1000
+	lifecyclePassRows             = 4096
+	lifecyclePassResources        = 32
+	lifecycleEmptySubBatch        = 512
+	subscriptionExpiryBatch       = 1000
+	lifecycleBatchBytes     int64 = 8 << 20
+	lifecycleCursorAtKey          = "lifecycle-cleanup-cursor-at"
+	lifecycleCursorNameKey        = "lifecycle-cleanup-cursor-name"
 )
 
 var lifecycleMessageStates = [...]struct {
@@ -30,6 +32,16 @@ var lifecycleMessageStates = [...]struct {
 	{string(StateCompleted), "idx_msg_completed"},
 	{string(StateDeadLettered), "idx_msg_dlq"},
 }
+
+var emptySubscriptionCandidatesSQL = `
+	SELECT q.name
+	  FROM queues q JOIN subscriptions s ON s.subscription=q.name
+	 WHERE q.kind='subscription' AND q.lifecycle_state='deleting'
+	   AND NOT EXISTS (` + messageExistenceUnion("q.name") + `)
+	   AND NOT EXISTS (SELECT 1 FROM dedup WHERE queue=q.name)
+	   AND NOT EXISTS (SELECT 1 FROM settlement_receipts WHERE queue=q.name)
+	   AND NOT EXISTS (SELECT 1 FROM receive_attempts WHERE queue=q.name)
+	 ORDER BY q.delete_started_at,q.name LIMIT ?`
 
 // messageExistenceUnion builds literal state predicates so SQLite can prove
 // that each branch matches its queue-prefix partial index. queueExpr is either
@@ -63,7 +75,7 @@ type DeleteResult struct {
 
 const queueSelectColumns = `name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
 	dead_letter_on_expire,dedup_window_ms,ordering_mode,dlq_max_age_ms,dlq_max_count,dlq_max_bytes,
-	lifecycle_state`
+	lifecycle_state,expires_at`
 
 type queueScanner interface{ Scan(...any) error }
 
@@ -73,7 +85,7 @@ func scanQueue(row queueScanner) (queueRow, error) {
 	var ordering string
 	err := row.Scan(&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs,
 		&dle, &q.dedupWindowMs, &ordering, &q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes,
-		&q.lifecycleState)
+		&q.lifecycleState, &q.expiresAtMs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return queueRow{}, ErrQueueNotFound
 	}
@@ -86,8 +98,8 @@ func (e *Engine) readQueueTx(ctx context.Context, tx *txn, name string) (queueRo
 	return scanQueue(tx.QueryRowContext(ctx, `SELECT `+queueSelectColumns+` FROM queues WHERE name=?`, name))
 }
 
-func queueLive(q queueRow) error {
-	if q.lifecycleState != "active" {
+func queueLiveAt(q queueRow, now int64) error {
+	if q.lifecycleState != "active" || (q.expiresAtMs > 0 && q.expiresAtMs <= now) {
 		return ErrQueueNotFound
 	}
 	return nil
@@ -100,7 +112,7 @@ func (e *Engine) checkQueueLiveTx(ctx context.Context, tx *txn, name string) (qu
 	if err != nil {
 		return q, err
 	}
-	return q, queueLive(q)
+	return q, queueLiveAt(q, e.now())
 }
 
 func (e *Engine) invalidateLifecycle(name string) {
@@ -110,6 +122,70 @@ func (e *Engine) invalidateLifecycle(name string) {
 	e.qmu.Unlock()
 	e.invalidateFilter(name)
 	e.note.notify(name)
+}
+
+// transitionExpiredSubscriptionsPass makes due fixed-lifetime subscriptions
+// durable members of the existing deletion pipeline. Correctness does not wait
+// for this scan: queueLiveAt and every data-plane transaction fence at the
+// absolute expiration. The indexed, bounded transition supplies restart-safe
+// physical cleanup and preserves the name until that cleanup commits.
+func (e *Engine) transitionExpiredSubscriptionsPass(ctx context.Context) (int, bool, error) {
+	var names []string
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		names = nil
+		now := e.now()
+		rows, err := tx.QueryContext(ctx, `
+			UPDATE queues
+			   SET lifecycle_state='deleting',delete_started_at=expires_at,updated_at=?
+			 WHERE name IN (
+			       SELECT name FROM queues
+			        WHERE kind='subscription' AND lifecycle_state='active'
+			          AND expires_at>0 AND expires_at<=?
+			        ORDER BY expires_at,name LIMIT ?)
+			RETURNING name`, now, now, subscriptionExpiryBatch)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			names = append(names, name)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		return rows.Close()
+	})
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		for _, name := range names {
+			e.invalidateLifecycle(name)
+		}
+	}
+	if errors.Is(err, ErrOutcomeUnknown) {
+		e.signalUncertainLifecycle()
+	}
+	// Only a full batch requests the 10 ms continuation. Errors fall back to the
+	// worker's one-second ticker, avoiding a tight retry loop during an outage.
+	return len(names), err == nil && len(names) == subscriptionExpiryBatch, err
+}
+
+func (e *Engine) runSubscriptionExpiryPass(ctx context.Context) bool {
+	changed, pending, err := e.transitionExpiredSubscriptionsPass(ctx)
+	if err != nil {
+		e.maintenanceFailure(ctx, "transition_expired_subscriptions", err)
+	}
+	if changed > 0 || errors.Is(err, ErrOutcomeUnknown) {
+		e.signalLifecycle()
+	}
+	return pending
+}
+
+func (e *Engine) transitionExpiredSubscriptions(ctx context.Context) {
+	e.runSubscriptionExpiryPass(ctx)
 }
 
 // DeleteQueueWithOptions logically retires one plain queue, then performs a
@@ -171,7 +247,9 @@ func (e *Engine) deleteEntity(ctx context.Context, topic, name, kind string, opt
 				return err
 			}
 		}
-		if q.lifecycleState == "active" && !opts.Force {
+		now := e.now()
+		ttlAuthorized := kind == "subscription" && q.expiresAtMs > 0 && q.expiresAtMs <= now
+		if q.lifecycleState == "active" && !opts.Force && !ttlAuthorized {
 			var occupied bool
 			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(`+messageExistenceUnion("?")+`)`, repeatedQueueArgs(name)...).Scan(&occupied); err != nil {
 				return err
@@ -181,7 +259,11 @@ func (e *Engine) deleteEntity(ctx context.Context, topic, name, kind string, opt
 			}
 		}
 		if q.lifecycleState == "active" {
-			if _, err := tx.ExecContext(ctx, `UPDATE queues SET lifecycle_state='deleting',delete_started_at=? WHERE name=? AND lifecycle_state='active'`, e.now(), name); err != nil {
+			startedAt := now
+			if ttlAuthorized {
+				startedAt = q.expiresAtMs
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE queues SET lifecycle_state='deleting',delete_started_at=? WHERE name=? AND lifecycle_state='active'`, startedAt, name); err != nil {
 				return err
 			}
 		}
@@ -206,6 +288,80 @@ func (e *Engine) deleteEntity(ctx context.Context, topic, name, kind string, opt
 		e.signalLifecycle()
 	}
 	return result, err
+}
+
+// cleanEmptySubscriptionsTx retires a burst of empty deleting subscriptions in
+// two set-based statements. This is the common path for temporary request/reply
+// subscriptions, and keeps a simultaneous TTL wave from paying one transaction
+// per name. Mapping rows are deleted first and backing queues second in the same
+// transaction; exact row counts make the operation safe even when foreign keys
+// are disabled, and any mismatch rolls the whole transaction back.
+func (e *Engine) cleanEmptySubscriptionsTx(ctx context.Context, tx *txn, budget *cleanupBudget) ([]string, bool, error) {
+	limit := lifecycleEmptySubBatch
+	if byRows := budget.rows / 2; byRows < limit {
+		limit = byRows
+	}
+	if limit <= 0 {
+		return nil, false, nil
+	}
+	rows, err := tx.QueryContext(ctx, emptySubscriptionCandidatesSQL, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	names := make([]string, 0, limit)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return nil, false, err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, false, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, false, err
+	}
+	if len(names) == 0 {
+		return nil, false, nil
+	}
+	args := make([]any, len(names))
+	for i := range names {
+		args[i] = names[i]
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(names)), ",")
+	mappingResult, err := tx.ExecContext(ctx,
+		`DELETE FROM subscriptions WHERE subscription IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	mappingRows, err := mappingResult.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	if mappingRows != int64(len(names)) {
+		return nil, false, ErrSubscriptionNotFound
+	}
+	queueResult, err := tx.ExecContext(ctx, `DELETE FROM queues
+		WHERE kind='subscription' AND lifecycle_state='deleting'
+		  AND name IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	queueRows, err := queueResult.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	if queueRows != int64(len(names)) {
+		return nil, false, ErrQueueNotFound
+	}
+	budget.rows -= 2 * len(names)
+	for _, name := range names {
+		tx.forgetQueue(name)
+	}
+	return names, len(names) == limit, nil
 }
 
 type cleanupBudget struct {
@@ -427,28 +583,46 @@ func (e *Engine) deleteEntityMetadataTx(ctx context.Context, tx *txn, name, kind
 }
 
 // maintainLifecycle applies one global row/byte/resource budget, so a burst of
-// forced deletions cannot monopolize the single writer. Local stores process up
-// to 32 resources per transaction. A remote store processes one: even bounded
-// rows spread across many resources would otherwise turn into hundreds of
-// sequential Hrana round trips while holding the write transaction. A durable
-// composite cursor preserves fairness across passes in either mode. Within a
-// local pass each selected queue receives a fair slice before unfinished queues
-// reuse spare capacity.
-func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
+// forced deletions cannot monopolize the single writer. Each pass first retires
+// a bounded set of empty subscription metadata, then spends the remaining budget
+// on loaded resources. Local stores process up to 32 loaded resources per
+// transaction. A remote store processes one: even bounded rows spread across
+// many resources would otherwise turn into hundreds of sequential Hrana round
+// trips while holding the write transaction. A durable composite cursor preserves
+// fairness across passes. Within a local pass each selected queue receives a fair
+// slice before unfinished queues reuse spare capacity.
+type lifecyclePassOutcome struct {
+	retry bool
+	fast  bool
+}
+
+func (e *Engine) maintainLifecyclePassDetailed(ctx context.Context) lifecyclePassOutcome {
 	type resource struct {
 		name      string
 		kind      string
 		startedAt int64
 	}
 	var touched []string
+	fastPathSelected := false
+	fastPathFull := false
 	hadResources := false
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		touched = nil
+		fastPathSelected = false
+		fastPathFull = false
 		hadResources = false
+		budget := cleanupBudget{rows: lifecyclePassRows, bytes: lifecycleBatchBytes}
+		fastNames, full, err := e.cleanEmptySubscriptionsTx(ctx, tx, &budget)
+		if err != nil {
+			return err
+		}
+		touched = append(touched, fastNames...)
+		fastPathSelected = len(fastNames) > 0 || full
+		fastPathFull = full
 		resourceLimit := lifecycleResourceLimit(e.db.remote)
 		cursorAt, cursorName := int64(math.MinInt64), ""
 		var encoded string
-		err := tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key=?`, lifecycleCursorAtKey).Scan(&encoded)
+		err = tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key=?`, lifecycleCursorAtKey).Scan(&encoded)
 		if err == nil {
 			if parsed, parseErr := strconv.ParseInt(encoded, 10, 64); parseErr == nil {
 				cursorAt = parsed
@@ -495,7 +669,6 @@ func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
 		}
 		hadResources = len(resources) > 0
 
-		budget := cleanupBudget{rows: lifecyclePassRows, bytes: lifecycleBatchBytes}
 		pending := resources
 		var last resource
 		for len(pending) > 0 && budget.rows > 0 && budget.bytes > 0 {
@@ -559,7 +732,14 @@ func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
 	// more deliberately permits one cheap confirmation pass and also covers more
 	// resources than the selection cap. Any error is retried because a durable
 	// deleting row may still exist (or an outcome-unknown commit may have landed).
-	return err != nil || hadResources
+	return lifecyclePassOutcome{
+		retry: err != nil || fastPathSelected || hadResources,
+		fast:  err == nil && fastPathFull,
+	}
+}
+
+func (e *Engine) maintainLifecyclePass(ctx context.Context) bool {
+	return e.maintainLifecyclePassDetailed(ctx).retry
 }
 
 // maintainLifecycle is the deterministic/manual wrapper used by tests and

@@ -12,6 +12,41 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Add fixed subscription lifetimes (MQLITE-128)
+
+- Add an optional fixed TTL to subscription creation across the engine, HTTP,
+  Go SDK, CLI, MCP and console. The broker stores one absolute expiration from
+  the first successful creation. Ordinary retries, filter updates, publishing,
+  receiving and settlement never extend it. Omitting TTL keeps a new
+  subscription permanent and preserves an existing lifetime; the same positive
+  TTL is idempotent, while a different positive TTL conflicts before the filter
+  can change.
+- Treat expiry as advance authorization for forced deletion. At the exact
+  deadline the subscription immediately leaves topic fan-out and every direct
+  data-plane operation, even before background maintenance observes it. Leases
+  cannot extend past the deadline, long polls wake there, and old receive or
+  settlement receipts cannot revive work. The retained name remains reserved
+  until restart-safe physical cleanup commits.
+- Keep expiry cleanup bounded without making empty temporary subscriptions wait
+  behind the one-resource remote cleanup rate. Indexed due transitions and
+  512-subscription set-based metadata batches remove the common empty case while
+  preserving transaction boundaries; subscriptions with messages continue
+  through the existing row, byte and fairness budgets. Capacity still counts a
+  logically expired subscription until cleanup removes it, so a large abandoned
+  backlog creates deliberate backpressure instead of unbounded metadata growth.
+- Preserve the legacy three-field subscription structs and complete list. New
+  lifecycle pages add required `created_at_ms` and `expires_at_ms` fields (`0`
+  means permanent), and report a due but not yet transitioned subscription as
+  `deleting`. Advance the canonical database guard to schema token **7** for the
+  absolute expiry column and due index; schema-5 and schema-6 files are refused,
+  not migrated.
+- Document the intended request/reply pattern: explicit deletion is the normal
+  completion path and fixed TTL is a forgotten-cleanup backstop. High-rate
+  callers should still use one stable per-instance reply subscription plus
+  unique correlation IDs. When a temporary subscription is appropriate, give
+  each lifetime a globally unique name and serialize same-name reuse because the
+  public API deliberately has no Generation field.
+
 ### Delete and inventory subscriptions safely (MQLITE-127)
 
 - Add empty-only subscription deletion and an explicit `force` option that

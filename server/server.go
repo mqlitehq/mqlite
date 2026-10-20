@@ -771,13 +771,17 @@ func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
-	var req wire.SubscribeRequest
+	var req wire.SubscribeWithOptionsRequest
 	if err := decode(r, &req); err != nil {
 		decodeErr(w, err)
 		return
 	}
 	logf(w, "topic", req.Topic, "sub", req.Name)
-	if err := s.eng.Subscribe(r.Context(), req.Topic, req.Name, req.Filter); err != nil {
+	if req.TTLMs < 0 {
+		s.fail(w, fmt.Errorf("%w: subscription ttl_ms must be non-negative", engine.ErrInvalidArgument))
+		return
+	}
+	if err := s.eng.SubscribeWithOptions(r.Context(), req.Topic, req.Name, req.Filter, engine.SubscribeOptions{TTLMs: req.TTLMs}); err != nil {
 		s.fail(w, err)
 		return
 	}
@@ -832,7 +836,10 @@ func (s *Server) handleListSubscriptionsPage(w http.ResponseWriter, r *http.Requ
 		NextAfter:     page.NextAfter,
 	}
 	for i, su := range page.Subscriptions {
-		resp.Subscriptions[i] = wire.SubscriptionPageJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr, State: su.State}
+		resp.Subscriptions[i] = wire.SubscriptionPageJSON{
+			Topic: su.Topic, Name: su.Name, Expr: su.Expr, State: su.State,
+			CreatedAtMs: su.CreatedAtMs, ExpiresAtMs: su.ExpiresAtMs,
+		}
 	}
 	writeJSON(w, resp)
 }

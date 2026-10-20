@@ -110,7 +110,7 @@ func MessageEventNames() []string {
 }
 
 func MaintenanceTaskNames() []string {
-	return []string{"locks", "scheduled", "ttl", "dedup", "receipts", "retention", "reclaim", "lifecycle"}
+	return []string{"locks", "scheduled", "ttl", "dedup", "receipts", "retention", "reclaim", "subscription_expiry", "lifecycle"}
 }
 
 type eventKey struct{ queue, event string }
@@ -294,7 +294,7 @@ func cloneHistogram(h DurationHistogram) DurationHistogram {
 
 // queueSnapshot performs one grouped read even for an empty queue inventory.
 // Its single engine-clock read supplies all ages and the observation timestamp.
-func queueSnapshotQuery(queue *string) (string, []any) {
+func queueSnapshotQuery(queue *string, now int64) (string, []any) {
 	// Aggregate messages before joining the inventory: the message indexes are
 	// intentionally state-specific, so joining raw rows can rescan a deep backlog
 	// once for every empty queue. The grouped relation scans retained rows once.
@@ -312,9 +312,11 @@ func queueSnapshotQuery(queue *string) (string, []any) {
 		query += ` WHERE queue=?`
 		args = append(args, *queue)
 	}
-	query += ` GROUP BY queue) m ON m.queue=q.name`
+	query += ` GROUP BY queue) m ON m.queue=q.name
+		WHERE q.lifecycle_state='active' AND (q.expires_at=0 OR q.expires_at>?)`
+	args = append(args, now)
 	if queue != nil {
-		query += ` WHERE q.name=? AND q.lifecycle_state='active'`
+		query += ` AND q.name=?`
 		args = append(args, *queue)
 	}
 	query += ` ORDER BY q.name`
@@ -322,10 +324,20 @@ func queueSnapshotQuery(queue *string) (string, []any) {
 }
 
 func (e *Engine) queueSnapshot(ctx context.Context, queue *string) ([]QueueObservation, int64, error) {
-	query, args := queueSnapshotQuery(queue)
+	query, _ := queueSnapshotQuery(queue, 0)
+	var now int64
 	out := make([]QueueObservation, 0)
 	var oldestTimes []sql.NullInt64
-	err := e.db.queryRows(ctx, query, func(rows *sql.Rows) error {
+	err := e.db.queryFresh(ctx, query, func() []any {
+		// Sample after acquiring the connection so the same fresh instant both
+		// fences expired subscriptions and supplies the returned ages. Remote
+		// retries rebuild this snapshot after their backoff.
+		now = e.now()
+		out = out[:0]
+		oldestTimes = oldestTimes[:0]
+		_, args := queueSnapshotQuery(queue, now)
+		return args
+	}, func(rows *sql.Rows) error {
 		for rows.Next() {
 			var q QueueObservation
 			var oldest sql.NullInt64
@@ -337,8 +349,7 @@ func (e *Engine) queueSnapshot(ctx context.Context, queue *string) ([]QueueObser
 			out = append(out, q)
 		}
 		return rows.Err()
-	}, args...)
-	now := e.now()
+	})
 	if err != nil {
 		return nil, now, err
 	}
@@ -652,8 +663,26 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 // mutateMessages records the exact returned rows after a confirmed transaction.
 // The predicate is unchanged; no preflight read races the actual mutation.
 func (e *Engine) mutateMessages(ctx context.Context, event, query string, args ...any) error {
-	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		rows, err := tx.QueryContext(ctx, query+` RETURNING queue,state`, args...)
+	return e.mutateMessagesFresh(ctx, event, query, func() []any { return args })
+}
+
+// mutateMessagesFresh rebuilds time-sensitive arguments inside every transaction
+// attempt. Remote retries may back off across an expiry boundary, so the fence
+// must use the clock observed by the attempt that can actually commit.
+func (e *Engine) mutateMessagesFresh(ctx context.Context, event, query string, buildArgs func() []any) error {
+	_, err := e.mutateMessagesFreshQueues(ctx, event, query, buildArgs)
+	return err
+}
+
+// mutateMessagesFreshQueues is mutateMessagesFresh plus the exact set of queues
+// changed by the confirmed transaction. Background wakeups use this result so a
+// queue that expired between candidate discovery and the mutation is not notified.
+func (e *Engine) mutateMessagesFreshQueues(ctx context.Context, event, query string, buildArgs func() []any) ([]string, error) {
+	var touched []string
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		touched = touched[:0]
+		seen := make(map[string]struct{})
+		rows, err := tx.QueryContext(ctx, query+` RETURNING queue,state`, buildArgs()...)
 		if err != nil {
 			return err
 		}
@@ -667,9 +696,14 @@ func (e *Engine) mutateMessages(ctx context.Context, event, query string, args .
 			if state == "dead_lettered" && event != "dead_lettered" {
 				tx.record(queue, "dead_lettered", 1)
 			}
+			if _, ok := seen[queue]; !ok {
+				seen[queue] = struct{}{}
+				touched = append(touched, queue)
+			}
 		}
 		return rows.Err()
 	})
+	return touched, err
 }
 
 type maintenanceContextKey struct{}

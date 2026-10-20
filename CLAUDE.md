@@ -219,8 +219,10 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 
 ### Other engine subsystems
 
-- **Background loops** (`engine/background.go`): lifecycle cleanup (1s, globally
-  bounded to 4,096 rows / about 8 MiB / 32 deleting backing queues locally, one remotely), reaper (1s, expired
+- **Background loops** (`engine/background.go`): subscription-expiry transition
+  (1s, indexed and bounded), lifecycle cleanup (globally bounded to 4,096 rows /
+  about 8 MiB / 32 deleting backing queues locally, one remotely, plus set-based
+  empty-subscription batches), reaper (1s, expired
   locks→active or DLQ), scheduler (1s, scheduled→active), TTL (10s, →DLQ/discard),
   dedup and aux janitors (60s), plus local free-page reclaim (60s, threshold 256
   pages, at most 256 pages per pass). All write through the single conn.
@@ -241,7 +243,11 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   queue in one transaction. The global
   active-plus-deleting capacity defaults to 10,000. The compatibility list remains
   complete and active-only; new inventory/reconciliation uses opaque-cursor keyset
-  pagination ordered by `(topic,name)`.
+  pagination ordered by `(topic,name)`. A subscription may store one absolute
+  fixed deadline. `now >= expires_at` immediately fences routing and every data
+  operation; expiry preauthorizes force cleanup, and no retry, filter update or
+  message activity may extend the deadline. Do not add a redundant stored TTL or
+  a public Generation to implement this.
 - **Message parent checks are transactional.** Every supported `messages` insert
   must resolve or check an active queue inside the same transaction. Parent
   deletion/rename and child queue-key updates have indexed schema guards, but

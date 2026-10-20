@@ -781,8 +781,11 @@ mqlite_maintenance_runs_total{task="retention",outcome="interrupted"} 1
 mqlite_maintenance_runs_total{task="reclaim",outcome="success"} 7
 mqlite_maintenance_runs_total{task="reclaim",outcome="error"} 6
 mqlite_maintenance_runs_total{task="reclaim",outcome="interrupted"} 1
+mqlite_maintenance_runs_total{task="subscription_expiry",outcome="success"} 7
+mqlite_maintenance_runs_total{task="subscription_expiry",outcome="error"} 7
+mqlite_maintenance_runs_total{task="subscription_expiry",outcome="interrupted"} 1
 mqlite_maintenance_runs_total{task="lifecycle",outcome="success"} 7
-mqlite_maintenance_runs_total{task="lifecycle",outcome="error"} 7
+mqlite_maintenance_runs_total{task="lifecycle",outcome="error"} 8
 mqlite_maintenance_runs_total{task="lifecycle",outcome="interrupted"} 1
 # HELP mqlite_maintenance_enabled Whether a task is scheduled automatically in this engine mode.
 # TYPE mqlite_maintenance_enabled gauge
@@ -793,6 +796,7 @@ mqlite_maintenance_enabled{task="dedup"} 1
 mqlite_maintenance_enabled{task="receipts"} 1
 mqlite_maintenance_enabled{task="retention"} 1
 mqlite_maintenance_enabled{task="reclaim"} 0
+mqlite_maintenance_enabled{task="subscription_expiry"} 1
 mqlite_maintenance_enabled{task="lifecycle"} 1
 # HELP mqlite_maintenance_duration_seconds Elapsed maintenance pass time by task.
 # TYPE mqlite_maintenance_duration_seconds histogram
@@ -915,6 +919,23 @@ mqlite_maintenance_duration_seconds_bucket{task="reclaim",le="20"} 13
 mqlite_maintenance_duration_seconds_bucket{task="reclaim",le="+Inf"} 14
 mqlite_maintenance_duration_seconds_sum{task="reclaim"} 0.028
 mqlite_maintenance_duration_seconds_count{task="reclaim"} 14
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.001"} 0
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.0025"} 1
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.005"} 2
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.01"} 3
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.025"} 4
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.05"} 5
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.1"} 6
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.25"} 7
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="0.5"} 8
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="1"} 9
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="2.5"} 10
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="5"} 11
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="10"} 12
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="20"} 13
+mqlite_maintenance_duration_seconds_bucket{task="subscription_expiry",le="+Inf"} 15
+mqlite_maintenance_duration_seconds_sum{task="subscription_expiry"} 0.03
+mqlite_maintenance_duration_seconds_count{task="subscription_expiry"} 15
 mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="0.001"} 0
 mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="0.0025"} 1
 mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="0.005"} 2
@@ -929,9 +950,9 @@ mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="2.5"} 10
 mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="5"} 11
 mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="10"} 12
 mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="20"} 13
-mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="+Inf"} 15
-mqlite_maintenance_duration_seconds_sum{task="lifecycle"} 0.03
-mqlite_maintenance_duration_seconds_count{task="lifecycle"} 15
+mqlite_maintenance_duration_seconds_bucket{task="lifecycle",le="+Inf"} 16
+mqlite_maintenance_duration_seconds_sum{task="lifecycle"} 0.032
+mqlite_maintenance_duration_seconds_count{task="lifecycle"} 16
 # HELP mqlite_maintenance_last_success_timestamp_seconds Most recent successful maintenance pass as Unix seconds, or zero before success.
 # TYPE mqlite_maintenance_last_success_timestamp_seconds gauge
 mqlite_maintenance_last_success_timestamp_seconds{task="locks"} 1.7000000001e+09
@@ -941,7 +962,8 @@ mqlite_maintenance_last_success_timestamp_seconds{task="dedup"} 1.70000000013e+0
 mqlite_maintenance_last_success_timestamp_seconds{task="receipts"} 1.70000000014e+09
 mqlite_maintenance_last_success_timestamp_seconds{task="retention"} 1.70000000015e+09
 mqlite_maintenance_last_success_timestamp_seconds{task="reclaim"} 1.70000000016e+09
-mqlite_maintenance_last_success_timestamp_seconds{task="lifecycle"} 1.70000000017e+09
+mqlite_maintenance_last_success_timestamp_seconds{task="subscription_expiry"} 1.70000000017e+09
+mqlite_maintenance_last_success_timestamp_seconds{task="lifecycle"} 1.70000000018e+09
 # HELP mqlite_filter_failures_total Routing filter compilation or evaluation failures, excluding validation, dry runs and nonmatches.
 # TYPE mqlite_filter_failures_total counter
 mqlite_filter_failures_total{stage="compile"} 2

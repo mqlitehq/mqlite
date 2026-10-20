@@ -246,18 +246,19 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   tests. The remote (Turso) path retries transient errors with backoff; the local
   path never retries. *(engine/storage_test.go, engine/turso_test.go)*
 - **10.4** Access-key table and index additions remain independently additive
-  within the current schema token 6. Verify complete backup/restore content,
+  inside the canonical schema. Verify complete backup/restore content,
   including active, expired and revoked credentials.
   An incompatible existing object named `access_keys` or
   `idx_access_keys_created` MUST fail rather than be overwritten or silently trusted.
   *(engine/storage_test.go: TestAccessKeySchemaAdditiveCompatibility,
   TestAccessKeySchemaConflict, TestAccessKeyCreationIndexUpgradeAndConflicts;
   test/production/restore/run.py, compat.py)*
-- **10.5** Durable queue lifecycle columns and cleanup indexes make current schema
-  token 6 incompatible with the released schema-5 layout. Each binary MUST refuse
-  the other's database rather than adding columns, restamping the token or
-  partially opening it. Operators must create a fresh database and preserve the
-  matching old binary/backup pair. *(engine/storage_test.go:
+- **10.5** Durable resource lifecycle and fixed subscription-expiry columns and
+  indexes make current schema token 7 incompatible with the released schema-5
+  layout and intermediate schema-6 layout. Each binary MUST refuse the other's
+  database rather than adding columns, restamping the token or partially opening
+  it. Operators must create a fresh database and preserve the matching old
+  binary/backup pair. *(engine/storage_test.go:
   TestSchemaVersionGuard, TestSchemaContentPinnedToVersionToken)*
 
 ## 11 · Subscription filters
@@ -314,6 +315,9 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   return every active subscription in `(topic,name)` order. The paged operation
   MUST use the same order, default to 100, reject limits above 1,000, return an
   exact total for the request's scope and optionally include deleting entries.
+  Every paged row MUST carry required non-negative `created_at_ms` and
+  `expires_at_ms`; zero expiry means permanent and a positive expiry MUST be
+  greater than creation. An expired retained row is logically deleting.
   Its opaque cursor MUST be bound to the topic and include-deleting scope. One
   request is a consistent snapshot; pages issued as separate requests do not
   promise a frozen snapshot under concurrent changes.
@@ -323,6 +327,26 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   exact pair may update its filter. A deleting entry MUST retain its slot until
   final physical cleanup. Public `CreateQueue(kind=subscription)` MUST NOT create
   a backing queue without a subscription mapping.
+- **12.6 Fixed subscription lifetime.** A positive creation TTL MUST store one
+  absolute deadline from the first successful transaction. Omitted/zero TTL on a
+  new subscription makes it permanent; on an existing subscription it preserves
+  the original lifetime. The same positive TTL is idempotent, while a different
+  positive TTL MUST return `ErrNameConflict` before changing the filter. Retry,
+  filter update, message activity and restart MUST NOT extend the deadline. At
+  `now >= expires_at` fan-out and every direct data-plane effect MUST reject the
+  subscription, cached metadata included. Locks and long polls MUST end no later
+  than the deadline, and idempotency records MUST NOT authorize work after it.
+  *(engine/functional_test.go, engine/engine_test.go,
+  engine/complete_batch_test.go; sdk_test.go; server/subscriptions_test.go)*
+- **12.7 Expiry cleanup.** Expiry is durable advance authorization to discard all
+  retained message states. The indexed scanner MUST transition due subscriptions
+  to the existing restart-safe deletion lifecycle, while correctness remains
+  independent of scan timing. Empty subscriptions MAY use set-based cleanup only
+  when mapping and backing rows are removed in one transaction with exact row
+  counts, including when foreign keys are off. Nonempty subscriptions remain
+  subject to the global row/byte/fairness bounds, and every retained row keeps its
+  capacity slot until physical removal. *(engine/lifecycle_test.go,
+  engine/storage_test.go)*
 
 ## 13 · Cancellation (context deadlines)
 

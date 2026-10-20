@@ -1954,7 +1954,7 @@
     },
     {
       "enabled": true,
-      "task": "lifecycle",
+      "task": "subscription_expiry",
       "runs": 15,
       "interrupted": 1,
       "failures": 7,
@@ -1994,6 +1994,50 @@
         ],
         "count": 15,
         "sum_seconds": 0.03
+      }
+    },
+    {
+      "enabled": true,
+      "task": "lifecycle",
+      "runs": 16,
+      "interrupted": 1,
+      "failures": 8,
+      "last_success_at_ms": 1700000000180,
+      "duration": {
+        "bounds_seconds": [
+          0.001,
+          0.0025,
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10,
+          20
+        ],
+        "bucket_counts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "count": 16,
+        "sum_seconds": 0.032
       }
     }
   ],
