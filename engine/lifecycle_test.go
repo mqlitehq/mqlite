@@ -1779,7 +1779,17 @@ func TestLifecycleWorkerFastContinuesFullEmptyBatches(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	e.startLifecycle(workerCtx)
 	e.signalLifecycle()
-	foreground, foregroundCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	foregroundTimeout := 500 * time.Millisecond
+	drainTimeout := 1500 * time.Millisecond
+	if raceEnabled {
+		// modernc.org/sqlite is pure Go, so -race instruments the database itself.
+		// Slow macOS runners can spend over a second in one otherwise bounded
+		// cleanup transaction; keep the assertion about eventual writer access
+		// and fast continuation without treating instrumentation cost as failure.
+		foregroundTimeout = 5 * time.Second
+		drainTimeout = 10 * time.Second
+	}
+	foreground, foregroundCancel := context.WithTimeout(ctx, foregroundTimeout)
 	if err := e.CreateQueue(foreground, "foreground", QueueConfig{}); err != nil {
 		foregroundCancel()
 		cancel()
@@ -1788,7 +1798,7 @@ func TestLifecycleWorkerFastContinuesFullEmptyBatches(t *testing.T) {
 	}
 	foregroundCancel()
 
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	deadline := time.Now().Add(drainTimeout)
 	for {
 		var retained int
 		if err := e.db.queryRowScan(ctx, []any{&retained}, `SELECT COUNT(*) FROM subscriptions WHERE topic='fast'`); err != nil {
