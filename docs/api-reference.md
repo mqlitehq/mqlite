@@ -573,6 +573,12 @@ and lock duration. Logical expiry prevents new routing/claims even before the
 background cleanup has finished; inventory exposes pending deletion until cleanup
 completes. The original name remains reserved during cleanup.
 
+Topic routing reads its subscription roster inside the publish transaction and
+rechecks expiry before each matching delivery. A subscription that expires during
+fan-out is skipped without blocking other live subscriptions. A direct send to an
+expired subscription fails instead; expiry during a direct batch rolls that batch
+back. A topic with no live subscriptions when routing begins returns `not_found`.
+
 Direct Send, Schedule, Receive, ReceiveDeferred and filter updates for a temporary
 subscription require its `generation`; topic publication remains independent of
 individual subscription generations. In the SDK use `SendOpts.Generation` or

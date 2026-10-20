@@ -731,13 +731,16 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 type busyConn struct{ st *busyState }
 
 type busyState struct {
-	failsLeft int
-	args      [][]driver.NamedValue // the args of every attempt, in order
-	queries   []string
-	noEffect  bool // a fenced write matched no message; exercise receipt lookup instead
-	commitErr error
-	execErr   error
-	onCommit  func() // optional coordination for commit-publication tests
+	failsLeft  int
+	args       [][]driver.NamedValue // the args of every attempt, in order
+	queries    []string
+	noEffect   bool // a fenced write matched no message; exercise receipt lookup instead
+	commitErr  error
+	execErr    error
+	onCommit   func() // optional coordination for commit-publication tests
+	queueReads int
+	insertIDs  bool // synthesize INSERT RETURNING rows for batch metadata tests
+	inserted   int64
 }
 
 func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
@@ -777,11 +780,16 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 	// operation. Supply a real queue row; injected BUSY faults still target the
 	// claim/settlement statements whose clock refresh these fixtures exercise.
 	if strings.Contains(query, "SELECT "+queueSelectColumns+" FROM queues WHERE name=?") {
+		c.st.queueReads++
 		return &busyQueueRows{values: []driver.Value{args[0].Value, "queue", int64(1000), int64(10), int64(0),
 			int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "fixture", "active", int64(0), int64(0)}}, nil
 	}
 	if !c.record(query, args) {
 		return nil, errors.New("database is locked") // isBusyErr => retryable
+	}
+	if c.st.insertIDs && strings.Contains(query, "INSERT INTO messages") {
+		c.st.inserted++
+		return &busyQueueRows{values: []driver.Value{c.st.inserted}}, nil
 	}
 	return emptyRows{}, nil
 }
@@ -2473,6 +2481,35 @@ func TestRemoteCommitPublishesRetirementBeforeReplacement(t *testing.T) {
 	e.recordMessage("q", "enqueued", 1)
 	if !e.observation.known["q"] || e.observation.events[eventKey{"q", "enqueued"}] != 1 || e.observation.events[eventKey{"", "enqueued"}] != 3 {
 		t.Fatalf("replacement observation was retired: known=%v events=%v", e.observation.known, e.observation.events)
+	}
+}
+
+func TestSendBatchLoadsTargetMetadataOncePerTransactionAttempt(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retry=%t", retry), func(t *testing.T) {
+			d, state := remoteDBFailingFirst(t, 0)
+			state.insertIDs = true
+			commits := 0
+			state.onCommit = func() {
+				commits++
+				if retry && commits == 1 {
+					state.failsLeft = 1 // The first commit provably did not land.
+				}
+			}
+			e := &Engine{db: d, note: newNotifier(), now: func() int64 { return 1000 }, maxMsgBytes: DefaultMaxMessageBytes}
+			const batchSize = 64
+			seqs, err := e.Send(context.Background(), "q", make([]OutMessage, batchSize)...)
+			if err != nil || len(seqs) != batchSize {
+				t.Fatalf("batch: %v %v", seqs, err)
+			}
+			wantAttempts := 1
+			if retry {
+				wantAttempts = 2
+			}
+			if state.queueReads != wantAttempts || commits != wantAttempts || state.inserted != int64(batchSize*wantAttempts) {
+				t.Fatalf("metadata reads=%d commits=%d inserted=%d; want one metadata read for each of %d attempts", state.queueReads, commits, state.inserted, wantAttempts)
+			}
+		})
 	}
 }
 

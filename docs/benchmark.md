@@ -228,6 +228,23 @@ It uses a file-backed local database and an advancing test clock to prune creati
 receipts without sleeps. It measures per-operation cost, not a sustainable arrival
 rate under real-time receipt quotas, concurrent traffic, or remote storage.
 
+A local comparison on Apple M1 Pro / macOS / Go 1.26.9 used 256-byte bodies,
+file-backed databases and the median of three fixed 300-operation runs. The
+baseline was v0.3.3 (`7286f8c`); the candidate includes the unreleased lifecycle
+checks and cleanup index:
+
+| Embedded benchmark | Baseline | Lifecycle candidate |
+|---|---:|---:|
+| Send one message | 91.5 µs/message | 140.3 µs/message |
+| Send a batch of 64 | 1.835 ms/batch | 2.029 ms/batch |
+| Receive batches and complete individually | 163.6 µs/message | 245.2 µs/message |
+
+The lifecycle checks have a measurable cost, particularly for individual writes.
+Batch sending reuses metadata only within its transaction; every message still
+checks expiry and generation. These short local runs identify overhead, not
+production capacity or tail latency. Reproduce with
+`go test ./engine -run '^$' -bench '^Benchmark(SendOne|SendBatch64|ReceiveComplete)$' -benchtime=300x -count=3`.
+
 - **rampdown_4x4**: produce hard, then stop producing while consumers drain to idle.
   RSS peak 31 MB → 27 MB after the load goes away — memory tracks the workload *down*,
   not a one-way ratchet.

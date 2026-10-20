@@ -64,17 +64,18 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 		if len(targets) != 1 || targets[0].name != queue {
 			return 0, fmt.Errorf("%w: generation requires a direct queue or subscription target", ErrInvalidArgument)
 		}
-		if _, err := t.e.checkQueueLiveTx(t.ctx, t.tx, queue, m.TargetGeneration); err != nil {
-			return 0, err
-		}
 	}
 	var last int64
-	for _, tg := range targets {
-		if !t.e.filterAccepts(tg, m, t.now, t.now) { // immediate send: visible_at == enqueued_at
+	for i := range targets {
+		tg := &targets[i]
+		if !t.e.filterAccepts(*tg, m, t.now, t.now) { // immediate send: visible_at == enqueued_at
 			continue
 		}
-		q, err := t.e.loadQueueTx(t.ctx, t.tx, tg.name)
+		q, err := t.e.loadTargetTx(t.ctx, t.tx, tg, m.TargetGeneration)
 		if err != nil {
+			if tg.name != queue && errors.Is(err, ErrQueueNotFound) && q.lifecycleState == "active" && q.expiresAtMs > 0 {
+				continue // A temporary subscriber can expire after the roster read.
+			}
 			return 0, err
 		}
 		if q.subscriptionTTLMs > 0 && tg.name == queue && m.TargetGeneration == "" {
@@ -165,8 +166,9 @@ func (e *Engine) resolveTargetsTx(ctx context.Context, tx *txn, name string) ([]
 	if len(subs) > 0 {
 		return subs, nil
 	}
-	if _, err := e.loadQueueTx(ctx, tx, name); err != nil {
+	q, err := e.loadQueueTx(ctx, tx, name)
+	if err != nil {
 		return nil, err
 	}
-	return []target{{name: name}}, nil
+	return []target{{name: name, queue: &q}}, nil
 }

@@ -645,15 +645,19 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 		for i, m := range ms {
 			// fan-out: identical body to each subscription target (topic) or the one queue.
 			var lastSeq int64
-			for _, t := range targets {
+			for j := range targets {
+				t := &targets[j]
 				if m.TargetGeneration != "" && t.name != name {
 					return fmt.Errorf("%w: target generation applies only to direct delivery", ErrInvalidArgument)
 				}
-				if !e.filterAccepts(t, m, now, visibleAt) { // empty/nil filter matches all
+				if !e.filterAccepts(*t, m, now, visibleAt) { // empty/nil filter matches all
 					continue
 				}
-				q, err := e.checkQueueLiveTx(ctx, tx, t.name, m.TargetGeneration)
+				q, err := e.loadTargetTx(ctx, tx, t, m.TargetGeneration)
 				if err != nil {
+					if t.name != name && errors.Is(err, ErrQueueNotFound) && q.lifecycleState == "active" && q.expiresAtMs > 0 {
+						continue // Expiry during fan-out must not block other live subscriptions.
+					}
 					return err
 				}
 				if q.subscriptionTTLMs > 0 && t.name == name && m.TargetGeneration == "" {
@@ -693,11 +697,24 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 	return seqs, conflicts, nil
 }
 
-// target is a concrete deliverable queue name plus an optional compiled filter.
+// target belongs to one transaction's routing snapshot. queue is populated once
+// on first delivery; lifecycle time and generation are still checked per message.
 // entry is nil for a plain queue or an empty filter (match all).
 type target struct {
 	name  string
 	entry *filterEntry
+	queue *queueRow
+}
+
+func (e *Engine) loadTargetTx(ctx context.Context, tx *txn, t *target, generation string) (queueRow, error) {
+	if t.queue == nil {
+		q, err := e.readQueueTx(ctx, tx, t.name)
+		if err != nil {
+			return queueRow{}, err
+		}
+		t.queue = &q
+	}
+	return *t.queue, queueLive(*t.queue, generation, e.now())
 }
 
 // targetFor builds a fan-out target from a subscription row, compiling and caching

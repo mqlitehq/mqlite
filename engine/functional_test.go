@@ -2458,6 +2458,140 @@ func TestResourceDeletionBoundsMetadataBytes(t *testing.T) {
 	}
 }
 
+func TestSendBatchRechecksSubscriptionExpiryPerMessage(t *testing.T) {
+	for _, topic := range []bool{false, true} {
+		t.Run(fmt.Sprintf("topic=%t", topic), func(t *testing.T) {
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			sub, err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{
+				TTLMs: 1000, RequestID: "create", RequestExpiresAtMs: e.now() + 1000,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			name, generation := "sub", sub.Generation
+			expirationRead := 6 // send, roster, direct metadata, batch time, first item, second item
+			if topic {
+				name, generation = "topic", ""
+				expirationRead-- // Topic metadata loads lazily at the first item's check.
+			}
+			reads := 0
+			e.now = func() int64 {
+				reads++
+				if reads >= expirationRead {
+					return sub.ExpiresAtMs
+				}
+				return sub.ExpiresAtMs - 1
+			}
+			seqs, err := e.Send(ctx, name, OutMessage{TargetGeneration: generation}, OutMessage{TargetGeneration: generation})
+			wantCount := 0
+			if topic {
+				wantCount = 1 // Only the first item was delivered before expiry.
+				if err != nil || len(seqs) != 2 || seqs[0] == 0 || seqs[1] != 0 {
+					t.Fatalf("topic did not skip its expired target: seqs=%v err=%v", seqs, err)
+				}
+			} else if !errors.Is(err, ErrQueueNotFound) || len(seqs) != 0 {
+				t.Fatalf("direct batch crossed expiration: seqs=%v err=%v", seqs, err)
+			}
+			if reads != expirationRead {
+				t.Fatalf("clock reads=%d want=%d", reads, expirationRead)
+			}
+			var count int
+			if err := e.db.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM messages WHERE queue='sub'`); err != nil || count != wantCount {
+				t.Fatalf("expiration handling: count=%d want=%d err=%v", count, wantCount, err)
+			}
+		})
+	}
+}
+
+func TestTopicFanoutSkipsSubscriptionExpiringAfterRosterRead(t *testing.T) {
+	for _, explicitTx := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit_tx=%t", explicitTx), func(t *testing.T) {
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			if err := e.Subscribe(ctx, "topic", "a-live", nil); err != nil {
+				t.Fatal(err)
+			}
+			sub, err := e.SubscribeWithOptions(ctx, "topic", "b-temporary", nil, SubscribeOptions{
+				TTLMs: 1000, RequestID: "create", RequestExpiresAtMs: e.now() + 1000,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reads, expirationRead, wantLive := 0, 5, 2
+			if explicitTx {
+				expirationRead, wantLive = 4, 1
+			}
+			e.now = func() int64 {
+				reads++
+				if reads >= expirationRead {
+					return sub.ExpiresAtMs
+				}
+				return sub.ExpiresAtMs - 1
+			}
+			if explicitTx {
+				err = e.Tx(ctx, func(tx *EngineTx) error {
+					_, err := tx.SendOne("topic", OutMessage{})
+					return err
+				})
+			} else {
+				_, err = e.Send(ctx, "topic", OutMessage{}, OutMessage{})
+			}
+			if err != nil {
+				t.Fatalf("expired subscriber blocked live fan-out: %v", err)
+			}
+			for name, want := range map[string]int{"a-live": wantLive, "b-temporary": 0} {
+				var count int
+				if err := e.db.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM messages WHERE queue=?`, name); err != nil || count != want {
+					t.Fatalf("%s count=%d want=%d err=%v", name, count, want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSendBatchChecksEachTargetGeneration(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	sub, err := e.SubscribeWithOptions(ctx, "topic", "sub", nil, SubscribeOptions{
+		TTLMs: 1000, RequestID: "create", RequestExpiresAtMs: e.now() + 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.Send(ctx, "sub", OutMessage{TargetGeneration: sub.Generation}, OutMessage{TargetGeneration: "older-generation"})
+	if !errors.Is(err, ErrQueueChanged) {
+		t.Fatalf("second message bypassed generation fencing: %v", err)
+	}
+	stats, err := e.Stats(ctx, "sub")
+	if err != nil || stats.Total != 0 {
+		t.Fatalf("failed batch retained its first insert: %+v %v", stats, err)
+	}
+}
+
+func TestEngineTxSendOneReloadsMetadataAfterRawSQL(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	err := e.Tx(ctx, func(tx *EngineTx) error {
+		if _, err := tx.SendOne("q", OutMessage{}); err != nil {
+			return err
+		}
+		if _, err := tx.SQL().ExecContext(tx.Context(), `UPDATE queues SET lifecycle_state='deleting' WHERE name='q'`); err != nil {
+			return err
+		}
+		_, err := tx.SendOne("q", OutMessage{})
+		return err
+	})
+	if !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("later SendOne reused metadata preceding raw SQL: %v", err)
+	}
+	stats, err := e.Stats(ctx, "q")
+	if err != nil || stats.Total != 0 {
+		t.Fatalf("failed transaction retained its first insert: %+v %v", stats, err)
+	}
+}
+
 func TestSubscriptionInventoryPaginationAndLogicalCounts(t *testing.T) {
 	ctx := context.Background()
 	e, clock := testEngine(t)
