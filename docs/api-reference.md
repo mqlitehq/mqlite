@@ -610,6 +610,9 @@ Register subscription `name` under `topic` (creates its backing queue).
   keep that clock synchronized because a forward step can expire a subscription
   early and a backward step can delay a deadline that has not yet been durably
   transitioned to `deleting`.
+- The bundled console limits entered TTLs to 3,650 fixed 24-hour days so their
+  millisecond value remains exact in browser JavaScript. Direct HTTP and Go SDK
+  clients retain the API's wider checked-integer range.
 - Name conflicts are rejected with `409 name_conflict`: a `topic` that names an
   existing queue or subscription, a `name` that belongs to a plain queue / another
   topic's subscription / a live topic, and `topic == name`. Re-subscribing the same
