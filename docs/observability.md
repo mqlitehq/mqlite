@@ -242,11 +242,15 @@ and registered RPC/result combinations are initialized to zero, so the first
 event can be detected after an earlier successful scrape. Use `rate`/`increase`
 across observed samples; a first scrape after an event cannot reconstruct its time.
 Maintenance tasks are `locks`, `scheduled`, `ttl`,
-`dedup`, `receipts`, `retention`, `reclaim`, `lifecycle`. `lifecycle` is the
+`dedup`, `receipts`, `retention`, `reclaim`, `subscription_expiry`,
+`lifecycle`. `subscription_expiry` is the one-second indexed transition of due
+fixed-lifetime subscriptions; a full 1,000-row due batch continues after a 10 ms
+yield, and data-plane expiry does not wait for the scan. `lifecycle` is the
 event-driven bounded cleanup pass for queue and subscription backing queues
-already marked deleting. Unfinished
-work is paced at one continuation pass per second; an idle store does not run the
-task, so a quiet `last_success` timestamp is expected. An uncertain remote delete
+already marked deleting. A full 512-row empty-subscription batch continues after
+a 10 ms yield. Loaded-message cleanup, errors and confirmation passes remain
+paced at one second; an idle store does not run the task, so a quiet
+`last_success` timestamp is expected. An uncertain remote delete
 commit temporarily schedules up to 30 one-second discovery passes even when the
 first inventory read is empty. Check enabled status and
 each task's actual cadence before alerting on its last-success time.
@@ -422,8 +426,9 @@ observation extensions. New brokers include their request counters plus the
 `queue_not_empty`, `subscription_not_empty` and `resource_exhausted` outcomes.
 `ListQueues.state` and the paged subscription inventory with
 `include_deleting=true`, rather than the canonical observation's queue gauges,
-identify resources whose cleanup is pending. The lifecycle maintenance row
-reports cleanup pass health; a force discard does not masquerade as normal
+identify resources whose cleanup is pending. The `subscription_expiry` and
+`lifecycle` maintenance rows report transition and cleanup health; a force or
+expiry-authorized discard does not masquerade as normal
 completion or retention message effects. The required decoder baseline is
 unchanged, so new clients continue to accept observations from older brokers.
 An occupied-resource or capacity rejection is an application outcome, not a

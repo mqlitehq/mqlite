@@ -269,7 +269,7 @@ def execute(args, out):
                 pass
             require(time.monotonic() < deadline, "authenticated storage readiness timed out")
             time.sleep(0.25)
-        require(state.get("version") == args.expected_version and state.get("schema_version") == "6"
+        require(state.get("version") == args.expected_version and state.get("schema_version") == "7"
                 and state.get("backend") == "local file" and state.get("auth") is True,
                 "unexpected broker version/schema/storage/auth")
         metrics_require_authentication()

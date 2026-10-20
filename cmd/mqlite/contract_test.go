@@ -346,6 +346,11 @@ func TestListSubscriptionsLegacyAndPageJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(pageJSON), &first); err != nil || len(first.Subscriptions) != 2 || first.Total != 3 || first.NextAfter == "" {
 		t.Fatalf("first page = %q (%v)", pageJSON, err)
 	}
+	for _, item := range first.Subscriptions {
+		if item.CreatedAtMs <= 0 || item.ExpiresAtMs != 0 {
+			t.Fatalf("first page omitted lifetime metadata: %+v", item)
+		}
+	}
 	secondJSON, err := captureStdout(t, func() error {
 		return cmdListSubscriptions(ctx, []string{"--after", first.NextAfter, "--limit", "2", "--output", "json"})
 	})

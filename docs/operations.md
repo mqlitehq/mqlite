@@ -1,6 +1,6 @@
 # Production operations
 
-This runbook covers the current unreleased source (port 6754, schema token 6) and
+This runbook covers the current unreleased source (port 6754, schema token 7) and
 released v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5). v0.3.3 is retracted;
 use v0.3.2 until its replacement is published.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
@@ -48,6 +48,15 @@ for metric definitions and alerts.
   subscription per request. If temporary subscriptions are required, use globally
   unique one-use names and rate-limit creation/deletion so bounded cleanup can keep
   up.
+- Treat a fixed subscription TTL as forgotten-cleanup insurance. The deadline is
+  absolute and expiry authorizes discarding every retained state; traffic and
+  filter edits do not renew it. Delete explicitly on normal completion, stagger
+  large expiry waves, and include unconsumed body bytes plus post-expiry cleanup
+  time in capacity planning.
+- Keep the broker host's UTC clock synchronized and alert on large time steps.
+  Subscription deadlines, scheduled delivery, message TTL and lock expiry all use
+  that clock. A forward step can make deadlines arrive early; a backward step can
+  delay a subscription expiry that has not yet been durably marked `deleting`.
 
 Choose and record the application's recovery objectives before launch: acceptable
 snapshot age (RPO), recovery time (RTO), backlog age, and capacity limits. Measure
@@ -218,18 +227,20 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
 For **v0.3.2 or retracted v0.3.3 → current unreleased source**, schema changes
-from **5 → 6** while port **6754** stays unchanged. Durable queue lifecycle columns
-and cleanup indexes make the database incompatible; there is no in-place migration.
+from **5 → 7** while port **6754** stays unchanged. Durable queue lifecycle and
+fixed subscription-expiry columns and indexes make the database incompatible;
+there is no in-place migration. Schema 6 belonged only to an intermediate
+unreleased lifecycle build and is refused too.
 Follow the different-token procedure above: stop producers and consumers, take a
 consistent schema-5 backup, account for every retained message state and managed
 key, preserve the matching old binary/database pair, and start current source with
-a fresh database. Do not edit the schema token or point schema-6 code at the old
+a fresh database. Do not edit the schema token or point schema-7 code at the old
 file. Move work through an application-level drain/replay process with stable
 business identities if it must survive the cutover.
 
 Current clients also change the deletion contract to `{name,force?}` with a typed
 `{deleted,state}` result; update broker, SDK, CLI, MCP and console together. A
-rollback after schema-6 accepts writes requires preserving and reconciling those
+rollback after schema-7 accepts writes requires preserving and reconciling those
 writes before restoring the schema-5 snapshot. If enabled, retain the private
 diagnostic log separately from database backups.
 
@@ -281,7 +292,8 @@ in this release, so do not improvise a direct SQL table copy between schemas.
 | Full disk / `SQLITE_FULL` | Stop ingress, preserve logs and acknowledged message identities. Expand storage or remove unrelated expired logs/backups; never remove the live DB or WAL. A full `VACUUM` needs working space and is unsuitable as an emergency first step. | Backend status, a fresh canary, successful replay/reconciliation of ambiguous requests, and retained-message integrity. |
 | Repeated broker crashes | Stop restart loops long enough to preserve the complete DB directory and logs. Check disk, memory/OOM and configuration. Restart only one owner. | Recovery of orphaned locks, DLQ reason/count, canary and consumer idempotency. |
 | Old backlog / growing DLQ | Check consumers, lock expiry/renewal and handler failures. Inspect reasons and payloads; fix the cause before bounded redrive. | Backlog age falls and verified redriven identities complete. |
-| Queue or subscription remains `deleting` | Keep producers stopped and the name reserved. Check storage availability, free disk and `resource_cleanup` maintenance failures; do not remove lifecycle rows or subscription mappings with SQL. Cleanup is deliberately bounded and resumes after restart. | `list` or `list-subscriptions --include-deleting` no longer contains the name; only then may the owner recreate it. Logical free pages can be reused before the DB/WAL files shrink. |
+| Queue or subscription remains `deleting` | Keep producers stopped and the name reserved. Check storage availability, free disk and `resource_cleanup`, `subscription_expiry`, and `lifecycle` maintenance failures; do not remove lifecycle rows or subscription mappings with SQL. Cleanup is deliberately bounded and resumes after restart. | `list` or `list-subscriptions --include-deleting` no longer contains the name; only then may the owner recreate it. Logical free pages can be reused before the DB/WAL files shrink. |
+| Many subscriptions expire together | Stop additional temporary-subscription churn. Inspect active plus deleting inventory, retained message bytes, storage latency, capacity and both expiry/lifecycle maintenance diagnostics. Do not recreate names while rows remain. | Expired rows were unavailable at their exact deadline, deleting inventory and capacity usage converge, and foreground latency remains within the workload's measured bound. |
 | Subscription creation returns `resource_exhausted` | Stop creation churn and inspect active plus deleting subscriptions with paged listing. Drain or explicitly force-retire abandoned entries, then let bounded cleanup finish. Raising the limit also raises metadata, fan-out and observation costs. | Deleting entries disappear, capacity becomes available and publish/observe latency remains within the workload's measured bound. |
 | An older database exposes a `kind=subscription` queue with no subscription mapping | Wait for a capacity slot, call `Subscribe` with the intended topic and existing backing-queue name to restore the mapping, then keep it or retire it through `DeleteSubscription`. Never repair MQLite-owned tables with direct SQL. | The exact topic/name appears in `list-subscriptions`; if retired, it disappears after bounded cleanup. |
 | Storage/remote timeouts | Check backend reachability and latency. Treat lost write responses as ambiguous; keep retries within the idempotency contract. | Authenticated status plus a write/consume canary. |

@@ -12,6 +12,7 @@ import (
 // through the single connection, so they serialize behind foreground work.
 func (e *Engine) startBackground(ctx context.Context) {
 	e.startLifecycle(ctx)
+	e.startSubscriptionExpiry(ctx)
 	// reaper at 1s bounds visibility-timeout redelivery to lock_duration + ≤1s
 	// (expired locks are reclaimed here, not on the claim hot path, so claims stay
 	// O(log n) on a deep backlog — see claim.go / the stress report).
@@ -27,6 +28,49 @@ func (e *Engine) startBackground(ctx context.Context) {
 	// free-page reclamation (MQLITE-53): hand deleted pages back to the OS so a
 	// churning queue's file doesn't bloat — no manual stop-the-broker VACUUM.
 	e.spawn(ctx, 60*time.Second, func(ctx context.Context) { e.runMaintenance(ctx, "reclaim", e.reclaimFreePages) })
+}
+
+const lifecycleFastRetryDelay = 10 * time.Millisecond
+
+// startSubscriptionExpiry detects newly due lifetimes once per second. A full
+// batch continues after a short yield: every batch is its own transaction, so
+// foreground work can enter between them, while a 10k simultaneous expiry does
+// not inherit a ten-second physical-transition delay.
+func (e *Engine) startSubscriptionExpiry(ctx context.Context) {
+	e.bgWG.Add(1)
+	go func() {
+		defer e.bgWG.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			for {
+				pending := false
+				e.runMaintenance(ctx, "subscription_expiry", func(ctx context.Context) {
+					pending = e.runSubscriptionExpiryPass(ctx)
+				})
+				if ctx.Err() != nil {
+					return
+				}
+				if !pending {
+					break
+				}
+				timer := time.NewTimer(lifecycleFastRetryDelay)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
+			}
+		}
+	}()
 }
 
 // signalLifecycle records cleanup work without blocking the caller. A capacity-one
@@ -71,11 +115,12 @@ func (e *Engine) takeUncertainLifecycleProbe() bool {
 	}
 }
 
-// startLifecycle runs cleanup only after durable work is discovered. Unfinished
-// passes are paced at one per second so a large forced deletion cannot monopolize
-// the single writer. A signal arriving during a pass remains buffered for the next
-// outer iteration, which prevents a deletion committed after an empty inventory
-// snapshot from being lost.
+// startLifecycle runs cleanup only after durable work is discovered. A full
+// metadata-only batch continues after a short yield; loaded-message cleanup and
+// errors remain paced at one pass per second. Every pass releases the writer. A
+// signal arriving during a pass remains buffered for the next outer iteration,
+// which prevents a deletion committed after an empty inventory snapshot from
+// being lost.
 func (e *Engine) startLifecycle(ctx context.Context) {
 	e.bgWG.Add(1)
 	go func() {
@@ -88,21 +133,26 @@ func (e *Engine) startLifecycle(ctx context.Context) {
 			}
 
 			for {
-				retry := false
+				outcome := lifecyclePassOutcome{}
 				e.runMaintenance(ctx, "lifecycle", func(ctx context.Context) {
-					retry = e.maintainLifecyclePass(ctx)
+					outcome = e.maintainLifecyclePassDetailed(ctx)
 				})
 				if ctx.Err() != nil {
 					return
 				}
 				if e.takeUncertainLifecycleProbe() {
-					retry = true
+					outcome.retry = true
+					outcome.fast = false
 				}
-				if !retry {
+				if !outcome.retry {
 					break
 				}
 
-				timer := time.NewTimer(time.Second)
+				delay := time.Second
+				if outcome.fast {
+					delay = lifecycleFastRetryDelay
+				}
+				timer := time.NewTimer(delay)
 				select {
 				case <-ctx.Done():
 					if !timer.Stop() {
@@ -133,19 +183,24 @@ func (e *Engine) spawn(ctx context.Context, interval time.Duration, fn func(cont
 	}()
 }
 
-func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) []string {
+func (e *Engine) distinctQueues(ctx context.Context, where string) []string {
 	var qs []string
-	if err := e.db.queryRows(ctx, `SELECT DISTINCT messages.queue FROM messages JOIN queues ON queues.name=messages.queue
-		WHERE queues.lifecycle_state='active' AND `+where,
+	if err := e.db.queryFresh(ctx, `SELECT DISTINCT messages.queue FROM messages JOIN queues ON queues.name=messages.queue
+		WHERE queues.lifecycle_state='active' AND (queues.expires_at=0 OR queues.expires_at>?) AND `+where,
+		func() []any {
+			qs = qs[:0]
+			return []any{e.now()}
+		},
 		func(rows *sql.Rows) error {
 			for rows.Next() {
 				var q string
-				if rows.Scan(&q) == nil {
-					qs = append(qs, q)
+				if err := rows.Scan(&q); err != nil {
+					return err
 				}
+				qs = append(qs, q)
 			}
 			return rows.Err()
-		}, args...); err != nil {
+		}); err != nil {
 		e.maintenanceFailure(ctx, "list_affected_queues", err)
 		return nil
 	}
@@ -154,9 +209,7 @@ func (e *Engine) distinctQueues(ctx context.Context, where string, args ...any) 
 
 // reapLocks reclaims expired locks: redeliver, or dead-letter once over max (§5.2 reaper).
 func (e *Engine) reapLocks(ctx context.Context) {
-	now := e.now()
-	qs := e.distinctQueues(ctx, `state='locked' AND locked_until<=?`, now)
-	err := e.mutateMessages(ctx, "lock_expired", `
+	qs, err := e.mutateMessagesFreshQueues(ctx, "lock_expired", `
 		UPDATE messages SET
 		    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                 THEN 'dead_lettered' ELSE 'active' END,
@@ -164,7 +217,9 @@ func (e *Engine) reapLocks(ctx context.Context) {
 		    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
 		 WHERE state='locked' AND locked_until<=?
-		   AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now)
+		   AND queue IN (SELECT name FROM queues
+		                 WHERE lifecycle_state='active' AND (expires_at=0 OR expires_at>?))`,
+		func() []any { now := e.now(); return []any{now, now} })
 	if err != nil {
 		e.maintenanceFailure(ctx, "reclaim_locks", err)
 		return
@@ -176,11 +231,12 @@ func (e *Engine) reapLocks(ctx context.Context) {
 
 // activateScheduled flips scheduled messages whose visible_at has arrived.
 func (e *Engine) activateScheduled(ctx context.Context) {
-	now := e.now()
-	qs := e.distinctQueues(ctx, `state='scheduled' AND visible_at<=?`, now)
-	if err := e.mutateMessages(ctx, "activated",
+	qs, err := e.mutateMessagesFreshQueues(ctx, "activated",
 		`UPDATE messages SET state='active' WHERE state='scheduled' AND visible_at<=?
-		 AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now); err != nil {
+		 AND queue IN (SELECT name FROM queues
+		               WHERE lifecycle_state='active' AND (expires_at=0 OR expires_at>?))`,
+		func() []any { now := e.now(); return []any{now, now} })
+	if err != nil {
 		e.maintenanceFailure(ctx, "activate_scheduled", err)
 		return
 	}
@@ -195,18 +251,21 @@ func (e *Engine) activateScheduled(ctx context.Context) {
 // before it ever activates is dead-lettered now, not only after activation
 // (MQLITE-61; the discard branch always had it).
 func (e *Engine) expireTTL(ctx context.Context) {
-	now := e.now()
-	if err := e.mutateMessages(ctx, "dead_lettered", `
+	if err := e.mutateMessagesFresh(ctx, "dead_lettered", `
 			UPDATE messages SET state='dead_lettered', dead_letter_reason='TTLExpired',
 		    locked_until=0, lock_token=NULL
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
-		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1 AND lifecycle_state='active')`, now); err != nil {
+		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=1 AND lifecycle_state='active'
+		                 AND (expires_at=0 OR expires_at>?))`,
+		func() []any { now := e.now(); return []any{now, now} }); err != nil {
 		e.maintenanceFailure(ctx, "expire_to_dlq", err)
 	}
-	if err := e.mutateMessages(ctx, "ttl_discarded", `
+	if err := e.mutateMessagesFresh(ctx, "ttl_discarded", `
 		DELETE FROM messages
 		 WHERE expires_at>0 AND expires_at<=? AND state IN ('active','locked','deferred','scheduled')
-		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=0 AND lifecycle_state='active')`, now); err != nil {
+		   AND queue IN (SELECT name FROM queues WHERE dead_letter_on_expire=0 AND lifecycle_state='active'
+		                 AND (expires_at=0 OR expires_at>?))`,
+		func() []any { now := e.now(); return []any{now, now} }); err != nil {
 		e.maintenanceFailure(ctx, "expire_discard", err)
 	}
 }
@@ -214,15 +273,29 @@ func (e *Engine) expireTTL(ctx context.Context) {
 // cleanupDedup drops dedup rows older than the widest configured window.
 func (e *Engine) cleanupDedup(ctx context.Context) {
 	var maxWindow sql.NullInt64
-	if err := e.db.queryRowScan(ctx, []any{&maxWindow}, `SELECT MAX(dedup_window_ms) FROM queues WHERE lifecycle_state='active'`); err != nil {
+	if err := e.db.queryFresh(ctx, `SELECT MAX(dedup_window_ms) FROM queues
+		WHERE lifecycle_state='active' AND (expires_at=0 OR expires_at>?)`,
+		func() []any {
+			maxWindow = sql.NullInt64{}
+			return []any{e.now()}
+		}, func(rows *sql.Rows) error {
+			if !rows.Next() {
+				return rows.Err()
+			}
+			return rows.Scan(&maxWindow)
+		}); err != nil {
 		e.maintenanceFailure(ctx, "read_dedup_window", err)
 		return
 	}
 	if !maxWindow.Valid || maxWindow.Int64 <= 0 {
 		return
 	}
-	if _, err := e.db.exec(ctx, `DELETE FROM dedup WHERE seen_at < ?
-		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, e.now()-maxWindow.Int64); err != nil {
+	if _, err := e.db.execFresh(ctx, `DELETE FROM dedup WHERE seen_at < ?
+		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active'
+		              AND (expires_at=0 OR expires_at>?))`, func() []any {
+		now := e.now()
+		return []any{now - maxWindow.Int64, now}
+	}); err != nil {
 		e.maintenanceFailure(ctx, "prune_dedup", err)
 	}
 }
@@ -231,13 +304,20 @@ func (e *Engine) cleanupDedup(ctx context.Context) {
 // These idempotency tables would otherwise grow unbounded; mqlite retires them on a
 // low-frequency pass so the feature ships with its own retention.
 func (e *Engine) cleanupExpiredAux(ctx context.Context) {
-	now := e.now()
-	if _, err := e.db.exec(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?
-		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now); err != nil {
+	if _, err := e.db.execFresh(ctx, `DELETE FROM settlement_receipts WHERE expires_at < ?
+		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active'
+		              AND (expires_at=0 OR expires_at>?))`, func() []any {
+		now := e.now()
+		return []any{now, now}
+	}); err != nil {
 		e.maintenanceFailure(ctx, "prune_settlement_receipts", err)
 	}
-	if _, err := e.db.exec(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?
-		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active')`, now); err != nil {
+	if _, err := e.db.execFresh(ctx, `DELETE FROM receive_attempts WHERE expires_at < ?
+		AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active'
+		              AND (expires_at=0 OR expires_at>?))`, func() []any {
+		now := e.now()
+		return []any{now, now}
+	}); err != nil {
 		e.maintenanceFailure(ctx, "prune_receive_attempts", err)
 	}
 }
@@ -281,13 +361,15 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 
 		// age: drop dead letters enqueued before the cutoff.
 		if maxAge > 0 {
-			cutoff := e.now() - maxAge
 			for i := 0; i < maxBatches; i++ {
 				epoch := e.observationEpoch()
-				res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
+				res, err := e.db.execFresh(ctx, `DELETE FROM messages WHERE id IN (
 					SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND enqueued_at < ?
 					  AND `+liveMessageQueueSQL+`
-					ORDER BY id LIMIT ?)`, q, cutoff, batch)
+					ORDER BY id LIMIT ?)`, func() []any {
+					now := e.now()
+					return []any{q, now - maxAge, now, batch}
+				})
 				if err != nil {
 					e.maintenanceFailure(ctx, "purge_retention_age", err)
 					break
@@ -308,9 +390,21 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 		// million dead letters that is very nearly every broker (review round-3 §3.2).
 		if maxCount > 0 {
 			var cutoffID sql.NullInt64
-			err := e.db.queryRowScan(ctx, []any{&cutoffID},
+			err := e.db.queryFresh(ctx,
 				`SELECT id FROM messages WHERE queue=? AND state='dead_lettered'
-				 ORDER BY id DESC LIMIT 1 OFFSET ?`, q, maxCount)
+				   AND `+liveMessageQueueSQL+`
+				 ORDER BY id DESC LIMIT 1 OFFSET ?`, func() []any {
+					cutoffID = sql.NullInt64{}
+					return []any{q, e.now(), maxCount}
+				}, func(rows *sql.Rows) error {
+					if !rows.Next() {
+						if err := rows.Err(); err != nil {
+							return err
+						}
+						return sql.ErrNoRows
+					}
+					return rows.Scan(&cutoffID)
+				})
 			switch {
 			case errors.Is(err, sql.ErrNoRows): // under the cap: no surplus, no work
 			case err != nil:
@@ -326,11 +420,23 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 		// under-cap DLQ has no such row, and that is a no-op, not an error.
 		if maxBytes > 0 {
 			var cutoffID sql.NullInt64
-			err := e.db.queryRowScan(ctx, []any{&cutoffID},
+			err := e.db.queryFresh(ctx,
 				`SELECT id FROM (
 				     SELECT id, SUM(length(body)) OVER (ORDER BY id DESC) AS cum
 				     FROM messages WHERE queue=? AND state='dead_lettered'
-				 ) WHERE cum > ? ORDER BY id DESC LIMIT 1`, q, maxBytes)
+				       AND `+liveMessageQueueSQL+`
+				 ) WHERE cum > ? ORDER BY id DESC LIMIT 1`, func() []any {
+					cutoffID = sql.NullInt64{}
+					return []any{q, e.now(), maxBytes}
+				}, func(rows *sql.Rows) error {
+					if !rows.Next() {
+						if err := rows.Err(); err != nil {
+							return err
+						}
+						return sql.ErrNoRows
+					}
+					return rows.Scan(&cutoffID)
+				})
 			switch {
 			case errors.Is(err, sql.ErrNoRows): // under the cap: no surplus, no work
 			case err != nil:
@@ -349,10 +455,10 @@ func (e *Engine) reapDLQ(ctx context.Context) {
 func (e *Engine) purgeDLQUpToID(ctx context.Context, q string, cutoffID int64, batch, maxBatches int, label string) {
 	for i := 0; i < maxBatches; i++ {
 		epoch := e.observationEpoch()
-		res, err := e.db.exec(ctx, `DELETE FROM messages WHERE id IN (
+		res, err := e.db.execFresh(ctx, `DELETE FROM messages WHERE id IN (
 			SELECT id FROM messages WHERE queue=? AND state='dead_lettered' AND id <= ?
 			  AND `+liveMessageQueueSQL+`
-			ORDER BY id LIMIT ?)`, q, cutoffID, batch)
+			ORDER BY id LIMIT ?)`, func() []any { return []any{q, cutoffID, e.now(), batch} })
 		if err != nil {
 			e.maintenanceFailure(ctx, "purge_retention_"+label, err)
 			return
@@ -469,6 +575,7 @@ func (e *Engine) reclaimPagesBounded(ctx context.Context, pages int) error {
 // RunMaintenanceOnce runs every maintenance pass synchronously. Tests with
 // DisableBackground use this to drive time-based transitions deterministically.
 func (e *Engine) RunMaintenanceOnce(ctx context.Context) {
+	e.runMaintenance(ctx, "subscription_expiry", e.transitionExpiredSubscriptions)
 	e.runMaintenance(ctx, "lifecycle", e.maintainLifecycle)
 	e.runMaintenance(ctx, "locks", e.reapLocks)
 	e.runMaintenance(ctx, "scheduled", e.activateScheduled)

@@ -535,6 +535,19 @@ func (c *Client) Subscribe(ctx context.Context, topic, name string, f *Filter) e
 	return c.post(ctx, wire.PathSubscribe, wire.SubscribeRequest{Topic: topic, Name: name, Filter: f}, &wire.Empty{})
 }
 
+// SubscribeWithOptions creates or updates a subscription and optionally assigns
+// a fixed lifetime on first creation. Supplying zero TTL preserves the lifetime
+// of an existing subscription.
+func (c *Client) SubscribeWithOptions(ctx context.Context, topic, name string, f *Filter, opts SubscribeOptions) error {
+	o, err := opts.toEngine()
+	if err != nil {
+		return err
+	}
+	return c.post(ctx, wire.PathSubscribe, wire.SubscribeWithOptionsRequest{
+		Topic: topic, Name: name, Filter: f, TTLMs: o.TTLMs,
+	}, &wire.Empty{})
+}
+
 // ListQueues lists queues/subscriptions.
 func (c *Client) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	var resp wire.ListQueuesResponse
@@ -647,7 +660,10 @@ func (c *Client) ListSubscriptionsWithOptions(ctx context.Context, opts ListSubs
 		NextAfter:     resp.NextAfter,
 	}
 	for i, s := range resp.Subscriptions {
-		out.Subscriptions[i] = SubscriptionPageItem{Topic: s.Topic, Name: s.Name, Expr: s.Expr, State: s.State}
+		out.Subscriptions[i] = SubscriptionPageItem{
+			Topic: s.Topic, Name: s.Name, Expr: s.Expr, State: s.State,
+			CreatedAtMs: s.CreatedAtMs, ExpiresAtMs: s.ExpiresAtMs,
+		}
 	}
 	return out, nil
 }

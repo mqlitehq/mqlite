@@ -216,22 +216,42 @@ for fan-out as soon as its last active subscription is retired, even if physical
 cleanup is pending. Its address remains reserved by a deleting mapping until that
 cleanup completes.
 
-There is no subscription TTL API in this release. Creating a subscription per
-request still requires explicit cleanup and makes request latency depend on
-metadata churn. For frequent request/reply traffic, create one stable reply
+Subscription creation may include a **fixed lifetime**. The broker saves one
+absolute `expires_at_ms` from the first successful creation. Ordinary retries,
+filter updates, message traffic and restart never extend it. Omitting TTL keeps a
+new subscription permanent and preserves an existing lifetime. Supplying the
+same positive TTL is idempotent; supplying a different positive TTL conflicts.
+To change or remove a lifetime, delete the subscription, wait for physical
+cleanup, and create a new lifetime under a new globally unique name.
+
+At the exact deadline the subscription is unavailable for fan-out and direct
+queue work, whether or not the background scanner has persisted `deleting` yet.
+Expiry is advance authorization for forced cleanup, including retained locked,
+scheduled, deferred and dead-letter messages. It cannot undo an external side
+effect that a locked delivery already caused. The mapping and name remain
+reserved until bounded cleanup finishes; a large unconsumed backlog can therefore
+continue to use disk and a subscription-capacity slot after logical expiry.
+
+Creating a subscription per request still adds metadata and cleanup work to the
+single writer. For frequent request/reply traffic, create one stable reply
 subscription per application instance and use a globally unique `correlation_id`
 for each request. A dispatcher receives from that subscription, delivers each
 reply to its waiter, and handles duplicates or replies that arrive after the
-waiter timed out.
+waiter timed out. Use TTL as a forgotten-cleanup backstop, not as the normal
+success path.
 
 If an application treats a subscription as temporary, its name is a one-use
-application identity: generate a globally unique name for that lifetime and never
-reuse it. Create the receiver before sending the request, then delete the
-subscription after the reply or timeout and reconcile a `deleting`/unknown result
-before releasing ownership. Put the address in `reply_to`, copy the request's
-`correlation_id` into the reply, and do not assume the broker implements an RPC
-waiter or rejects late replies for you. For high request rates, prefer the stable
-dispatcher pattern above.
+application identity: generate a globally unique name for that lifetime and do
+not race same-name recreation. Create the receiver before sending the request,
+then delete the subscription after the reply or timeout and reconcile a
+`deleting`/unknown result before releasing ownership. Put the address in
+`reply_to`, copy the request's `correlation_id` into the reply, and do not assume
+the broker implements an RPC waiter or rejects late replies for you. A late
+publish after expiry is no longer routed to that subscription; if the topic has
+no other active subscription, the publish finds no live target. After cleanup,
+the old name has no durable identity that distinguishes a delayed retry from
+deliberate reuse. For high request rates, prefer the stable dispatcher pattern
+above.
 
 The broker accepts at most 10,000 active plus deleting subscriptions by default.
 Deleting entries continue to count until physical cleanup completes, which puts

@@ -337,15 +337,21 @@
       topic fan-out immediately, and keeps its mapping and name for reconciliation
       until bounded cleanup completes. The implicit topic becomes unavailable for
       fan-out when its last active subscription is retired, while a deleting mapping
-      reserves its address until cleanup completes. There is no subscription TTL API
-      in this release.</p>
+      reserves its address until cleanup completes.</p>
+    <p>Subscription creation may set a fixed lifetime. The broker saves one absolute
+      deadline from the first successful creation; retries, filter updates and message
+      activity never extend it. At the exact deadline the subscription leaves fan-out
+      and its data plane, and expiry authorizes forced bounded cleanup of retained
+      messages. Its name remains reserved until physical cleanup finishes. Leave TTL
+      unset for a permanent subscription.</p>
     <p>A subscription per request still creates metadata and cleanup work. For
       frequent request/reply traffic, use one stable reply subscription per
       application instance and dispatch replies with a globally unique
       <code>correlation_id</code>. If a temporary subscription is unavoidable, use a
       globally unique one-use name, create the receiver before sending, and delete
-      it after the reply or timeout. Reconcile unknown outcomes before releasing
-      ownership; handle duplicates and late replies in the application.</p>
+      it after the reply or timeout; use TTL as forgotten-cleanup insurance.
+      Reconcile unknown outcomes before releasing ownership; handle duplicates and
+      late replies in the application.</p>
     <p>The default limit is 10,000 active plus deleting subscriptions. Deleting
       entries keep their slot until cleanup finishes. This bounds metadata; publish
       work and stored copies still grow with the matching subscription count.</p>

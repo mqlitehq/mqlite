@@ -154,6 +154,36 @@ func TestBlackboxSubscriptionDeleteAndPagedInventory(t *testing.T) {
 	}
 }
 
+func TestBlackboxSubscribeTTL(t *testing.T) {
+	ctx := context.Background()
+	url, eng := bbBroker(t, "tok")
+	env := append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN=tok")
+
+	create := exec.Command(mqliteBin, "subscribe", "requests", "temporary", "--ttl", "1h", "--expr", `subject == "request"`)
+	create.Env = env
+	if output, err := create.CombinedOutput(); err != nil {
+		t.Fatalf("TTL subscribe: %v: %s", err, output)
+	}
+	page, err := eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "requests"})
+	if err != nil || len(page.Subscriptions) != 1 {
+		t.Fatalf("inventory = %+v, %v", page, err)
+	}
+	item := page.Subscriptions[0]
+	if item.ExpiresAtMs-item.CreatedAtMs != 60*60*1000 || item.Expr != `subject == "request"` {
+		t.Fatalf("temporary subscription = %+v", item)
+	}
+
+	invalid := exec.Command(mqliteBin, "subscribe", "requests", "sub-ms", "--ttl", "1ns")
+	invalid.Env = env
+	if code, stderr := exitCode(invalid); code == 0 || !strings.Contains(stderr, "at least 1ms") {
+		t.Fatalf("sub-ms TTL: code=%d stderr=%q", code, stderr)
+	}
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "requests"})
+	if err != nil || page.Total != 1 {
+		t.Fatalf("invalid TTL had side effects: %+v, %v", page, err)
+	}
+}
+
 // P1-1: if stdout is a broken pipe, `receive` must exit non-zero AND must NOT acknowledge
 // the message — otherwise a Peek-Lock consumer silently loses data.
 func TestBlackboxReceiveBrokenPipe(t *testing.T) {

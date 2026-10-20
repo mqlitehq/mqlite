@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -158,7 +159,9 @@ func dispatch(req rpcRequest) (rpcResponse, bool) {
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`
 		}
-		if err := json.Unmarshal(req.Params, &p); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(req.Params))
+		decoder.UseNumber()
+		if err := decoder.Decode(&p); err != nil {
 			return reply(nil, &rpcError{Code: -32602, Message: "invalid params"})
 		}
 		return reply(callTool(p.Name, p.Arguments), nil)
@@ -210,14 +213,25 @@ func str(a map[string]any, k string) string {
 	}
 	return ""
 }
-func num(a map[string]any, k string) int64 {
-	switch v := a[k].(type) {
+
+func integer(value any) (int64, bool) {
+	switch n := value.(type) {
+	case json.Number:
+		value, err := strconv.ParseInt(n.String(), 10, 64)
+		return value, err == nil
 	case float64:
-		return int64(v)
+		if n >= -0x1p63 && n < 0x1p63 && math.Trunc(n) == n {
+			return int64(n), true
+		}
 	case int64:
-		return v
+		return n, true
 	}
-	return 0
+	return 0, false
+}
+
+func num(a map[string]any, k string) int64 {
+	v, _ := integer(a[k])
+	return v
 }
 func intArrProp(desc string) map[string]any {
 	return map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": desc}
@@ -229,10 +243,7 @@ func intArr(a map[string]any, k string) []int64 {
 	}
 	out := make([]int64, 0, len(raw))
 	for _, v := range raw {
-		switch n := v.(type) {
-		case float64:
-			out = append(out, int64(n))
-		case int64:
+		if n, ok := integer(v); ok {
 			out = append(out, n)
 		}
 	}
@@ -253,14 +264,8 @@ func validInteger(args map[string]any, name string) bool {
 	if !present {
 		return true
 	}
-	switch n := value.(type) {
-	case float64:
-		return n >= -0x1p63 && n < 0x1p63 && math.Trunc(n) == n
-	case int64:
-		return true
-	default:
-		return false
-	}
+	_, ok := integer(value)
+	return ok
 }
 
 // strArr rejects mixed-type arrays instead of silently discarding an invalid
@@ -300,15 +305,16 @@ var tools = []tool{
 		},
 	},
 	{
-		name: "subscribe", desc: "Create or update a named subscription under a topic.",
+		name: "subscribe", desc: "Create or update a named subscription; ttl_ms is a fixed lifetime from first creation and is never renewed.",
 		schema: keyObj(map[string]any{
-			"topic": strProp("topic name"),
-			"name":  strProp("subscription name"),
-			"expr":  strProp("optional expr-lang filter; omitted or empty matches all messages"),
+			"topic":  strProp("topic name"),
+			"name":   strProp("subscription name"),
+			"expr":   strProp("optional expr-lang filter; omitted or empty matches all messages"),
+			"ttl_ms": map[string]any{"type": "integer", "minimum": 1, "description": "optional fixed lifetime in milliseconds from first creation"},
 		}, "topic", "name"),
 		forward: func(a map[string]any) (string, any) {
-			return wire.PathSubscribe, wire.SubscribeRequest{
-				Topic: str(a, "topic"), Name: str(a, "name"), Filter: subscriptionFilter(a),
+			return wire.PathSubscribe, wire.SubscribeWithOptionsRequest{
+				Topic: str(a, "topic"), Name: str(a, "name"), Filter: subscriptionFilter(a), TTLMs: num(a, "ttl_ms"),
 			}
 		},
 	},
@@ -639,7 +645,16 @@ func validateStrictToolArgs(t tool, args map[string]any) error {
 		if err := requireString("name"); err != nil {
 			return err
 		}
-		return optionalString("expr")
+		if err := optionalString("expr"); err != nil {
+			return err
+		}
+		if !validInteger(args, "ttl_ms") {
+			return fmt.Errorf("subscribe ttl_ms must be an integer")
+		}
+		if _, present := args["ttl_ms"]; present && num(args, "ttl_ms") <= 0 {
+			return fmt.Errorf("subscribe ttl_ms must be positive")
+		}
+		return nil
 	case "delete_subscription":
 		if err := requireString("topic"); err != nil {
 			return err

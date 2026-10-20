@@ -89,6 +89,10 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("bad filter expr", http.MethodPost, wire.PathSubscribe, "secret", sub("bad", "subject =="), http.StatusBadRequest, "invalid_argument")
 	check("unknown filter field", http.MethodPost, wire.PathSubscribe, "secret", sub("bad2", `nope == "x"`), http.StatusBadRequest, "invalid_argument")
 	check("valid filter", http.MethodPost, wire.PathSubscribe, "secret", sub("ok", `subject_parts[0] == "a"`), http.StatusOK, "")
+	check("removed subscription generation", http.MethodPost, wire.PathSubscribe, "secret",
+		[]byte(`{"topic":"ev","name":"generation","generation":"retired"}`), http.StatusBadRequest, "invalid_argument")
+	check("invalid subscription TTL type", http.MethodPost, wire.PathSubscribe, "secret",
+		[]byte(`{"topic":"ev","name":"ttl","ttl_ms":"1000"}`), http.StatusBadRequest, "invalid_argument")
 
 	// Strict request validation (MQLITE-86): an unknown field or data after the JSON
 	// body is a typed 400, not a silently-dropped typo; empty name / unknown enum map

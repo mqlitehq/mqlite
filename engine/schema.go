@@ -5,7 +5,7 @@ package engine
 // whose recorded version differs is refused with ErrSchemaVersionMismatch (see db.go)
 // rather than running today's DDL against a layout it doesn't match. Change the token
 // whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
-const schemaVersion = "6"
+const schemaVersion = "7"
 
 // MQLITE-121 introduced this independently additive table. It remains part of
 // the canonical schema and can be restored when absent without changing queues.
@@ -45,10 +45,16 @@ var schemaStmts = []string{
 	    dlq_max_bytes         INTEGER NOT NULL DEFAULT 0,
 	    lifecycle_state       TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle_state IN ('active','deleting')),
 	    delete_started_at     INTEGER NOT NULL DEFAULT 0,
+	    -- Subscription lifetime is fixed when the mapping is first created. Plain
+	    -- queues never expire; zero keeps a subscription permanent.
+	    expires_at            INTEGER NOT NULL DEFAULT 0 CHECK (
+	                              expires_at=0 OR (kind='subscription' AND expires_at>created_at)),
 	    created_at            INTEGER NOT NULL,
 	    updated_at            INTEGER NOT NULL
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_queue_deleting ON queues(delete_started_at, name) WHERE lifecycle_state='deleting'`,
+	`CREATE INDEX IF NOT EXISTS idx_subscription_expiry ON queues(expires_at, name)
+	  WHERE kind='subscription' AND lifecycle_state='active' AND expires_at>0`,
 
 	// topic -> subscription fan-out roster.
 	`CREATE TABLE IF NOT EXISTS subscriptions (

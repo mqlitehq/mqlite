@@ -70,6 +70,13 @@ type LatencyBucket struct {
 // MaxObserveResponseBytes bounds the complete inventory before client allocation.
 const MaxObserveResponseBytes = 32 << 20
 
+// maintenanceTaskBaselineV032 is the maintenance domain guaranteed by the
+// released v0.3.2 observation contract. New broker tasks are additive: clients
+// must accept them, but must not require them from an older compatible broker.
+var maintenanceTaskBaselineV032 = [...]string{
+	"locks", "scheduled", "ttl", "dedup", "receipts", "retention", "reclaim",
+}
+
 // ReadObserveResponse bounds full-response validation before allocating an inventory.
 func ReadObserveResponse(reader io.Reader) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(reader, MaxObserveResponseBytes+1))
@@ -166,7 +173,7 @@ func DecodeObserveResponse(data []byte) (ObserveResponse, error) {
 		}
 		tasks = append(tasks, m.Task)
 	}
-	valid = valid && completeDomain(tasks, engine.MaintenanceTaskNames())
+	valid = valid && completeDomain(tasks, maintenanceTaskBaselineV032[:])
 	stages := make([]string, 0, len(out.Filters))
 	for _, f := range out.Filters {
 		stages = append(stages, f.Stage)

@@ -4,6 +4,7 @@
 Drives a running mqlite broker over HTTP to exercise multi-step queue behaviour:
 lifecycle, visibility timeout, abandon/redelivery, dead-letter + redrive, defer,
 schedule, dedup window, session ordering, receive-and-delete and fencing.
+Subscription coverage includes fixed TTL, logical expiry and automatic cleanup.
 
 Env: ENDPOINT, TOKEN, RUNID (set by run.sh).
 """
@@ -65,10 +66,12 @@ def create_queue(name, cfg=None):
     return call("/mqlite.v1.AdminService/CreateQueue", {"name": name, "config": cfg or {}})
 
 
-def create_sub(topic, name, flt=None):
+def create_sub(topic, name, flt=None, ttl_ms=None):
     body = {"topic": topic, "name": name}
     if flt:
         body["filter"] = flt
+    if ttl_ms is not None:
+        body["ttl_ms"] = ttl_ms
     return call("/mqlite.v1.AdminService/Subscribe", body)
 
 
@@ -503,13 +506,86 @@ def t_queue_deletion():
           "read-only reconciliation observes background cleanup completion")
 
 
+def t_subscription_ttl():
+    section("subscription TTL: fixed deadline, logical fencing and automatic cleanup")
+    admin = "/mqlite.v1.AdminService/"
+    queue = "/mqlite.v1.QueueService/"
+    topic = f"{RUNID}_py_ttl_topic"
+    name = f"{RUNID}_py_ttl_sub"
+    ttl_ms = 5000
+
+    status, _ = create_sub(topic, name, {"expr": 'subject == "request"'}, ttl_ms)
+    check(status == 200, "temporary subscription created")
+    status, page = call(admin + "ListSubscriptionsPage",
+                        {"topic": topic, "include_deleting": True})
+    items = [item for item in page.get("subscriptions", []) if item["name"] == name]
+    check(status == 200 and len(items) == 1 and
+          items[0]["expires_at_ms"] - items[0]["created_at_ms"] == ttl_ms,
+          "inventory exposes the fixed absolute deadline")
+    original = items[0]
+
+    status, _ = create_sub(topic, name, {"expr": 'subject == "updated"'})
+    check(status == 200, "filter update without TTL preserves the lifetime")
+    status, _ = create_sub(topic, name, {"expr": 'subject == "updated"'}, ttl_ms)
+    check(status == 200, "same positive TTL is an idempotent retry")
+    status, conflict = create_sub(topic, name, {"expr": 'subject == "wrong"'}, ttl_ms + 1000)
+    check(status == 409 and conflict.get("code") == "name_conflict",
+          "different positive TTL is a name conflict")
+    status, page = call(admin + "ListSubscriptionsPage",
+                        {"topic": topic, "include_deleting": True})
+    current = next(item for item in page["subscriptions"] if item["name"] == name)
+    check(current["created_at_ms"] == original["created_at_ms"] and
+          current["expires_at_ms"] == original["expires_at_ms"] and
+          current.get("expr") == 'subject == "updated"',
+          "retries and rejected changes do not move the deadline or overwrite the filter")
+    status, invalid = create_sub(topic, name + "_invalid", ttl_ms=-1)
+    check(status == 400 and invalid.get("code") == "invalid_argument",
+          "negative TTL is rejected")
+
+    status, sent = send(topic, "reply", subject="updated")
+    check(status == 200 and sent["seq_numbers"][0] > 0, "topic publish fans out before expiry")
+    status, received = receive(name, mode=1)
+    check(status == 200 and len(received["messages"]) == 1, "temporary subscription delivers before expiry")
+
+    delay = max(0, (original["expires_at_ms"] - now_ms()) / 1000 + 0.05)
+    time.sleep(delay)
+    status, expired = call(queue + "Stats", {"queue": name})
+    check(status == 404 and expired.get("code") == "not_found",
+          "subscription is fenced at its exact deadline before cleanup")
+    status, active = call(admin + "ListSubscriptions", {})
+    check(status == 200 and all(item["name"] != name for item in active.get("subscriptions", [])),
+          "legacy active inventory hides expired subscriptions")
+    status, page = call(admin + "ListSubscriptionsPage",
+                        {"topic": topic, "include_deleting": True})
+    retained = [item for item in page.get("subscriptions", []) if item["name"] == name]
+    check(status == 200 and (not retained or
+          (retained[0]["state"] == "deleting" and
+           retained[0]["created_at_ms"] == original["created_at_ms"] and
+           retained[0]["expires_at_ms"] == original["expires_at_ms"])),
+          "lifecycle inventory shows deleting or completed cleanup")
+
+    # The owner serializes same-name reuse and waits until the TTL-authorized
+    # cleanup releases the name.
+    replacement = (0, {})
+    for _ in range(20):
+        replacement = create_sub(topic, name)
+        if replacement[0] == 200:
+            break
+        time.sleep(0.25)
+    check(replacement[0] == 200, "same name can be recreated after automatic cleanup")
+    status, page = call(admin + "ListSubscriptionsPage", {"topic": topic})
+    recreated = [item for item in page.get("subscriptions", []) if item["name"] == name]
+    check(status == 200 and len(recreated) == 1 and recreated[0]["expires_at_ms"] == 0,
+          "recreated subscription is permanent when TTL is omitted")
+
+
 def main():
     print(f"Python behavioural suite — endpoint={ENDPOINT} runid={RUNID}")
     for fn in (t_lifecycle, t_batch, t_visibility_timeout, t_dlq_redrive,
                t_explicit_deadletter, t_defer, t_schedule, t_dedup, t_sessions,
                t_receive_and_delete, t_fencing,
                t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled, t_access_keys,
-               t_queue_deletion):
+               t_queue_deletion, t_subscription_ttl):
         try:
             fn()
         except Exception as e:  # noqa

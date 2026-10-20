@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"math"
 	"time"
 )
 
@@ -127,7 +128,7 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 	if wait > 20000 {
 		wait = 20000
 	}
-	deadline := e.now() + wait
+	deadline := boundedDeadlineMs(e.now(), wait, 0)
 
 	for {
 		q, err := e.loadQueue(ctx, queue)
@@ -146,9 +147,19 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 			release()
 			return msgs, err
 		}
-		remaining := deadline - e.now()
+		now := e.now()
+		remaining := deadline - now
+		// A subscription's fixed lifetime is also the latest instant a
+		// long-poll may remain parked. Expiry is a pre-authorized forced
+		// deletion, so do not wait for the background transition to wake us.
+		if q.expiresAtMs > 0 && q.expiresAtMs-now < remaining {
+			remaining = q.expiresAtMs - now
+		}
 		if remaining <= 0 {
 			release()
+			if q.expiresAtMs > 0 && q.expiresAtMs <= now {
+				return nil, ErrQueueNotFound
+			}
 			return nil, nil
 		}
 		timer := time.NewTimer(time.Duration(remaining) * time.Millisecond)
@@ -214,6 +225,9 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 				return err
 			}
 			now := e.now()
+			if err := queueLiveAt(q, now); err != nil {
+				return err
+			}
 			err = tx.QueryRowContext(ctx, `
 			UPDATE messages
 			   SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
@@ -221,7 +235,7 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 			   AND (expires_at=0 OR expires_at>?)
 			RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
 			          reply_to, subject, content_type, properties, enqueued_at, locked_until`,
-				now+q.lockDurationMs, token, seq, queue, now).Scan(
+				queueLockUntil(q, now), token, seq, queue, now).Scan(
 				&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
 				&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs)
 			if err == nil {
@@ -249,4 +263,30 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 		out = append(out, &m)
 	}
 	return out, nil
+}
+
+// queueLockUntil caps every subscription lease at its absolute lifetime. A
+// caller may finish work before then, but no lock or renewal can claim that the
+// subscription remains usable after its pre-authorized deletion instant.
+func queueLockUntil(q queueRow, now int64) int64 {
+	return boundedDeadlineMs(now, q.lockDurationMs, q.expiresAtMs)
+}
+
+// boundedDeadlineMs adds a relative millisecond duration without wrapping and
+// then applies an optional absolute lifetime. Callers validate their durations;
+// handling both signs here keeps the arithmetic safe for persisted values too.
+func boundedDeadlineMs(now, durationMs, expiresAtMs int64) int64 {
+	var deadline int64
+	switch {
+	case durationMs > 0 && now > math.MaxInt64-durationMs:
+		deadline = math.MaxInt64
+	case durationMs < 0 && now < math.MinInt64-durationMs:
+		deadline = math.MinInt64
+	default:
+		deadline = now + durationMs
+	}
+	if expiresAtMs > 0 && expiresAtMs < deadline {
+		return expiresAtMs
+	}
+	return deadline
 }

@@ -94,12 +94,14 @@ See [operations](../../../docs/operations.md) for the operator procedure.
 
 ## v0.3.0 schema-boundary recovery
 
-Queue lifecycle storage changes the schema token from 5 to 6. There is no in-place
-migration: opening a schema-5 database with this candidate must fail without
-changing its schema or data. Keep the matching v0.3.0 binary and a backup available
-until the new deployment has been validated. Verify both sides of this boundary
-with the real v0.3.0 binary and its clean source checkout (used only to build the
-full old message-state fixture):
+Durable queue lifecycle and fixed subscription expiration change the schema token
+from 5 to 7. There is no in-place migration: opening a schema-5 database with this
+candidate must fail without changing its schema or data. Schema 6, used by the
+intermediate lifecycle implementation, is rejected by the engine compatibility
+tests as well. Keep the matching v0.3.0 binary and a backup available until the new
+deployment has been validated. Verify both sides of the released boundary with the
+real v0.3.0 binary and its clean source checkout (used only to build the full old
+message-state fixture):
 
 ```sh
 python3 test/production/restore/compat.py \
@@ -111,10 +113,10 @@ python3 test/production/restore/compat.py \
 
 The script creates a complete schema-5 fixture, lets the released binary perform
 its normal orphan recovery, and takes an exact logical snapshot. The candidate
-must reject that database as schema 5 while expecting schema 6, leaving the
+must reject that database as schema 5 while expecting schema 7, leaving the
 snapshot byte-for-byte equivalent at the logical level. The released binary must
 then reopen the same database and complete a verified send/peek round trip. In the
-reverse direction, the candidate creates a fresh schema-6 database and the
+reverse direction, the candidate creates a fresh schema-7 database and the
 released binary must reject it while leaving its complete snapshot unchanged.
 Evidence contains all six snapshots and hashes for both binaries and the fixture
 worker.

@@ -209,6 +209,48 @@ func TestCommandsEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSubscribeTTLCommand(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err := cmdCreateSubscription(ctx, []string{"events", "temporary", "--ttl", "1h", "--expr", `subject == "request"`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdCreateSubscription(ctx, []string{"events", "negative", "--ttl", "-1s"}); err == nil {
+		t.Fatal("negative subscription TTL accepted")
+	}
+	if err := cmdCreateSubscription(ctx, []string{"events", "sub-ms", "--ttl", "1ns"}); err == nil {
+		t.Fatal("sub-millisecond subscription TTL accepted")
+	}
+	if err := cmdCreateSubscription(ctx, []string{"events", "durable"}); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	page, err := c.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{Topic: "events"})
+	if err != nil || page.Total != 2 || len(page.Subscriptions) != 2 {
+		t.Fatalf("inventory = %+v, %v", page, err)
+	}
+	for _, item := range page.Subscriptions {
+		switch item.Name {
+		case "temporary":
+			if item.ExpiresAtMs-item.CreatedAtMs != time.Hour.Milliseconds() || item.Expr != `subject == "request"` {
+				t.Fatalf("temporary = %+v", item)
+			}
+		case "durable":
+			if item.ExpiresAtMs != 0 {
+				t.Fatalf("durable = %+v", item)
+			}
+		default:
+			t.Fatalf("unexpected subscription = %+v", item)
+		}
+	}
+}
+
 func deadLetterOne(t *testing.T, ctx context.Context, queue string) {
 	t.Helper()
 	c, err := dial(ctx)

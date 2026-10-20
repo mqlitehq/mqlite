@@ -169,7 +169,7 @@ usage: mqlite <command> [flags]
  admin
   create-queue <name>       create/update a queue
   delete-queue <name>       delete an empty queue (--force discards retained data)
-  subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate')
+  subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate' --ttl 5m)
   delete-subscription <topic> <name>  delete an empty subscription (--force discards retained data)
   list                      list queues
   list-subscriptions        list subscriptions; pagination flags return a page object
@@ -215,6 +215,7 @@ type api interface {
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
 	DeleteQueueWithOptions(ctx context.Context, name string, opts ...mqlite.DeleteQueueOpts) (mqlite.DeleteResult, error)
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
+	SubscribeWithOptions(ctx context.Context, topic, name string, f *mqlite.Filter, opts mqlite.SubscribeOptions) error
 	DeleteSubscriptionWithOptions(ctx context.Context, topic, name string, opts ...mqlite.DeleteSubscriptionOpts) (mqlite.DeleteResult, error)
 	ListQueues(ctx context.Context) ([]mqlite.QueueInfo, error)
 	ListSubscriptions(ctx context.Context) ([]mqlite.SubscriptionInfo, error)
@@ -754,12 +755,13 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 func cmdCreateSubscription(ctx context.Context, args []string) error {
 	fs := newFlags("subscribe")
 	exprStr := fs.String("expr", "", `filter expression (expr-lang), e.g. 'subject_parts[0]=="orders"'; empty = match all`)
+	ttl := fs.Duration("ttl", 0, "fixed lifetime from first creation (for example 5m); zero creates permanent or preserves existing")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 2 { // exact arity
-		return fmt.Errorf("usage: subscribe <topic> <subscription> [--expr 'predicate']")
+		return fmt.Errorf("usage: subscribe <topic> <subscription> [--expr 'predicate' --ttl 5m]")
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -770,7 +772,7 @@ func cmdCreateSubscription(ctx context.Context, args []string) error {
 	if *exprStr != "" {
 		f = &mqlite.Filter{Expr: *exprStr}
 	}
-	if err := c.Subscribe(ctx, pos[0], pos[1], f); err != nil {
+	if err := c.SubscribeWithOptions(ctx, pos[0], pos[1], f, mqlite.SubscribeOptions{TTL: *ttl}); err != nil {
 		return err
 	}
 	return okResult(map[string]any{"action": "subscribe", "subscription": pos[1], "topic": pos[0]}, "action", "subscription", "topic")

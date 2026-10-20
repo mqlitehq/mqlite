@@ -70,11 +70,18 @@ func BenchmarkSendBatch64(b *testing.B) {
 // Queue configuration is carried by the roster JOIN; an accidental per-subscription
 // metadata lookup makes this path visibly regress as fanout grows, especially on a
 // remote store where every lookup is a round trip.
-func benchmarkTopicFanout(b *testing.B, subscriptions int) {
+func benchmarkTopicFanout(b *testing.B, subscriptions int, subscriptionTTLMs int64) {
 	ctx := context.Background()
 	e := benchEngine(b)
 	for i := 0; i < subscriptions; i++ {
-		if err := e.Subscribe(ctx, "topic", fmt.Sprintf("sub-%02d", i), nil); err != nil {
+		name := fmt.Sprintf("sub-%02d", i)
+		var err error
+		if subscriptionTTLMs > 0 {
+			err = e.SubscribeWithOptions(ctx, "topic", name, nil, SubscribeOptions{TTLMs: subscriptionTTLMs})
+		} else {
+			err = e.Subscribe(ctx, "topic", name, nil)
+		}
+		if err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -91,9 +98,13 @@ func benchmarkTopicFanout(b *testing.B, subscriptions int) {
 	b.ReportMetric(float64(b.N*subscriptions)/b.Elapsed().Seconds(), "delivery/s")
 }
 
-func BenchmarkTopicFanout1(b *testing.B)   { benchmarkTopicFanout(b, 1) }
-func BenchmarkTopicFanout32(b *testing.B)  { benchmarkTopicFanout(b, 32) }
-func BenchmarkTopicFanout256(b *testing.B) { benchmarkTopicFanout(b, 256) }
+func BenchmarkTopicFanout1(b *testing.B)   { benchmarkTopicFanout(b, 1, 0) }
+func BenchmarkTopicFanout32(b *testing.B)  { benchmarkTopicFanout(b, 32, 0) }
+func BenchmarkTopicFanout256(b *testing.B) { benchmarkTopicFanout(b, 256, 0) }
+
+// BenchmarkTopicFanoutTTL32 isolates the per-effect expiry fence for fixed-life
+// subscriptions. Its one-hour deadlines remain live for the whole benchmark.
+func BenchmarkTopicFanoutTTL32(b *testing.B) { benchmarkTopicFanout(b, 32, 3_600_000) }
 
 // BenchmarkSubscriptionCreateDelete measures serialized, one-use subscription
 // churn with low and high retained metadata cardinality. Seed setup is untimed.
@@ -185,6 +196,85 @@ func BenchmarkListSubscriptionsPage(b *testing.B) {
 			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "page/s")
 		})
 	}
+}
+
+// BenchmarkSubscriptionExpiryNoDue measures the once-per-second discovery pass
+// at the default metadata ceiling when every fixed lifetime is still in the
+// future. This is the steady-state cost paid by a broker that uses temporary
+// subscriptions but has no expiry work to perform.
+func BenchmarkSubscriptionExpiryNoDue(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	now := e.now()
+	const inventory = 10_000
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,expires_at,created_at,updated_at)
+	  SELECT printf('ttl-%05d',i),'subscription','active',?,?,? FROM n`,
+		inventory-1, now+3_600_000, now, now); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'temporary',name,created_at FROM queues WHERE kind='subscription'`); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		changed, pending, err := e.transitionExpiredSubscriptionsPass(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if changed != 0 || pending {
+			b.Fatalf("no-due pass changed=%d pending=%t", changed, pending)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "pass/s")
+}
+
+// BenchmarkSubscriptionExpiryBatch1000 measures one full indexed transition
+// transaction. Reactivating the fixed roster is untimed; physical cleanup is
+// covered by the lifecycle benchmarks because expired subscriptions enter that
+// same deletion path after this transition.
+func BenchmarkSubscriptionExpiryBatch1000(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	now := e.now()
+	const inventory = subscriptionExpiryBatch
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,expires_at,created_at,updated_at)
+	  SELECT printf('due-%04d',i),'subscription','active',?,?,? FROM n`,
+		inventory-1, now, now-1, now-1); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'temporary',name,created_at FROM queues WHERE kind='subscription'`); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		if _, err := e.db.exec(ctx, `UPDATE queues
+			SET lifecycle_state='active',delete_started_at=0,updated_at=?
+			WHERE kind='subscription'`, now-1); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		changed, pending, err := e.transitionExpiredSubscriptionsPass(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if changed != inventory || !pending {
+			b.Fatalf("full due pass changed=%d pending=%t", changed, pending)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N*inventory)/b.Elapsed().Seconds(), "subscription/s")
 }
 
 func BenchmarkReceiveComplete(b *testing.B) {

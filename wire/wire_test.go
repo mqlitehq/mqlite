@@ -21,6 +21,15 @@ var _ struct {
 	Expr  string `json:"expr,omitempty"`
 } = wire.SubscriptionJSON{}
 
+// SubscribeRequest is also a released public wire type. TTL creation uses a
+// separate request type on the same route so its exact three-field shape stays
+// source compatible, including for external unkeyed literals.
+var _ struct {
+	Topic  string         `json:"topic"`
+	Name   string         `json:"name"`
+	Filter *engine.Filter `json:"filter,omitempty"`
+} = wire.SubscribeRequest{}
+
 // The JSON field names ARE the contract between the broker and every client
 // (curl, the Go SDK, future SDKs). Pin them so a struct-tag edit can't silently
 // break the wire format (MQLITE-26).
@@ -101,6 +110,44 @@ func TestDeleteQueueJSONContract(t *testing.T) {
 }
 
 func TestSubscriptionLifecycleJSONContract(t *testing.T) {
+	legacySubscribe, err := json.Marshal(wire.SubscribeRequest{Topic: "events", Name: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(legacySubscribe) != `{"topic":"events","name":"worker"}` {
+		t.Fatalf("legacy subscribe request = %s", legacySubscribe)
+	}
+	temporarySubscribe, err := json.Marshal(wire.SubscribeWithOptionsRequest{
+		Topic: "events", Name: "temporary", TTLMs: 60_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(temporarySubscribe) != `{"topic":"events","name":"temporary","ttl_ms":60000}` {
+		t.Fatalf("temporary subscribe request = %s", temporarySubscribe)
+	}
+	for _, body := range []string{
+		`{"topic":"events","name":"durable"}`,
+		`{"topic":"events","name":"durable","ttl_ms":0}`,
+		`{"topic":"events","name":"temporary","ttl_ms":1}`,
+	} {
+		var decoded wire.SubscribeWithOptionsRequest
+		if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+			t.Fatalf("valid subscribe request %s: %v", body, err)
+		}
+	}
+	for _, body := range []string{
+		`{"topic":"events","name":"temporary","ttl_ms":null}`,
+		`{"topic":"events","name":"temporary","ttl_ms":-1}`,
+		`{"topic":"events","name":"temporary","ttl_ms":1.5}`,
+		`{"topic":"events","name":"temporary","ttl_ms":"1"}`,
+		`{"topic":"events","name":"temporary","generation":"removed"}`,
+	} {
+		var decoded wire.SubscribeWithOptionsRequest
+		if err := json.Unmarshal([]byte(body), &decoded); err == nil {
+			t.Fatalf("invalid subscribe request accepted: %s", body)
+		}
+	}
 	request, err := json.Marshal(wire.DeleteSubscriptionRequest{Topic: "events", Name: "worker", Force: true})
 	if err != nil {
 		t.Fatal(err)
@@ -118,13 +165,15 @@ func TestSubscriptionLifecycleJSONContract(t *testing.T) {
 		t.Fatalf("page request = %s", pageRequest)
 	}
 	pageResponse, err := json.Marshal(wire.ListSubscriptionsPageResponse{
-		Subscriptions: []wire.SubscriptionPageJSON{{Topic: "events", Name: "worker", State: "deleting"}},
-		Total:         1, NextAfter: "next",
+		Subscriptions: []wire.SubscriptionPageJSON{{
+			Topic: "events", Name: "worker", State: "deleting", CreatedAtMs: 100, ExpiresAtMs: 200,
+		}},
+		Total: 1, NextAfter: "next",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(pageResponse) != `{"subscriptions":[{"topic":"events","name":"worker","state":"deleting"}],"total":1,"next_after":"next"}` {
+	if string(pageResponse) != `{"subscriptions":[{"topic":"events","name":"worker","state":"deleting","created_at_ms":100,"expires_at_ms":200}],"total":1,"next_after":"next"}` {
 		t.Fatalf("page response = %s", pageResponse)
 	}
 	legacyResponse, err := json.Marshal(wire.ListSubscriptionsResponse{
@@ -622,11 +671,25 @@ func TestObserveResponseRequiresCompleteCounterMatrices(t *testing.T) {
 		v.Collection.State, v.Collection.ErrorCode, v.Queues = "unavailable", "closed", nil
 		check(v, false)
 	}
+	requiredMaintenance := map[string]bool{
+		"locks": true, "scheduled": true, "ttl": true, "dedup": true,
+		"receipts": true, "retention": true, "reclaim": true,
+	}
 	for i := range base.Maintenance {
 		v := base
 		v.Maintenance = append(append([]engine.MaintenanceObservation{}, base.Maintenance[:i]...), base.Maintenance[i+1:]...)
-		check(v, false)
+		check(v, !requiredMaintenance[base.Maintenance[i].Task])
 	}
+	// A current SDK must continue to accept the complete v0.3.2 task domain.
+	// subscription_expiry and lifecycle are additive tasks emitted by newer brokers.
+	v := base
+	v.Maintenance = nil
+	for _, task := range base.Maintenance {
+		if requiredMaintenance[task.Task] {
+			v.Maintenance = append(v.Maintenance, task)
+		}
+	}
+	check(v, true)
 	for i := range base.Filters {
 		v := base
 		v.Filters = append(append([]engine.FilterCounter{}, base.Filters[:i]...), base.Filters[i+1:]...)
@@ -637,7 +700,7 @@ func TestObserveResponseRequiresCompleteCounterMatrices(t *testing.T) {
 		v.HTTP.Authentication = append(append([]wire.AuthenticationObservation{}, base.HTTP.Authentication[:i]...), base.HTTP.Authentication[i+1:]...)
 		check(v, false)
 	}
-	v := base
+	v = base
 	v.Messages = []engine.MessageCounter{}
 	check(v, false) // Existing inventory cannot silently lose all event counters.
 	v.Queues = []engine.QueueObservation{}

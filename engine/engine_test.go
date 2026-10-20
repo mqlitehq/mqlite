@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -433,5 +435,735 @@ func TestReceiveAndDelete(t *testing.T) {
 	mt, _ := e.Stats(ctx, "q")
 	if mt.Total != 0 {
 		t.Fatalf("message should be gone, got %+v", mt)
+	}
+}
+
+// ─── fixed subscription lifetime: data-plane fencing ────────────────────────
+
+func mustDataPlaneSubscriptionTTL(t *testing.T, e *Engine, topic, name string, ttlMs int64) int64 {
+	t.Helper()
+	if err := e.SubscribeWithOptions(context.Background(), topic, name, nil, SubscribeOptions{TTLMs: ttlMs}); err != nil {
+		t.Fatalf("subscribe %s: %v", name, err)
+	}
+	var expires int64
+	if err := e.db.queryRowScan(context.Background(), []any{&expires},
+		`SELECT expires_at FROM queues WHERE name=?`, name); err != nil {
+		t.Fatalf("read %s expiration: %v", name, err)
+	}
+	return expires
+}
+
+// Expiry is a logical forced deletion at the exact stored millisecond. This
+// matrix deliberately does not run maintenance: every path must fence itself,
+// rather than relying on the background transition to deleting.
+func TestSubscriptionExpiryFencesDataPlaneAtBoundary(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	expires := mustDataPlaneSubscriptionTTL(t, e, "events", "ephemeral", 1_000)
+
+	seqs, err := e.Send(ctx, "ephemeral",
+		OutMessage{Body: []byte("defer")},
+		OutMessage{Body: []byte("reject")},
+		OutMessage{Body: []byte("complete-before-expiry")},
+		OutMessage{Body: []byte("complete")},
+		OutMessage{Body: []byte("abandon")},
+		OutMessage{Body: []byte("reject-at-expiry")},
+		OutMessage{Body: []byte("defer-at-expiry")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := e.Receive(ctx, "ephemeral", ReceiveOptions{MaxMessages: len(seqs), AttemptID: "request-1"})
+	if err != nil || len(locked) != len(seqs) {
+		t.Fatalf("claim=%d, %v", len(locked), err)
+	}
+	for _, m := range locked {
+		if m.LockedUntilMs != expires {
+			t.Fatalf("lease %d ends at %d, want subscription expiry %d", m.SeqNumber, m.LockedUntilMs, expires)
+		}
+	}
+	var attemptExpires int64
+	if err := e.db.queryRowScan(ctx, []any{&attemptExpires},
+		`SELECT expires_at FROM receive_attempts WHERE queue=? AND attempt_id=?`, "ephemeral", "request-1"); err != nil {
+		t.Fatal(err)
+	}
+	if attemptExpires != expires {
+		t.Fatalf("receive-attempt expires=%d, want subscription expiry %d", attemptExpires, expires)
+	}
+	if err := e.Defer(ctx, "ephemeral", locked[0].SeqNumber, locked[0].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reject(ctx, "ephemeral", locked[1].SeqNumber, locked[1].LockToken, "fixture", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Complete(ctx, "ephemeral", locked[2].SeqNumber, locked[2].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := e.Schedule(ctx, "ephemeral", OutMessage{Body: []byte("scheduled")}, expires+10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	atomic.StoreInt64(clock, expires) // equality is expired
+
+	for name, call := range map[string]func() error{
+		"send": func() error {
+			_, err := e.SendOne(ctx, "ephemeral", OutMessage{Body: []byte("late")})
+			return err
+		},
+		"schedule": func() error {
+			_, err := e.Schedule(ctx, "ephemeral", OutMessage{Body: []byte("late")}, expires+10_000)
+			return err
+		},
+		"publish": func() error {
+			_, err := e.SendOne(ctx, "events", OutMessage{Body: []byte("late")})
+			return err
+		},
+		"schedule publish": func() error {
+			_, err := e.Schedule(ctx, "events", OutMessage{Body: []byte("late")}, expires+10_000)
+			return err
+		},
+		"receive": func() error {
+			_, err := e.Receive(ctx, "ephemeral", ReceiveOptions{})
+			return err
+		},
+		"receive attempt replay": func() error {
+			_, err := e.Receive(ctx, "ephemeral", ReceiveOptions{AttemptID: "request-1"})
+			return err
+		},
+		"receive deferred": func() error {
+			_, err := e.ReceiveDeferred(ctx, "ephemeral", locked[0].SeqNumber)
+			return err
+		},
+		"peek": func() error {
+			_, err := e.Peek(ctx, "ephemeral", PeekOptions{})
+			return err
+		},
+		"stats": func() error {
+			_, err := e.Stats(ctx, "ephemeral")
+			return err
+		},
+		"cancel":  func() error { return e.Cancel(ctx, "ephemeral", scheduled) },
+		"redrive": func() error { _, err := e.Redrive(ctx, "ephemeral", RedriveOptions{}); return err },
+		"purge":   func() error { _, err := e.Purge(ctx, "ephemeral", RedriveOptions{}); return err },
+		"renew":   func() error { return e.Renew(ctx, "ephemeral", locked[3].SeqNumber, locked[3].LockToken) },
+		"renew batch": func() error {
+			_, err := e.RenewBatch(ctx, "ephemeral", []SettleItem{{SeqNumber: locked[3].SeqNumber, LockToken: locked[3].LockToken}})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, ErrQueueNotFound) {
+				t.Fatalf("at expiry got %v, want ErrQueueNotFound", err)
+			}
+		})
+	}
+
+	settles := []struct {
+		name string
+		idx  int
+		call func(*Message) error
+	}{
+		{"complete", 3, func(m *Message) error { return e.Complete(ctx, "ephemeral", m.SeqNumber, m.LockToken) }},
+		{"abandon", 4, func(m *Message) error { return e.Abandon(ctx, "ephemeral", m.SeqNumber, m.LockToken, 0) }},
+		{"reject", 5, func(m *Message) error { return e.Reject(ctx, "ephemeral", m.SeqNumber, m.LockToken, "late", "") }},
+		{"defer", 6, func(m *Message) error { return e.Defer(ctx, "ephemeral", m.SeqNumber, m.LockToken) }},
+	}
+	for _, tc := range settles {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(locked[tc.idx]); !errors.Is(err, ErrLockLost) {
+				t.Fatalf("at expiry got %v, want ErrLockLost", err)
+			}
+			var state string
+			if err := e.db.queryRowScan(ctx, []any{&state}, `SELECT state FROM messages WHERE id=?`, locked[tc.idx].SeqNumber); err != nil {
+				t.Fatal(err)
+			}
+			if state != string(StateLocked) {
+				t.Fatalf("expired settle changed state to %q", state)
+			}
+		})
+	}
+
+	// A receipt created while the subscription was live cannot authorize a replay
+	// after its lifetime ends.
+	if err := e.Complete(ctx, "ephemeral", locked[2].SeqNumber, locked[2].LockToken); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("expired receipt replay=%v, want ErrLockLost", err)
+	}
+	batch, err := e.CompleteBatch(ctx, "ephemeral", []SettleItem{
+		{SeqNumber: locked[2].SeqNumber, LockToken: locked[2].LockToken},
+		{SeqNumber: locked[3].SeqNumber, LockToken: locked[3].LockToken},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 2 || batch[0].Ok || batch[1].Ok {
+		t.Fatalf("expired CompleteBatch vouched for a mutation or receipt: %+v", batch)
+	}
+}
+
+func TestSubscriptionDeadlinesSaturateNearMaxInt64(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	created := int64(math.MaxInt64 - 5)
+	atomic.StoreInt64(clock, created)
+	expires := mustDataPlaneSubscriptionTTL(t, e, "events", "ephemeral", 5)
+	if expires != math.MaxInt64 {
+		t.Fatalf("subscription expiry=%d, want MaxInt64", expires)
+	}
+	if got := boundedDeadlineMs(created, 10, 0); got != math.MaxInt64 {
+		t.Fatalf("saturated deadline=%d, want MaxInt64", got)
+	}
+	if got := boundedDeadlineMs(created, 10, math.MaxInt64-1); got != math.MaxInt64-1 {
+		t.Fatalf("bounded deadline=%d, want subscription limit", got)
+	}
+
+	seqs, err := e.Send(ctx, "ephemeral",
+		OutMessage{Body: []byte("deferred")},
+		OutMessage{Body: []byte("renew")},
+		OutMessage{Body: []byte("renew-batch")},
+		OutMessage{Body: []byte("complete-batch")})
+	if err != nil || len(seqs) != 4 {
+		t.Fatalf("send=%v, %v", seqs, err)
+	}
+	msgs, err := e.Receive(ctx, "ephemeral", ReceiveOptions{MaxMessages: 4, AttemptID: "near-max"})
+	if err != nil || len(msgs) != 4 {
+		t.Fatalf("receive=%d, %v", len(msgs), err)
+	}
+	for _, msg := range msgs {
+		if msg.LockedUntilMs != math.MaxInt64 {
+			t.Fatalf("message %d lock=%d, want MaxInt64", msg.SeqNumber, msg.LockedUntilMs)
+		}
+	}
+	var attemptExpiry int64
+	if err := e.db.queryRowScan(ctx, []any{&attemptExpiry},
+		`SELECT expires_at FROM receive_attempts WHERE queue='ephemeral' AND attempt_id='near-max'`); err != nil {
+		t.Fatal(err)
+	}
+	if attemptExpiry != math.MaxInt64 {
+		t.Fatalf("attempt expiry=%d, want MaxInt64", attemptExpiry)
+	}
+
+	if err := e.Defer(ctx, "ephemeral", msgs[0].SeqNumber, msgs[0].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	deferred, err := e.ReceiveDeferred(ctx, "ephemeral", msgs[0].SeqNumber)
+	if err != nil || len(deferred) != 1 || deferred[0].LockedUntilMs != math.MaxInt64 {
+		t.Fatalf("deferred lease=%v, %v", deferred, err)
+	}
+	if err := e.Renew(ctx, "ephemeral", msgs[1].SeqNumber, msgs[1].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	renewed, err := e.RenewBatch(ctx, "ephemeral", []SettleItem{{SeqNumber: msgs[2].SeqNumber, LockToken: msgs[2].LockToken}})
+	if err != nil || len(renewed) != 1 || !renewed[0].Ok || renewed[0].LockedUntilMs != math.MaxInt64 {
+		t.Fatalf("renew batch=%+v, %v", renewed, err)
+	}
+	completed, err := e.CompleteBatch(ctx, "ephemeral", []SettleItem{{SeqNumber: msgs[3].SeqNumber, LockToken: msgs[3].LockToken}})
+	if err != nil || len(completed) != 1 || !completed[0].Ok {
+		t.Fatalf("complete batch=%+v, %v", completed, err)
+	}
+	var minReceiptExpiry int64
+	if err := e.db.queryRowScan(ctx, []any{&minReceiptExpiry},
+		`SELECT MIN(expires_at) FROM settlement_receipts WHERE queue='ephemeral'`); err != nil {
+		t.Fatal(err)
+	}
+	if minReceiptExpiry != math.MaxInt64 {
+		t.Fatalf("settlement receipt expiry=%d, want MaxInt64", minReceiptExpiry)
+	}
+}
+
+func TestReceiveLongPollDeadlineSaturatesNearMaxInt64(t *testing.T) {
+	e, clock := testEngine(t)
+	mustQueue(t, e, "permanent", QueueConfig{})
+	atomic.StoreInt64(clock, math.MaxInt64-5)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	go func() {
+		time.Sleep(time.Millisecond)
+		atomic.StoreInt64(clock, math.MaxInt64)
+	}()
+	msgs, err := e.Receive(ctx, "permanent", ReceiveOptions{WaitMs: 20})
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("near-MaxInt64 long poll=%v, %v", msgs, err)
+	}
+}
+
+func TestSubscriptionExpiryFiltersTopicRoster(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	expires := mustDataPlaneSubscriptionTTL(t, e, "events", "temporary", 1_000)
+	if err := e.Subscribe(ctx, "events", "permanent", nil); err != nil {
+		t.Fatal(err)
+	}
+	atomic.StoreInt64(clock, expires)
+	if _, err := e.SendOne(ctx, "events", OutMessage{Body: []byte("only-live")}); err != nil {
+		t.Fatalf("publish to mixed roster: %v", err)
+	}
+	var temporary, permanent int
+	if err := e.db.queryRowScan(ctx, []any{&temporary}, `SELECT COUNT(*) FROM messages WHERE queue='temporary'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.queryRowScan(ctx, []any{&permanent}, `SELECT COUNT(*) FROM messages WHERE queue='permanent'`); err != nil {
+		t.Fatal(err)
+	}
+	if temporary != 0 || permanent != 1 {
+		t.Fatalf("fan-out temporary/permanent=%d/%d, want 0/1", temporary, permanent)
+	}
+}
+
+func TestDirectBatchRefreshesSubscriptionExpiryAtEachEffect(t *testing.T) {
+	for _, operation := range []string{"send", "schedule"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			expires := mustDataPlaneSubscriptionTTL(t, e, "events", "temporary", 1_000)
+			var reads int64
+			liveReads := int64(2) // route resolution + first message effect
+			if operation == "schedule" {
+				liveReads++ // public scheduled-time validation
+			}
+			e.now = func() int64 {
+				if atomic.AddInt64(&reads, 1) <= liveReads {
+					return expires - 1
+				}
+				return expires
+			}
+			messages := []OutMessage{{Body: []byte("first")}, {Body: []byte("second")}}
+			var err error
+			if operation == "send" {
+				_, err = e.Send(ctx, "temporary", messages...)
+			} else {
+				_, err = e.ScheduleBatch(ctx, "temporary", messages, expires+10_000)
+			}
+			if !errors.Is(err, ErrQueueNotFound) {
+				t.Fatalf("mid-batch expiry=%v, want ErrQueueNotFound", err)
+			}
+			var count int
+			if err := e.db.queryRowScan(ctx, []any{&count},
+				`SELECT COUNT(*) FROM messages WHERE queue='temporary'`); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("atomic batch retained %d messages after target expiry", count)
+			}
+		})
+	}
+}
+
+func TestTopicFanoutRefreshesSubscriptionExpiryAtEachEffect(t *testing.T) {
+	for _, operation := range []string{"send", "schedule"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			if err := e.Subscribe(ctx, "events", "a-permanent", nil); err != nil {
+				t.Fatal(err)
+			}
+			expires := mustDataPlaneSubscriptionTTL(t, e, "events", "b-temporary", 1_000)
+			var reads int64
+			liveReads := int64(1) // publish/roster time; temporary target fence sees expiry
+			if operation == "schedule" {
+				liveReads++ // public scheduled-time validation
+			}
+			e.now = func() int64 {
+				if atomic.AddInt64(&reads, 1) <= liveReads {
+					return expires - 1
+				}
+				return expires
+			}
+			var err error
+			if operation == "send" {
+				_, err = e.SendOne(ctx, "events", OutMessage{Body: []byte("fanout")})
+			} else {
+				_, err = e.Schedule(ctx, "events", OutMessage{Body: []byte("fanout")}, expires+10_000)
+			}
+			if err != nil {
+				t.Fatalf("topic %s across target expiry: %v", operation, err)
+			}
+			var permanent, temporary int
+			if err := e.db.queryRowScan(ctx, []any{&permanent},
+				`SELECT COUNT(*) FROM messages WHERE queue='a-permanent'`); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.db.queryRowScan(ctx, []any{&temporary},
+				`SELECT COUNT(*) FROM messages WHERE queue='b-temporary'`); err != nil {
+				t.Fatal(err)
+			}
+			if permanent != 1 || temporary != 0 {
+				t.Fatalf("fanout permanent/temporary=%d/%d, want 1/0", permanent, temporary)
+			}
+		})
+	}
+}
+
+func TestEngineTxRefreshesSubscriptionExpiryAtEachTarget(t *testing.T) {
+	t.Run("direct", func(t *testing.T) {
+		ctx := context.Background()
+		e, _ := testEngine(t)
+		expires := mustDataPlaneSubscriptionTTL(t, e, "events", "temporary", 1_000)
+		var reads int64
+		e.now = func() int64 {
+			if atomic.AddInt64(&reads, 1) == 1 { // route resolution is still live
+				return expires - 1
+			}
+			return expires // the direct effect is rejected
+		}
+		err := e.Tx(ctx, func(tx *EngineTx) error {
+			_, err := tx.SendOne("temporary", OutMessage{Body: []byte("late")})
+			return err
+		})
+		if !errors.Is(err, ErrQueueNotFound) {
+			t.Fatalf("transactional direct send=%v, want ErrQueueNotFound", err)
+		}
+		var count int
+		if err := e.db.queryRowScan(ctx, []any{&count},
+			`SELECT COUNT(*) FROM messages WHERE queue='temporary'`); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("transactional direct send inserted %d expired messages", count)
+		}
+	})
+
+	t.Run("topic fanout", func(t *testing.T) {
+		ctx := context.Background()
+		e, _ := testEngine(t)
+		if err := e.Subscribe(ctx, "events", "a-permanent", nil); err != nil {
+			t.Fatal(err)
+		}
+		expires := mustDataPlaneSubscriptionTTL(t, e, "events", "b-temporary", 1_000)
+		var reads int64
+		e.now = func() int64 {
+			if atomic.AddInt64(&reads, 1) == 1 { // shared publish/roster time
+				return expires - 1
+			}
+			return expires
+		}
+		if err := e.Tx(ctx, func(tx *EngineTx) error {
+			_, err := tx.SendOne("events", OutMessage{Body: []byte("fanout")})
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var permanent, temporary int
+		if err := e.db.queryRowScan(ctx, []any{&permanent},
+			`SELECT COUNT(*) FROM messages WHERE queue='a-permanent'`); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.db.queryRowScan(ctx, []any{&temporary},
+			`SELECT COUNT(*) FROM messages WHERE queue='b-temporary'`); err != nil {
+			t.Fatal(err)
+		}
+		if permanent != 1 || temporary != 0 {
+			t.Fatalf("transactional fanout permanent/temporary=%d/%d, want 1/0", permanent, temporary)
+		}
+	})
+}
+
+func TestTopicFanoutUsesOnePublishTimestamp(t *testing.T) {
+	for _, mode := range []string{"send", "transaction"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			for _, name := range []string{"a", "b"} {
+				if err := e.Subscribe(ctx, "events", name, &Filter{Expr: `enqueued_at.Hour() == 0`}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var reads int64
+			e.now = func() int64 {
+				// The first target would see midnight and the second 01:00 if fan-out
+				// sampled the publish clock per target.
+				if atomic.AddInt64(&reads, 1) <= 2 {
+					return 0
+				}
+				return int64(time.Hour / time.Millisecond)
+			}
+			if mode == "send" {
+				if _, err := e.SendOne(ctx, "events", OutMessage{Body: []byte("same publish")}); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := e.Tx(ctx, func(tx *EngineTx) error {
+				_, err := tx.SendOne("events", OutMessage{Body: []byte("same publish")})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := e.db.sql.QueryContext(ctx, `SELECT queue,enqueued_at FROM messages ORDER BY queue`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var queues []string
+			var timestamps []int64
+			for rows.Next() {
+				var queue string
+				var enqueuedAt int64
+				if err := rows.Scan(&queue, &enqueuedAt); err != nil {
+					t.Fatal(err)
+				}
+				queues = append(queues, queue)
+				timestamps = append(timestamps, enqueuedAt)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(queues, []string{"a", "b"}) {
+				t.Fatalf("time-dependent filters routed to %v, want both subscriptions", queues)
+			}
+			if len(timestamps) != 2 || timestamps[0] != timestamps[1] {
+				t.Fatalf("fan-out enqueued_at=%v, want one shared publish timestamp", timestamps)
+			}
+		})
+	}
+}
+
+func TestEngineTxSendUsesCallTimeForSubscriptionExpiry(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	expires := mustDataPlaneSubscriptionTTL(t, e, "events", "temporary", 1_000)
+	err := e.Tx(ctx, func(tx *EngineTx) error {
+		atomic.StoreInt64(clock, expires)
+		_, err := tx.SendOne("temporary", OutMessage{Body: []byte("late")})
+		return err
+	})
+	if !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("SendOne after an open transaction crossed expiry=%v", err)
+	}
+	var count int
+	if err := e.db.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM messages WHERE queue='temporary'`); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expired transactional send inserted %d messages", count)
+	}
+}
+
+func TestSendRefreshesSubscriptionExpiryAfterWriterWait(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e, clock := testEngine(t)
+	expires := mustDataPlaneSubscriptionTTL(t, e, "events", "temporary", 1_000)
+	held, err := e.db.sql.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := e.db.sql.Stats().WaitCount
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.SendOne(ctx, "temporary", OutMessage{Body: []byte("late")})
+		done <- err
+	}()
+	for e.db.sql.Stats().WaitCount == before {
+		select {
+		case err := <-done:
+			t.Fatalf("send returned before waiting for writer: %v", err)
+		case <-ctx.Done():
+			t.Fatal("send never waited for writer")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	atomic.StoreInt64(clock, expires)
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrQueueNotFound) {
+			t.Fatalf("send admitted with stale pre-wait time: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("send did not finish after writer release")
+	}
+}
+
+func TestSubscriptionExpiryBoundsLongPoll(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	e, clock := testEngine(t)
+	expires := mustDataPlaneSubscriptionTTL(t, e, "events", "temporary", 75)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		atomic.StoreInt64(clock, expires)
+	}()
+	started := time.Now()
+	_, err := e.Receive(ctx, "temporary", ReceiveOptions{WaitMs: 2_000})
+	if !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("long poll at expiry=%v, want ErrQueueNotFound", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("long poll slept past subscription expiry: %v", elapsed)
+	}
+}
+
+func TestRedriveDoesNotReinsertStaleCandidates(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "source", QueueConfig{})
+	mustQueue(t, e, "target", QueueConfig{})
+	var id int64
+	if err := e.db.queryRowScan(ctx, []any{&id},
+		`INSERT INTO messages(queue,state,enqueued_at,body) VALUES('source','dead_lettered',1,X'01') RETURNING id`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `DELETE FROM messages WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := e.moveBatch(ctx, "target", "source", true, []dlqRec{{id: id}})
+	if err != nil || moved != 0 {
+		t.Fatalf("stale cross-queue move=%d, %v", moved, err)
+	}
+	var targetRows int
+	if err := e.db.queryRowScan(ctx, []any{&targetRows}, `SELECT COUNT(*) FROM messages WHERE queue='target'`); err != nil {
+		t.Fatal(err)
+	}
+	if targetRows != 0 {
+		t.Fatalf("stale candidate was resurrected into target: %d rows", targetRows)
+	}
+
+	if err := e.db.queryRowScan(ctx, []any{&id},
+		`INSERT INTO messages(queue,state,delivery_count,enqueued_at,body) VALUES('source','dead_lettered',7,1,X'02') RETURNING id`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `UPDATE messages SET state='active' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	moved, err = e.moveBatch(ctx, "", "source", false, []dlqRec{{id: id}})
+	if err != nil || moved != 0 {
+		t.Fatalf("stale same-queue move=%d, %v", moved, err)
+	}
+	var state string
+	var deliveries int
+	if err := e.db.queryRowScan(ctx, []any{&state, &deliveries},
+		`SELECT state,delivery_count FROM messages WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(StateActive) || deliveries != 7 {
+		t.Fatalf("stale same-queue candidate was rewritten: state=%s delivery_count=%d", state, deliveries)
+	}
+}
+
+func TestRateLimitedRedriveStopsWhenSubscriptionExpiresBetweenChunks(t *testing.T) {
+	for _, expiringQueue := range []string{"source", "target"} {
+		t.Run(expiringQueue, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			e, clock := testEngine(t)
+			var expires int64
+			if expiringQueue == "source" {
+				expires = mustDataPlaneSubscriptionTTL(t, e, "source-topic", "source", 1_000)
+				mustQueue(t, e, "target", QueueConfig{})
+			} else {
+				mustQueue(t, e, "source", QueueConfig{})
+				expires = mustDataPlaneSubscriptionTTL(t, e, "target-topic", "target", 1_000)
+			}
+			for i := 0; i < 2; i++ {
+				if _, err := e.db.exec(ctx,
+					`INSERT INTO messages(queue,state,enqueued_at,body) VALUES('source','dead_lettered',1,X'01')`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			expirySet := make(chan error, 1)
+			go func() {
+				for {
+					var targetRows int
+					if err := e.db.queryRowScan(ctx, []any{&targetRows},
+						`SELECT COUNT(*) FROM messages WHERE queue='target'`); err != nil {
+						expirySet <- err
+						return
+					}
+					if targetRows == 1 {
+						// Observe the committed first chunk before crossing the fixed
+						// lifetime. This makes the inter-chunk boundary deterministic.
+						atomic.StoreInt64(clock, expires)
+						expirySet <- nil
+						return
+					}
+					select {
+					case <-ctx.Done():
+						expirySet <- ctx.Err()
+						return
+					case <-time.After(time.Millisecond):
+					}
+				}
+			}()
+			moved, err := e.Redrive(ctx, "source", RedriveOptions{Target: "target", RatePerSec: 1})
+			if setErr := <-expirySet; setErr != nil {
+				t.Fatalf("advance subscription expiry: %v", setErr)
+			}
+			if moved != 1 || !errors.Is(err, ErrQueueNotFound) {
+				t.Fatalf("redrive across %s expiry moved=%d err=%v, want 1 then ErrQueueNotFound", expiringQueue, moved, err)
+			}
+			var sourceRows, targetRows int
+			if err := e.db.queryRowScan(ctx, []any{&sourceRows}, `SELECT COUNT(*) FROM messages WHERE queue='source'`); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.db.queryRowScan(ctx, []any{&targetRows}, `SELECT COUNT(*) FROM messages WHERE queue='target'`); err != nil {
+				t.Fatal(err)
+			}
+			if sourceRows != 1 || targetRows != 1 {
+				t.Fatalf("source/target rows=%d/%d, want 1/1", sourceRows, targetRows)
+			}
+		})
+	}
+}
+
+func TestRateLimitedRedriveWaitIsCanceledByClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "source", QueueConfig{})
+	mustQueue(t, e, "target", QueueConfig{})
+	for i := 0; i < 2; i++ {
+		if _, err := e.db.exec(ctx,
+			`INSERT INTO messages(queue,state,enqueued_at,body) VALUES('source','dead_lettered',1,X'01')`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type result struct {
+		moved int
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		moved, err := e.Redrive(ctx, "source", RedriveOptions{Target: "target", RatePerSec: 1})
+		done <- result{moved: moved, err: err}
+	}()
+	for {
+		var targetRows int
+		if err := e.db.queryRowScan(ctx, []any{&targetRows}, `SELECT COUNT(*) FROM messages WHERE queue='target'`); err != nil {
+			t.Fatal(err)
+		}
+		if targetRows == 1 {
+			break
+		}
+		select {
+		case r := <-done:
+			t.Fatalf("redrive returned before its throttle wait: %+v", r)
+		case <-ctx.Done():
+			t.Fatal("first redrive chunk did not finish")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	started := time.Now()
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 750*time.Millisecond {
+		t.Fatalf("Close waited for the one-second throttle: %v", elapsed)
+	}
+	select {
+	case r := <-done:
+		if r.moved != 1 || !errors.Is(r.err, ErrClosed) {
+			t.Fatalf("redrive after Close=%+v, want one moved then ErrClosed", r)
+		}
+	case <-ctx.Done():
+		t.Fatal("redrive throttle ignored engine Close")
+	}
+}
+
+func TestRedriveThrottleHandlesFarFutureSubscriptionExpiry(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := e.waitRedriveThrottle(ctx, math.MaxInt64); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("far-future expiry wait=%v, want context deadline", err)
 	}
 }

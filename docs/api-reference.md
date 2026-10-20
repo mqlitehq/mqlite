@@ -498,8 +498,9 @@ authorize discard and receive the `Deleted` / `State` outcome. Reconcile a
 progresses without another delete.
 
 The public identity remains the queue name; force does not introduce a lifetime
-token. Durable deletion metadata advances the current source to schema token 6,
-which refuses schema-5 files rather than migrating them.
+token. Durable deletion and fixed-lifetime metadata advance the current source to
+schema token 7, which refuses schema-5 and schema-6 files rather than migrating
+them.
 The console exposes **delete queue** in a plain queue's detail page and requires
 an exact name confirmation. A nonempty queue additionally requires a force
 checkbox and shows the locked-delivery side-effect warning. If an accepted deletion
@@ -587,6 +588,31 @@ Register subscription `name` under `topic` (creates its backing queue).
   matches all). Topic and subscription names are valid UTF-8 strings of 1–128
   bytes. A malformed expr or name is rejected with `400 invalid_argument`.
   **Response** `{}`.
+- The same route accepts `SubscribeWithOptionsRequest`, which adds optional
+  `ttl_ms`. A positive integer stores a fixed lifetime from the first successful
+  creation; omitted or zero creates a permanent subscription when the name is
+  new, and preserves an existing subscription's lifetime. JSON `null`, fractions,
+  strings, negative values and integer overflow, plus Go SDK durations between
+  zero and one millisecond, return `400 invalid_argument`. The Go methods are `Subscribe` and
+  `SubscribeWithOptions(..., SubscribeOptions{TTL: 15*time.Minute})`; the legacy
+  request struct and method are unchanged.
+- Re-subscribing the same `(topic,name)` with TTL omitted or zero preserves the original
+  deadline while allowing a filter update. Repeating its original positive TTL is
+  idempotent and also does not extend the deadline. A different positive TTL,
+  including an attempt to turn a permanent subscription into a temporary one,
+  returns `409 name_conflict` before the filter changes. A temporary subscription
+  cannot be made permanent in place; delete it and create a new lifetime.
+- At `now >= expires_at_ms` the subscription immediately leaves topic fan-out and
+  every backing-queue operation. Expiry is preauthorization for forced bounded
+  cleanup, including retained messages. The name remains reserved until physical
+  cleanup completes. This guarantee does not undo external effects already caused
+  by a locked delivery. Creation and enforcement use the broker host's UTC clock;
+  keep that clock synchronized because a forward step can expire a subscription
+  early and a backward step can delay a deadline that has not yet been durably
+  transitioned to `deleting`.
+- The bundled console limits entered TTLs to 3,650 fixed 24-hour days so their
+  millisecond value remains exact in browser JavaScript. Direct HTTP and Go SDK
+  clients retain the API's wider checked-integer range.
 - Name conflicts are rejected with `409 name_conflict`: a `topic` that names an
   existing queue or subscription, a `name` that belongs to a plain queue / another
   topic's subscription / a live topic, and `topic == name`. Re-subscribing the same
@@ -601,12 +627,22 @@ Register subscription `name` under `topic` (creates its backing queue).
   `Subscribe` for the intended topic/name, then use `DeleteSubscription` if the
   orphan should be retired. Do not edit MQLite-owned tables directly.
 
+```bash
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data '{"topic":"replies","name":"request-01J...","ttl_ms":900000}' \
+  "$BASE_URL/mqlite.v1.AdminService/Subscribe"
+# → {}
+```
+
 ### ListQueues
 
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
   `state`, `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`,
   `dedup_window_ms`}]). `state` is `active` or `deleting`. Deleting queues remain
-  listed while their name is reserved, but their data plane is unavailable.
+  listed while their name is reserved, but their data plane is unavailable. A
+  fixed-lifetime subscription is reported as `deleting` at its deadline even if
+  the periodic transition has not yet persisted the state; the legacy fields do
+  not expose its deadline.
 
 ### ListSubscriptions
 
@@ -624,8 +660,13 @@ Register subscription `name` under `topic` (creates its backing queue).
   the previous response), `limit` (`0` or omitted = 100, maximum 1,000), and
   `include_deleting` (default false).
 - Response:
-  `{"subscriptions":[{"topic","name","expr","state"}],"total":N,"next_after":"..."}`.
+  `{"subscriptions":[{"topic","name","expr","state","created_at_ms","expires_at_ms"}],"total":N,"next_after":"..."}`.
   `state` is `active` or `deleting`; `next_after` is omitted on the final page.
+  Both timestamps are required epoch-millisecond integers. `expires_at_ms=0`
+  means permanent; otherwise it is greater than `created_at_ms` and never moves.
+  An expired row is reported as `deleting` immediately, even before the periodic
+  transition has persisted that state. The default view excludes such rows;
+  `include_deleting=true` includes them for reconciliation.
   `total` counts the complete selected scope at the snapshot used for that
   request and is independent of `after`/`limit`. Go page entries use
   `SubscriptionPageItem`, whose required `State` field is separate from the

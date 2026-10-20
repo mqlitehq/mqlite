@@ -208,6 +208,16 @@ type SubscribeRequest struct {
 	Name   string         `json:"name"`
 	Filter *engine.Filter `json:"filter,omitempty"`
 }
+
+// SubscribeWithOptionsRequest adds optional fixed-lifetime creation to the
+// existing Subscribe route. SubscribeRequest deliberately remains unchanged so
+// released clients using keyed or unkeyed literals keep compiling unchanged.
+type SubscribeWithOptionsRequest struct {
+	Topic  string         `json:"topic"`
+	Name   string         `json:"name"`
+	Filter *engine.Filter `json:"filter,omitempty"`
+	TTLMs  int64          `json:"ttl_ms,omitempty"`
+}
 type DeleteSubscriptionRequest struct {
 	Topic string `json:"topic"`
 	Name  string `json:"name"`
@@ -258,10 +268,12 @@ type ListSubscriptionsResponse struct {
 
 // SubscriptionPageJSON is one lifecycle-aware paged subscription entry.
 type SubscriptionPageJSON struct {
-	Topic string `json:"topic"`
-	Name  string `json:"name"`
-	Expr  string `json:"expr,omitempty"`
-	State string `json:"state"`
+	Topic       string `json:"topic"`
+	Name        string `json:"name"`
+	Expr        string `json:"expr,omitempty"`
+	State       string `json:"state"`
+	CreatedAtMs int64  `json:"created_at_ms"`
+	ExpiresAtMs int64  `json:"expires_at_ms"`
 }
 type ListSubscriptionsPageRequest struct {
 	Topic           string `json:"topic,omitempty"`

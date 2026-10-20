@@ -18,7 +18,7 @@ const settlementTTLMs = 30 * 60 * 1000 // 30 min
 
 // Embedded in each mutation so logical deletion cannot race a preflight read.
 const liveMessageQueueSQL = `EXISTS (SELECT 1 FROM queues lq WHERE lq.name=messages.queue
- AND lq.lifecycle_state='active')`
+	AND lq.lifecycle_state='active' AND (lq.expires_at=0 OR lq.expires_at>?))`
 
 func affected(res sql.Result) error {
 	n, err := res.RowsAffected()
@@ -67,7 +67,8 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 		// the CALLER's context and were interruptible after all (codex).
 		// Read after writer/transaction admission, including every remote retry.
 		// Lease expiry fences a new effect even before the reaper clears its token.
-		n, err := do(ctx, tx, e.now())
+		now := e.now()
+		n, err := do(ctx, tx, now)
 		if err != nil {
 			return err
 		}
@@ -93,11 +94,13 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 			// The rule, stated once: a replay is the same request. Anything else, on a message you
 			// no longer hold, is ErrLockLost — which is the truth.
 			var one int
+			now = e.now()
 			err := tx.QueryRowContext(ctx,
 				`SELECT 1 FROM settlement_receipts
 				   WHERE queue=? AND seq_number=? AND lock_token=? AND operation=? AND args=? AND expires_at>?
-				     AND EXISTS (SELECT 1 FROM queues q WHERE q.name=settlement_receipts.queue AND q.lifecycle_state='active')`,
-				queue, seq, token, op, args, e.now()).Scan(&one)
+				     AND EXISTS (SELECT 1 FROM queues q WHERE q.name=settlement_receipts.queue
+				                 AND q.lifecycle_state='active' AND (q.expires_at=0 OR q.expires_at>?))`,
+				queue, seq, token, op, args, now, now).Scan(&one)
 			if err == nil {
 				return nil // idempotent replay of the exact request that already succeeded
 			}
@@ -110,10 +113,10 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 		if op == "dead_lettered" {
 			tx.record(queue, "rejected", n)
 		}
-		now := e.now() // the receipt's retention starts when it is recorded
+		now = e.now() // the receipt's retention starts when it is recorded
 		_, err = tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at)
-			 VALUES (?,?,?,?,?,?,?)`, token, queue, seq, op, args, now, now+settlementTTLMs)
+			 VALUES (?,?,?,?,?,?,?)`, token, queue, seq, op, args, now, boundedDeadlineMs(now, settlementTTLMs, 0))
 		return err
 	})
 }
@@ -136,7 +139,8 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 	var removed int64
 	err := e.settleOp(ctx, queue, seq, token, "completed", "", func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx,
-			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL, seq, queue, token, now)
+			`DELETE FROM messages WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL,
+			seq, queue, token, now, now)
 		if err != nil {
 			return 0, err
 		}
@@ -173,7 +177,7 @@ func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token str
 			    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 			                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
 			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL+` RETURNING state`,
-			delayMs, now+delayMs, seq, queue, token, now).Scan(&state)
+			delayMs, now+delayMs, seq, queue, token, now, now).Scan(&state)
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil
 		}
@@ -206,7 +210,7 @@ func (e *Engine) Reject(ctx context.Context, queue string, seq int64, token, rea
 			UPDATE messages SET state='dead_lettered', locked_until=0, lock_token=NULL,
 			    dead_letter_reason=?, dead_letter_description=?
 			 WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL,
-			reason, nz(desc), seq, queue, token, now)
+			reason, nz(desc), seq, queue, token, now, now)
 		if err != nil {
 			return 0, err
 		}
@@ -219,7 +223,8 @@ func (e *Engine) Defer(ctx context.Context, queue string, seq int64, token strin
 	return e.settleOp(ctx, queue, seq, token, "deferred", "", func(ctx context.Context, tx *txn, now int64) (int64, error) {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE messages SET state='deferred', locked_until=0, lock_token=NULL
-			   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL, seq, queue, token, now)
+			   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL,
+			seq, queue, token, now, now)
 		if err != nil {
 			return 0, err
 		}
@@ -243,7 +248,7 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 		   WHERE id=? AND queue=? AND lock_token=? AND state='locked' AND locked_until>? AND `+liveMessageQueueSQL,
 		func() []any {
 			now := e.now()
-			return []any{now + q.lockDurationMs, seq, queue, token, now}
+			return []any{queueLockUntil(q, now), seq, queue, token, now, now}
 		})
 	if err != nil {
 		return err
@@ -401,7 +406,7 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		// reclaimed it at once.
 		func() []any {
 			now := e.now()
-			return append([]any{now + q.lockDurationMs, now}, args...)
+			return append([]any{queueLockUntil(q, now), now, now}, args...)
 		},
 		func(sel *sql.Rows) error {
 			// An item whose lock was lost, or whose token is wrong, matches no row: it is simply
@@ -530,9 +535,10 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 		err := chunkPairs(rows, func(group []SettleItem, pairs string) error {
 			// Each chunk has its own write time: later chunks cannot use leases
 			// that expired while an earlier statement was running.
+			now := e.now()
 			sel, err := tx.QueryContext(ctx,
 				`DELETE FROM messages WHERE state='locked' AND locked_until>? AND `+liveMessageQueueSQL+` AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
-				 RETURNING id, lock_token`, append([]any{e.now()}, pairArgs(queue, group)...)...)
+					 RETURNING id, lock_token`, append([]any{now, now}, pairArgs(queue, group)...)...)
 			if err != nil {
 				return err
 			}
@@ -582,15 +588,17 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 				end = len(rows)
 			}
 			group := rows[start:end]
-			args := make([]any, 0, 4+2*len(group))
-			args = append(args, e.now(), "completed", "", queue)
+			now := e.now()
+			args := make([]any, 0, 5+2*len(group))
+			args = append(args, now, "completed", "", queue, now)
 			for _, it := range group {
 				args = append(args, it.SeqNumber, it.LockToken)
 			}
 			rec, err := tx.QueryContext(ctx,
 				`SELECT seq_number, lock_token FROM settlement_receipts
 				   WHERE expires_at>? AND operation=? AND args=? AND queue=?
-				     AND EXISTS (SELECT 1 FROM queues q WHERE q.name=settlement_receipts.queue AND q.lifecycle_state='active')
+				     AND EXISTS (SELECT 1 FROM queues q WHERE q.name=settlement_receipts.queue
+				                 AND q.lifecycle_state='active' AND (q.expires_at=0 OR q.expires_at>?))
 				     AND (seq_number, lock_token) IN (VALUES `+
 					strings.Repeat(",(?,?)", len(group))[1:]+`)`, args...)
 			if err != nil {
@@ -628,7 +636,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 				}
 				vals.WriteString("(?,?,?,?,?,?,?)")
 				recArgs = append(recArgs,
-					it.LockToken, queue, it.SeqNumber, "completed", "", now, now+settlementTTLMs)
+					it.LockToken, queue, it.SeqNumber, "completed", "", now, boundedDeadlineMs(now, settlementTTLMs, 0))
 			}
 			if vals.Len() == 0 {
 				return nil
