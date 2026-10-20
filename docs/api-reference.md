@@ -432,8 +432,9 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 
 ### DeleteQueue
 
-Available in the current unreleased source. The incompatible request shape from
-v0.3.3 was withdrawn and that module version is retracted.
+The corrected name-only contract below is available in **v0.4.0 and later**. The
+incompatible request shape from v0.3.3 was withdrawn and that module version is
+retracted.
 
 Deletes a **plain queue**. Requires administrator/manage permission. The default
 is empty-only; force is a separate, explicit authorization to discard retained
@@ -506,9 +507,9 @@ authorize discard and receive the `Deleted` / `State` outcome. Reconcile a
 progresses without another delete.
 
 The public identity remains the queue name; force does not introduce a lifetime
-token. Durable deletion and fixed-lifetime metadata advance the current source to
-schema token 7, which refuses schema-5 and schema-6 files rather than migrating
-them.
+token. Durable deletion and fixed-lifetime metadata make v0.4.0 schema token 7,
+which refuses schema-5 and schema-6 files rather than migrating them. Schema 6
+belonged only to intermediate unreleased builds and was never tagged.
 The console exposes **delete queue** in a plain queue's detail page and requires
 an exact name confirmation. A nonempty queue additionally requires a force
 checkbox and shows the locked-delivery side-effect warning. If an accepted deletion
@@ -517,6 +518,8 @@ second delete that could target a same-name replacement. Older brokers report th
 operation as unsupported.
 
 ### DeleteSubscription
+
+Available in **v0.4.0 and later**.
 
 Deletes one exact topic/subscription pair. It uses the same durable, bounded
 lifecycle as `DeleteQueue`, but owns both the topic roster mapping and the
@@ -600,9 +603,10 @@ Register subscription `name` under `topic` (creates its backing queue).
   bytes. A malformed expr or name is rejected with `400 invalid_argument`.
   **Response** `{}`.
 - The same route accepts `SubscribeWithOptionsRequest`, which adds optional
-  `ttl_ms`. A positive integer stores a fixed lifetime from the first successful
-  creation; omitted or zero creates a permanent subscription when the name is
-  new, and preserves an existing subscription's lifetime. JSON `null`, fractions,
+  `ttl_ms` in **v0.4.0 and later**. A positive integer stores a fixed lifetime
+  from the first successful creation; omitted or zero creates a permanent
+  subscription when the name is new, and preserves an existing subscription's
+  lifetime. JSON `null`, fractions,
   strings, negative values and integer overflow, plus Go SDK durations between
   zero and one millisecond, return `400 invalid_argument`. The Go methods are `Subscribe` and
   `SubscribeWithOptions(..., SubscribeOptions{TTL: 15*time.Minute})`; the legacy
@@ -666,6 +670,8 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   retains the original three-field `SubscriptionInfo` type for this method.
 
 ### ListSubscriptionsPage
+
+Available in **v0.4.0 and later**.
 
 - POST `/mqlite.v1.AdminService/ListSubscriptionsPage`.
 - Request fields: `topic` (optional exact topic), `after` (an opaque cursor from

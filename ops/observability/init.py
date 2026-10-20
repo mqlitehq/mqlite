@@ -14,12 +14,17 @@ def main():
     if env.exists():
         previous = dict(line.split("=", 1) for line in env.read_text().splitlines()
                         if line and not line.startswith("#") and "=" in line)
+        if previous.get("OBS_STACK_VERSION") != "0.4.0":
+            raise SystemExit(
+                "Existing .env predates the v0.4.0 schema boundary. Preserve its data, "
+                "move .env aside, and initialize a fresh v0.4.0 directory."
+            )
     state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
     configured = previous.get("OBS_DATA_DIR", "").strip('"')
     requested = os.environ.get("OBS_DATA_DIR", "")
     if configured and requested and Path(configured).resolve() != Path(requested).resolve():
         raise SystemExit("Existing .env selects another data directory; review it before changing the stack.")
-    data = Path(requested or configured or str(state / "mqlite-observability-032")).resolve()
+    data = Path(requested or configured or str(state / "mqlite-observability-040")).resolve()
     repo = ROOT.parent.parent
     if data == repo or repo in data.parents:
         raise SystemExit("OBS_DATA_DIR must be outside the source checkout.")
@@ -39,7 +44,10 @@ def main():
                 stream.write(prefix + secrets.token_hex(32) + "\n")
         path.chmod(0o600)
     if not env.exists():
-        env.write_text(f'OBS_UID={os.getuid()}\nOBS_GID={os.getgid()}\nOBS_DATA_DIR="{data}"\n')
+        env.write_text(
+            f'OBS_STACK_VERSION=0.4.0\nOBS_UID={os.getuid()}\nOBS_GID={os.getgid()}\n'
+            f'OBS_DATA_DIR="{data}"\n'
+        )
     env.chmod(0o600)
     print("Ready: private credentials and persistent data are outside the source checkout.")
     print("Credentials were preserved if this stack was initialized before.")

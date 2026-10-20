@@ -87,7 +87,7 @@ durability remain the operator's responsibility.
 
 ## Maintenance failure diagnosis
 
-The current unreleased source adds optional `maintenance[].diagnostics` and
+v0.4.0 adds optional `maintenance[].diagnostics` and
 `storage.operations[].last_error` fields to Observe. v0.3.2 and older snapshots
 remain valid; missing diagnostics mean **not reported**, not healthy. Existing
 Prometheus labels and cumulative error buckets are unchanged.

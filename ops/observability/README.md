@@ -18,7 +18,7 @@ version. Before that tag is published, use the exact reviewed candidate commit
 for a release rehearsal instead.
 
 ```sh
-git clone --branch v0.3.2 --depth 1 https://github.com/mqlitehq/mqlite.git
+git clone --branch v0.4.0 --depth 1 https://github.com/mqlitehq/mqlite.git
 cd mqlite/ops/observability
 python3 init.py
 docker compose up --build -d
@@ -27,10 +27,14 @@ docker compose ps
 
 Initialization writes a private `.env` pointer and generates three different random
 credentials. Secrets and persistent data live **outside the source checkout**, by
-default at `$XDG_STATE_HOME/mqlite-observability-032`, or
-`~/.local/state/mqlite-observability-032` when XDG_STATE_HOME is unset. To select
-another location, set `OBS_DATA_DIR` before the first initialization. Existing
-credentials are preserved. Files are mode 0600 and directories 0700; services run
+default at `$XDG_STATE_HOME/mqlite-observability-040`, or
+`~/.local/state/mqlite-observability-040` when XDG_STATE_HOME is unset. The new
+directory prevents a schema-5 demo database from being reused by the schema-7
+broker. `init.py` records the stack version in `.env` and refuses an older pointer;
+preserve that old data and move `.env` aside before initializing v0.4.0. To
+select another location, set `OBS_DATA_DIR` before the first initialization.
+Existing v0.4.0 credentials are preserved. Files are mode 0600 and directories
+0700; services run
 as your numeric UID/GID so file permissions need not be relaxed.
 
 | Service | Local URL | Credentials |

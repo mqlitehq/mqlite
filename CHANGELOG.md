@@ -10,7 +10,36 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## Unreleased
+## v0.4.0 — 2026-10-21
+
+> **Upgrade from v0.3.2 or retracted v0.3.3:** port **6754** is unchanged, but
+> the canonical schema token changes from **5 → 7**. There is no in-place
+> migration. Stop writers, take a consistent backup, account for every retained
+> message and managed key, preserve the schema-5 binary/database pair, and start
+> v0.4.0 with a fresh database. Schema 6 belonged only to intermediate unreleased
+> lifecycle builds and is refused as well; it was never a tagged release.
+>
+> v0.3.3 remains retracted. Its public queue `Generation` contract was removed;
+> v0.4.0 addresses resources by name and requires one owner to serialize deletion
+> with same-name recreation. Upgrade the broker, SDK, CLI, MCP and console
+> together when adopting the corrected deletion APIs.
+>
+> **Prometheus migration:** the aliases `mqlite_queue_total` and
+> `mqlite_queue_oldest_message_age_ms`, deprecated in v0.3.2, are removed.
+> Replace them with `mqlite_queue_retained_messages` and
+> `mqlite_queue_oldest_message_age_seconds`; divide millisecond alert thresholds
+> by 1,000. Native `Observe` JSON retains `queues[].oldest_message_age_ms`.
+
+### Remove deprecated Prometheus aliases (MQLITE-129)
+
+- Remove the `mqlite_queue_total` and `mqlite_queue_oldest_message_age_ms`
+  compatibility families on the announced v0.4.0 boundary. The canonical
+  retained-depth and age-in-seconds families remain exact projections of the
+  native observation snapshot, and the shipped dashboard, rules and verifier use
+  only those canonical names.
+- Require the complete exposition fixture to pass `promtool check metrics`
+  without the two former naming warnings. This changes Prometheus exposition
+  only; the native JSON `oldest_message_age_ms` field remains available.
 
 ### Isolate deep-backlog observation reads (MQLITE-132)
 
@@ -167,7 +196,8 @@ upgrade notes before replacing a broker.
   option without bringing lifetime identity into data-plane requests.
 - This is an intentional breaking correction for v0.3.3 clients. The v0.3.3 Go
   module is retracted; v0.3.2 clients are unaffected. This correction itself kept
-  schema token **5**; MQLITE-126 advances the current source to token 6.
+  schema token **5**; MQLITE-126 advanced the v0.4.0 development line to token 6,
+  and MQLITE-128 advanced the released schema to token 7.
 - Make the name-reuse boundary explicit. Queue deletion and same-name recreation
   must be serialized by one owner. Do not replay an old deletion after recreation;
   reconcile an uncertain result before allowing the name to be reused.
@@ -180,7 +210,7 @@ upgrade notes before replacing a broker.
 
 > **Retracted:** this release exposed queue lifetime metadata as a public API and
 > spread it through deletion clients. That contract was removed on `main` before
-> the next release. Use v0.3.2 until a replacement release is published.
+> v0.4.0. Use v0.3.2 or v0.4.0 and later.
 
 > **Upgrade from v0.3.2:** port **6754**, schema token **5**, message data and
 > managed-key storage remain compatible. Keep one active broker per database and

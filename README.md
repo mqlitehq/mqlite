@@ -262,7 +262,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_MONITOR_TOKENS` | optional, distinct read-only credentials for `observe` and `/metrics`; administrator auth must remain enabled |
 | `MQLITE_METRICS` | enable authenticated Prometheus `/metrics` on the API port (`on`/`true`/`1`; default `off`); requires administrator auth |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
-| `MQLITE_MAX_SUBSCRIPTIONS` | maximum active plus deleting subscriptions (default 10,000) |
+| `MQLITE_MAX_SUBSCRIPTIONS` | v0.4.0+: maximum active plus deleting subscriptions (default 10,000) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
 > The DB connection string is **only ever read from the environment** — it is
@@ -362,7 +362,8 @@ hands them back to the OS via `incremental_vacuum`, so the file grows to the pea
 and then shrinks back gradually as the queue drains (a full `VACUUM` rewrite stays
 manual-only, via `mqlite vacuum`). See [docs/retention.md](docs/retention.md).
 
-Queue and subscription deletion follow the same bounded-storage principle. They
+In v0.4.0 and later, queue and subscription deletion follow the same
+bounded-storage principle. They
 are empty-only by default; `--force` explicitly discards active, locked,
 scheduled, deferred and dead-letter work. Acceptance first persists a `deleting`
 state, which immediately blocks the backing queue, removes a subscription from
@@ -441,21 +442,28 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-This source tree contains the unreleased replacement for **retracted v0.3.3**. It
-keeps the default broker port **6754** and uses schema token **7**. The public queue
-identity experiment has been removed; queue operations address a queue by name.
-See [CHANGELOG.md](CHANGELOG.md) for the breaking correction and upgrade notes.
-For a tagged deployment, use **v0.3.2** until a replacement release is published;
-see [deployment](docs/deployment.md) for configuration.
+This source tree targets **v0.4.0**, with default broker port **6754** and schema
+token **7**. It replaces retracted v0.3.3 and removes that release's public queue
+`Generation` contract; queue operations address a queue by name. See
+[CHANGELOG.md](CHANGELOG.md) for the corrected deletion contract and upgrade notes.
+Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
+or pin the image to `ghcr.io/mqlitehq/mqlite:0.4.0`; see
+[deployment](docs/deployment.md) for configuration.
 
-**Moving from v0.3.0/v0.3.1/v0.3.2 or retracted v0.3.3 to the current source
-requires a fresh database.** Those builds use schema token 5; MQLite deliberately
+**Moving from v0.3.0/v0.3.1/v0.3.2 or retracted v0.3.3 to v0.4.0 requires a
+fresh database.** Those builds use schema token 5; MQLite deliberately
 has no in-place schema migration. Stop writers, take a consistent backup, account
 for retained work in every state, and keep the old binary/database pair for
 rollback. Do not restamp or point schema-7 code at the old file. A schema-6
-database made by an intermediate unreleased lifecycle build is refused as well.
-See
-[upgrade and rollback](docs/operations.md#upgrade-and-rollback).
+database made by an intermediate unreleased lifecycle build is refused as well;
+schema 6 was never released.
+See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
+
+v0.4.0 also removes the deprecated Prometheus aliases `mqlite_queue_total` and
+`mqlite_queue_oldest_message_age_ms`. Migrate to
+`mqlite_queue_retained_messages` and
+`mqlite_queue_oldest_message_age_seconds` before upgrading. The native JSON field
+`oldest_message_age_ms` remains unchanged.
 
 **Upgrading from v0.2.0 requires a new database.** There is no in-place schema
 migration. Account for retained messages in every state, preserve the old binary
