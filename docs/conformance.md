@@ -183,8 +183,10 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status:
   400 `invalid_argument`/`group_required` · 401 `unauthenticated` · 403
   `permission_denied` · 404 `not_found` · 409
-  `already_exists`/`lock_lost`/`name_conflict`/`key_conflict` · 413 `message_too_large` · 500
-  `internal`. *(server/errors_test.go; see [api-reference.md](api-reference.md))*
+  `already_exists`/`lock_lost`/`name_conflict`/`key_conflict`/
+  `queue_not_empty`/`subscription_not_empty` · 413 `message_too_large` ·
+  429 `resource_exhausted` · 500 `internal` · 503 `outcome_unknown`.
+  *(server/errors_test.go; see [api-reference.md](api-reference.md))*
 - **9.3** Every registered RPC MUST bind a permission in the route registration.
   Send/Schedule/Cancel require send; all other QueueService methods require listen;
   AdminService and AuthService require manage, except Observe and the opt-in
@@ -300,6 +302,27 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   `ErrQueueNotFound`. Behavior after directly altering internal tables to create a
   queue/topic collision is outside the public contract.
   *(engine/functional_test.go: TestTopicQueueNamespaceDisjoint)*
+- **12.3 Subscription lifecycle.** Deletion MUST select the exact `(topic,name)`
+  pair. By default it MUST reject every retained message state with
+  `ErrSubscriptionNotEmpty`; force is durable authorization to discard all states.
+  Acceptance atomically marks the backing queue `deleting`, excludes it from
+  fan-out and the data plane, and preserves the mapping and name until bounded
+  cleanup removes the queue and mapping in the same transaction. Restart MUST resume accepted
+  cleanup without another force authorization. The last active subscription's
+  retirement makes its implicit topic unavailable immediately.
+- **12.4 Bounded inventory.** The compatibility `ListSubscriptions` operation MUST
+  return every active subscription in `(topic,name)` order. The paged operation
+  MUST use the same order, default to 100, reject limits above 1,000, return an
+  exact total for the request's scope and optionally include deleting entries.
+  Its opaque cursor MUST be bound to the topic and include-deleting scope. One
+  request is a consistent snapshot; pages issued as separate requests do not
+  promise a frozen snapshot under concurrent changes.
+- **12.5 Capacity.** The engine MUST bound active plus deleting subscriptions
+  (default 10,000). Creating a new mapping at the bound returns
+  `ErrSubscriptionLimit` (HTTP 429 `resource_exhausted`); re-subscribing an active
+  exact pair may update its filter. A deleting entry MUST retain its slot until
+  final physical cleanup. Public `CreateQueue(kind=subscription)` MUST NOT create
+  a backing queue without a subscription mapping.
 
 ## 13 · Cancellation (context deadlines)
 

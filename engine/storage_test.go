@@ -932,6 +932,37 @@ func TestResolveTargetsUsesOnlyIndexedSeeks(t *testing.T) {
 	}
 }
 
+func TestSubscriptionInventoryUsesKeysetIndexes(t *testing.T) {
+	e, _ := testEngine(t)
+	topicPage := explainPlan(t, e, `
+		SELECT s.topic,s.subscription,s.filter_json,q.lifecycle_state
+		FROM subscriptions s JOIN queues q ON q.name=s.subscription
+		WHERE s.topic=? AND q.lifecycle_state='active' AND s.subscription>?
+		ORDER BY s.topic,s.subscription LIMIT ?`, "topic", "after", 101)
+	if strings.Contains(topicPage, "SCAN s") || strings.Contains(topicPage, "USE TEMP B-TREE") {
+		t.Fatalf("topic subscription page lost its keyset seek:\n%s", topicPage)
+	}
+	if !strings.Contains(topicPage, "SEARCH s USING") || !strings.Contains(topicPage, "SEARCH q USING") {
+		t.Fatalf("topic subscription page must seek both mapping and queue metadata:\n%s", topicPage)
+	}
+
+	globalPage := explainPlan(t, e, `
+		SELECT s.topic,s.subscription,s.filter_json,q.lifecycle_state
+		FROM subscriptions s JOIN queues q ON q.name=s.subscription
+		WHERE q.lifecycle_state='active' AND (s.topic,s.subscription)>(?,?)
+		ORDER BY s.topic,s.subscription LIMIT ?`, "topic", "after", 101)
+	if strings.Contains(globalPage, "USE TEMP B-TREE") || !strings.Contains(globalPage, "sqlite_autoindex_subscriptions_1") || !strings.Contains(globalPage, "SEARCH q USING") {
+		t.Fatalf("global subscription page must walk the ordered primary key and seek queue metadata:\n%s", globalPage)
+	}
+
+	topicCount := explainPlan(t, e, `
+		SELECT COUNT(*) FROM subscriptions s JOIN queues q ON q.name=s.subscription
+		WHERE s.topic=? AND q.lifecycle_state='active'`, "topic")
+	if strings.Contains(topicCount, "SCAN s") || !strings.Contains(topicCount, "SEARCH s USING") || !strings.Contains(topicCount, "SEARCH q USING") {
+		t.Fatalf("topic subscription count lost indexed joins:\n%s", topicCount)
+	}
+}
+
 func TestResolveTargetsKeepsStableTopicOrder(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
@@ -978,7 +1009,7 @@ func TestEmptyLifecycleCleanupUsesOneMutationStatement(t *testing.T) {
 	err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
 		budget := cleanupBudget{rows: lifecyclePassRows, bytes: lifecycleBatchBytes}
 		var err error
-		done, err = e.cleanQueueTx(ctx, tx, "q", &budget)
+		done, err = e.cleanEntityTx(ctx, tx, "q", "queue", &budget)
 		return err
 	})
 	if err != nil || !done {

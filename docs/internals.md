@@ -227,23 +227,25 @@ it is small and boring on purpose:
 
 | Loop | Cadence | Job |
 |---|---|---|
-| lifecycle | event-driven; 1 s between continuation passes | continue bounded physical cleanup for queues durably marked `deleting` |
+| lifecycle | event-driven; 1 s between continuation passes | continue bounded physical cleanup for queues and subscription backing queues durably marked `deleting` |
 | reaper | 1 s | expired locks → back to `active` — or to the DLQ once `delivery_count ≥ max` |
 | scheduler | 1 s | `scheduled` rows whose time arrived → `active` |
 | TTL sweep | 10 s | expired messages → DLQ (or discard), from *any* non-terminal state |
 | janitors | 60 s | prune old receipts and dedup entries; reclaim up to 256 local free pages once 256 accumulate |
 
-**Queue deletion is a durable state machine.** An empty-only delete verifies every
-message state in the same transaction that changes `queues.lifecycle_state` from
-`active` to `deleting`; force skips the empty check because its caller explicitly
-authorized discard. The state change invalidates cached configuration, wakes long
-polls, rejects further queue work and keeps the namespace occupied. Physical
-cleanup then removes messages, dedup rows and both receipt tables before deleting
-the queue row itself.
+**Resource deletion is a durable state machine.** An empty-only queue or
+subscription delete verifies every message state in the same transaction that
+changes the backing `queues.lifecycle_state` from `active` to `deleting`; force
+skips the empty check because its caller explicitly authorized discard. The state
+change invalidates cached configuration, wakes long polls, rejects further queue
+work and keeps the namespace occupied. A subscription stops participating in
+fan-out in that same committed state transition. Physical cleanup then removes
+messages, dedup rows and both receipt tables before deleting the queue row itself;
+the subscription mapping and backing queue are removed explicitly in one transaction.
 
 The accepting call removes no more than 1,000 physical rows and targets about
 8 MiB. Each lifecycle pass globally caps cleanup at 4,096 rows and targets about
-8 MiB, across at most 32 queues
+8 MiB, across at most 32 backing queues
 locally or one queue on remote Turso/libSQL. The remote cap bounds Hrana round
 trips inside one write transaction; the persisted cursor provides fair rotation.
 `Open` runs a pass before lock recovery. The marker is therefore both the restart
@@ -256,7 +258,9 @@ idle polling round trip on remote stores. The one exception is a remote deletion
 or cleanup transaction whose commit acknowledgement is uncertain: after the
 immediate pass, the worker performs 30 delayed probes one second apart so a commit
 that becomes visible after the first inventory snapshot is still discovered.
-Restart recovery remains the durable fallback after that window.
+Restart recovery remains the durable fallback after that window. Metadata work
+uses the same global budget: finalizing a subscription consumes two rows in the
+pass budget, one queue row and one subscription mapping.
 
 **Crash recovery is one statement.** On `Open`, every `locked` row is an orphan
 of a previous process (locks are rows, remember) and is reclaimed — back to

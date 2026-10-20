@@ -349,28 +349,82 @@ func cmdDeleteQueue(ctx context.Context, args []string) error {
 	return okResult(map[string]any{"name": pos[0], "deleted": result.Deleted, "state": result.State}, "name", "deleted", "state")
 }
 
-// ─── list-subscriptions: topic membership + filter expressions ──────────────────────
-func cmdListSubscriptions(ctx context.Context, args []string) error {
-	fs := newFlags("list-subscriptions")
+// ─── delete-subscription: empty-only by default, explicit discard with --force ─────
+func cmdDeleteSubscription(ctx context.Context, args []string) error {
+	fs := newFlags("delete-subscription")
+	force := fs.Bool("force", false, "discard retained messages while deleting the subscription")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(pos) != 0 {
-		return fmt.Errorf("usage: list-subscriptions  (takes no arguments)")
+	if len(pos) != 2 {
+		return fmt.Errorf("usage: delete-subscription <topic> <name> [--force]")
 	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
+	result, err := c.DeleteSubscriptionWithOptions(ctx, pos[0], pos[1], mqlite.DeleteSubscriptionOpts{Force: *force})
+	if err != nil {
+		return err
+	}
+	return okResult(map[string]any{
+		"topic": pos[0], "name": pos[1], "deleted": result.Deleted, "state": result.State,
+	}, "topic", "name", "deleted", "state")
+}
+
+// ─── list-subscriptions: legacy full list or an explicitly requested page ───────────
+func cmdListSubscriptions(ctx context.Context, args []string) error {
+	fs := newFlags("list-subscriptions")
+	topic := fs.String("topic", "", "only subscriptions under this topic")
+	after := fs.String("after", "", "opaque cursor from the previous page")
+	limit := fs.Int("limit", 0, "page size (default 100, maximum 1000)")
+	includeDeleting := fs.Bool("include-deleting", false, "include subscriptions whose deletion is pending")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 0 {
+		return fmt.Errorf("usage: list-subscriptions [--topic topic --after cursor --limit n --include-deleting]")
+	}
+	if flagGiven("limit") && (*limit < 1 || *limit > 1000) {
+		return fmt.Errorf("--limit must be between 1 and 1000")
+	}
+	c, err := dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	pageRequested := flagGiven("topic") || flagGiven("after") || flagGiven("limit") || flagGiven("include-deleting")
+	if pageRequested {
+		page, err := c.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{
+			Topic: *topic, After: *after, Limit: *limit, IncludeDeleting: *includeDeleting,
+		})
+		if err != nil {
+			return err
+		}
+		if page.Subscriptions == nil {
+			page.Subscriptions = []mqlite.SubscriptionPageItem{}
+		}
+		if jsonOut() {
+			return emitJSON(page)
+		}
+		printSubscriptionPage(page.Subscriptions)
+		fmt.Printf("total=%d", page.Total)
+		if page.NextAfter != "" {
+			fmt.Printf(" next_after=%s", page.NextAfter)
+		}
+		fmt.Println()
+		return nil
+	}
 	subs, err := c.ListSubscriptions(ctx)
 	if err != nil {
 		return err
 	}
 	if jsonOut() {
 		if subs == nil {
-			subs = []mqlite.SubscriptionInfo{} // JSON must be [] not null
+			subs = []mqlite.SubscriptionInfo{} // legacy JSON contract is [] rather than null
 		}
 		return emitJSON(subs)
 	}
@@ -378,6 +432,11 @@ func cmdListSubscriptions(ctx context.Context, args []string) error {
 		fmt.Println("(no subscriptions)")
 		return nil
 	}
+	printSubscriptions(subs)
+	return nil
+}
+
+func printSubscriptions(subs []mqlite.SubscriptionInfo) {
 	for _, s := range subs {
 		expr := s.Expr
 		if expr == "" {
@@ -385,7 +444,16 @@ func cmdListSubscriptions(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("%-20s topic=%-20s filter=%s\n", s.Name, s.Topic, expr)
 	}
-	return nil
+}
+
+func printSubscriptionPage(subs []mqlite.SubscriptionPageItem) {
+	for _, s := range subs {
+		expr := s.Expr
+		if expr == "" {
+			expr = "(match all)"
+		}
+		fmt.Printf("%-20s topic=%-20s state=%-8s filter=%s\n", s.Name, s.Topic, s.State, expr)
+	}
 }
 
 // ─── test-filter: dry-run a subscription filter expression ──────────────────────────

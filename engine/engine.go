@@ -1,15 +1,19 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // Engine is the embeddable queue core: a Store plus Service Bus semantics,
@@ -26,7 +30,8 @@ type Engine struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 
-	maxMsgBytes int64
+	maxMsgBytes      int64
+	maxSubscriptions int
 
 	dlqMaxAgeMs int64 // DLQ retention: drop dead letters older than this (0 = off)
 	dlqMaxCount int   // DLQ retention: keep at most N dead letters per queue (0 = off)
@@ -53,6 +58,7 @@ type Options struct {
 	DisableBackground bool         // skip reaper/scheduler loops (tests)
 	Synchronous       string       // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
 	MaxMessageBytes   int64        // reject bodies larger than this; 0 -> 1 MiB (§11.4)
+	MaxSubscriptions  int          // retained active + deleting subscriptions; 0 -> 10,000
 	// DLQ retention bounds (MQLITE-21): a background pass drops dead letters
 	// oldest-first past these. ONLY state='dead_lettered' is touched; 0 = that
 	// dimension unbounded. Defaults are applied by the broker, not the engine.
@@ -62,8 +68,17 @@ type Options struct {
 	Logger      *slog.Logger // background-loop failures log here; nil -> slog.Default()
 }
 
-// DefaultMaxMessageBytes is the default body-size cap (1 MiB, design §14-Q7).
-const DefaultMaxMessageBytes = 1 << 20
+const (
+	// DefaultMaxMessageBytes is the default body-size cap (1 MiB, design §14-Q7).
+	DefaultMaxMessageBytes = 1 << 20
+	// DefaultMaxSubscriptions bounds retained subscription metadata and fan-out growth.
+	// Deleting subscriptions continue to count until bounded cleanup removes them.
+	DefaultMaxSubscriptions = 10_000
+	// maxAddressNameBytes bounds newly created queue, topic and subscription
+	// addresses, keeping stateless subscription cursors bounded and losslessly
+	// JSON-encodable. Inventory and deletion still accept legacy stored topics.
+	maxAddressNameBytes = 128
+)
 
 type queueRow struct {
 	name             string
@@ -85,6 +100,9 @@ type queueRow struct {
 // Open opens the store (initializing the schema), performs single-broker crash
 // recovery, and starts background maintenance loops.
 func Open(ctx context.Context, opts Options) (*Engine, error) {
+	if opts.MaxSubscriptions < 0 {
+		return nil, fmt.Errorf("%w: max subscriptions must not be negative", ErrInvalidArgument)
+	}
 	d, err := openDB(ctx, opts.DB, opts.AuthToken, opts.Synchronous)
 	if err != nil {
 		return nil, err
@@ -101,25 +119,30 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if maxMsg <= 0 {
 		maxMsg = DefaultMaxMessageBytes
 	}
+	maxSubscriptions := opts.MaxSubscriptions
+	if maxSubscriptions == 0 {
+		maxSubscriptions = DefaultMaxSubscriptions
+	}
 	lg := opts.Logger
 	if lg == nil {
 		lg = slog.Default()
 	}
 	d.log = lg
 	e := &Engine{
-		db:            d,
-		note:          newNotifier(),
-		now:           nowFn,
-		log:           lg,
-		closed:        make(chan struct{}),
-		lifecycleWake: make(chan struct{}, 1),
-		qcache:        map[string]queueRow{},
-		filterCache:   map[string]*filterEntry{},
-		maxMsgBytes:   maxMsg,
-		observation:   observations{started: nowFn(), background: !opts.DisableBackground},
-		dlqMaxAgeMs:   opts.DLQMaxAgeMs,
-		dlqMaxCount:   opts.DLQMaxCount,
-		dlqMaxBytes:   opts.DLQMaxBytes,
+		db:               d,
+		note:             newNotifier(),
+		now:              nowFn,
+		log:              lg,
+		closed:           make(chan struct{}),
+		lifecycleWake:    make(chan struct{}, 1),
+		qcache:           map[string]queueRow{},
+		filterCache:      map[string]*filterEntry{},
+		maxMsgBytes:      maxMsg,
+		maxSubscriptions: maxSubscriptions,
+		observation:      observations{started: nowFn(), background: !opts.DisableBackground},
+		dlqMaxAgeMs:      opts.DLQMaxAgeMs,
+		dlqMaxCount:      opts.DLQMaxCount,
+		dlqMaxBytes:      opts.DLQMaxBytes,
 	}
 	if err := e.initializeObservations(ctx); err != nil {
 		_ = d.close()
@@ -200,8 +223,8 @@ func (e *Engine) Remote() bool { return e.db.remote }
 // centralized here so BOTH CreateQueue and Subscribe fail loud with a typed
 // ErrInvalidArgument (→ 400) — agent-facing APIs must fail predictably (MQLITE-86 / D5).
 func validateQueueConfig(name string, cfg QueueConfig) error {
-	if name == "" {
-		return fmt.Errorf("%w: queue name required", ErrInvalidArgument)
+	if err := validateAddressName("queue", name); err != nil {
+		return err
 	}
 	switch cfg.Kind {
 	case "", "queue", "subscription":
@@ -216,12 +239,22 @@ func validateQueueConfig(name string, cfg QueueConfig) error {
 	return nil
 }
 
+func validateAddressName(kind, name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: %s name required", ErrInvalidArgument, kind)
+	}
+	if len(name) > maxAddressNameBytes || !utf8.ValidString(name) {
+		return fmt.Errorf("%w: %s name must be valid UTF-8 and at most %d bytes", ErrInvalidArgument, kind, maxAddressNameBytes)
+	}
+	return nil
+}
+
 func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {
 	if err := validateQueueConfig(name, cfg); err != nil {
 		return err
 	}
 	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		return e.createQueueTx(ctx, tx, name, cfg, true)
+		return e.createQueueTx(ctx, tx, name, cfg, true, false)
 	}); err != nil {
 		return err
 	}
@@ -242,7 +275,7 @@ func (e *Engine) DeleteQueue(ctx context.Context, name string) error {
 }
 
 // createQueueTx is CreateQueue's body bound to a transaction so callers
-// (CreateQueue, Subscribe) keep the name guards and the insert atomic.
+// (CreateQueue, Subscribe) keep the name guards and insert atomic.
 //
 // Queue, subscription and topic names share ONE flat namespace and must stay
 // disjoint (review F2 / MQLITE-57): a queue and topic sharing one address would
@@ -251,14 +284,15 @@ func (e *Engine) DeleteQueue(ctx context.Context, name string) error {
 // The upsert path for an existing queue of the same name stays open ONLY for
 // the same kind: a plain CreateQueue over a subscription's backing queue (or a
 // kind='subscription' request over a plain queue) is rejected rather than
-// silently retuning an entity the caller doesn't think they own. A deliberate
-// backing-queue reconfig stays possible by passing Kind:"subscription".
+// silently retuning an entity the caller doesn't think they own. CreateQueue may
+// reconfigure an existing, mapped subscription backing queue, but only Subscribe
+// may create one: this prevents public creation of unreachable orphan metadata.
 // createQueueTx creates the queue `name`, or — when overwrite is true — reconfigures an
 // existing one from cfg (CreateQueue's documented "update config if exists" contract).
 // overwrite=false only ensures the row exists and never touches an existing queue's config:
 // Subscribe uses it so re-subscribing (a filter update) can't reset the backing queue's
 // lock/delivery/TTL/dedup/ordering/DLQ settings (MQLITE-73). The name guards run either way.
-func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg QueueConfig, overwrite bool) error {
+func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg QueueConfig, overwrite, fromSubscribe bool) error {
 	// Central guard: also runs for Subscribe's backing-queue creation, so a bad name
 	// or enum can't reach the INSERT and CHECK-fault into a 500 (MQLITE-86).
 	if err := validateQueueConfig(name, cfg); err != nil {
@@ -289,6 +323,22 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 	newQueue := errors.Is(err, sql.ErrNoRows)
 	if !newQueue && lifecycleState != "active" {
 		return fmt.Errorf("%w: queue name is reserved until cleanup completes", ErrNameConflict)
+	}
+	if kind == "subscription" {
+		if newQueue && !fromSubscribe {
+			return fmt.Errorf("%w: create subscriptions with Subscribe", ErrInvalidArgument)
+		}
+		if !newQueue && overwrite && !fromSubscribe {
+			var mapped int
+			err := tx.QueryRowContext(ctx,
+				`SELECT 1 FROM subscriptions WHERE subscription=? LIMIT 1`, name).Scan(&mapped)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: subscription backing queue has no topic mapping", ErrInvalidArgument)
+			}
+			if err != nil {
+				return err
+			}
+		}
 	}
 	lock := cfg.LockDurationMs
 	if lock <= 0 {
@@ -359,8 +409,11 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 // considered and rejected in favor of this flat disjoint namespace — it moves
 // the ambiguity into addressing instead of removing it.
 func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filter) error {
-	if topic == "" || name == "" {
-		return fmt.Errorf("%w: topic and subscription name required", ErrInvalidArgument)
+	if err := validateAddressName("topic", topic); err != nil {
+		return err
+	}
+	if err := validateAddressName("subscription", name); err != nil {
+		return err
 	}
 	if topic == name {
 		return fmt.Errorf("%w: subscription %q cannot use its own topic's name", ErrNameConflict, name)
@@ -384,6 +437,7 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 	// concurrent CreateQueue/Subscribe can't slip between check and insert (the
 	// local single connection serializes anyway; the remote pool does not).
 	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		mappingExists := false
 		var topicKind string
 		err := tx.QueryRowContext(ctx,
 			`SELECT kind FROM queues WHERE name=?`, topic).Scan(&topicKind)
@@ -402,21 +456,35 @@ func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filt
 			if existingKind.String != "subscription" {
 				return fmt.Errorf("%w: %q is already a queue", ErrNameConflict, name)
 			}
-			var otherTopic sql.NullString
-			if err := tx.QueryRowContext(ctx,
-				`SELECT topic FROM subscriptions WHERE subscription=? AND topic<>? LIMIT 1`,
-				name, topic).Scan(&otherTopic); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			var mappedTopic string
+			err := tx.QueryRowContext(ctx,
+				`SELECT topic FROM subscriptions WHERE subscription=? LIMIT 1`, name).Scan(&mappedTopic)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			if otherTopic.Valid {
+			if err == nil && mappedTopic != topic {
 				return fmt.Errorf("%w: subscription %q already exists under topic %q",
-					ErrNameConflict, name, otherTopic.String)
+					ErrNameConflict, name, mappedTopic)
 			}
+			mappingExists = err == nil
 		}
 		// createQueueTx additionally rejects a subscription name that is itself a
 		// live topic — the same shadowing hazard from the other side.
-		if err := e.createQueueTx(ctx, tx, name, QueueConfig{Kind: "subscription"}, false); err != nil {
+		if err := e.createQueueTx(ctx, tx, name, QueueConfig{Kind: "subscription"}, false, true); err != nil {
 			return err
+		}
+		if !mappingExists {
+			var retained int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscriptions`).Scan(&retained); err != nil {
+				return err
+			}
+			limit := e.maxSubscriptions
+			if limit == 0 { // keep directly-constructed test engines on the documented default
+				limit = DefaultMaxSubscriptions
+			}
+			if retained >= limit {
+				return fmt.Errorf("%w: maximum %d retained subscriptions", ErrSubscriptionLimit, limit)
+			}
 		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO subscriptions (topic,subscription,filter_json,created_at)
@@ -444,13 +512,96 @@ type SubscriptionInfo struct {
 	Expr  string `json:"expr,omitempty"` // the filter expression; "" = match all
 }
 
+// SubscriptionPageItem is one subscription in the lifecycle-aware paged
+// inventory. State is active or deleting.
+type SubscriptionPageItem struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"` // the filter expression; "" = match all
+	State string `json:"state"`
+}
+
+// ListSubscriptionsOptions controls a bounded subscription inventory page.
+// After is the opaque NextAfter cursor returned by the preceding request. Total
+// and Subscriptions are read from one snapshot; later pages may observe changes.
+type ListSubscriptionsOptions struct {
+	Topic           string
+	After           string
+	Limit           int
+	IncludeDeleting bool
+}
+
+// SubscriptionPage is one keyset-ordered inventory page from a consistent
+// current snapshot. Total is the exact number of subscriptions in the requested
+// scope before applying After; separate page requests do not share a snapshot.
+type SubscriptionPage struct {
+	Subscriptions []SubscriptionPageItem `json:"subscriptions"`
+	Total         int                    `json:"total"`
+	NextAfter     string                 `json:"next_after,omitempty"`
+}
+
+const (
+	defaultSubscriptionPageSize = 100
+	maxSubscriptionPageSize     = 1000
+	subscriptionCursorVersion   = 1
+	maxSubscriptionCursorBytes  = 1 << 20
+)
+
+type subscriptionCursor struct {
+	Version         int    `json:"v"`
+	Topic           string `json:"topic"`
+	Name            string `json:"name"`
+	Scope           string `json:"scope,omitempty"`
+	IncludeDeleting bool   `json:"include_deleting,omitempty"`
+}
+
+func decodeSubscriptionCursor(encoded string) (subscriptionCursor, error) {
+	var cursor subscriptionCursor
+	if encoded == "" || len(encoded) > maxSubscriptionCursorBytes {
+		return cursor, fmt.Errorf("%w: invalid subscription cursor", ErrInvalidArgument)
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return cursor, fmt.Errorf("%w: invalid subscription cursor", ErrInvalidArgument)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cursor); err != nil {
+		return subscriptionCursor{}, fmt.Errorf("%w: invalid subscription cursor", ErrInvalidArgument)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return subscriptionCursor{}, fmt.Errorf("%w: invalid subscription cursor", ErrInvalidArgument)
+	}
+	return cursor, nil
+}
+
+func subscriptionInfo(topic, name string, filterJSON sql.NullString) SubscriptionInfo {
+	info := SubscriptionInfo{Topic: topic, Name: name}
+	if filterJSON.Valid && filterJSON.String != "" {
+		var filter Filter
+		if json.Unmarshal([]byte(filterJSON.String), &filter) == nil {
+			info.Expr = filter.Expr
+		}
+	}
+	return info
+}
+
+func subscriptionPageItem(topic, name, state string, filterJSON sql.NullString) SubscriptionPageItem {
+	legacy := subscriptionInfo(topic, name, filterJSON)
+	return SubscriptionPageItem{Topic: legacy.Topic, Name: legacy.Name, Expr: legacy.Expr, State: state}
+}
+
 // ListSubscriptions returns every subscription with its topic and filter expression,
 // ordered by topic then name. (ListQueues shows the backing queues; this exposes the
 // topic membership + filter that ListQueues does not.)
 func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
 	var out []SubscriptionInfo
-	err := e.db.queryRows(ctx,
-		`SELECT topic, subscription, filter_json FROM subscriptions ORDER BY topic, subscription`,
+	err := e.db.queryRows(ctx, `
+		SELECT s.topic,s.subscription,s.filter_json
+		FROM subscriptions s JOIN queues q ON q.name=s.subscription
+		WHERE q.lifecycle_state='active'
+		ORDER BY s.topic,s.subscription`,
 		func(rows *sql.Rows) error {
 			for rows.Next() {
 				var topic, sub string
@@ -458,18 +609,103 @@ func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, err
 				if err := rows.Scan(&topic, &sub, &fj); err != nil {
 					return err
 				}
-				s := SubscriptionInfo{Topic: topic, Name: sub}
-				if fj.Valid && fj.String != "" {
-					var f Filter
-					if json.Unmarshal([]byte(fj.String), &f) == nil {
-						s.Expr = f.Expr
-					}
-				}
-				out = append(out, s)
+				out = append(out, subscriptionInfo(topic, sub, fj))
 			}
 			return rows.Err()
 		})
 	return out, err
+}
+
+// ListSubscriptionsWithOptions returns one bounded keyset page. Active-only is
+// the public default; IncludeDeleting exposes retained name reservations for
+// management and reconciliation.
+func (e *Engine) ListSubscriptionsWithOptions(ctx context.Context, opts ListSubscriptionsOptions) (SubscriptionPage, error) {
+	if opts.Limit < 0 || opts.Limit > maxSubscriptionPageSize {
+		return SubscriptionPage{}, fmt.Errorf("%w: subscription list limit must be between 0 and %d", ErrInvalidArgument, maxSubscriptionPageSize)
+	}
+	if opts.Limit == 0 {
+		opts.Limit = defaultSubscriptionPageSize
+	}
+
+	var cursor subscriptionCursor
+	if opts.After != "" {
+		var err error
+		cursor, err = decodeSubscriptionCursor(opts.After)
+		if err != nil || cursor.Version != subscriptionCursorVersion || cursor.Name == "" ||
+			cursor.Scope != opts.Topic || cursor.IncludeDeleting != opts.IncludeDeleting ||
+			(opts.Topic != "" && cursor.Topic != opts.Topic) || (opts.Topic == "" && cursor.Topic == "") {
+			return SubscriptionPage{}, fmt.Errorf("%w: invalid subscription cursor", ErrInvalidArgument)
+		}
+	}
+
+	page := SubscriptionPage{Subscriptions: []SubscriptionPageItem{}}
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		page = SubscriptionPage{Subscriptions: []SubscriptionPageItem{}}
+		where := ` WHERE 1=1`
+		args := make([]any, 0, 7)
+		if opts.Topic != "" {
+			where += ` AND s.topic=?`
+			args = append(args, opts.Topic)
+		}
+		if !opts.IncludeDeleting {
+			where += ` AND q.lifecycle_state='active'`
+		}
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM subscriptions s JOIN queues q ON q.name=s.subscription`+where,
+			args...).Scan(&page.Total); err != nil {
+			return err
+		}
+		if opts.After != "" {
+			if opts.Topic != "" {
+				where += ` AND s.subscription>?`
+				args = append(args, cursor.Name)
+			} else {
+				where += ` AND (s.topic,s.subscription)>(?,?)`
+				args = append(args, cursor.Topic, cursor.Name)
+			}
+		}
+		args = append(args, opts.Limit+1)
+		rows, err := tx.QueryContext(ctx, `
+			SELECT s.topic,s.subscription,s.filter_json,q.lifecycle_state
+			FROM subscriptions s JOIN queues q ON q.name=s.subscription`+where+`
+			ORDER BY s.topic,s.subscription LIMIT ?`, args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var topic, name, state string
+			var filterJSON sql.NullString
+			if err := rows.Scan(&topic, &name, &filterJSON, &state); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			page.Subscriptions = append(page.Subscriptions, subscriptionPageItem(topic, name, state, filterJSON))
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(page.Subscriptions) > opts.Limit {
+			page.Subscriptions = page.Subscriptions[:opts.Limit]
+			last := page.Subscriptions[len(page.Subscriptions)-1]
+			encoded, err := json.Marshal(subscriptionCursor{
+				Version:         subscriptionCursorVersion,
+				Topic:           last.Topic,
+				Name:            last.Name,
+				Scope:           opts.Topic,
+				IncludeDeleting: opts.IncludeDeleting,
+			})
+			if err != nil {
+				return err
+			}
+			page.NextAfter = base64.RawURLEncoding.EncodeToString(encoded)
+		}
+		return nil
+	})
+	return page, err
 }
 
 func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {

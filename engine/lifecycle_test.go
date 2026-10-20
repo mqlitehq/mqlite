@@ -53,6 +53,559 @@ func queueLifecycleState(t *testing.T, e *Engine, name string) (string, bool) {
 	return "", false
 }
 
+func disableForeignKeys(t *testing.T, e *Engine) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := e.db.exec(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	var enabled int
+	if err := e.db.queryRowScan(ctx, []any{&enabled}, `PRAGMA foreign_keys`); err != nil {
+		t.Fatalf("read foreign_keys pragma: %v", err)
+	}
+	if enabled != 0 {
+		t.Fatalf("foreign_keys=%d, want disabled regression environment", enabled)
+	}
+}
+
+func subscriptionMetadataRows(t *testing.T, e *Engine, name string) (mappings, queues int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := e.db.queryRowScan(ctx, []any{&mappings},
+		`SELECT COUNT(*) FROM subscriptions WHERE subscription=?`, name); err != nil {
+		t.Fatalf("count subscription mapping %q: %v", name, err)
+	}
+	if err := e.db.queryRowScan(ctx, []any{&queues},
+		`SELECT COUNT(*) FROM queues WHERE name=?`, name); err != nil {
+		t.Fatalf("count subscription queue %q: %v", name, err)
+	}
+	return mappings, queues
+}
+
+func TestDeleteSubscriptionExactEmptyAndForceSemantics(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	if err := e.Subscribe(ctx, "events", "worker", &Filter{Expr: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.loadQueue(ctx, "worker"); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.compiledFilter("worker", "true")
+	wake, release := e.note.subscribe("worker")
+	defer release()
+
+	for _, state := range []State{StateActive, StateLocked, StateScheduled, StateDeferred, StateCompleted, StateDeadLettered} {
+		if _, err := e.db.exec(ctx,
+			`INSERT INTO messages(queue,state,enqueued_at,body) VALUES(?,?,1,?)`,
+			"worker", string(state), []byte("discard")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.db.exec(ctx,
+		`INSERT INTO dedup(queue,message_id,request_hash,seq_number,seen_at) VALUES('worker','id','hash',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx,
+		`INSERT INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at)
+		 VALUES('token','worker',1,'completed','',1,9999999999999)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx,
+		`INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at)
+		 VALUES('worker','attempt','[]',1,9999999999999)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.DeleteSubscription(ctx, "wrong-topic", "worker"); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("wrong topic delete=%v, want ErrSubscriptionNotFound", err)
+	}
+	if err := e.DeleteSubscription(ctx, "events", "worker"); !errors.Is(err, ErrSubscriptionNotEmpty) {
+		t.Fatalf("non-empty delete=%v, want ErrSubscriptionNotEmpty", err)
+	}
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "events", "worker", DeleteOptions{Force: true})
+	if err != nil || !result.Deleted || result.State != "deleted" {
+		t.Fatalf("force delete result=%+v, error=%v", result, err)
+	}
+
+	for _, table := range []string{"messages", "dedup", "settlement_receipts", "receive_attempts"} {
+		if got := lifecycleRows(t, e, table, "worker"); got != 0 {
+			t.Fatalf("%s retained %d rows", table, got)
+		}
+	}
+	var mappings, queues int
+	if err := e.db.queryRowScan(ctx, []any{&mappings},
+		`SELECT COUNT(*) FROM subscriptions WHERE topic='events' AND subscription='worker'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.queryRowScan(ctx, []any{&queues},
+		`SELECT COUNT(*) FROM queues WHERE name='worker'`); err != nil {
+		t.Fatal(err)
+	}
+	if mappings != 0 || queues != 0 {
+		t.Fatalf("retained metadata: mappings=%d queues=%d", mappings, queues)
+	}
+	if _, err := e.SendOne(ctx, "events", OutMessage{}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("last subscription left topic routable: %v", err)
+	}
+	if _, err := e.SendOne(ctx, "worker", OutMessage{}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("deleted backing queue accepted send: %v", err)
+	}
+	if err := e.DeleteSubscription(ctx, "events", "worker"); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("repeat delete=%v, want ErrSubscriptionNotFound", err)
+	}
+
+	select {
+	case <-wake:
+	default:
+		t.Fatal("subscription deletion did not wake a registered receiver")
+	}
+	e.qmu.RLock()
+	_, queueCached := e.qcache["worker"]
+	e.qmu.RUnlock()
+	e.filterMu.Lock()
+	_, filterCached := e.filterCache["worker"]
+	e.filterMu.Unlock()
+	e.note.mu.Lock()
+	_, notifierRetained := e.note.chans["worker"]
+	e.note.mu.Unlock()
+	if queueCached || filterCached || notifierRetained {
+		t.Fatalf("retired in-memory state remains: queue=%t filter=%t notifier=%t", queueCached, filterCached, notifierRetained)
+	}
+
+	if err := e.Subscribe(ctx, "empty-topic", "empty", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeleteSubscription(ctx, "empty-topic", "empty"); err != nil {
+		t.Fatalf("empty subscription delete: %v", err)
+	}
+}
+
+func TestSubscriptionDeletionDoesNotDependOnForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	disableForeignKeys(t, e)
+
+	if err := e.Subscribe(ctx, "empty-topic", "empty-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "empty-topic", "empty-sub", DeleteOptions{})
+	if err != nil || !result.Deleted || result.State != "deleted" {
+		t.Fatalf("empty delete with foreign keys off=%+v, error=%v", result, err)
+	}
+	if mappings, queues := subscriptionMetadataRows(t, e, "empty-sub"); mappings != 0 || queues != 0 {
+		t.Fatalf("empty delete retained metadata with foreign keys off: mappings=%d queues=%d", mappings, queues)
+	}
+
+	if err := e.Subscribe(ctx, "forced-topic", "forced-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "forced-topic", OutMessage{Body: []byte("discard")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeleteSubscription(ctx, "forced-topic", "forced-sub"); !errors.Is(err, ErrSubscriptionNotEmpty) {
+		t.Fatalf("non-force delete with foreign keys off=%v, want ErrSubscriptionNotEmpty", err)
+	}
+	result, err = e.DeleteSubscriptionWithOptions(ctx, "forced-topic", "forced-sub", DeleteOptions{Force: true})
+	if err != nil || !result.Deleted || result.State != "deleted" {
+		t.Fatalf("forced delete with foreign keys off=%+v, error=%v", result, err)
+	}
+	if mappings, queues := subscriptionMetadataRows(t, e, "forced-sub"); mappings != 0 || queues != 0 {
+		t.Fatalf("forced delete retained metadata with foreign keys off: mappings=%d queues=%d", mappings, queues)
+	}
+}
+
+func TestSubscriptionBackgroundCleanupDoesNotDependOnForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: "file:" + filepath.Join(t.TempDir(), "background-foreign-keys-off.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	disableForeignKeys(t, e)
+	if err := e.Subscribe(ctx, "background-topic", "background-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	insertLifecycleMessages(t, e, "background-sub", lifecycleBatchRows+17, 1)
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "background-topic", "background-sub", DeleteOptions{Force: true})
+	if err != nil || result.Deleted || result.State != "deleting" {
+		t.Fatalf("bounded foreground delete=%+v, error=%v", result, err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mappings, queues := subscriptionMetadataRows(t, e, "background-sub")
+		if mappings == 0 && queues == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background cleanup retained metadata with foreign keys off: mappings=%d queues=%d", mappings, queues)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSubscriptionRestartCleanupDoesNotDependOnForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "restart-foreign-keys-off.db")
+	opts := Options{DB: "file:" + path, DisableBackground: true}
+	e, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disableForeignKeys(t, e)
+	if err := e.Subscribe(ctx, "restart-topic", "restart-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	insertLifecycleMessages(t, e, "restart-sub", lifecycleBatchRows+lifecyclePassRows+17, 1)
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "restart-topic", "restart-sub", DeleteOptions{Force: true})
+	if err != nil || result.Deleted || result.State != "deleting" {
+		t.Fatalf("bounded foreground delete=%+v, error=%v", result, err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err = Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if got := lifecycleRows(t, e, "messages", "restart-sub"); got != 17 {
+		t.Fatalf("startup cleanup remaining=%d, want 17", got)
+	}
+	disableForeignKeys(t, e)
+	e.RunMaintenanceOnce(ctx)
+	if mappings, queues := subscriptionMetadataRows(t, e, "restart-sub"); mappings != 0 || queues != 0 {
+		t.Fatalf("restart cleanup retained metadata with foreign keys off: mappings=%d queues=%d", mappings, queues)
+	}
+}
+
+func TestSubscriptionFinalMetadataConsumesTwoRows(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	disableForeignKeys(t, e)
+	if err := e.Subscribe(ctx, "topic", "sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx,
+		`UPDATE queues SET lifecycle_state='deleting',delete_started_at=1 WHERE name='sub'`); err != nil {
+		t.Fatal(err)
+	}
+
+	var firstDone bool
+	var firstBudget cleanupBudget
+	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		firstBudget = cleanupBudget{rows: 1, bytes: lifecycleBatchBytes}
+		var err error
+		firstDone, err = e.cleanEntityTx(ctx, tx, "sub", "subscription", &firstBudget)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if firstDone || firstBudget.rows != 1 {
+		t.Fatalf("one-row budget retired two metadata rows: done=%t budget=%+v", firstDone, firstBudget)
+	}
+	if state, ok := queueLifecycleState(t, e, "sub"); !ok || state != "deleting" {
+		t.Fatalf("subscription reservation state=(%q,%t)", state, ok)
+	}
+
+	var secondDone bool
+	var secondBudget cleanupBudget
+	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		secondBudget = cleanupBudget{rows: 2, bytes: lifecycleBatchBytes}
+		var err error
+		secondDone, err = e.cleanEntityTx(ctx, tx, "sub", "subscription", &secondBudget)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !secondDone || secondBudget.rows != 0 {
+		t.Fatalf("two-row metadata retirement: done=%t budget=%+v", secondDone, secondBudget)
+	}
+	var mappings int
+	if err := e.db.queryRowScan(ctx, []any{&mappings},
+		`SELECT COUNT(*) FROM subscriptions WHERE subscription='sub'`); err != nil || mappings != 0 {
+		t.Fatalf("retained mappings=%d, error=%v", mappings, err)
+	}
+}
+
+func TestSubscriptionMetadataRetirementMismatchRollsBack(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	disableForeignKeys(t, e)
+	if err := e.Subscribe(ctx, "topic", "sub", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The mapping DELETE succeeds first, but the active queue does not match the
+	// final deleting-row predicate. The returned error must roll the mapping back.
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		done, removed, err := e.deleteEntityMetadataTx(ctx, tx, "sub", "subscription", false)
+		if err == nil || done || removed != 0 {
+			t.Fatalf("mismatched retirement: done=%t removed=%d error=%v", done, removed, err)
+		}
+		return err
+	})
+	if !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("mismatched retirement error=%v, want ErrQueueNotFound", err)
+	}
+	if mappings, queues := subscriptionMetadataRows(t, e, "sub"); mappings != 1 || queues != 1 {
+		t.Fatalf("mismatched retirement committed partial metadata: mappings=%d queues=%d", mappings, queues)
+	}
+}
+
+func TestSubscriptionDeletionBoundedRestartableAndNameReserved(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "subscription-lifecycle.db")
+	now := int64(1_700_000_000_000)
+	opts := Options{DB: "file:" + path, DisableBackground: true, Now: func() int64 { return now }}
+	e, err := Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Subscribe(ctx, "topic", "large-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	const rows = lifecycleBatchRows + lifecyclePassRows + 17
+	insertLifecycleMessages(t, e, "large-sub", rows, 1)
+
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "topic", "large-sub", DeleteOptions{Force: true})
+	if err != nil || result.Deleted || result.State != "deleting" {
+		t.Fatalf("foreground delete=%+v, error=%v", result, err)
+	}
+	if got := lifecycleRows(t, e, "messages", "large-sub"); got != rows-lifecycleBatchRows {
+		t.Fatalf("foreground remaining=%d, want %d", got, rows-lifecycleBatchRows)
+	}
+	if err := e.Subscribe(ctx, "topic", "large-sub", nil); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("deleting subscription name was reusable: %v", err)
+	}
+	if _, err := e.SendOne(ctx, "topic", OutMessage{}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("topic routed to deleting subscription: %v", err)
+	}
+	page, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "topic", IncludeDeleting: true})
+	if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 || page.Subscriptions[0].State != "deleting" {
+		t.Fatalf("deleting inventory=%+v, error=%v", page, err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err = Open(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if got := lifecycleRows(t, e, "messages", "large-sub"); got != 17 {
+		t.Fatalf("startup bounded cleanup remaining=%d, want 17", got)
+	}
+	if state, ok := queueLifecycleState(t, e, "large-sub"); !ok || state != "deleting" {
+		t.Fatalf("restart lost reservation: state=(%q,%t)", state, ok)
+	}
+	e.RunMaintenanceOnce(ctx)
+	if _, ok := queueLifecycleState(t, e, "large-sub"); ok {
+		t.Fatal("follow-up maintenance did not finish subscription deletion")
+	}
+	if err := e.Subscribe(ctx, "topic", "large-sub", nil); err != nil {
+		t.Fatalf("same-name recreation after physical cleanup: %v", err)
+	}
+}
+
+func TestConcurrentTopicPublishAndForceDeleteSubscription(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	for i := 0; i < 24; i++ {
+		topic := fmt.Sprintf("topic-%02d", i)
+		name := fmt.Sprintf("sub-%02d", i)
+		if err := e.Subscribe(ctx, topic, name, nil); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var sendErr, deleteErr error
+		var result DeleteResult
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, sendErr = e.SendOne(ctx, topic, OutMessage{Body: []byte("race")})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			result, deleteErr = e.DeleteSubscriptionWithOptions(ctx, topic, name, DeleteOptions{Force: true})
+		}()
+		close(start)
+		wg.Wait()
+		if sendErr != nil && !errors.Is(sendErr, ErrQueueNotFound) {
+			t.Fatalf("iteration %d send error=%v", i, sendErr)
+		}
+		if deleteErr != nil || !result.Deleted {
+			t.Fatalf("iteration %d delete=%+v, error=%v", i, result, deleteErr)
+		}
+		if got := lifecycleRows(t, e, "messages", name); got != 0 {
+			t.Fatalf("iteration %d left %d messages after deletion", i, got)
+		}
+		if _, err := e.SendOne(ctx, topic, OutMessage{}); !errors.Is(err, ErrQueueNotFound) {
+			t.Fatalf("iteration %d topic remained routable: %v", i, err)
+		}
+	}
+}
+
+func TestConcurrentTopicPublishAndEmptyDeleteSubscription(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	for i := 0; i < 64; i++ {
+		topic := fmt.Sprintf("empty-race-topic-%02d", i)
+		name := fmt.Sprintf("empty-race-sub-%02d", i)
+		if err := e.Subscribe(ctx, topic, name, nil); err != nil {
+			t.Fatal(err)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var sendErr, deleteErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, sendErr = e.SendOne(ctx, topic, OutMessage{Body: []byte("must-not-be-lost")})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			deleteErr = e.DeleteSubscription(ctx, topic, name)
+		}()
+		close(start)
+		wg.Wait()
+
+		switch {
+		case sendErr == nil:
+			if !errors.Is(deleteErr, ErrSubscriptionNotEmpty) {
+				t.Fatalf("iteration %d: successful send paired with delete error %v, want ErrSubscriptionNotEmpty", i, deleteErr)
+			}
+			if got := lifecycleRows(t, e, "messages", name); got != 1 {
+				t.Fatalf("iteration %d: successful send retained %d messages, want 1", i, got)
+			}
+			if mappings, queues := subscriptionMetadataRows(t, e, name); mappings != 1 || queues != 1 {
+				t.Fatalf("iteration %d: rejected empty-delete changed metadata: mappings=%d queues=%d", i, mappings, queues)
+			}
+			if result, err := e.DeleteSubscriptionWithOptions(ctx, topic, name, DeleteOptions{Force: true}); err != nil || !result.Deleted {
+				t.Fatalf("iteration %d: cleanup force delete=%+v, error=%v", i, result, err)
+			}
+
+		case deleteErr == nil:
+			if !errors.Is(sendErr, ErrQueueNotFound) {
+				t.Fatalf("iteration %d: successful delete paired with send error %v, want ErrQueueNotFound", i, sendErr)
+			}
+			if got := lifecycleRows(t, e, "messages", name); got != 0 {
+				t.Fatalf("iteration %d: successful delete allowed %d messages", i, got)
+			}
+			if mappings, queues := subscriptionMetadataRows(t, e, name); mappings != 0 || queues != 0 {
+				t.Fatalf("iteration %d: successful delete retained metadata: mappings=%d queues=%d", i, mappings, queues)
+			}
+
+		default:
+			t.Fatalf("iteration %d: neither operation won: send=%v delete=%v", i, sendErr, deleteErr)
+		}
+	}
+}
+
+func TestSubscriptionLimitCountsDeletingAndAllowsFilterUpdate(t *testing.T) {
+	ctx := context.Background()
+	if e, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true, MaxSubscriptions: -1}); !errors.Is(err, ErrInvalidArgument) || e != nil {
+		t.Fatalf("negative max subscriptions: engine=%v error=%v", e, err)
+	}
+	e, err := Open(ctx, Options{
+		DB:                "file:" + filepath.Join(t.TempDir(), "subscription-limit.db"),
+		DisableBackground: true,
+		MaxSubscriptions:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.CreateQueue(ctx, "bare", QueueConfig{Kind: "subscription"}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("public orphan backing queue creation=%v", err)
+	}
+	// A pre-upgrade orphan can still be repaired through Subscribe, but attaching
+	// it is a new mapping and therefore cannot bypass the configured capacity.
+	if _, err := e.db.exec(ctx,
+		`INSERT INTO queues(name,kind,created_at,updated_at) VALUES('legacy-orphan','subscription',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Subscribe(ctx, "topic", "first", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Subscribe(ctx, "topic", "first", &Filter{Expr: "true"}); err != nil {
+		t.Fatalf("filter update at capacity: %v", err)
+	}
+	if err := e.Subscribe(ctx, "legacy", "legacy-orphan", nil); !errors.Is(err, ErrSubscriptionLimit) {
+		t.Fatalf("legacy orphan attachment bypassed capacity: %v", err)
+	}
+	insertLifecycleMessages(t, e, "first", lifecycleBatchRows+1, 1)
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "topic", "first", DeleteOptions{Force: true})
+	if err != nil || result.Deleted || result.State != "deleting" {
+		t.Fatalf("bounded delete=%+v, error=%v", result, err)
+	}
+	if err := e.Subscribe(ctx, "topic", "second", nil); !errors.Is(err, ErrSubscriptionLimit) {
+		t.Fatalf("deleting subscription did not consume capacity: %v", err)
+	}
+	e.RunMaintenanceOnce(ctx)
+	if err := e.Subscribe(ctx, "legacy", "legacy-orphan", nil); err != nil {
+		t.Fatalf("cleanup did not release capacity for legacy orphan repair: %v", err)
+	}
+}
+
+func TestConcurrentSubscriptionCreationCannotExceedLimit(t *testing.T) {
+	ctx := context.Background()
+	const limit = 8
+	const contenders = 32
+	e, err := Open(ctx, Options{
+		DB:                "file:" + filepath.Join(t.TempDir(), "subscription-limit-race.db"),
+		DisableBackground: true,
+		MaxSubscriptions:  limit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	start := make(chan struct{})
+	results := make(chan error, contenders)
+	var wg sync.WaitGroup
+	for i := 0; i < contenders; i++ {
+		name := fmt.Sprintf("sub-%02d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- e.Subscribe(ctx, "topic", name, nil)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	succeeded, limited := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrSubscriptionLimit):
+			limited++
+		default:
+			t.Fatalf("unexpected concurrent creation error: %v", err)
+		}
+	}
+	if succeeded != limit || limited != contenders-limit {
+		t.Fatalf("concurrent admission successes=%d limited=%d, want %d/%d", succeeded, limited, limit, contenders-limit)
+	}
+	page, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "topic", Limit: maxSubscriptionPageSize})
+	if err != nil || page.Total != limit || len(page.Subscriptions) != limit {
+		t.Fatalf("retained subscription count=%+v, error=%v", page, err)
+	}
+}
+
 func TestForceDeleteCleansAllMessageStatesAndAuxiliaryRows(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
@@ -1057,7 +1610,9 @@ func TestMessageParentDeleteStaysIndexedBesideDeepUnrelatedBacklog(t *testing.T)
 func TestSubscriptionChildIndexIsUniqueAndUsedForParentDelete(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
-	mustQueue(t, e, "subscription-child", QueueConfig{Kind: "subscription"})
+	if err := e.Subscribe(ctx, "topic-a", "subscription-child", nil); err != nil {
+		t.Fatal(err)
+	}
 
 	var unique int
 	if err := e.db.queryRowScanUnobserved(ctx, []any{&unique},
@@ -1066,10 +1621,6 @@ func TestSubscriptionChildIndexIsUniqueAndUsedForParentDelete(t *testing.T) {
 	}
 	if unique != 1 {
 		t.Fatalf("idx_subs_by_subscription unique=%d, want 1", unique)
-	}
-	if _, err := e.db.execUnobserved(ctx,
-		`INSERT INTO subscriptions(topic,subscription,created_at) VALUES('topic-a','subscription-child',1)`); err != nil {
-		t.Fatal(err)
 	}
 	if _, err := e.db.execUnobserved(ctx,
 		`INSERT INTO subscriptions(topic,subscription,created_at) VALUES('topic-b','subscription-child',1)`); err == nil ||

@@ -140,6 +140,7 @@ func (s *Server) routes() {
 	h(wire.PathSubscribe, engine.KeyManage, s.handleSubscribe)
 	h(wire.PathListQueues, engine.KeyManage, s.handleListQueues)
 	h(wire.PathListSubscriptions, engine.KeyManage, s.handleListSubscriptions)
+	h(wire.PathListSubscriptionsPage, engine.KeyManage, s.handleListSubscriptionsPage)
 	h(wire.PathTestFilter, engine.KeyManage, s.handleTestFilter)
 	h(wire.PathRedrive, engine.KeyManage, s.handleRedrive)
 	h(wire.PathPurge, engine.KeyManage, s.handlePurge)
@@ -149,6 +150,7 @@ func (s *Server) routes() {
 	h(wire.PathListKeys, engine.KeyManage, s.authEnabled(s.handleListKeys))
 	h(wire.PathRevokeKey, engine.KeyManage, s.authEnabled(s.handleRevokeKey))
 	h(wire.PathDeleteQueue, engine.KeyManage, s.handleDeleteQueue)
+	h(wire.PathDeleteSubscription, engine.KeyManage, s.handleDeleteSubscription)
 	s.mux.HandleFunc("/metrics", s.authorize(monitorPermission, s.handleMetrics))
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -390,12 +392,16 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusForbidden, "permission_denied", "access key lacks the required permission")
 	case errors.Is(err, engine.ErrKeyConflict):
 		writeErr(w, http.StatusConflict, "key_conflict", err.Error())
-	case errors.Is(err, engine.ErrQueueNotFound), errors.Is(err, engine.ErrNotFound):
+	case errors.Is(err, engine.ErrSubscriptionNotFound), errors.Is(err, engine.ErrQueueNotFound), errors.Is(err, engine.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, engine.ErrDedupConflict):
 		writeErr(w, http.StatusConflict, "already_exists", err.Error())
 	case errors.Is(err, engine.ErrQueueNotEmpty):
 		writeErr(w, http.StatusConflict, "queue_not_empty", err.Error())
+	case errors.Is(err, engine.ErrSubscriptionNotEmpty):
+		writeErr(w, http.StatusConflict, "subscription_not_empty", err.Error())
+	case errors.Is(err, engine.ErrSubscriptionLimit):
+		writeErr(w, http.StatusTooManyRequests, "resource_exhausted", err.Error())
 	case errors.Is(err, engine.ErrNameConflict):
 		writeErr(w, http.StatusConflict, "name_conflict", err.Error())
 	case errors.Is(err, engine.ErrGroupRequired):
@@ -735,6 +741,21 @@ func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, wire.DeleteQueueResponse{Deleted: result.Deleted, State: result.State})
 }
 
+func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
+	var req wire.DeleteSubscriptionRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	logf(w, "topic", req.Topic, "sub", req.Name)
+	result, err := s.eng.DeleteSubscriptionWithOptions(r.Context(), req.Topic, req.Name, engine.DeleteOptions{Force: req.Force})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, wire.DeleteSubscriptionResponse{Deleted: result.Deleted, State: result.State})
+}
+
 func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
 	var req wire.CreateQueueRequest
 	if err := decode(r, &req); err != nil {
@@ -788,6 +809,30 @@ func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request)
 	resp := wire.ListSubscriptionsResponse{Subscriptions: make([]wire.SubscriptionJSON, len(subs))}
 	for i, su := range subs {
 		resp.Subscriptions[i] = wire.SubscriptionJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr}
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleListSubscriptionsPage(w http.ResponseWriter, r *http.Request) {
+	var req wire.ListSubscriptionsPageRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	page, err := s.eng.ListSubscriptionsWithOptions(r.Context(), engine.ListSubscriptionsOptions{
+		Topic: req.Topic, After: req.After, Limit: req.Limit, IncludeDeleting: req.IncludeDeleting,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	resp := wire.ListSubscriptionsPageResponse{
+		Subscriptions: make([]wire.SubscriptionPageJSON, len(page.Subscriptions)),
+		Total:         page.Total,
+		NextAfter:     page.NextAfter,
+	}
+	for i, su := range page.Subscriptions {
+		resp.Subscriptions[i] = wire.SubscriptionPageJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr, State: su.State}
 	}
 	writeJSON(w, resp)
 }

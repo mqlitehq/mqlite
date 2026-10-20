@@ -38,6 +38,7 @@ reasonable (they count toward the JSON request you send, not toward the body cap
 | `max_messages` per `Receive` | 256 (max) | request field |
 | `wait_time_ms` long-poll | 20000 (max) | request field |
 | `Peek` `max` | 32 default, 1000 max | request field |
+| retained subscriptions | 10,000 active + deleting | `MQLITE_MAX_SUBSCRIPTIONS` (serve) / `Options.MaxSubscriptions` or `WithMaxSubscriptions` (embedded) |
 | filter `expr` source | capped length + AST node count | internal (see [concepts.md](concepts.md#subscription-filters-expr)) |
 
 ## The base URL
@@ -476,9 +477,11 @@ work.
   `state:"deleted"` response, or confirm that `ListQueues` no longer contains a
   previously deleting name, before creating its replacement. Never replay an old
   deletion after recreation.
-- The SDK and MCP client send a lifecycle delete at most once: they do not follow
-  HTTP redirects, and transport failures, redirects or invalid successful
-  acknowledgements are `outcome_unknown`. Keep the name reserved and inspect
+- The SDK and MCP client each call their configured HTTP transport once and do not
+  follow HTTP redirects. Transport failures, redirects, every HTTP 5xx response
+  (including a gateway-generated response), and invalid successful
+  acknowledgements are `outcome_unknown`. Configure custom transports and proxies
+  not to retry these destructive routes. Keep the name reserved and inspect
   `ListQueues`. Under the single-owner rule, an absent row confirms the deletion;
   a `deleting` row means cleanup is still running. Never use another delete as a
   status check or automatically retry it. The engine performs up to 30 one-second
@@ -504,6 +507,37 @@ is still cleaning up, the console reconciles with `ListQueues`; it does not issu
 second delete that could target a same-name replacement. Older brokers report the
 operation as unsupported.
 
+### DeleteSubscription
+
+Deletes one exact topic/subscription pair. It uses the same durable, bounded
+lifecycle as `DeleteQueue`, but owns both the topic roster mapping and the
+subscription's backing queue.
+
+- POST `/mqlite.v1.AdminService/DeleteSubscription`
+- Request: `{"topic":"events","name":"worker"}` or the same object with
+  `"force":true`. A wrong topic for a globally unique subscription name is
+  `404 not_found`; it never selects the subscription by name alone.
+- Response: `{"deleted":true,"state":"deleted"}` or
+  `{"deleted":false,"state":"deleting"}`. Without force, any retained
+  message state returns `409 subscription_not_empty`. Force is the caller's
+  durable authorization to discard all states, including locked deliveries.
+- The accepted transaction first marks the backing queue `deleting`. It is then
+  excluded from topic fan-out and direct queue operations immediately, while its
+  mapping and name remain available for reconciliation. Final physical removal
+  removes the mapping in the same transaction. Retiring the last active
+  subscription therefore makes the implicit topic unavailable for fan-out
+  immediately. A deleting mapping keeps the topic address reserved until physical
+  cleanup completes.
+- The SDK methods are `DeleteSubscription` (empty-only) and
+  `DeleteSubscriptionWithOptions(..., DeleteSubscriptionOpts{Force:true})`.
+  The built-in destructive clients call their HTTP transport once and classify
+  redirects, transport failures, every HTTP 5xx, and invalid success bodies as an
+  uncertain outcome. Reconcile that outcome with `ListSubscriptionsPage` using
+  the same topic and `include_deleting:true`; do not replay the deletion.
+- Subscription identity is still name-only. One owner must serialize deletion
+  and recreation, and temporary subscription names should be globally unique and
+  used for only one lifetime.
+
 ### CreateQueue
 
 Create a queue, or **update** one (idempotent **upsert** on `name`: calling it again
@@ -515,13 +549,13 @@ rejected with `409 name_conflict` instead of silently taking over
 ([concepts → provisioning](concepts.md#provisioning--what-you-create-vs-what-is-created-for-you)).
 **Response** `{}` (Empty).
 
-**Request** `CreateQueueRequest`: `name` (string) + `config` (`QueueConfigJSON`, all
-fields optional — omit one to take its default). Every duration is **epoch milliseconds**.
+**Request** `CreateQueueRequest`: `name` (valid UTF-8, 1–128 bytes) + `config`
+(`QueueConfigJSON`, all fields optional — omit one to take its default). Every duration is **epoch milliseconds**.
 Config is **queue-level**: it's set here, not per `Send`/`Receive`.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `kind` | string | `queue` | `queue` (normal) or `subscription` (a topic's backing queue — normally created via `Subscribe`, not by hand). |
+| `kind` | string | `queue` | `queue` (normal). `subscription` can reconfigure an existing legitimate backing queue through the advanced engine/wire surface, but cannot create a backing queue without a topic mapping; use `Subscribe` to create one. |
 | `lock_duration_ms` | int (ms) | `30000` (30s) | the **peek-lock window**: how long a `Receive`'d message stays invisible to other consumers before its lock expires and it's redelivered. `Renew` extends a held lock by this same amount. There is **no per-`Receive` override** — it's fixed by the queue. `0` → the 30s default. |
 | `max_delivery_count` | int | `10` | how many delivery attempts before a message is dead-lettered (`reason=MaxDeliveryCountExceeded`). Reached at `>=` (the Nth delivery is the last). `0` → the default of 10. |
 | `default_ttl_ms` | int (ms) | `0` = unlimited | per-message time-to-live applied when a `Send` doesn't set its own `ttl_ms`. On expiry the message goes to the DLQ or is discarded — see `dead_letter_on_expire`. |
@@ -550,11 +584,22 @@ Register subscription `name` under `topic` (creates its backing queue).
 
 - **Request** `SubscribeRequest`: `topic`, `name`, `filter` (optional —
   `{"expr": "<predicate>"}`, an [expr boolean over the message](concepts.md#subscription-filters-expr); empty/omitted
-  matches all). A malformed expr is rejected with `400 invalid_argument`. **Response** `{}`.
+  matches all). Topic and subscription names are valid UTF-8 strings of 1–128
+  bytes. A malformed expr or name is rejected with `400 invalid_argument`.
+  **Response** `{}`.
 - Name conflicts are rejected with `409 name_conflict`: a `topic` that names an
   existing queue or subscription, a `name` that belongs to a plain queue / another
   topic's subscription / a live topic, and `topic == name`. Re-subscribing the same
   `(topic, name)` is the idempotent filter-update path and succeeds.
+- Active and deleting subscriptions share a configurable global capacity. The
+  default is 10,000. Creating a new mapping at capacity returns
+  `429 resource_exhausted`; updating the filter of an existing active mapping is
+  still allowed. A deleting mapping releases its slot only after bounded physical
+  cleanup completes.
+- A database created by an older build may contain a `kind=subscription` backing
+  queue with no topic mapping. When capacity is available, repair it by calling
+  `Subscribe` for the intended topic/name, then use `DeleteSubscription` if the
+  orphan should be retired. Do not edit MQLite-owned tables directly.
 
 ### ListQueues
 
@@ -566,8 +611,36 @@ Register subscription `name` under `topic` (creates its backing queue).
 ### ListSubscriptions
 
 - **Request** `{}`. **Response** `{subscriptions: [{topic, name, expr}]}` — every
-  subscription with its topic and [filter expression](concepts.md#subscription-filters-expr) (`expr` empty = match
-  all). `ListQueues` shows the backing queues; this exposes the topic + filter it omits.
+  active subscription with its topic and [filter expression](concepts.md#subscription-filters-expr) (`expr` empty = match
+  all). This compatibility route is intentionally not paged. The configured
+  subscription ceiling bounds its maximum size; new integrations should use the
+  paged route below. The Go SDK retains the original three-field
+  `SubscriptionInfo` type for this method.
+
+### ListSubscriptionsPage
+
+- POST `/mqlite.v1.AdminService/ListSubscriptionsPage`.
+- Request fields: `topic` (optional exact topic), `after` (an opaque cursor from
+  the previous response), `limit` (`0` or omitted = 100, maximum 1,000), and
+  `include_deleting` (default false).
+- Response:
+  `{"subscriptions":[{"topic","name","expr","state"}],"total":N,"next_after":"..."}`.
+  `state` is `active` or `deleting`; `next_after` is omitted on the final page.
+  `total` counts the complete selected scope at the snapshot used for that
+  request and is independent of `after`/`limit`. Go page entries use
+  `SubscriptionPageItem`, whose required `State` field is separate from the
+  legacy `SubscriptionInfo` type.
+- Ordering is `(topic,name)` and pagination is keyset-based. Cursors are opaque
+  and bound to `topic` plus `include_deleting`; reusing one with a different
+  scope returns `400 invalid_argument`. `limit` may change between pages.
+- Each request is internally consistent. A sequence of requests is not a frozen
+  database snapshot, so concurrent creates and deletes can change later pages and
+  their `total`. Consumers that need a stable administrative export should quiesce
+  subscription changes for the traversal.
+- The Go SDK and MCP tool reject a successful page that is null, incomplete,
+  oversized, out of order, outside the requested topic/state scope, or inconsistent
+  with its `total`, page size, or cursor progress. Such a response is not valid
+  evidence for destructive-operation reconciliation.
 
 ### TestFilter
 
@@ -658,18 +731,26 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 400 | `group_required` | a `group_fifo` send with no `group_id` |
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
 | 403 | `permission_denied` | a valid key lacks permission, or key management was attempted with auth disabled (`mqlite.ErrPermissionDenied`) |
-| 404 | `not_found` | the queue or message doesn't exist; or an unknown path |
+| 404 | `not_found` | the queue, exact topic/subscription pair, or message doesn't exist; or an unknown path |
 | 409 | `already_exists` | single-message dedup conflict (same id, different body) |
 | 409 | `name_conflict` | a queue/subscription/topic name collision at creation time, including a name reserved by a deleting queue — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
 | 409 | `key_conflict` | a managed key ID or token digest is already registered (`mqlite.ErrKeyConflict`); no existing secret is returned |
 | 409 | `lock_lost` | settle with an expired or wrong `lock_token` |
 | 409 | `queue_not_empty` | deletion found retained messages in at least one state |
+| 409 | `subscription_not_empty` | subscription deletion found retained messages in at least one state |
+| 429 | `resource_exhausted` | the active plus deleting subscription capacity is full (`mqlite.ErrSubscriptionLimit`) |
 | 413 | `message_too_large` | body over `MaxMessageBytes` (default 1 MiB) |
 | 499 | `canceled` | the client canceled the request |
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
 
+The `503 outcome_unknown` row describes a response generated by the broker. The
+Go SDK treats every HTTP 5xx received for a lifecycle delete as
+`ErrOutcomeUnknown`, even when its envelope says `internal`, because an
+intermediary may have generated that response after the broker committed.
+
 The Go SDK re-exports sentinel errors such as `mqlite.ErrLockLost`,
 `ErrDedupConflict`, `ErrInvalidArgument` and `ErrOutcomeUnknown`, so `errors.Is`
-works in both embedded and client mode. An accepted queue deletion is a successful
-operation even when its typed HTTP result is `state:"deleting"`.
+works in both embedded and client mode. An accepted queue or subscription
+deletion is a successful operation even when its typed HTTP result is
+`state:"deleting"`.

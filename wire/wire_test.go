@@ -13,6 +13,14 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
+// Keep the released legacy wire type's exact field order, tags and arity. This
+// preserves external unkeyed SubscriptionJSON literals at compile time.
+var _ struct {
+	Topic string `json:"topic"`
+	Name  string `json:"name"`
+	Expr  string `json:"expr,omitempty"`
+} = wire.SubscriptionJSON{}
+
 // The JSON field names ARE the contract between the broker and every client
 // (curl, the Go SDK, future SDKs). Pin them so a struct-tag edit can't silently
 // break the wire format (MQLITE-26).
@@ -88,6 +96,52 @@ func TestDeleteQueueJSONContract(t *testing.T) {
 		}
 		if !tc.ok && decodeErr == nil {
 			t.Errorf("DecodeDeleteQueueResponse(%s) accepted %+v", tc.body, got)
+		}
+	}
+}
+
+func TestSubscriptionLifecycleJSONContract(t *testing.T) {
+	request, err := json.Marshal(wire.DeleteSubscriptionRequest{Topic: "events", Name: "worker", Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(request) != `{"topic":"events","name":"worker","force":true}` {
+		t.Fatalf("delete request = %s", request)
+	}
+	pageRequest, err := json.Marshal(wire.ListSubscriptionsPageRequest{
+		Topic: "events", After: "cursor", Limit: 25, IncludeDeleting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(pageRequest) != `{"topic":"events","after":"cursor","limit":25,"include_deleting":true}` {
+		t.Fatalf("page request = %s", pageRequest)
+	}
+	pageResponse, err := json.Marshal(wire.ListSubscriptionsPageResponse{
+		Subscriptions: []wire.SubscriptionPageJSON{{Topic: "events", Name: "worker", State: "deleting"}},
+		Total:         1, NextAfter: "next",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(pageResponse) != `{"subscriptions":[{"topic":"events","name":"worker","state":"deleting"}],"total":1,"next_after":"next"}` {
+		t.Fatalf("page response = %s", pageResponse)
+	}
+	legacyResponse, err := json.Marshal(wire.ListSubscriptionsResponse{
+		Subscriptions: []wire.SubscriptionJSON{{Topic: "events", Name: "worker"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(legacyResponse) != `{"subscriptions":[{"topic":"events","name":"worker"}]}` {
+		t.Fatalf("legacy response = %s", legacyResponse)
+	}
+
+	for _, body := range []string{`{"deleted":true,"state":"deleted"}`, `{"deleted":false,"state":"deleting"}`} {
+		generic, genericErr := wire.DecodeDeleteResponse([]byte(body))
+		legacy, legacyErr := wire.DecodeDeleteQueueResponse([]byte(body))
+		if genericErr != nil || legacyErr != nil || generic != legacy {
+			t.Fatalf("shared deletion acknowledgement %s = %+v/%v, %+v/%v", body, generic, genericErr, legacy, legacyErr)
 		}
 	}
 }

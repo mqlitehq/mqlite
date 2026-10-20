@@ -15,7 +15,9 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -621,5 +623,135 @@ func TestListSubscriptions(t *testing.T) {
 	}
 	if by["gold"].Expr != `properties["tier"]=="gold"` {
 		t.Errorf("gold expr: %+v", by["gold"])
+	}
+}
+
+func TestListSubscriptionsWithOptionsPaginationAndDeletingScope(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	for _, pair := range [][2]string{{"a", "a1"}, {"a", "a2"}, {"b", "b1"}, {"a", "a0"}} {
+		if err := e.Subscribe(ctx, pair[0], pair[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at)
+	  SELECT 'a0',printf('attempt-%d',i),'[]',1,9999999999999 FROM n`, lifecycleBatchRows); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.DeleteSubscriptionWithOptions(ctx, "a", "a0", DeleteOptions{})
+	if err != nil || result.Deleted || result.State != "deleting" {
+		t.Fatalf("prepare deleting subscription=%+v, error=%v", result, err)
+	}
+
+	first, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "a", Limit: 1})
+	if err != nil || first.Total != 2 || len(first.Subscriptions) != 1 ||
+		first.Subscriptions[0].Name != "a1" || first.Subscriptions[0].State != "active" || first.NextAfter == "" {
+		t.Fatalf("first active page=%+v, error=%v", first, err)
+	}
+	second, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "a", Limit: 1, After: first.NextAfter})
+	if err != nil || second.Total != 2 || len(second.Subscriptions) != 1 ||
+		second.Subscriptions[0].Name != "a2" || second.NextAfter != "" {
+		t.Fatalf("second active page=%+v, error=%v", second, err)
+	}
+	if _, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "b", After: first.NextAfter}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("cross-topic cursor=%v, want ErrInvalidArgument", err)
+	}
+	if _, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "a", IncludeDeleting: true, After: first.NextAfter}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("cross-visibility cursor=%v, want ErrInvalidArgument", err)
+	}
+	for _, opts := range []ListSubscriptionsOptions{
+		{After: "not-base64!"},
+		{After: base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"topic":"a","name":"a1","scope":"a","extra":true}`)), Topic: "a"},
+		{After: strings.Repeat("A", maxSubscriptionCursorBytes+1)},
+		{Limit: -1},
+		{Limit: maxSubscriptionPageSize + 1},
+	} {
+		if _, err := e.ListSubscriptionsWithOptions(ctx, opts); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("invalid options %+v returned %v", opts, err)
+		}
+	}
+
+	all, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: "a", IncludeDeleting: true})
+	if err != nil || all.Total != 3 || len(all.Subscriptions) != 3 {
+		t.Fatalf("include-deleting page=%+v, error=%v", all, err)
+	}
+	if all.Subscriptions[0].Name != "a0" || all.Subscriptions[0].State != "deleting" {
+		t.Fatalf("deleting reservation missing from ordered inventory: %+v", all.Subscriptions)
+	}
+	legacy, err := e.ListSubscriptions(ctx)
+	if err != nil || len(legacy) != 3 {
+		t.Fatalf("legacy active inventory=%+v, error=%v", legacy, err)
+	}
+	for _, sub := range legacy {
+		if sub.Name == "a0" {
+			t.Fatalf("legacy inventory exposed deleting subscription: %+v", legacy)
+		}
+	}
+
+	globalFirst, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Limit: 2})
+	if err != nil || globalFirst.Total != 3 || len(globalFirst.Subscriptions) != 2 ||
+		globalFirst.Subscriptions[0].Name != "a1" || globalFirst.Subscriptions[1].Name != "a2" || globalFirst.NextAfter == "" {
+		t.Fatalf("global first page=%+v, error=%v", globalFirst, err)
+	}
+	globalSecond, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Limit: 2, After: globalFirst.NextAfter})
+	if err != nil || globalSecond.Total != 3 || len(globalSecond.Subscriptions) != 1 ||
+		globalSecond.Subscriptions[0].Topic != "b" || globalSecond.Subscriptions[0].Name != "b1" || globalSecond.NextAfter != "" {
+		t.Fatalf("global second page=%+v, error=%v", globalSecond, err)
+	}
+}
+
+func TestSubscriptionCursorRoundTripsMaximumTopicName(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	topic := strings.Repeat("é", maxAddressNameBytes/2) // 128 UTF-8 bytes.
+	if len(topic) != maxAddressNameBytes {
+		t.Fatalf("test topic is %d bytes, want %d", len(topic), maxAddressNameBytes)
+	}
+	for _, name := range []string{"a", "b"} {
+		if err := e.Subscribe(ctx, topic, name, nil); err != nil {
+			t.Fatalf("subscribe at topic boundary: %v", err)
+		}
+	}
+	first, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: topic, Limit: 1})
+	if err != nil || len(first.Subscriptions) != 1 || first.NextAfter == "" || len(first.NextAfter) > maxSubscriptionCursorBytes {
+		t.Fatalf("maximum-topic first page=%+v, cursor bytes=%d, error=%v", first, len(first.NextAfter), err)
+	}
+	second, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{Topic: topic, Limit: 1, After: first.NextAfter})
+	if err != nil || len(second.Subscriptions) != 1 || second.Subscriptions[0].Name != "b" || second.NextAfter != "" {
+		t.Fatalf("maximum-topic second page=%+v, error=%v", second, err)
+	}
+
+	for _, invalid := range []string{strings.Repeat("a", maxAddressNameBytes+1), string([]byte{0xff})} {
+		if err := e.Subscribe(ctx, invalid, "invalid-topic", nil); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("invalid topic of %d bytes returned %v", len(invalid), err)
+		}
+		if err := e.Subscribe(ctx, "valid-topic", invalid, nil); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("invalid subscription name of %d bytes returned %v", len(invalid), err)
+		}
+	}
+}
+
+func TestListSubscriptionsLegacyRemainsUnbounded(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	const count = defaultSubscriptionPageSize + 5
+	for i := 0; i < count; i++ {
+		if err := e.Subscribe(ctx, "topic", fmt.Sprintf("sub-%03d", i), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy, err := e.ListSubscriptions(ctx)
+	if err != nil || len(legacy) != count {
+		t.Fatalf("legacy inventory count=%d, error=%v; want %d", len(legacy), err, count)
+	}
+	first, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{})
+	if err != nil || first.Total != count || len(first.Subscriptions) != defaultSubscriptionPageSize || first.NextAfter == "" {
+		t.Fatalf("default page=%+v, error=%v", first, err)
+	}
+	last, err := e.ListSubscriptionsWithOptions(ctx, ListSubscriptionsOptions{After: first.NextAfter})
+	if err != nil || last.Total != count || len(last.Subscriptions) != 5 || last.NextAfter != "" {
+		t.Fatalf("last page=%+v, error=%v", last, err)
 	}
 }

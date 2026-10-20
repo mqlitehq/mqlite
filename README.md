@@ -234,7 +234,10 @@ mqlite complete orders 42 <lock-token>           # settle a --no-ack message (al
 mqlite peek orders --state dead_lettered
 mqlite status                                    # backend / ping / counts
 mqlite observe --output json                     # unified observation; monitor or manage
-mqlite list-subscriptions ; mqlite test-filter 'subject == "x"'
+mqlite list-subscriptions --topic events --limit 100
+mqlite delete-subscription events worker                 # empty-only
+mqlite delete-subscription events worker --force         # explicitly discard retained work
+mqlite test-filter 'subject == "x"'
 mqlite metrics orders --output json              # machine-readable: the same keys as the HTTP API
 mqlite redrive orders --max 100                  # DLQ → active
 mqlite purge-dlq orders --older-than 24h         # delete dead-lettered (unbounded needs --all)
@@ -258,6 +261,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_MONITOR_TOKENS` | optional, distinct read-only credentials for `observe` and `/metrics`; administrator auth must remain enabled |
 | `MQLITE_METRICS` | enable authenticated Prometheus `/metrics` on the API port (`on`/`true`/`1`; default `off`); requires administrator auth |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
+| `MQLITE_MAX_SUBSCRIPTIONS` | maximum active plus deleting subscriptions (default 10,000) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
 > The DB connection string is **only ever read from the environment** — it is
@@ -357,14 +361,26 @@ hands them back to the OS via `incremental_vacuum`, so the file grows to the pea
 and then shrinks back gradually as the queue drains (a full `VACUUM` rewrite stays
 manual-only, via `mqlite vacuum`). See [docs/retention.md](docs/retention.md).
 
-Queue deletion follows the same bounded-storage principle. It is empty-only by
-default; `--force` explicitly discards active, locked, scheduled, deferred and
-dead-letter work. Acceptance first persists a `deleting` state, which immediately
-blocks queue operations and reserves the name. The response reports either
-`deleted` or `deleting`; background cleanup resumes after restart. A locked
-delivery may already have produced an external side effect, which deletion cannot
-undo. Serialize deletion and same-name recreation, and wait until `list` no longer
-shows the name before reusing it.
+Queue and subscription deletion follow the same bounded-storage principle. They
+are empty-only by default; `--force` explicitly discards active, locked,
+scheduled, deferred and dead-letter work. Acceptance first persists a `deleting`
+state, which immediately blocks the backing queue, removes a subscription from
+topic fan-out, and reserves the name. The response reports either `deleted` or
+`deleting`; background cleanup resumes after restart. The final removal of a
+subscription backing queue also removes its topic mapping. An implicit topic
+becomes unavailable for fan-out once it has no active subscriptions, while its
+address remains reserved by any deleting mapping until physical cleanup
+completes. A locked delivery may already have produced an external side effect,
+which deletion cannot undo. Serialize deletion
+and same-name recreation, use globally unique one-use names for temporary
+subscriptions, and wait until the relevant inventory no longer shows the name
+before reusing it.
+
+The default 10,000-subscription ceiling counts both active and deleting entries;
+pending cleanup intentionally keeps its slot. It bounds metadata growth, while
+publish work and stored message copies still grow with
+`messages × matching subscriptions`. Treat 10,000 as a safety ceiling rather than
+a low-latency fan-out promise, and measure the roster sizes used by your workload.
 
 ## Docker
 

@@ -105,6 +105,24 @@ accepted, 40 required background-style cleanup, convergence p99/max was
 is a regression signal, not a deployment capacity claim; reproduce it on the target
 CPU, filesystem, durability mode, message sizes, and remote backend when applicable.
 
+MQLITE-127 also adds native Go benchmarks for topic fan-out, subscription
+create/empty-delete churn, and exact-total subscription pagination:
+
+```bash
+go test ./engine -run '^$' \
+  -bench 'Benchmark(TopicFanout|SubscriptionCreateDelete|ListSubscriptionsPage)' \
+  -benchmem -count=5
+```
+
+On an Apple M1 Pro with Go 1.26.9, the final PR3 engine candidate measured
+382.402 µs per create/delete lifecycle with 100 retained subscriptions and
+389.064 µs with 10,000 retained subscriptions (1.017×). A 100-item page with
+an exact total measured 0.660 ms at 1,000 subscriptions and 5.245 ms at 10,000.
+A smoke with 5,000 queued messages acknowledged force deletion in 4.100 ms and
+converged in one 30.707 ms maintenance pass. These control-plane measurements
+found no strong lifecycle regression, but the exact count scales with inventory;
+do not treat the 10,000-subscription safety ceiling as a low-latency guarantee.
+
 ## 1 · Throughput & write amplification
 
 256 B bodies unless noted. `wB/op` = bytes physically written to disk per op (write

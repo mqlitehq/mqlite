@@ -84,7 +84,9 @@ func TestTursoIntegration(t *testing.T) {
 	q := fmt.Sprintf("itest_%d", time.Now().UnixNano())
 	deleteQ := q + "_delete"
 	raceQ := q + "_race"
-	cleanupTursoQueues(t, e, q, deleteQ, raceQ)
+	emptySub := q + "_sub_empty"
+	forcedSub := q + "_sub_force"
+	cleanupTursoQueues(t, e, q, deleteQ, raceQ, emptySub, forcedSub)
 	if err := e.CreateQueue(ctx, q, QueueConfig{LockDurationMs: 30000, MaxDeliveryCount: 5}); err != nil {
 		t.Fatalf("create queue: %v", err)
 	}
@@ -104,6 +106,34 @@ func TestTursoIntegration(t *testing.T) {
 		t.Fatalf("force delete lifecycle queue: %+v %v", deleted, err)
 	}
 	t.Log("Turso lifecycle triggers OK: non-empty parent rejected and bounded force delete converged")
+
+	// Subscription retirement must remove both physical metadata rows explicitly.
+	// Turso/libSQL deployments do not promise that PRAGMA foreign_keys is enabled.
+	if err := e.Subscribe(ctx, q+"_topic_empty", emptySub, nil); err != nil {
+		t.Fatalf("create empty remote subscription: %v", err)
+	}
+	if result, err := e.DeleteSubscriptionWithOptions(ctx, q+"_topic_empty", emptySub, DeleteOptions{}); err != nil || !result.Deleted {
+		t.Fatalf("delete empty remote subscription: %+v %v", result, err)
+	}
+	if mappings, queues := subscriptionMetadataRows(t, e, emptySub); mappings != 0 || queues != 0 {
+		t.Fatalf("empty remote subscription retained metadata: mappings=%d queues=%d", mappings, queues)
+	}
+	if err := e.Subscribe(ctx, q+"_topic_force", forcedSub, nil); err != nil {
+		t.Fatalf("create forced remote subscription: %v", err)
+	}
+	if _, err := e.SendOne(ctx, q+"_topic_force", OutMessage{Body: []byte("discard")}); err != nil {
+		t.Fatalf("seed forced remote subscription: %v", err)
+	}
+	if err := e.DeleteSubscription(ctx, q+"_topic_force", forcedSub); !errors.Is(err, ErrSubscriptionNotEmpty) {
+		t.Fatalf("non-empty remote subscription delete=%v, want ErrSubscriptionNotEmpty", err)
+	}
+	if result, err := e.DeleteSubscriptionWithOptions(ctx, q+"_topic_force", forcedSub, DeleteOptions{Force: true}); err != nil || !result.Deleted {
+		t.Fatalf("force delete remote subscription: %+v %v", result, err)
+	}
+	if mappings, queues := subscriptionMetadataRows(t, e, forcedSub); mappings != 0 || queues != 0 {
+		t.Fatalf("forced remote subscription retained metadata: mappings=%d queues=%d", mappings, queues)
+	}
+	t.Log("Turso subscription lifecycle OK: mapping and backing queue retired explicitly")
 
 	if err := e.CreateQueue(ctx, raceQ, QueueConfig{}); err != nil {
 		t.Fatalf("create lifecycle race queue: %v", err)

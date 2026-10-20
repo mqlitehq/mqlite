@@ -52,10 +52,11 @@ wrapped, `database/sql` will not transparently retry it, so MQLite does:
   `message_id`/dedup before retrying; transparent recovery would need durable per-op
   idempotency, which is deferred. **`errors.Is(err, mqlite.ErrOutcomeUnknown)` works in
   both embedded and client mode.**
-- **Never retry a logical error.** A constraint violation or `no such table` is final,
-  and a structured server *response* (e.g. `error code 500: …`) is a definite non-commit
-  — neither is treated as outcome-unknown. Local stores never retry at all (a single
-  conn is the single writer).
+- **Never retry a logical storage error.** A constraint violation or `no such table`
+  is final inside the engine. At the HTTP client boundary, lifecycle deletion is
+  more conservative: every HTTP 5xx is `ErrOutcomeUnknown`, because a gateway can
+  synthesize that response after the broker committed and its acknowledgement was
+  lost. Local stores never retry at all (a single conn is the single writer).
 
 > **Transport caveat.** The outcome-unknown guarantee holds for the documented remote
 > transport `libsql://` (Hrana-over-HTTP). The `ws://`/`wss://` transports can wrap a

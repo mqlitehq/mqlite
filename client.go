@@ -59,7 +59,14 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 func (c *Client) Close() error { return nil }
 
 func isLifecycleDeletePath(path string) bool {
-	return path == wire.PathDeleteQueue
+	return path == wire.PathDeleteQueue || path == wire.PathDeleteSubscription
+}
+
+func lifecycleReconcileHint(path string) string {
+	if path == wire.PathDeleteSubscription {
+		return "ListSubscriptionsPage"
+	}
+	return "ListQueues"
 }
 
 func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) error {
@@ -91,14 +98,20 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 		if isLifecycleDeletePath(path) {
 			// Once RoundTrip starts, a transport error cannot prove whether the
 			// broker committed the name-addressed deletion. Do not invite an
-			// automatic replay that could hit a later same-name queue.
-			return fmt.Errorf("%w: deletion response unavailable; inspect ListQueues to reconcile: %s", ErrOutcomeUnknown, err.Error())
+			// automatic replay that could hit a later same-name resource.
+			return fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %s", ErrOutcomeUnknown, lifecycleReconcileHint(path), err.Error())
 		}
 		return err
 	}
 	defer resp.Body.Close()
 	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 3 {
-		return fmt.Errorf("%w: deletion received HTTP redirect %d; inspect ListQueues to reconcile", ErrOutcomeUnknown, resp.StatusCode)
+		return fmt.Errorf("%w: deletion received HTTP redirect %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
+	}
+	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 5 {
+		// An intermediary can synthesize a gateway error after the broker has
+		// accepted the request but before its acknowledgement reaches us. The
+		// status and body therefore cannot safely authorize a name-only replay.
+		return fmt.Errorf("%w: deletion received HTTP %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
 	}
 	keyResponse := path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey
 	var keyData []byte
@@ -150,6 +163,12 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 		case http.StatusForbidden:
 			eb.Code = "permission_denied"
 		}
+		if path == wire.PathDeleteSubscription && eb.Code == "not_found" {
+			return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message)
+		}
+		if path == wire.PathSubscribe && eb.Code == "resource_exhausted" {
+			return fmt.Errorf("%w: %s", ErrSubscriptionLimit, eb.Message)
+		}
 		return mapErr(eb)
 	}
 	if respOut != nil {
@@ -167,10 +186,18 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 			*raw = data
 			return nil
 		}
-		if raw, ok := respOut.(*json.RawMessage); ok && isLifecycleDeletePath(path) {
-			data, err := wire.ReadDeleteQueueResponse(resp.Body)
+		if raw, ok := respOut.(*json.RawMessage); ok && path == wire.PathListSubscriptionsPage {
+			data, err := wire.ReadListSubscriptionsPageResponse(resp.Body)
 			if err != nil {
-				return fmt.Errorf("%w: invalid deletion acknowledgement; inspect ListQueues to reconcile", ErrOutcomeUnknown)
+				return err
+			}
+			*raw = data
+			return nil
+		}
+		if raw, ok := respOut.(*json.RawMessage); ok && isLifecycleDeletePath(path) {
+			data, err := wire.ReadDeleteResponse(resp.Body)
+			if err != nil {
+				return fmt.Errorf("%w: invalid deletion acknowledgement; inspect %s to reconcile", ErrOutcomeUnknown, lifecycleReconcileHint(path))
 			}
 			*raw = data
 			return nil
@@ -188,6 +215,8 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
 	case "queue_not_empty":
 		return fmt.Errorf("%w: %s", ErrQueueNotEmpty, eb.Message)
+	case "subscription_not_empty":
+		return fmt.Errorf("%w: %s", ErrSubscriptionNotEmpty, eb.Message)
 	case "name_conflict":
 		return fmt.Errorf("%w: %s", ErrNameConflict, eb.Message)
 	case "group_required":
@@ -471,9 +500,32 @@ func (c *Client) DeleteQueueWithOptions(ctx context.Context, name string, opts .
 	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name, Force: o.Force}, &data); err != nil {
 		return DeleteResult{}, err
 	}
-	resp, err := wire.DecodeDeleteQueueResponse(data)
+	resp, err := wire.DecodeDeleteResponse(data)
 	if err != nil {
 		return DeleteResult{}, fmt.Errorf("%w: invalid deletion acknowledgement; inspect ListQueues to reconcile", ErrOutcomeUnknown)
+	}
+	return DeleteResult{Deleted: resp.Deleted, State: resp.State}, nil
+}
+
+// DeleteSubscription removes an empty subscription. An accepted deletion
+// returns nil whether bounded physical cleanup completed in this call or
+// continues in the background. Use DeleteSubscriptionWithOptions to
+// force-discard retained messages or inspect the accepted deletion state.
+func (c *Client) DeleteSubscription(ctx context.Context, topic, name string) error {
+	_, err := c.DeleteSubscriptionWithOptions(ctx, topic, name)
+	return err
+}
+
+// DeleteSubscriptionWithOptions returns the accepted deletion state.
+func (c *Client) DeleteSubscriptionWithOptions(ctx context.Context, topic, name string, opts ...DeleteSubscriptionOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	var data json.RawMessage
+	if err := c.post(ctx, wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: topic, Name: name, Force: o.Force}, &data); err != nil {
+		return DeleteResult{}, err
+	}
+	resp, err := wire.DecodeDeleteResponse(data)
+	if err != nil {
+		return DeleteResult{}, fmt.Errorf("%w: invalid deletion acknowledgement; inspect ListSubscriptionsPage to reconcile", ErrOutcomeUnknown)
 	}
 	return DeleteResult{Deleted: resp.Deleted, State: resp.State}, nil
 }
@@ -571,6 +623,31 @@ func (c *Client) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, err
 	out := make([]SubscriptionInfo, len(resp.Subscriptions))
 	for i, s := range resp.Subscriptions {
 		out[i] = SubscriptionInfo{Topic: s.Topic, Name: s.Name, Expr: s.Expr}
+	}
+	return out, nil
+}
+
+// ListSubscriptionsWithOptions returns one internally consistent subscription
+// page. Separate page requests may observe concurrent roster changes.
+func (c *Client) ListSubscriptionsWithOptions(ctx context.Context, opts ListSubscriptionsOptions) (SubscriptionPage, error) {
+	request := wire.ListSubscriptionsPageRequest{
+		Topic: opts.Topic, After: opts.After, Limit: opts.Limit, IncludeDeleting: opts.IncludeDeleting,
+	}
+	var data json.RawMessage
+	if err := c.post(ctx, wire.PathListSubscriptionsPage, request, &data); err != nil {
+		return SubscriptionPage{}, err
+	}
+	resp, err := wire.DecodeListSubscriptionsPageResponse(data, request)
+	if err != nil {
+		return SubscriptionPage{}, err
+	}
+	out := SubscriptionPage{
+		Subscriptions: make([]SubscriptionPageItem, len(resp.Subscriptions)),
+		Total:         resp.Total,
+		NextAfter:     resp.NextAfter,
+	}
+	for i, s := range resp.Subscriptions {
+		out.Subscriptions[i] = SubscriptionPageItem{Topic: s.Topic, Name: s.Name, Expr: s.Expr, State: s.State}
 	}
 	return out, nil
 }
