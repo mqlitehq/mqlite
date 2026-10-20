@@ -401,31 +401,22 @@ corruption**). Local + cloud (Fly) throughput/memory/disk methodology and number
 
 ## Status
 
-This source tree targets **v0.3.3**: default broker port **6754**, schema token **5**,
-runtime-managed access keys and unified observability. See [CHANGELOG.md](CHANGELOG.md)
-for release and upgrade notes.
+This source tree includes **unreleased queue and subscription lifecycle support**:
+default broker port **6754**, schema token **6**, fixed subscription TTL and
+generation-fenced deletion. See [CHANGELOG.md](CHANGELOG.md) for the release boundary.
+The published **v0.3.3** release uses schema token **5**.
 Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
 or pin the image to `ghcr.io/mqlitehq/mqlite:0.3.3`; see
 [deployment](docs/deployment.md) for configuration.
 
-**Upgrading from v0.3.2 preserves message and managed-key data.** This release adds
-maintenance diagnostics and generation-checked empty-queue deletion without a schema
-change. Stop clients before retiring a queue name and retain its generation when
-retrying deletion. See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
-
-**Upgrading from v0.3.1 preserves message and managed-key data.** Back up first;
-process counters reset at restart. A rollback to v0.3.1 also needs compatible
-scraper/rule configuration because `Observe` and configured monitor credentials
-are new in v0.3.2. See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
-
-**Upgrading from v0.3.0 preserves existing queue data.** Back up first and retain a
-configured administrator token if you need to roll back; v0.3.0 cannot authenticate
-managed keys.
-
-**Upgrading from v0.2.0 requires a new database.** There is no in-place schema
-migration. Account for retained messages in every state, preserve the old binary
-and a consistent database backup, and follow the
+**This source tree requires a new database when upgrading from published
+v0.3.0–v0.3.3 (schema 5), or v0.2.0 (schema 2).** There is no in-place schema
+migration. Account for retained messages in every state, export or drain them with
+the old broker, preserve the old binary and a consistent database backup, and follow the
 [upgrade and rollback procedure](docs/operations.md#upgrade-and-rollback).
+Do not overwrite the old database or edit its schema token. Queue and subscription
+deletion defaults to empty-only; `force` and subscription TTL explicitly authorize
+discarding retained work. Keep the original generation when retrying deletion.
 Delivery remains at-least-once; consumers must be idempotent.
 
 Hermetic unit + invariant (TCK-style) tests run in CI on every push, and live

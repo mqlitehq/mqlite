@@ -149,6 +149,7 @@ func (s *Server) routes() {
 	h(wire.PathListKeys, engine.KeyManage, s.authEnabled(s.handleListKeys))
 	h(wire.PathRevokeKey, engine.KeyManage, s.authEnabled(s.handleRevokeKey))
 	h(wire.PathDeleteQueue, engine.KeyManage, s.handleDeleteQueue)
+	h(wire.PathDeleteSubscription, engine.KeyManage, s.handleDeleteSubscription)
 	s.mux.HandleFunc("/metrics", s.authorize(monitorPermission, s.handleMetrics))
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -398,6 +399,10 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, "queue_changed", err.Error())
 	case errors.Is(err, engine.ErrQueueNotEmpty):
 		writeErr(w, http.StatusConflict, "queue_not_empty", err.Error())
+	case errors.Is(err, engine.ErrResourceLimit):
+		writeErr(w, http.StatusTooManyRequests, "resource_limit", err.Error())
+	case errors.Is(err, engine.ErrDeletionPending):
+		writeErr(w, http.StatusConflict, "deletion_pending", err.Error())
 	case errors.Is(err, engine.ErrNameConflict):
 		writeErr(w, http.StatusConflict, "name_conflict", err.Error())
 	case errors.Is(err, engine.ErrGroupRequired):
@@ -432,6 +437,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	outs := make([]engine.OutMessage, len(req.Messages))
 	for i, m := range req.Messages {
 		o := m.ToOut()
+		o.TargetGeneration = req.Generation
 		if req.TTLMs > 0 {
 			o.TTLMs = req.TTLMs
 		}
@@ -504,6 +510,7 @@ func (s *Server) handleReceive(w http.ResponseWriter, r *http.Request) {
 	}
 	logf(w, "queue", req.Queue)
 	msgs, err := s.eng.Receive(r.Context(), req.Queue, engine.ReceiveOptions{
+		Generation:  req.Generation,
 		MaxMessages: req.MaxMessages,
 		WaitMs:      req.WaitTimeMs,
 		Mode:        engine.ReceiveMode(req.ReceiveMode),
@@ -531,7 +538,7 @@ func (s *Server) handleReceiveDeferred(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logf(w, "queue", req.Queue)
-	msgs, err := s.eng.ReceiveDeferred(r.Context(), req.Queue, req.SeqNumbers...)
+	msgs, err := s.eng.ReceiveDeferredWithGeneration(r.Context(), req.Queue, req.Generation, req.SeqNumbers...)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -729,11 +736,27 @@ func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logf(w, "queue", req.Name)
-	if err := s.eng.DeleteQueue(r.Context(), req.Name, req.Generation); err != nil {
+	result, err := s.eng.DeleteQueueWithOptions(r.Context(), req.Name, req.Generation, engine.DeleteOptions{Force: req.Force})
+	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, wire.DeleteQueueResponse{Deleted: true})
+	writeJSON(w, wire.DeleteQueueResponse{Deleted: result.Deleted, State: result.State, Generation: result.Generation})
+}
+
+func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
+	var req wire.DeleteSubscriptionRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	logf(w, "topic", req.Topic, "sub", req.Name)
+	result, err := s.eng.DeleteSubscription(r.Context(), req.Topic, req.Name, req.Generation, engine.DeleteOptions{Force: req.Force})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, wire.DeleteSubscriptionResponse{Deleted: result.Deleted, State: result.State, Generation: result.Generation})
 }
 
 func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
@@ -757,11 +780,12 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logf(w, "topic", req.Topic, "sub", req.Name)
-	if err := s.eng.Subscribe(r.Context(), req.Topic, req.Name, req.Filter); err != nil {
+	sub, err := s.eng.SubscribeWithOptions(r.Context(), req.Topic, req.Name, req.Filter, engine.SubscribeOptions{TTLMs: req.TTLMs, Generation: req.Generation, RequestID: req.RequestID, RequestExpiresAtMs: req.RequestExpiresAtMs})
+	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, wire.Empty{})
+	writeJSON(w, subscriptionJSON(sub))
 }
 
 func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
@@ -773,22 +797,39 @@ func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 	resp := wire.ListQueuesResponse{Queues: make([]wire.QueueInfoJSON, len(qs))}
 	for i, q := range qs {
 		resp.Queues[i] = wire.QueueInfoJSON{
-			Name: q.Name, Kind: q.Kind, Generation: q.Generation, LockDurationMs: q.LockDurationMs,
+			Name: q.Name, Kind: q.Kind, Generation: q.Generation, State: q.State, ExpiresAtMs: q.ExpiresAtMs, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs,
 		}
 	}
 	writeJSON(w, resp)
 }
 
+func subscriptionJSON(s engine.SubscriptionInfo) wire.SubscriptionJSON {
+	return wire.SubscriptionJSON{Topic: s.Topic, Name: s.Name, Expr: s.Expr, Generation: s.Generation, TTLMs: s.TTLMs, ExpiresAtMs: s.ExpiresAtMs, State: s.State}
+}
+
 func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
-	subs, err := s.eng.ListSubscriptions(r.Context())
+	var req wire.ListSubscriptionsRequest
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
+	// The empty request retains the legacy complete inventory contract.
+	var page engine.SubscriptionPage
+	var err error
+	if req == (wire.ListSubscriptionsRequest{}) {
+		page.Subscriptions, err = s.eng.ListSubscriptions(r.Context())
+		page.Total = len(page.Subscriptions)
+	} else {
+		page, err = s.eng.ListSubscriptionsPage(r.Context(), engine.ListSubscriptionsOptions{Topic: req.Topic, After: req.After, Limit: req.Limit, IncludeDeleting: req.IncludeDeleting})
+	}
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	resp := wire.ListSubscriptionsResponse{Subscriptions: make([]wire.SubscriptionJSON, len(subs))}
-	for i, su := range subs {
-		resp.Subscriptions[i] = wire.SubscriptionJSON{Topic: su.Topic, Name: su.Name, Expr: su.Expr}
+	resp := wire.ListSubscriptionsResponse{Subscriptions: make([]wire.SubscriptionJSON, len(page.Subscriptions)), Total: page.Total, NextAfter: page.NextAfter}
+	for i, sub := range page.Subscriptions {
+		resp.Subscriptions[i] = subscriptionJSON(sub)
 	}
 	writeJSON(w, resp)
 }

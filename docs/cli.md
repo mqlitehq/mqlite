@@ -179,6 +179,14 @@ mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering st
 | `--dlq-max-bytes` | 0 (inherit) | per-queue: cap dead-letter body bytes (`-1` = unbounded) |
 
 ### `subscribe <topic> <name>` — create a subscription
+
+Unreleased lifecycle options: `--ttl 1m` fixes expiry from first creation;
+`--request-id ID` and `--request-expires-at RFC3339` retain one creation attempt for
+safe retries (at most five minutes). Preserve these values until the outcome is
+resolved. A retry does not renew TTL or resurrect a deleted subscription.
+Use `--generation ID` to update a known temporary subscription's filter. Positive
+TTL authorizes discarding all remaining work at expiry, including locked messages.
+
 *(alias: `create-subscription`)*
 ```bash
 mqlite subscribe orders eu-orders --expr 'subject_parts[0]=="orders" && properties["region"]=="eu"'
@@ -186,6 +194,25 @@ mqlite subscribe orders eu-orders --expr 'subject_parts[0]=="orders" && properti
 | Flag | | |
 |---|---|---|
 | `--expr` | "" | subscription filter — an [expr](concepts.md#subscription-filters-expr) boolean predicate; empty = match all |
+
+### `delete-queue` / `delete-subscription` — retire resources
+
+Unreleased, schema 6:
+
+```bash
+mqlite delete-queue jobs --generation "$GENERATION"
+mqlite delete-subscription reply-worker --topic replies --generation "$GENERATION"
+mqlite delete-subscription reply-worker --topic replies --generation "$GENERATION" --force
+```
+
+Default deletion rejects any retained messages. `--force` discards all states,
+including in-flight work and the DLQ. Preserve the original generation when
+retrying. A `deleting` result means the name is unavailable and reserved while
+cleanup continues; `deleted` means physical cleanup finished. A deleted name can
+later identify a new generation, so resolving a fresh identity is a new action.
+
+The unreleased `send`, `schedule`, `receive` and `receive-deferred` commands accept
+`--generation`; it is required for direct access to a temporary subscription.
 
 ### `send <queue> <body>` — enqueue a message
 `body` of `-` reads stdin; or use `--file`.
@@ -344,6 +371,11 @@ mqlite status                 # backend, location, schema, ping, size, queue/sub
 ```
 
 ### `list-subscriptions` — subscriptions with topic + filter
+
+Unreleased: `--topic TOPIC --limit 100` returns a filtered page and `total`;
+continue with `--after NEXT_AFTER`. Add `--include-deleting` to inspect pending
+cleanup. Listing with no flags retains the legacy JSON array; using page/filter
+flags returns the page object with `subscriptions`, `total` and `next_after`.
 ```bash
 mqlite list-subscriptions
 ```

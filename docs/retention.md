@@ -99,6 +99,14 @@ producers. Rules:
 
 ## Space reclamation
 
+Resource deletion is separate from message retention. The unreleased schema-6
+`DeleteQueue`/`DeleteSubscription` defaults to empty-only; explicit force and fixed
+subscription TTL authorize discarding every retained state. An expired subscription
+does not merely send its messages to the DLQ. Cleanup can remain pending after the
+resource becomes unavailable, and its name stays reserved until cleanup completes.
+Message TTL still follows `dead_letter_on_expire`; setting it does not delete the
+queue or subscription itself.
+
 Deleting rows frees SQLite *pages*. mqlite opens every DB with
 `auto_vacuum=INCREMENTAL` (set at creation), and a background janitor runs
 `PRAGMA incremental_vacuum` once enough pages free up — so the file grows to the peak
@@ -106,7 +114,8 @@ backlog and then **shrinks back gradually** as the queue drains, without a full 
 or a lock on the hot path. The mechanisms, in order of cost:
 
 - **Reuse + background incremental_vacuum (default).** Free pages are reused by later
-  inserts, and the janitor hands the surplus back to the OS a bounded chunk at a time.
+  inserts, and the janitor hands the surplus back to the OS. In the unreleased
+  lifecycle implementation the background pass reclaims at most 256 pages at a time.
   For a steady-state queue the file churns in place; after a one-off DLQ flush it recovers
   the disk on its own. No action needed.
 - **`mqlite vacuum`** runs the same checkpoint → `incremental_vacuum` → checkpoint

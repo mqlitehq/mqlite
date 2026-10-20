@@ -183,7 +183,7 @@ func TestCLIContractGuards(t *testing.T) {
 func TestUsageListsAllCommands(t *testing.T) {
 	out, _ := captureStdout(t, func() error { usage(); return nil })
 	for _, cmd := range []string{
-		"serve", "create-queue", "subscribe", "send", "schedule", "cancel", "receive",
+		"serve", "create-queue", "delete-queue", "delete-subscription", "subscribe", "send", "schedule", "cancel", "receive",
 		"receive-deferred", "complete", "abandon", "reject", "defer", "renew", "peek",
 		"metrics", "status", "observe", "list", "list-subscriptions", "test-filter", "redrive",
 		"purge-dlq", "vacuum",

@@ -2,9 +2,11 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Go-native benchmarks for the embedded engine (no HTTP) — run with:
@@ -27,6 +29,70 @@ func benchEngine(b *testing.B) *Engine {
 	}
 	b.Cleanup(func() { _ = e.Close() })
 	return e
+}
+
+// BenchmarkSubscriptionLifecycle exercises request/reply churn with a real local
+// database and a retained backlog belonging to another queue. Each operation owns
+// a new subscription name, publishes, receives, then explicitly deletes or expires
+// it. The logical test clock advances to prune retry receipts without real sleeps.
+func BenchmarkSubscriptionLifecycle(b *testing.B) {
+	for _, backlog := range []int{0, 10000} {
+		for _, expire := range []bool{false, true} {
+			b.Run(fmt.Sprintf("backlog=%d/expiry=%t", backlog, expire), func(b *testing.B) {
+				ctx := context.Background()
+				now := time.Now().UnixMilli()
+				e, err := Open(ctx, Options{DB: "file:" + filepath.Join(b.TempDir(), "mq.db"), DisableBackground: true, Now: func() int64 { return now }})
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer e.Close()
+				if err := e.CreateQueue(ctx, "unrelated", QueueConfig{}); err != nil {
+					b.Fatal(err)
+				}
+				if backlog > 0 {
+					messages := make([]OutMessage, backlog)
+					for i := range messages {
+						messages[i].Body = make([]byte, 256)
+					}
+					if _, err := e.Send(ctx, "unrelated", messages...); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					name := fmt.Sprintf("request-%d", i)
+					sub, err := e.SubscribeWithOptions(ctx, "replies", name, nil, SubscribeOptions{TTLMs: 1000, RequestID: name, RequestExpiresAtMs: now + 1000})
+					if err != nil {
+						b.Fatal(err)
+					}
+					if _, err := e.SendOne(ctx, "replies", OutMessage{Body: make([]byte, 256)}); err != nil {
+						b.Fatal(err)
+					}
+					msgs, err := e.Receive(ctx, name, ReceiveOptions{Generation: sub.Generation})
+					if err != nil || len(msgs) != 1 {
+						b.Fatalf("receive: %d messages, %v", len(msgs), err)
+					}
+					if expire {
+						now += 1001
+						e.maintainLifecycle(ctx)
+					} else {
+						result, err := e.DeleteSubscription(ctx, "replies", name, sub.Generation, DeleteOptions{Force: true})
+						if err != nil || !result.Deleted {
+							b.Fatalf("delete: %+v %v", result, err)
+						}
+						now += 1001
+					}
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "lifecycle/s")
+				page, err := e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{IncludeDeleting: true})
+				if err != nil || page.Total != 0 || len(e.filterCache) != 0 || len(e.note.chans) != 0 || len(e.qcache) > 1 {
+					b.Fatalf("retained lifecycle state: %+v %v filters=%d waits=%d cache=%d", page, err, len(e.filterCache), len(e.note.chans), len(e.qcache))
+				}
+			})
+		}
+	}
 }
 
 func BenchmarkSendOne(b *testing.B) {

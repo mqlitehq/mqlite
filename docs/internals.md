@@ -28,21 +28,22 @@ code and becomes **database invariants**.
 
 The rest of this document is those invariants, in the order they earn their keep.
 
-## 2 · The schema: eight tables, one of which matters most
+## 2 · The schema: nine tables, one of which matters most
 
-Everything lives in eight `STRICT` tables (`engine/schema.go`). Seven carry the
+The unreleased schema-6 implementation uses nine `STRICT` tables (`engine/schema.go`). Eight carry the
 machinery; one carries your data:
 
 | Table | Job |
 |---|---|
 | `messages` | **the queue itself** — every message, in every state |
-| `queues` | per-queue config: lock duration, retry bound, TTL, dedup window, ordering mode, DLQ retention |
+| `queues` | per-queue config plus resource lifecycle, fixed subscription TTL and deletion state |
 | `subscriptions` | the topic fan-out roster (`topic → subscription` + optional filter) |
 | `dedup` | duplicate-detection window |
 | `settlement_receipts` | makes acknowledgements idempotent (§7) |
 | `receive_attempts` | makes receives idempotent (§7) |
-| `meta` | one row: the schema guard token (§9) |
+| `meta` | schema guard token and opaque queue generation metadata |
 | `access_keys` | SHA-256 token digests, permission sets, expiry and revocation metadata (v0.3.1) |
+| `subscription_creations` | bounded creation request receipts preventing retry resurrection after retirement |
 
 The heart, abridged:
 
@@ -317,8 +318,9 @@ Every claim in this document is enforced by something that fails loudly:
 - **A schema golden test** — the complete canonical DDL is pinned. A database
   with a different guard token is refused (`ErrSchemaVersionMismatch`); existing
   table layouts are never migrated. Incompatible changes require a token change.
-  The independent `access_keys` addition preserves token 5, with a separate golden
-  for its DDL, the unchanged prior DDL and actual old-binary compatibility checks.
+  The historical independent `access_keys` addition preserved token 5. Lifecycle
+  columns and creation receipts now use token 6 and explicitly reject schema-5
+  databases without modifying them.
 - **An integrity sweep** — a randomized send/receive/crash workload asserting
   every message arrives (no loss), arrives intact (content hash), and never
   exceeds its delivery bound.

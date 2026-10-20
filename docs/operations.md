@@ -1,6 +1,8 @@
 # Production operations
 
-This runbook covers v0.3.3 and upgrades from v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5).
+This runbook covers published v0.3.3 (port 6754, schema token 5) and the unreleased
+lifecycle implementation (schema token 6). Schema-5 databases require a separately
+created database for the new implementation; they are never migrated automatically.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -184,6 +186,18 @@ same procedure on representative operational data before relying on a backup.
 
 Check schema tokens before replacing a binary. Version numbers alone do not
 establish database compatibility, and MQLite does not run schema migrations.
+
+**Schema 5 → 6 (unreleased lifecycle features):** stop producers, account for all
+active, locked, scheduled, deferred and dead-lettered work, and preserve the old
+binary/configuration plus a consistent backup. Drain work using the old broker or
+export and re-enqueue it through an application-controlled transfer that preserves
+the intended metadata and handles duplicates. A raw database backup does not
+convert schemas or preserve live lock tokens in a new database. Create schema 6
+at a different path/database, recreate configuration and access keys, and validate
+before moving traffic. Keep the original database for rollback; never edit its
+schema token, copy tables ad hoc, or delete it merely because the new binary refuses
+to open it. Returning to the old snapshot does not incorporate work accepted by
+the new broker after cutover.
 
 | Situation | Procedure |
 |---|---|

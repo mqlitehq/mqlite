@@ -2161,3 +2161,322 @@ func TestDeleteQueueGenerationFencesReplacement(t *testing.T) {
 		})
 	}
 }
+
+// ─── Resource lifecycle (MQLITE-65) ─────────────────────────────────────────
+
+func TestSubscriptionTTLReplayAndIncarnationIsolation(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	opts := SubscribeOptions{TTLMs: 1000, RequestID: "create-first", RequestExpiresAtMs: e.now() + 30_000}
+	first, err := e.SubscribeWithOptions(ctx, "topic", "reply", &Filter{Expr: `subject == "wanted"`}, opts)
+	if err != nil || first.Generation == "" || first.ExpiresAtMs != e.now()+1000 {
+		t.Fatalf("create: %+v %v", first, err)
+	}
+	advance(clock, 200*time.Millisecond)
+	replay, err := e.SubscribeWithOptions(ctx, "topic", "reply", &Filter{Expr: first.Expr}, opts)
+	if err != nil || replay != first {
+		t.Fatalf("creation replay changed lifetime: %+v %v", replay, err)
+	}
+	updated, err := e.SubscribeWithOptions(ctx, "topic", "reply", &Filter{Expr: `subject == "later"`}, SubscribeOptions{Generation: first.Generation})
+	if err != nil || updated.ExpiresAtMs != first.ExpiresAtMs {
+		t.Fatalf("update extended ttl: %+v %v", updated, err)
+	}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "reply", nil, SubscribeOptions{Generation: first.Generation, TTLMs: 2000}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("changed ttl: %v", err)
+	}
+	if err := e.Subscribe(ctx, "topic", "reply", nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("unfenced update: %v", err)
+	}
+	// Replaying creation after a filter update returns its original receipt without
+	// reverting the current subscription's filter.
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "reply", &Filter{Expr: first.Expr}, opts); err != nil {
+		t.Fatal(err)
+	}
+	page, err := e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{Topic: "topic"})
+	if err != nil || len(page.Subscriptions) != 1 || page.Subscriptions[0].Expr != updated.Expr {
+		t.Fatalf("replay rewrote filter: %+v %v", page, err)
+	}
+	if _, err := e.SendOne(ctx, "reply", OutMessage{Body: []byte("unfenced")}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("unfenced temporary send: %v", err)
+	}
+	if _, err := e.SendOne(ctx, "topic", OutMessage{Subject: "later", Body: []byte("expires with entity")}); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, 800*time.Millisecond)
+	// No maintenance has run: wall-clock expiry itself must stop new operations.
+	if _, err := e.SendOne(ctx, "topic", OutMessage{Subject: "later"}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("expired topic routed: %v", err)
+	}
+	if _, err := e.Receive(ctx, "reply", ReceiveOptions{Generation: first.Generation}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("expired subscription delivered: %v", err)
+	}
+	page, err = e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{Topic: "topic"})
+	if err != nil || page.Total != 0 {
+		t.Fatalf("expired visible: %+v %v", page, err)
+	}
+	page, err = e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{Topic: "topic", IncludeDeleting: true})
+	if err != nil || page.Total != 1 || page.Subscriptions[0].State != "deleting" {
+		t.Fatalf("missing reservation: %+v %v", page, err)
+	}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "reply", &Filter{Expr: first.Expr}, opts); !errors.Is(err, ErrQueueChanged) {
+		t.Fatalf("expired creation replay: %v", err)
+	}
+	nextOpts := SubscribeOptions{TTLMs: 1000, RequestID: "create-second", RequestExpiresAtMs: e.now() + 30_000}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "reply", nil, nextOpts); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("reused before cleanup: %v", err)
+	}
+	e.maintainLifecycle(ctx)
+	second, err := e.SubscribeWithOptions(ctx, "topic", "reply", nil, nextOpts)
+	if err != nil || second.Generation == first.Generation {
+		t.Fatalf("replacement: %+v %v", second, err)
+	}
+	if _, err := e.DeleteSubscription(ctx, "topic", "reply", first.Generation, DeleteOptions{Force: true}); !errors.Is(err, ErrQueueChanged) {
+		t.Fatalf("old delete reached replacement: %v", err)
+	}
+	if _, err := e.SendOne(ctx, "reply", OutMessage{TargetGeneration: first.Generation}); !errors.Is(err, ErrQueueChanged) {
+		t.Fatalf("old send reached replacement: %v", err)
+	}
+	if _, err := e.Receive(ctx, "reply", ReceiveOptions{Generation: first.Generation}); !errors.Is(err, ErrQueueChanged) {
+		t.Fatalf("old receive reached replacement: %v", err)
+	}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "reply", &Filter{Expr: first.Expr}, opts); !errors.Is(err, ErrQueueChanged) {
+		t.Fatalf("old creation reached replacement: %v", err)
+	}
+}
+
+func TestSubscriptionCreationReceiptLimitsAndExpiry(t *testing.T) {
+	ctx := context.Background()
+	var now int64 = 1700000000000
+	e, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true, Now: func() int64 { return now }, MaxSubscriptions: 2, MaxSubscriptionRequests: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	opts := SubscribeOptions{TTLMs: 1000, RequestID: "one", RequestExpiresAtMs: now + 2000}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "oversized", &Filter{Expr: strings.Repeat(" ", maxFilterSourceLen+1)}, opts); !errors.Is(err, ErrInvalidFilter) {
+		t.Fatalf("whitespace bypassed receipt size bound: %v", err)
+	}
+	first, err := e.SubscribeWithOptions(ctx, "topic", "first", nil, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "first", &Filter{Expr: "true"}, opts); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("request conflict: %v", err)
+	}
+	other := SubscribeOptions{TTLMs: 1000, RequestID: "two", RequestExpiresAtMs: now + 2000}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "second", nil, other); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("receipt quota ignored: %v", err)
+	}
+	if _, err := e.DeleteSubscription(ctx, "topic", "first", first.Generation, DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "first", nil, opts); !errors.Is(err, ErrQueueChanged) {
+		t.Fatalf("deleted request resurrected: %v", err)
+	}
+	now += 2000
+	e.maintainLifecycle(ctx)
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "first", nil, opts); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("pruned expired request replayed: %v", err)
+	}
+	other.RequestExpiresAtMs = now + 2000
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "second", nil, other); err != nil {
+		t.Fatalf("expired receipt capacity not recovered: %v", err)
+	}
+	if err := e.Subscribe(ctx, "other", "durable", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Subscribe(ctx, "other", "overflow", nil); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("subscription quota ignored: %v", err)
+	}
+}
+
+func TestDeleteSubscriptionForceCleansEveryStateAndAuxiliaryRows(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	sub, err := e.SubscribeWithOptions(ctx, "topic", "sub", &Filter{Expr: "true"}, SubscribeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "other", QueueConfig{})
+	if _, err := e.SendOne(ctx, "other", OutMessage{Body: []byte("keep")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []State{StateActive, StateLocked, StateScheduled, StateDeferred, StateCompleted, StateDeadLettered} {
+		if _, err := e.db.exec(ctx, `INSERT INTO messages(queue,state,enqueued_at,body) VALUES(?,?,?,?)`, "sub", string(state), e.now(), []byte("discard")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO dedup(queue,message_id,seq_number,seen_at) VALUES('sub','old',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at) VALUES('sub','old','[]',1,9999999999999)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO settlement_receipts(lock_token,queue,seq_number,operation,args,created_at,expires_at) VALUES('old','sub',1,'complete','',1,9999999999999)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.DeleteSubscription(ctx, "wrong", "sub", sub.Generation, DeleteOptions{Force: true}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("wrong topic delete: %v", err)
+	}
+	if _, err := e.DeleteSubscription(ctx, "topic", "sub", sub.Generation, DeleteOptions{}); !errors.Is(err, ErrQueueNotEmpty) {
+		t.Fatalf("default lost messages: %v", err)
+	}
+	result, err := e.DeleteSubscription(ctx, "topic", "sub", sub.Generation, DeleteOptions{Force: true})
+	if err != nil || !result.Deleted || result.State != "deleted" {
+		t.Fatalf("force result: %+v %v", result, err)
+	}
+	for _, table := range []string{"messages", "dedup", "receive_attempts", "settlement_receipts"} {
+		var count int
+		if err := e.db.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM `+table+` WHERE queue='sub'`); err != nil || count != 0 {
+			t.Fatalf("%s retained rows: %d %v", table, count, err)
+		}
+	}
+	if stats, err := e.Stats(ctx, "other"); err != nil || stats.Total != 1 {
+		t.Fatalf("crossed entity boundary: %+v %v", stats, err)
+	}
+	if _, err := e.SendOne(ctx, "topic", OutMessage{}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("last subscription left topic: %v", err)
+	}
+}
+
+func TestResourceDeletionBoundedAndRestartable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "lifecycle.db")
+	e, _ := testEngineAt(t, path)
+	mustQueue(t, e, "large", QueueConfig{})
+	queues, err := e.ListQueues(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := queues[0].Generation
+	const rows = 2*lifecyclePassRows + lifecycleBatchRows + 17
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?)
+  INSERT INTO messages(queue,enqueued_at,body) SELECT 'large',1,x'01' FROM n`, rows); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.DeleteQueueWithOptions(ctx, "large", generation, DeleteOptions{Force: true})
+	if err != nil || result.Deleted || result.State != "deleting" {
+		t.Fatalf("unbounded foreground deletion: %+v %v", result, err)
+	}
+	var remaining int
+	if err := e.db.queryRowScan(ctx, []any{&remaining}, `SELECT COUNT(*) FROM messages WHERE queue='large'`); err != nil || remaining != rows-lifecycleBatchRows {
+		t.Fatalf("foreground budget: %d %v", remaining, err)
+	}
+	if err := e.CreateQueue(ctx, "large", QueueConfig{}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("reserved name reused: %v", err)
+	}
+	if _, err := e.SendOne(ctx, "large", OutMessage{}); !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("deleting queue accepted send: %v", err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, _ = testEngineAt(t, path)
+	if err := e.db.queryRowScan(ctx, []any{&remaining}, `SELECT COUNT(*) FROM messages WHERE queue='large'`); err != nil || remaining != rows-lifecycleBatchRows-lifecyclePassRows {
+		t.Fatalf("startup budget/resume: %d %v", remaining, err)
+	}
+	for i := 0; i < 3; i++ {
+		e.maintainLifecycle(ctx)
+	}
+	if queues, err := e.ListQueues(ctx); err != nil || len(queues) != 0 {
+		t.Fatalf("cleanup did not finish: %+v %v", queues, err)
+	}
+	mustQueue(t, e, "large", QueueConfig{})
+	queues, err = e.ListQueues(ctx)
+	if err != nil || queues[0].Generation == generation {
+		t.Fatalf("replacement reused generation: %+v %v", queues, err)
+	}
+}
+
+func TestResourceDeletionBoundsAuxiliaryRows(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	queues, err := e.ListQueues(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2500)
+ INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at) SELECT 'q',CAST(i AS TEXT),'[]',1,9999999999999 FROM n`); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeleteQueue(ctx, "q", queues[0].Generation); !errors.Is(err, ErrDeletionPending) {
+		t.Fatalf("large auxiliary delete must be pending: %v", err)
+	}
+	var remaining int
+	if err := e.db.queryRowScan(ctx, []any{&remaining}, `SELECT COUNT(*) FROM receive_attempts WHERE queue='q'`); err != nil || remaining != 1500 {
+		t.Fatalf("auxiliary budget: %d %v", remaining, err)
+	}
+	e.maintainLifecycle(ctx)
+	if queues, err := e.ListQueues(ctx); err != nil || len(queues) != 0 {
+		t.Fatalf("auxiliary cleanup: %+v %v", queues, err)
+	}
+}
+
+func TestSubscriptionInventoryPaginationAndLogicalCounts(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	for _, pair := range [][2]string{{"a", "a1"}, {"a", "a2"}, {"b", "b1"}} {
+		if err := e.Subscribe(ctx, pair[0], pair[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts := SubscribeOptions{TTLMs: 1, RequestID: "expires", RequestExpiresAtMs: e.now() + 1000}
+	if _, err := e.SubscribeWithOptions(ctx, "a", "a0", nil, opts); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Millisecond)
+	first, err := e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{Topic: "a", Limit: 1})
+	if err != nil || first.Total != 2 || len(first.Subscriptions) != 1 || first.Subscriptions[0].Name != "a1" || first.NextAfter == "" {
+		t.Fatalf("first page: %+v %v", first, err)
+	}
+	second, err := e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{Topic: "a", Limit: 1, After: first.NextAfter})
+	if err != nil || second.Total != 2 || len(second.Subscriptions) != 1 || second.Subscriptions[0].Name != "a2" || second.NextAfter != "" {
+		t.Fatalf("second page: %+v %v", second, err)
+	}
+	if _, err := e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{Topic: "b", After: first.NextAfter}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("cross-scope cursor: %v", err)
+	}
+	all, err := e.ListSubscriptionsPage(ctx, ListSubscriptionsOptions{Topic: "a", IncludeDeleting: true})
+	if err != nil || all.Total != 3 || all.Subscriptions[0].State != "deleting" {
+		t.Fatalf("retiring inventory: %+v %v", all, err)
+	}
+}
+
+func TestRetiredFilterSnapshotCannotResurrectCache(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	oldExpr := `subject == "old"`
+	old, err := e.SubscribeWithOptions(ctx, "topic", "sub", &Filter{Expr: oldExpr}, SubscribeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A remote transaction may hold this roster snapshot while another transaction
+	// deletes the entity and publishes its cache invalidation.
+	oldEpoch := e.queueCacheEpoch()
+	if _, err := e.DeleteSubscription(ctx, "topic", "sub", old.Generation, DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	entry := e.compiledFilter("sub", oldExpr, oldEpoch)
+	if entry.err != nil || !e.filterAccepts(target{name: "sub", entry: entry}, OutMessage{Subject: "old"}, e.now(), e.now()) {
+		t.Fatal("old snapshot did not retain its own filter semantics")
+	}
+	e.filterMu.Lock()
+	count := len(e.filterCache)
+	e.filterMu.Unlock()
+	if count != 0 {
+		t.Fatal("late remote roster resurrected retired filter cache")
+	}
+	currentExpr := `subject == "new"`
+	if _, err := e.SubscribeWithOptions(ctx, "topic", "sub", &Filter{Expr: currentExpr}, SubscribeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	current := e.compiledFilter("sub", currentExpr, e.queueCacheEpoch())
+	_ = e.compiledFilter("sub", oldExpr, oldEpoch)
+	e.filterMu.Lock()
+	cached := e.filterCache["sub"]
+	e.filterMu.Unlock()
+	if cached != current {
+		t.Fatal("late old snapshot overwrote the replacement's cached filter")
+	}
+}

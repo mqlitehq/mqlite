@@ -84,6 +84,10 @@ func main() {
 	switch cmd {
 	case "serve":
 		err = cmdServe(ctx, args)
+	case "delete-queue":
+		err = cmdDeleteQueue(ctx, args)
+	case "delete-subscription":
+		err = cmdDeleteSubscription(ctx, args)
 	case "create-queue":
 		err = cmdCreateQueue(ctx, args)
 	case "subscribe", "create-subscription":
@@ -165,7 +169,9 @@ usage: mqlite <command> [flags]
   create-queue <name>       create/update a queue
   subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate')
   list                      list queues
-  list-subscriptions        list subscriptions with their topic + filter
+  delete-queue <name>        delete an empty queue (--generation ID; --force discards retained data)
+  delete-subscription <name> --topic TOPIC [--generation ID --force]
+  list-subscriptions        list subscriptions (--topic NAME --limit N --after CURSOR --include-deleting)
   peek <queue>              browse messages without locking (--state --from --max)
   test-filter <expr>        dry-run a filter expression against an optional sample
   metrics <queue>           show queue counters
@@ -207,6 +213,10 @@ type api interface {
 	Cancel(ctx context.Context, queue string, seq int64) error
 	CreateQueue(ctx context.Context, name string, cfg mqlite.QueueConfig) error
 	Subscribe(ctx context.Context, topic, name string, f *mqlite.Filter) error
+	SubscribeWithOptions(context.Context, string, string, *mqlite.Filter, mqlite.SubscribeOpts) (mqlite.SubscriptionInfo, error)
+	DeleteQueueWithOptions(context.Context, string, ...mqlite.DeleteQueueOpts) (mqlite.DeleteResult, error)
+	DeleteSubscription(context.Context, string, string, ...mqlite.DeleteSubscriptionOpts) (mqlite.DeleteResult, error)
+	ListSubscriptionsPage(context.Context, mqlite.ListSubscriptionsOpts) (mqlite.SubscriptionPage, error)
 	ListQueues(ctx context.Context) ([]mqlite.QueueInfo, error)
 	ListSubscriptions(ctx context.Context) ([]mqlite.SubscriptionInfo, error)
 	TestFilter(ctx context.Context, expr string, sample *mqlite.OutMessage, enqueuedAtMs, visibleAtMs int64) (mqlite.FilterTestResult, error)
@@ -292,6 +302,17 @@ func embeddedOpts() []mqlite.EmbeddedOption {
 	if v := os.Getenv("MQLITE_SYNC"); v != "" { // NORMAL (default) | FULL | OFF | EXTRA — validated at Open
 		opts = append(opts, mqlite.WithSynchronous(v))
 	}
+	limits := []int{0, 0}
+	for i, key := range []string{"MQLITE_MAX_SUBSCRIPTIONS", "MQLITE_MAX_SUBSCRIPTION_REQUESTS"} {
+		if v := os.Getenv(key); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limits[i] = n
+			} else {
+				warnEnv(key, v)
+			}
+		}
+	}
+	opts = append(opts, mqlite.WithSubscriptionLimits(limits[0], limits[1]))
 	return opts
 }
 
@@ -736,13 +757,24 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 
 func cmdCreateSubscription(ctx context.Context, args []string) error {
 	fs := newFlags("subscribe")
-	exprStr := fs.String("expr", "", `filter expression (expr-lang), e.g. 'subject_parts[0]=="orders"'; empty = match all`)
+	exprStr := fs.String("expr", "", "filter expression; empty matches all")
+	ttl := fs.Duration("ttl", 0, "fixed subscription lifetime; requires --request-id and --request-expires-at")
+	generation := fs.String("generation", "", "existing incarnation for a temporary filter update")
+	requestID := fs.String("request-id", "", "stable ID reused for this temporary create")
+	retryUntil := fs.String("request-expires-at", "", "absolute RFC3339 retry deadline (within five minutes)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(pos) != 2 { // exact arity
-		return fmt.Errorf("usage: subscribe <topic> <subscription> [--expr 'predicate']")
+	if len(pos) != 2 {
+		return fmt.Errorf("usage: subscribe <topic> <subscription> [--expr predicate --ttl 1m --request-id ID --request-expires-at RFC3339 --generation ID]")
+	}
+	var expires time.Time
+	if *retryUntil != "" {
+		expires, err = time.Parse(time.RFC3339Nano, *retryUntil)
+		if err != nil {
+			return fmt.Errorf("--request-expires-at: %w", err)
+		}
 	}
 	c, err := dial(ctx)
 	if err != nil {
@@ -753,14 +785,22 @@ func cmdCreateSubscription(ctx context.Context, args []string) error {
 	if *exprStr != "" {
 		f = &mqlite.Filter{Expr: *exprStr}
 	}
-	if err := c.Subscribe(ctx, pos[0], pos[1], f); err != nil {
+	if *ttl == 0 && *generation == "" && *requestID == "" && *retryUntil == "" {
+		if err := c.Subscribe(ctx, pos[0], pos[1], f); err != nil {
+			return err
+		}
+		return okResult(map[string]any{"action": "subscribe", "subscription": pos[1], "topic": pos[0]}, "action", "subscription", "topic")
+	}
+	sub, err := c.SubscribeWithOptions(ctx, pos[0], pos[1], f, mqlite.SubscribeOpts{TTL: *ttl, Generation: *generation, RequestID: *requestID, RequestExpiresAt: expires})
+	if err != nil {
 		return err
 	}
-	return okResult(map[string]any{"action": "subscribe", "subscription": pos[1], "topic": pos[0]}, "action", "subscription", "topic")
+	return okResult(map[string]any{"action": "subscribe", "subscription": sub.Name, "topic": sub.Topic, "generation": sub.Generation, "ttl_ms": sub.TTLMs, "expires_at_ms": sub.ExpiresAtMs, "state": sub.State}, "action", "subscription", "topic", "generation", "expires_at_ms", "state")
 }
 
 func cmdSend(ctx context.Context, args []string) error {
 	fs := newFlags("send")
+	generation := fs.String("generation", "", "destination incarnation")
 	file := fs.String("file", "", "read body from file")
 	msgID := fs.String("message-id", "", "message id (dedup/idempotency key)")
 	group := fs.String("group", "", "group id (MessageGroupId)")
@@ -785,7 +825,7 @@ func cmdSend(ctx context.Context, args []string) error {
 	}
 	defer c.Close()
 	seq, err := c.SendOne(ctx, queue, mqlite.OutMessage{
-		Body: body, MessageID: *msgID, GroupID: *group, Subject: *subject, ReplyTo: *replyTo, TTL: *ttl,
+		TargetGeneration: *generation, Body: body, MessageID: *msgID, GroupID: *group, Subject: *subject, ReplyTo: *replyTo, TTL: *ttl,
 	})
 	if err != nil {
 		return err
@@ -795,6 +835,7 @@ func cmdSend(ctx context.Context, args []string) error {
 
 func cmdReceive(ctx context.Context, args []string) error {
 	fs := newFlags("receive")
+	generation := fs.String("generation", "", "destination incarnation")
 	max := fs.Int("max", 1, "max messages")
 	wait := fs.Duration("wait", 0, "long-poll wait (e.g. 5s)")
 	noAck := fs.Bool("no-ack", false, "leave messages locked (do not Complete)")
@@ -822,7 +863,7 @@ func cmdReceive(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	msgs, err := c.Receive(ctx, queue, mqlite.RecvOpts{Max: *max, Wait: *wait, AtMostOnce: *del})
+	msgs, err := c.Receive(ctx, queue, mqlite.RecvOpts{Generation: *generation, Max: *max, Wait: *wait, AtMostOnce: *del})
 	if err != nil {
 		return err
 	}

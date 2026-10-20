@@ -119,14 +119,23 @@ type filterEntry struct {
 	usesBodyJSON bool
 }
 
-// compiledFilter returns the cached compiled program for a subscription, recompiling
-// when the stored expression changed (a re-subscribe). Concurrency-safe.
-func (e *Engine) compiledFilter(sub, exprStr string) *filterEntry {
+func (e *Engine) queueCacheEpoch() uint64 {
+	e.qmu.RLock()
+	defer e.qmu.RUnlock()
+	return e.qepoch
+}
+
+// compiledFilter returns the program belonging to a transaction's roster snapshot.
+// A remote read can finish after deletion invalidated the cache: such a snapshot
+// may use its program, but must not repopulate a retired name or overwrite a new
+// incarnation's cache entry. Capture epoch before the transaction begins.
+func (e *Engine) compiledFilter(sub, exprStr string, epoch uint64) *filterEntry {
 	e.filterMu.Lock()
-	defer e.filterMu.Unlock()
 	if ent, ok := e.filterCache[sub]; ok && ent.expr == exprStr {
+		e.filterMu.Unlock()
 		return ent
 	}
+	e.filterMu.Unlock()
 	prog, err := compileFilter(exprStr)
 	ent := &filterEntry{
 		expr:         exprStr,
@@ -135,7 +144,16 @@ func (e *Engine) compiledFilter(sub, exprStr string) *filterEntry {
 		usesBodyText: referencesVar(prog, "body_text"),
 		usesBodyJSON: referencesVar(prog, "body_json"),
 	}
-	e.filterCache[sub] = ent
+	// Coordinate the epoch check and cache publication with lifecycle invalidation.
+	// Compilation stays outside the locks so an expensive expression cannot delay
+	// retirement or unrelated cache hits.
+	e.qmu.RLock()
+	defer e.qmu.RUnlock()
+	if e.qepoch == epoch {
+		e.filterMu.Lock()
+		e.filterCache[sub] = ent
+		e.filterMu.Unlock()
+	}
 	return ent
 }
 
@@ -193,12 +211,12 @@ func (e *Engine) filterAccepts(t target, m OutMessage, enqueuedAtMs, visibleAtMs
 // means "match all" (a nil program). A bad expression returns ErrInvalidFilter
 // wrapping the precise compiler error (position + available names/functions).
 func compileFilter(source string) (*vm.Program, error) {
-	if strings.TrimSpace(source) == "" {
-		return nil, nil // match-all
-	}
 	if len(source) > maxFilterSourceLen {
 		return nil, fmt.Errorf("%w: expression too long (%d > %d bytes)",
 			ErrInvalidFilter, len(source), maxFilterSourceLen)
+	}
+	if strings.TrimSpace(source) == "" {
+		return nil, nil // match-all
 	}
 	prog, err := expr.Compile(source, filterOptions()...)
 	if err != nil {

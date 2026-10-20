@@ -625,3 +625,54 @@ func TestObserveOptionalDiagnosticsCompatibility(t *testing.T) {
 		reject(v)
 	}
 }
+
+func TestObserveRetiredAggregateRoundTrip(t *testing.T) {
+	data, err := os.ReadFile("../server/testdata/observability.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := wire.DecodeObserveResponse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := make([]engine.MessageCounter, 0, len(engine.MessageEventNames()))
+	for i, event := range engine.MessageEventNames() {
+		retired = append(retired, engine.MessageCounter{Queue: "", Event: event, Count: uint64(i)})
+	}
+	base.Messages = append(base.Messages, retired...)
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := wire.DecodeObserveResponse(encoded)
+	if err != nil || !reflect.DeepEqual(decoded, base) {
+		t.Fatalf("retired aggregate did not round-trip: %v", err)
+	}
+	reject := func(value wire.ObserveResponse) {
+		t.Helper()
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := wire.DecodeObserveResponse(encoded); err == nil {
+			t.Fatal("invalid retired aggregate accepted")
+		}
+	}
+	for i := range retired {
+		value := base
+		at := len(base.Messages) - len(retired) + i
+		value.Messages = append(append([]engine.MessageCounter{}, base.Messages[:at]...), base.Messages[at+1:]...)
+		reject(value)
+	}
+	duplicate := base
+	duplicate.Messages = append(append([]engine.MessageCounter{}, base.Messages...), retired[0])
+	reject(duplicate)
+	emptyEvent := base
+	emptyEvent.Messages = append([]engine.MessageCounter{}, base.Messages...)
+	emptyEvent.Messages[len(emptyEvent.Messages)-1].Event = ""
+	reject(emptyEvent)
+	invalidInventory := base
+	invalidInventory.Queues = append([]engine.QueueObservation{}, base.Queues...)
+	invalidInventory.Queues[0].Queue = ""
+	reject(invalidInventory) // Empty queue is legal only in the counter aggregate.
+}

@@ -77,3 +77,28 @@ func TestListSubscriptionsAndTestFilter(t *testing.T) {
 		t.Fatalf("TestFilter invalid = %+v", tfBad)
 	}
 }
+
+func TestSubscriptionCapacityHTTP(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, MaxSubscriptions: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.Subscribe(ctx, "events", "first", nil); err != nil {
+		t.Fatal(err)
+	}
+	handler := server.New(eng, []string{"admin"}).Handler()
+	body, _ := json.Marshal(wire.SubscribeRequest{Topic: "events", Name: "second"})
+	req := httptest.NewRequest(http.MethodPost, wire.PathSubscribe, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer admin")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var out wire.ErrorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusTooManyRequests || out.Code != "resource_limit" {
+		t.Fatalf("capacity=%d %s", rec.Code, rec.Body.String())
+	}
+}

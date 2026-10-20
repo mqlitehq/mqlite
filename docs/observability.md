@@ -239,7 +239,7 @@ and registered RPC/result combinations are initialized to zero, so the first
 event can be detected after an earlier successful scrape. Use `rate`/`increase`
 across observed samples; a first scrape after an event cannot reconstruct its time.
 Maintenance tasks are `locks`, `scheduled`, `ttl`,
-`dedup`, `receipts`, `retention`, `reclaim`. Check enabled status and each task's
+`dedup`, `receipts`, `retention`, `reclaim`, and `lifecycle`. Check enabled status and each task's
 actual cadence before alerting on its last-success time.
 Canceled passes during normal shutdown are `interrupted`, not successful passes
 or maintenance errors; they do not advance the last-success timestamp.
@@ -255,6 +255,21 @@ committed effect. An uncertain remote outcome is not classified as a known
 rollback. Counters are process-local and reset at restart; unobserved activity
 before a crash can be lost. They are operational measurements, not a durable
 billing or business audit ledger.
+
+With the unreleased lifecycle implementation, retiring an entity releases its
+per-name counter state. Its confirmed counts move to one aggregate whose `queue`
+is the empty string; this value cannot be a real queue name. Late commit callbacks
+crossing a concurrent retirement also contribute to that aggregate, so totals are
+preserved without attributing old work to a replacement. Same-name recreation starts
+new per-queue counters. A simultaneous lifecycle change can therefore make individual
+queue attribution conservative; broker-wide confirmed totals remain available.
+
+The retired aggregate is historical accounting, not an activity series: transferring
+counts into it is not new throughput. Exclude `queue=""` from per-queue rates. For a
+broker-wide rate across retiring names, sum the cumulative counters first and apply
+`rate` to that recorded aggregate (or use a PromQL subquery); do not sum separate
+rates including the retired transfer series. Metric label cardinality tracks live
+and pending resources rather than every temporary name used since process start.
 Custom raw SQL through `EngineTx.SQL` is not attributed to message-effect events.
 Queue gauges still report the actual retained database rows, including unexpected
 states; do not use event counters to reconstruct changes made outside the normal
@@ -311,7 +326,7 @@ samples remain “No data” or “Not available”; they are not replaced with 
 mqlite_queue_messages{state="active"}
 
 # Observed completion throughput; rate handles observed counter resets
-sum by (instance, queue) (rate(mqlite_message_events_total{event="completed"}[5m]))
+sum by (instance, queue) (rate(mqlite_message_events_total{event="completed",queue!=""}[5m]))
 
 # Handler p95; Receive includes intentional long-poll waiting
 histogram_quantile(0.95, sum by (instance, rpc, le) (
@@ -398,7 +413,8 @@ interrupts only that isolated stack to verify scrape-auth recovery, Grafana
 connection failure/recovery and persistence/counter reset after broker restart.
 Managed-cloud/Kubernetes deployment validation remains environment-specific.
 
-DeleteQueue is an additive RPC observation extension. New brokers include its
-request counters and the `queue_not_empty` and `queue_changed` outcomes. The required decoder baseline
+Lifecycle RPCs are additive observation extensions. New brokers include
+DeleteQueue/DeleteSubscription request counters and the `queue_not_empty`,
+`queue_changed`, `deletion_pending` and `resource_limit` outcomes. The required decoder baseline
 is unchanged so new clients continue to accept observations from older brokers.
 An occupied-queue rejection is an application outcome, not a storage failure.

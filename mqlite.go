@@ -34,6 +34,8 @@ var (
 	ErrNameConflict     = engine.ErrNameConflict
 	ErrQueueNotEmpty    = engine.ErrQueueNotEmpty
 	ErrQueueChanged     = engine.ErrQueueChanged
+	ErrDeletionPending  = engine.ErrDeletionPending
+	ErrResourceLimit    = engine.ErrResourceLimit
 	ErrGroupRequired    = engine.ErrGroupRequired
 	// ErrDBLocked is returned by OpenEmbedded when the local file DB is already open
 	// in another process: embedded mode is single-process, single-writer (MQLITE-6).
@@ -68,8 +70,9 @@ type Filter = engine.Filter
 
 // OutMessage is a message to send. Body is opaque; broker never parses it.
 type OutMessage struct {
-	Body      []byte
-	MessageID string // dedup/idempotency key; empty -> body SHA-256 when dedup on
+	TargetGeneration string // destination incarnation fence; required for direct sends to temporary subscriptions
+	Body             []byte
+	MessageID        string // dedup/idempotency key; empty -> body SHA-256 when dedup on
 	// GroupID is an ordering/partition key (= SQS MessageGroupId, ASB SessionId):
 	// same GroupID = strict in-order (FIFO per group); empty = own group (max
 	// parallelism). NOT a consumer group — competing consumers just Receive the
@@ -85,15 +88,16 @@ type OutMessage struct {
 
 func (m OutMessage) toEngine() engine.OutMessage {
 	return engine.OutMessage{
-		Body:          m.Body,
-		MessageID:     m.MessageID,
-		GroupID:       m.GroupID,
-		CorrelationID: m.CorrelationID,
-		ReplyTo:       m.ReplyTo,
-		Subject:       m.Subject,
-		ContentType:   m.ContentType,
-		Properties:    m.Properties,
-		TTLMs:         m.TTL.Milliseconds(),
+		TargetGeneration: m.TargetGeneration,
+		Body:             m.Body,
+		MessageID:        m.MessageID,
+		GroupID:          m.GroupID,
+		CorrelationID:    m.CorrelationID,
+		ReplyTo:          m.ReplyTo,
+		Subject:          m.Subject,
+		ContentType:      m.ContentType,
+		Properties:       m.Properties,
+		TTLMs:            m.TTL.Milliseconds(),
 	}
 }
 
@@ -140,7 +144,41 @@ type QueueInfo = engine.QueueInfo
 // DeleteQueueOpts binds deletion to a queue incarnation obtained from ListQueues.
 // Keep Generation unchanged when reconciling or retrying a previous request.
 // If omitted, the SDK looks up the current generation once before deletion.
-type DeleteQueueOpts struct{ Generation string }
+type DeleteQueueOpts struct {
+	Generation string
+	Force      bool // retire immediately and discard remaining messages in bounded cleanup
+}
+
+// DeleteSubscriptionOpts binds deletion to a subscription incarnation.
+type DeleteSubscriptionOpts = DeleteQueueOpts
+
+// DeleteResult reports whether physical removal is complete or cleanup is pending.
+type DeleteResult = engine.DeleteResult
+
+// SubscribeOpts configures a fixed-lifetime subscription. Retain the complete options
+// when retrying; a request ID and absolute retry deadline are required for TTL creates.
+type SubscribeOpts struct {
+	TTL              time.Duration
+	Generation       string
+	RequestID        string
+	RequestExpiresAt time.Time
+}
+
+func (o SubscribeOpts) toEngine() engine.SubscribeOptions {
+	expiry := int64(0)
+	if !o.RequestExpiresAt.IsZero() {
+		expiry = o.RequestExpiresAt.UnixMilli()
+	}
+	ttl := o.TTL.Milliseconds()
+	if o.TTL != 0 && ttl == 0 {
+		ttl = -1
+	}
+	return engine.SubscribeOptions{TTLMs: ttl, Generation: o.Generation, RequestID: o.RequestID, RequestExpiresAtMs: expiry}
+}
+
+// ListSubscriptionsOpts selects one bounded page; an empty topic selects all topics.
+type ListSubscriptionsOpts = engine.ListSubscriptionsOptions
+type SubscriptionPage = engine.SubscriptionPage
 
 func queueGeneration(queues []QueueInfo, name string) (string, error) {
 	for _, q := range queues {
@@ -196,6 +234,7 @@ const MaxRenewBatch = engine.MaxRenewBatch
 
 // RecvOpts configures a Receive call.
 type RecvOpts struct {
+	Generation string        // incarnation fence; required for temporary subscriptions
 	Max        int           // most messages to claim (0 -> 1)
 	Wait       time.Duration // long-poll wait (0 -> don't wait); capped at 20s
 	AtMostOnce bool          // receive-and-delete (no lock, no settle)
@@ -215,12 +254,13 @@ func (o RecvOpts) toEngine() engine.ReceiveOptions {
 	if max <= 0 {
 		max = 1
 	}
-	return engine.ReceiveOptions{MaxMessages: max, WaitMs: o.Wait.Milliseconds(), Mode: o.mode(), AttemptID: o.Attempt}
+	return engine.ReceiveOptions{Generation: o.Generation, MaxMessages: max, WaitMs: o.Wait.Milliseconds(), Mode: o.mode(), AttemptID: o.Attempt}
 }
 
 // SendOpts configures a SendOne call.
 type SendOpts struct {
-	At time.Time // schedule delivery for t (zero -> immediate)
+	Generation string    // incarnation fence; required for temporary subscriptions
+	At         time.Time // schedule delivery for t (zero -> immediate)
 }
 
 // AbandonOpts configures a Message.Abandon call.

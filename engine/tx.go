@@ -60,6 +60,14 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if m.TargetGeneration != "" {
+		if len(targets) != 1 || targets[0].name != queue {
+			return 0, fmt.Errorf("%w: generation requires a direct queue or subscription target", ErrInvalidArgument)
+		}
+		if _, err := t.e.checkQueueLiveTx(t.ctx, t.tx, queue, m.TargetGeneration); err != nil {
+			return 0, err
+		}
+	}
 	var last int64
 	for _, tg := range targets {
 		if !t.e.filterAccepts(tg, m, t.now, t.now) { // immediate send: visible_at == enqueued_at
@@ -68,6 +76,9 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 		q, err := t.e.loadQueueTx(t.ctx, t.tx, tg.name)
 		if err != nil {
 			return 0, err
+		}
+		if q.subscriptionTTLMs > 0 && tg.name == queue && m.TargetGeneration == "" {
+			return 0, fmt.Errorf("%w: generation required for a temporary subscription target", ErrInvalidArgument)
 		}
 		if q.ordering == OrderGroupFIFO && m.GroupID == "" {
 			return 0, ErrGroupRequired
@@ -132,7 +143,9 @@ func (e *Engine) Tx(ctx context.Context, fn func(*EngineTx) error) error {
 
 func (e *Engine) resolveTargetsTx(ctx context.Context, tx *txn, name string) ([]target, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT subscription, filter_json FROM subscriptions WHERE topic=? ORDER BY subscription`, name)
+		`SELECT s.subscription, s.filter_json FROM subscriptions s JOIN queues q ON q.name=s.subscription
+		 WHERE s.topic=? AND q.lifecycle_state='active' AND (q.expires_at=0 OR q.expires_at>?)
+		 ORDER BY s.subscription`, name, e.now())
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +157,7 @@ func (e *Engine) resolveTargetsTx(ctx context.Context, tx *txn, name string) ([]
 		if err := rows.Scan(&s, &fj); err != nil {
 			return nil, err
 		}
-		subs = append(subs, e.targetFor(s, fj))
+		subs = append(subs, e.targetFor(s, fj, tx.queueEpoch))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

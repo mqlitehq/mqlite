@@ -19,6 +19,7 @@ func newAttemptID() string {
 }
 
 type receiverConfig struct {
+	generation  string
 	autoRenew   bool
 	concurrency int
 	prefetch    int
@@ -27,6 +28,11 @@ type receiverConfig struct {
 
 // ReceiverOption configures a Receiver.
 type ReceiverOption func(*receiverConfig)
+
+// WithGeneration pins every receive in this loop to one resource incarnation.
+func WithGeneration(generation string) ReceiverOption {
+	return func(c *receiverConfig) { c.generation = generation }
+}
 
 // WithAutoRenew keeps locks alive with a background heartbeat for long handlers.
 func WithAutoRenew() ReceiverOption { return func(c *receiverConfig) { c.autoRenew = true } }
@@ -87,8 +93,11 @@ func (r *Receiver) notify(err error) {
 func isPermanent(err error) bool {
 	return errors.Is(err, ErrUnauthenticated) ||
 		errors.Is(err, ErrPermissionDenied) ||
+		errors.Is(err, ErrInvalidArgument) ||
 		errors.Is(err, ErrNotFound) ||
 		errors.Is(err, ErrQueueNotFound) ||
+		errors.Is(err, ErrQueueChanged) ||
+		errors.Is(err, ErrDeletionPending) ||
 		// The broker does not serve this operation at all — an older broker, or a proxy that
 		// routes only part of the API. Retrying cannot make the route appear, so a receiver that
 		// treated this as transient would spin forever instead of reporting the incompatibility
@@ -119,6 +128,19 @@ func reserve(ctx context.Context, sem chan struct{}, max int) int {
 		}
 	}
 	return n
+}
+
+func (r *Receiver) receiveOne(ctx context.Context, max int, attemptID string) ([]*Message, error) {
+	if r.cfg.generation == "" {
+		return r.src.receiveOne(ctx, r.queue, max, 20000, engine.PeekLock, attemptID)
+	}
+	pinned, ok := r.src.(interface {
+		receiveOneGeneration(context.Context, string, int, int64, engine.ReceiveMode, string, string) ([]*Message, error)
+	})
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	return pinned.receiveOneGeneration(ctx, r.queue, max, 20000, engine.PeekLock, attemptID, r.cfg.generation)
 }
 
 // Run pulls and processes messages until ctx is canceled or a permanent error occurs.
@@ -193,7 +215,7 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		// recorded this batch (only the response was lost), the retry replays it instead of
 		// claiming new messages.
 		attemptID := newAttemptID()
-		msgs, err := r.src.receiveOne(rctx, r.queue, n, 20000, engine.PeekLock, attemptID) // 20s long-poll
+		msgs, err := r.receiveOne(rctx, n, attemptID) // 20s long-poll
 		// Sample the shutdown ordering the moment the error is observed — before the retry and
 		// before notify, either of which can span a caller cancellation (codex).
 		errAfterCancel := err != nil && cancelled()
@@ -201,7 +223,7 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			// ONE transient retry, same attempt id (a lost response replays the same batch). A
 			// permanent error is, by definition, not helped by retrying — and retrying it opened
 			// a window in which a later cancellation could displace the error's ordering.
-			msgs, err = r.src.receiveOne(rctx, r.queue, n, 20000, engine.PeekLock, attemptID)
+			msgs, err = r.receiveOne(rctx, n, attemptID)
 			errAfterCancel = err != nil && cancelled()
 		}
 		if err != nil {

@@ -136,10 +136,10 @@ func TestSchemaVersionGuard(t *testing.T) {
 // the statements are the contract).
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
-		wantVersion = "5"
-		// MQLITE-121: the independent access_keys table is additive; all previous
-		// statements are pinned separately by TestAccessKeySchemaAdditiveCompatibility.
-		wantHash = "755981e5ff9dbd1e04a7e0f1152358452464053ff1a6276300f20135b5c21ec0"
+		wantVersion = "6"
+		// MQLITE-65: lifecycle metadata changes delivery semantics; old engines
+		// must reject these databases rather than ignore expiration/deletion.
+		wantHash = "dcc15fcb5a25d8902703d72846723d826df3c5d89b463f1f1be85fdccec27617"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -150,7 +150,138 @@ func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	}
 }
 
+// Version 5 had no lifecycle columns. Preserve a full DDL hash for the previous
+// shipped format and prove Open rejects it before changing its data or schema.
+func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
+	var previous []string
+	for _, statement := range schemaStmts {
+		if strings.Contains(statement, "idx_queue_expiry") || strings.Contains(statement, "idx_queue_deleting") ||
+			strings.Contains(statement, "idx_subs_by_subscription") || strings.Contains(statement, "idx_msg_queue") ||
+			strings.Contains(statement, "subscription_creations") {
+			continue
+		}
+		if strings.HasPrefix(statement, "CREATE TABLE IF NOT EXISTS queues") {
+			var kept []string
+			for _, line := range strings.Split(statement, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "lifecycle_state ") || strings.HasPrefix(trimmed, "subscription_ttl_ms ") ||
+					strings.HasPrefix(trimmed, "expires_at ") || strings.HasPrefix(trimmed, "delete_started_at ") {
+					continue
+				}
+				kept = append(kept, line)
+			}
+			statement = strings.Join(kept, "\n")
+		}
+		previous = append(previous, statement)
+	}
+	const previousHash = "755981e5ff9dbd1e04a7e0f1152358452464053ff1a6276300f20135b5c21ec0"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(previous, "\n")))); got != previousHash {
+		t.Fatalf("version 5 fixture drifted: %s", got)
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "version-five.db")
+	d, err := openDB(ctx, path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range previous {
+		if _, err := d.exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.exec(ctx, `INSERT INTO meta VALUES('schema_version','5')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.exec(ctx, `INSERT INTO queues(name,created_at,updated_at) VALUES('old',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.exec(ctx, `INSERT INTO messages(queue,enqueued_at,body) VALUES('old',1,?)`, []byte("preserve me")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.close(); err != nil {
+		t.Fatal(err)
+	}
+	if e, err := Open(ctx, Options{DB: path, DisableBackground: true}); !errors.Is(err, ErrSchemaVersionMismatch) || e != nil {
+		if e != nil {
+			_ = e.Close()
+		}
+		t.Fatalf("version 5 accepted: %v", err)
+	}
+	d, err = openDB(ctx, path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.close()
+	var body []byte
+	if err := d.queryRowScan(ctx, []any{&body}, `SELECT body FROM messages WHERE queue='old'`); err != nil || string(body) != "preserve me" {
+		t.Fatalf("previous data changed: %q %v", body, err)
+	}
+	var count int
+	if err := d.queryRowScan(ctx, []any{&count}, `SELECT COUNT(*) FROM pragma_table_info('queues') WHERE name='lifecycle_state'`); err != nil || count != 0 {
+		t.Fatalf("previous layout mutated: %d %v", count, err)
+	}
+}
+
 // ─── Free-page reclamation ──────────────────────────────────────────────────
+
+func TestLifecycleDeletionPlansSeekOwnedRows(t *testing.T) {
+	e, _ := testEngine(t)
+	for _, query := range []string{
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE queue='q')`,
+		`DELETE FROM queues WHERE name='q' AND lifecycle_state='deleting'`,
+		`SELECT topic FROM subscriptions WHERE subscription='q'`,
+	} {
+		var plan []string
+		err := e.db.queryRows(context.Background(), `EXPLAIN QUERY PLAN `+query, func(rows *sql.Rows) error {
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					return err
+				}
+				plan = append(plan, detail)
+			}
+			return rows.Err()
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(plan, "\n")
+		if strings.Contains(joined, "SCAN messages") || strings.Contains(joined, "SCAN subscriptions") {
+			t.Fatalf("lifecycle scans unrelated entities: %s\n%s", query, joined)
+		}
+		if !strings.Contains(joined, "SEARCH") {
+			t.Fatalf("lifecycle query lacks seek: %s\n%s", query, joined)
+		}
+	}
+}
+
+func TestBackgroundReclaimHasPageBudget(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+	 INSERT INTO messages(queue,enqueued_at,body) SELECT 'q',1,zeroblob(4096) FROM n`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `DELETE FROM messages WHERE queue='q'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	var before, after int
+	if err := e.db.queryRowScan(ctx, []any{&before}, `PRAGMA freelist_count`); err != nil {
+		t.Fatal(err)
+	}
+	e.reclaimFreePages(ctx)
+	if err := e.db.queryRowScan(ctx, []any{&after}, `PRAGMA freelist_count`); err != nil {
+		t.Fatal(err)
+	}
+	if before <= 512 || after >= before || before-after > 256 {
+		t.Fatalf("background page budget: %d -> %d", before, after)
+	}
+}
 
 // Compact(full=false) must actually return freed pages to the OS — a single
 // incremental_vacuum step with no checkpoint reclaimed almost nothing and never shrank the
@@ -550,7 +681,11 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 	}
 	sizeBefore := fi.Size()
 
-	e.reclaimFreePages(ctx) // checkpoint + incremental_vacuum + checkpoint → file shrinks
+	// Each background pass moves at most 256 pages. Repeated passes must reclaim
+	// the backlog while allowing foreground work between passes.
+	for pass := 0; pass <= before/256 && freelist() >= freePageReclaimMin; pass++ {
+		e.reclaimFreePages(ctx)
+	}
 
 	afterFree := freelist()
 	fi2, err := os.Stat(path)
@@ -559,8 +694,8 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 	}
 	t.Logf("reclaim: freelist %d -> %d pages, file %d -> %d bytes (%.0f%% returned to OS)",
 		before, afterFree, sizeBefore, fi2.Size(), 100*float64(sizeBefore-fi2.Size())/float64(sizeBefore))
-	// A working reclaim returns essentially the WHOLE freelist to the OS, not a few
-	// pages. incremental_vacuum needs the freed pages on the main-DB freelist AND a
+	// Repeated bounded passes return essentially the whole reclaimable freelist.
+	// incremental_vacuum needs the freed pages on the main-DB freelist AND a
 	// checkpoint to truncate the file — a weak "shrank at all" check would pass even on
 	// a near-total leak, which is exactly what an empty-queue-but-10MB-file looks like.
 	if afterFree >= freePageReclaimMin {
@@ -602,6 +737,7 @@ type busyState struct {
 	noEffect  bool // a fenced write matched no message; exercise receipt lookup instead
 	commitErr error
 	execErr   error
+	onCommit  func() // optional coordination for commit-publication tests
 }
 
 func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
@@ -615,6 +751,9 @@ func (c *busyConn) Begin() (driver.Tx, error) { return &busyTx{st: c.st}, nil }
 type busyTx struct{ st *busyState }
 
 func (t *busyTx) Commit() error {
+	if t.st.onCommit != nil {
+		t.st.onCommit()
+	}
 	if t.st.failsLeft > 0 {
 		t.st.failsLeft--
 		return errors.New("database is locked") // busy: the commit provably did not land
@@ -634,6 +773,13 @@ func (c *busyConn) record(query string, args []driver.NamedValue) bool {
 }
 
 func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	// Lifecycle validation reads authoritative metadata before the timed message
+	// operation. Supply a real queue row; injected BUSY faults still target the
+	// claim/settlement statements whose clock refresh these fixtures exercise.
+	if strings.Contains(query, "SELECT "+queueSelectColumns+" FROM queues WHERE name=?") {
+		return &busyQueueRows{values: []driver.Value{args[0].Value, "queue", int64(1000), int64(10), int64(0),
+			int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "fixture", "active", int64(0), int64(0)}}, nil
+	}
 	if !c.record(query, args) {
 		return nil, errors.New("database is locked") // isBusyErr => retryable
 	}
@@ -654,6 +800,28 @@ func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.Na
 }
 
 type emptyRows struct{}
+
+type busyQueueRows struct {
+	values []driver.Value
+	done   bool
+}
+
+func (r *busyQueueRows) Columns() []string {
+	columns := make([]string, len(r.values))
+	for i := range columns {
+		columns[i] = fmt.Sprint(i)
+	}
+	return columns
+}
+func (r *busyQueueRows) Close() error { return nil }
+func (r *busyQueueRows) Next(values []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	copy(values, r.values)
+	r.done = true
+	return nil
+}
 
 func (emptyRows) Columns() []string         { return []string{"id"} }
 func (emptyRows) Close() error              { return nil }
@@ -1145,7 +1313,7 @@ func TestClaimTimeRefreshesOnRemoteRetry(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			d, st := remoteDBFailingFirst(t, 2)
 			tick := int64(100_000)
-			q := queueRow{name: "q", lockDurationMs: 1_000}
+			q := queueRow{name: "q", lockDurationMs: 1_000, generation: "fixture", lifecycleState: "active"}
 			e := &Engine{db: d, qcache: map[string]queueRow{"q": q}, now: func() int64 {
 				tick += 2_000
 				return tick
@@ -1191,7 +1359,7 @@ func TestSettlementTimeRefreshesOnRemoteRetry(t *testing.T) {
 				d, st := remoteDBFailingFirst(t, 2)
 				st.noEffect = noEffect
 				var tick int64 = 100_000
-				q := queueRow{name: "q", lockDurationMs: 1_000}
+				q := queueRow{name: "q", lockDurationMs: 1_000, generation: "fixture", lifecycleState: "active"}
 				e := &Engine{db: d, note: newNotifier(), qcache: map[string]queueRow{"q": q}, now: func() int64 {
 					tick += 2_000
 					return tick
@@ -1721,15 +1889,13 @@ func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
 }
 
 func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
-	// Pin every pre-existing DDL byte, independent of the new table's golden.
+	// The independent access-key table can still be added to an otherwise
+	// current database. Version 5 itself is incompatible with lifecycle metadata.
 	var oldSchema []string
 	for _, stmt := range schemaStmts {
 		if stmt != accessKeySchema && stmt != accessKeyCreatedIndex {
 			oldSchema = append(oldSchema, stmt)
 		}
-	}
-	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(oldSchema, "\n")))); got != "9dcb13ddf1fbf11179a690e70d357dcfa1b87fa6f135a85db02164185d5854e6" || schemaVersion != "5" {
-		t.Fatalf("v0.3.0 queue schema changed: hash=%s token=%s", got, schemaVersion)
 	}
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "old.db")
@@ -1742,7 +1908,7 @@ func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := d.exec(ctx, `INSERT INTO meta VALUES ('schema_version','5')`); err != nil {
+	if _, err := d.exec(ctx, `INSERT INTO meta VALUES ('schema_version',?)`, schemaVersion); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.exec(ctx, `INSERT INTO queues(name, created_at, updated_at) VALUES ('existing', 1, 1)`); err != nil {
@@ -2238,6 +2404,78 @@ func TestObservabilityTransactionRetriesAndUnknownOutcome(t *testing.T) {
 	}
 }
 
+func TestRemoteCommitPublishesRetirementBeforeReplacement(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	d.sql.SetMaxOpenConns(4)
+	e := &Engine{db: d, observation: observations{
+		initialized: true,
+		known:       map[string]bool{"q": true},
+		events:      map[eventKey]uint64{{"q", "enqueued"}: 3},
+	}}
+	firstCommit := make(chan struct{})
+	releaseAck := make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(releaseAck) }) }
+	defer unblock()
+	var commits atomic.Int32
+	state.onCommit = func() {
+		if commits.Add(1) == 1 {
+			close(firstCommit)
+			<-releaseAck // The primary committed; its acknowledgement is delayed.
+		}
+	}
+	deleted := make(chan error, 1)
+	go func() {
+		deleted <- e.inTx(context.Background(), func(_ context.Context, tx *txn) error {
+			tx.forgetQueue("q")
+			return nil
+		})
+	}()
+	select {
+	case <-firstCommit:
+	case <-time.After(time.Second):
+		t.Fatal("deletion did not reach commit")
+	}
+	created := make(chan error, 1)
+	createReady := make(chan struct{})
+	go func() {
+		created <- e.inTx(context.Background(), func(_ context.Context, tx *txn) error {
+			tx.rememberQueue("q")
+			close(createReady)
+			return nil
+		})
+	}()
+	select {
+	case <-createReady:
+	case <-time.After(time.Second):
+		t.Fatal("replacement callback was blocked by the commit publication guard")
+	}
+	// Both transactions captured the old observation epoch. Only their commit
+	// phase is serialized, and the first retains the guard through publication.
+	if e.commitMu.TryLock() {
+		e.commitMu.Unlock()
+		t.Fatal("a later commit can overtake the pending retirement publication")
+	}
+	if got := commits.Load(); got != 1 {
+		t.Fatalf("replacement committed before retirement acknowledgement: %d commits", got)
+	}
+	unblock()
+	for _, done := range []chan error{deleted, created} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("commit publication did not finish")
+		}
+	}
+	e.recordMessage("q", "enqueued", 1)
+	if !e.observation.known["q"] || e.observation.events[eventKey{"q", "enqueued"}] != 1 || e.observation.events[eventKey{"", "enqueued"}] != 3 {
+		t.Fatalf("replacement observation was retired: known=%v events=%v", e.observation.known, e.observation.events)
+	}
+}
+
 func TestObservabilityStorageClassificationAndHistogram(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
@@ -2278,7 +2516,7 @@ func TestObservabilityMaintenanceFailuresAndFilterOutcomes(t *testing.T) {
 	ctx := context.Background()
 	e.RunMaintenanceOnce(ctx)
 	s := e.Observability(ctx)
-	if len(s.Maintenance) != 7 {
+	if len(s.Maintenance) != len(MaintenanceTaskNames()) {
 		t.Fatalf("maintenance=%d", len(s.Maintenance))
 	}
 	for _, m := range s.Maintenance {
@@ -2686,7 +2924,11 @@ func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
 			t.Fatal(err)
 		}
 		joined := strings.Join(plan, "\n")
-		if !strings.Contains(joined, "MATERIALIZE m") || strings.Count(joined, "SCAN messages") != 1 || strings.Index(joined, "SCAN messages") > strings.Index(joined, "LEFT-JOIN") {
+		messageAccess := strings.Index(joined, "SCAN messages")
+		if messageAccess < 0 {
+			messageAccess = strings.Index(joined, "SEARCH messages")
+		}
+		if !strings.Contains(joined, "MATERIALIZE m") || strings.Count(joined, "SCAN messages")+strings.Count(joined, "SEARCH messages") != 1 || messageAccess > strings.Index(joined, "LEFT-JOIN") {
 			t.Fatalf("messages must be aggregated once before inventory join:\n%s", joined)
 		}
 	}

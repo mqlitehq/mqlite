@@ -125,7 +125,10 @@ func DecodeObserveResponse(data []byte) (ObserveResponse, error) {
 		messageEvents[q.Queue] = nil
 	}
 	for _, m := range out.Messages {
-		valid = valid && m.Queue != "" && m.Event != ""
+		// The empty queue is the bounded retired-resource aggregate, never an
+		// inventory entity. It must carry the same complete, unique event domain
+		// as a named queue; the domain checks below reject partial aggregates.
+		valid = valid && m.Event != ""
 		messageEvents[m.Queue] = append(messageEvents[m.Queue], m.Event)
 	}
 	for _, events := range messageEvents {

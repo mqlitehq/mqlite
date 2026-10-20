@@ -135,6 +135,7 @@
   <a href="#map">Overview</a>
   <a href="#concepts">Five concepts</a>
   <a href="#provision">Provisioning</a>
+  <a href="#lifecycle">Lifecycle</a>
   <a href="#ids">Two IDs</a>
   <a href="#faq">FAQ</a>
   <a href="#cloud">Cloud comparison</a>
@@ -257,7 +258,7 @@
           <h3 style="margin-top:0">Topic</h3>
           <p>A <b>logical name</b> standing for "the set of subscriptions attached to it".</p>
           <p>It is <b>not an explicitly created object</b> — it exists exactly while a
-            subscription references it. <b>A zero-subscription topic does not exist</b>, and a
+            live subscription references it. <b>A zero-live-subscription topic does not exist</b>; expired/deleting rows do not keep it publishable, and a
             topic <b>holds no messages</b>: no inbox, no buffer, no retention.</p>
         </div>
       </div>
@@ -317,13 +318,55 @@
                                      (the topic comes into being as a side effect)
 
   Send target resolution:
-    name has subscription rows -> topic, fan out  ·  else -> existing queue  ·  else -> error
+    name has live subscriptions -> topic, fan out  ·  else -> existing live queue  ·  else -> error
   Receive / settle / Stats address a plain queue or subscription by its own name.</pre>
     <div class="callout"><div class="i">🧭</div><div>
       Difference from ASB: in ASB both the Topic and the Subscription are created explicitly;
       MQLite makes "create topic" implicit and "create the subscription's queue" automatic —
       <b>two fewer steps</b>.
     </div></div>
+  </div>
+</section>
+
+<section id="lifecycle">
+  <div class="wrap">
+    <h2>Resource lifecycle and temporary subscriptions</h2>
+    <p class="lead">Unreleased, schema 6: <code>DeleteQueue</code> and
+      <code>DeleteSubscription</code> default to empty-only. Locked, scheduled,
+      deferred and dead-lettered messages all count. Explicit <code>force</code>
+      discards every retained state; it does not undo consumer side effects.</p>
+    <p>Retiring a subscription stops routing and retires its backing queue. The
+      topic disappears when its last live subscription retires; there is no separate
+      <code>DeleteTopic</code>. Physical cleanup may continue with
+      <code>state="deleting"</code>, reserving the name until completion and resuming
+      after restart. Preserve the original generation on retries so an old action
+      cannot affect a same-name replacement.</p>
+    <table>
+      <thead><tr><th>Setting</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>Subscription TTL</td><td>One deadline fixed at first creation; 0 means durable.
+          Retries, filter changes, traffic and restart do not renew it. Expiry preauthorizes
+          force deletion, including in-flight messages.</td></tr>
+        <tr><td>Message TTL</td><td>Expires a message into the DLQ or discards it, according
+          to configuration. It does not delete the subscription.</td></tr>
+        <tr><td>Lock duration</td><td>Bounds a consumer lease; independent of resource expiry.</td></tr>
+      </tbody>
+    </table>
+    <p>Temporary creation requires a stable request ID and absolute retry deadline
+      of at most five minutes. An accepted request replay cannot resurrect an expired
+      or deleted subscription. Direct sends, receives and filter changes for a temporary
+      subscription require its generation. Logical expiry rejects new work even while
+      cleanup is pending. See <a href="api-reference.md#subscribe">the API contract</a>.</p>
+    <p>For frequent request/reply, a stable reply queue per application instance and
+      an application dispatcher keyed by <code>correlation_id</code> avoids one resource
+      per request. Create the waiter before sending; handle duplicates, late replies and
+      timeouts. <code>reply_to</code> and <code>correlation_id</code> are metadata, not an
+      automatic broker RPC protocol. For temporary replies, carry the reply generation
+      in an application property alongside <code>reply_to</code> and use it when replying.</p>
+    <p><code>ListSubscriptions</code> supports topic filtering, counts and pages;
+      include deleting entries to inspect cleanup. Stopping a receiver alone does not
+      remove its subscription. Configured inventory limits are admission controls, not
+      measured throughput guarantees.</p>
   </div>
 </section>
 

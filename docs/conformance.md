@@ -243,14 +243,18 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
   tests. The remote (Turso) path retries transient errors with backoff; the local
   path never retries. *(engine/storage_test.go, engine/turso_test.go)*
-- **10.4** Compatible access-key table and index additions MUST preserve schema token 5
-  and existing v0.3.0 data. Verify real upgrade/downgrade behavior and complete
+- **10.4** Compatible access-key table and index additions MUST preserve their
+  existing schema token. The historical schema-5 access-key additions preserved
+  v0.3.0 data; lifecycle columns use the new incompatible schema token 6. Verify real upgrade/downgrade behavior and complete
   backup/restore content, including active, expired and revoked credentials.
   An incompatible existing object named `access_keys` or
   `idx_access_keys_created` MUST fail rather than be overwritten or silently trusted.
   *(engine/storage_test.go: TestAccessKeySchemaAdditiveCompatibility,
   TestAccessKeySchemaConflict, TestAccessKeyCreationIndexUpgradeAndConflicts;
   test/production/restore/run.py, compat.py)*
+- **10.5** The lifecycle implementation MUST reject a schema-5 database without
+  changing it; it MUST NOT silently add incompatible columns or rewrite the token.
+  *(engine/storage_test.go: TestLifecycleSchemaRejectsVersionFiveWithoutMutation)*
 
 ## 11 · Subscription filters
 
@@ -276,6 +280,24 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   *(engine/filter_test.go `TestFilterReSubscribeRecompiles`)*
 
 ## 12 · Topics & naming
+
+The unreleased resource lifecycle contract additionally requires:
+
+- Default queue/subscription deletion MUST reject any retained message state.
+  Force deletion and fixed subscription expiry authorize discarding all states;
+  retirement MUST reject new work and reserve the name until cleanup finishes.
+- A subscription's positive TTL MUST be fixed from first creation. Retry, filter
+  change, traffic and restart MUST NOT renew it. Creation receipts MUST prevent an
+  old accepted request from resurrecting a retired subscription.
+- Deletion and direct operations on a temporary subscription MUST retain its
+  generation; a stale identity MUST NOT operate on a replacement. Topic publication
+  routes only to live subscriptions in the publishing transaction.
+- Retiring names MUST NOT cause in-memory metric state or canceled long-poll
+  registrations to grow with historical entity count. Confirmed event totals
+  survive as bounded retired aggregates; late callbacks cannot reintroduce old names.
+  *(engine/concurrency_test.go: TestObservabilityRetirementFencesLateCommit,
+  TestObservabilityUniqueNameChurnRetainsOnlyAggregate,
+  TestNotifierRetiresCanceledAndReplacedWaiters, TestNotifierReleaseKeepsOtherWaiters)*
 
 - **12.1** Plain-queue names, subscription names (their backing queues) and topic
   names are **one disjoint namespace**. Every collision MUST be rejected with

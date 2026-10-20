@@ -22,7 +22,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	if max > 1000 {
 		max = 1000
 	}
-	args := []any{queue, opts.FromSeq}
+	args := []any{queue, opts.FromSeq, int64(0)}
 	stateClause := ""
 	if opts.State != "" {
 		stateClause = " AND state=?"
@@ -31,12 +31,15 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	args = append(args, max)
 	var out []*PeekedMessage
 	var bytes int64
-	err := e.db.queryRows(ctx, `
+	err := e.db.queryFresh(ctx, `
 		SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
 		       properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
 		       dead_letter_reason,dead_letter_description
-		FROM messages WHERE queue=? AND id>=?`+stateClause+`
-		ORDER BY id ASC LIMIT ?`, func(rows *sql.Rows) error {
+		FROM messages WHERE queue=? AND id>=? AND `+liveMessageQueueSQL+stateClause+`
+		ORDER BY id ASC LIMIT ?`, func() []any {
+		args[2] = e.now()
+		return args
+	}, func(rows *sql.Rows) error {
 		for rows.Next() {
 			var p PeekedMessage
 			var st string
@@ -64,7 +67,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 			}
 		}
 		return rows.Err()
-	}, args...)
+	})
 	return out, err
 }
 

@@ -130,8 +130,9 @@ Every transition, with its trigger and the condition under which it fires:
 A **logical name** standing for "the set of subscriptions attached to it".
 
 - A topic is **not an explicitly created/stored object** — its existence is exactly
-  "there are rows in `subscriptions` with `topic=<name>`". **A topic with zero
-  subscriptions does not exist.**
+  "there are live subscriptions with `topic=<name>`". **A topic with zero live
+  subscriptions does not exist.** Expired/deleting subscriptions awaiting cleanup
+  do not keep it publishable.
 - A topic **holds no messages of its own**: no inbox, no buffer, no retention.
 
 ### Subscription
@@ -191,6 +192,48 @@ You only ever do two kinds of "create":
 > Difference from ASB: in ASB both the Topic and the Subscription are created
 > explicitly; MQLite makes "create topic" implicit and "create the subscription's
 > queue" automatic — two fewer steps.
+
+### Resource lifecycle and temporary subscriptions
+
+The unreleased schema-6 API supports `DeleteQueue` and `DeleteSubscription`.
+Both default to deleting only empty resources; every message state counts,
+including locked, scheduled, deferred and dead-lettered. Explicit `force` discards
+all retained work. A subscription deletion retires its routing and backing queue
+together; its topic disappears when the last live subscription is retired.
+There is no separately stored topic to delete.
+
+Deleting and expired resources immediately stop accepting new work. Physical
+cleanup can finish in later bounded passes, with `state:"deleting"` and the name
+reserved until it completes. Restart resumes cleanup. A generation identifies
+one lifetime; preserve it when retrying deletion or addressing a resource that
+may be replaced. Do not look up a new generation and blindly retry an old action.
+
+An optional subscription TTL fixes its expiry from first creation. `0` means
+durable. Subscribe retries, filter changes, messages and restarts never renew it;
+it is not an idle timeout or a heartbeat. Choosing TTL authorizes force deletion
+at expiry, even if messages remain or a consumer is working on one. Message TTL,
+DLQ retention and lock duration are independent settings.
+
+Temporary creation requires a stable creation request ID and a bounded absolute
+retry deadline. Reuse the same request to reconcile an uncertain result; it cannot
+resurrect an expired/deleted subscription. Direct sends, receives and filter
+updates to temporary subscriptions require the creation result's generation.
+See [Subscribe](api-reference.md#subscribe) for fields and limits.
+
+For frequent request/reply, a stable reply queue per application instance with
+an application dispatcher keyed by `correlation_id` avoids creating one durable
+resource per request. Create the local waiter before sending the request, then
+handle duplicate, late and timed-out replies explicitly. `reply_to` and
+`correlation_id` are metadata: the worker sends the reply and copies the correlation
+ID; the broker does not implement an RPC wait protocol. If temporary replies are
+needed, create the subscription before sending and carry its generation in an
+application property beside `reply_to`, so late replies cannot enter a replacement.
+
+One topic can have many subscriptions. `ListSubscriptions` can filter by topic,
+return a total and paginate; include deleting resources to inspect cleanup.
+Stopping a receiver alone does not delete its subscription. Subscriber count,
+filter cost, message size and creation/deletion rate all affect capacity; the
+configured inventory limits are admission bounds, not performance promises.
 
 ### Message ID vs Sequence Number (the two ids people conflate)
 | | Who assigns it | When fanned out to N subs | Purpose |

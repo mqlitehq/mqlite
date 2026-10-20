@@ -17,8 +17,8 @@ and the Go SDK, so the two can't drift) and the server's error mapping.
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
 - **At-least-once:** consumers must be idempotent. A message is delivered at least
-  once and never silently dropped (see [retention.md](retention.md) for what is and
-  isn't auto-deleted).
+  once while retained. Explicit force deletion, subscription expiry and configured
+  message expiry/retention can discard work (see [retention.md](retention.md)).
 - **One settlement verb per outcome** — `Complete` / `Abandon` / `Reject` / `Defer`,
   no aliases. New effects require the `lock_token` from `Receive` and an unexpired
   lease; exact-request receipt replays are described below.
@@ -39,6 +39,13 @@ reasonable (they count toward the JSON request you send, not toward the body cap
 | `wait_time_ms` long-poll | 20000 (max) | request field |
 | `Peek` `max` | 32 default, 1000 max | request field |
 | filter `expr` source | capped length + AST node count | internal (see [concepts.md](concepts.md#subscription-filters-expr)) |
+| retained subscriptions, including pending deletion | 10000 | `MQLITE_MAX_SUBSCRIPTIONS` / embedded `WithSubscriptionLimits` |
+| retained subscription creation receipts | 10000 | `MQLITE_MAX_SUBSCRIPTION_REQUESTS` / embedded `WithSubscriptionLimits` |
+| subscription creation retry window | 5 minutes maximum | absolute `request_expires_at_ms`; never extended by retry |
+
+The subscription limits are admission controls, not tested throughput guarantees.
+Exhaustion returns HTTP 429 `resource_limit`; cleanup or receipt expiry must free
+capacity before new requests are admitted. Negative configured limits are invalid.
 
 ## The base URL
 
@@ -138,7 +145,7 @@ and console. Requires `manage` or a configured monitor credential.
 | `collection` | Queue collection `state`, `last_success_at_ms`, `duration_seconds`, bounded `error_code` |
 | `queue_count`, `subscription_count`, `queues` | Actual retained state counts and age; counts are usable only when collection is `available` |
 | `runtime` | Schema version, read-probe availability/latency and local footprint availability/bytes; no DSN or path |
-| `messages` | Engine-lifetime `{queue,event,count}` effects, recorded after confirmed commits |
+| `messages` | Confirmed `{queue,event,count}` effects; retired/concurrently changing lifetimes aggregate under `queue:""` to bound retained labels |
 | `storage` | Bounded operation outcomes, durations, retries and database connection pool measurements |
 | `maintenance`, `filters` | Maintenance enablement, results/durations/last success and filter failures |
 | `http` | Request outcomes/full elapsed time, final authentication outcomes and post-auth handler histograms |
@@ -266,7 +273,8 @@ All paths are `/mqlite.v1.QueueService/<Method>`.
 Enqueue one or more messages in one transaction.
 
 - **Request** `SendRequest`: `queue` (string), `messages` ([Message]),
-  `scheduled_enqueue_time_ms` (int, optional), `ttl_ms` (int, optional).
+  `scheduled_enqueue_time_ms` (int, optional), `ttl_ms` (int, optional),
+  `generation` (string; required when directly addressing a temporary subscription).
 - **Response** `SendResponse`: `seq_numbers` ([int]) — one per input message, positional.
 - **Dedup:** in a multi-message batch, a slot that hits a dedup conflict (same
   `message_id`, different body) comes back as `0` (skipped) while the rest commit. A
@@ -279,6 +287,12 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 ```
 
 ### Receive
+
+Unreleased: `generation` is required when receiving directly from a temporary
+subscription, including `ReceiveDeferred`. It is optional for durable queues and
+subscriptions. A mismatch rejects the operation rather than targeting a same-name
+replacement. SDK `RecvOpts.Generation` and `WithGeneration` bind receivers to the
+identity returned by creation/inventory.
 
 Peek-Lock (default) or Receive-and-Delete; long-polls up to `wait_time_ms`.
 Receive-and-Delete removes the row before returning it and grants no lease:
@@ -426,25 +440,31 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 
 ### DeleteQueue
 
-Available in **v0.3.3 and later**.
-
-Removes an **empty plain queue**. Requires administrator/manage permission.
+Empty-only deletion is available in **v0.3.3**. The force/pending lifecycle
+contract below is **unreleased and requires schema 6**. Requires manage permission.
 
 - POST `/mqlite.v1.AdminService/DeleteQueue`
 - Read the queue's `generation` from `ListQueues`, then send
-  `{"name":"orders","generation":"<value from ListQueues>"}`.
-  Response: `{"deleted":true}`. Missing generation returns HTTP 400.
+  `{"name":"orders","generation":"<value from ListQueues>","force":false}`.
+  Missing generation returns HTTP 400.
 - The generation must still match inside the deletion transaction. HTTP 409,
   `queue_changed`, means the name now identifies a replacement; the request did
   not delete it. Preserve the original generation when retrying/reconciling.
 - All message states block deletion, including locked, scheduled, deferred and
   dead-lettered messages: HTTP 409, `queue_not_empty`. Drain or settle them first.
+- Explicit `force:true` authorizes discarding every retained message, including
+  in-flight work and the DLQ. Consumer side effects outside the broker are not undone.
 - Subscription backing queues are rejected with HTTP 400, `invalid_argument`;
   this operation does not remove topic subscriptions.
-- Missing queues return HTTP 404, `not_found`. Queue configuration and per-queue
-  deduplication, settlement receipts and receive-attempt records are removed in
-  the same transaction. Recreating the name starts with fresh auxiliary records;
-  message sequence numbers are not reset. Process event counters remain historical.
+- The response is `{"deleted":true,"state":"deleted","generation":"…"}` when
+  cleanup completed, or `{"deleted":false,"state":"deleting","generation":"…"}`
+  when retirement is accepted and cleanup remains. Both are HTTP 200. Pending
+  resources reject new sends/claims, keep their name reserved, and resume bounded
+  cleanup after restart. Inspect inventory or retry with the **same generation**.
+- Missing queues return HTTP 404, `not_found`. Message, deduplication, settlement
+  receipt and receive-attempt cleanup finishes before the name is reusable.
+  Recreating the name starts with fresh auxiliary records; sequence numbers are
+  not reset. Retired event counts move into the bounded `queue:""` aggregate.
 - Stop producers and consumers before retiring a queue. The transactional
   emptiness check prevents deletion of a concurrent acknowledged send. Requests
   still addressing a retired name fail; an existing long poll is woken.
@@ -452,16 +472,24 @@ Removes an **empty plain queue**. Requires administrator/manage permission.
   before retrying. Queue names are reusable. Keep the original generation; never automatically
   look up a replacement generation and retry a previous deletion against it.
 
-Go SDK: `client.DeleteQueue(ctx, name)` / `embedded.DeleteQueue(ctx, name)`.
-These resolve the current generation once per invocation. For retained requests,
-pass `DeleteQueueOpts{Generation: originalGeneration}` to fence later retries.
-`ListQueues` adds the optional `generation` field; existing response fields and
-all prior RPC contracts remain unchanged. New queue generations are opaque IDs
-stored in the existing `meta` table. Existing queues use a stable legacy identity
-until deleted; reconfiguration preserves identity. No schema-version change or
-migration is required.
-The console exposes **delete queue** in a plain queue's detail page and requires
-an exact name confirmation. Older brokers report the operation as unsupported.
+Go SDK: `DeleteQueue(ctx, name)` remains the error-only convenience method and
+returns `ErrDeletionPending` when physical cleanup remains. Use
+`DeleteQueueWithOptions(ctx, name, DeleteQueueOpts{Generation: originalGeneration,
+Force: true})` to receive the full deletion result. Always retain the original
+generation across retries; resolving a new generation is a new deletion intent.
+
+### DeleteSubscription
+
+Unreleased, schema 6. POST `/mqlite.v1.AdminService/DeleteSubscription` with
+`{"topic":"replies","name":"reply-worker","generation":"…","force":false}`.
+Requires manage permission. Read the identity from `ListSubscriptions` or the
+`Subscribe` response. The empty check, explicit force behavior, pending result,
+generation fencing and cleanup contract are the same as `DeleteQueue`.
+
+This retires both the routing subscription and its backing queue. Removing the
+last active subscription makes the implicit topic unavailable; there is no
+separate `DeleteTopic` operation. A backing queue cannot be removed through
+`DeleteQueue`. SDK `DeleteSubscription` returns the deletion result.
 
 ### CreateQueue
 
@@ -509,22 +537,80 @@ Register subscription `name` under `topic` (creates its backing queue).
 
 - **Request** `SubscribeRequest`: `topic`, `name`, `filter` (optional —
   `{"expr": "<predicate>"}`, an [expr boolean over the message](concepts.md#subscription-filters-expr); empty/omitted
-  matches all). A malformed expr is rejected with `400 invalid_argument`. **Response** `{}`.
+  matches all). A malformed expr is rejected with `400 invalid_argument`.
+  The unreleased response is `{topic,name,expr?,generation,ttl_ms?,expires_at_ms?,state}`.
 - Name conflicts are rejected with `409 name_conflict`: a `topic` that names an
   existing queue or subscription, a `name` that belongs to a plain queue / another
   topic's subscription / a live topic, and `topic == name`. Re-subscribing the same
   `(topic, name)` is the idempotent filter-update path and succeeds.
 
+Unreleased optional fields: `ttl_ms`, `generation`, `request_id` and
+`request_expires_at_ms`. `ttl_ms:0` creates a durable subscription. A positive TTL
+sets one persisted deadline on **first creation**; traffic, filter updates,
+retries and restarts do not extend it. Changing a live subscription's TTL is
+rejected; retire it and create a new generation for a new lifetime. Use
+`generation` when updating a known subscription to reject a same-name replacement.
+
+A positive-TTL creation requires a unique `request_id` and an absolute
+`request_expires_at_ms` no more than five minutes ahead of broker time. Persist the
+same request fields for retries. Replaying an accepted request does not create
+another subscription, change its filter or resurrect it after deletion/expiry.
+It returns the original identity only while that generation is still live;
+otherwise it returns `queue_changed`. Reusing the request ID with changed inputs
+is rejected. After the request deadline,
+reconcile inventory rather than automatically inventing a fresh creation request.
+
+TTL is **preauthorized force deletion** at the fixed deadline: it discards all
+remaining states, including locked replies. It is distinct from message `ttl_ms`
+and lock duration. Logical expiry prevents new routing/claims even before the
+background cleanup has finished; inventory exposes pending deletion until cleanup
+completes. The original name remains reserved during cleanup.
+
+Direct Send, Schedule, Receive, ReceiveDeferred and filter updates for a temporary
+subscription require its `generation`; topic publication remains independent of
+individual subscription generations. In the SDK use `SendOpts.Generation` or
+`OutMessage.TargetGeneration`, and `RecvOpts.Generation`. For request/reply,
+include the reply generation in an application property alongside `ReplyTo`; the
+replying worker must supply it when sending directly to the temporary reply target.
+
+```go
+// Retain opts until this creation's outcome has been reconciled.
+opts := mqlite.SubscribeOpts{
+    TTL: time.Minute,
+    RequestID: "a-unique-create-request-id",
+    RequestExpiresAt: time.Now().Add(5 * time.Minute),
+}
+sub, err := client.SubscribeWithOptions(ctx, "replies", "reply-worker", nil, opts)
+// Preserve sub.Generation when sending, receiving, updating or deleting this lifetime.
+```
+
 ### ListQueues
 
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
-  `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`, `dedup_window_ms`}]).
+  `generation`, `state`, `expires_at_ms?`, `lock_duration_ms`,
+  `max_delivery_count`, `default_ttl_ms`, `dedup_window_ms`}]). Retained metadata
+  awaiting cleanup is included with `state:"deleting"`.
 
 ### ListSubscriptions
 
-- **Request** `{}`. **Response** `{subscriptions: [{topic, name, expr}]}` — every
-  subscription with its topic and [filter expression](concepts.md#subscription-filters-expr) (`expr` empty = match
-  all). `ListQueues` shows the backing queues; this exposes the topic + filter it omits.
+- **Request** `{topic?,after?,limit?,include_deleting?}`. **Response**
+  `{subscriptions:[{topic,name,expr?,generation,ttl_ms?,expires_at_ms?,state}],total,next_after?}`.
+  Omit `topic` to include all topics; `expr` empty means match all. The default
+  view contains live subscriptions; use `include_deleting:true` for pending cleanup.
+- `total` counts the matching inventory before the page cursor. Set `limit` and
+  continue with the opaque `next_after`; the paged SDK defaults to 100 and permits
+  at most 1000. Concurrent changes can alter later pages and totals; this is not a
+  snapshot held across calls.
+- The default total excludes expired/deleting subscriptions. With
+  `include_deleting:true`, it also counts retained cleanup reservations. Legacy
+  `ListQueues` and `Status` counts include those reservations, so they can differ
+  from the default live-subscription total.
+- `{}` retains the legacy all-live-subscriptions behavior. For high-cardinality
+  inventories use `ListSubscriptionsPage` with a topic and an explicit page size.
+
+For example, `{"topic":"replies","limit":100}` lists the first page and total
+for one topic without downloading unrelated subscriptions. `ListQueues` also
+shows backing queues, while this operation includes their topic and filter.
 
 ### TestFilter
 
@@ -620,7 +706,10 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 409 | `name_conflict` | a queue/subscription/topic name collision at creation time — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
 | 409 | `key_conflict` | a managed key ID or token digest is already registered (`mqlite.ErrKeyConflict`); no existing secret is returned |
 | 409 | `lock_lost` | settle with an expired or wrong `lock_token` |
+| 409 | `queue_not_empty` | default deletion found retained messages in any state |
+| 409 | `queue_changed` | a retained generation no longer identifies this resource lifetime |
 | 413 | `message_too_large` | body over `MaxMessageBytes` (default 1 MiB) |
+| 429 | `resource_limit` | retained subscriptions or creation receipts reached their configured admission limit |
 | 499 | `canceled` | the client canceled the request |
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
@@ -628,3 +717,8 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 The Go SDK re-exports the sentinel errors (`mqlite.ErrLockLost`, `ErrDedupConflict`,
 `ErrInvalidArgument`, `ErrOutcomeUnknown`, …) so `errors.Is` works in both embedded and
 client mode.
+
+Deletion RPCs return `state:"deleting"` while physical cleanup remains pending.
+The error-only Go `DeleteQueue` convenience method reports `ErrDeletionPending`
+for that result. Creating a replacement before cleanup finishes returns
+`name_conflict`; retain the original generation when checking deletion again.

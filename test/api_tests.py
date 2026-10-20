@@ -463,12 +463,78 @@ def t_access_keys():
             check(status in (200, 404), "test credential revoked or never committed")
 
 
+def t_resource_lifecycle():
+    section("Resource lifecycle: generations, fixed TTL, pagination and forced deletion")
+    admin = "/mqlite.v1.AdminService/"
+    queue = "/mqlite.v1.QueueService/"
+    topic = "lifecycle-topic-" + RUNID
+    durable = []
+    for suffix in ("a", "b"):
+        status, sub = create_sub(topic, "lifecycle-" + suffix + "-" + RUNID)
+        check(status == 200 and bool(sub.get("generation")), "durable subscription returns identity")
+        durable.append(sub)
+    status, page = call(admin + "ListSubscriptions", {"topic": topic, "limit": 1})
+    check(status == 200 and page["total"] == 2 and len(page["subscriptions"]) == 1,
+          "topic page includes matching total")
+    cursor = page["next_after"]
+    status, second = call(admin + "ListSubscriptions", {"topic": topic, "limit": 1, "after": cursor})
+    check(status == 200 and second["total"] == 2 and len(second["subscriptions"]) == 1 and
+          second["subscriptions"][0]["name"] != page["subscriptions"][0]["name"],
+          "second page advances without repeating first subscription")
+    check(call(admin + "ListSubscriptions", {"topic": "other", "after": cursor})[0] == 400,
+          "cursor cannot silently switch topic scope")
+    name = "lifecycle-temporary-" + RUNID
+    create = {"topic": topic, "name": name, "ttl_ms": 60000,
+              "request_id": secrets.token_hex(16), "request_expires_at_ms": int(time.time() * 1000) + 60000}
+    check(call(admin + "Subscribe", {"topic": topic, "name": name, "ttl_ms": 1200})[0] == 400,
+          "temporary creation requires retry identity")
+    status, sub = call(admin + "Subscribe", create)
+    check(status == 200 and sub.get("expires_at_ms", 0) > 0, "temporary creation returns absolute expiry")
+    generation = sub["generation"]
+    status, replay = call(admin + "Subscribe", create)
+    check(status == 200 and replay["generation"] == generation and
+          replay["expires_at_ms"] == sub["expires_at_ms"], "creation replay preserves generation and deadline")
+    payload = {"queue": name, "messages": [{"body": b64("reply")}]}
+    check(call(queue + "Send", payload)[0] == 400, "temporary direct send requires generation")
+    payload["generation"] = generation
+    check(call(queue + "Send", payload)[0] == 200, "generation-bound reply is accepted")
+    delete = {"topic": topic, "name": name, "generation": generation}
+    check(call(admin + "DeleteSubscription", delete)[0] == 409, "nonempty subscription is protected by default")
+    status, removed = call(admin + "DeleteSubscription", dict(delete, force=True))
+    check(status == 200 and removed["state"] in ("deleting", "deleted"), "force explicitly retires nonempty subscription")
+    check(call(queue + "Send", payload)[0] != 200, "retired generation cannot receive new replies")
+    check(call(admin + "Subscribe", create)[0] == 409, "late creation replay cannot resurrect deleted subscription")
+    # The tiny force above fits one cleanup batch, so its name is immediately reusable.
+    replacement = dict(create, request_id=secrets.token_hex(16), ttl_ms=1200)
+    status, renewed = call(admin + "Subscribe", replacement)
+    check(status == 200 and renewed["generation"] != generation, "name reuse has a fresh generation")
+    check(call(queue + "Send", payload)[0] == 409, "stale direct send cannot reach replacement")
+    remaining = (renewed["expires_at_ms"] - int(time.time() * 1000)) / 1000
+    time.sleep(max(0, remaining) + 0.05)
+    check(call(queue + "Receive", {"queue": name, "generation": renewed["generation"]})[0] == 404,
+          "fixed TTL stops consumption before physical cleanup")
+    check(call(admin + "Subscribe", replacement)[0] == 409,
+          "expired creation request cannot recreate its previous incarnation")
+    for sub in durable:
+        check(call(admin + "DeleteSubscription", {"topic": topic, "name": sub["name"],
+                  "generation": sub["generation"]})[0] == 200, "empty durable subscription can be deleted")
+    status, page = call(admin + "ListSubscriptions", {"topic": topic, "limit": 10})
+    check(status == 200 and page["total"] == 0, "topic has no active subscriptions after retirement")
+    plain = "lifecycle-plain-" + RUNID
+    create_queue(plain)
+    send(plain, "discard")
+    _, inventory = call(admin + "ListQueues", {})
+    identity = next(q["generation"] for q in inventory["queues"] if q["name"] == plain)
+    status, removed = call(admin + "DeleteQueue", {"name": plain, "generation": identity, "force": True})
+    check(status == 200 and removed["deleted"] is True, "plain queue supports explicit forced deletion")
+
+
 def main():
     print(f"Python behavioural suite — endpoint={ENDPOINT} runid={RUNID}")
     for fn in (t_lifecycle, t_batch, t_visibility_timeout, t_dlq_redrive,
                t_explicit_deadletter, t_defer, t_schedule, t_dedup, t_sessions,
                t_receive_and_delete, t_fencing,
-               t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled, t_access_keys):
+               t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled, t_access_keys, t_resource_lifecycle):
         try:
             fn()
         except Exception as e:  # noqa

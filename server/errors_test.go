@@ -243,6 +243,7 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 		{"/mqlite.v1.AuthService/ListKeys", engine.KeyManage},
 		{"/mqlite.v1.AuthService/RevokeKey", engine.KeyManage},
 		{wire.PathDeleteQueue, engine.KeyManage},
+		{wire.PathDeleteSubscription, engine.KeyManage},
 	}
 	inventory := keyTestRequest(server.New(keyTestEngine(t, nil), []string{"admin"}).Handler(), http.MethodGet, "/", "", nil)
 	var card wire.DiscoveryCard
@@ -350,6 +351,12 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 							body = wire.DeleteQueueRequest{Name: "target", Generation: q.Generation}
 						}
 					}
+				case wire.PathDeleteSubscription:
+					sub, subErr := eng.SubscribeWithOptions(ctx, "delete-topic", "delete-sub", nil, engine.SubscribeOptions{})
+					if subErr != nil {
+						t.Fatal(subErr)
+					}
+					body = wire.DeleteSubscriptionRequest{Topic: sub.Topic, Name: sub.Name, Generation: sub.Generation}
 				case wire.PathCreateQueue:
 					body = wire.CreateQueueRequest{Name: "new"}
 				case wire.PathSubscribe:

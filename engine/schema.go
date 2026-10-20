@@ -5,7 +5,7 @@ package engine
 // whose recorded version differs is refused with ErrSchemaVersionMismatch (see db.go)
 // rather than running today's DDL against a layout it doesn't match. Change the token
 // whenever the schema changes incompatibly — pre-1.0 a stale DB is simply recreated.
-const schemaVersion = "5"
+const schemaVersion = "6"
 
 // MQLITE-121: this independent table is additive to schema 5. Existing queue data
 // and indexes remain unchanged; a v0.3.0 broker ignores and preserves these rows.
@@ -43,9 +43,15 @@ var schemaStmts = []string{
 	    dlq_max_age_ms        INTEGER NOT NULL DEFAULT 0,
 	    dlq_max_count         INTEGER NOT NULL DEFAULT 0,
 	    dlq_max_bytes         INTEGER NOT NULL DEFAULT 0,
+	    lifecycle_state       TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle_state IN ('active','deleting')),
+	    subscription_ttl_ms   INTEGER NOT NULL DEFAULT 0 CHECK (subscription_ttl_ms >= 0),
+	    expires_at            INTEGER NOT NULL DEFAULT 0 CHECK (expires_at >= 0),
+	    delete_started_at     INTEGER NOT NULL DEFAULT 0,
 	    created_at            INTEGER NOT NULL,
 	    updated_at            INTEGER NOT NULL
 	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS idx_queue_expiry ON queues(expires_at, name) WHERE expires_at>0 AND lifecycle_state='active'`,
+	`CREATE INDEX IF NOT EXISTS idx_queue_deleting ON queues(delete_started_at, name) WHERE lifecycle_state='deleting'`,
 
 	// topic -> subscription fan-out roster.
 	`CREATE TABLE IF NOT EXISTS subscriptions (
@@ -57,6 +63,7 @@ var schemaStmts = []string{
 	    FOREIGN KEY (subscription) REFERENCES queues(name) ON DELETE CASCADE
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_subs_by_topic ON subscriptions(topic)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_by_subscription ON subscriptions(subscription)`,
 
 	// core message table. id (INTEGER PRIMARY KEY AUTOINCREMENT = rowid) is the
 	// broker-assigned seq_number (ASB SequenceNumber analogue): strictly increasing for
@@ -87,6 +94,9 @@ var schemaStmts = []string{
 	    dead_letter_reason      TEXT,
 	    dead_letter_description TEXT
 	) STRICT`,
+	// Lifecycle deletion checks every message state; partial claim indexes cannot
+	// answer an empty-queue check or bound cleanup across all states.
+	`CREATE INDEX IF NOT EXISTS idx_msg_queue ON messages(queue, id)`,
 
 	// Hot claim path: a partial index over ACTIVE rows only, ordered by (queue,id).
 	// claim seeks straight to the queue's smallest active id regardless of how many
@@ -169,6 +179,17 @@ var schemaStmts = []string{
 	    PRIMARY KEY (queue, attempt_id)
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS idx_recv_attempt_expire ON receive_attempts(expires_at)`,
+	// Temporary creation requests remain fenced even after the entity is removed.
+	// Expired request deadlines are rejected before consulting this bounded ledger.
+	`CREATE TABLE IF NOT EXISTS subscription_creations (
+	    request_id   TEXT PRIMARY KEY,
+	    fingerprint  TEXT NOT NULL,
+	    subscription TEXT NOT NULL,
+	    generation   TEXT NOT NULL,
+	    response     TEXT NOT NULL,
+	    expires_at   INTEGER NOT NULL
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS idx_subscription_creation_expiry ON subscription_creations(expires_at, request_id)`,
 
 	accessKeySchema,
 	accessKeyCreatedIndex,

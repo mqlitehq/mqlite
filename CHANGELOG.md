@@ -10,6 +10,33 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
+## Unreleased
+
+### Queue and subscription lifecycle (MQLITE-65)
+
+> **Incompatible storage change: schema token 6.** Published v0.3.0–v0.3.3
+> databases use token 5 and cannot be opened by this source tree. Preserve the old
+> binary and a consistent backup; account for retained work, export or drain it
+> with the old broker, and create the new database separately. No automatic
+> migration or deletion of old databases is performed. Never change the schema
+> token manually. See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
+
+- Add `DeleteSubscription` and explicit `force` deletion for queues and subscriptions.
+  The default rejects every retained message state. Force also discards locked,
+  scheduled, deferred and dead-lettered messages; it cannot undo a consumer's
+  external side effects. Every deletion remains fenced by the original generation.
+- Retiring a resource stops new work immediately, reserves its name while bounded
+  cleanup completes, and resumes cleanup after restart. Retrying with the original
+  generation reconciles pending deletion without targeting a replacement.
+- Add optional fixed subscription TTL. The deadline is set at first creation;
+  retries, filter changes, traffic and restarts do not extend it. Choosing TTL
+  authorizes force cleanup at expiry, including messages still in flight.
+- Add bounded creation request receipts, topic-filtered subscription pages and
+  counts. A replay cannot recreate a subscription after it was deleted or expired.
+- Reclaim canceled long-poll registrations and retired per-name metric state.
+  Confirmed counters for retired or concurrently changing lifetimes remain in one
+  aggregate with `queue=""`; fresh same-name resources start fresh per-queue counters.
+
 ## v0.3.3 — 2026-10-13
 
 > **Upgrade from v0.3.2:** port **6754**, schema token **5**, message data and

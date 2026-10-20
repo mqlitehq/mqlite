@@ -46,6 +46,11 @@ and error reference: [api-reference.md](api-reference.md).
 
 ## Docker / GHCR
 
+> **Unreleased source builds use schema token 6.** The published-image examples
+> below remain pinned to v0.3.3 (schema 5). Lifecycle/TTL features require the new
+> source build and a separately created database; a v0.3.3 database is not migrated
+> automatically. Follow [upgrade and rollback](operations.md#upgrade-and-rollback).
+
 > **Version and upgrade compatibility.**
 > These instructions target **v0.3.3**, with default port **6754** and schema token **5**.
 > Existing v0.3.0/v0.3.1/v0.3.2 databases remain compatible; back up before upgrading and
@@ -210,6 +215,12 @@ managed-key storage; upgrading from v0.3.1/v0.3.2 leaves the schema unchanged. T
 consistent backup first. `Observe` and configured monitor credentials require
 v0.3.2; restore compatible monitoring configuration when rolling back.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).
+
+The unreleased lifecycle implementation uses **schema 6**, incompatible with both
+earlier schemas. Use the old broker to drain or explicitly export retained work,
+preserve a consistent backup and the matching old binary, and start the candidate
+with a new database. A backup is a rollback artifact, not an automatic schema-6
+conversion. Recreate queue/subscription configuration and access keys deliberately.
 
 ## Turso (remote libSQL)
 

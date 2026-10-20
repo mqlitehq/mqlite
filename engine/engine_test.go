@@ -50,6 +50,142 @@ func recvOne(t *testing.T, e *Engine, q string) *Message {
 	return ms[0]
 }
 
+// Expiration is enforced without waiting for maintenance, across every public
+// data path. Existing receipts and an artificially long message lease cannot
+// authorize an effect after the subscription itself has expired.
+func TestSubscriptionExpiryFencesDataPlane(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	sub, err := e.SubscribeWithOptions(ctx, "events", "temporary", nil, SubscribeOptions{
+		TTLMs: 1000, RequestID: "expiry-data-plane", RequestExpiresAtMs: e.now() + 5000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Send(ctx, "events", OutMessage{Body: []byte("completed")}, OutMessage{Body: []byte("deferred")}, OutMessage{Body: []byte("locked")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, sub.Name, ReceiveOptions{MaxMessages: 3, Generation: sub.Generation})
+	if err != nil || len(msgs) != 3 {
+		t.Fatalf("receive: %v %v", msgs, err)
+	}
+	for _, m := range msgs {
+		if m.LockedUntilMs != sub.ExpiresAtMs {
+			t.Fatalf("lease %d outlives subscription %d", m.LockedUntilMs, sub.ExpiresAtMs)
+		}
+	}
+	if err := e.Complete(ctx, sub.Name, msgs[0].SeqNumber, msgs[0].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Defer(ctx, sub.Name, msgs[1].SeqNumber, msgs[1].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `UPDATE messages SET locked_until=? WHERE id=?`, e.now()+60000, msgs[2].SeqNumber); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Second)
+	item := SettleItem{SeqNumber: msgs[2].SeqNumber, LockToken: msgs[2].LockToken}
+	for _, op := range deadlineOperations {
+		t.Run(op, func(t *testing.T) {
+			err := callDeadlineOperation(ctx, e, op, sub.Name, item)
+			if !errors.Is(err, ErrLockLost) && !errors.Is(err, ErrQueueNotFound) {
+				t.Fatalf("expired subscription allowed %s: %v", op, err)
+			}
+		})
+	}
+	if err := e.Complete(ctx, sub.Name, msgs[0].SeqNumber, msgs[0].LockToken); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("expired subscription replayed receipt: %v", err)
+	}
+	for name, call := range map[string]func() error{
+		"publish": func() error { _, err := e.SendOne(ctx, "events", OutMessage{}); return err },
+		"direct": func() error {
+			_, err := e.SendOne(ctx, sub.Name, OutMessage{TargetGeneration: sub.Generation})
+			return err
+		},
+		"schedule": func() error { _, err := e.Schedule(ctx, "events", OutMessage{}, e.now()+1000); return err },
+		"transaction": func() error {
+			return e.Tx(ctx, func(tx *EngineTx) error { _, err := tx.SendOne("events", OutMessage{}); return err })
+		},
+		"receive": func() error {
+			_, err := e.Receive(ctx, sub.Name, ReceiveOptions{Generation: sub.Generation})
+			return err
+		},
+		"deferred": func() error {
+			_, err := e.ReceiveDeferredWithGeneration(ctx, sub.Name, sub.Generation, msgs[1].SeqNumber)
+			return err
+		},
+		"purge":   func() error { _, err := e.Purge(ctx, sub.Name, RedriveOptions{}); return err },
+		"redrive": func() error { _, err := e.Redrive(ctx, sub.Name, RedriveOptions{}); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, ErrQueueNotFound) {
+				t.Fatalf("expired operation: %v", err)
+			}
+		})
+	}
+	if got, err := e.Peek(ctx, sub.Name, PeekOptions{}); err != nil || len(got) != 0 {
+		t.Fatalf("expired subscription remained browsable: %v %v", got, err)
+	}
+	var retained int
+	if err := e.db.queryRowScan(ctx, []any{&retained}, `SELECT COUNT(*) FROM messages WHERE queue=?`, sub.Name); err != nil || retained != 2 {
+		t.Fatalf("expired operations modified retained data: %d %v", retained, err)
+	}
+}
+
+func TestTemporarySubscriptionRequiresIncarnation(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	sub, err := e.SubscribeWithOptions(ctx, "events", "temporary", nil, SubscribeOptions{
+		TTLMs: 1000, RequestID: "incarnation", RequestExpiresAtMs: e.now() + 5000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, sub.Name, OutMessage{}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("unfenced send: %v", err)
+	}
+	if err := e.Tx(ctx, func(tx *EngineTx) error { _, err := tx.SendOne(sub.Name, OutMessage{}); return err }); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("unfenced transactional send: %v", err)
+	}
+	if _, err := e.Receive(ctx, sub.Name, ReceiveOptions{}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("unfenced receive: %v", err)
+	}
+	if _, err := e.ReceiveDeferred(ctx, sub.Name, 1); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("unfenced deferred receive: %v", err)
+	}
+	if _, err := e.SendOne(ctx, sub.Name, OutMessage{TargetGeneration: sub.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SendOne(ctx, "events", OutMessage{TargetGeneration: sub.Generation}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("topic accepted direct-target generation: %v", err)
+	}
+}
+
+func TestSubscriptionLongPollExpiryWithoutMaintenance(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	e, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	sub, err := e.SubscribeWithOptions(ctx, "events", "temporary", nil, SubscribeOptions{
+		TTLMs: 50, RequestID: "long-poll", RequestExpiresAtMs: e.now() + 5000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.Receive(ctx, sub.Name, ReceiveOptions{Generation: sub.Generation, WaitMs: 20000})
+	if !errors.Is(err, ErrQueueNotFound) {
+		t.Fatalf("TTL did not wake a long poll: %v", err)
+	}
+	e.note.mu.Lock()
+	defer e.note.mu.Unlock()
+	if len(e.note.chans) != 0 {
+		t.Fatalf("expired receiver retained %d notifier names", len(e.note.chans))
+	}
+}
+
 // I-core: send -> receive (Peek-Lock) -> complete; metrics reflect each step.
 func TestSendReceiveComplete(t *testing.T) {
 	ctx := context.Background()
@@ -318,6 +454,197 @@ func TestRedrive(t *testing.T) {
 	}
 	if got := recvOne(t, e, "q"); got == nil {
 		t.Fatal("redriven message should be receivable")
+	}
+}
+
+// A selected DLQ ID is not ownership: purge, another redrive and receive can
+// change it before this redrive obtains the writer. Only current DLQ rows move.
+func TestRedriveRechecksStaleCandidates(t *testing.T) {
+	for _, cross := range []bool{false, true} {
+		name := "same-queue"
+		if cross {
+			name = "cross-queue"
+		}
+		t.Run(name, func(t *testing.T) {
+			e, _ := testEngine(t)
+			ctx := context.Background()
+			mustQueue(t, e, "src", QueueConfig{})
+			mustQueue(t, e, "dst", QueueConfig{})
+			ids, err := e.Send(ctx, "src", OutMessage{Body: []byte("purged")}, OutMessage{Body: []byte("claimed")}, OutMessage{Body: []byte("remaining"), CorrelationID: "correlation", ReplyTo: "replies", Subject: "subject", Properties: map[string]string{"key": "value"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages, err := e.Receive(ctx, "src", ReceiveOptions{MaxMessages: 3})
+			if err != nil || len(messages) != 3 {
+				t.Fatalf("setup receive=%v err=%v", messages, err)
+			}
+			for _, m := range messages {
+				if err := e.Reject(ctx, "src", m.SeqNumber, m.LockToken, "test", ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source, err := e.loadQueue(ctx, "src")
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := e.loadQueue(ctx, "dst")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, err := e.Purge(ctx, "src", RedriveOptions{Max: 1}); err != nil || n != 1 {
+				t.Fatalf("purge=%d err=%v", n, err)
+			}
+			if n, err := e.Redrive(ctx, "src", RedriveOptions{Max: 1}); err != nil || n != 1 {
+				t.Fatalf("competing redrive=%d err=%v", n, err)
+			}
+			locked := recvOne(t, e, "src")
+			if locked == nil || locked.SeqNumber != ids[1] {
+				t.Fatalf("competing claim=%+v", locked)
+			}
+			moved, err := e.moveBatch(ctx, "dst", "src", cross, ids, source.generation, target.generation)
+			if err != nil || moved != 1 {
+				t.Fatalf("stale redrive moved=%d err=%v", moved, err)
+			}
+			// Resetting or deleting the concurrently claimed row would lose this lease.
+			if err := e.Complete(ctx, "src", locked.SeqNumber, locked.LockToken); err != nil {
+				t.Fatalf("stale redrive changed live lease: %v", err)
+			}
+			destination := "src"
+			if cross {
+				destination = "dst"
+			}
+			got, err := e.Receive(ctx, destination, ReceiveOptions{MaxMessages: 10})
+			if err != nil || len(got) != 1 {
+				t.Fatalf("remaining receive=%v err=%v", got, err)
+			}
+			if string(got[0].Body) != "remaining" || got[0].CorrelationID != "correlation" || got[0].ReplyTo != "replies" || got[0].Subject != "subject" || got[0].Properties["key"] != "value" {
+				t.Fatalf("wrong row/metadata revived: %+v", got[0])
+			}
+			if !cross && got[0].SeqNumber != ids[2] {
+				t.Fatal("same-queue redrive changed sequence")
+			}
+			src, err := e.Stats(ctx, "src")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if src.DeadLettered != 0 || (cross && src.Total != 0) {
+				t.Fatalf("source leftovers=%+v", src)
+			}
+		})
+	}
+}
+
+// Public throttled calls release the writer between chunks. Rows purged in that
+// interval must not be resurrected, and the returned count must describe effects.
+func TestRedriveConcurrentPurgeAndCancel(t *testing.T) {
+	for _, cancelDuringThrottle := range []bool{false, true} {
+		name := "purge"
+		if cancelDuringThrottle {
+			name = "cancel"
+		}
+		t.Run(name, func(t *testing.T) {
+			e, _ := testEngine(t)
+			base := context.Background()
+			mustQueue(t, e, "src", QueueConfig{})
+			mustQueue(t, e, "dst", QueueConfig{})
+			deadLetterN(t, e, "src", 3)
+			ctx, cancel := context.WithCancel(base)
+			defer cancel()
+			type result struct {
+				moved int
+				err   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				n, err := e.Redrive(ctx, "src", RedriveOptions{Target: "dst", RatePerSec: 1})
+				done <- result{n, err}
+			}()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				stats, err := e.Stats(base, "dst")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stats.Active == 1 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("first redrive chunk did not commit")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if cancelDuringThrottle {
+				cancel()
+				select {
+				case res := <-done:
+					if res.moved != 1 || !errors.Is(res.err, context.Canceled) {
+						t.Fatalf("cancel result=%+v", res)
+					}
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("throttle ignored cancellation")
+				}
+				src, err := e.Stats(base, "src")
+				if err != nil || src.DeadLettered != 2 {
+					t.Fatalf("cancel source=%+v err=%v", src, err)
+				}
+			} else {
+				if n, err := e.Purge(base, "src", RedriveOptions{}); err != nil || n != 2 {
+					t.Fatalf("concurrent purge=%d err=%v", n, err)
+				}
+				select {
+				case res := <-done:
+					if res.moved != 1 || res.err != nil {
+						t.Fatalf("purge result=%+v", res)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("redrive did not finish")
+				}
+				dst, err := e.Stats(base, "dst")
+				if err != nil || dst.Active != 1 {
+					t.Fatalf("purged rows resurrected: %+v err=%v", dst, err)
+				}
+			}
+		})
+	}
+}
+
+// Internal SQL chunks must not turn the unthrottled public operation into
+// partial commits: a failure in a later chunk restores every original DLQ row.
+func TestRedriveLargeMoveRollsBackTogether(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "src", QueueConfig{})
+	mustQueue(t, e, "dst", QueueConfig{})
+	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		for i := 0; i < 1001; i++ {
+			subject := "ok"
+			if i == 1000 {
+				subject = "fail"
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO messages(queue,state,enqueued_at,subject,body) VALUES ('src','dead_lettered',?,?,?)`, e.now(), subject, []byte("body")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `CREATE TRIGGER fail_redrive BEFORE INSERT ON messages WHEN NEW.queue='dst' AND NEW.subject='fail' BEGIN SELECT RAISE(ABORT,'redrive test failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if moved, err := e.Redrive(ctx, "src", RedriveOptions{Target: "dst"}); err == nil || moved != 0 {
+		t.Fatalf("failed move=%d err=%v", moved, err)
+	}
+	src, err := e.Stats(ctx, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := e.Stats(ctx, "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.DeadLettered != 1001 || dst.Total != 0 {
+		t.Fatalf("partial commit: src=%+v dst=%+v", src, dst)
 	}
 }
 

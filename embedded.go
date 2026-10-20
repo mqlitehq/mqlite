@@ -24,15 +24,17 @@ type Embedded struct {
 }
 
 type embeddedConfig struct {
-	authToken         string
-	disableBackground bool
-	now               func() int64
-	maxMessageBytes   int64
-	logger            *slog.Logger
-	synchronous       string
-	dlqMaxAgeMs       int64
-	dlqMaxCount       int
-	dlqMaxBytes       int64
+	maxSubscriptions        int
+	maxSubscriptionRequests int
+	authToken               string
+	disableBackground       bool
+	now                     func() int64
+	maxMessageBytes         int64
+	logger                  *slog.Logger
+	synchronous             string
+	dlqMaxAgeMs             int64
+	dlqMaxCount             int
+	dlqMaxBytes             int64
 }
 
 // EmbeddedOption configures OpenEmbedded.
@@ -57,6 +59,15 @@ func WithClock(now func() int64) EmbeddedOption {
 // WithMaxMessageBytes caps message body size (0 -> 1 MiB default).
 func WithMaxMessageBytes(n int64) EmbeddedOption {
 	return func(c *embeddedConfig) { c.maxMessageBytes = n }
+}
+
+// WithSubscriptionLimits bounds retained subscriptions and temporary-create request
+// receipts. Zero selects engine defaults; negative values are invalid.
+func WithSubscriptionLimits(maxSubscriptions, maxRequests int) EmbeddedOption {
+	return func(c *embeddedConfig) {
+		c.maxSubscriptions = maxSubscriptions
+		c.maxSubscriptionRequests = maxRequests
+	}
 }
 
 // WithLogger routes background-loop failures to lg (nil -> slog.Default()).
@@ -96,16 +107,18 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 		o(&cfg)
 	}
 	eng, err := engine.Open(ctx, engine.Options{
-		DB:                dbDSN,
-		AuthToken:         cfg.authToken,
-		Now:               cfg.now,
-		DisableBackground: cfg.disableBackground,
-		MaxMessageBytes:   cfg.maxMessageBytes,
-		Logger:            cfg.logger,
-		Synchronous:       cfg.synchronous,
-		DLQMaxAgeMs:       cfg.dlqMaxAgeMs,
-		DLQMaxCount:       cfg.dlqMaxCount,
-		DLQMaxBytes:       cfg.dlqMaxBytes,
+		MaxSubscriptions:        cfg.maxSubscriptions,
+		MaxSubscriptionRequests: cfg.maxSubscriptionRequests,
+		DB:                      dbDSN,
+		AuthToken:               cfg.authToken,
+		Now:                     cfg.now,
+		DisableBackground:       cfg.disableBackground,
+		MaxMessageBytes:         cfg.maxMessageBytes,
+		Logger:                  cfg.logger,
+		Synchronous:             cfg.synchronous,
+		DLQMaxAgeMs:             cfg.dlqMaxAgeMs,
+		DLQMaxCount:             cfg.dlqMaxCount,
+		DLQMaxBytes:             cfg.dlqMaxBytes,
 	})
 	if err != nil {
 		return nil, err
@@ -157,6 +170,9 @@ func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
 // SendOpts.At schedules delayed delivery.
 func (e *Embedded) SendOne(ctx context.Context, queue string, m OutMessage, opts ...SendOpts) (int64, error) {
 	o := firstOpt(opts)
+	if o.Generation != "" {
+		m.TargetGeneration = o.Generation
+	}
 	if !o.At.IsZero() {
 		return e.eng.Schedule(ctx, queue, m.toEngine(), o.At.UnixMilli())
 	}
@@ -167,6 +183,9 @@ func (e *Embedded) SendOne(ctx context.Context, queue string, m OutMessage, opts
 func (e *Embedded) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]int64, error) {
 	outs := make([]engine.OutMessage, len(msgs))
 	for i, m := range msgs {
+		if m.TargetGeneration != msgs[0].TargetGeneration {
+			return nil, fmt.Errorf("%w: batch target generations must match", ErrInvalidArgument)
+		}
 		outs[i] = m.toEngine()
 	}
 	return e.eng.Send(ctx, queue, outs...)
@@ -258,7 +277,7 @@ func (e *Embedded) Receive(ctx context.Context, queue string, opts ...RecvOpts) 
 	var ms []*engine.Message
 	var err error
 	if len(o.Pick) > 0 {
-		ms, err = e.eng.ReceiveDeferred(ctx, queue, o.Pick...)
+		ms, err = e.eng.ReceiveDeferredWithGeneration(ctx, queue, o.Generation, o.Pick...)
 	} else {
 		ms, err = e.eng.Receive(ctx, queue, o.toEngine()) // carries AttemptID for idempotent receive
 	}
@@ -273,7 +292,11 @@ func (e *Embedded) Receive(ctx context.Context, queue string, opts ...RecvOpts) 
 }
 
 func (e *Embedded) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
-	ms, err := e.eng.Receive(ctx, queue, engine.ReceiveOptions{MaxMessages: max, WaitMs: waitMs, Mode: mode, AttemptID: attemptID})
+	return e.receiveOneGeneration(ctx, queue, max, waitMs, mode, attemptID, "")
+}
+
+func (e *Embedded) receiveOneGeneration(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID, generation string) ([]*Message, error) {
+	ms, err := e.eng.Receive(ctx, queue, engine.ReceiveOptions{Generation: generation, MaxMessages: max, WaitMs: waitMs, Mode: mode, AttemptID: attemptID})
 	if err != nil {
 		return nil, err
 	}
@@ -305,20 +328,59 @@ func (e *Embedded) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]
 
 // ── admin ───────────────────────────────────────────────────────────────────
 
-// DeleteQueue removes an empty plain queue. All message states prevent deletion.
+// DeleteQueue removes a plain queue, returning ErrDeletionPending if force cleanup
+// has retired the queue but has not finished removing its retained state.
 func (e *Embedded) DeleteQueue(ctx context.Context, name string, opts ...DeleteQueueOpts) error {
-	generation := firstOpt(opts).Generation
-	if generation == "" {
+	result, err := e.DeleteQueueWithOptions(ctx, name, opts...)
+	if err != nil {
+		return err
+	}
+	if !result.Deleted {
+		return ErrDeletionPending
+	}
+	return nil
+}
+
+// DeleteQueueWithOptions reports whether physical cleanup is complete.
+func (e *Embedded) DeleteQueueWithOptions(ctx context.Context, name string, opts ...DeleteQueueOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	if o.Generation == "" {
 		queues, err := e.ListQueues(ctx)
 		if err != nil {
-			return err
+			return DeleteResult{}, err
 		}
-		generation, err = queueGeneration(queues, name)
+		o.Generation, err = queueGeneration(queues, name)
 		if err != nil {
-			return err
+			return DeleteResult{}, err
 		}
 	}
-	return e.eng.DeleteQueue(ctx, name, generation)
+	return e.eng.DeleteQueueWithOptions(ctx, name, o.Generation, engine.DeleteOptions{Force: o.Force})
+}
+
+// DeleteSubscription removes the mapping and its backing queue.
+func (e *Embedded) DeleteSubscription(ctx context.Context, topic, name string, opts ...DeleteSubscriptionOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	if o.Generation == "" {
+		queues, err := e.ListQueues(ctx)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+		o.Generation, err = queueGeneration(queues, name)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+	}
+	return e.eng.DeleteSubscription(ctx, topic, name, o.Generation, engine.DeleteOptions{Force: o.Force})
+}
+
+// SubscribeWithOptions creates or updates a subscription with fixed TTL and retry identity.
+func (e *Embedded) SubscribeWithOptions(ctx context.Context, topic, name string, f *Filter, opts SubscribeOpts) (SubscriptionInfo, error) {
+	return e.eng.SubscribeWithOptions(ctx, topic, name, f, opts.toEngine())
+}
+
+// ListSubscriptionsPage returns one bounded inventory page and its matching total.
+func (e *Embedded) ListSubscriptionsPage(ctx context.Context, opts ListSubscriptionsOpts) (SubscriptionPage, error) {
+	return e.eng.ListSubscriptionsPage(ctx, opts)
 }
 
 func (e *Embedded) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {

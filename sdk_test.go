@@ -827,8 +827,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "16e881e9aada134254a2dff0f517591a91b76fd73b4beca26943160feadd5ff1",
-		"concepts.html": "82bcc5f06357c17ce19a8efd5c2cdd9f63887a0aaa5dbb9990cf424216e3e6ef",
+		"concepts.md":   "664d94784d6517ed4158a30a43d68bacd207bf8a8490b1111717cbceb8d567af",
+		"concepts.html": "355eb59b2dea8e896af13b77d88d6dbc0bf781a718ce573db75793cb153645b0",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {
@@ -2062,5 +2062,187 @@ func TestDeleteQueueRequiresAcknowledgement(t *testing.T) {
 	}
 	if err := c.DeleteQueue(context.Background(), "q", mqlite.DeleteQueueOpts{Generation: "fixture"}); !errors.Is(err, mqlite.ErrOutcomeUnknown) {
 		t.Fatalf("missing acknowledgement: %v", err)
+	}
+}
+
+// Resource lifecycle flows must agree between embedded and HTTP SDKs, including
+// create replay, fixed expiry, bounded cleanup, and stale receiver fencing.
+func TestSubscriptionLifecycleSDK(t *testing.T) {
+	type lifecycleAPI interface {
+		CreateQueue(context.Context, string, mqlite.QueueConfig) error
+		DeleteQueue(context.Context, string, ...mqlite.DeleteQueueOpts) error
+		DeleteQueueWithOptions(context.Context, string, ...mqlite.DeleteQueueOpts) (mqlite.DeleteResult, error)
+		ListQueues(context.Context) ([]mqlite.QueueInfo, error)
+		Subscribe(context.Context, string, string, *mqlite.Filter) error
+		SubscribeWithOptions(context.Context, string, string, *mqlite.Filter, mqlite.SubscribeOpts) (mqlite.SubscriptionInfo, error)
+		ListSubscriptionsPage(context.Context, mqlite.ListSubscriptionsOpts) (mqlite.SubscriptionPage, error)
+		DeleteSubscription(context.Context, string, string, ...mqlite.DeleteSubscriptionOpts) (mqlite.DeleteResult, error)
+		SendOne(context.Context, string, mqlite.OutMessage, ...mqlite.SendOpts) (int64, error)
+		Send(context.Context, string, ...mqlite.OutMessage) ([]int64, error)
+		Receive(context.Context, string, ...mqlite.RecvOpts) ([]*mqlite.Message, error)
+		Receiver(string, ...mqlite.ReceiverOption) *mqlite.Receiver
+	}
+	for _, remote := range []bool{false, true} {
+		t.Run(fmt.Sprintf("remote=%t", remote), func(t *testing.T) {
+			ctx := context.Background()
+			var now atomic.Int64
+			now.Store(1700000000000)
+			embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground(), mqlite.WithClock(now.Load))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer embedded.Close()
+			var api lifecycleAPI = embedded
+			if remote {
+				ts := httptest.NewServer(server.New(embedded.Engine(), nil).Handler())
+				defer ts.Close()
+				client, err := mqlite.Open(ctx, ts.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				api = client
+			}
+			if err := api.Subscribe(ctx, "events", "durable", nil); err != nil {
+				t.Fatal(err)
+			}
+			opts := mqlite.SubscribeOpts{TTL: time.Minute, RequestID: "temporary-create", RequestExpiresAt: time.UnixMilli(now.Load() + 120000)}
+			sub, err := api.SubscribeWithOptions(ctx, "events", "temporary", nil, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sub.Generation == "" || sub.TTLMs != 60000 || sub.ExpiresAtMs != now.Load()+60000 || sub.State != "active" {
+				t.Fatalf("identity=%+v", sub)
+			}
+			missingCtx, missingCancel := context.WithTimeout(ctx, time.Second)
+			if err := api.Receiver(sub.Name).Run(missingCtx, func(context.Context, *mqlite.Message) error { return nil }); !errors.Is(err, mqlite.ErrInvalidArgument) {
+				t.Fatalf("receiver without temporary generation=%v", err)
+			}
+			missingCancel()
+			now.Add(1000)
+			replay, err := api.SubscribeWithOptions(ctx, "events", "temporary", nil, opts)
+			if err != nil || replay.Generation != sub.Generation || replay.ExpiresAtMs != sub.ExpiresAtMs {
+				t.Fatalf("replay=%+v err=%v", replay, err)
+			}
+			if _, err := api.SubscribeWithOptions(ctx, "events", "bad-ttl", nil, mqlite.SubscribeOpts{TTL: time.Nanosecond}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+				t.Fatalf("sub-ms TTL=%v", err)
+			}
+			page, err := api.ListSubscriptionsPage(ctx, mqlite.ListSubscriptionsOpts{Topic: "events", Limit: 1})
+			if err != nil || page.Total != 2 || len(page.Subscriptions) != 1 || page.NextAfter == "" {
+				t.Fatalf("first page=%+v err=%v", page, err)
+			}
+			next, err := api.ListSubscriptionsPage(ctx, mqlite.ListSubscriptionsOpts{Topic: "events", Limit: 1, After: page.NextAfter})
+			if err != nil || next.Total != 2 || len(next.Subscriptions) != 1 || next.Subscriptions[0].Name == page.Subscriptions[0].Name {
+				t.Fatalf("next=%+v err=%v", next, err)
+			}
+			if _, err := api.SendOne(ctx, sub.Name, mqlite.OutMessage{Body: []byte("reply")}, mqlite.SendOpts{Generation: sub.Generation}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := api.DeleteSubscription(ctx, sub.Topic, sub.Name, mqlite.DeleteSubscriptionOpts{Generation: sub.Generation}); !errors.Is(err, mqlite.ErrQueueNotEmpty) {
+				t.Fatalf("nonempty delete=%v", err)
+			}
+			msgs, err := api.Receive(ctx, sub.Name, mqlite.RecvOpts{Generation: sub.Generation})
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("receive=%v err=%v", msgs, err)
+			}
+			if err := msgs[0].Defer(ctx); err != nil {
+				t.Fatal(err)
+			}
+			msgs, err = api.Receive(ctx, sub.Name, mqlite.RecvOpts{Generation: sub.Generation, Pick: []int64{msgs[0].SequenceNumber}})
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("deferred=%v err=%v", msgs, err)
+			}
+			if err := msgs[0].Complete(ctx); err != nil {
+				t.Fatal(err)
+			}
+			pinned := api.Receiver(sub.Name, mqlite.WithGeneration(sub.Generation))
+			result, err := api.DeleteSubscription(ctx, sub.Topic, sub.Name, mqlite.DeleteSubscriptionOpts{Generation: sub.Generation})
+			if err != nil || !result.Deleted {
+				t.Fatalf("delete=%+v err=%v", result, err)
+			}
+			if _, err := api.SubscribeWithOptions(ctx, sub.Topic, sub.Name, nil, opts); !errors.Is(err, mqlite.ErrQueueChanged) {
+				t.Fatalf("deleted create replay=%v", err)
+			}
+			opts.RequestID = "replacement-create"
+			replacement, err := api.SubscribeWithOptions(ctx, sub.Topic, sub.Name, nil, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiverCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			if err := pinned.Run(receiverCtx, func(context.Context, *mqlite.Message) error {
+				t.Error("old receiver processed replacement")
+				return nil
+			}); !errors.Is(err, mqlite.ErrQueueChanged) {
+				t.Fatalf("old receiver=%v", err)
+			}
+			if _, err := api.SendOne(ctx, sub.Name, mqlite.OutMessage{}, mqlite.SendOpts{Generation: sub.Generation}); !errors.Is(err, mqlite.ErrQueueChanged) {
+				t.Fatalf("old send=%v", err)
+			}
+			now.Store(replacement.ExpiresAtMs)
+			if _, err := api.Receive(ctx, sub.Name, mqlite.RecvOpts{Generation: replacement.Generation}); err == nil {
+				t.Fatal("expired receive succeeded")
+			}
+			if _, err := api.SubscribeWithOptions(ctx, sub.Topic, sub.Name, nil, opts); !errors.Is(err, mqlite.ErrQueueChanged) {
+				t.Fatalf("expired create replay=%v", err)
+			}
+			embedded.Engine().RunMaintenanceOnce(ctx)
+			force, err := api.SubscribeWithOptions(ctx, "cleanup", "large", nil, mqlite.SubscribeOpts{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			backlog := make([]mqlite.OutMessage, 5000)
+			for i := range backlog {
+				backlog[i].Body = []byte("discard")
+			}
+			if _, err := api.Send(ctx, force.Name, backlog...); err != nil {
+				t.Fatal(err)
+			}
+			result, err = api.DeleteSubscription(ctx, force.Topic, force.Name, mqlite.DeleteSubscriptionOpts{Generation: force.Generation, Force: true})
+			if err != nil || result.Deleted || result.State != "deleting" {
+				t.Fatalf("force=%+v err=%v", result, err)
+			}
+			if _, err := api.SendOne(ctx, force.Name, mqlite.OutMessage{}); err == nil {
+				t.Fatal("retired destination accepted send")
+			}
+			deleting, err := api.ListSubscriptionsPage(ctx, mqlite.ListSubscriptionsOpts{Topic: force.Topic, IncludeDeleting: true})
+			if err != nil || deleting.Total != 1 || deleting.Subscriptions[0].State != "deleting" {
+				t.Fatalf("deleting page=%+v err=%v", deleting, err)
+			}
+			for i := 0; i < 10; i++ {
+				embedded.Engine().RunMaintenanceOnce(ctx)
+			}
+			deleting, err = api.ListSubscriptionsPage(ctx, mqlite.ListSubscriptionsOpts{Topic: force.Topic, IncludeDeleting: true})
+			if err != nil || deleting.Total != 0 {
+				t.Fatalf("cleanup=%+v err=%v", deleting, err)
+			}
+
+			if err := api.CreateQueue(ctx, "plain", mqlite.QueueConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := api.Send(ctx, "plain", backlog...); err != nil {
+				t.Fatal(err)
+			}
+			queues, err := api.ListQueues(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var generation string
+			for _, q := range queues {
+				if q.Name == "plain" {
+					generation = q.Generation
+				}
+			}
+			if generation == "" {
+				t.Fatal("plain queue identity missing")
+			}
+			if err := api.DeleteQueue(ctx, "plain", mqlite.DeleteQueueOpts{Generation: generation, Force: true}); !errors.Is(err, mqlite.ErrDeletionPending) {
+				t.Fatalf("legacy force wrapper=%v", err)
+			}
+			progress, err := api.DeleteQueueWithOptions(ctx, "plain", mqlite.DeleteQueueOpts{Generation: generation, Force: true})
+			if err != nil || (!progress.Deleted && progress.State != "deleting") {
+				t.Fatalf("queue cleanup=%+v err=%v", progress, err)
+			}
+		})
 	}
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -427,5 +429,64 @@ func TestServeDiagnosticLogRejectsInvalidDestinationBeforeOpeningDatabase(t *tes
 				t.Fatalf("database opened before validation: %v", err)
 			}
 		})
+	}
+}
+
+func TestLifecycleCommands(t *testing.T) {
+	resetGlobals(t)
+	ctx := context.Background()
+	t.Setenv("MQLITE_ENDPOINT", "")
+	t.Setenv("MQLITE_DB", "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	deadline := time.Now().Add(2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	output, err := captureStdout(t, func() error {
+		return cmdCreateSubscription(ctx, []string{"events", "reply", "--ttl", "1m", "--request-id", "cli-create", "--request-expires-at", deadline, "--output", "json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		Generation  string `json:"generation"`
+		ExpiresAtMs int64  `json:"expires_at_ms"`
+	}
+	if err := json.Unmarshal([]byte(output), &created); err != nil || created.Generation == "" || created.ExpiresAtMs == 0 {
+		t.Fatalf("created=%q err=%v", output, err)
+	}
+	pageOutput, err := captureStdout(t, func() error {
+		return cmdListSubscriptions(ctx, []string{"--topic", "events", "--limit", "1", "--output", "json"})
+	})
+	var page mqlite.SubscriptionPage
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(pageOutput), &page); err != nil || page.Total != 1 || len(page.Subscriptions) != 1 || page.Subscriptions[0].Generation != created.Generation {
+		t.Fatalf("page=%q err=%v", pageOutput, err)
+	}
+	if _, err := captureStdout(t, func() error { return cmdSend(ctx, []string{"reply", "payload", "--generation", created.Generation}) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdDeleteSubscription(ctx, []string{"reply", "--topic", "events", "--generation", created.Generation}); !errors.Is(err, mqlite.ErrQueueNotEmpty) {
+		t.Fatalf("nonempty=%v", err)
+	}
+	resultOutput, err := captureStdout(t, func() error {
+		return cmdDeleteSubscription(ctx, []string{"reply", "--topic", "events", "--generation", created.Generation, "--force", "--output", "json"})
+	})
+	var result mqlite.DeleteResult
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(resultOutput), &result); err != nil || result.Generation != created.Generation || (!result.Deleted && result.State != "deleting") {
+		t.Fatalf("result=%q err=%v", resultOutput, err)
+	}
+	if _, err := captureStdout(t, func() error { return cmdCreateQueue(ctx, []string{"empty"}) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureStdout(t, func() error { return cmdDeleteQueue(ctx, []string{"empty"}) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdDeleteSubscription(ctx, []string{"reply"}); err == nil {
+		t.Fatal("missing topic accepted")
+	}
+	if err := cmdCreateSubscription(ctx, []string{"events", "bad", "--ttl", "1ns"}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Fatalf("tiny TTL=%v", err)
 	}
 }

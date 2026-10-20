@@ -119,6 +119,27 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 		runLocker(ctx, e)
 	case "delivery-limit":
 		runDeliveryLimitLocker(ctx, e)
+	case "lifecycle":
+		queues, err := e.ListQueues(ctx)
+		if err != nil {
+			fail("list lifecycle resources", err)
+		}
+		for _, q := range queues {
+			var result mqlite.DeleteResult
+			opts := mqlite.DeleteQueueOpts{Generation: q.Generation, Force: true}
+			if q.Kind == "subscription" {
+				result, err = e.DeleteSubscription(ctx, "replies", q.Name, opts)
+			} else {
+				result, err = e.DeleteQueueWithOptions(ctx, q.Name, opts)
+			}
+			if err != nil || result.Deleted || result.State != "deleting" {
+				fail("expected committed pending deletion", fmt.Errorf("result=%+v err=%v", result, err))
+			}
+		}
+		fmt.Println(readyMarker)
+		_ = os.Stdout.Sync()
+		// Keep the acknowledged cleanup pending until the harness kills this process.
+		<-ctx.Done()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown crash role %q\n", role)
 		os.Exit(2)
@@ -599,6 +620,95 @@ func TestCrashRecoveryDeadLettersLastDelivery(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCrashResourceRetirement persists two partially deleted backlogs before a
+// hard kill. Restart must continue cleanup without making either incarnation
+// usable again, and a delayed creation retry must not resurrect its old target.
+func TestCrashResourceRetirement(t *testing.T) {
+	ctx := context.Background()
+	db := dbPath(t)
+	create := mqlite.SubscribeOpts{TTL: time.Minute, RequestID: "original", RequestExpiresAt: time.Now().Add(2 * time.Minute)}
+	var sub mqlite.SubscriptionInfo
+	var queueGeneration, oldToken string
+	var oldSequence int64
+	func() {
+		e := openWithRetry(ctx, db)
+		defer e.Close()
+		ensureQueue(ctx, e, "q")
+		var err error
+		sub, err = e.SubscribeWithOptions(ctx, "replies", "reply", nil, create)
+		if err != nil {
+			t.Fatal(err)
+		}
+		qs, err := e.ListQueues(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range qs {
+			if q.Name == "q" {
+				queueGeneration = q.Generation
+			}
+		}
+		messages := make([]mqlite.OutMessage, 5000)
+		for i := range messages {
+			messages[i].Body = []byte("retained until forced deletion")
+		}
+		for _, target := range []string{"q", "replies"} {
+			if _, err := e.Send(ctx, target, messages...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		locked, err := e.Receive(ctx, "reply", mqlite.RecvOpts{Generation: sub.Generation})
+		if err != nil || len(locked) != 1 {
+			t.Fatalf("lock: %v, %d messages", err, len(locked))
+		}
+		oldToken = locked[0].LockToken()
+		oldSequence = locked[0].SequenceNumber
+	}()
+	_, _ = killLoop(t, db, "lifecycle", readyMarker, true, 1)
+	e := openWithRetry(ctx, db)
+	defer e.Close()
+	for _, name := range []string{"q", "reply", "replies"} {
+		if _, err := e.SendOne(ctx, name, mqlite.OutMessage{Body: []byte("late")}); !errors.Is(err, mqlite.ErrQueueNotFound) {
+			t.Fatalf("retired %s accepted send after crash: %v", name, err)
+		}
+	}
+	if err := e.Engine().Complete(ctx, "reply", oldSequence, oldToken); !errors.Is(err, mqlite.ErrLockLost) && !errors.Is(err, mqlite.ErrNotFound) {
+		t.Fatalf("old lock after crash: %v", err)
+	}
+	for _, q := range []struct{ name, generation string }{{"q", queueGeneration}, {"reply", sub.Generation}} {
+		for pass := 0; pass < 10; pass++ {
+			var result mqlite.DeleteResult
+			var err error
+			opts := mqlite.DeleteQueueOpts{Generation: q.generation, Force: true}
+			if q.name == "reply" {
+				result, err = e.DeleteSubscription(ctx, "replies", q.name, opts)
+			} else {
+				result, err = e.DeleteQueueWithOptions(ctx, q.name, opts)
+			}
+			if errors.Is(err, mqlite.ErrQueueNotFound) || (err == nil && result.Deleted) {
+				break
+			}
+			if err != nil || pass == 9 {
+				t.Fatalf("cleanup %s: %+v %v", q.name, result, err)
+			}
+		}
+	}
+	if _, err := e.SubscribeWithOptions(ctx, "replies", "reply", nil, create); !errors.Is(err, mqlite.ErrQueueChanged) {
+		t.Fatalf("delayed create resurrected retired subscription: %v", err)
+	}
+	create.RequestID = "replacement"
+	replacement, err := e.SubscribeWithOptions(ctx, "replies", "reply", nil, create)
+	if err != nil || replacement.Generation == sub.Generation {
+		t.Fatalf("recreation: %+v %v", replacement, err)
+	}
+	if _, err := e.SendOne(ctx, "replies", mqlite.OutMessage{Body: []byte("new")}); err != nil {
+		t.Fatalf("recreated implicit topic: %v", err)
+	}
+	if _, err := e.DeleteSubscription(ctx, "replies", "reply", mqlite.DeleteSubscriptionOpts{Generation: sub.Generation, Force: true}); !errors.Is(err, mqlite.ErrQueueChanged) {
+		t.Fatalf("old deletion reached replacement: %v", err)
 	}
 }
 

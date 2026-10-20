@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -128,35 +129,40 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		wait = 20000
 	}
 	deadline := e.now() + wait
+	generation := opts.Generation
 
 	for {
 		q, err := e.loadQueue(ctx, queue)
 		if err != nil {
 			return nil, err
 		}
+		if q.subscriptionTTLMs > 0 && opts.Generation == "" {
+			return nil, fmt.Errorf("%w: generation required to receive from a temporary subscription", ErrInvalidArgument)
+		}
+		if generation == "" {
+			generation = q.generation
+		} else if generation != q.generation {
+			return nil, ErrQueueChanged
+		}
+		// Register before the transactional recheck. Release even if deletion
+		// happened before registration; a retired name must not leak a channel.
+		var ch <-chan struct{}
+		release := func() {}
+		if wait > 0 {
+			ch, release = e.note.subscribe(queue)
+		}
 		msgs, err := e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
-		if err != nil {
-			return nil, err
-		}
-		if len(msgs) > 0 || wait == 0 {
-			return msgs, nil
-		}
-		// register a waiter, then re-check to avoid a lost wakeup.
-		ch := e.note.wait(queue)
-		q, err = e.loadQueue(ctx, queue)
-		if err != nil {
-			return nil, err
-		}
-		msgs, err = e.claimRound(ctx, q, max, opts.Mode, opts.AttemptID)
-		if err != nil {
-			return nil, err
-		}
-		if len(msgs) > 0 {
-			return msgs, nil
+		if err != nil || len(msgs) > 0 || wait == 0 {
+			release()
+			return msgs, err
 		}
 		remaining := deadline - e.now()
 		if remaining <= 0 {
+			release()
 			return nil, nil
+		}
+		if q.expiresAtMs > 0 && q.expiresAtMs-e.now() < remaining {
+			remaining = q.expiresAtMs - e.now()
 		}
 		timer := time.NewTimer(time.Duration(remaining) * time.Millisecond)
 		select {
@@ -165,6 +171,7 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
+			release()
 			return nil, ctx.Err()
 		case <-e.closed:
 			// Close() wakes every long-poll waiter. Without this arm the waiter slept out its
@@ -172,9 +179,20 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 			// torn down (round-8). The claim rounds themselves are covered by the admission gate;
 			// this covers the one place a Receive parks outside it.
 			timer.Stop()
+			release()
 			return nil, ErrClosed
 		}
+		release()
 	}
+}
+
+// A subscription lease cannot outlive the subscription that owns it.
+func queueLeaseDeadline(q queueRow, now int64) int64 {
+	until := now + q.lockDurationMs
+	if q.expiresAtMs > 0 && until > q.expiresAtMs {
+		until = q.expiresAtMs
+	}
+	return until
 }
 
 // claimUpTo claims up to max messages in a SINGLE transaction — one commit for the whole
@@ -199,9 +217,20 @@ func (e *Engine) claimUpTo(ctx context.Context, q queueRow, max int, mode Receiv
 
 // ReceiveDeferred locks previously-deferred messages by seq_number (§8.7).
 func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int64) ([]*Message, error) {
+	return e.ReceiveDeferredWithGeneration(ctx, queue, "", seqs...)
+}
+
+// ReceiveDeferredWithGeneration optionally pins the subscription or queue incarnation.
+func (e *Engine) ReceiveDeferredWithGeneration(ctx context.Context, queue, generation string, seqs ...int64) ([]*Message, error) {
 	q, err := e.loadQueue(ctx, queue)
 	if err != nil {
 		return nil, err
+	}
+	if q.subscriptionTTLMs > 0 && generation == "" {
+		return nil, fmt.Errorf("%w: generation required to receive from a temporary subscription", ErrInvalidArgument)
+	}
+	if generation != "" && generation != q.generation {
+		return nil, ErrQueueChanged
 	}
 	var out []*Message
 	for _, seq := range seqs {
@@ -214,27 +243,37 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 		// Each item keeps its existing independent commit. Read the clock only after
 		// acquiring the writer, and again if a remote transaction must retry (MQLITE-108).
 		err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			current, err := e.checkQueueLiveTx(ctx, tx, queue, q.generation)
+			if err != nil {
+				return err
+			}
 			now := e.now()
-			return tx.QueryRowContext(ctx, `
+			if err := queueLive(current, q.generation, now); err != nil {
+				return err
+			}
+			err = tx.QueryRowContext(ctx, `
 			UPDATE messages
 			   SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
 			 WHERE id=? AND queue=? AND state='deferred'
 			   AND (expires_at=0 OR expires_at>?)
 			RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
 			          reply_to, subject, content_type, properties, enqueued_at, locked_until`,
-				now+q.lockDurationMs, token, seq, queue, now).Scan(
+				queueLeaseDeadline(current, now), token, seq, queue, now).Scan(
 				&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
 				&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs)
+			if err == nil {
+				tx.record(queue, "delivered", 1)
+				if m.DeliveryCount > 1 {
+					tx.record(queue, "redelivered", 1)
+				}
+			}
+			return err
 		})
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
 			return out, err
-		}
-		e.recordMessage(queue, "delivered", 1)
-		if m.DeliveryCount > 1 {
-			e.recordMessage(queue, "redelivered", 1)
 		}
 		m.LockToken = token
 		m.GroupID = groupID.String

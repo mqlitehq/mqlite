@@ -930,13 +930,16 @@ func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
 	}
 	item := SettleItem{SeqNumber: msgs[0].SeqNumber, LockToken: msgs[0].LockToken}
 
-	// The old lease is still live when the write begins. Only the following read,
-	// after RETURNING reaches EOF, crosses the newly committed deadline.
+	// The lifecycle metadata check and the write both see a live old lease.
+	// The next read, after RETURNING reaches EOF, crosses the new deadline.
 	var reads int
 	e.now = func() int64 {
 		reads++
 		if reads == 1 {
 			return atomic.AddInt64(&ms, 500)
+		}
+		if reads == 2 {
+			return atomic.LoadInt64(&ms)
 		}
 		return atomic.AddInt64(&ms, time.Hour.Milliseconds())
 	}

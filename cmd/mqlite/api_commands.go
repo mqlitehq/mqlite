@@ -144,6 +144,7 @@ func cmdSettle(ctx context.Context, verb string, args []string) error {
 // ─── schedule: send with a future delivery time ─────────────────────────────────────
 func cmdSchedule(ctx context.Context, args []string) error {
 	fs := newFlags("schedule")
+	generation := fs.String("generation", "", "destination incarnation")
 	at := fs.String("at", "", "delivery time: RFC3339 (2026-01-02T15:04:05Z) or a duration from now (e.g. 30m)")
 	file := fs.String("file", "", "read body from file")
 	msgID := fs.String("message-id", "", "message id (dedup/idempotency key)")
@@ -171,7 +172,7 @@ func cmdSchedule(ctx context.Context, args []string) error {
 	defer c.Close()
 	seq, err := c.SendOne(ctx, pos[0], mqlite.OutMessage{
 		Body: body, MessageID: *msgID, GroupID: *group, Subject: *subject,
-	}, mqlite.SendOpts{At: when})
+	}, mqlite.SendOpts{At: when, Generation: *generation})
 	if err != nil {
 		return err
 	}
@@ -225,6 +226,7 @@ func cmdCancel(ctx context.Context, args []string) error {
 // ─── receive-deferred: fetch set-aside messages back by seq_number ───────────────────
 func cmdReceiveDeferred(ctx context.Context, args []string) error {
 	fs := newFlags("receive-deferred")
+	generation := fs.String("generation", "", "destination incarnation")
 	seqCSV := fs.String("seq", "", "comma-separated deferred seq_numbers to fetch (e.g. 42,57)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
@@ -242,7 +244,7 @@ func cmdReceiveDeferred(ctx context.Context, args []string) error {
 		return err
 	}
 	defer c.Close()
-	msgs, err := c.Receive(ctx, pos[0], mqlite.RecvOpts{Pick: seqs})
+	msgs, err := c.Receive(ctx, pos[0], mqlite.RecvOpts{Pick: seqs, Generation: *generation})
 	if err != nil {
 		return err
 	}
@@ -327,40 +329,95 @@ func cmdStatus(ctx context.Context, args []string) error {
 }
 
 // ─── list-subscriptions: topic membership + filter expressions ──────────────────────
-func cmdListSubscriptions(ctx context.Context, args []string) error {
-	fs := newFlags("list-subscriptions")
+func cmdDeleteQueue(ctx context.Context, args []string) error {
+	return cmdDeleteResource(ctx, args, false)
+}
+func cmdDeleteSubscription(ctx context.Context, args []string) error {
+	return cmdDeleteResource(ctx, args, true)
+}
+func cmdDeleteResource(ctx context.Context, args []string, subscription bool) error {
+	command := "delete-queue"
+	if subscription {
+		command = "delete-subscription"
+	}
+	fs := newFlags(command)
+	generation := fs.String("generation", "", "incarnation from list; retain across retries")
+	force := fs.Bool("force", false, "retire immediately and discard every retained message state")
+	topic := fs.String("topic", "", "topic (required for delete-subscription)")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(pos) != 0 {
-		return fmt.Errorf("usage: list-subscriptions  (takes no arguments)")
+	if len(pos) != 1 || (subscription && *topic == "") || (!subscription && *topic != "") {
+		return fmt.Errorf("usage: %s <name> [--generation ID --force] (delete-subscription also requires --topic)", command)
 	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	subs, err := c.ListSubscriptions(ctx)
+	var result mqlite.DeleteResult
+	if subscription {
+		result, err = c.DeleteSubscription(ctx, *topic, pos[0], mqlite.DeleteSubscriptionOpts{Generation: *generation, Force: *force})
+	} else {
+		result, err = c.DeleteQueueWithOptions(ctx, pos[0], mqlite.DeleteQueueOpts{Generation: *generation, Force: *force})
+	}
 	if err != nil {
 		return err
 	}
+	return okResult(map[string]any{"name": pos[0], "deleted": result.Deleted, "state": result.State, "generation": result.Generation}, "name", "deleted", "state", "generation")
+}
+
+func cmdListSubscriptions(ctx context.Context, args []string) error {
+	fs := newFlags("list-subscriptions")
+	topic := fs.String("topic", "", "filter by topic")
+	after := fs.String("after", "", "opaque cursor returned by the previous page")
+	limit := fs.Int("limit", 0, "page size (1-1000); defaults to 100 when selecting a page")
+	includeDeleting := fs.Bool("include-deleting", false, "include retired subscriptions awaiting cleanup")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 0 {
+		return fmt.Errorf("usage: list-subscriptions [--topic NAME --limit N --after CURSOR --include-deleting]")
+	}
+	c, err := dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	paged := *topic != "" || *after != "" || *limit != 0 || *includeDeleting
+	var page mqlite.SubscriptionPage
+	if paged {
+		page, err = c.ListSubscriptionsPage(ctx, mqlite.ListSubscriptionsOpts{Topic: *topic, After: *after, Limit: *limit, IncludeDeleting: *includeDeleting})
+	} else {
+		page.Subscriptions, err = c.ListSubscriptions(ctx)
+		page.Total = len(page.Subscriptions)
+	}
+	if err != nil {
+		return err
+	}
+	if page.Subscriptions == nil {
+		page.Subscriptions = []mqlite.SubscriptionInfo{}
+	}
 	if jsonOut() {
-		if subs == nil {
-			subs = []mqlite.SubscriptionInfo{} // JSON must be [] not null
+		if paged {
+			return emitJSON(page)
 		}
-		return emitJSON(subs)
+		return emitJSON(page.Subscriptions)
 	}
-	if len(subs) == 0 {
+	if len(page.Subscriptions) == 0 {
 		fmt.Println("(no subscriptions)")
-		return nil
 	}
-	for _, s := range subs {
-		expr := s.Expr
+	for _, sub := range page.Subscriptions {
+		expr := sub.Expr
 		if expr == "" {
 			expr = "(match all)"
 		}
-		fmt.Printf("%-20s topic=%-20s filter=%s\n", s.Name, s.Topic, expr)
+		fmt.Printf("%-20s topic=%-20s generation=%s state=%s expires_at_ms=%d filter=%s\n", sub.Name, sub.Topic, sub.Generation, sub.State, sub.ExpiresAtMs, expr)
+	}
+	if paged {
+		fmt.Printf("total=%d next_after=%s\n", page.Total, page.NextAfter)
 	}
 	return nil
 }

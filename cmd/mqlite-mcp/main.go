@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/internal/authkey"
 	"github.com/mqlitehq/mqlite/internal/defaults"
 	ver "github.com/mqlitehq/mqlite/internal/version"
@@ -196,6 +197,11 @@ func intProp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
 }
 
+func boolProp(desc string) map[string]any {
+	return map[string]any{"type": "boolean", "description": desc}
+}
+func boolean(a map[string]any, key string) bool { v, _ := a[key].(bool); return v }
+
 func str(a map[string]any, k string) string {
 	if v, ok := a[k].(string); ok {
 		return v
@@ -284,15 +290,52 @@ var tools = []tool{
 		},
 	},
 	{
+		name: "delete_queue", desc: "Delete a plain queue; force retires it and discards all retained states. Keep the listed generation for retries.",
+		schema: keyObj(map[string]any{"name": strProp("queue name"), "generation": strProp("incarnation from list_queues"), "force": boolProp("discard retained messages; cleanup may be pending")}, "name", "generation"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: str(a, "name"), Generation: str(a, "generation"), Force: boolean(a, "force")}
+		},
+	},
+	{
+		name: "delete_subscription", desc: "Delete a subscription and its backing queue. Force discards all retained messages; cleanup may be pending.",
+		schema: keyObj(map[string]any{"topic": strProp("topic name"), "name": strProp("subscription name"), "generation": strProp("incarnation from list_subscriptions"), "force": boolProp("discard retained messages")}, "topic", "name", "generation"),
+		forward: func(a map[string]any) (string, any) {
+			return wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: str(a, "topic"), Name: str(a, "name"), Generation: str(a, "generation"), Force: boolean(a, "force")}
+		},
+	},
+	{
+		name: "subscribe", desc: "Create or update a subscription. Temporary creates require a stable request_id and absolute retry deadline within five minutes; retain both for retries. TTL never renews on replay.",
+		schema: keyObj(map[string]any{"topic": strProp("topic name"), "name": strProp("globally unique subscription name"), "expr": strProp("optional filter expression"), "ttl_ms": intProp("fixed lifetime; zero is durable"), "generation": strProp("existing incarnation for temporary updates"), "request_id": strProp("stable temporary-create ID"), "request_expires_at_ms": intProp("absolute UTC epoch-ms retry deadline")}, "topic", "name"),
+		forward: func(a map[string]any) (string, any) {
+			var filter *engine.Filter
+			if expr := str(a, "expr"); expr != "" {
+				filter = &engine.Filter{Expr: expr}
+			}
+			return wire.PathSubscribe, wire.SubscribeRequest{Topic: str(a, "topic"), Name: str(a, "name"), Filter: filter, TTLMs: num(a, "ttl_ms"), Generation: str(a, "generation"), RequestID: str(a, "request_id"), RequestExpiresAtMs: num(a, "request_expires_at_ms")}
+		},
+	},
+	{
+		name: "list_subscriptions", desc: "List one bounded subscription page, optionally for one topic, with total count, generations and fixed expiry.",
+		schema: keyObj(map[string]any{"topic": strProp("optional topic filter"), "after": strProp("next_after from previous page"), "limit": intProp("page size; default 100"), "include_deleting": boolProp("include retired subscriptions awaiting cleanup")}),
+		forward: func(a map[string]any) (string, any) {
+			limit := int(num(a, "limit"))
+			if _, ok := a["limit"]; !ok {
+				limit = 100
+			}
+			return wire.PathListSubscriptions, wire.ListSubscriptionsRequest{Topic: str(a, "topic"), After: str(a, "after"), Limit: limit, IncludeDeleting: boolean(a, "include_deleting")}
+		},
+	},
+	{
 		name: "send", desc: "Send a message to a queue.",
 		schema: obj(map[string]any{
 			"queue":      strProp("queue name"),
+			"generation": strProp("optional destination incarnation"),
 			"body":       strProp("message body (text)"),
 			"message_id": strProp("optional dedup/idempotency key"),
 			"group_id":   strProp("optional ordering/session key"),
 		}, "queue", "body"),
 		forward: func(a map[string]any) (string, any) {
-			return wire.PathSend, wire.SendRequest{Queue: str(a, "queue"), Messages: []wire.Message{{
+			return wire.PathSend, wire.SendRequest{Queue: str(a, "queue"), Generation: str(a, "generation"), Messages: []wire.Message{{
 				Body: []byte(str(a, "body")), MessageID: str(a, "message_id"), GroupID: str(a, "group_id"),
 			}}}
 		},
@@ -301,12 +344,13 @@ var tools = []tool{
 		name: "receive", desc: "Receive (peek-lock) messages; returns seq_number + lock_token to settle with.",
 		schema: obj(map[string]any{
 			"queue":        strProp("queue name"),
+			"generation":   strProp("optional destination incarnation"),
 			"max_messages": intProp("max messages (default 1)"),
 			"wait_time_ms": intProp("long-poll wait in ms (default 0)"),
 		}, "queue"),
 		forward: func(a map[string]any) (string, any) {
 			return wire.PathReceive, wire.ReceiveRequest{
-				Queue: str(a, "queue"), MaxMessages: int(num(a, "max_messages")), WaitTimeMs: num(a, "wait_time_ms"),
+				Queue: str(a, "queue"), Generation: str(a, "generation"), MaxMessages: int(num(a, "max_messages")), WaitTimeMs: num(a, "wait_time_ms"),
 			}
 		},
 	},
@@ -349,10 +393,11 @@ var tools = []tool{
 	{
 		name: "receive_deferred", desc: "Retrieve previously deferred messages by their seq_numbers (re-locks them for settling).",
 		schema: obj(map[string]any{
-			"queue": strProp("queue name"), "seq_numbers": intArrProp("seq numbers of deferred messages to retrieve"),
+			"generation": strProp("optional destination incarnation"),
+			"queue":      strProp("queue name"), "seq_numbers": intArrProp("seq numbers of deferred messages to retrieve"),
 		}, "queue", "seq_numbers"),
 		forward: func(a map[string]any) (string, any) {
-			return wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: str(a, "queue"), SeqNumbers: intArr(a, "seq_numbers")}
+			return wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: str(a, "queue"), Generation: str(a, "generation"), SeqNumbers: intArr(a, "seq_numbers")}
 		},
 	},
 	{
@@ -429,6 +474,33 @@ var tools = []tool{
 func callTool(name string, args map[string]any) map[string]any {
 	for _, t := range tools {
 		if t.name == name {
+			if value, present := args["generation"]; present {
+				if _, ok := value.(string); !ok {
+					return textResult("error: generation must be a string", true)
+				}
+			}
+			if name == "subscribe" || name == "delete_queue" || name == "delete_subscription" || name == "list_subscriptions" {
+				props := t.schema["properties"].(map[string]any)
+				for key, value := range args {
+					spec, ok := props[key]
+					if !ok {
+						return textResult("error: unknown lifecycle argument: "+key, true)
+					}
+					typ := spec.(map[string]any)["type"]
+					valid := true
+					switch typ {
+					case "integer":
+						valid = validKeyInteger(args, key)
+					case "boolean":
+						_, valid = value.(bool)
+					case "string":
+						_, valid = value.(string)
+					}
+					if !valid {
+						return textResult("error: invalid lifecycle argument: "+key, true)
+					}
+				}
+			}
 			path, body := t.forward(args)
 			create, creating := body.(wire.CreateKeyRequest)
 			if creating && !authkey.ValidID(create.ID) {

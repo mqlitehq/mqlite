@@ -11,6 +11,219 @@ import (
 	"time"
 )
 
+// A canceled long poll must not retain one map entry per temporary queue. A
+// release from the old channel must also leave a replacement waiter reachable.
+func TestNotifierRetiresCanceledAndReplacedWaiters(t *testing.T) {
+	n := newNotifier()
+	for i := 0; i < 1000; i++ {
+		_, release := n.subscribe(fmt.Sprintf("temporary-%d", i))
+		release()
+		release() // cleanup is safe when both an early exit and a defer run
+	}
+	if len(n.chans) != 0 {
+		t.Fatalf("canceled waiters retained %d names", len(n.chans))
+	}
+	old, releaseOld := n.subscribe("reused")
+	n.notify("reused")
+	select {
+	case <-old:
+	default:
+		t.Fatal("old waiter was not notified")
+	}
+	fresh, releaseFresh := n.subscribe("reused")
+	releaseOld()
+	select {
+	case <-fresh:
+		t.Fatal("retired waiter closed a replacement channel")
+	default:
+	}
+	n.notify("reused")
+	select {
+	case <-fresh:
+	default:
+		t.Fatal("replacement waiter lost its notification")
+	}
+	releaseFresh()
+	if len(n.chans) != 0 {
+		t.Fatalf("completed waiters retained %d names", len(n.chans))
+	}
+}
+
+func TestNotifierReleaseKeepsOtherWaiters(t *testing.T) {
+	n := newNotifier()
+	first, releaseFirst := n.subscribe("q")
+	second, releaseSecond := n.subscribe("q")
+	if first != second {
+		t.Fatal("concurrent waiters must observe the same notification")
+	}
+	releaseFirst()
+	n.notify("q")
+	select {
+	case <-second:
+	default:
+		t.Fatal("one canceled waiter removed another waiter's notification")
+	}
+	releaseSecond()
+}
+
+func TestObservabilityRetirementFencesLateCommit(t *testing.T) {
+	o := observations{initialized: true, known: map[string]bool{"q": true}}
+	o.commit(&txn{events: map[eventKey]uint64{{"q", "enqueued"}: 3}})
+	late := &txn{events: map[eventKey]uint64{{"q", "completed"}: 2}}
+	o.commit(&txn{forgottenQueues: map[string]bool{"q": true}})
+	o.commit(&txn{observationEpoch: o.epoch, rememberedQueues: map[string]bool{"q": true}})
+	o.commit(late)
+	o.commit(&txn{observationEpoch: o.epoch, events: map[eventKey]uint64{{"q", "enqueued"}: 1}})
+	if !o.known["q"] || len(o.known) != 1 {
+		t.Fatalf("replacement inventory=%v", o.known)
+	}
+	if o.events[eventKey{"q", "enqueued"}] != 1 || o.events[eventKey{"q", "completed"}] != 0 {
+		t.Fatalf("old lifetime contaminated replacement: %v", o.events)
+	}
+	if o.events[eventKey{"", "enqueued"}] != 3 || o.events[eventKey{"", "completed"}] != 2 {
+		t.Fatalf("retired aggregate lost confirmed effects: %v", o.events)
+	}
+	// Confirmed creation hooks follow database commit order, even if the
+	// transaction began before another name retired and carries an older epoch.
+	prior := o.epoch
+	o.commit(&txn{rememberedQueues: map[string]bool{"new-name": true}})
+	if !o.known["new-name"] || o.epoch <= prior {
+		t.Fatal("confirmed creation was lost or failed to fence older inventory")
+	}
+}
+
+func TestObservabilityUniqueNameChurnRetainsOnlyAggregate(t *testing.T) {
+	o := observations{initialized: true}
+	for i := 0; i < 1000; i++ {
+		name := fmt.Sprintf("request-%d", i)
+		epoch := o.epoch
+		o.commit(&txn{observationEpoch: epoch, rememberedQueues: map[string]bool{name: true}})
+		o.commit(&txn{observationEpoch: epoch, events: map[eventKey]uint64{{name, "enqueued"}: 1}})
+		o.commit(&txn{observationEpoch: epoch, forgottenQueues: map[string]bool{name: true}})
+		o.commit(&txn{observationEpoch: epoch, events: map[eventKey]uint64{{name, "completed"}: 1}})
+	}
+	if len(o.known) != 0 || len(o.events) != 2 {
+		t.Fatalf("retired names retained: known=%d event keys=%d", len(o.known), len(o.events))
+	}
+	if o.events[eventKey{"", "enqueued"}] != 1000 || o.events[eventKey{"", "completed"}] != 1000 {
+		t.Fatalf("retired counts=%v", o.events)
+	}
+}
+
+func TestObservabilityRetiredAggregateHasCompleteEventDomain(t *testing.T) {
+	e, _ := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "retired", QueueConfig{})
+	if _, err := e.SendOne(ctx, "retired", OutMessage{Body: []byte("work")}); err != nil {
+		t.Fatal(err)
+	}
+	queues, err := e.ListQueues(ctx)
+	if err != nil || len(queues) != 1 {
+		t.Fatalf("inventory=%v err=%v", queues, err)
+	}
+	if result, err := e.DeleteQueueWithOptions(ctx, "retired", queues[0].Generation, DeleteOptions{Force: true}); err != nil || !result.Deleted {
+		t.Fatalf("delete=%+v err=%v", result, err)
+	}
+	snapshot := e.Observability(ctx)
+	if len(snapshot.Messages) != len(MessageEventNames()) {
+		t.Fatalf("retired event domain is partial: %+v", snapshot.Messages)
+	}
+	for _, row := range snapshot.Messages {
+		if row.Queue != "" {
+			t.Fatalf("retired name retained: %+v", row)
+		}
+	}
+}
+
+func TestSubscriptionChurnReclaimsPersistentAndMemoryState(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	for i := 0; i < 300; i++ {
+		name := fmt.Sprintf("temporary-%d", i)
+		sub, err := e.SubscribeWithOptions(ctx, "replies", name, &Filter{Expr: `subject == "reply"`}, SubscribeOptions{
+			TTLMs: 1000, RequestID: name, RequestExpiresAtMs: e.now() + 1000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.SendOne(ctx, "replies", OutMessage{Subject: "reply", Body: []byte(name)}); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := e.Receive(ctx, name, ReceiveOptions{Generation: sub.Generation, AttemptID: name})
+		if err != nil || len(msgs) != 1 {
+			t.Fatalf("receive iteration %d: %d messages %v", i, len(msgs), err)
+		}
+		if i%2 == 0 {
+			if err := e.Complete(ctx, name, msgs[0].SeqNumber, msgs[0].LockToken); err != nil {
+				t.Fatal(err)
+			}
+			result, err := e.DeleteSubscription(ctx, "replies", name, sub.Generation, DeleteOptions{})
+			if err != nil || !result.Deleted {
+				t.Fatalf("delete iteration %d: %+v %v", i, result, err)
+			}
+		}
+		advance(clock, 1001*time.Millisecond)
+		e.maintainLifecycle(ctx)
+	}
+	for _, table := range []string{"queues", "subscriptions", "messages", "dedup", "settlement_receipts", "receive_attempts", "subscription_creations"} {
+		var count int
+		if err := e.db.queryRowScan(ctx, []any{&count}, "SELECT COUNT(*) FROM "+table); err != nil || count != 0 {
+			t.Fatalf("retained %s rows=%d err=%v", table, count, err)
+		}
+	}
+	if len(e.qcache) != 0 || len(e.filterCache) != 0 || len(e.note.chans) != 0 || len(e.observation.known) != 0 || len(e.observation.events) > len(MessageEventNames()) {
+		t.Fatalf("retained name state: queues=%d filters=%d waits=%d known=%d counters=%d", len(e.qcache), len(e.filterCache), len(e.note.chans), len(e.observation.known), len(e.observation.events))
+	}
+}
+
+func TestSubscriptionExpiryBetweenMetadataAndReceiveStatement(t *testing.T) {
+	for _, replay := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replay=%t", replay), func(t *testing.T) {
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			sub, err := e.SubscribeWithOptions(ctx, "topic", "reply", nil, SubscribeOptions{TTLMs: 1000, RequestID: "create", RequestExpiresAtMs: e.now() + 1000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.SendOne(ctx, "topic", OutMessage{Body: []byte("reply")}); err != nil {
+				t.Fatal(err)
+			}
+			msgs, err := e.Receive(ctx, "reply", ReceiveOptions{Generation: sub.Generation, AttemptID: "receive"})
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("receive: %v %v", msgs, err)
+			}
+			if !replay {
+				if err := e.Defer(ctx, "reply", msgs[0].SeqNumber, msgs[0].LockToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			q, err := e.loadQueue(ctx, "reply")
+			if err != nil {
+				t.Fatal(err)
+			}
+			reads, expirationRead := 0, 3 // cached metadata, transactional metadata, claim statement
+			if replay {
+				expirationRead = 2 // transactional metadata, receipt lookup statement
+			}
+			e.now = func() int64 {
+				reads++
+				if reads >= expirationRead {
+					return sub.ExpiresAtMs
+				}
+				return sub.ExpiresAtMs - 1
+			}
+			if replay {
+				msgs, err = e.claimRound(ctx, q, 1, PeekLock, "receive")
+			} else {
+				msgs, err = e.ReceiveDeferredWithGeneration(ctx, "reply", sub.Generation, msgs[0].SeqNumber)
+			}
+			if !errors.Is(err, ErrQueueNotFound) || len(msgs) != 0 {
+				t.Fatalf("delivered across expiration: messages=%v err=%v clock reads=%d", msgs, err, reads)
+			}
+		})
+	}
+}
+
 // Concurrency invariants — the properties that make a queue a queue, asserted under real parallelism.
 //
 // Everything else in this suite tests what the engine SAYS when you ask it something. These tests

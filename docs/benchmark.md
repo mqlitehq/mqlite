@@ -203,6 +203,20 @@ bodies. Default body cap is 1 MiB (`MaxMessageBytes`).
 
 ## 6 · Load ramp & consumer churn (local)
 
+These historical tests cycle **consumer workers on an existing queue**. They do
+not measure subscription creation/deletion, thousands of subscriptions per topic,
+fixed-TTL expiry storms or force deletion under backlog. Their memory figures
+must not be used as a capacity guarantee for temporary request/reply subscriptions.
+The unreleased lifecycle limits cap retained inventory and creation receipts;
+they do not certify a sustainable creation rate or latency at that cap.
+
+Size temporary workloads using concurrent live subscriptions, creation rate and
+TTL, matching fan-out copies, queued body bytes, and cleanup lag. Measure publish
+and claim tail latency while deleting/expiring resources and while monitoring is
+enabled. Include a large unrelated backlog, same-name replacement, delayed replies,
+and restart with pending cleanup. Compare against a stable reply queue per instance
+before choosing a per-request subscription topology.
+
 - **rampdown_4x4**: produce hard, then stop producing while consumers drain to idle.
   RSS peak 31 MB → 27 MB after the load goes away — memory tracks the workload *down*,
   not a one-way ratchet.

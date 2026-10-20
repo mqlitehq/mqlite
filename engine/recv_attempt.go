@@ -22,9 +22,17 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 	}
 	var out []*Message
 	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		current, err := e.checkQueueLiveTx(ctx, tx, q.name, q.generation)
+		if err != nil {
+			return err
+		}
 		// Writer admission and remote retries can outlive an attempt record. Evaluate
 		// its expiry inside this transaction, never against the pre-wait time.
-		if msgs, ok, err := lookupAttempt(ctx, tx, q.name, attemptID, e.now()); err != nil {
+		now := e.now()
+		if err := queueLive(current, q.generation, now); err != nil {
+			return err
+		}
+		if msgs, ok, err := lookupAttempt(ctx, tx, q.name, attemptID, now); err != nil {
 			return err
 		} else if ok {
 			out = msgs
@@ -84,6 +92,11 @@ func storeAttempt(ctx context.Context, tx *txn, queue, attemptID string, msgs []
 
 // claimUpToTx is claimUpTo bound to an explicit transaction (idempotent receive).
 func (e *Engine) claimUpToTx(ctx context.Context, tx *txn, q queueRow, max int, mode ReceiveMode) ([]*Message, error) {
+	current, err := e.checkQueueLiveTx(ctx, tx, q.name, q.generation)
+	if err != nil {
+		return nil, err
+	}
+	q = current
 	var out []*Message
 	var bytes int64
 	for i := 0; i < max; i++ {
@@ -120,7 +133,10 @@ func (e *Engine) claimOneTx(ctx context.Context, tx *txn, q queueRow) (*Message,
 	// Read after acquiring the writer and for each item: a pool wait, retry, or
 	// preceding claim must not consume this item's lease or reuse stale TTL eligibility.
 	now := e.now()
-	lockUntil := now + q.lockDurationMs
+	if q.expiresAtMs > 0 && q.expiresAtMs <= now {
+		return nil, ErrQueueNotFound
+	}
+	lockUntil := queueLeaseDeadline(q, now)
 	var (
 		m                                                          Message
 		groupID, messageID, correlationID, replyTo, subject, ctype sql.NullString

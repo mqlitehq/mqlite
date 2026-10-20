@@ -60,6 +60,8 @@ var (
 	ErrDBLocked              = errors.New("mqlite: database file is already open by another process")
 	ErrSchemaVersionMismatch = errors.New("mqlite: database schema version is incompatible with this build")
 	ErrInvalidFilter         = errors.New("mqlite: invalid subscription filter expression")
+	ErrResourceLimit         = errors.New("mqlite: resource limit reached")
+	ErrDeletionPending       = errors.New("mqlite: deletion accepted; cleanup is pending")
 	// ErrInvalidArgument is a caller-side request/config error (empty name, unknown
 	// enum, malformed body) — the server maps it to 400 invalid_argument rather than
 	// letting it leak out as an opaque 500 (MQLITE-86).
@@ -86,8 +88,11 @@ type QueueConfig struct {
 
 // OutMessage is a message to enqueue. Body is opaque; the broker never parses it.
 type OutMessage struct {
-	Body      []byte
-	MessageID string // dedup / idempotency key; empty -> body SHA-256 used when dedup on
+	// TargetGeneration fences direct delivery to a particular queue incarnation.
+	// Topic fan-out uses the current live subscription roster instead.
+	TargetGeneration string
+	Body             []byte
+	MessageID        string // dedup / idempotency key; empty -> body SHA-256 used when dedup on
 	// GroupID is an ordering / partition key (= SQS MessageGroupId, ASB SessionId):
 	// messages sharing a GroupID are delivered strictly in-order (FIFO per group);
 	// empty -> the message is its own group (max parallelism). It is NOT a consumer
@@ -163,6 +168,8 @@ type Metrics struct {
 // QueueInfo describes a queue for listing.
 type QueueInfo struct {
 	Generation       string `json:"generation,omitempty"`
+	State            string `json:"state"`
+	ExpiresAtMs      int64  `json:"expires_at_ms,omitempty"`
 	Name             string `json:"name"`
 	Kind             string `json:"kind"`
 	LockDurationMs   int64  `json:"lock_duration_ms"`
@@ -173,6 +180,7 @@ type QueueInfo struct {
 
 // ReceiveOptions controls a Receive call.
 type ReceiveOptions struct {
+	Generation  string // optional incarnation fence; required for temporary subscriptions
 	MaxMessages int
 	WaitMs      int64 // long-poll up to 20000
 	Mode        ReceiveMode

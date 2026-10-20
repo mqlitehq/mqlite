@@ -234,6 +234,17 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   (`Filter{Expr}`), compiled+type-checked at Subscribe (cached per subscription) and
   run fail-closed at publish — see `docs/concepts.md` (§ Subscription filters).
   Receive/Redrive/Stats target the subscription by name.
+- **Resource lifecycle** (`engine/lifecycle.go`): schema 6 adds durable retirement
+  state, fixed subscription expiry and bounded creation receipts. Deletion is
+  generation-fenced and empty-only unless force is explicit; TTL preauthorizes
+  force at the fixed deadline. Keep routing and direct-operation liveness checks
+  inside the operation's transaction. Pending cleanup reserves the name and must
+  resume after restart. Never renew expiry on retry or reuse a creation request to
+  resurrect a retired subscription. A temporary direct target requires generation.
+- **Bounded process state**: use `txn.rememberQueue`/`txn.forgetQueue` for committed
+  topology changes. Observation epochs route late racing effects to the fixed
+  retired aggregate (`queue=""`) instead of resurrecting names. Production long
+  polls use `notifier.subscribe` and release every registration on all exits.
 
 ### Conventions specific to this repo
 

@@ -786,11 +786,15 @@ func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query strin
 // ignore. QueryRowContext returns a Scan-compatible row that also records statement failures.
 // Existing statement sites therefore cannot pick the wrong execution context.
 type txn struct {
-	tx             *sql.Tx
-	caller         context.Context // may be cancelled
-	exec           context.Context // protected on a local store; the caller's on a remote one
-	events         map[eventKey]uint64
-	statementError error
+	tx               *sql.Tx
+	caller           context.Context // may be cancelled
+	exec             context.Context // protected on a local store; the caller's on a remote one
+	events           map[eventKey]uint64
+	observationEpoch uint64
+	queueEpoch       uint64
+	rememberedQueues map[string]bool
+	forgottenQueues  map[string]bool
+	statementError   error
 }
 
 func (t *txn) ctx() context.Context {
@@ -836,6 +840,20 @@ func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) transact
 // cannot see their boundaries — so they are not guarded. EngineTx documents this.
 func (t *txn) SQL() *sql.Tx { return t.tx }
 
+// commitAttempt keeps confirmed database commits and their observation effects
+// in the same order. Remote transactions can overlap: a delayed deletion reply
+// must publish retirement before a replacement creation publishes its name.
+// Callbacks and statements run outside this lock.
+func (e *Engine) commitAttempt(attempt *txn) error {
+	e.commitMu.Lock()
+	defer e.commitMu.Unlock()
+	if err := attempt.tx.Commit(); err != nil {
+		return err
+	}
+	e.observation.commit(attempt)
+	return nil
+}
+
 // inTx runs fn inside a transaction, retrying the whole transaction on a
 // connection error (the aborted tx leaves nothing committed, so retry is safe).
 func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) error {
@@ -844,6 +862,8 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
 		// still honours the caller's context, and an already-cancelled caller never begins at all.
 		return e.db.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
+			queueEpoch := e.queueCacheEpoch()
+			observationEpoch := e.observationEpoch()
 			tx, berr := c.BeginTx(ec, nil)
 			if berr != nil {
 				return berr
@@ -865,7 +885,7 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			// the caller and the process's one writer is wedged for good (codex). Rollback after a
 			// successful Commit is a no-op (ErrTxDone).
 			defer func() { _ = tx.Rollback() }()
-			attempt := &txn{tx: tx, caller: ctx, exec: ec}
+			attempt := &txn{tx: tx, caller: ctx, exec: ec, observationEpoch: observationEpoch, queueEpoch: queueEpoch}
 			if ferr := fn(ec, attempt); ferr != nil {
 				return ferr
 			}
@@ -878,11 +898,7 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr // the deferred rollback undoes it
 			}
-			if err := tx.Commit(); err != nil {
-				return err
-			}
-			e.observation.add(attempt.events)
-			return nil
+			return e.commitAttempt(attempt)
 		})
 	}
 	var err error
@@ -899,6 +915,8 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			a.callbackRejected.Store(false)
 		}
 		var tx *sql.Tx
+		queueEpoch := e.queueCacheEpoch()
+		observationEpoch := e.observationEpoch()
 		tx, err = e.db.sql.BeginTx(ctx, nil)
 		if err != nil {
 			if e.db.retryable(err) {
@@ -917,16 +935,13 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
 		// replayable statement failures into ErrOutcomeUnknown.
 		var ferr, cerr error
-		attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx)}
+		attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx), observationEpoch: observationEpoch, queueEpoch: queueEpoch}
 		func() {
 			defer func() { _ = tx.Rollback() }()
 			if ferr = fn(e.db.stmtCtx(ctx), attempt); ferr != nil {
 				return
 			}
-			cerr = tx.Commit()
-			if cerr == nil {
-				e.observation.add(attempt.events)
-			}
+			cerr = e.commitAttempt(attempt)
 		}()
 		if ferr != nil {
 			err = ferr

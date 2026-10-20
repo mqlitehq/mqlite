@@ -69,7 +69,7 @@ func TestToolsList(t *testing.T) {
 			t.Fatalf("tool %v has no inputSchema", td["name"])
 		}
 	}
-	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "list_keys", "list_queues", "observe", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats"}
+	want := []string{"abandon", "complete", "create_key", "create_queue", "defer", "delete_queue", "delete_subscription", "list_keys", "list_queues", "list_subscriptions", "observe", "peek", "purge", "receive", "receive_deferred", "redrive", "reject", "renew", "revoke_key", "send", "stats", "subscribe"}
 	got := make([]string, 0, len(names))
 	for name := range names {
 		got = append(got, name)
@@ -157,6 +157,8 @@ func TestToolSchemaForwardConsistency(t *testing.T) {
 		for key, spec := range props {
 			var sentinel any = "SENTINEL-" + key
 			switch typ, _ := spec.(map[string]any)["type"].(string); typ {
+			case "boolean":
+				sentinel = true
 			case "integer":
 				sentinel = float64(987654) // JSON numbers decode to float64 in args
 			case "array":
@@ -269,7 +271,12 @@ var goldenWireShapes = map[string][]string{
 		"config.dlq_max_age_ms", "config.dlq_max_bytes", "config.dlq_max_count", "config.kind",
 		"config.lock_duration_ms", "config.max_delivery_count", "config.ordering_mode", "name",
 	},
+	"wire.DeleteQueueRequest":        {"name", "generation", "force"},
+	"wire.DeleteSubscriptionRequest": {"topic", "name", "generation", "force"},
+	"wire.SubscribeRequest":          {"topic", "name", "filter.expr", "ttl_ms", "generation", "request_id", "request_expires_at_ms"},
+	"wire.ListSubscriptionsRequest":  {"topic", "after", "limit", "include_deleting"},
 	"wire.SendRequest": {
+		"generation",
 		"messages[].body", "messages[].content_type", "messages[].correlation_id",
 		"messages[].dead_letter_description", "messages[].dead_letter_reason",
 		"messages[].delivery_count", "messages[].enqueued_at_ms", "messages[].expires_at_ms",
@@ -278,8 +285,8 @@ var goldenWireShapes = map[string][]string{
 		"messages[].seq_number", "messages[].state", "messages[].subject",
 		"messages[].visible_at_ms", "queue", "scheduled_enqueue_time_ms", "ttl_ms",
 	},
-	"wire.ReceiveRequest":         {"max_messages", "queue", "receive_attempt_id", "receive_mode", "wait_time_ms"},
-	"wire.ReceiveDeferredRequest": {"queue", "seq_numbers"},
+	"wire.ReceiveRequest":         {"generation", "max_messages", "queue", "receive_attempt_id", "receive_mode", "wait_time_ms"},
+	"wire.ReceiveDeferredRequest": {"generation", "queue", "seq_numbers"},
 	"wire.SettleRequest": {
 		"dead_letter_description", "dead_letter_reason", "delay_ms", "lock_token", "queue", "seq_number",
 	},
@@ -855,5 +862,36 @@ func TestObserveToolCanonicalMonitorAndFailures(t *testing.T) {
 	broker.endpoint, broker.http = malformed.URL, malformed.Client()
 	if callTool("observe", map[string]any{})["isError"] != true {
 		t.Fatal("malformed observation presented as success")
+	}
+}
+
+func TestLifecycleToolArgumentValidation(t *testing.T) {
+	forwarded := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { forwarded++; _, _ = w.Write([]byte(`{}`)) }))
+	defer ts.Close()
+	broker.endpoint = ts.URL
+	broker.token = ""
+	broker.http = ts.Client()
+	// Rejected before transport: a typo must never silently omit TTL or force intent.
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"subscribe", map[string]any{"ttl": float64(1000)}},
+		{"subscribe", map[string]any{"ttl_ms": 1.5}},
+		{"subscribe", map[string]any{"request_expires_at_ms": "tomorrow"}},
+		{"delete_queue", map[string]any{"force": "true"}},
+		{"delete_subscription", map[string]any{"generation": float64(123)}},
+		{"list_subscriptions", map[string]any{"limit": 1.5}},
+		{"send", map[string]any{"generation": float64(123)}},
+		{"receive", map[string]any{"generation": false}},
+		{"receive_deferred", map[string]any{"generation": nil}},
+	} {
+		if result := callTool(tc.name, tc.args); result["isError"] != true {
+			t.Fatalf("%s accepted malformed args: %v", tc.name, result)
+		}
+	}
+	if forwarded != 0 {
+		t.Fatalf("malformed arguments reached broker %d times", forwarded)
 	}
 }

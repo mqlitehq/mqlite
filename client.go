@@ -154,6 +154,10 @@ func mapErr(eb wire.ErrorBody) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, eb.Message)
 	case "already_exists":
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
+	case "resource_limit":
+		return fmt.Errorf("%w: %s", ErrResourceLimit, eb.Message)
+	case "deletion_pending":
+		return fmt.Errorf("%w: %s", ErrDeletionPending, eb.Message)
 	case "queue_changed":
 		return fmt.Errorf("%w: %s", ErrQueueChanged, eb.Message)
 	case "queue_not_empty":
@@ -231,7 +235,10 @@ func msToTime(ms int64) time.Time {
 func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts ...SendOpts) (int64, error) {
 	o := firstOpt(opts)
 	path := wire.PathSend
-	req := wire.SendRequest{Queue: queue, Messages: []wire.Message{outToWire(m)}, TTLMs: m.TTL.Milliseconds()}
+	if o.Generation != "" {
+		m.TargetGeneration = o.Generation
+	}
+	req := wire.SendRequest{Queue: queue, Generation: m.TargetGeneration, Messages: []wire.Message{outToWire(m)}, TTLMs: m.TTL.Milliseconds()}
 	if !o.At.IsZero() {
 		path = wire.PathSchedule
 		req.ScheduledEnqueueTimeMs = o.At.UnixMilli()
@@ -259,13 +266,16 @@ func (c *Client) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]
 	wm := make([]wire.Message, len(msgs))
 	var ttl int64
 	for i, m := range msgs {
+		if m.TargetGeneration != msgs[0].TargetGeneration {
+			return nil, fmt.Errorf("%w: batch target generations must match", ErrInvalidArgument)
+		}
 		wm[i] = outToWire(m)
 		if ttl == 0 {
 			ttl = m.TTL.Milliseconds()
 		}
 	}
 	var resp wire.SendResponse
-	if err := c.post(ctx, wire.PathSend, wire.SendRequest{Queue: queue, Messages: wm, TTLMs: ttl}, &resp); err != nil {
+	if err := c.post(ctx, wire.PathSend, wire.SendRequest{Queue: queue, Generation: msgs[0].TargetGeneration, Messages: wm, TTLMs: ttl}, &resp); err != nil {
 		return nil, err
 	}
 	return resp.SeqNumbers, nil
@@ -361,13 +371,13 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 	o := firstOpt(opts)
 	var resp wire.ReceiveResponse
 	if len(o.Pick) > 0 {
-		if err := c.post(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, SeqNumbers: o.Pick}, &resp); err != nil {
+		if err := c.post(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, Generation: o.Generation, SeqNumbers: o.Pick}, &resp); err != nil {
 			return nil, err
 		}
 	} else {
 		eo := o.toEngine()
 		if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
-			Queue: queue, MaxMessages: eo.MaxMessages, WaitTimeMs: eo.WaitMs,
+			Queue: queue, Generation: eo.Generation, MaxMessages: eo.MaxMessages, WaitTimeMs: eo.WaitMs,
 			ReceiveMode: int(eo.Mode), AttemptID: eo.AttemptID, // idempotent receive
 		}, &resp); err != nil {
 			return nil, err
@@ -381,9 +391,13 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 }
 
 func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
+	return c.receiveOneGeneration(ctx, queue, max, waitMs, mode, attemptID, "")
+}
+
+func (c *Client) receiveOneGeneration(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID, generation string) ([]*Message, error) {
 	var resp wire.ReceiveResponse
 	if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
-		Queue: queue, MaxMessages: max, WaitTimeMs: waitMs, ReceiveMode: int(mode), AttemptID: attemptID,
+		Queue: queue, Generation: generation, MaxMessages: max, WaitTimeMs: waitMs, ReceiveMode: int(mode), AttemptID: attemptID,
 	}, &resp); err != nil {
 		return nil, err
 	}
@@ -425,32 +439,88 @@ func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	}, &wire.Empty{})
 }
 
-// DeleteQueue removes an empty plain queue. All message states prevent deletion.
+// DeleteQueue removes a plain queue. Force may return ErrDeletionPending when
+// the queue has been retired and physical cleanup is still running.
 func (c *Client) DeleteQueue(ctx context.Context, name string, opts ...DeleteQueueOpts) error {
-	generation := firstOpt(opts).Generation
-	if generation == "" {
+	result, err := c.DeleteQueueWithOptions(ctx, name, opts...)
+	if err != nil {
+		return err
+	}
+	if !result.Deleted {
+		return ErrDeletionPending
+	}
+	return nil
+}
+
+// DeleteQueueWithOptions returns the retirement and cleanup state.
+func (c *Client) DeleteQueueWithOptions(ctx context.Context, name string, opts ...DeleteQueueOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	if o.Generation == "" {
 		queues, err := c.ListQueues(ctx)
 		if err != nil {
-			return err
+			return DeleteResult{}, err
 		}
-		generation, err = queueGeneration(queues, name)
+		o.Generation, err = queueGeneration(queues, name)
 		if err != nil {
-			return err
+			return DeleteResult{}, err
 		}
 	}
 	var resp wire.DeleteQueueResponse
-	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name, Generation: generation}, &resp); err != nil {
-		return err
+	if err := c.post(ctx, wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: name, Generation: o.Generation, Force: o.Force}, &resp); err != nil {
+		return DeleteResult{}, err
 	}
-	if !resp.Deleted {
-		return fmt.Errorf("%w: deletion acknowledgement missing; inspect ListQueues before retrying", ErrOutcomeUnknown)
+	return deletionResult(resp, o.Generation)
+}
+
+func deletionResult(resp wire.DeleteQueueResponse, generation string) (DeleteResult, error) {
+	if (!resp.Deleted && resp.State != "deleting") || (resp.Deleted && resp.State != "" && resp.State != "deleted") || (resp.Generation != "" && resp.Generation != generation) {
+		return DeleteResult{}, fmt.Errorf("%w: deletion acknowledgement missing or mismatched; inspect inventory before retrying", ErrOutcomeUnknown)
 	}
-	return nil
+	return DeleteResult{Deleted: resp.Deleted, State: resp.State, Generation: resp.Generation}, nil
+}
+
+// DeleteSubscription removes a subscription and its backing queue. Retain Generation
+// across retries so an old request cannot delete a replacement with the same name.
+func (c *Client) DeleteSubscription(ctx context.Context, topic, name string, opts ...DeleteSubscriptionOpts) (DeleteResult, error) {
+	o := firstOpt(opts)
+	if o.Generation == "" {
+		queues, err := c.ListQueues(ctx)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+		o.Generation, err = queueGeneration(queues, name)
+		if err != nil {
+			return DeleteResult{}, err
+		}
+	}
+	var resp wire.DeleteSubscriptionResponse
+	if err := c.post(ctx, wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: topic, Name: name, Generation: o.Generation, Force: o.Force}, &resp); err != nil {
+		return DeleteResult{}, err
+	}
+	return deletionResult(resp, o.Generation)
 }
 
 // Subscribe registers a subscription under a topic with an optional filter.
 func (c *Client) Subscribe(ctx context.Context, topic, name string, f *Filter) error {
 	return c.post(ctx, wire.PathSubscribe, wire.SubscribeRequest{Topic: topic, Name: name, Filter: f}, &wire.Empty{})
+}
+
+// SubscribeWithOptions creates or updates a subscription and returns its identity.
+// Reuse the same request ID and absolute deadline after an uncertain TTL create.
+func (c *Client) SubscribeWithOptions(ctx context.Context, topic, name string, f *Filter, opts SubscribeOpts) (SubscriptionInfo, error) {
+	o := opts.toEngine()
+	var resp wire.SubscriptionJSON
+	if err := c.post(ctx, wire.PathSubscribe, wire.SubscribeRequest{Topic: topic, Name: name, Filter: f, TTLMs: o.TTLMs, Generation: o.Generation, RequestID: o.RequestID, RequestExpiresAtMs: o.RequestExpiresAtMs}, &resp); err != nil {
+		return SubscriptionInfo{}, err
+	}
+	if resp.Generation == "" || resp.Topic != topic || resp.Name != name || resp.State != "active" {
+		return SubscriptionInfo{}, fmt.Errorf("%w: subscription identity missing; inspect ListSubscriptions before retrying", ErrOutcomeUnknown)
+	}
+	return subscriptionInfo(resp), nil
+}
+
+func subscriptionInfo(s wire.SubscriptionJSON) SubscriptionInfo {
+	return SubscriptionInfo{Topic: s.Topic, Name: s.Name, Expr: s.Expr, Generation: s.Generation, TTLMs: s.TTLMs, ExpiresAtMs: s.ExpiresAtMs, State: s.State}
 }
 
 // ListQueues lists queues/subscriptions.
@@ -461,7 +531,7 @@ func (c *Client) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	}
 	out := make([]QueueInfo, len(resp.Queues))
 	for i, q := range resp.Queues {
-		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, Generation: q.Generation, LockDurationMs: q.LockDurationMs,
+		out[i] = QueueInfo{Name: q.Name, Kind: q.Kind, Generation: q.Generation, State: q.State, ExpiresAtMs: q.ExpiresAtMs, LockDurationMs: q.LockDurationMs,
 			MaxDeliveryCount: q.MaxDeliveryCount, DefaultTTLMs: q.DefaultTTLMs, DedupWindowMs: q.DedupWindowMs}
 	}
 	return out, nil
@@ -534,9 +604,26 @@ func (c *Client) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, err
 	}
 	out := make([]SubscriptionInfo, len(resp.Subscriptions))
 	for i, s := range resp.Subscriptions {
-		out[i] = SubscriptionInfo{Topic: s.Topic, Name: s.Name, Expr: s.Expr}
+		out[i] = subscriptionInfo(s)
 	}
 	return out, nil
+}
+
+// ListSubscriptionsPage returns a bounded inventory page and the matching total.
+func (c *Client) ListSubscriptionsPage(ctx context.Context, opts ListSubscriptionsOpts) (SubscriptionPage, error) {
+	var resp wire.ListSubscriptionsResponse
+	limit := opts.Limit
+	if limit == 0 {
+		limit = 100
+	}
+	if err := c.post(ctx, wire.PathListSubscriptions, wire.ListSubscriptionsRequest{Topic: opts.Topic, After: opts.After, Limit: limit, IncludeDeleting: opts.IncludeDeleting}, &resp); err != nil {
+		return SubscriptionPage{}, err
+	}
+	page := SubscriptionPage{Subscriptions: make([]SubscriptionInfo, len(resp.Subscriptions)), Total: resp.Total, NextAfter: resp.NextAfter}
+	for i, s := range resp.Subscriptions {
+		page.Subscriptions[i] = subscriptionInfo(s)
+	}
+	return page, nil
 }
 
 // TestFilter dry-runs a subscription filter expression: it compiles expr and, when sample

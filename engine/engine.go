@@ -25,7 +25,9 @@ type Engine struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 
-	maxMsgBytes int64
+	maxMsgBytes             int64
+	maxSubscriptionRequests int
+	maxSubscriptions        int
 
 	dlqMaxAgeMs int64 // DLQ retention: drop dead letters older than this (0 = off)
 	dlqMaxCount int   // DLQ retention: keep at most N dead letters per queue (0 = off)
@@ -38,17 +40,20 @@ type Engine struct {
 	filterMu    sync.Mutex              // guards filterCache
 	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
 
+	commitMu    sync.Mutex // orders confirmed commits and their in-memory lifecycle effects
 	observation observations
 }
 
 // Options configures Open.
 type Options struct {
-	DB                string       // DB DSN: file:./mq.db | :memory: | libsql://host
-	AuthToken         string       // injected from env; never compiled in
-	Now               func() int64 // test clock (epoch ms)
-	DisableBackground bool         // skip reaper/scheduler loops (tests)
-	Synchronous       string       // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
-	MaxMessageBytes   int64        // reject bodies larger than this; 0 -> 1 MiB (§11.4)
+	DB                      string       // DB DSN: file:./mq.db | :memory: | libsql://host
+	AuthToken               string       // injected from env; never compiled in
+	Now                     func() int64 // test clock (epoch ms)
+	DisableBackground       bool         // skip reaper/scheduler loops (tests)
+	Synchronous             string       // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
+	MaxMessageBytes         int64        // reject bodies larger than this; 0 -> 1 MiB (§11.4)
+	MaxSubscriptionRequests int          // pending creation receipts; 0 -> 10,000
+	MaxSubscriptions        int          // retained subscriptions, including deleting; 0 -> 10,000
 	// DLQ retention bounds (MQLITE-21): a background pass drops dead letters
 	// oldest-first past these. ONLY state='dead_lettered' is touched; 0 = that
 	// dimension unbounded. Defaults are applied by the broker, not the engine.
@@ -62,14 +67,18 @@ type Options struct {
 const DefaultMaxMessageBytes = 1 << 20
 
 type queueRow struct {
-	name             string
-	kind             string
-	lockDurationMs   int64
-	maxDeliveryCount int
-	defaultTTLMs     int64
-	deadLetterOnExp  bool
-	dedupWindowMs    int64
-	ordering         OrderingMode
+	name              string
+	kind              string
+	generation        string
+	expiresAtMs       int64
+	subscriptionTTLMs int64
+	lifecycleState    string
+	lockDurationMs    int64
+	maxDeliveryCount  int
+	defaultTTLMs      int64
+	deadLetterOnExp   bool
+	dedupWindowMs     int64
+	ordering          OrderingMode
 	// per-queue DLQ retention overrides (MQLITE-29): 0 = inherit engine default,
 	// >0 = this queue's bound, -1 = explicitly unbounded.
 	dlqMaxAgeMs int64
@@ -80,6 +89,9 @@ type queueRow struct {
 // Open opens the store (initializing the schema), performs single-broker crash
 // recovery, and starts background maintenance loops.
 func Open(ctx context.Context, opts Options) (*Engine, error) {
+	if opts.MaxSubscriptions < 0 || opts.MaxSubscriptionRequests < 0 {
+		return nil, fmt.Errorf("%w: subscription limits must not be negative", ErrInvalidArgument)
+	}
 	d, err := openDB(ctx, opts.DB, opts.AuthToken, opts.Synchronous)
 	if err != nil {
 		return nil, err
@@ -102,19 +114,33 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	}
 	d.log = lg
 	e := &Engine{
-		db:          d,
-		note:        newNotifier(),
-		now:         nowFn,
-		log:         lg,
-		closed:      make(chan struct{}),
-		qcache:      map[string]queueRow{},
-		filterCache: map[string]*filterEntry{},
-		maxMsgBytes: maxMsg,
-		observation: observations{started: nowFn(), background: !opts.DisableBackground},
-		dlqMaxAgeMs: opts.DLQMaxAgeMs,
-		dlqMaxCount: opts.DLQMaxCount,
-		dlqMaxBytes: opts.DLQMaxBytes,
+		db:                      d,
+		note:                    newNotifier(),
+		now:                     nowFn,
+		log:                     lg,
+		closed:                  make(chan struct{}),
+		qcache:                  map[string]queueRow{},
+		filterCache:             map[string]*filterEntry{},
+		maxMsgBytes:             maxMsg,
+		maxSubscriptionRequests: opts.MaxSubscriptionRequests,
+		maxSubscriptions:        opts.MaxSubscriptions,
+		observation:             observations{started: nowFn(), background: !opts.DisableBackground},
+		dlqMaxAgeMs:             opts.DLQMaxAgeMs,
+		dlqMaxCount:             opts.DLQMaxCount,
+		dlqMaxBytes:             opts.DLQMaxBytes,
 	}
+	if e.maxSubscriptionRequests <= 0 {
+		e.maxSubscriptionRequests = 10000
+	}
+	if e.maxSubscriptions <= 0 {
+		e.maxSubscriptions = 10000
+	}
+
+	if err := e.initializeObservations(ctx); err != nil {
+		_ = d.close()
+		return nil, err
+	}
+	e.maintainLifecycle(ctx)
 
 	// Single-broker crash recovery (§4.4): any 'locked' row is an orphan from a
 	// previous process — reclaim it immediately (delivery_count was already
@@ -129,7 +155,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		    locked_until = 0, lock_token = NULL,
 		    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
-		 WHERE state='locked'`); err != nil {
+		 WHERE state='locked' AND queue IN (SELECT name FROM queues WHERE lifecycle_state='active' AND (expires_at=0 OR expires_at>?))`, e.now()); err != nil {
 		_ = d.close()
 		return nil, fmt.Errorf("crash recovery: %w", err)
 	}
@@ -211,78 +237,16 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 	delete(e.qcache, name)
 	e.qepoch++
 	e.qmu.Unlock()
-	e.rememberQueue(name)
 	return nil
 }
 
-// DeleteQueue removes an empty plain queue and its deduplication/replay records.
-// Every message state, including scheduled and dead-lettered, prevents deletion.
-// The check and cleanup share one transaction; concurrent sends cannot be lost.
-// A missing queue returns ErrQueueNotFound. Subscription lifecycle is separate.
-// generation must be the identity returned by ListQueues; a stale request cannot
-// delete a replacement with the same name (ErrQueueChanged).
+// DeleteQueue removes an empty plain queue. The generation fences retries against
+// replacements. Large auxiliary cleanup returns ErrDeletionPending; inspect
+// DeleteQueueWithOptions for its explicit lifecycle result.
 func (e *Engine) DeleteQueue(ctx context.Context, name, generation string) error {
-	if generation == "" {
-		return fmt.Errorf("%w: queue generation required", ErrInvalidArgument)
-	}
-	if name == "" {
-		return fmt.Errorf("%w: queue name required", ErrInvalidArgument)
-	}
-	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		var kind, actualGeneration string
-		if err := tx.QueryRowContext(ctx, `SELECT kind,
-			COALESCE((SELECT value FROM meta WHERE key='queue-generation:' || queues.name), 'legacy:' || created_at)
-			FROM queues WHERE name=?`, name).Scan(&kind, &actualGeneration); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrQueueNotFound
-			}
-			return err
-		}
-		if generation != actualGeneration {
-			return ErrQueueChanged
-		}
-		if kind != "queue" {
-			return fmt.Errorf("%w: DeleteQueue only supports plain queues, not subscriptions", ErrInvalidArgument)
-		}
-		var occupied bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM messages WHERE queue=?)`, name).Scan(&occupied); err != nil {
-			return err
-		}
-		if occupied {
-			return ErrQueueNotEmpty
-		}
-		// These tables deliberately have no foreign keys. Remove them atomically so
-		// reusing a queue name cannot replay old deliveries or deduplicate new sends.
-		for _, statement := range []string{
-			`DELETE FROM dedup WHERE queue=?`,
-			`DELETE FROM settlement_receipts WHERE queue=?`,
-			`DELETE FROM receive_attempts WHERE queue=?`,
-			`DELETE FROM meta WHERE key='queue-generation:' || ?`,
-		} {
-			if _, err := tx.ExecContext(ctx, statement, name); err != nil {
-				return err
-			}
-		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM queues WHERE name=? AND kind='queue'
-			AND NOT EXISTS(SELECT 1 FROM messages WHERE queue=?)`, name, name)
-		if err != nil {
-			return err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if n != 1 {
-			return ErrQueueNotEmpty
-		}
-		return nil
-	})
-	if err == nil || errors.Is(err, ErrOutcomeUnknown) {
-		e.qmu.Lock()
-		delete(e.qcache, name)
-		e.qepoch++
-		e.qmu.Unlock()
-		e.note.notify(name)
+	result, err := e.DeleteQueueWithOptions(ctx, name, generation, DeleteOptions{})
+	if err == nil && !result.Deleted {
+		return ErrDeletionPending
 	}
 	return err
 }
@@ -334,6 +298,27 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 		return err
 	}
 	newQueue := errors.Is(err, sql.ErrNoRows)
+	if newQueue && kind == "subscription" {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM queues WHERE kind='subscription'`).Scan(&count); err != nil {
+			return err
+		}
+		if count >= e.maxSubscriptions {
+			return fmt.Errorf("%w: subscription capacity %d", ErrResourceLimit, e.maxSubscriptions)
+		}
+	}
+	if !newQueue {
+		q, err := e.readQueueTx(ctx, tx, name)
+		if err != nil {
+			return err
+		}
+		if queueLive(q, "", e.now()) != nil {
+			return fmt.Errorf("%w: entity name reserved until cleanup completes", ErrNameConflict)
+		}
+		if overwrite && q.subscriptionTTLMs > 0 {
+			return fmt.Errorf("%w: temporary subscription configuration is immutable", ErrInvalidArgument)
+		}
+	}
 	lock := cfg.LockDurationMs
 	if lock <= 0 {
 		lock = 30000
@@ -378,6 +363,7 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 		return err
 	}
 	if newQueue {
+		tx.rememberQueue(name)
 		// Additive metadata in the existing meta table; schema and old readers stay compatible.
 		_, err = tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES(?,?)
 			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, "queue-generation:"+name, randToken())
@@ -406,90 +392,19 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 // considered and rejected in favor of this flat disjoint namespace — it moves
 // the ambiguity into addressing instead of removing it.
 func (e *Engine) Subscribe(ctx context.Context, topic, name string, filter *Filter) error {
-	if topic == "" || name == "" {
-		return fmt.Errorf("%w: topic and subscription name required", ErrInvalidArgument)
-	}
-	if topic == name {
-		return fmt.Errorf("%w: subscription %q cannot use its own topic's name", ErrNameConflict, name)
-	}
-	// Validate the filter expression up front: a bad one is rejected here
-	// (ErrInvalidFilter -> 400) with the precise compiler error and never stored.
-	if filter != nil {
-		if _, err := compileFilter(filter.Expr); err != nil {
-			return err
-		}
-	}
-	var fj sql.NullString
-	if filter != nil {
-		b, err := json.Marshal(filter)
-		if err != nil {
-			return err
-		}
-		fj = sql.NullString{String: string(b), Valid: true}
-	}
-	// Guards + backing-queue upsert + mapping upsert run in ONE transaction so a
-	// concurrent CreateQueue/Subscribe can't slip between check and insert (the
-	// local single connection serializes anyway; the remote pool does not).
-	if err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		var topicKind string
-		err := tx.QueryRowContext(ctx,
-			`SELECT kind FROM queues WHERE name=?`, topic).Scan(&topicKind)
-		if err == nil {
-			return fmt.Errorf("%w: topic %q is already a %s", ErrNameConflict, topic, topicKind)
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		var existingKind sql.NullString
-		if err := tx.QueryRowContext(ctx,
-			`SELECT kind FROM queues WHERE name=?`, name).Scan(&existingKind); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if existingKind.Valid {
-			if existingKind.String != "subscription" {
-				return fmt.Errorf("%w: %q is already a queue", ErrNameConflict, name)
-			}
-			var otherTopic sql.NullString
-			if err := tx.QueryRowContext(ctx,
-				`SELECT topic FROM subscriptions WHERE subscription=? AND topic<>? LIMIT 1`,
-				name, topic).Scan(&otherTopic); err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			if otherTopic.Valid {
-				return fmt.Errorf("%w: subscription %q already exists under topic %q",
-					ErrNameConflict, name, otherTopic.String)
-			}
-		}
-		// createQueueTx additionally rejects a subscription name that is itself a
-		// live topic — the same shadowing hazard from the other side.
-		if err := e.createQueueTx(ctx, tx, name, QueueConfig{Kind: "subscription"}, false); err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO subscriptions (topic,subscription,filter_json,created_at)
-			VALUES (?,?,?,?)
-			ON CONFLICT(topic,subscription) DO UPDATE SET filter_json=excluded.filter_json`,
-			topic, name, fj, e.now())
-		return err
-	}); err != nil {
-		return err
-	}
-	e.qmu.Lock()
-	delete(e.qcache, name)
-	e.qepoch++
-	e.qmu.Unlock()
-	e.rememberQueue(name)
-	// A re-subscribe may have changed the filter — drop any cached program so the
-	// next publish recompiles from the freshly stored expression.
-	e.invalidateFilter(name)
-	return nil
+	_, err := e.SubscribeWithOptions(ctx, topic, name, filter, SubscribeOptions{})
+	return err
 }
 
 // SubscriptionInfo describes one topic→subscription mapping and its filter.
 type SubscriptionInfo struct {
-	Topic string `json:"topic"`
-	Name  string `json:"name"`
-	Expr  string `json:"expr,omitempty"` // the filter expression; "" = match all
+	Generation  string `json:"generation"`
+	TTLMs       int64  `json:"ttl_ms,omitempty"`
+	ExpiresAtMs int64  `json:"expires_at_ms,omitempty"`
+	State       string `json:"state"`
+	Topic       string `json:"topic"`
+	Name        string `json:"name"`
+	Expr        string `json:"expr,omitempty"` // the filter expression; "" = match all
 }
 
 // ListSubscriptions returns every subscription with its topic and filter expression,
@@ -497,27 +412,18 @@ type SubscriptionInfo struct {
 // topic membership + filter that ListQueues does not.)
 func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
 	var out []SubscriptionInfo
-	err := e.db.queryRows(ctx,
-		`SELECT topic, subscription, filter_json FROM subscriptions ORDER BY topic, subscription`,
-		func(rows *sql.Rows) error {
-			for rows.Next() {
-				var topic, sub string
-				var fj sql.NullString
-				if err := rows.Scan(&topic, &sub, &fj); err != nil {
-					return err
-				}
-				s := SubscriptionInfo{Topic: topic, Name: sub}
-				if fj.Valid && fj.String != "" {
-					var f Filter
-					if json.Unmarshal([]byte(fj.String), &f) == nil {
-						s.Expr = f.Expr
-					}
-				}
-				out = append(out, s)
-			}
-			return rows.Err()
-		})
-	return out, err
+	opts := ListSubscriptionsOptions{Limit: 1000}
+	for {
+		page, err := e.ListSubscriptionsPage(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page.Subscriptions...)
+		if page.NextAfter == "" {
+			return out, nil
+		}
+		opts.After = page.NextAfter
+	}
 }
 
 func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
@@ -527,23 +433,24 @@ func (e *Engine) loadQueue(ctx context.Context, name string) (queueRow, error) {
 		epoch := e.qepoch
 		e.qmu.RUnlock()
 		if ok {
-			return q, nil
+			return q, queueLive(q, "", e.now())
 		}
 		var dle int
 		var ordering string
-		if err := e.db.queryRowScan(ctx,
-			[]any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering,
-				&q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes}, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms,ordering_mode,
-		       dlq_max_age_ms,dlq_max_count,dlq_max_bytes FROM queues WHERE name=?`, name); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return queueRow{}, ErrQueueNotFound
-			}
+		err := e.db.queryRowScan(ctx, []any{&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount, &q.defaultTTLMs,
+			&dle, &q.dedupWindowMs, &ordering, &q.dlqMaxAgeMs, &q.dlqMaxCount, &q.dlqMaxBytes,
+			&q.generation, &q.lifecycleState, &q.expiresAtMs, &q.subscriptionTTLMs}, `SELECT `+queueSelectColumns+` FROM queues WHERE name=?`, name)
+		if errors.Is(err, sql.ErrNoRows) {
+			return queueRow{}, ErrQueueNotFound
+		}
+		if err != nil {
 			return queueRow{}, err
 		}
 		q.deadLetterOnExp = dle != 0
 		q.ordering = OrderingMode(ordering)
+		if err := queueLive(q, "", e.now()); err != nil {
+			return queueRow{}, err
+		}
 		e.qmu.Lock()
 		if e.qepoch != epoch {
 			e.qmu.Unlock()
@@ -560,19 +467,20 @@ func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	var out []QueueInfo
 	err := e.db.queryRows(ctx, `
 		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,dedup_window_ms,
-		       COALESCE((SELECT value FROM meta WHERE key='queue-generation:' || queues.name), 'legacy:' || created_at)
+		       COALESCE((SELECT value FROM meta WHERE key='queue-generation:' || queues.name), 'legacy:' || created_at),
+        CASE WHEN lifecycle_state='active' AND expires_at>0 AND expires_at<=? THEN 'deleting' ELSE lifecycle_state END,expires_at
 		FROM queues ORDER BY name`,
 		func(rows *sql.Rows) error {
 			for rows.Next() {
 				var qi QueueInfo
 				if err := rows.Scan(&qi.Name, &qi.Kind, &qi.LockDurationMs, &qi.MaxDeliveryCount,
-					&qi.DefaultTTLMs, &qi.DedupWindowMs, &qi.Generation); err != nil {
+					&qi.DefaultTTLMs, &qi.DedupWindowMs, &qi.Generation, &qi.State, &qi.ExpiresAtMs); err != nil {
 					return err
 				}
 				out = append(out, qi)
 			}
 			return rows.Err()
-		})
+		}, e.now())
 	return out, err
 }
 
@@ -650,17 +558,24 @@ func validateScheduleTime(atMs, nowMs int64) error {
 // retry/DLQ discipline (max_delivery_count, Reject); Cancel must not silently remove
 // them (MQLITE-66).
 func (e *Engine) Cancel(ctx context.Context, queue string, seq int64) error {
-	res, err := e.db.exec(ctx,
-		`DELETE FROM messages WHERE id=? AND queue=? AND state='scheduled' AND delivery_count=0`, seq, queue)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	} else {
-		e.recordMessage(queue, "canceled", n)
-	}
-	return nil
+	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		if _, err := e.checkQueueLiveTx(ctx, tx, queue, ""); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE id=? AND queue=? AND state='scheduled' AND delivery_count=0`, seq, queue)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		tx.record(queue, "canceled", n)
+		return nil
+	})
 }
 
 // Compact reclaims free database pages to the OS (MQLITE-31). New local DBs use
@@ -701,10 +616,6 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 			return nil, nil, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(ms[i].Body), e.maxMsgBytes)
 		}
 	}
-	targets, err := e.resolveTargets(ctx, name)
-	if err != nil {
-		return nil, nil, err
-	}
 	now := e.now()
 	// visible_at for the filter env: the scheduled time for a delayed send, else now.
 	visibleAt := now
@@ -715,7 +626,16 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 	conflicts := make([]bool, len(ms))
 	woke := map[string]bool{}
 
-	err = e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		targets, err := e.resolveTargetsTx(ctx, tx, name)
+		if err != nil {
+			return err
+		}
+		now = e.now()
+		visibleAt = now
+		if atMs > 0 {
+			visibleAt = atMs
+		}
 		// reset per-attempt accumulators (inTx may retry the whole closure).
 		for i := range seqs {
 			seqs[i] = 0
@@ -726,12 +646,18 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 			// fan-out: identical body to each subscription target (topic) or the one queue.
 			var lastSeq int64
 			for _, t := range targets {
+				if m.TargetGeneration != "" && t.name != name {
+					return fmt.Errorf("%w: target generation applies only to direct delivery", ErrInvalidArgument)
+				}
 				if !e.filterAccepts(t, m, now, visibleAt) { // empty/nil filter matches all
 					continue
 				}
-				q, err := e.loadQueueTx(ctx, tx, t.name)
+				q, err := e.checkQueueLiveTx(ctx, tx, t.name, m.TargetGeneration)
 				if err != nil {
 					return err
+				}
+				if q.subscriptionTTLMs > 0 && t.name == name && m.TargetGeneration == "" {
+					return fmt.Errorf("%w: target generation required for direct delivery to a temporary subscription", ErrInvalidArgument)
 				}
 				if q.ordering == OrderGroupFIFO && m.GroupID == "" {
 					return ErrGroupRequired
@@ -776,67 +702,19 @@ type target struct {
 
 // targetFor builds a fan-out target from a subscription row, compiling and caching
 // its filter expression (empty or absent → entry nil → match all).
-func (e *Engine) targetFor(sub string, fj sql.NullString) target {
+func (e *Engine) targetFor(sub string, fj sql.NullString, epoch uint64) target {
 	t := target{name: sub}
 	if fj.Valid && fj.String != "" {
 		var f Filter
 		if json.Unmarshal([]byte(fj.String), &f) == nil && f.Expr != "" {
-			t.entry = e.compiledFilter(sub, f.Expr)
+			t.entry = e.compiledFilter(sub, f.Expr, epoch)
 		}
 	}
 	return t
 }
 
-// resolveTargets expands a topic to its subscriptions, else validates the queue.
-func (e *Engine) resolveTargets(ctx context.Context, name string) ([]target, error) {
-	var subs []target
-	if err := e.db.queryRows(ctx,
-		`SELECT subscription, filter_json FROM subscriptions WHERE topic=? ORDER BY subscription`,
-		func(rows *sql.Rows) error {
-			for rows.Next() {
-				var s string
-				var fj sql.NullString
-				if err := rows.Scan(&s, &fj); err != nil {
-					return err
-				}
-				subs = append(subs, e.targetFor(s, fj))
-			}
-			return rows.Err()
-		}, name); err != nil {
-		return nil, err
-	}
-	if len(subs) > 0 {
-		return subs, nil
-	}
-	// not a topic — must be an existing queue.
-	if _, err := e.loadQueue(ctx, name); err != nil {
-		return nil, err
-	}
-	return []target{{name: name}}, nil
-}
-
 func (e *Engine) loadQueueTx(ctx context.Context, tx *txn, name string) (queueRow, error) {
-	e.qmu.RLock()
-	q, ok := e.qcache[name]
-	e.qmu.RUnlock()
-	if ok {
-		return q, nil
-	}
-	row := tx.QueryRowContext(ctx, `
-		SELECT name,kind,lock_duration_ms,max_delivery_count,default_ttl_ms,
-		       dead_letter_on_expire,dedup_window_ms,ordering_mode FROM queues WHERE name=?`, name)
-	var dle int
-	var ordering string
-	if err := row.Scan(&q.name, &q.kind, &q.lockDurationMs, &q.maxDeliveryCount,
-		&q.defaultTTLMs, &dle, &q.dedupWindowMs, &ordering); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return queueRow{}, ErrQueueNotFound
-		}
-		return queueRow{}, err
-	}
-	q.deadLetterOnExp = dle != 0
-	q.ordering = OrderingMode(ordering)
-	return q, nil
+	return e.checkQueueLiveTx(ctx, tx, name, "")
 }
 
 func propsJSON(p map[string]string) (sql.NullString, error) {
