@@ -23,6 +23,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -648,13 +649,18 @@ func TestCrashQueueDeletionResumes(t *testing.T) {
 	}
 	var lockedState, lockToken string
 	var deliveries int
-	if err := e.Tx(ctx, func(tx *engine.EngineTx) error {
+	readErr := e.Tx(ctx, func(tx *engine.EngineTx) error {
 		return tx.SQL().QueryRowContext(tx.Context(),
 			`SELECT state,lock_token,delivery_count FROM messages WHERE message_id='locked-delete'`).
 			Scan(&lockedState, &lockToken, &deliveries)
-	}); err != nil || lockedState != "locked" || lockToken == "" || deliveries != 1 {
+	})
+	// The event-driven lifecycle worker may delete this row immediately after the
+	// startup pass. If it is still present, crash recovery must have left it locked
+	// for discard; absence is also valid because physical cleanup already advanced.
+	if (readErr != nil && !errors.Is(readErr, sql.ErrNoRows)) ||
+		(readErr == nil && (lockedState != "locked" || lockToken == "" || deliveries != 1)) {
 		t.Fatalf("deleting lock was recovered instead of left for cleanup: state=%q token=%q deliveries=%d err=%v",
-			lockedState, lockToken, deliveries, err)
+			lockedState, lockToken, deliveries, readErr)
 	}
 	if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("late")}); !errors.Is(err, mqlite.ErrQueueNotFound) {
 		t.Fatalf("retired queue accepted a message after restart: %v", err)
