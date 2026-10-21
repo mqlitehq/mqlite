@@ -31,7 +31,7 @@ func TestGlobalObservationStateAggregationSemantics(t *testing.T) {
 	ctx := context.Background()
 	base := *clock
 
-	for _, name := range []string{"mixed", "locked-only", "non-age", "empty", "deleting"} {
+	for _, name := range []string{"mixed", "active-only", "locked-only", "non-age", "empty", "deleting"} {
 		mustQueue(t, e, name, QueueConfig{})
 	}
 	if err := e.Subscribe(ctx, "topic", "live-sub", nil); err != nil {
@@ -64,6 +64,7 @@ func TestGlobalObservationStateAggregationSemantics(t *testing.T) {
 		{"mixed", "scheduled", base - 20_000},
 		{"mixed", "completed", base - 30_000},
 		{"mixed", "dead_lettered", base - 40_000},
+		{"active-only", "active", base - 350},
 		{"locked-only", "locked", base - 250},
 		{"non-age", "deferred", base - 50_000},
 		{"deleting", "active", base - 60_000},
@@ -81,7 +82,7 @@ func TestGlobalObservationStateAggregationSemantics(t *testing.T) {
 	for _, row := range rows {
 		got[row.Queue] = row
 	}
-	if len(got) != 5 {
+	if len(got) != 6 {
 		t.Fatalf("active inventory=%+v", rows)
 	}
 	if _, ok := got["deleting"]; ok {
@@ -94,6 +95,9 @@ func TestGlobalObservationStateAggregationSemantics(t *testing.T) {
 	if mixed.Active != 2 || mixed.Locked != 2 || mixed.Deferred != 1 || mixed.Scheduled != 1 ||
 		mixed.DeadLettered != 1 || mixed.Total != 8 || mixed.Unexpected != 1 || mixed.OldestMessageAgeMs != 401 {
 		t.Fatalf("mixed queue=%+v", mixed)
+	}
+	if active := got["active-only"]; active.Total != 1 || active.Active != 1 || active.OldestMessageAgeMs != 351 {
+		t.Fatalf("active-only queue=%+v", active)
 	}
 	if locked := got["locked-only"]; locked.Total != 1 || locked.Locked != 1 || locked.OldestMessageAgeMs != 251 {
 		t.Fatalf("locked-only queue=%+v", locked)
