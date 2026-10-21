@@ -390,15 +390,18 @@ func cloneQueueObservations(in []QueueObservation) []QueueObservation {
 func queueSnapshotQuery(queue *string, now int64) (string, []any) {
 	// Aggregate messages before joining the inventory: the message indexes are
 	// intentionally state-specific, so joining raw rows can rescan a deep backlog
-	// once for every empty queue. The grouped relation scans retained rows once.
+	// once for every empty queue. The grouped relation scans retained rows once;
+	// FILTER steps only the matching state aggregate for each row.
 	query := `SELECT q.name,q.kind,
 	COALESCE(m.active,0),COALESCE(m.locked,0),COALESCE(m.deferred,0),
 	COALESCE(m.scheduled,0),COALESCE(m.dead_lettered,0),COALESCE(m.total,0),m.oldest
 	FROM queues q LEFT JOIN (
-	SELECT queue,SUM(state='active') AS active,SUM(state='locked') AS locked,
-	SUM(state='deferred') AS deferred,SUM(state='scheduled') AS scheduled,
-	SUM(state='dead_lettered') AS dead_lettered,COUNT(*) AS total,
-	MIN(CASE WHEN state IN ('active','locked') THEN enqueued_at END) AS oldest
+	SELECT queue,COUNT(*) FILTER (WHERE state='active') AS active,
+	COUNT(*) FILTER (WHERE state='locked') AS locked,
+	COUNT(*) FILTER (WHERE state='deferred') AS deferred,
+	COUNT(*) FILTER (WHERE state='scheduled') AS scheduled,
+	COUNT(*) FILTER (WHERE state='dead_lettered') AS dead_lettered,COUNT(*) AS total,
+	MIN(enqueued_at) FILTER (WHERE state IN ('active','locked')) AS oldest
 	FROM messages`
 	var args []any
 	if queue != nil {
