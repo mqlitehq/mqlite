@@ -287,7 +287,7 @@ go test ./engine -run '^$' \
 Median allocation counts stayed at 3,594 per all-active refresh and 3,294 per
 six-state refresh; reported bytes per operation differed by less than 0.1%. A
 separate seven-round query harness also covered all-locked and 70%-active skewed
-data and found no latency regression. These temporary local-file measurements
+data and reported lower medians. These temporary local-file measurements
 isolate the aggregate expression; they are not a deployment capacity result.
 
 A three-pair local-file check then used a 300,000-row cold active backlog, 1,000

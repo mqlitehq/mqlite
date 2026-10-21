@@ -3230,9 +3230,9 @@ func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
 	e, _ := testEngine(t)
 	for _, queue := range []*string{nil, func() *string { q := "q"; return &q }()} {
 		query, args := queueSnapshotQuery(queue, 1_700_000_000_000)
-		// FILTER skips the five non-matching state aggregates for each retained
-		// message. Keep this deterministic shape check in CI; wall-clock thresholds
-		// are too noisy across its operating systems and Go versions.
+		// FILTER keeps non-matching rows out of each state aggregate. Keep this
+		// deterministic shape check in CI; wall-clock thresholds are too noisy
+		// across its operating systems and Go versions.
 		if got := strings.Count(query, "COUNT(*) FILTER (WHERE state="); got != 5 ||
 			!strings.Contains(query, "MIN(enqueued_at) FILTER (WHERE state IN ('active','locked'))") {
 			t.Fatalf("observation query lost selective aggregates:\n%s", query)
