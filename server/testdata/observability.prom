@@ -22,7 +22,7 @@ mqlite_sample_timestamp_seconds 1.7000000025e+09
 # HELP mqlite_collection_last_success_timestamp_seconds Most recent successful queue collection as Unix seconds, or zero before success.
 # TYPE mqlite_collection_last_success_timestamp_seconds gauge
 mqlite_collection_last_success_timestamp_seconds 1.7000000025e+09
-# HELP mqlite_collection_duration_seconds Elapsed time of the latest queue collection.
+# HELP mqlite_collection_duration_seconds Elapsed time of the latest queue gauge refresh.
 # TYPE mqlite_collection_duration_seconds gauge
 mqlite_collection_duration_seconds 0.0015
 # HELP mqlite_collection_success Whether the latest queue collection succeeded.

@@ -153,6 +153,7 @@ func (e *Engine) transitionExpiredSubscriptionsPass(ctx context.Context) (int, b
 				return err
 			}
 			names = append(names, name)
+			tx.retireQueue(name)
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -166,6 +167,7 @@ func (e *Engine) transitionExpiredSubscriptionsPass(ctx context.Context) (int, b
 		}
 	}
 	if errors.Is(err, ErrOutcomeUnknown) {
+		e.fenceUncertainObservation()
 		e.signalUncertainLifecycle()
 	}
 	// Only a full batch requests the 10 ms continuation. Errors fall back to the
@@ -266,6 +268,9 @@ func (e *Engine) deleteEntity(ctx context.Context, topic, name, kind string, opt
 			if _, err := tx.ExecContext(ctx, `UPDATE queues SET lifecycle_state='deleting',delete_started_at=? WHERE name=? AND lifecycle_state='active'`, startedAt, name); err != nil {
 				return err
 			}
+			// The resource leaves active observation inventory at this durable
+			// transition, even when bounded physical cleanup needs later passes.
+			tx.retireQueue(name)
 		}
 		budget := cleanupBudget{rows: lifecycleBatchRows, bytes: lifecycleBatchBytes}
 		done, err := e.cleanEntityTx(ctx, tx, name, kind, &budget)
@@ -283,6 +288,7 @@ func (e *Engine) deleteEntity(ctx context.Context, topic, name, kind string, opt
 		e.invalidateLifecycle(name)
 	}
 	if errors.Is(err, ErrOutcomeUnknown) {
+		e.fenceUncertainObservation()
 		e.signalUncertainLifecycle()
 	} else if err == nil && !result.Deleted {
 		e.signalLifecycle()

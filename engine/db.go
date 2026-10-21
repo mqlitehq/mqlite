@@ -20,13 +20,15 @@ import (
 	_ "modernc.org/sqlite"                               // driver "sqlite"  (local file/:memory:)
 )
 
-// db wraps a single-connection *sql.DB. MaxOpenConns(1) IS the single writer
-// (design D3): database/sql serializes every caller onto one connection, so
-// there is zero file-level write-lock contention and claims stay atomic.
+// db wraps the single-writer *sql.DB plus an optional read-only observation
+// reader for local WAL files. MaxOpenConns(1) on sql IS the single writer
+// (design D3): database/sql serializes mutations onto that connection, so there
+// is zero file-level write-lock contention and claims stay atomic.
 type db struct {
 	log     *slog.Logger
 	storage storageObservations
 	sql     *sql.DB
+	reader  *sql.DB // one read-only, query-only connection for local file observation reads
 	remote  bool
 	dsn     string    // the user-facing DB string (no auth token — that's only in the conn string)
 	lock    io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
@@ -205,7 +207,37 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		}
 		return nil, fmt.Errorf("ping %s: %w", driver, err)
 	}
-	return &db{sql: sdb, remote: remote, dsn: dsn, lock: lock}, nil
+
+	// A deep exact observation scans retained messages. On a local WAL database,
+	// run those scans on one dedicated read-only connection so they do not wait
+	// in front of Send/Receive/settle on the single writer connection. Keep
+	// :memory: on the writer: a second SQLite connection would be a different
+	// database. Remote already has a small provider-backed pool.
+	var reader *sql.DB
+	if !remote {
+		if path, ok := localFilePath(dsn); ok {
+			readerDSN := "file:" + path + "?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(5000)" +
+				"&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)"
+			reader, err = sql.Open("sqlite", readerDSN)
+			if err == nil {
+				reader.SetMaxOpenConns(1)
+				reader.SetMaxIdleConns(1)
+				reader.SetConnMaxLifetime(0)
+				err = reader.PingContext(pingCtx)
+			}
+			if err != nil {
+				if reader != nil {
+					_ = reader.Close()
+				}
+				_ = sdb.Close()
+				if lock != nil {
+					_ = lock.Close()
+				}
+				return nil, fmt.Errorf("open observation reader: %w", err)
+			}
+		}
+	}
+	return &db{sql: sdb, reader: reader, remote: remote, dsn: dsn, lock: lock}, nil
 }
 
 // initSchema creates the tables/indexes idempotently (CREATE IF NOT EXISTS) and
@@ -295,6 +327,15 @@ func (d *db) beginClosing() {
 	d.closeMu.Unlock()
 }
 
+// isClosing is used before serving an observation result that needs no database
+// connection. Such a cache hit must still honor the engine lifecycle instead of
+// returning a healthy snapshot after Close has shut the admission gate.
+func (d *db) isClosing() bool {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	return d.closing
+}
+
 func (d *db) close() error {
 	// Shut the gate (idempotent) so nothing new is admitted, then wait for the ops already in flight
 	// to finish — a statement still executing, a transaction still committing — before closing the
@@ -311,7 +352,13 @@ func (d *db) close() error {
 	d.closeMu.Unlock()
 	d.inFlight.Wait()
 
-	err := d.sql.Close()
+	var err error
+	if d.reader != nil {
+		err = d.reader.Close()
+	}
+	if e := d.sql.Close(); e != nil && err == nil {
+		err = e
+	}
 	if d.lock != nil {
 		if e := d.lock.Close(); e != nil && err == nil {
 			err = e
@@ -476,6 +523,34 @@ func (d *db) withConn(ctx context.Context, fn func(execCtx context.Context, c *s
 	// destructive operation (Purge, Cancel, ReceiveDeferred) could mutate the database on behalf of
 	// a caller who had already timed out and never started it (codex). The rule is: nothing BEGINS
 	// for a caller who has given up.
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	return fn(d.stmtCtx(ctx), conn)
+}
+
+// withReadConn mirrors withConn's close and cancellation contract on the local
+// file observation reader. A running modernc SQLite statement is deliberately
+// not interrupted; cancellation while waiting for the sole reader still works.
+func (d *db) withReadConn(ctx context.Context, fn func(execCtx context.Context, c *sql.Conn) error) error {
+	if d.reader == nil {
+		return d.withConn(ctx, fn)
+	}
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	if !d.enter() {
+		return ErrClosed
+	}
+	defer d.inFlight.Done()
+	conn, err := d.reader.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if afterConnAcquired != nil {
+		afterConnAcquired()
+	}
 	if err := checkCtx(ctx); err != nil {
 		return err
 	}
@@ -661,6 +736,26 @@ func (d *db) queryFreshUnobserved(ctx context.Context, query string, buildArgs f
 	return err
 }
 
+// queryFreshReadUnobserved uses the dedicated local file reader when available.
+// Other backends preserve their existing connection and retry behavior.
+func (d *db) queryFreshReadUnobserved(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	if d.reader == nil {
+		return d.queryFreshUnobserved(ctx, query, buildArgs, scan)
+	}
+	return d.withReadConn(ctx, func(ec context.Context, c *sql.Conn) error {
+		args := buildArgs()
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		rows, err := c.QueryContext(ec, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		return scan(rows)
+	})
+}
+
 // queryRows is query for a LOCAL store: the rows are consumed inside scan, which is what lets the
 // connection be reserved — a cancellable wait, then an uninterruptible statement (see stmtCtx).
 // Returning *sql.Rows cannot do that: the rows would outlive the reservation.
@@ -766,6 +861,30 @@ func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query strin
 	return err
 }
 
+// queryRowScanReadUnobserved runs a single-row observation probe on the
+// dedicated local-file reader when one exists. Memory databases must keep using
+// their sole connection, and remote stores retain the provider pool and retry
+// behavior in queryRowScanUnobserved.
+func (d *db) queryRowScanReadUnobserved(ctx context.Context, dest []any, query string, args ...any) error {
+	if d.reader == nil {
+		return d.queryRowScanUnobserved(ctx, dest, query, args...)
+	}
+	return d.withReadConn(ctx, func(ec context.Context, c *sql.Conn) error {
+		rows, err := c.QueryContext(ec, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			return sql.ErrNoRows
+		}
+		return rows.Scan(dest...)
+	})
+}
+
 // txn is the ONLY way engine code issues a statement inside a transaction, and it exists because
 // three review rounds running found a fresh path that had quietly skipped the cancellation rules.
 // A guard you have to remember to apply is a guard that gets forgotten, so this one is structural:
@@ -792,6 +911,7 @@ type txn struct {
 	events           map[eventKey]uint64
 	observationEpoch uint64
 	rememberedQueues map[string]bool
+	retiredQueues    map[string]bool
 	forgottenQueues  map[string]bool
 	statementError   error
 }

@@ -57,6 +57,14 @@ for metric definitions and alerts.
   Subscription deadlines, scheduled delivery, message TTL and lock expiry all use
   that clock. A forward step can make deadlines arrive early; a backward step can
   delay a subscription expiry that has not yet been durably marked `deleting`.
+- Treat global queue gauges as sampled monitoring data. Within one broker process,
+  `Observe`, `/metrics` and the console share them for about 10 seconds and expose
+  the original `sampled_at_ms`; use fresh per-queue `Stats` when an operation needs
+  a current drain decision. A very slow refresh adds its own duration to the
+  possible message-gauge age. Keep normal scrape intervals at 15 seconds or
+  longer unless a measured workload justifies more frequent probes. One cache
+  refresh still scans retained messages and can consume CPU, storage bandwidth
+  and WAL checkpoint headroom on a deep backlog.
 
 Choose and record the application's recovery objectives before launch: acceptable
 snapshot age (RPO), recovery time (RTO), backlog age, and capacity limits. Measure
@@ -161,8 +169,11 @@ auxiliary tables. Do not copy only the main file while the broker is running, an
 do not write or run an external checkpoint against the live source. Keep the
 backup connection read-only and short-lived. SQLite's documented
 [WAL-reset issue](https://www.sqlite.org/wal.html#the_wal_reset_bug) requires multiple
-connections concurrently writing/checkpointing; MQLite's single connection and
-this backup restriction avoid that topology. See [dependency policy](dependencies.md).
+connections concurrently writing/checkpointing. A local MQLite database has one
+connection that may write or checkpoint plus one observation reader opened with
+SQLite `mode=ro` and `query_only`; the reader cannot write or checkpoint. That
+division and this backup restriction avoid the affected topology. See
+[dependency policy](dependencies.md).
 
 ### Offline directory copy
 

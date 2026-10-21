@@ -81,7 +81,7 @@ func (e *Engine) runtimeObservation(ctx context.Context) (RuntimeObservation, in
 	}
 	start := time.Now()
 	var one int
-	if err := e.db.queryRowScan(ctx, []any{&one}, "SELECT 1"); err != nil {
+	if err := e.db.queryRowScanRead(ctx, []any{&one}, "SELECT 1"); err != nil {
 		return r, -1
 	}
 	elapsed := time.Since(start)

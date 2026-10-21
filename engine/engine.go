@@ -269,6 +269,9 @@ func (e *Engine) CreateQueue(ctx context.Context, name string, cfg QueueConfig) 
 		now := e.now()
 		return e.createQueueTx(ctx, tx, name, cfg, true, false, 0, now)
 	}); err != nil {
+		if errors.Is(err, ErrOutcomeUnknown) {
+			e.fenceUncertainObservation()
+		}
 		return err
 	}
 	e.qmu.Lock()
@@ -557,6 +560,9 @@ func (e *Engine) SubscribeWithOptions(ctx context.Context, topic, name string, f
 			topic, name, fj, now)
 		return err
 	}); err != nil {
+		if errors.Is(err, ErrOutcomeUnknown) {
+			e.fenceUncertainObservation()
+		}
 		return err
 	}
 	e.qmu.Lock()
@@ -858,7 +864,9 @@ func (e *Engine) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	if err == nil {
 		live := make(map[string]bool, len(out))
 		for _, q := range out {
-			live[q.Name] = true
+			if q.State == "active" {
+				live[q.Name] = true
+			}
 		}
 		e.observation.mu.Lock()
 		e.observation.reconcileTopologyLocked(live, collectionEpoch)

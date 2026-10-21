@@ -73,7 +73,7 @@ func prometheusSnapshot(s wire.ObserveResponse) string {
 		{"mqlite_start_time_seconds", "Engine start time as Unix seconds.", float64(s.StartedAtMs) / 1000},
 		{"mqlite_sample_timestamp_seconds", "Queue sample time as Unix seconds.", float64(s.SampledAtMs) / 1000},
 		{"mqlite_collection_last_success_timestamp_seconds", "Most recent successful queue collection as Unix seconds, or zero before success.", float64(s.Collection.LastSuccessAtMs) / 1000},
-		{"mqlite_collection_duration_seconds", "Elapsed time of the latest queue collection.", s.Collection.DurationSeconds},
+		{"mqlite_collection_duration_seconds", "Elapsed time of the latest queue gauge refresh.", s.Collection.DurationSeconds},
 	} {
 		metricHeader(&b, m.name, "gauge", m.help)
 		fmt.Fprintf(&b, "%s %g\n", m.name, m.value)

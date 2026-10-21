@@ -80,12 +80,58 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 
 // Stats returns pgmq-style counters for a queue (§7.3).
 func (e *Engine) Stats(ctx context.Context, queue string) (Metrics, error) {
-	rows, _, err := e.queueSnapshot(ctx, &queue)
+	row, err := e.queueMetrics(ctx, queue)
 	if err != nil {
 		return Metrics{}, err
 	}
-	if len(rows) == 0 {
-		return Metrics{}, ErrQueueNotFound
+	return row.Metrics, nil
+}
+
+const queueMetricsSQL = `SELECT
+	a.n,a.oldest,l.n,l.oldest,d.n,s.n,c.n,dl.n
+	FROM queues q
+	CROSS JOIN (SELECT COUNT(*) AS n,MIN(enqueued_at) AS oldest FROM messages WHERE queue=? AND state='active') a
+	CROSS JOIN (SELECT COUNT(*) AS n,MIN(enqueued_at) AS oldest FROM messages WHERE queue=? AND state='locked') l
+	CROSS JOIN (SELECT COUNT(*) AS n FROM messages WHERE queue=? AND state='deferred') d
+	CROSS JOIN (SELECT COUNT(*) AS n FROM messages WHERE queue=? AND state='scheduled') s
+	CROSS JOIN (SELECT COUNT(*) AS n FROM messages WHERE queue=? AND state='completed') c
+	CROSS JOIN (SELECT COUNT(*) AS n FROM messages WHERE queue=? AND state='dead_lettered') dl
+	WHERE q.name=? AND q.lifecycle_state='active' AND (q.expires_at=0 OR q.expires_at>?)`
+
+// queueMetrics keeps an exact per-queue snapshot while making every message
+// branch match one existing state-specific partial index. This avoids scanning
+// unrelated queues; completed is included in Total and reported as unexpected.
+func (e *Engine) queueMetrics(ctx context.Context, queue string) (QueueObservation, error) {
+	var out QueueObservation
+	var activeOldest, lockedOldest sql.NullInt64
+	var now int64
+	err := e.db.queryFreshRead(ctx, queueMetricsSQL, func() []any {
+		now = e.now()
+		return []any{queue, queue, queue, queue, queue, queue, queue, now}
+	}, func(rows *sql.Rows) error {
+		if !rows.Next() {
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			return ErrQueueNotFound
+		}
+		if err := rows.Scan(&out.Active, &activeOldest, &out.Locked, &lockedOldest,
+			&out.Deferred, &out.Scheduled, &out.Unexpected, &out.DeadLettered); err != nil {
+			return err
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return QueueObservation{}, err
 	}
-	return rows[0].Metrics, nil
+	out.Queue = queue
+	out.Total = out.Active + out.Locked + out.Deferred + out.Scheduled + out.DeadLettered + out.Unexpected
+	oldest := activeOldest
+	if lockedOldest.Valid && (!oldest.Valid || lockedOldest.Int64 < oldest.Int64) {
+		oldest = lockedOldest
+	}
+	if oldest.Valid && now > oldest.Int64 {
+		out.OldestMessageAgeMs = now - oldest.Int64
+	}
+	return out, nil
 }

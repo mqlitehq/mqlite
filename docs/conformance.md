@@ -238,7 +238,14 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 
 - **10.1** Local file / `:memory:` use a single writer (`SetMaxOpenConns(1)`); a second
   process / second `OpenEmbedded` on the same file MUST fail fast with `ErrDBLocked`.
-  *(engine/storage_test.go)*
+  A local file MAY use one separate `mode=ro` plus `query_only` WAL connection
+  for observation reads; it MUST reject writes and checkpoints and share the
+  engine close gate. The global queue snapshot MAY be reused for about 10
+  seconds, MUST preserve its original
+  `sampled_at_ms` and internal topology fence as one cache entry, MUST coalesce
+  concurrent refreshes, and MUST NOT cache a failed refresh. Per-queue `Stats`
+  remains a fresh indexed read.
+  *(engine/storage_test.go, engine/observability_performance_test.go)*
 - **10.2** `Open` MUST refuse a DB whose recorded `schemaVersion` differs from the
   binary's (`ErrSchemaVersionMismatch`) rather than running mismatched DDL against it.
   *(engine/storage_test.go)*
