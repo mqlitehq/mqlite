@@ -92,22 +92,23 @@ of the new surface rather than silently skipping it.
 
 See [operations](../../../docs/operations.md) for the operator procedure.
 
-## v0.3.0 schema-boundary recovery
+## v0.3.2 schema-boundary recovery
 
 Durable queue lifecycle and fixed subscription expiration change the schema token
 from 5 to 7. There is no in-place migration: opening a schema-5 database with this
 candidate must fail without changing its schema or data. Schema 6, used by the
 intermediate lifecycle implementation, is rejected by the engine compatibility
-tests as well. Keep the matching v0.3.0 binary and a backup available until the new
+tests as well. Keep the matching v0.3.2 binary and a backup available until the new
 deployment has been validated. Verify both sides of the released boundary with the
-real v0.3.0 binary and its clean source checkout (used only to build the full old
+real v0.3.2 binary and its clean source checkout (used only to build the full old
 message-state fixture):
 
 ```sh
 python3 test/production/restore/compat.py \
-  --old-binary /absolute/path/to/released-v0.3.0/mqlite \
-  --old-source /absolute/path/to/clean-v0.3.0-source \
+  --old-binary /absolute/path/to/released-v0.3.2/mqlite \
+  --old-source /absolute/path/to/clean-v0.3.2-source \
   --new-binary /absolute/path/to/candidate/mqlite \
+  --go-toolchain go1.27.1 \
   --output /absolute/path/to/evidence/new-compat-run
 ```
 

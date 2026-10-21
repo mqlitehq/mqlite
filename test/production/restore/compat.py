@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prove schema-7 refusal leaves a released schema-5 database recoverable.
 
-Use the released v0.3.0 binary and source to create the full schema-5 fixture.
+Use the released v0.3.2 binary and source to create the full schema-5 fixture.
 The candidate must reject it without changing schema or data. The matching old
 binary must then reopen that same database and complete a read/write round trip.
 The reverse check proves the old binary also rejects a fresh schema-7 database
@@ -20,13 +20,13 @@ from run import (Worker, after_open, canonical, cell, cli, compare, digest,
                  require, rows, save, snapshot)
 
 
-BASE_SHA = "86a85f36443c15e07dc99c78f045680a93a4c612"
+BASE_SHA = "8232296ea871c9550b58e13328b729ac771cffe8"
 
 
 def check_old_fixture(snap):
     expected = {"queues", "subscriptions", "messages", "dedup", "settlement_receipts",
-                "receive_attempts", "meta", "sqlite_sequence", "business_orders"}
-    require(set(snap["tables"]) == expected, "v0.3.0 fixture table surface changed")
+                "receive_attempts", "meta", "sqlite_sequence", "business_orders", "access_keys"}
+    require(set(snap["tables"]) == expected, "v0.3.2 fixture table surface changed")
     require(all(rows(snap, table) for table in expected), "old fixture left a table empty")
     require({row["state"] for row in rows(snap, "messages")} ==
             {"active", "locked", "deferred", "scheduled", "dead_lettered"},
@@ -55,17 +55,17 @@ def run(args, out):
     source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"],
                                          cwd=args.old_source, text=True).strip()
     require(source_sha == BASE_SHA,
-            "old fixture source must be the exact released v0.3.0 commit")
+            "old fixture source must be the exact released v0.3.2 commit")
     require(not subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=no"],
         cwd=args.old_source, text=True).strip(), "old fixture source is dirty")
     old_version = subprocess.check_output([str(args.old_binary), "version"], text=True).strip()
-    require(old_version == "mqlite 0.3.0", "old broker is not the released v0.3.0")
+    require(old_version == "mqlite 0.3.2", "old broker is not the released v0.3.2")
     new_version = subprocess.check_output([str(args.new_binary), "version"], text=True).strip()
     require(new_version != old_version, "candidate must report a distinct patch version")
 
-    fixture = out / "v030-fixture"
-    build_env = dict(os.environ, GOTOOLCHAIN="go1.27.1")
+    fixture = out / "v032-fixture"
+    build_env = dict(os.environ, GOTOOLCHAIN=args.go_toolchain)
     result = subprocess.run(["go", "build", "-trimpath", "-o", str(fixture),
                              "./test/production/restore"], cwd=args.old_source,
                             env=build_env, text=True, capture_output=True, timeout=180)
@@ -169,6 +169,8 @@ def main():
     parser.add_argument("--old-binary", type=Path, required=True)
     parser.add_argument("--old-source", type=Path, required=True)
     parser.add_argument("--new-binary", type=Path, required=True)
+    parser.add_argument("--go-toolchain", default="go1.27.1",
+                        help="GOTOOLCHAIN value for building the historical fixture")
     parser.add_argument("--output", type=Path, required=True,
                         help="new, nonexistent evidence directory")
     args = parser.parse_args()
