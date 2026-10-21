@@ -670,9 +670,6 @@ func seedObservationBenchmarkStates(b *testing.B, messages, queues int, mixed bo
 	b.Helper()
 	ctx := context.Background()
 	e := benchEngine(b)
-	if _, err := e.db.exec(ctx, `INSERT INTO queues(name,created_at,updated_at) VALUES('hot',1,1)`); err != nil {
-		b.Fatal(err)
-	}
 	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?)
 		INSERT INTO queues(name,created_at,updated_at) SELECT printf('q%03d',i),1,1 FROM n`, queues-1); err != nil {
 		b.Fatal(err)
@@ -680,11 +677,22 @@ func seedObservationBenchmarkStates(b *testing.B, messages, queues int, mixed bo
 	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?)
 		INSERT INTO messages(queue,state,enqueued_at,body)
 		SELECT printf('q%03d',i%?),
-			CASE WHEN ?=0 THEN 'active' ELSE CASE i%6
+			CASE WHEN ?=0 THEN 'active' ELSE CASE ((i/?)+(i%?))%6
 				WHEN 0 THEN 'active' WHEN 1 THEN 'locked' WHEN 2 THEN 'deferred'
 				WHEN 3 THEN 'scheduled' WHEN 4 THEN 'completed' ELSE 'dead_lettered' END END,
-			1700000000000,x'00' FROM n`, messages-1, queues, mixed); err != nil {
+			1700000000000,x'00' FROM n`, messages-1, queues, mixed, queues, queues); err != nil {
 		b.Fatal(err)
+	}
+	if mixed {
+		var groups, total, smallest, largest int
+		if err := e.db.queryRowScan(ctx, []any{&groups, &total, &smallest, &largest}, `
+			SELECT COUNT(*),SUM(n),MIN(n),MAX(n)
+			FROM (SELECT queue,state,COUNT(*) AS n FROM messages GROUP BY queue,state)`); err != nil {
+			b.Fatal(err)
+		}
+		if groups != queues*6 || total != messages || largest-smallest > 1 {
+			b.Fatalf("mixed fixture groups=%d total=%d per_group=%d..%d", groups, total, smallest, largest)
+		}
 	}
 	if _, err := e.db.exec(ctx, `ANALYZE`); err != nil {
 		b.Fatal(err)
@@ -765,6 +773,9 @@ func BenchmarkSendDuringDeepObservation(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			ctx, cancel := context.WithCancel(context.Background())
 			e := seedObservationBenchmark(b, 300_000, 300)
+			if err := e.CreateQueue(ctx, "hot", QueueConfig{}); err != nil {
+				b.Fatal(err)
+			}
 			var observer sync.WaitGroup
 			stopObserver := func() {
 				cancel()
