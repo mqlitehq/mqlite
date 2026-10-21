@@ -10,7 +10,7 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## v0.4.0 — 2026-10-21
+## v0.4.0 — 2026-10-22
 
 > **Upgrade from v0.3.2 or retracted v0.3.3:** port **6754** is unchanged, but
 > the canonical schema token changes from **5 → 7**. There is no in-place
@@ -63,6 +63,20 @@ upgrade notes before replacing a broker.
   probes and process counters are collected for each request. Per-queue `Stats`
   remains fresh. A refresh still consumes CPU and storage bandwidth and retains
   a WAL snapshot for its duration.
+
+### Add destructive-operation audit evidence (MQLITE-131)
+
+- Give each logged broker request a broker-generated correlation ID, return it in
+  `X-Request-ID`, and record a safe `actor_kind` classification plus a managed-key
+  public ID when one exists. Caller-supplied request IDs, credentials, token
+  digests, message bodies and generated key secrets never become log fields.
+- Record reconciliation evidence for queue and subscription deletion, including
+  `force`, whether acceptance is known, and the accepted result. Purge and managed
+  key changes likewise include their safe request bounds and confirmed effects.
+- Keep this evidence operational rather than presenting it as a durable audit
+  ledger. Operators must retain broker stderr externally; an unknown deletion
+  outcome still requires read-only inventory reconciliation, and embedded brokers
+  must supply a retained request logger when they need the same evidence.
 
 ### Enforce one strict JSON request object (MQLITE-130)
 
