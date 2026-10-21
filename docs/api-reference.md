@@ -6,6 +6,11 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
+Every RPC body must be exactly one non-null JSON object, including operations
+whose request is otherwise empty (`{}`). Unknown fields and data after that object
+are rejected. Repeated fields retain Go's `encoding/json` behavior: later scalar
+values replace earlier ones, while repeated object and map values may merge.
+
 ## Conventions
 
 - **Transport:** HTTP `POST`, `Content-Type: application/json`. Discovery and
@@ -768,7 +773,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 
 | HTTP | `code` | When |
 |---|---|---|
-| 400 | `invalid_argument` | malformed JSON, an **unknown field**, trailing data after the object, a bad filter expression, an empty queue name, or an unknown enum (`kind` / `ordering_mode`). The decoder is strict — a typo'd field is a 400, not a silently-dropped no-op (`mqlite.ErrInvalidArgument`). |
+| 400 | `invalid_argument` | malformed JSON, a non-object or `null` request body, an **unknown field**, trailing data after the object, a bad filter expression, an empty queue name, or an unknown enum (`kind` / `ordering_mode`). The decoder is strict — a typo'd field is a 400, not a silently-dropped no-op (`mqlite.ErrInvalidArgument`). |
 | 400 | `group_required` | a `group_fifo` send with no `group_id` |
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
 | 403 | `permission_denied` | a valid key lacks permission, or key management was attempted with auth disabled (`mqlite.ErrPermissionDenied`) |
@@ -780,7 +785,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 409 | `queue_not_empty` | deletion found retained messages in at least one state |
 | 409 | `subscription_not_empty` | subscription deletion found retained messages in at least one state |
 | 429 | `resource_exhausted` | the active plus deleting subscription capacity is full (`mqlite.ErrSubscriptionLimit`) |
-| 413 | `message_too_large` | body over `MaxMessageBytes` (default 1 MiB) |
+| 413 | `message_too_large` | a message body over `MaxMessageBytes` (default 1 MiB), or request decoding that exceeds `server.MaxBodyBytes` (default 32 MiB) |
 | 499 | `canceled` | the client canceled the request |
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |

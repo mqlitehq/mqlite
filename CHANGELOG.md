@@ -12,6 +12,15 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Enforce one strict JSON request object (MQLITE-130)
+
+- Require every RPC body to contain exactly one non-null JSON object. This now
+  includes `ListQueues`, legacy `ListSubscriptions`, `Status`, and `Observe`;
+  direct HTTP callers must send `{}` instead of an empty body or `null`.
+  Unknown fields, trailing JSON values, and request decoding past the configured
+  body cap are rejected consistently. Official SDK, CLI, MCP, and console calls
+  already send request objects.
+
 ### Add fixed subscription lifetimes (MQLITE-128)
 
 - Add an optional fixed TTL to subscription creation across the engine, HTTP,

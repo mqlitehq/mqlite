@@ -172,6 +172,94 @@ func TestRequestBodyCap(t *testing.T) {
 	}
 }
 
+// Every registered RPC accepts one request object and rejects unknown fields.
+// The live discovery inventory keeps this contract test complete when a route is
+// added; TestDiscoveryCardPinned independently pins that inventory.
+func TestEveryRPCRejectsUnknownFields(t *testing.T) {
+	eng := keyTestEngine(t, nil)
+	h := server.New(eng, []string{"admin"}).Handler()
+	inventory := keyTestRequest(h, http.MethodGet, "/", "", nil)
+	keyTestStatus(t, inventory, http.StatusOK, "")
+	var card wire.DiscoveryCard
+	if err := json.Unmarshal(inventory.Body.Bytes(), &card); err != nil {
+		t.Fatal(err)
+	}
+	if len(card.Endpoints) == 0 {
+		t.Fatal("discovery returned no registered RPCs")
+	}
+	for _, path := range card.Endpoints {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path,
+				strings.NewReader(`{"__mqlite_unknown_field__":true}`))
+			req.Header.Set("Authorization", "Bearer admin")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			keyTestStatus(t, rec, http.StatusBadRequest, "invalid_argument")
+			var body wire.ErrorBody
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(body.Message, `unknown field "__mqlite_unknown_field__"`) {
+				t.Fatalf("request was not rejected by strict unknown-field decoding: %q", body.Message)
+			}
+		})
+	}
+}
+
+func TestEmptyRPCRequestObjectContract(t *testing.T) {
+	eng := keyTestEngine(t, nil)
+	srv := server.New(eng, []string{"admin"})
+	srv.MaxBodyBytes = 32
+	h := srv.Handler()
+	paths := []string{
+		wire.PathListQueues,
+		wire.PathListSubscriptions,
+		wire.PathStatus,
+		wire.PathObserve,
+	}
+	cases := []struct {
+		name   string
+		body   string
+		status int
+		code   string
+	}{
+		{name: "object", body: `{}`, status: http.StatusOK},
+		{name: "empty", body: ``, status: http.StatusBadRequest, code: "invalid_argument"},
+		{name: "null", body: `null`, status: http.StatusBadRequest, code: "invalid_argument"},
+		{name: "array", body: `[]`, status: http.StatusBadRequest, code: "invalid_argument"},
+		{name: "scalar", body: `true`, status: http.StatusBadRequest, code: "invalid_argument"},
+		{name: "trailing_object", body: `{} {}`, status: http.StatusBadRequest, code: "invalid_argument"},
+		{name: "oversize_object", body: `{` + strings.Repeat(" ", 64) + `}`, status: http.StatusRequestEntityTooLarge, code: "message_too_large"},
+	}
+	for _, path := range paths {
+		for _, tt := range cases {
+			t.Run(path+"/"+tt.name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(tt.body))
+				req.Header.Set("Authorization", "Bearer admin")
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				keyTestStatus(t, rec, tt.status, tt.code)
+			})
+		}
+	}
+
+	// Duplicate fields retain encoding/json's deterministic last-value-wins rule.
+	srv.MaxBodyBytes = 1024
+	req := httptest.NewRequest(http.MethodPost, wire.PathCreateQueue,
+		strings.NewReader(`{"name":"ignored","name":"accepted","config":{}}`))
+	req.Header.Set("Authorization", "Bearer admin")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	keyTestStatus(t, rec, http.StatusOK, "")
+	queues, err := eng.ListQueues(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queues) != 1 || queues[0].Name != "accepted" {
+		t.Fatalf("duplicate request field did not keep its last value: %+v", queues)
+	}
+}
+
 // ── Managed access keys and complete route authorization (MQLITE-121) ───────
 
 func keyTestEngine(t *testing.T, now func() int64) *engine.Engine {
