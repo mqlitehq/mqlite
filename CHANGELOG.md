@@ -64,6 +64,19 @@ upgrade notes before replacing a broker.
   remains fresh. A refresh still consumes CPU and storage bandwidth and retains
   a WAL snapshot for its duration.
 
+### Reduce global observation aggregate work (MQLITE-134)
+
+- Make the exact all-queue refresh step only the matching state counter for each
+  retained message. The query keeps one grouped scan and preserves active,
+  locked, deferred, scheduled, dead-lettered, total, unexpected and oldest
+  active-or-locked semantics.
+- Keep the database schema, observation API, cache and singleflight behavior
+  unchanged. Refresh cost remains proportional to the rows currently retained in
+  `messages`; completed messages normally leave that table when settled, so this
+  is current backlog rather than cumulative broker throughput.
+- Add mixed-state equivalence coverage, a six-state deep-backlog benchmark and a
+  deterministic query-shape check that runs in the existing CI matrix.
+
 ### Add destructive-operation audit evidence (MQLITE-131)
 
 - Give each logged broker request a broker-generated correlation ID, return it in
