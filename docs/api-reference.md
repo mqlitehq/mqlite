@@ -651,6 +651,9 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 
 ### ListQueues
 
+The `state` field and deleting-resource visibility below are available in
+**v0.4.0 and later**.
+
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
   `state`, `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`,
   `dedup_window_ms`}]). `state` is `active` or `deleting`. Deleting queues remain

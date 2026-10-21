@@ -6,9 +6,10 @@ The image must already exist locally and provide the release image's Alpine
 utilities and `mqlite` binary. The runner never pulls, builds, or publishes images.
 
 ```sh
+MQ_VERSION=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/version/version.go)
 python3 test/production/disk_full.py mqlite:candidate \
   --expected-revision FULL_40_CHARACTER_COMMIT_SHA \
-  --expected-version 0.3.0 \
+  --expected-version "$MQ_VERSION" \
   --output /absolute/path/to/new/disk-full-evidence
 ```
 

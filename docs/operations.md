@@ -237,7 +237,7 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
-For **v0.3.2 or retracted v0.3.3 → v0.4.0**, schema changes
+For **v0.3.0, v0.3.1, v0.3.2 or retracted v0.3.3 → v0.4.0**, schema changes
 from **5 → 7** while port **6754** stays unchanged. Durable queue lifecycle and
 fixed subscription-expiry columns and indexes make the database incompatible;
 there is no in-place migration. Schema 6 belonged only to an intermediate

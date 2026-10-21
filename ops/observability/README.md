@@ -17,6 +17,18 @@ Use the matching release tag so the broker, dashboard and rules come from the sa
 version. Before that tag is published, use the exact reviewed candidate commit
 for a release rehearsal instead.
 
+Stop the v0.3.2 starter before launching this stack because both versions publish
+the same loopback ports. From its old checkout, run `docker compose down` in
+`ops/observability`. If the checkout has already moved to v0.4.0 and the old
+pointer was saved as `.env.v0.3.2`, stop that project explicitly:
+
+```sh
+docker compose -p mqlite-observability-032 --env-file .env.v0.3.2 down
+```
+
+This stops the old containers without deleting their schema-5 data. Preserve that
+data with the matching old binary; the schema-7 broker cannot open it.
+
 ```sh
 git clone --branch v0.4.0 --depth 1 https://github.com/mqlitehq/mqlite.git
 cd mqlite/ops/observability

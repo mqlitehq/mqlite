@@ -1,6 +1,6 @@
 # HELP mqlite_info Broker build and storage backend information.
 # TYPE mqlite_info gauge
-mqlite_info{version="0.3.2",backend="local",schema_version="6"} 1
+mqlite_info{version="0.4.0",backend="local",schema_version="7"} 1
 # HELP mqlite_storage_read_available Whether the latest SELECT 1 read probe succeeded; not a write health check.
 # TYPE mqlite_storage_read_available gauge
 mqlite_storage_read_available 1
