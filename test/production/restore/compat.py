@@ -1,26 +1,217 @@
 #!/usr/bin/env python3
 """Prove schema-7 refusal leaves a released schema-5 database recoverable.
 
-Use the released v0.3.2 binary and source to create the full schema-5 fixture.
-The candidate must reject it without changing schema or data. The matching old
-binary must then reopen that same database and complete a read/write round trip.
-The reverse check proves the old binary also rejects a fresh schema-7 database
-without changing it; cross-schema use requires a new database or restored backup.
+Use the published v0.3.2 archive, binary, and exact source commit to create the
+full schema-5 fixture. Build the candidate from an archive of its clean HEAD.
+The candidate must reject schema 5 without changing schema or data, and the
+matching old binary must remain usable. The reverse check proves the old binary
+also rejects a fresh schema-7 database without changing it.
 """
 
 import argparse
 import base64
+import hashlib
+import io
 import json
 import os
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
-from pathlib import Path
+import tarfile
+import tempfile
+import zipfile
 
-from run import (Worker, after_open, canonical, cell, cli, compare, digest,
-                 require, rows, save, snapshot)
+from run import (Worker, after_open, canonical, cell, cli, command, compare,
+                 digest, require, rows, save, snapshot)
 
 
 BASE_SHA = "8232296ea871c9550b58e13328b729ac771cffe8"
+OLD_VERSION = "mqlite 0.3.2"
+NEW_VERSION = "mqlite 0.4.0"
+# SHA-256 of the checksums.txt asset published with v0.3.2. This offline trust
+# anchor prevents a matching, locally fabricated archive and manifest from
+# being accepted as the released artifact.
+V032_CHECKSUMS_SHA256 = "8964707b9ebe2c52e31ae564d062aad61ad83ca7dac2fb295f83af72845a3887"
+VERSION_RE = re.compile(r'^const Version = "([^"]+)"$', re.MULTILINE)
+SNAPSHOTS = (
+    "01-old-seed.json",
+    "02-schema5-before-refusal.json",
+    "03-schema5-after-refusal.json",
+    "04-schema5-old-roundtrip.json",
+    "05-schema7-fresh.json",
+    "06-schema7-after-old-refusal.json",
+)
+
+
+def sha256_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def parse_checksums(value):
+    entries = {}
+    require(value, "release checksum file is empty")
+    for line in value.splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+        require(match is not None, "release checksum file has an invalid line")
+        checksum, name = match.groups()
+        require(name not in entries, "release checksum file has a duplicate artifact")
+        entries[name] = checksum
+    return entries
+
+
+def release_binary(archive_path):
+    try:
+        if archive_path.name.endswith((".tar.gz", ".tgz")):
+            with tarfile.open(archive_path, "r:gz") as archive:
+                members = [item for item in archive.getmembers() if item.name == "mqlite"]
+                require(len(members) == 1 and members[0].isfile(),
+                        "release tar archive must contain exactly one regular mqlite member")
+                stream = archive.extractfile(members[0])
+                require(stream is not None, "release tar mqlite member is unreadable")
+                return stream.read(), members[0].name
+        if archive_path.name.endswith(".zip"):
+            with zipfile.ZipFile(archive_path) as archive:
+                members = [item for item in archive.infolist()
+                           if item.filename == "mqlite.exe"]
+                require(len(members) == 1 and not members[0].is_dir(),
+                        "release zip archive must contain exactly one mqlite.exe member")
+                with archive.open(members[0]) as stream:
+                    return stream.read(), members[0].filename
+    except (tarfile.TarError, zipfile.BadZipFile, OSError) as error:
+        raise RuntimeError("invalid release archive: " + str(error)) from error
+    raise RuntimeError("release archive must be .tar.gz, .tgz, or .zip")
+
+
+def verify_old_release(old_binary, old_archive, old_checksums):
+    for path, label in ((old_binary, "old binary"), (old_archive, "old archive"),
+                        (old_checksums, "old checksums")):
+        require(path.is_file(), label + " is not a regular file")
+    checksums_hash = digest(old_checksums)
+    require(checksums_hash == V032_CHECKSUMS_SHA256,
+            "checksum file is not the published v0.3.2 checksums.txt")
+    entries = parse_checksums(old_checksums.read_text())
+    require(old_archive.name in entries,
+            "release archive is not listed in the v0.3.2 checksum file")
+    archive_hash = digest(old_archive)
+    require(archive_hash == entries[old_archive.name],
+            "release archive checksum does not match v0.3.2 checksums.txt")
+    archived_binary, member = release_binary(old_archive)
+    binary_bytes = old_binary.read_bytes()
+    require(binary_bytes == archived_binary,
+            "old binary does not exactly match the binary in the release archive")
+    return {
+        "archive": old_archive.name,
+        "archive_sha256": archive_hash,
+        "checksums": old_checksums.name,
+        "checksums_sha256": checksums_hash,
+        "binary_member": member,
+        "binary_sha256": sha256_bytes(archived_binary),
+    }
+
+
+def git_command(repo, *args, binary=False):
+    result = subprocess.run(["git", *args], cwd=repo, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=not binary, timeout=60)
+    detail = (result.stderr if not binary else result.stderr.decode(errors="replace")).strip()
+    require(result.returncode == 0,
+            "git " + " ".join(args) + " failed" + (": " + detail if detail else ""))
+    return result.stdout
+
+
+def source_identity(repo, revision, expected_version, require_clean=False):
+    require(repo.is_dir(), "source path is not a directory: " + str(repo))
+    commit = git_command(repo, "rev-parse", "--verify", revision + "^{commit}").strip()
+    tree = git_command(repo, "rev-parse", "--verify", commit + "^{tree}").strip()
+    require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None,
+            "source commit is not a full SHA-1")
+    require(re.fullmatch(r"[0-9a-f]{40}", tree) is not None,
+            "source tree is not a full SHA-1")
+    version_source = git_command(repo, "show", commit + ":internal/version/version.go")
+    versions = VERSION_RE.findall(version_source)
+    require(versions == [expected_version],
+            "source version must be exactly " + expected_version)
+    status = git_command(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    if require_clean:
+        require(status == "", "candidate source is dirty: " + status.rstrip())
+    return {"commit": commit, "tree": tree, "status_porcelain": status,
+            "version": expected_version}
+
+
+def git_archive(repo, revision):
+    data = git_command(repo, "archive", "--format=tar", revision, binary=True)
+    return data, sha256_bytes(data)
+
+
+def extract_git_archive(data, destination):
+    destination.mkdir()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            for member in archive.getmembers():
+                relative = PurePosixPath(member.name)
+                require(relative.parts and not relative.is_absolute() and
+                        ".." not in relative.parts,
+                        "git archive contains an unsafe path")
+                target = destination.joinpath(*relative.parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                require(member.isfile(), "git archive contains an unsupported entry")
+                require(not target.exists(), "git archive contains a duplicate entry")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                stream = archive.extractfile(member)
+                require(stream is not None, "git archive member is unreadable")
+                with target.open("xb") as output:
+                    while True:
+                        block = stream.read(1024 * 1024)
+                        if not block:
+                            break
+                        output.write(block)
+                target.chmod(member.mode & 0o777)
+    except tarfile.TarError as error:
+        raise RuntimeError("invalid git archive: " + str(error)) from error
+
+
+def build_environment(toolchain):
+    env = dict(os.environ)
+    env.update({"GOTOOLCHAIN": toolchain, "GOWORK": "off",
+                "GOFLAGS": "-mod=readonly", "CGO_ENABLED": "0"})
+    return env
+
+
+def build_from_revision(repo, revision, output, package, log, env, go_version):
+    archive_data, archive_hash = git_archive(repo, revision)
+    build_command = ["go", "build", "-mod=readonly", "-buildvcs=false",
+                     "-trimpath", "-o", str(output), package]
+    record = {
+        "command": build_command,
+        "environment": {key: env[key] for key in
+                        ("GOTOOLCHAIN", "GOWORK", "GOFLAGS", "CGO_ENABLED")},
+        "go_version": go_version,
+        "source_archive_sha256": archive_hash,
+        "source_revision": revision,
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix=".compat-source-", dir=output.parent) as temporary:
+            source = Path(temporary) / "source"
+            extract_git_archive(archive_data, source)
+            result = subprocess.run(build_command, cwd=source, env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    timeout=180)
+        record.update({"exit_code": result.returncode, "output": result.stdout})
+    except BaseException as error:
+        record["error"] = str(error)
+        save(log, record)
+        raise
+    save(log, record)
+    require(result.returncode == 0, "build failed; see " + str(log))
+    require(output.is_file(), "build succeeded without producing " + str(output))
+    return {"command": build_command, "environment": record["environment"],
+            "go_version": go_version, "source_archive_sha256": archive_hash,
+            "binary_sha256": digest(output)}
+
+
+def require_version(actual, expected, label):
+    require(actual == expected, label + " must report exactly " + expected)
 
 
 def check_old_fixture(snap):
@@ -52,25 +243,59 @@ def require_schema_refusal(output, actual, expected, label):
 
 
 def run(args, out):
-    source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"],
-                                         cwd=args.old_source, text=True).strip()
-    require(source_sha == BASE_SHA,
-            "old fixture source must be the exact released v0.3.2 commit")
-    require(not subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
-        cwd=args.old_source, text=True).strip(), "old fixture source is dirty")
-    old_version = subprocess.check_output([str(args.old_binary), "version"], text=True).strip()
-    require(old_version == "mqlite 0.3.2", "old broker is not the released v0.3.2")
-    new_version = subprocess.check_output([str(args.new_binary), "version"], text=True).strip()
-    require(new_version != old_version, "candidate must report a distinct patch version")
+    released = verify_old_release(args.old_binary, args.old_archive, args.old_checksums)
+    old_version = command([args.old_binary, "version"], out / "old-version.log").strip()
+    require_version(old_version, OLD_VERSION, "old broker")
+    old_source = source_identity(args.old_source, BASE_SHA, "0.3.2")
+    require(old_source["commit"] == BASE_SHA,
+            "old fixture source does not contain the exact v0.3.2 commit")
+    candidate_source = source_identity(args.new_source, "HEAD", "0.4.0", require_clean=True)
 
+    build_env = build_environment(args.go_toolchain)
+    go_version = command(["go", "version"], out / "go-version.log", env=build_env).strip()
     fixture = out / "v032-fixture"
-    build_env = dict(os.environ, GOTOOLCHAIN=args.go_toolchain)
-    result = subprocess.run(["go", "build", "-trimpath", "-o", str(fixture),
-                             "./test/production/restore"], cwd=args.old_source,
-                            env=build_env, text=True, capture_output=True, timeout=180)
-    (out / "fixture-build.log").write_text(result.stdout + result.stderr)
-    require(result.returncode == 0, "failed to build the original fixture")
+    fixture_build = build_from_revision(args.old_source, BASE_SHA, fixture,
+                                        "./test/production/restore",
+                                        out / "fixture-build.log", build_env, go_version)
+    candidate = out / "mqlite-candidate"
+    candidate_build = build_from_revision(args.new_source, candidate_source["commit"],
+                                          candidate, "./cmd/mqlite",
+                                          out / "candidate-build.log", build_env, go_version)
+    # Fail if HEAD or its full porcelain state changed while the binary was built.
+    candidate_after_build = source_identity(args.new_source, "HEAD", "0.4.0",
+                                             require_clean=True)
+    require(candidate_after_build == candidate_source,
+            "candidate source changed while its binary was built")
+
+    new_version = command([candidate, "version"], out / "candidate-version.log").strip()
+    require_version(new_version, NEW_VERSION, "candidate")
+
+    provenance = {
+        "released": {
+            **released,
+            "fixture_binary_sha256": fixture_build["binary_sha256"],
+            "source_archive_sha256": fixture_build["source_archive_sha256"],
+            "source_commit": old_source["commit"],
+            "source_status_porcelain": old_source["status_porcelain"],
+            "source_tree": old_source["tree"],
+            "version_output": old_version,
+        },
+        "candidate": {
+            "binary_sha256": candidate_build["binary_sha256"],
+            "source_archive_sha256": candidate_build["source_archive_sha256"],
+            "source_commit": candidate_source["commit"],
+            "source_tree": candidate_source["tree"],
+            "source_status_porcelain": candidate_source["status_porcelain"],
+            "version_output": new_version,
+        },
+        "build": {
+            "configured_toolchain": args.go_toolchain,
+            "go_version": go_version,
+            "fixture": fixture_build,
+            "candidate": candidate_build,
+        },
+    }
+    save(out / "provenance.json", provenance)
 
     db, manifest = out / "schema5.db", out / "old-message-manifest.json"
     worker = Worker(fixture, "seed", db, manifest, out / "old-seed")
@@ -93,7 +318,7 @@ def run(args, out):
     before = snapshot(db, stopped=True)
     save(out / "02-schema5-before-refusal.json", before)
 
-    refusal = cli(args.new_binary, db, out, "candidate-refuses-schema5",
+    refusal = cli(candidate, db, out, "candidate-refuses-schema5",
                   "metrics", "active", refusal=True)
     require_schema_refusal(refusal, "5", "7", "candidate")
     after_refusal = snapshot(db, stopped=True)
@@ -131,7 +356,7 @@ def run(args, out):
     # Pin the other side of the boundary: a fresh candidate creates schema 7,
     # and the released schema-5 binary refuses it without altering it.
     fresh = out / "schema7.db"
-    cli(args.new_binary, fresh, out, "candidate-create-schema7", "create-queue", "fresh")
+    cli(candidate, fresh, out, "candidate-create-schema7", "create-queue", "fresh")
     schema7 = snapshot(fresh, stopped=True)
     save(out / "05-schema7-fresh.json", schema7)
     require(rows(schema7, "meta") == [{"key": "schema_version", "value": "7"}],
@@ -146,18 +371,26 @@ def run(args, out):
     save(out / "06-schema7-after-old-refusal.json", schema7_after)
     compare(schema7_after, schema7, "old refusal modified schema-7 database")
 
+    snapshot_hashes = {name: digest(out / name) for name in SNAPSHOTS}
+    provenance["snapshot_sha256"] = snapshot_hashes
+    save(out / "provenance.json", provenance)
     return {
         "status": "PASS",
         "old_version": old_version,
         "new_version": new_version,
-        "old_source_sha": source_sha,
-        "old_binary_sha256": digest(args.old_binary),
-        "new_binary_sha256": digest(args.new_binary),
-        "fixture_binary_sha256": digest(fixture),
+        "old_source_sha": old_source["commit"],
+        "old_source_tree": old_source["tree"],
+        "new_source_sha": candidate_source["commit"],
+        "new_source_tree": candidate_source["tree"],
+        "old_binary_sha256": released["binary_sha256"],
+        "new_binary_sha256": candidate_build["binary_sha256"],
+        "fixture_binary_sha256": fixture_build["binary_sha256"],
+        "snapshot_sha256": snapshot_hashes,
+        "provenance": provenance,
         "old_schema_version": "5",
         "new_schema_version": "7",
         "old_tables_verified": sorted(before["tables"]),
-        "snapshots": 6,
+        "snapshots": len(SNAPSHOTS),
         "candidate_refusal_preserved_schema5": True,
         "matching_old_runtime_read_write": True,
         "old_refusal_preserved_schema7": True,
@@ -166,15 +399,23 @@ def run(args, out):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--old-binary", type=Path, required=True)
-    parser.add_argument("--old-source", type=Path, required=True)
-    parser.add_argument("--new-binary", type=Path, required=True)
+    parser.add_argument("--old-binary", type=Path, required=True,
+                        help="extracted mqlite binary from the published v0.3.2 archive")
+    parser.add_argument("--old-archive", type=Path, required=True,
+                        help="published v0.3.2 .tar.gz or .zip release archive")
+    parser.add_argument("--old-checksums", type=Path, required=True,
+                        help="published v0.3.2 checksums.txt")
+    parser.add_argument("--old-source", type=Path, required=True,
+                        help="git repository containing the exact v0.3.2 commit")
+    parser.add_argument("--new-source", type=Path, required=True,
+                        help="clean v0.4.0 candidate git checkout; HEAD is archived and built")
     parser.add_argument("--go-toolchain", default="go1.27.1",
-                        help="GOTOOLCHAIN value for building the historical fixture")
+                        help="GOTOOLCHAIN value for both source-archive builds")
     parser.add_argument("--output", type=Path, required=True,
                         help="new, nonexistent evidence directory")
     args = parser.parse_args()
-    for field in ("old_binary", "old_source", "new_binary", "output"):
+    for field in ("old_binary", "old_archive", "old_checksums", "old_source",
+                  "new_source", "output"):
         setattr(args, field, getattr(args, field).resolve())
     args.output.mkdir(parents=True, exist_ok=False)
     try:
