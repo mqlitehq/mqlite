@@ -230,8 +230,8 @@ serializes the full response.
 
 A local file database runs `Stats`, the `SELECT 1` storage probe and global refresh
 on one dedicated `mode=ro` plus `query_only` connection. It cannot write or
-checkpoint, and WAL reads do not occupy the sole
-writer connection, so a deep refresh does not sit in front of Send, Receive or
+checkpoint, and WAL reads do not occupy the sole writer connection, so a deep
+refresh does not sit in front of Send, Receive or
 settlement. Reader work serializes on that one connection. A refresh still
 consumes CPU and storage bandwidth and holds a WAL snapshot until it finishes;
 long scans can delay checkpoint progress and grow the WAL. `:memory:` cannot use a

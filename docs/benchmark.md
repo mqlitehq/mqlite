@@ -183,18 +183,84 @@ interval. In the same three-run sample, median send time was 111.542 µs without
 that load and 135.724 µs with it (+21.7%); throughput moved from 8,965 to 7,368
 messages/s (-17.8%).
 
-A separate five-pair, 10-second pressure run at the same commit alternated phase
+An earlier five-pair, 10-second pressure run at the same commit alternated phase
 order and used two observation loops (5-second and 15-second cadences) plus
-per-second `Stats`. The paired median p99 change was +0.7% and paired median
-throughput change was -2.9%, satisfying the 10% investigation threshold at the
-median. Individual p99 changes ranged from -32.0% to +127.9%, however, and two of
-five trials exceeded 10%; this run does not establish a per-trial latency bound.
-The monitored WAL peaked between 16.0 and 39.5 MiB. A post-phase passive
-checkpoint reported `busy=0` and all logged frames checkpointed in every trial.
-Long-lived observation snapshots can still delay WAL reuse. Cache hits and a
-separate reader reduce writer-connection interference, but monitoring continues
-to use CPU, storage bandwidth and memory. Size and scrape against the target CPU,
-storage, queue inventory and backlog.
+per-second `Stats`. Its paired median p99 change was +0.7% and paired median
+throughput change was -2.9%, but the offered load was unbounded and two of five
+p99 changes exceeded 10% (+18.7% and +127.9%). This exploratory run does not
+establish an acceptance result or per-trial latency bound. Its monitored WAL
+peaked between 16.0 and 39.5 MiB. A post-phase passive checkpoint reported
+`busy=0` with all logged frames checkpointed in every trial.
+
+A second run measured the exact runtime commit `8722e65` at a fixed offered load.
+It used five alternating baseline/monitored pairs, 5 seconds of warmup and 20
+seconds of measurement at 1,000 scheduled sends/s. Each monitored phase ran three
+per-second `Stats` callers, a 5-second global observer and a 15-second global
+observer. The harness cleared the warmup snapshot immediately before measurement
+and verified exactly two global refreshes, two distinct sample timestamps, 60
+successful `Stats` calls, four successful 5-second observations and two successful
+15-second observations per monitored phase. All 20,000 offered slots per phase
+were accounted for, every admitted message completed, and every phase ended with
+zero backlog.
+
+| Measure | Baseline absolute median | Monitored absolute median | Absolute-median change | Paired-median change |
+|---|---:|---:|---:|---:|
+| Throughput | 984.6/s | 981.0/s | -0.37% | -1.06% |
+| Dropped offered slots | 1.54% | 1.90% | +0.36 pp | +1.05 pp |
+| Send p99 | 0.936 ms | 1.000 ms | +6.87% | **+18.50%** |
+| Receive p99 | 1.634 ms | 1.842 ms | +12.72% | **+14.80%** |
+| Complete p99 | 0.532 ms | 0.728 ms | +36.96% | **+53.03%** |
+| End-to-end p99 | 5.791 ms | 5.837 ms | +0.79% | **+154.12%** |
+
+The preselected paired-median 10% investigation threshold was exceeded by all
+four foreground p99 measures. Across the five pairs, throughput changes ranged
+from -2.21% to +2.64%, drop changes from -2.53 to +2.18 percentage points, Send
+p99 changes from -15.08% to +41.82%, Receive from -10.05% to +23.08%, Complete
+from -40.03% to +78.14%, and end-to-end from -50.06% to +164.33%. The difference
+between the absolute and paired medians shows substantial host variation; it does
+not override the failed paired gate. These results support stable throughput and
+bounded backlog at this offered load, but they do not support a claim that global
+observation has no foreground tail-latency cost.
+
+The harness completed successfully because its workload accounting, refresh
+count, error, backlog and WAL-reclamation assertions passed. That `PASS` is not a
+performance pass; the paired tail-latency gate above failed.
+
+Baseline WAL peaks were 3.96–3.97 MiB; monitored peaks were 17.14–21.15 MiB,
+or 4.32–5.34 times their paired baselines. After every phase, a passive checkpoint
+reported `busy=0` with all frames checkpointed, and the following truncating
+checkpoint left a zero-byte WAL. Long-lived observation snapshots can therefore
+cause transient WAL expansion even though the file was reclaimable after each
+reader finished in this run.
+
+Cache hits and a separate reader reduce writer-connection interference, but a
+global refresh still scans the deep backlog and shares CPU, page cache and storage
+with foreground work. Size and scrape against the target CPU, storage, queue
+inventory and backlog, and measure foreground p99 on the deployment host.
+
+The same fixed-phase harness also characterized a bounded 500 scheduled sends/s.
+Its five-pair result supports a throughput/backlog range only; it does not replace
+the failed 1,000/s gate or establish a tail-latency-safe operating point.
+
+| Measure | Baseline absolute median | Monitored absolute median | Absolute-median change | Paired-median change |
+|---|---:|---:|---:|---:|
+| Throughput | 486.10/s | 486.95/s | +0.175% | +1.483% |
+| Dropped offered slots | 2.78% | 2.61% | -0.170 pp | -1.450 pp |
+| Send p99 | 3.620 ms | 4.929 ms | +36.174% | -9.442% |
+| Receive p99 | 5.503 ms | 6.076 ms | +10.415% | -1.177% |
+| Complete p99 | 1.204 ms | 1.074 ms | -10.787% | -27.905% |
+| End-to-end p99 | 8.544 ms | 9.574 ms | +12.063% | -28.305% |
+
+The favorable paired medians conceal one severe adverse window. In pair 3,
+throughput changed by -11.772%, the drop rate by +11.630 percentage points, and
+Send, Receive, Complete and end-to-end p99 by +222.861%, +96.104%, +951.156% and
++2,370.167%; monitored end-to-end p99 was 125.041 ms. Baseline drop rates ranged
+from 1.21% to 8.04%, so host variation was material even without observation.
+Each monitored phase still recorded exactly two global refreshes, no monitoring
+errors or missed calls, and zero ending backlog. Baseline WAL peaks were
+3.96–3.98 MiB and monitored peaks were 10.29–13.03 MiB; every passive checkpoint
+fully drained its frames and every following truncating checkpoint left a
+zero-byte WAL.
 
 ## 1 · Throughput & write amplification
 

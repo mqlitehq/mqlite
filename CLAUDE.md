@@ -169,8 +169,8 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
   so there is zero file-lock contention and claims are atomic. A local WAL file
   also has exactly one `mode=ro` plus `query_only` connection for `Stats`,
   observation probes and global observation refreshes; it cannot write or
-  checkpoint and never weakens writer
-  serialization. Global queue gauges have an approximately 10-second shared
+  checkpoint and never weakens writer serialization. Global queue gauges have
+  an approximately 10-second shared
   snapshot, while per-queue `Stats` stays fresh. `:memory:` stays on the sole
   connection because another SQLite connection would be another database.
   (`engine/db.go`)

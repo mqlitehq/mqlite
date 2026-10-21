@@ -18,14 +18,15 @@ upgrade notes before replacing a broker.
   existing state-specific partial indexes. A sparse queue no longer scans
   unrelated messages; `completed` rows remain included in `total` as unexpected
   retained state, and oldest active/locked age stays exact.
-- Give local file databases one query-only observation connection alongside the
-  sole writer connection. `Stats`, the `Observe` storage probe and global queue
-  refreshes use this WAL reader, so a deep monitoring query no longer occupies
-  the connection used by Send/Receive/settlement. The writer invariant and
-  cross-process advisory lock are unchanged. In-memory databases cannot share a
-  second connection; remote Turso/libSQL continues to use its existing small
-  provider-backed pool. Local storage-pool metrics aggregate both connections,
-  so a file database reports `max_open=2`; `:memory:` remains `max_open=1`.
+- Give local file databases one read-only (`mode=ro` plus `query_only`)
+  observation connection alongside the sole writer connection. `Stats`, the
+  `Observe` storage probe and global queue refreshes use this WAL reader, so a
+  deep monitoring query no longer occupies the connection used by
+  Send/Receive/settlement. The writer invariant and cross-process advisory lock
+  are unchanged. In-memory databases cannot share a second connection; remote
+  Turso/libSQL continues to use its existing small provider-backed pool. Local
+  storage-pool metrics aggregate both connections, so a file database reports
+  `max_open=2`; `:memory:` remains `max_open=1`.
 - Share the expensive all-queue gauge snapshot across `Observe`, `/metrics` and
   console polling for about 10 seconds. Concurrent refreshes collapse into one
   scan; a failed refresh is not cached. `sampled_at_ms` remains the time of the

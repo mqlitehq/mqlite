@@ -105,8 +105,8 @@ a time — most systems fight that; mqlite **builds on it**:
 - **The file is in WAL mode**, so at the file level readers never block the
   writer and never see torn state. Monitoring probes, fresh per-queue `Stats` and
   global observation refreshes use one separate `mode=ro` plus `query_only`
-  connection; global
-  queue gauges are shared for about 10 seconds and concurrent refreshes coalesce.
+  connection; global queue gauges are shared for about 10 seconds and concurrent
+  refreshes coalesce.
   Ordinary engine reads and every mutation retain their existing
   writer-connection ordering. An in-memory engine cannot share that reader and
   stays on its single connection. `synchronous=NORMAL` is the default
