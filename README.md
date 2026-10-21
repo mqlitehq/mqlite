@@ -93,7 +93,10 @@ one SQLite (or Turso) database. You only start an HTTP server if you *choose* to
 > claim ordering). Sharing one file DB across processes is **not supported**: when
 > you need multiple processes or hosts, run the broker (§2) and connect over HTTP —
 > that single broker is the one writer. (`:memory:` is private per handle, and a
-> remote Turso DB is serialized server-side, so neither takes the lock.)
+> remote Turso DB is serialized server-side, so neither takes the local file lock.)
+> A Turso database must still have exactly one active MQLite broker or embedded
+> `Engine`. Replace that owner stop-then-start after confirming the old process has
+> exited; rolling overlap against the same database is unsupported.
 
 ```go
 ctx := context.Background()

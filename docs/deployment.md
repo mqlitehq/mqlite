@@ -238,6 +238,12 @@ The same env works in Docker (`-e MQLITE_DB=... -e MQLITE_DB_AUTH_TOKEN=...`) or
 lives in Turso. Durability is the Turso server's responsibility — `MQLITE_SYNC` is
 ignored for remote DSNs. See [turso.md](turso.md).
 
+Run exactly one active MQLite broker or embedded `Engine` per Turso database. To
+replace it, stop the old owner, confirm its process has exited, and only then start
+the replacement. Rolling overlap against the same database is unsupported. The
+remote connection pool is safe only within one MQLite process; it does not provide
+cross-process ownership.
+
 ## Verify any deploy
 
 ```bash

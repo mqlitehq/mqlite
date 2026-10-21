@@ -9,8 +9,10 @@ used.
 
 ## Concurrency model
 
-MQLite is a **single logical writer** in both modes — one broker process owns the
-queue. What differs is the connection pool:
+MQLite is a **single logical writer** in both modes: each database has exactly one
+active MQLite broker or embedded `Engine`. Replace that owner stop-then-start after
+confirming the old process has exited. Do not use rolling overlap against the same
+database. What differs between storage modes is the connection pool:
 
 ```
 ┌─────────────────┬──────────────────────────┬────────────────────────────────────┐
@@ -27,12 +29,14 @@ queue. What differs is the connection pool:
 └─────────────────┴──────────────────────────┴────────────────────────────────────┘
 ```
 
-A small remote pool is safe because the Turso primary serializes writes; it is
-*more* resilient than a single conn because a server-closed idle stream is dropped
-and replaced instead of reused. Each broker process shares its expensive
-all-queue observation query for about 10 seconds on both local and remote
-backends; separate brokers do not share that cache. Per-queue `Stats` and each
-observation's lightweight storage probe still use the backend shown above.
+A small remote pool is safe within that one MQLite process because the Turso
+primary serializes writes across its connections; this does not make two brokers
+or embedded `Engine` instances safe. The pool is *more* resilient than a single
+connection because a server-closed idle stream is dropped and replaced instead of
+reused. Each broker process shares its expensive all-queue observation query for
+about 10 seconds on both local and remote backends; separate brokers do not share
+that cache. Per-queue `Stats` and each observation's lightweight storage probe
+still use the backend shown above.
 
 ## Connection resilience (the remote hardening)
 
