@@ -22,7 +22,7 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_MONITOR_TOKENS` | v0.3.2+: optional comma-separated credentials for `Observe` and `/metrics` only; requires auth and distinct administrator credentials |
 | `MQLITE_METRICS` | v0.3.2+: opt-in authenticated `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
-| `MQLITE_MAX_SUBSCRIPTIONS` | active plus deleting subscription capacity (default 10,000); pending cleanup continues to occupy a slot |
+| `MQLITE_MAX_SUBSCRIPTIONS` | v0.4.0+: active plus deleting subscription capacity (default 10,000); pending cleanup continues to occupy a slot |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
 | `MQLITE_UI` | serve the embedded admin console at `/ui` (default on; `off` runs headless) |
@@ -48,38 +48,36 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> These tagged-image instructions target **v0.3.2**, with default port **6754**
-> and schema token **5**. v0.3.3 is retracted because its public queue identity
-> contract was withdrawn; use v0.3.2 until a replacement is published. Existing
-> v0.3.0/v0.3.1 databases remain compatible; back up before upgrading and retain a
-> configured administrator. Existing Prometheus scrapers require
-> `MQLITE_METRICS=on` after upgrading from v0.3.1; metrics is disabled by default.
-> Rolling back to v0.3.1 also requires its
-> previous monitoring configuration; v0.3.0 additionally ignores managed keys.
+> These tagged-image instructions target **v0.4.0**, with default port **6754**
+> and schema token **7**. v0.3.3 is retracted because its public queue identity
+> contract was withdrawn. v0.3.0/v0.3.1/v0.3.2 and retracted v0.3.3 use schema
+> token 5 and cannot be opened by v0.4.0; preserve the matching old
+> binary/database pair, take a consistent backup, account for retained work, and
+> start v0.4.0 with a fresh database. Intermediate schema 6 was never released
+> and is refused too. Before replacing a v0.3.x broker, migrate Prometheus rules
+> from `mqlite_queue_total` to `mqlite_queue_retained_messages` and from
+> `mqlite_queue_oldest_message_age_ms` to
+> `mqlite_queue_oldest_message_age_seconds` (divide thresholds by 1,000).
 > **v0.2.0 uses port 8080 and schema token 2.** Its database cannot be opened by
-> v0.3.2: preserve the old binary/database pair and follow the
+> v0.4.0: preserve the old binary/database pair and follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before replacing it.
-> The current unreleased source uses schema token **7** for durable resource
-> deletion and fixed subscription lifetimes, and does not open schema-5 or
-> intermediate unreleased schema-6 databases. Build it against a fresh
-> database after taking a consistent backup and accounting for retained work.
 
 The published image is multi-arch (amd64 + arm64):
 
 ```bash
-# v0.3.2, default port 6754
+# v0.4.0, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.3.2
+  ghcr.io/mqlitehq/mqlite:0.4.0
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin exact `0.3.2` in production while v0.3.3 is retracted; floating `:0.3` and
-  `:latest` may resolve to a withdrawn image until a replacement is published.
+- Pin exact `0.4.0` in production. Stable releases also publish the `:0.4` and
+  `:latest` aliases, but an exact tag makes upgrades explicit.
   Images `>= 0.3.0` listen on `6754`; **`0.2.x` and earlier listen on `8080`** — if you pin an
   older tag, publish the port it actually uses.
 - Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. Metrics is
@@ -97,7 +95,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.3.2"   # pinned image, no build on Fly
+  image = "ghcr.io/mqlitehq/mqlite:0.4.0"   # pinned image, no build on Fly
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -211,15 +209,16 @@ online snapshots, offline directory copies, isolated restore validation and roll
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
 **v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and retracted
-v0.3.3 use schema 5; current unreleased source uses schema 7.** Intermediate
-unreleased lifecycle builds used schema 6. There is no
+v0.3.3 use schema 5; v0.4.0 uses schema 7.** Intermediate unreleased lifecycle
+builds used schema 6, which was never tagged. There is no
 in-place migration between these tokens. Before changing tokens, account for
 retained work in every state, keep the old binary/database pair and a consistent
 backup, and create the candidate database separately. Do not restamp an old file.
 Within the tagged schema-5 line, v0.3.0 → v0.3.1 adds compatible managed-key
 storage and v0.3.1 → v0.3.2 leaves the schema unchanged. `Observe` and configured
 monitor credentials require v0.3.2; restore compatible monitoring configuration
-when rolling back. Follow the runbook when testing the current unreleased source.
+when rolling back. Follow the runbook for the v0.4.0 fresh-database cutover and
+metric-name migration.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).
 
 ## Turso (remote libSQL)
@@ -238,6 +237,12 @@ The same env works in Docker (`-e MQLITE_DB=... -e MQLITE_DB_AUTH_TOKEN=...`) or
 (`fly secrets set MQLITE_DB_AUTH_TOKEN=...`); drop the `[[mounts]]` volume since data
 lives in Turso. Durability is the Turso server's responsibility — `MQLITE_SYNC` is
 ignored for remote DSNs. See [turso.md](turso.md).
+
+Run exactly one active MQLite broker or embedded `Engine` per Turso database. To
+replace it, stop the old owner, confirm its process has exited, and only then start
+the replacement. Rolling overlap against the same database is unsupported. The
+remote connection pool is safe only within one MQLite process; it does not provide
+cross-process ownership.
 
 ## Verify any deploy
 

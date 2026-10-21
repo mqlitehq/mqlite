@@ -92,24 +92,38 @@ of the new surface rather than silently skipping it.
 
 See [operations](../../../docs/operations.md) for the operator procedure.
 
-## v0.3.0 schema-boundary recovery
+## v0.3.2 schema-boundary recovery
 
 Durable queue lifecycle and fixed subscription expiration change the schema token
 from 5 to 7. There is no in-place migration: opening a schema-5 database with this
 candidate must fail without changing its schema or data. Schema 6, used by the
 intermediate lifecycle implementation, is rejected by the engine compatibility
-tests as well. Keep the matching v0.3.0 binary and a backup available until the new
+tests as well. Keep the matching v0.3.2 binary and a backup available until the new
 deployment has been validated. Verify both sides of the released boundary with the
-real v0.3.0 binary and its clean source checkout (used only to build the full old
-message-state fixture):
+published v0.3.2 archive, its `checksums.txt`, the binary extracted from that
+archive, a Git repository containing the v0.3.2 commit, and the clean final
+candidate checkout:
 
 ```sh
 python3 test/production/restore/compat.py \
-  --old-binary /absolute/path/to/released-v0.3.0/mqlite \
-  --old-source /absolute/path/to/clean-v0.3.0-source \
-  --new-binary /absolute/path/to/candidate/mqlite \
+  --old-binary /absolute/path/to/released-v0.3.2/mqlite \
+  --old-archive /absolute/path/to/mqlite_0.3.2_darwin_arm64.tar.gz \
+  --old-checksums /absolute/path/to/v0.3.2/checksums.txt \
+  --old-source /absolute/path/to/repository-containing-v0.3.2 \
+  --new-source /absolute/path/to/clean-v0.4.0-source \
+  --go-toolchain go1.27.1 \
   --output /absolute/path/to/evidence/new-compat-run
 ```
+
+The runner is offline with respect to release provenance: it pins the published
+v0.3.2 checksum-manifest digest, verifies the archive checksum, and requires the
+supplied old binary to match the archive member byte for byte before executing it.
+It exports both source revisions with `git archive` from isolated Git metadata
+that ignores repository-local replace refs, attributes and configuration, then
+builds the fixture and candidate with `GOWORK=off`, read-only module metadata and
+the selected toolchain.
+The candidate HEAD must be clean and report exactly v0.4.0; untracked and ignored
+files cannot enter either source build.
 
 The script creates a complete schema-5 fixture, lets the released binary perform
 its normal orphan recovery, and takes an exact logical snapshot. The candidate
@@ -118,5 +132,6 @@ snapshot byte-for-byte equivalent at the logical level. The released binary must
 then reopen the same database and complete a verified send/peek round trip. In the
 reverse direction, the candidate creates a fresh schema-7 database and the
 released binary must reject it while leaving its complete snapshot unchanged.
-Evidence contains all six snapshots and hashes for both binaries and the fixture
-worker.
+Evidence contains all six snapshot hashes, source commits and trees, source
+archive hashes, build commands and environment, the actual Go version, and hashes
+for the release archive, checksum manifest, both binaries and the fixture worker.

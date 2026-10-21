@@ -56,11 +56,16 @@ func TestMetricsEndpoint(t *testing.T) {
 	for _, want := range []string{
 		`mqlite_queue_messages{queue="orders",state="active"} 1`,
 		`mqlite_queue_messages{queue="orders",state="locked"} 0`,
-		`mqlite_queue_total{queue="orders"} 1`,
+		`mqlite_queue_retained_messages{queue="orders"} 1`,
 		"# TYPE mqlite_queue_messages gauge",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("/metrics output missing %q:\n%s", want, out)
+		}
+	}
+	for _, removed := range []string{"mqlite_queue_total", "mqlite_queue_oldest_message_age_ms"} {
+		if strings.Contains(out, removed) {
+			t.Fatalf("/metrics still exposes removed v0.4.0 alias %q:\n%s", removed, out)
 		}
 	}
 }

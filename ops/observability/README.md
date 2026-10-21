@@ -17,8 +17,20 @@ Use the matching release tag so the broker, dashboard and rules come from the sa
 version. Before that tag is published, use the exact reviewed candidate commit
 for a release rehearsal instead.
 
+Stop the v0.3.2 starter before launching this stack because both versions publish
+the same loopback ports. From its old checkout, run `docker compose down` in
+`ops/observability`. If the checkout has already moved to v0.4.0 and the old
+pointer was saved as `.env.v0.3.2`, stop that project explicitly:
+
 ```sh
-git clone --branch v0.3.2 --depth 1 https://github.com/mqlitehq/mqlite.git
+docker compose -p mqlite-observability-032 --env-file .env.v0.3.2 down
+```
+
+This stops the old containers without deleting their schema-5 data. Preserve that
+data with the matching old binary; the schema-7 broker cannot open it.
+
+```sh
+git clone --branch v0.4.0 --depth 1 https://github.com/mqlitehq/mqlite.git
 cd mqlite/ops/observability
 python3 init.py
 docker compose up --build -d
@@ -27,10 +39,14 @@ docker compose ps
 
 Initialization writes a private `.env` pointer and generates three different random
 credentials. Secrets and persistent data live **outside the source checkout**, by
-default at `$XDG_STATE_HOME/mqlite-observability-032`, or
-`~/.local/state/mqlite-observability-032` when XDG_STATE_HOME is unset. To select
-another location, set `OBS_DATA_DIR` before the first initialization. Existing
-credentials are preserved. Files are mode 0600 and directories 0700; services run
+default at `$XDG_STATE_HOME/mqlite-observability-040`, or
+`~/.local/state/mqlite-observability-040` when XDG_STATE_HOME is unset. The new
+directory prevents a schema-5 demo database from being reused by the schema-7
+broker. `init.py` records the stack version in `.env` and refuses an older pointer;
+preserve that old data and move `.env` aside before initializing v0.4.0. To
+select another location, set `OBS_DATA_DIR` before the first initialization.
+Existing v0.4.0 credentials are preserved. Files are mode 0600 and directories
+0700; services run
 as your numeric UID/GID so file permissions need not be relaxed.
 
 | Service | Local URL | Credentials |
@@ -195,8 +211,8 @@ python3 test/observability/check_config.py
 
 After initialization, this uses the pinned `promtool` to validate Compose,
 Prometheus configuration, operating/demo rules and the entire exposition fixture.
-It accepts exactly the two legacy-name warnings documented in the compatibility
-contract, and verifies that malformed exposition is rejected. Run the real-stack
+It requires the v0.4.0 exposition contract to pass metric-name validation without
+warnings, and verifies that malformed exposition is rejected. Run the real-stack
 driver as well: parsing configuration alone cannot prove credentials, networking,
 scrapes, alert transitions or Grafana queries work.
 

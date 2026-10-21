@@ -33,7 +33,7 @@ actual executable checksums and authenticated broker schema/storage status. The
 completed runner must report this exact provenance, workload configuration and
 requested duration, with elapsed workload time inside the supervised interval. It
 runs the verified image IDs, so later retagging does not change the candidate.
-The database schema expectation is currently 5; changing it requires reviewing the
+The database schema expectation is currently 7; changing it requires reviewing the
 restore fixtures and acceptance contract.
 
 The supervisor starts two resource-limited containers on one private internal

@@ -1,6 +1,6 @@
 # HELP mqlite_info Broker build and storage backend information.
 # TYPE mqlite_info gauge
-mqlite_info{version="0.3.2",backend="local",schema_version="6"} 1
+mqlite_info{version="0.4.0",backend="local",schema_version="7"} 1
 # HELP mqlite_storage_read_available Whether the latest SELECT 1 read probe succeeded; not a write health check.
 # TYPE mqlite_storage_read_available gauge
 mqlite_storage_read_available 1
@@ -59,14 +59,6 @@ mqlite_queue_unexpected_messages{queue="worker"} 0
 # TYPE mqlite_queue_oldest_message_age_seconds gauge
 mqlite_queue_oldest_message_age_seconds{queue="orders	line\n\"quote\\雪"} 1.25
 mqlite_queue_oldest_message_age_seconds{queue="worker"} 0
-# HELP mqlite_queue_total Total messages in a queue.
-# TYPE mqlite_queue_total gauge
-mqlite_queue_total{queue="orders	line\n\"quote\\雪"} 21
-mqlite_queue_total{queue="worker"} 0
-# HELP mqlite_queue_oldest_message_age_ms Age of the oldest active or locked message in a queue, in milliseconds.
-# TYPE mqlite_queue_oldest_message_age_ms gauge
-mqlite_queue_oldest_message_age_ms{queue="orders	line\n\"quote\\雪"} 1250
-mqlite_queue_oldest_message_age_ms{queue="worker"} 0
 # HELP mqlite_message_events_total Confirmed message effects since engine start; overlapping event categories are not a ledger.
 # TYPE mqlite_message_events_total counter
 mqlite_message_events_total{queue="orders	line\n\"quote\\雪",event="enqueued"} 1

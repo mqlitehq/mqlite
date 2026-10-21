@@ -41,7 +41,7 @@ func histogram(b *strings.Builder, name, labels string, h engine.DurationHistogr
 }
 
 // prometheusSnapshot is a serializer only: no database access, clocks or counter
-// updates. Compatibility names below are exact projections, never another ledger.
+// updates. Derived families below are exact projections, never another ledger.
 func prometheusSnapshot(s wire.ObserveResponse) string {
 	var b strings.Builder
 	metricHeader(&b, "mqlite_info", "gauge", "Broker build and storage backend information.")
@@ -108,8 +108,6 @@ func prometheusSnapshot(s wire.ObserveResponse) string {
 		{"mqlite_queue_retained_messages", "All retained message rows, including unexpected states.", func(q engine.QueueObservation) float64 { return float64(q.Total) }},
 		{"mqlite_queue_unexpected_messages", "Retained rows outside the five normal working states.", func(q engine.QueueObservation) float64 { return float64(q.Unexpected) }},
 		{"mqlite_queue_oldest_message_age_seconds", "Age of the oldest active or locked message in seconds, zero when absent.", func(q engine.QueueObservation) float64 { return float64(q.OldestMessageAgeMs) / 1000 }},
-		{"mqlite_queue_total", "Total messages in a queue.", func(q engine.QueueObservation) float64 { return float64(q.Total) }},
-		{"mqlite_queue_oldest_message_age_ms", "Age of the oldest active or locked message in a queue, in milliseconds.", func(q engine.QueueObservation) float64 { return float64(q.OldestMessageAgeMs) }},
 	} {
 		metricHeader(&b, metric.name, "gauge", metric.help)
 		for _, q := range s.Queues {

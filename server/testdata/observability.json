@@ -3,7 +3,7 @@
   "started_at_ms": 1700000000000,
   "backend": "local",
   "runtime": {
-    "schema_version": "6",
+    "schema_version": "7",
     "ping_seconds": 0.00125,
     "read_available": true,
     "db_size_bytes": 123456,
@@ -2051,7 +2051,7 @@
       "count": 3
     }
   ],
-  "version": "0.3.2",
+  "version": "0.4.0",
   "access": "monitor",
   "http": {
     "state": "available",
