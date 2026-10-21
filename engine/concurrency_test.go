@@ -138,8 +138,9 @@ func (x *exclusivity) report(t *testing.T) {
 func TestConcurrentConsumersNeverShareAMessage(t *testing.T) {
 	eachLocalStore(t, func(t *testing.T, dsn string) {
 		const (
-			messages  = 400
-			consumers = 8
+			messages      = 400
+			consumers     = 8
+			drainConsumer = -1
 		)
 		ctx := context.Background()
 		e, err := Open(ctx, Options{DB: dsn})
@@ -224,6 +225,31 @@ func TestConcurrentConsumersNeverShareAMessage(t *testing.T) {
 		wg.Wait()
 
 		x.report(t) // invariants 1 and 2
+		if x.completedCount() != messages {
+			// The randomized phase may stop with a valid short lease still in flight.
+			// Give the reaper and one well-behaved consumer a bounded convergence window
+			// before deciding that a message is lost or permanently stuck.
+			drainDeadline := time.Now().Add(5 * time.Second)
+			for x.completedCount() < messages && time.Now().Before(drainDeadline) {
+				msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, WaitMs: 50})
+				if err != nil {
+					t.Fatalf("drain receive: %v", err)
+				}
+				if len(msgs) == 0 {
+					continue
+				}
+				m := msgs[0]
+				x.claim(m.SeqNumber, drainConsumer, m.LockToken, m.LockedUntilMs, time.Now().UnixMilli())
+				err = e.Complete(ctx, "q", m.SeqNumber, m.LockToken)
+				x.settled(m.SeqNumber, m.LockToken, err == nil)
+				if err == nil {
+					atomic.AddInt64(&completed, 1)
+				} else if !errors.Is(err, ErrLockLost) {
+					t.Fatalf("drain complete: %v", err)
+				}
+			}
+			x.report(t) // the convergence consumer obeys the same exclusivity oracle
+		}
 
 		// Invariant 3: nothing was lost. Every message sent came out the other side.
 		if got := x.completedCount(); got != messages {
@@ -237,10 +263,10 @@ func TestConcurrentConsumersNeverShareAMessage(t *testing.T) {
 				}
 			}
 			m, _ := e.Stats(context.Background(), "q")
-			t.Fatalf("MESSAGE LOSS: %d of %d messages were completed.\n"+
+			t.Fatalf("DRAIN TIMEOUT: %d of %d messages were completed after the convergence window.\n"+
 				"  still in the queue: active=%d locked=%d dead=%d deferred=%d\n"+
-				"  never completed (first few): %v\n"+
-				"  a queue may deliver a message more than once; it may not lose one.",
+				"  not completed (first few): %v\n"+
+				"  every sent message must remain recoverable and converge to completion.",
 				got, messages, m.Active, m.Locked, m.DeadLettered, m.Deferred, stuck)
 		}
 	})
