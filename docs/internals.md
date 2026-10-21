@@ -92,8 +92,8 @@ Four deliberate choices hide in this table:
 Here is the design decision everything else leans on. SQLite allows one writer at
 a time — most systems fight that; mqlite **builds on it**:
 
-- **In-process, the connection pool has size one** (`SetMaxOpenConns(1)`).
-  `database/sql` queues every caller onto that connection, so *all writes are
+- **In-process, the writer pool has size one** (`SetMaxOpenConns(1)`).
+  `database/sql` queues every mutation onto that connection, so *all writes are
   serialized before SQLite ever sees them*. There is no lock contention, no
   `SQLITE_BUSY` retry loop, no interleaving to reason about. Two goroutines
   cannot half-claim the same message because their statements cannot overlap.
@@ -103,8 +103,13 @@ a time — most systems fight that; mqlite **builds on it**:
   file fails fast with `ErrDBLocked` instead of corrupting claims. Want multiple
   processes? Run the broker — one broker *is* the one writer.
 - **The file is in WAL mode**, so at the file level readers never block the
-  writer and never see torn state. (In embedded mode reads still funnel through
-  the same single connection; WAL is what makes that safe and cheap.) `synchronous=NORMAL` is the default
+  writer and never see torn state. Monitoring probes, fresh per-queue `Stats` and
+  global observation refreshes use one separate `mode=ro` plus `query_only`
+  connection; global
+  queue gauges are shared for about 10 seconds and concurrent refreshes coalesce.
+  Ordinary engine reads and every mutation retain their existing
+  writer-connection ordering. An in-memory engine cannot share that reader and
+  stays on its single connection. `synchronous=NORMAL` is the default
   durability point; `FULL` is a knob (`MQLITE_SYNC`) when an fsync per commit is
   worth ~4–11× of your local throughput (on remote Turso it's a no-op — the
   server owns durability).

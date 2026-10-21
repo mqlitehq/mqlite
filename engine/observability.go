@@ -125,6 +125,36 @@ type observations struct {
 	events      map[eventKey]uint64
 	maintenance map[string]MaintenanceObservation
 	filters     [2]uint64
+	queueCache  *queueObservationSnapshot
+	queueFlight *queueObservationFlight
+}
+
+const queueObservationTTL = 10 * time.Second
+
+// Test seams used to make topology changes at the two otherwise microscopic
+// singleflight boundaries deterministic. Production leaves both nil.
+var afterQueueSnapshotCollected func()
+var afterGlobalQueueFlightJoin func()
+
+// queueObservationSnapshot keeps all freshness metadata beside the rows it
+// describes. A flight captures epoch before its read; a published cache entry
+// carries the topology fence against which those rows were reconciled. Relabeling
+// stale rows with an unrelated current epoch could erase a newly created queue.
+type queueObservationSnapshot struct {
+	queues          []QueueObservation
+	sampledAtMs     int64
+	epoch           uint64
+	durationSeconds float64
+	expiresAt       time.Time
+}
+
+// queueObservationFlight shares one global scan, including its failure, with
+// callers that arrive while it is running. Failed results are never installed
+// in queueCache, so a later call can retry.
+type queueObservationFlight struct {
+	done   chan struct{}
+	result queueObservationSnapshot
+	err    error
 }
 
 func (o *observations) addLocked(events map[eventKey]uint64, epoch uint64) {
@@ -150,6 +180,18 @@ func (e *Engine) observationEpoch() uint64 {
 	return e.observation.epoch
 }
 
+// fenceUncertainObservation invalidates cached and in-flight topology after a
+// topology commit acknowledgement is lost. It deliberately preserves known
+// names and counters: the next successful inventory decides whether the commit
+// landed.
+func (e *Engine) fenceUncertainObservation() {
+	o := &e.observation
+	o.mu.Lock()
+	o.epoch++
+	o.queueCache = nil
+	o.mu.Unlock()
+}
+
 func (e *Engine) recordMessage(queue, event string, n int64, epochs ...uint64) {
 	if n > 0 {
 		o := &e.observation
@@ -169,8 +211,11 @@ func (e *Engine) recordMessage(queue, event string, n int64, epochs ...uint64) {
 func (o *observations) commit(t *txn) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	for name := range t.retiredQueues {
+		o.retireLocked(name, true)
+	}
 	for name := range t.forgottenQueues {
-		o.forgetLocked(name)
+		o.retireLocked(name, false)
 	}
 	if len(t.rememberedQueues) > 0 {
 		if o.known == nil {
@@ -185,15 +230,30 @@ func (o *observations) commit(t *txn) {
 }
 
 func (o *observations) forgetLocked(name string) {
+	o.retireLocked(name, false)
+}
+
+// retireLocked removes one active observation dimension. A durable
+// active-to-deleting transition always fences an older scan, even when this
+// process had not discovered the active resource. Physical cleanup uses the
+// idempotent form as a restart/outcome-unknown reconciliation fallback.
+func (o *observations) retireLocked(name string, forceFence bool) {
+	_, changed := o.known[name]
 	delete(o.known, name)
 	for _, event := range MessageEventNames() {
 		key := eventKey{name, event}
 		if count := o.events[key]; count != 0 {
+			changed = true
 			o.events[eventKey{"", event}] += count
 		}
 		delete(o.events, key)
 	}
-	o.epoch++
+	// Logical retirement is the observable topology change. Physical cleanup
+	// repeats forgetQueue as a restart/outcome-unknown reconciliation fallback;
+	// once the name and its counters are retired that repeat is a no-op.
+	if forceFence || changed {
+		o.epoch++
+	}
 }
 
 // reconcileTopologyLocked applies a successful database inventory only if no
@@ -208,19 +268,36 @@ func (o *observations) reconcileTopologyLocked(live map[string]bool, collectionE
 	if o.known == nil {
 		o.known = make(map[string]bool)
 	}
+	added := false
+	for name := range live {
+		if !o.known[name] {
+			added = true
+			break
+		}
+	}
+	removed := false
 	for name := range o.known {
 		if !live[name] {
 			o.forgetLocked(name)
+			removed = true
 		}
 	}
 	o.known = live
+	// Outcome-unknown remote commits can make an inventory the first observer of
+	// a creation. Mark an add-only change too, otherwise an older inventory with
+	// the same epoch could later erase the discovered name. A removal already
+	// advances the epoch through forgetLocked.
+	if added && !removed {
+		o.epoch++
+	}
 }
 
 // initializeObservations runs before startup recovery so existing queues receive
 // their process-local recovery counters without later retaining deleted names.
 func (e *Engine) initializeObservations(ctx context.Context) error {
 	known := make(map[string]bool)
-	if err := e.db.queryRows(ctx, `SELECT name FROM queues`, func(rows *sql.Rows) error {
+	if err := e.db.queryRows(ctx, `SELECT name FROM queues
+		WHERE lifecycle_state='active' AND (expires_at=0 OR expires_at>?)`, func(rows *sql.Rows) error {
 		for rows.Next() {
 			var name string
 			if err := rows.Scan(&name); err != nil {
@@ -229,7 +306,7 @@ func (e *Engine) initializeObservations(ctx context.Context) error {
 			known[name] = true
 		}
 		return rows.Err()
-	}); err != nil {
+	}, e.now()); err != nil {
 		return err
 	}
 	e.observation.mu.Lock()
@@ -265,6 +342,13 @@ func (t *txn) forgetQueue(name string) {
 	t.forgottenQueues[name] = true
 }
 
+func (t *txn) retireQueue(name string) {
+	if t.retiredQueues == nil {
+		t.retiredQueues = make(map[string]bool)
+	}
+	t.retiredQueues[name] = true
+}
+
 func newDurationHistogram() DurationHistogram {
 	return DurationHistogram{BoundsSeconds: append([]float64{}, durationBounds[:]...), BucketCounts: make([]uint64, len(durationBounds))}
 }
@@ -290,6 +374,15 @@ func cloneHistogram(h DurationHistogram) DurationHistogram {
 	h.BoundsSeconds = append([]float64{}, h.BoundsSeconds...)
 	h.BucketCounts = append([]uint64{}, h.BucketCounts...)
 	return h
+}
+
+func cloneQueueObservations(in []QueueObservation) []QueueObservation {
+	if in == nil {
+		return nil
+	}
+	out := make([]QueueObservation, len(in))
+	copy(out, in)
+	return out
 }
 
 // queueSnapshot performs one grouped read even for an empty queue inventory.
@@ -328,7 +421,7 @@ func (e *Engine) queueSnapshot(ctx context.Context, queue *string) ([]QueueObser
 	var now int64
 	out := make([]QueueObservation, 0)
 	var oldestTimes []sql.NullInt64
-	err := e.db.queryFresh(ctx, query, func() []any {
+	err := e.db.queryFreshRead(ctx, query, func() []any {
 		// Sample after acquiring the connection so the same fresh instant both
 		// fences expired subscriptions and supplies the returned ages. Remote
 		// retries rebuild this snapshot after their backoff.
@@ -353,6 +446,9 @@ func (e *Engine) queueSnapshot(ctx context.Context, queue *string) ([]QueueObser
 	if err != nil {
 		return nil, now, err
 	}
+	if afterQueueSnapshotCollected != nil {
+		afterQueueSnapshotCollected()
+	}
 	for i, oldest := range oldestTimes {
 		if oldest.Valid && now > oldest.Int64 {
 			out[i].OldestMessageAgeMs = now - oldest.Int64
@@ -361,19 +457,141 @@ func (e *Engine) queueSnapshot(ctx context.Context, queue *string) ([]QueueObser
 	return out, now, nil
 }
 
+// globalQueueSnapshot caches only the expensive all-queue gauge scan. Per-queue
+// Stats deliberately bypasses it and remains a fresh indexed read. The cache TTL
+// uses monotonic process time; sampledAtMs remains the engine-clock instant that
+// produced the gauges and can therefore stay unchanged on a cache hit.
+func (e *Engine) globalQueueSnapshot(ctx context.Context) ([]QueueObservation, int64, uint64, float64, error) {
+	for {
+		if err := checkCtx(ctx); err != nil {
+			return nil, 0, 0, 0, err
+		}
+		if e.db.isClosing() {
+			return nil, 0, 0, 0, ErrClosed
+		}
+
+		o := &e.observation
+		o.mu.Lock()
+		now := time.Now()
+		if cached := o.queueCache; cached != nil && cached.epoch == o.epoch && now.Before(cached.expiresAt) {
+			result := *cached
+			o.mu.Unlock()
+			result.queues = cloneQueueObservations(result.queues)
+			// Close may have started while the observation mutex was held. Cached
+			// results use no connection, but they still must not report success once
+			// the engine's admission gate is closed.
+			if e.db.isClosing() {
+				return nil, 0, 0, 0, ErrClosed
+			}
+			return result.queues, result.sampledAtMs, result.epoch, result.durationSeconds, nil
+		}
+		// Expiry and topology changes both make the snapshot unusable. Drop the
+		// reference before refreshing so a failed refresh cannot look cached and a
+		// deep, obsolete inventory can be reclaimed promptly.
+		o.queueCache = nil
+		if flight := o.queueFlight; flight != nil {
+			o.mu.Unlock()
+			if afterGlobalQueueFlightJoin != nil {
+				afterGlobalQueueFlightJoin()
+			}
+			select {
+			case <-flight.done:
+				if err := checkCtx(ctx); err != nil {
+					return nil, 0, 0, 0, err
+				}
+				if e.db.isClosing() {
+					return nil, 0, 0, 0, ErrClosed
+				}
+				// A leader's deadline belongs only to that request. A live waiter
+				// competes to refresh again instead of inheriting another caller's
+				// cancellation; success and storage failures remain shared.
+				if errors.Is(flight.err, context.Canceled) || errors.Is(flight.err, context.DeadlineExceeded) {
+					continue
+				}
+				// A caller that arrived after a topology commit can still find the
+				// older flight before its leader publishes the result. Never return that
+				// successful pre-change inventory to the newer caller.
+				o.mu.Lock()
+				current := flight.result.epoch == o.epoch
+				o.mu.Unlock()
+				if flight.err == nil && !current {
+					continue
+				}
+				return cloneQueueObservations(flight.result.queues), flight.result.sampledAtMs, flight.result.epoch, flight.result.durationSeconds, flight.err
+			case <-ctx.Done():
+				return nil, 0, 0, 0, ctx.Err()
+			case <-e.closed:
+				return nil, 0, 0, 0, ErrClosed
+			}
+		}
+
+		flight := &queueObservationFlight{done: make(chan struct{})}
+		flight.result.epoch = o.epoch
+		o.queueFlight = flight
+		o.mu.Unlock()
+
+		refreshStart := time.Now()
+		queues, sampledAtMs, err := e.queueSnapshot(ctx, nil)
+		// Neither the flight nor cache may retain a slice exposed to a caller. A
+		// waiter can wake and clone concurrently with the leader returning, so sharing
+		// queueSnapshot's backing array here would permit caller mutation to race that
+		// clone.
+		immutableQueues := cloneQueueObservations(queues)
+		flight.result.queues = immutableQueues
+		flight.result.sampledAtMs = sampledAtMs
+		flight.result.durationSeconds = time.Since(refreshStart).Seconds()
+		flight.err = err
+
+		var live map[string]bool
+		if err == nil {
+			live = make(map[string]bool, len(immutableQueues))
+			for _, q := range immutableQueues {
+				live[q.Queue] = true
+			}
+		}
+		o.mu.Lock()
+		if err == nil {
+			o.lastSuccess = sampledAtMs
+			// A topology callback after the scan began makes this inventory unsafe
+			// to reuse. The current caller may consume its one-shot read, but the next
+			// request must collect again. When the fence still matches, reconciliation
+			// and publication happen under this same lock so rows and epoch stay paired.
+			if flight.result.epoch == o.epoch {
+				o.reconcileTopologyLocked(live, flight.result.epoch)
+				flight.result.epoch = o.epoch
+				flight.result.expiresAt = time.Now().Add(queueObservationTTL)
+				o.queueCache = &queueObservationSnapshot{
+					queues:          immutableQueues,
+					sampledAtMs:     sampledAtMs,
+					epoch:           flight.result.epoch,
+					durationSeconds: flight.result.durationSeconds,
+					expiresAt:       flight.result.expiresAt,
+				}
+			}
+		}
+		o.queueFlight = nil
+		close(flight.done)
+		o.mu.Unlock()
+
+		return cloneQueueObservations(immutableQueues), sampledAtMs, flight.result.epoch, flight.result.durationSeconds, err
+	}
+}
+
 func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
-	start := time.Now()
-	collectionEpoch := e.observationEpoch()
 	s := ObservabilitySnapshot{Backend: "memory", Messages: []MessageCounter{}, Maintenance: []MaintenanceObservation{}, Filters: []FilterCounter{}}
 	if e.db.remote {
 		s.Backend = "remote"
 	} else if _, ok := localFilePath(e.db.dsn); ok {
 		s.Backend = "local"
 	}
-	s.Runtime, _ = e.runtimeObservation(ctx)
 	var err error
-	s.Queues, s.SampledAtMs, err = e.queueSnapshot(ctx, nil)
-	s.Collection = CollectionStatus{State: "available", DurationSeconds: time.Since(start).Seconds()}
+	var collectionDuration float64
+	s.Queues, s.SampledAtMs, _, collectionDuration, err = e.globalQueueSnapshot(ctx)
+	// Join or refresh the expensive global scan before probing the same reader.
+	// Otherwise every concurrent Observe queues its own SELECT 1 ahead of the
+	// refresh and delays both singleflight admission and Close.
+	s.Runtime, _ = e.runtimeObservation(ctx)
+	s.Collection = CollectionStatus{State: "available", DurationSeconds: collectionDuration}
 	if err != nil {
 		s.Collection.State = "unavailable"
 		s.Collection.ErrorCode = storageErrorCode(err)
@@ -387,19 +605,7 @@ func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 	}
 	e.observation.mu.Lock()
 	s.StartedAtMs = e.observation.started
-	if err == nil {
-		e.observation.lastSuccess = s.SampledAtMs
-	}
 	s.Collection.LastSuccessAtMs = e.observation.lastSuccess
-	// A snapshot that raced retirement must not restore a stale name. A later
-	// successful snapshot also reconciles delayed remote commit callbacks.
-	if err == nil {
-		live := make(map[string]bool, len(s.Queues))
-		for _, q := range s.Queues {
-			live[q.Queue] = true
-		}
-		e.observation.reconcileTopologyLocked(live, collectionEpoch)
-	}
 	for queue := range e.observation.known {
 		for _, event := range MessageEventNames() {
 			s.Messages = append(s.Messages, MessageCounter{Queue: queue, Event: event, Count: e.observation.events[eventKey{queue, event}]})
@@ -436,7 +642,7 @@ func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 		}
 		return s.Messages[i].Event < s.Messages[j].Event
 	})
-	s.Storage = e.db.storage.snapshot(e.db.sql.Stats())
+	s.Storage = e.db.storage.snapshot(e.db.poolStats())
 	return s
 }
 
@@ -641,6 +847,30 @@ func (d *db) queryFresh(ctx context.Context, q string, args func() []any, scan f
 	d.finishStorage(a, err)
 	return err
 }
+func (d *db) queryFreshRead(ctx context.Context, q string, args func() []any, scan func(*sql.Rows) error) error {
+	ctx, a := startStorage(ctx, storageQueryOperation(q))
+	err := d.queryFreshReadUnobserved(ctx, q, args, scan)
+	d.finishStorage(a, err)
+	return err
+}
+
+func (d *db) poolStats() sql.DBStats {
+	s := d.sql.Stats()
+	if d.reader == nil {
+		return s
+	}
+	r := d.reader.Stats()
+	s.MaxOpenConnections += r.MaxOpenConnections
+	s.OpenConnections += r.OpenConnections
+	s.InUse += r.InUse
+	s.Idle += r.Idle
+	s.WaitCount += r.WaitCount
+	s.WaitDuration += r.WaitDuration
+	s.MaxIdleClosed += r.MaxIdleClosed
+	s.MaxIdleTimeClosed += r.MaxIdleTimeClosed
+	s.MaxLifetimeClosed += r.MaxLifetimeClosed
+	return s
+}
 func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
 	ctx, a := startStorage(ctx, "read")
 	err := d.queryRowsUnobserved(ctx, q, scan, args...)
@@ -650,6 +880,12 @@ func (d *db) queryRows(ctx context.Context, q string, scan func(*sql.Rows) error
 func (d *db) queryRowScan(ctx context.Context, dest []any, q string, args ...any) error {
 	ctx, a := startStorage(ctx, "read")
 	err := d.queryRowScanUnobserved(ctx, dest, q, args...)
+	d.finishStorage(a, err)
+	return err
+}
+func (d *db) queryRowScanRead(ctx context.Context, dest []any, q string, args ...any) error {
+	ctx, a := startStorage(ctx, "read")
+	err := d.queryRowScanReadUnobserved(ctx, dest, q, args...)
 	d.finishStorage(a, err)
 	return err
 }

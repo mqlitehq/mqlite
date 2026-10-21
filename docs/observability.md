@@ -191,11 +191,23 @@ measurements and `mqlite_collection_success 0`, omitting queue gauges that could
 be collected. Failure before the endpoint, including invalid scrape credentials,
 causes Prometheus `up` to become zero instead.
 
-Queue counts are actual retained rows from a grouped database query. They describe
-stored states, not guaranteed immediate delivery eligibility: visibility, TTL,
-lease expiry awaiting maintenance and ordering rules can affect claims. Different
-measurement domains are sampled at different instants. The observation is not an
-atomic transaction encompassing every database, HTTP and in-process counter.
+Queue gauges come from an exact grouped database query at the reported
+`sampled_at_ms`. One process-local gauge snapshot is shared across native
+`Observe`, `/metrics` and console requests for about 10 seconds. A cache hit
+preserves the original timestamp instead of presenting cached rows as new.
+Message writes and polling do not extend the fixed cache deadline; a queue create
+or delete invalidates the snapshot. The deadline begins when a refresh finishes,
+so after an unusually slow scan the gauges can trail current messages by the scan
+duration plus roughly one cache window. Per-queue `Stats` remains a fresh indexed
+read.
+
+Counts describe stored states at the sample time, not guaranteed immediate
+delivery eligibility: visibility, TTL, lease expiry awaiting maintenance and
+ordering rules can affect claims. Runtime probes, process counters and queue
+gauges are sampled at different instants. The observation is not an atomic
+transaction encompassing every database, HTTP and in-process counter. Collection
+duration is the elapsed time of the gauge refresh that produced `sampled_at_ms`;
+it remains unchanged on a cache hit.
 
 `/healthz` is open process liveness. `mqlite_storage_read_available` reports a real
 storage read probe; success does not prove writes, end-to-end delivery or data
@@ -204,18 +216,37 @@ for memory/remote backends, not a fabricated zero-byte database.
 
 ### Collection cost and interval
 
-Each observation collects the full queue inventory with one grouped message scan
-and a storage read probe. The scan includes retained rows, so its cost grows with
-backlog as well as queue count. A local SQLite database uses the same single-writer
-connection for application work and collection; monitoring is not free or isolated
-from message-operation latency.
+Each observation runs a storage read probe. A cache refresh also collects the full
+queue inventory with one grouped message scan. Concurrent refreshes share that
+scan, and successful rows are reused for about 10 seconds; failed scans are not
+cached, so later requests can retry. The scan includes retained rows, so refresh
+cost grows with backlog as well as queue count. Exact per-queue `Stats` uses one
+literal branch per message state and the existing queue-prefixed partial indexes,
+so it does not scan unrelated queues.
+
+The cache retains one queue-gauge slice whose size grows with queue inventory,
+not backlog depth. Each request receives its own slice and still allocates and
+serializes the full response.
+
+A local file database runs `Stats`, the `SELECT 1` storage probe and global refresh
+on one dedicated `mode=ro` plus `query_only` connection. It cannot write or
+checkpoint, and WAL reads do not occupy the sole
+writer connection, so a deep refresh does not sit in front of Send, Receive or
+settlement. Reader work serializes on that one connection. A refresh still
+consumes CPU and storage bandwidth and holds a WAL snapshot until it finishes;
+long scans can delay checkpoint progress and grow the WAL. `:memory:` cannot use a
+second connection without becoming a different database, so its refresh and
+probe still share the sole writer connection. Remote Turso/libSQL observations
+use the existing small provider pool and consume provider query resources.
 
 Start production scraping at 15 seconds, measure collection duration and actual
 send/receive latency under the expected retained backlog, then adjust the scrape
-and native/console polling intervals. Each native observation or Prometheus scrape
-collects its own snapshot. Grafana dashboard refreshes query Prometheus instead
-of adding direct broker scans. The local demonstration uses a faster interval to
-make transitions visible; choose production cadence from measured workload needs.
+and native/console polling intervals. Requests inside the roughly 10-second gauge
+window share one snapshot, but each request still runs a storage probe and builds
+its response; aggressive polling is not free. Grafana dashboard refreshes query
+Prometheus instead of adding direct broker requests. The local demonstration uses
+a faster interval to make transitions visible; choose production cadence from
+measured workload needs.
 
 RPC/result and storage/error dimensions have fixed vocabularies, but their
 zero-initialized counters and histogram buckets still produce many series. Queue
@@ -241,7 +272,7 @@ use Unix seconds in Prometheus and epoch milliseconds in native JSON.
 | `mqlite_collection_success` | gauge | 1 when queue collection succeeds, otherwise 0 |
 | `mqlite_collection_status` | gauge, value 1 | `state`, bounded `error_code` |
 | `mqlite_collection_last_success_timestamp_seconds` | gauge | Last successful collection, 0 before one succeeds |
-| `mqlite_collection_duration_seconds` | gauge | Queue collection elapsed time |
+| `mqlite_collection_duration_seconds` | gauge | Latest queue-gauge refresh elapsed time; unchanged on cache hits |
 | `mqlite_entities` | gauge | `kind=queue|subscription`; queue count excludes subscriptions and topic routing names |
 | `mqlite_queue_messages` | gauge | `queue`, `state=active|locked|deferred|scheduled|dead_lettered` |
 | `mqlite_queue_retained_messages` | gauge | `queue`; all retained rows including unexpected states |
@@ -255,7 +286,7 @@ use Unix seconds in Prometheus and epoch milliseconds in native JSON.
 | `mqlite_storage_operations_total` | counter | `operation`, `outcome`, `error_code` |
 | `mqlite_storage_operation_duration_seconds` | histogram | Same labels; storage-operation elapsed time |
 | `mqlite_storage_retries_total` | counter | Same labels; safe retry attempts within the observed operation |
-| `mqlite_storage_pool_connections` | gauge | `state=max_open|open|in_use|idle` |
+| `mqlite_storage_pool_connections` | gauge | `state=max_open|open|in_use|idle`; local files aggregate the one writer and one observation reader |
 | `mqlite_storage_pool_waits_total` | counter | Connection-pool waits |
 | `mqlite_storage_pool_wait_duration_seconds_total` | counter | Cumulative pool waiting time, distinct from SQL execution |
 | `mqlite_storage_read_available` | gauge | Storage read probe succeeded, 0 or 1 |

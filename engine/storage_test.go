@@ -787,6 +787,7 @@ type busyState struct {
 	onCommit        func()
 	queueReads      int
 	queueExpiresAt  int64
+	queueMissing    bool
 	rosterRows      int
 	rosterRead      int
 	lifecycleLimits []int64
@@ -834,6 +835,9 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 	normalized := strings.Join(strings.Fields(query), " ")
 	if strings.Contains(normalized, "lifecycle_state") && strings.Contains(normalized, "FROM queues WHERE name=?") {
 		c.st.queueReads++
+		if c.st.queueMissing && strings.HasPrefix(normalized, "SELECT kind,lifecycle_state,expires_at") {
+			return emptyRows{}, nil
+		}
 		name := "q"
 		if len(args) > 0 {
 			name, _ = args[0].Value.(string)
@@ -2958,6 +2962,7 @@ func TestObservabilityAgeUsesPostReadClock(t *testing.T) {
 	e, clock := testEngine(t)
 	ctx := context.Background()
 	mustQueue(t, e, "q", QueueConfig{})
+	enqueuedAt := *clock
 	if _, err := e.SendOne(ctx, "q", OutMessage{}); err != nil {
 		t.Fatal(err)
 	}
@@ -2968,7 +2973,7 @@ func TestObservabilityAgeUsesPostReadClock(t *testing.T) {
 		t.Fatalf("age=%d err=%v", m.OldestMessageAgeMs, err)
 	}
 	snapshot := e.Observability(ctx)
-	if snapshot.SampledAtMs != *clock || snapshot.Queues[0].OldestMessageAgeMs != 3000 {
+	if snapshot.SampledAtMs != enqueuedAt+2000 || snapshot.Queues[0].OldestMessageAgeMs != snapshot.SampledAtMs-enqueuedAt || *clock != snapshot.SampledAtMs+1000 {
 		t.Fatalf("sampling clock mismatch sampled=%d clock=%d age=%d", snapshot.SampledAtMs, *clock, snapshot.Queues[0].OldestMessageAgeMs)
 	}
 }

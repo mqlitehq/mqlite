@@ -141,7 +141,7 @@ and console. Requires `manage` or a configured monitor credential.
 |---|---|
 | `sampled_at_ms`, `started_at_ms`, `backend`, `version` | Queue sampling instant, engine lifetime and non-sensitive identity |
 | `access` | Request capability: `manage`, `monitor` or `anonymous`; SDK embedded mode uses `embedded` |
-| `collection` | Queue collection `state`, `last_success_at_ms`, `duration_seconds`, bounded `error_code` |
+| `collection` | Queue collection `state`, `last_success_at_ms`, latest queue-gauge refresh `duration_seconds`, bounded `error_code` |
 | `queue_count`, `subscription_count`, `queues` | Actual retained state counts and age; counts are usable only when collection is `available` |
 | `runtime` | Schema version, read-probe availability/latency and local footprint availability/bytes; no DSN or path |
 | `messages` | Engine-lifetime `{queue,event,count}` effects, recorded after confirmed commits |

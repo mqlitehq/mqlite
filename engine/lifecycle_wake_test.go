@@ -387,6 +387,12 @@ func TestDeleteOutcomeUnknownSchedulesLifecycleReconciliation(t *testing.T) {
 	state.commitErr = io.EOF
 	e := fakeRemoteEngine(d)
 	e.lifecycleWake = make(chan struct{}, 1)
+	e.observation.known = map[string]bool{"q": true}
+	e.observation.queueCache = &queueObservationSnapshot{
+		queues: []QueueObservation{{Metrics: Metrics{Queue: "q"}}},
+		epoch:  e.observation.epoch,
+	}
+	beforeEpoch := e.observation.epoch
 
 	result, err := e.DeleteQueueWithOptions(context.Background(), "q", DeleteOptions{Force: true})
 	if !errors.Is(err, ErrOutcomeUnknown) {
@@ -397,6 +403,30 @@ func TestDeleteOutcomeUnknownSchedulesLifecycleReconciliation(t *testing.T) {
 	}
 	if got := len(e.lifecycleWake); got != 1 {
 		t.Fatalf("delete outcome-unknown wake count=%d, want 1", got)
+	}
+	if e.observation.queueCache != nil || e.observation.epoch != beforeEpoch+1 || !e.observation.known["q"] {
+		t.Fatalf("outcome-unknown observation fence: epoch=%d/%d cache=%+v known=%v",
+			e.observation.epoch, beforeEpoch, e.observation.queueCache, e.observation.known)
+	}
+}
+
+func TestCreateOutcomeUnknownInvalidatesObservationCache(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	state.commitErr = io.EOF
+	state.queueMissing = true
+	e := fakeRemoteEngine(d)
+	e.observation.queueCache = &queueObservationSnapshot{
+		queues: []QueueObservation{{Metrics: Metrics{Queue: "q"}}},
+		epoch:  e.observation.epoch,
+	}
+	beforeEpoch := e.observation.epoch
+
+	if err := e.CreateQueue(context.Background(), "q", QueueConfig{}); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("create error=%v, want ErrOutcomeUnknown", err)
+	}
+	if e.observation.queueCache != nil || e.observation.epoch != beforeEpoch+1 {
+		t.Fatalf("outcome-unknown create fence: epoch=%d/%d cache=%+v",
+			e.observation.epoch, beforeEpoch, e.observation.queueCache)
 	}
 }
 

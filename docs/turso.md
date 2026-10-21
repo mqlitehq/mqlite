@@ -18,7 +18,9 @@ queue. What differs is the connection pool:
 ├─────────────────┼──────────────────────────┼────────────────────────────────────┤
 │ writer          │ 1 conn = the writer      │ broker is the writer; the Turso    │
 │                 │ (file lock, MQLITE-6)    │ primary serializes commits         │
-│ pool            │ MaxOpen=1, MaxIdle=1     │ MaxOpen=4, MaxIdle=2               │
+│ writer pool     │ MaxOpen=1, MaxIdle=1     │ MaxOpen=4, MaxIdle=2               │
+│ observation     │ file: 1 read-only conn;  │ existing provider pool             │
+│                 │ :memory: writer conn     │                                    │
 │ idle handling   │ ConnMaxLifetime=0        │ IdleTime=3s, Lifetime=55s          │
 │ why             │ atomic claims, no        │ recycle conns before Turso closes  │
 │                 │ contention               │ idle Hrana streams                 │
@@ -27,7 +29,10 @@ queue. What differs is the connection pool:
 
 A small remote pool is safe because the Turso primary serializes writes; it is
 *more* resilient than a single conn because a server-closed idle stream is dropped
-and replaced instead of reused.
+and replaced instead of reused. Each broker process shares its expensive
+all-queue observation query for about 10 seconds on both local and remote
+backends; separate brokers do not share that cache. Per-queue `Stats` and each
+observation's lightweight storage probe still use the backend shown above.
 
 ## Connection resilience (the remote hardening)
 

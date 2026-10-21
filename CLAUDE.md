@@ -165,8 +165,15 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
 ### The single-writer model (most important invariant)
 
 - **Local file / `:memory:`** → `db.sql` uses `SetMaxOpenConns(1)`. That one
-  connection *is* the single writer: `database/sql` serializes every caller, so
-  there is zero file-lock contention and claims are atomic. (`engine/db.go`)
+  connection *is* the single writer: `database/sql` serializes every mutation,
+  so there is zero file-lock contention and claims are atomic. A local WAL file
+  also has exactly one `mode=ro` plus `query_only` connection for `Stats`,
+  observation probes and global observation refreshes; it cannot write or
+  checkpoint and never weakens writer
+  serialization. Global queue gauges have an approximately 10-second shared
+  snapshot, while per-queue `Stats` stays fresh. `:memory:` stays on the sole
+  connection because another SQLite connection would be another database.
+  (`engine/db.go`)
 - **Embedded local file** additionally takes an OS advisory lock on a `<db>.lock`
   sidecar (`engine/lock_unix.go` / `lock_windows.go`). A second process — or second
   `OpenEmbedded` on the same file — fails fast with `ErrDBLocked`. Sharing a file DB

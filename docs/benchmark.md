@@ -158,6 +158,44 @@ Adding required lifecycle timestamps to 100-item subscription pages changed the
 median from 5.187 ms to 5.376 ms (+3.65%). Page memory fell from about 39 KB to
 30 KB after exact preallocation; allocation counts stayed effectively flat.
 
+MQLITE-132 adds native observation benchmarks over 300,000 retained messages in
+300 queues:
+
+```bash
+go test ./engine -run '^$' \
+  -bench 'Benchmark(ObservationDeepBacklog|SendDuringDeepObservation)$' \
+  -benchmem -count=3
+```
+
+`ObserveAllQueuesRefresh` forces a new grouped scan on each iteration;
+`ObserveAllQueuesCacheHit` prewarms the process-local snapshot. A three-run sample
+on an Apple M1 Pro with Go 1.26.9 at commit `0407013` used the exact command above.
+Median per-queue `Stats` fell from 21.152 ms on the pre-change engine to 1.716 ms
+with the indexed query. The candidate's full-refresh median was 291.638 ms versus
+251.412 ms in the earlier baseline run; the 16% difference in separate, noisy
+runs needs investigation rather than a no-regression claim. A cache hit took
+1.454 ms, about 201 times faster than that refresh. The cached call still builds
+the complete response and allocated about 1.1 MB in this 300-queue benchmark.
+
+The send benchmark's `continuous_observe` mode is deliberately hostile: one
+goroutine requests observations as fast as it can instead of following a scrape
+interval. In the same three-run sample, median send time was 111.542 µs without
+that load and 135.724 µs with it (+21.7%); throughput moved from 8,965 to 7,368
+messages/s (-17.8%).
+
+A separate five-pair, 10-second pressure run at the same commit alternated phase
+order and used two observation loops (5-second and 15-second cadences) plus
+per-second `Stats`. The paired median p99 change was +0.7% and paired median
+throughput change was -2.9%, satisfying the 10% investigation threshold at the
+median. Individual p99 changes ranged from -32.0% to +127.9%, however, and two of
+five trials exceeded 10%; this run does not establish a per-trial latency bound.
+The monitored WAL peaked between 16.0 and 39.5 MiB. A post-phase passive
+checkpoint reported `busy=0` and all logged frames checkpointed in every trial.
+Long-lived observation snapshots can still delay WAL reuse. Cache hits and a
+separate reader reduce writer-connection interference, but monitoring continues
+to use CPU, storage bandwidth and memory. Size and scrape against the target CPU,
+storage, queue inventory and backlog.
+
 ## 1 · Throughput & write amplification
 
 256 B bodies unless noted. `wB/op` = bytes physically written to disk per op (write

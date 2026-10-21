@@ -1307,6 +1307,18 @@ func TestTopologyReconciliationRejectsStaleInventory(t *testing.T) {
 	if !o.known["existing"] || !o.known["created"] || len(o.known) != 2 {
 		t.Fatalf("stale inventory replaced newer topology: %v", o.known)
 	}
+
+	// An inventory can be the first confirmation of an outcome-unknown remote
+	// creation. That add-only repair must also fence an older inventory.
+	o = observations{initialized: true, known: map[string]bool{"existing": true}}
+	collectionEpoch = o.epoch
+	o.mu.Lock()
+	o.reconcileTopologyLocked(map[string]bool{"existing": true, "discovered": true}, collectionEpoch)
+	o.reconcileTopologyLocked(map[string]bool{}, collectionEpoch)
+	o.mu.Unlock()
+	if !o.known["existing"] || !o.known["discovered"] || len(o.known) != 2 {
+		t.Fatalf("stale inventory replaced discovered topology: %v", o.known)
+	}
 }
 
 func TestLifecycleCleanupQueriesUseQueuePrefixIndexes(t *testing.T) {

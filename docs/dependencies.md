@@ -38,10 +38,12 @@ binary gates must continue to pass if a later code/dependency change adds a call
 Go vulnerability scanning does not cover every native SQLite defect. SQLite's
 [WAL-reset issue](https://www.sqlite.org/wal.html#the_wal_reset_bug) affects older
 SQLite versions when multiple connections concurrently write/checkpoint one WAL
-database. MQLite serializes local operations on one SQL connection; keep external
-backup connections read-only and never run another writer/checkpointer against the
-live file. The [operations runbook](operations.md#consistent-backups) preserves that
-restriction. Review native engine advisories before changing this connection model.
+database. MQLite serializes local writes and checkpoints on one SQL connection.
+A second local connection serves observation reads with SQLite `mode=ro` and
+`query_only`, so it cannot write or checkpoint. Keep external backup connections
+read-only and never run another writer/checkpointer against the live file. The
+[operations runbook](operations.md#consistent-backups) preserves that restriction.
+Review native engine advisories before changing this connection model.
 
 Container OS packages have a separate security boundary from Go dependencies.
 The runtime image upgrades installed APKs within the supported Alpine branch
