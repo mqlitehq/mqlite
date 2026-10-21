@@ -661,9 +661,12 @@ func subscriptionPageItem(topic, name, state string, filterJSON sql.NullString, 
 	}
 }
 
-// ListSubscriptions returns every subscription with its topic and filter expression,
-// ordered by topic then name. (ListQueues shows the backing queues; this exposes the
-// topic membership + filter that ListQueues does not.)
+// ListSubscriptions returns every active, unexpired subscription with its topic and
+// filter expression, ordered by topic then name. (ListQueues shows the backing queues;
+// this exposes the topic membership + filter that ListQueues does not.)
+//
+// Compatibility note: use ListSubscriptionsWithOptions for bounded inventory and
+// lifecycle reconciliation, including deleting name reservations.
 func (e *Engine) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
 	var out []SubscriptionInfo
 	err := e.db.queryFresh(ctx, `

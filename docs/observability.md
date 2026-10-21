@@ -41,6 +41,50 @@ For a runnable broker, Prometheus and Grafana stack, see
 [the local observability demo](../ops/observability/README.md). For an existing
 platform, use the [cloud and Kubernetes guide](observability-cloud.md).
 
+## Access logs and destructive-operation evidence
+
+`mqlite serve` enables request logging to stderr. Each emitted record has a
+broker-generated 32-character `request_id`; the same value is returned in the
+`X-Request-ID` response header and exposed to configured CORS clients. The broker
+does not trust or copy a caller-supplied request ID. An enabled-CORS preflight is
+deliberately not logged, and a successful empty `Receive` is emitted at Debug so
+an Info-level handler may filter it. The ID correlates one HTTP attempt with one
+log record; it is not an idempotency key and does not authorize retrying a destructive request.
+
+`actor_kind` distinguishes `anonymous`, `unverified`, `static_admin`,
+`static_monitor`, and `managed_key`. A successfully authenticated managed key also
+records its public `actor_key_id`, unless that ID equals a configured static
+credential. Static administrator and monitor credentials have no public ID, and
+invalid, expired, or revoked credentials cannot be safely attributed, so those
+records never invent one. Authentication headers, token
+digests, message bodies, and generated key secrets are not copied into access-log
+fields. Resource names and public IDs are logged by design; never put a secret in
+either.
+
+The following management records include operation-specific evidence in addition
+to status, error code, actor, request ID, and duration:
+
+| RPC | Fields |
+|---|---|
+| `DeleteQueue` | `queue`, `force`, `acceptance` (`accepted`, `rejected`, or `unknown`), then `result_state` and `deleted` for an accepted result |
+| `DeleteSubscription` | `topic`, `sub`, `force`, the same acceptance and result fields |
+| `Purge` | `queue`, requested `max` and `older_than_ms` bounds, and confirmed `purged` count |
+| `CreateKey`, `RevokeKey` | safe syntactically valid public `key_id`; a value equal to a configured static credential is omitted; successful operations add `result_state=created` or `revoked` |
+
+These records are operational evidence, not a persistent audit table. A success
+record describes the broker result; an `acceptance=unknown` deletion still needs
+read-only reconciliation. Logs do not remove the rule that one owner must
+serialize deletion with same-name recreation. Resource names and public key IDs
+may themselves be sensitive operational metadata, so restrict log access.
+
+The default access log exists only on stderr. Container and service platforms may
+discard it quickly, and `MQLITE_DIAGNOSTIC_LOG` deliberately excludes routine
+requests. Forward stderr to an external log store and set its retention to cover
+your incident-response and destructive-request reconciliation window. Embedded
+brokers must pass a retained logger with `WithRequestLog`; a JSON `slog` handler is
+recommended when machines consume the evidence. Log delivery and storage
+durability remain the operator's responsibility.
+
 ## Maintenance failure diagnosis
 
 The current unreleased source adds optional `maintenance[].diagnostics` and

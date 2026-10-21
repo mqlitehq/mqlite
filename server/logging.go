@@ -1,10 +1,18 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+const requestIDHeader = "X-Request-ID"
+
+var fallbackRequestID atomic.Uint64
 
 // logging emits one access-log line per request through Server.Logger. The level is
 // chosen by HTTP status (2xx info, 4xx warn, 5xx error) so a colour-aware handler tells
@@ -22,14 +30,16 @@ func (s *Server) logging(next http.Handler) http.Handler {
 		if !ok {
 			rec = &statusRecorder{ResponseWriter: w, status: http.StatusOK, logging: true}
 		}
+		requestID := newRequestID()
+		rec.Header().Set(requestIDHeader, requestID)
 		start := time.Now()
 		next.ServeHTTP(rec, r)
 
 		// /mqlite.v1.QueueService/Send -> QueueService/Send (the message that matters).
 		rpc := strings.TrimPrefix(r.URL.Path, "/mqlite.v1.")
 		dur := time.Since(start).Round(time.Microsecond)
-		args := make([]any, 0, len(rec.kv)+4)
-		args = append(args, "status", rec.status)
+		args := make([]any, 0, len(rec.kv)+6)
+		args = append(args, "status", rec.status, "request_id", requestID)
 		args = append(args, rec.kv...) // queue / msgs / seq / msg_id / code, per handler
 		args = append(args, "dur", dur.String())
 		switch {
@@ -43,6 +53,19 @@ func (s *Server) logging(next http.Handler) http.Handler {
 			s.Logger.Info(rpc, args...)
 		}
 	})
+}
+
+// newRequestID creates a log correlation ID entirely on the broker. It never
+// copies a caller-controlled header, which keeps credentials accidentally placed
+// in request metadata out of the access log. The fallback preserves correlation
+// if the operating-system random source is unavailable; request IDs are public
+// identifiers, not authentication material.
+func newRequestID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		return hex.EncodeToString(raw[:])
+	}
+	return fmt.Sprintf("%016x%016x", uint64(time.Now().UnixNano()), fallbackRequestID.Add(1))
 }
 
 // statusRecorder captures the status code an inner handler writes (default 200 when the

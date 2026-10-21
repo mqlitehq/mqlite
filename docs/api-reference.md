@@ -493,6 +493,9 @@ work.
   discovery passes after an uncertain remote database commit so a late-visible
   retirement can enter normal cleanup; startup recovery is the durable fallback.
   Concurrent delete/recreate controllers are unsupported.
+- When access logging is retained, the operation record includes its server request
+  ID, safe actor classification, queue, force decision, acceptance, and returned
+  lifecycle state. See [destructive-operation evidence](observability.md#access-logs-and-destructive-operation-evidence).
 
 Go SDK: `client.DeleteQueue(ctx, name) error` and the equivalent embedded method
 retain their empty-only signature. They return `nil` once deletion is accepted,
@@ -543,6 +546,9 @@ subscription's backing queue.
 - Subscription identity is still name-only. One owner must serialize deletion
   and recreation, and temporary subscription names should be globally unique and
   used for only one lifetime.
+- Retained access logs record the topic/subscription target, force decision,
+  acceptance and returned lifecycle state without storing a Bearer token. See
+  [destructive-operation evidence](observability.md#access-logs-and-destructive-operation-evidence).
 
 ### CreateQueue
 
@@ -653,10 +659,11 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 
 - **Request** `{}`. **Response** `{subscriptions: [{topic, name, expr}]}` — every
   active subscription with its topic and [filter expression](concepts.md#subscription-filters-expr) (`expr` empty = match
-  all). This compatibility route is intentionally not paged. The configured
-  subscription ceiling bounds its maximum size; new integrations should use the
-  paged route below. The Go SDK retains the original three-field
-  `SubscriptionInfo` type for this method.
+  all). This compatibility-only route is active/unexpired-only and intentionally
+  not paged. It is deprecated for management and reconciliation because it cannot
+  expose deleting name reservations. The configured subscription ceiling bounds
+  its maximum size; new integrations should use the paged route below. The Go SDK
+  retains the original three-field `SubscriptionInfo` type for this method.
 
 ### ListSubscriptionsPage
 
@@ -710,7 +717,9 @@ Move dead-lettered messages back to active (or to another queue).
 Permanently delete dead-lettered messages.
 
 - **Request** `PurgeRequest`: `queue`, `max` (int), `older_than_ms` (int; both zero
-  purges the whole DLQ). **Response** `PurgeResponse`: `purged` (int).
+  purges the whole DLQ). **Response** `PurgeResponse`: `purged` (int). Retained
+  access logs include both requested bounds and the confirmed purge count; see
+  [destructive-operation evidence](observability.md#access-logs-and-destructive-operation-evidence).
 
 ### Status
 

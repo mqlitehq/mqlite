@@ -140,6 +140,14 @@ authenticate again. Keys issued by another key are independent: revoking their
 issuer does not revoke them. An administrator can revoke itself; retain another
 administrator before doing so.
 
+When broker access logs are retained, successful creation and revocation records
+include the target's public key ID and the caller's safe actor classification. A
+value equal to a configured static credential is omitted even when it has valid
+public-ID syntax, including when it would otherwise be an actor ID. A managed
+caller is identified by its own public key ID; configured administrator tokens
+have no public ID. Secrets and token digests are never log fields. See
+[access-log retention and limits](observability.md#access-logs-and-destructive-operation-evidence).
+
 If a creation response is lost, keep the original public ID and list keys as an
 administrator to find it. If it exists without a saved secret, revoke it and
 create a replacement with a new ID. A repeated ID returns `409 key_conflict` and

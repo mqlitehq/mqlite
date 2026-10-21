@@ -241,8 +241,9 @@ business identities if it must survive the cutover.
 Current clients also change the deletion contract to `{name,force?}` with a typed
 `{deleted,state}` result; update broker, SDK, CLI, MCP and console together. A
 rollback after schema-7 accepts writes requires preserving and reconciling those
-writes before restoring the schema-5 snapshot. If enabled, retain the private
-diagnostic log separately from database backups.
+writes before restoring the schema-5 snapshot. Retain broker stderr externally for
+the destructive-operation reconciliation window; the private diagnostic log is
+separate from access logs and database backups.
 
 For **v0.3.1 → v0.3.2**, schema token **5**, port **6754**, message data and
 managed-key storage remain unchanged. Follow the same-schema procedure above;

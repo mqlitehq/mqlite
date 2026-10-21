@@ -627,7 +627,11 @@ func (c *Client) Status(ctx context.Context) (StatusInfo, error) {
 	}, nil
 }
 
-// ListSubscriptions returns every subscription with its topic and filter expression.
+// ListSubscriptions returns every active, unexpired subscription with its topic and
+// filter expression.
+//
+// Compatibility note: use ListSubscriptionsWithOptions for bounded inventory and
+// lifecycle reconciliation, including deleting name reservations.
 func (c *Client) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
 	var resp wire.ListSubscriptionsResponse
 	if err := c.post(ctx, wire.PathListSubscriptions, wire.Empty{}, &resp); err != nil {

@@ -20,6 +20,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", s.CORS)
+		h.Set("Access-Control-Expose-Headers", requestIDHeader)
 		if s.CORS != "*" {
 			h.Add("Vary", "Origin") // response varies by origin when not wildcard
 		}
