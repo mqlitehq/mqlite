@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/authkey"
 	"github.com/mqlitehq/mqlite/wire"
 )
 
@@ -241,6 +242,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Exact console paths only: /uixyz must not bypass authentication.
 		if !s.authenticationEnabled() || openPath(r.URL.Path) {
+			logf(w, "actor_kind", "anonymous")
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -250,6 +252,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			if len(values) == 0 {
 				outcome = "missing"
 			}
+			logf(w, "actor_kind", "unverified")
 			authOutcome(w, outcome)
 			s.fail(w, engine.ErrUnauthenticated)
 			return
@@ -259,6 +262,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		// multiple credentials or whitespace inside/after the opaque token.
 		tok = strings.TrimLeft(tok, " ")
 		if !ok || !strings.EqualFold(scheme, "Bearer") || tok == "" || strings.ContainsAny(tok, " \t\r\n,") {
+			logf(w, "actor_kind", "unverified")
 			authOutcome(w, "invalid")
 			s.fail(w, engine.ErrUnauthenticated)
 			return
@@ -273,6 +277,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			}
 		}
 		permission := engine.KeyManage
+		actorKind, actorKeyID := "static_admin", ""
 		if !static {
 			monitor := false
 			for _, t := range s.MonitorTokens {
@@ -283,15 +288,22 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			}
 			if monitor {
 				permission = monitorPermission
+				actorKind = "static_monitor"
 			} else {
 				key, outcome, err := s.eng.AuthenticateAccessKeyWithOutcome(r.Context(), tok)
 				if err != nil {
+					logf(w, "actor_kind", "unverified")
 					authOutcome(w, outcome)
 					s.fail(w, err)
 					return
 				}
 				permission = key.Permissions
+				actorKind, actorKeyID = "managed_key", key.ID
 			}
+		}
+		logf(w, "actor_kind", actorKind)
+		if actorKeyID != "" {
+			s.logPublicKeyID(w, "actor_key_id", actorKeyID)
 		}
 		authOutcome(w, "success")
 		ctx := context.WithValue(r.Context(), permissionContextKey{}, permission)
@@ -750,12 +762,14 @@ func (s *Server) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
 		decodeErr(w, err)
 		return
 	}
-	logf(w, "queue", req.Name)
+	logf(w, "queue", req.Name, "force", req.Force)
 	result, err := s.eng.DeleteQueueWithOptions(r.Context(), req.Name, engine.DeleteOptions{Force: req.Force})
 	if err != nil {
+		logDeleteAcceptance(w, err)
 		s.fail(w, err)
 		return
 	}
+	logf(w, "acceptance", "accepted", "result_state", result.State, "deleted", result.Deleted)
 	writeJSON(w, wire.DeleteQueueResponse{Deleted: result.Deleted, State: result.State})
 }
 
@@ -765,13 +779,23 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 		decodeErr(w, err)
 		return
 	}
-	logf(w, "topic", req.Topic, "sub", req.Name)
+	logf(w, "topic", req.Topic, "sub", req.Name, "force", req.Force)
 	result, err := s.eng.DeleteSubscriptionWithOptions(r.Context(), req.Topic, req.Name, engine.DeleteOptions{Force: req.Force})
 	if err != nil {
+		logDeleteAcceptance(w, err)
 		s.fail(w, err)
 		return
 	}
+	logf(w, "acceptance", "accepted", "result_state", result.State, "deleted", result.Deleted)
 	writeJSON(w, wire.DeleteSubscriptionResponse{Deleted: result.Deleted, State: result.State})
+}
+
+func logDeleteAcceptance(w http.ResponseWriter, err error) {
+	acceptance := "rejected"
+	if errors.Is(err, engine.ErrOutcomeUnknown) {
+		acceptance = "unknown"
+	}
+	logf(w, "acceptance", acceptance)
 }
 
 func (s *Server) handleCreateQueue(w http.ResponseWriter, r *http.Request) {
@@ -950,7 +974,7 @@ func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
 		decodeErr(w, err)
 		return
 	}
-	logf(w, "queue", req.Queue)
+	logf(w, "queue", req.Queue, "max", req.Max, "older_than_ms", req.OlderThanMs)
 	purged, err := s.eng.Purge(r.Context(), req.Queue, engine.RedriveOptions{
 		Max: req.Max, OlderThanMs: req.OlderThanMs,
 	})
@@ -958,7 +982,7 @@ func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	logf(w, "n", purged)
+	logf(w, "n", purged, "purged", purged)
 	writeJSON(w, wire.PurgeResponse{Purged: purged})
 }
 
@@ -970,6 +994,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		decodeErr(w, err)
 		return
 	}
+	s.logPublicKeyID(w, "key_id", req.ID)
 	permissions, err := engine.ParseKeyPermissions(req.Permissions)
 	if err != nil {
 		s.fail(w, err)
@@ -982,6 +1007,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	logf(w, "result_state", "created")
 	writeJSON(w, wire.CreateKeyResponse{Key: wire.FromAccessKey(key), Token: token})
 }
 
@@ -1009,9 +1035,36 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 		decodeErr(w, err)
 		return
 	}
+	s.logPublicKeyID(w, "key_id", req.ID)
 	if err := s.eng.RevokeAccessKey(r.Context(), req.ID); err != nil {
 		s.fail(w, err)
 		return
 	}
+	logf(w, "result_state", "revoked")
 	writeJSON(w, wire.RevokeKeyResponse{Ok: true})
+}
+
+// logPublicKeyID records a syntactically valid public ID unless its bytes are
+// also configured as a static administrator or monitor credential. Static
+// credentials are intentionally unconstrained strings, so a valid-looking ID
+// can still be a secret supplied in the wrong request field.
+func (s *Server) logPublicKeyID(w http.ResponseWriter, field, id string) {
+	if !authkey.ValidID(id) {
+		return
+	}
+	secret := 0
+	for token := range s.tokens {
+		if len(token) == len(id) {
+			secret |= subtle.ConstantTimeCompare([]byte(token), []byte(id))
+		}
+	}
+	for _, token := range s.MonitorTokens {
+		token = strings.TrimSpace(token)
+		if len(token) == len(id) {
+			secret |= subtle.ConstantTimeCompare([]byte(token), []byte(id))
+		}
+	}
+	if secret == 0 {
+		logf(w, field, id)
+	}
 }

@@ -2,6 +2,8 @@ package server_test
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -20,6 +22,7 @@ func corsServer(t *testing.T, origin string) *httptest.Server {
 	t.Cleanup(func() { eng.Close() })
 	s := server.New(eng, []string{"secret"})
 	s.CORS = origin
+	s.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return ts
@@ -45,6 +48,9 @@ func TestCORSPreflightBypassesAuth(t *testing.T) {
 	if got := res.Header.Get("Access-Control-Allow-Headers"); got == "" {
 		t.Errorf("Allow-Headers missing")
 	}
+	if got := res.Header.Get("Access-Control-Expose-Headers"); got != "X-Request-ID" {
+		t.Errorf("Expose-Headers = %q, want X-Request-ID", got)
+	}
 }
 
 func TestCORSHeaderOnActualResponse(t *testing.T) {
@@ -61,6 +67,12 @@ func TestCORSHeaderOnActualResponse(t *testing.T) {
 	}
 	if got := res.Header.Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Allow-Origin = %q, want *", got)
+	}
+	if got := res.Header.Get("Access-Control-Expose-Headers"); got != "X-Request-ID" {
+		t.Errorf("Expose-Headers = %q, want X-Request-ID", got)
+	}
+	if got := res.Header.Get("X-Request-ID"); !validLogRequestID(got) {
+		t.Errorf("X-Request-ID = %q, want broker-generated correlation ID", got)
 	}
 }
 

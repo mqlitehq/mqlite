@@ -838,24 +838,30 @@ func TestAccessKeyRevocationAndExpiryBoundaries(t *testing.T) {
 
 func TestAccessKeyErrorsDoNotEchoSecrets(t *testing.T) {
 	eng := keyTestEngine(t, nil)
-	const static = "legacy-static-secret-for-redaction-check"
+	const (
+		static  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		monitor = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
 	key, token := keyTestCreate(t, eng, 1, engine.KeySend, 0)
 	var logs bytes.Buffer
 	srv := server.New(eng, []string{static})
+	srv.MonitorTokens = []string{"  " + monitor + "  "}
 	srv.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	h := srv.Handler()
-	secrets := []string{static, token, fmt.Sprintf("%x", sha256.Sum256([]byte(token))), "token_hash"}
+	secrets := []string{static, monitor, token, fmt.Sprintf("%x", sha256.Sum256([]byte(token))), "token_hash"}
 	for _, tt := range []struct {
 		path, credential string
 		body             any
 		status           int
 	}{
 		{wire.PathCreateKey, static, wire.CreateKeyRequest{ID: token, Name: "test", Permissions: []string{"send"}}, 400},
+		{wire.PathCreateKey, static, wire.CreateKeyRequest{ID: static, Name: "test", Permissions: []string{token}}, 400},
 		{wire.PathCreateKey, static, wire.CreateKeyRequest{ID: fmt.Sprintf("%032x", 2), Name: "test", Permissions: []string{token}}, 400},
 		{wire.PathCreateKey, static, wire.CreateKeyRequest{ID: key.ID, Name: "test", Permissions: []string{"send"}}, 409},
 		{wire.PathListKeys, static, wire.ListKeysRequest{AfterID: token}, 400},
 		{wire.PathRevokeKey, static, wire.RevokeKeyRequest{ID: token}, 400},
-		{wire.PathRevokeKey, static, wire.RevokeKeyRequest{ID: static}, 400},
+		{wire.PathRevokeKey, static, wire.RevokeKeyRequest{ID: static}, 404},
+		{wire.PathRevokeKey, static, wire.RevokeKeyRequest{ID: monitor}, 404},
 		{wire.PathRevokeKey, static, wire.RevokeKeyRequest{ID: fmt.Sprintf("%032x", 99)}, 404},
 		{wire.PathCreateKey, token, wire.CreateKeyRequest{}, 403},
 		{wire.PathListKeys, token, wire.ListKeysRequest{}, 403},

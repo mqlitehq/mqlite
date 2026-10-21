@@ -404,7 +404,11 @@ func (e *Embedded) Observe(ctx context.Context) (Observation, error) {
 	}, nil
 }
 
-// ListSubscriptions returns every subscription with its topic and filter expression.
+// ListSubscriptions returns every active, unexpired subscription with its topic and
+// filter expression.
+//
+// Compatibility note: use ListSubscriptionsWithOptions for bounded inventory and
+// lifecycle reconciliation, including deleting name reservations.
 func (e *Embedded) ListSubscriptions(ctx context.Context) ([]SubscriptionInfo, error) {
 	return e.eng.ListSubscriptions(ctx)
 }
@@ -501,9 +505,11 @@ func WithCORS(origin string) ServeOption {
 }
 
 // WithRequestLog enables a per-request access log on the broker, emitted through lg (one
-// line per RPC: method, status, latency, at a level chosen by status). nil leaves request
-// logging off. Separate from WithLogger (which routes the engine's background-loop
-// failures) so a caller can colour the broker's live traffic without touching engine logs.
+// line per RPC: method, status, request ID, safe actor identity, latency, and operation
+// details at a level chosen by status). nil leaves request logging off. Callers that need
+// durable audit evidence must retain this logger externally. Separate from WithLogger
+// (which routes the engine's background-loop failures) so a caller can colour the broker's
+// live traffic without touching engine logs.
 func WithRequestLog(lg *slog.Logger) ServeOption {
 	return func(c *serveConfig) { c.reqLogger = lg }
 }
