@@ -26,6 +26,7 @@ from run import (Worker, after_open, canonical, cell, cli, command, compare,
 
 
 BASE_SHA = "8232296ea871c9550b58e13328b729ac771cffe8"
+BASE_TREE = "78c5398052b0ff051b778f55c3a72fb49a5e1508"
 OLD_VERSION = "mqlite 0.3.2"
 NEW_VERSION = "mqlite 0.4.0"
 # SHA-256 of the checksums.txt asset published with v0.3.2. This offline trust
@@ -109,8 +110,29 @@ def verify_old_release(old_binary, old_archive, old_checksums):
     }
 
 
-def git_command(repo, *args, binary=False):
-    result = subprocess.run(["git", *args], cwd=repo, stdout=subprocess.PIPE,
+def git_environment(extra=None):
+    env = dict(os.environ)
+    unsafe = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_ATTR_NOSYSTEM", "GIT_COMMON_DIR",
+        "GIT_CONFIG", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_DEFAULT_HASH", "GIT_DIR",
+        "GIT_EXEC_PATH", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY", "GIT_PREFIX", "GIT_REPLACE_REF_BASE",
+        "GIT_TEMPLATE_DIR", "GIT_WORK_TREE",
+    }
+    for key in tuple(env):
+        if key in unsafe or key.startswith("GIT_CONFIG_KEY_") or \
+                key.startswith("GIT_CONFIG_VALUE_") or key == "GIT_CONFIG_COUNT":
+            env.pop(key)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    if extra:
+        env.update(extra)
+    return env
+
+
+def git_command(repo, *args, binary=False, extra_env=None):
+    result = subprocess.run(["git", "--no-replace-objects", *args], cwd=repo,
+                            env=git_environment(extra_env), stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=not binary, timeout=60)
     detail = (result.stderr if not binary else result.stderr.decode(errors="replace")).strip()
     require(result.returncode == 0,
@@ -138,7 +160,42 @@ def source_identity(repo, revision, expected_version, require_clean=False):
 
 
 def git_archive(repo, revision):
-    data = git_command(repo, "archive", "--format=tar", revision, binary=True)
+    commit = git_command(repo, "rev-parse", "--verify", revision + "^{commit}").strip()
+    require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None,
+            "archive source commit is not a full SHA-1")
+    object_path = Path(git_command(repo, "rev-parse", "--git-path", "objects").strip())
+    if not object_path.is_absolute():
+        object_path = repo / object_path
+    object_path = object_path.resolve()
+    require(object_path.is_dir(), "source Git object store is not a directory")
+    require("\n" not in str(object_path) and "\r" not in str(object_path),
+            "source Git object store path contains a line break")
+
+    # Archive from fresh metadata that can read the source's content-addressed
+    # objects but cannot see its replace refs, info/attributes, local config, or
+    # templates. Committed .gitattributes still retain their normal semantics.
+    with tempfile.TemporaryDirectory(prefix=".compat-git-") as temporary:
+        root = Path(temporary)
+        home, template = root / "home", root / "template"
+        home.mkdir()
+        template.mkdir()
+        metadata = root / "repo.git"
+        isolated = {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / "xdg"),
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }
+        git_command(root, "init", "--quiet", "--bare", "--template=" + str(template),
+                    str(metadata), extra_env=isolated)
+        alternates = metadata / "objects" / "info" / "alternates"
+        alternates.write_text(str(object_path) + "\n")
+        data = git_command(root, "--git-dir=" + str(metadata),
+                           "-c", "core.attributesFile=" + os.devnull,
+                           "archive", "--format=tar", commit, binary=True,
+                           extra_env=isolated)
     return data, sha256_bytes(data)
 
 
@@ -249,6 +306,8 @@ def run(args, out):
     old_source = source_identity(args.old_source, BASE_SHA, "0.3.2")
     require(old_source["commit"] == BASE_SHA,
             "old fixture source does not contain the exact v0.3.2 commit")
+    require(old_source["tree"] == BASE_TREE,
+            "old fixture source does not contain the exact v0.3.2 tree")
     candidate_source = source_identity(args.new_source, "HEAD", "0.4.0", require_clean=True)
 
     build_env = build_environment(args.go_toolchain)

@@ -170,6 +170,43 @@ class SourceArchiveTests(unittest.TestCase):
         self.assertRegex(commit, r"^[0-9a-f]{40}$")
         self.assertRegex(tree, r"^[0-9a-f]{40}$")
 
+    def test_source_export_ignores_replace_refs(self):
+        repo = self.repository()
+        original = self.git(repo, "rev-parse", "HEAD")
+        original_tree = self.git(repo, "rev-parse", "HEAD^{tree}")
+        (repo / "payload.txt").write_text("forged\n")
+        subprocess.run(["git", "add", "payload.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.name=compat-test",
+                        "-c", "user.email=compat@example.invalid",
+                        "commit", "-qm", "replacement"], cwd=repo, check=True)
+        replacement = self.git(repo, "rev-parse", "HEAD")
+        subprocess.run(["git", "replace", original, replacement], cwd=repo, check=True)
+        subprocess.run(["git", "--no-replace-objects", "reset", "--hard", "-q", original],
+                       cwd=repo, check=True)
+        self.assertEqual(self.git(repo, "show", original + ":payload.txt"), "forged")
+
+        identity = compat.source_identity(repo, "HEAD", "0.4.0", require_clean=True)
+        self.assertEqual(identity["commit"], original)
+        self.assertEqual(identity["tree"], original_tree)
+        archive, _ = compat.git_archive(repo, original)
+        destination = self.root / "replace-export"
+        compat.extract_git_archive(archive, destination)
+        self.assertEqual((destination / "payload.txt").read_text(), "committed\n")
+
+    def test_source_export_ignores_repository_local_attributes(self):
+        repo = self.repository()
+        (repo / ".git/info/attributes").write_text("payload.txt export-ignore\n")
+        commit = self.git(repo, "rev-parse", "HEAD")
+        direct = subprocess.check_output(
+            ["git", "archive", "--format=tar", commit], cwd=repo)
+        with tarfile.open(fileobj=io.BytesIO(direct), mode="r:") as source:
+            self.assertNotIn("payload.txt", source.getnames())
+
+        archive, _ = compat.git_archive(repo, commit)
+        destination = self.root / "attributes-export"
+        compat.extract_git_archive(archive, destination)
+        self.assertEqual((destination / "payload.txt").read_text(), "committed\n")
+
     def test_archive_build_uses_isolated_source_and_fixed_go_environment(self):
         source_archive = io.BytesIO()
         with tarfile.open(fileobj=source_archive, mode="w") as archive:

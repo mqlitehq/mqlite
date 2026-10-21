@@ -118,8 +118,10 @@ python3 test/production/restore/compat.py \
 The runner is offline with respect to release provenance: it pins the published
 v0.3.2 checksum-manifest digest, verifies the archive checksum, and requires the
 supplied old binary to match the archive member byte for byte before executing it.
-It exports both source revisions with `git archive`, then builds the fixture and
-candidate with `GOWORK=off`, read-only module metadata and the selected toolchain.
+It exports both source revisions with `git archive` from isolated Git metadata
+that ignores repository-local replace refs, attributes and configuration, then
+builds the fixture and candidate with `GOWORK=off`, read-only module metadata and
+the selected toolchain.
 The candidate HEAD must be clean and report exactly v0.4.0; untracked and ignored
 files cannot enter either source build.
 
