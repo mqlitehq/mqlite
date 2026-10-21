@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -340,18 +342,34 @@ func (s *Server) authEnabled(fn http.HandlerFunc) http.HandlerFunc {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-// decode strictly parses exactly one JSON object into v: an unknown field or any
-// data after the first value is a 400, not a silently-dropped typo (MQLITE-86). A
-// typo'd field like "messsages" would otherwise decode to an empty, successful Send.
+// decode strictly parses exactly one non-null JSON object into v: an unknown field
+// or any data after the first value is a 400, not a silently-dropped typo
+// (MQLITE-86). A typo'd field like "messsages" would otherwise decode to an empty,
+// successful Send. v is always a pointer to a request struct; decoding through a
+// temporary pointer distinguishes JSON null from a real zero-valued object.
 func decode(r *http.Request, v any) error {
+	dst := reflect.ValueOf(v)
+	if dst.Kind() != reflect.Pointer || dst.IsNil() || dst.Elem().Kind() != reflect.Struct {
+		return errors.New("request destination must be a non-nil pointer to a struct")
+	}
+	tmp := reflect.New(dst.Type()) // **T: null stays nil, while {} allocates a *T.
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
+	if err := dec.Decode(tmp.Interface()); err != nil {
 		return err
 	}
-	if dec.More() {
-		return errors.New("unexpected data after JSON body (want a single object)")
+	decoded := tmp.Elem()
+	if decoded.IsNil() {
+		return errors.New("JSON request body must be an object, not null")
 	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("unexpected data after JSON body (want a single object)")
+		}
+		return fmt.Errorf("unexpected data after JSON body: %w", err)
+	}
+	dst.Elem().Set(decoded.Elem())
 	return nil
 }
 
@@ -789,6 +807,11 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
+	var req wire.Empty
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
 	qs, err := s.eng.ListQueues(r.Context())
 	if err != nil {
 		s.fail(w, err)
@@ -805,6 +828,11 @@ func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
+	var req wire.Empty
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
 	subs, err := s.eng.ListSubscriptions(r.Context())
 	if err != nil {
 		s.fail(w, err)
@@ -847,6 +875,11 @@ func (s *Server) handleListSubscriptionsPage(w http.ResponseWriter, r *http.Requ
 // handleStatus reports a desensitized runtime snapshot for an ops view: backend kind,
 // redacted location, read latency, local footprint, counts, uptime. Behind auth.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	var req wire.Empty
+	if err := decode(r, &req); err != nil {
+		decodeErr(w, err)
+		return
+	}
 	ctx := r.Context()
 	st, queues, subs := s.eng.RuntimeStatus(ctx)
 	version := s.Version
