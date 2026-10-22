@@ -308,6 +308,44 @@ in both directions. Three short sequential pairs cannot attribute those tail
 changes to the query. The result supports lower refresh cost and completed work
 accounting, not a claim that observation has no foreground latency cost.
 
+## Remote Turso trend soak
+
+The manually dispatched **Turso performance soak** Action exercises one
+package-internal Engine directly against the dedicated verification database.
+It is separate from the HTTP broker and uses four closed-loop lanes: two standard
+queues, one `group_fifo` queue and one `strict_fifo` queue. Each lane repeatedly
+sends one unique 256-byte body, receives and verifies that exact body, then
+completes it before starting the next cycle. This keeps the live message working
+set bounded while exercising the four-connection remote pool and normal
+background maintenance.
+
+Choose 2, 10 or 30 minutes when dispatching the workflow. Start with 2 minutes to
+verify credentials, cleanup and evidence collection; use 30 minutes for the
+intended sustained trend check. The workflow and the existing Turso nightly suite
+share one repository-wide concurrency lock because both use `TestMain` to reset
+the same database. Both workflows have a fail-closed allowlist for the
+verification host before tests can reset it. Never point either workflow at a
+production database.
+
+Each minute, and once more for a final partial window, the artifact records
+per-lane and overall cycles/s; Send, Receive, Complete and end-to-end p50/p95/p99
+and maximum latency; empty/error counts; queue backlog; settlement-receipt
+counts; storage outcomes and retries; pool waits; Go heap, RSS, goroutines, GC and
+process CPU where the runner exposes them. `metadata.json`, `windows.jsonl`,
+`summary.json`, `summary.md` and the test log are retained for 14 days. Errors,
+body mismatches, accounting failures, final backlog or exact cleanup failures
+fail the run, while the evidence written before a failure remains uploadable.
+A runner cancellation or outer test timeout can interrupt final cleanup; the
+next run's `TestMain` reset and namespaced startup cleanup remove that residue.
+
+The first-to-last window change is descriptive and has no performance threshold.
+GitHub-hosted runner placement, shared CPU and network path add noise, so this is
+a stability and trend test rather than an SLA or capacity result. Turso does not
+expose physical database or WAL file sizes through this client; those JSON fields
+are `null`, never a misleading zero. Settlement receipts have 30-minute
+retention, so a 30-minute run's final receipt count is a current retention
+snapshot rather than a lifetime completion total.
+
 ## 1 · Throughput & write amplification
 
 256 B bodies unless noted. `wB/op` = bytes physically written to disk per op (write

@@ -1,0 +1,84 @@
+name: Turso performance soak
+
+# Manual, bounded trend/stability evidence against the dedicated verification
+# database. This shares a static lock with the destructive nightly TestMain reset.
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: Sustained closed-loop duration
+        required: true
+        default: '30'
+        type: choice
+        options:
+          - '2'
+          - '10'
+          - '30'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: turso-verification-db
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: ${{ inputs.duration_minutes }} minute Turso soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: ${{ github.repository == 'mqlitehq/mqlite' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Validate dedicated verification database
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+        run: |
+          if [ -z "$MQLITE_TEST_DB" ] || [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
+            echo "Required Turso verification secrets are not configured."
+            exit 1
+          fi
+          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
+            echo "MQLITE_TEST_DB is not the dedicated verification database."
+            exit 1
+          fi
+      - name: Run sustained direct-engine workload
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+          MQLITE_TURSO_SOAK_CONFIRM_TEST_DB: '1'
+          MQLITE_TURSO_SOAK_DURATION: ${{ inputs.duration_minutes }}m
+          MQLITE_TURSO_SOAK_OUTPUT: ${{ runner.temp }}/turso-performance-soak
+        run: |
+          set -o pipefail
+          mkdir -p "$MQLITE_TURSO_SOAK_OUTPUT"
+          go test ./engine \
+            -run '^TestTursoPerformanceSoak$' \
+            -count=1 -v -timeout 42m 2>&1 |
+            tee "$MQLITE_TURSO_SOAK_OUTPUT/test.log"
+      - name: Publish run summary
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/turso-performance-soak
+        run: |
+          if [ -f "$EVIDENCE_DIR/summary.md" ]; then
+            cat "$EVIDENCE_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Turso performance soak"
+              echo ""
+              echo "The test ended before summary evidence was written; inspect test.log."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload soak evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: turso-performance-soak-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/turso-performance-soak/
+          if-no-files-found: warn
+          retention-days: 14
