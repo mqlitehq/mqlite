@@ -1613,7 +1613,8 @@ func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
 // tursoSoakAdmission bounds every harness-originated database call. Limiting the
 // harness to one call keeps foreground demand below the remote pool's
 // four-connection limit while all four logical lanes remain active, providing
-// headroom for background maintenance.
+// headroom for background maintenance. Background workers do not use this gate,
+// and it does not reserve the Turso primary's serialized write lock.
 type tursoSoakAdmission struct {
 	slots chan struct{}
 }

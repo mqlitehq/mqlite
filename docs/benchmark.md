@@ -327,6 +327,10 @@ providing headroom for normal background maintenance. The profile is deliberatel
 a sustainable stability and trend load. It is not a capacity test, and its
 throughput must not be read as the backend's maximum.
 
+The admission limit applies only to calls made by the harness. Engine background
+workers bypass it, and it does not reserve the Turso primary's serialized write
+lock.
+
 Choose 2, 10 or 30 minutes when dispatching the workflow. Start with 2 minutes to
 verify credentials, cleanup and evidence collection; use 30 minutes for the
 intended sustained trend check. The workflow and the existing Turso nightly suite
