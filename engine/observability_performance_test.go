@@ -26,6 +26,93 @@ func TestStatsQueryPlanUsesStateIndexes(t *testing.T) {
 	}
 }
 
+func TestGlobalObservationStateAggregationSemantics(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	base := *clock
+
+	for _, name := range []string{"mixed", "active-only", "locked-only", "non-age", "empty", "deleting"} {
+		mustQueue(t, e, name, QueueConfig{})
+	}
+	if err := e.Subscribe(ctx, "topic", "live-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SubscribeWithOptions(ctx, "topic", "expired-sub", nil, SubscribeOptions{TTLMs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `UPDATE queues SET lifecycle_state='deleting',delete_started_at=? WHERE name='deleting'`, base); err != nil {
+		t.Fatal(err)
+	}
+
+	insert := func(queue, state string, enqueuedAt int64) {
+		t.Helper()
+		if _, err := e.db.exec(ctx,
+			`INSERT INTO messages(queue,state,enqueued_at,body) VALUES(?,?,?,x'')`,
+			queue, state, enqueuedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, row := range []struct {
+		queue, state string
+		enqueuedAt   int64
+	}{
+		{"mixed", "active", base - 100},
+		{"mixed", "active", base - 300},
+		{"mixed", "locked", base - 200},
+		{"mixed", "locked", base - 400},
+		{"mixed", "deferred", base - 10_000},
+		{"mixed", "scheduled", base - 20_000},
+		{"mixed", "completed", base - 30_000},
+		{"mixed", "dead_lettered", base - 40_000},
+		{"active-only", "active", base - 350},
+		{"locked-only", "locked", base - 250},
+		{"non-age", "deferred", base - 50_000},
+		{"deleting", "active", base - 60_000},
+		{"expired-sub", "active", base - 70_000},
+	} {
+		insert(row.queue, row.state, row.enqueuedAt)
+	}
+	advance(clock, time.Millisecond)
+
+	rows, sampledAt, err := e.queueSnapshot(ctx, nil)
+	if err != nil || sampledAt != *clock {
+		t.Fatalf("snapshot sampled_at=%d want=%d err=%v", sampledAt, *clock, err)
+	}
+	got := make(map[string]QueueObservation, len(rows))
+	for _, row := range rows {
+		got[row.Queue] = row
+	}
+	if len(got) != 6 {
+		t.Fatalf("active inventory=%+v", rows)
+	}
+	if _, ok := got["deleting"]; ok {
+		t.Fatalf("deleting queue remained observable: %+v", rows)
+	}
+	if _, ok := got["expired-sub"]; ok {
+		t.Fatalf("expired subscription remained observable: %+v", rows)
+	}
+	mixed := got["mixed"]
+	if mixed.Active != 2 || mixed.Locked != 2 || mixed.Deferred != 1 || mixed.Scheduled != 1 ||
+		mixed.DeadLettered != 1 || mixed.Total != 8 || mixed.Unexpected != 1 || mixed.OldestMessageAgeMs != 401 {
+		t.Fatalf("mixed queue=%+v", mixed)
+	}
+	if active := got["active-only"]; active.Total != 1 || active.Active != 1 || active.OldestMessageAgeMs != 351 {
+		t.Fatalf("active-only queue=%+v", active)
+	}
+	if locked := got["locked-only"]; locked.Total != 1 || locked.Locked != 1 || locked.OldestMessageAgeMs != 251 {
+		t.Fatalf("locked-only queue=%+v", locked)
+	}
+	if nonAge := got["non-age"]; nonAge.Total != 1 || nonAge.Deferred != 1 || nonAge.OldestMessageAgeMs != 0 {
+		t.Fatalf("non-age queue=%+v", nonAge)
+	}
+	if empty := got["empty"]; empty.Total != 0 || empty.OldestMessageAgeMs != 0 {
+		t.Fatalf("empty queue=%+v", empty)
+	}
+	if sub := got["live-sub"]; sub.Kind != "subscription" || sub.Total != 0 {
+		t.Fatalf("live subscription=%+v", sub)
+	}
+}
+
 func TestLocalFileObservationReaderIsSeparateAndQueryOnly(t *testing.T) {
 	e, _ := testEngine(t)
 	ctx := context.Background()
@@ -583,26 +670,43 @@ func TestObservationReaderWaitCancellationAndClose(t *testing.T) {
 	}
 }
 
-func seedObservationBenchmark(b *testing.B, messages, queues int) *Engine {
+func seedObservationBenchmarkStates(b *testing.B, messages, queues int, mixed bool) *Engine {
 	b.Helper()
 	ctx := context.Background()
 	e := benchEngine(b)
-	if _, err := e.db.exec(ctx, `INSERT INTO queues(name,created_at,updated_at) VALUES('hot',1,1)`); err != nil {
-		b.Fatal(err)
-	}
 	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?)
 		INSERT INTO queues(name,created_at,updated_at) SELECT printf('q%03d',i),1,1 FROM n`, queues-1); err != nil {
 		b.Fatal(err)
 	}
 	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?)
 		INSERT INTO messages(queue,state,enqueued_at,body)
-		SELECT printf('q%03d',i%?),'active',1700000000000,x'00' FROM n`, messages-1, queues); err != nil {
+		SELECT printf('q%03d',i%?),
+			CASE WHEN ?=0 THEN 'active' ELSE CASE ((i/?)+(i%?))%6
+				WHEN 0 THEN 'active' WHEN 1 THEN 'locked' WHEN 2 THEN 'deferred'
+				WHEN 3 THEN 'scheduled' WHEN 4 THEN 'completed' ELSE 'dead_lettered' END END,
+			1700000000000,x'00' FROM n`, messages-1, queues, mixed, queues, queues); err != nil {
 		b.Fatal(err)
+	}
+	if mixed {
+		var groups, total, smallest, largest int
+		if err := e.db.queryRowScan(ctx, []any{&groups, &total, &smallest, &largest}, `
+			SELECT COUNT(*),SUM(n),MIN(n),MAX(n)
+			FROM (SELECT queue,state,COUNT(*) AS n FROM messages GROUP BY queue,state)`); err != nil {
+			b.Fatal(err)
+		}
+		if groups != queues*6 || total != messages || largest-smallest > 1 {
+			b.Fatalf("mixed fixture groups=%d total=%d per_group=%d..%d", groups, total, smallest, largest)
+		}
 	}
 	if _, err := e.db.exec(ctx, `ANALYZE`); err != nil {
 		b.Fatal(err)
 	}
 	return e
+}
+
+func seedObservationBenchmark(b *testing.B, messages, queues int) *Engine {
+	b.Helper()
+	return seedObservationBenchmarkStates(b, messages, queues, false)
 }
 
 // BenchmarkObservationDeepBacklog keeps the 300k-row reproduction available
@@ -621,6 +725,21 @@ func BenchmarkObservationDeepBacklog(b *testing.B) {
 	})
 	b.Run("ObserveAllQueuesRefresh", func(b *testing.B) {
 		e := seedObservationBenchmark(b, messages, queues)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			e.observation.mu.Lock()
+			if e.observation.queueCache != nil {
+				e.observation.queueCache.expiresAt = time.Time{}
+			}
+			e.observation.mu.Unlock()
+			if s := e.Observability(context.Background()); s.Collection.State != "available" {
+				b.Fatal(s.Collection)
+			}
+		}
+	})
+	b.Run("ObserveAllQueuesRefreshMixedStates", func(b *testing.B) {
+		e := seedObservationBenchmarkStates(b, messages, queues, true)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -658,6 +777,9 @@ func BenchmarkSendDuringDeepObservation(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			ctx, cancel := context.WithCancel(context.Background())
 			e := seedObservationBenchmark(b, 300_000, 300)
+			if err := e.CreateQueue(ctx, "hot", QueueConfig{}); err != nil {
+				b.Fatal(err)
+			}
 			var observer sync.WaitGroup
 			stopObserver := func() {
 				cancel()

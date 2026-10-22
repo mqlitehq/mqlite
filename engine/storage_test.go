@@ -3230,6 +3230,13 @@ func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
 	e, _ := testEngine(t)
 	for _, queue := range []*string{nil, func() *string { q := "q"; return &q }()} {
 		query, args := queueSnapshotQuery(queue, 1_700_000_000_000)
+		// FILTER keeps non-matching rows out of each state aggregate. Keep this
+		// deterministic shape check in CI; wall-clock thresholds are too noisy
+		// across its operating systems and Go versions.
+		if got := strings.Count(query, "COUNT(*) FILTER (WHERE state="); got != 5 ||
+			!strings.Contains(query, "MIN(enqueued_at) FILTER (WHERE state IN ('active','locked'))") {
+			t.Fatalf("observation query lost selective aggregates:\n%s", query)
+		}
 		var plan []string
 		err := e.db.queryRows(context.Background(), "EXPLAIN QUERY PLAN "+query, func(rows *sql.Rows) error {
 			for rows.Next() {
@@ -3246,12 +3253,19 @@ func TestObservabilityCollectionAggregatesBeforeInventoryJoin(t *testing.T) {
 			t.Fatal(err)
 		}
 		joined := strings.Join(plan, "\n")
-		messageRead := strings.Index(joined, "SCAN messages")
-		if messageRead < 0 {
-			messageRead = strings.Index(joined, "SEARCH messages USING INDEX idx_msg_queue")
+		messageReads := 0
+		messageRead := -1
+		for _, detail := range plan {
+			if strings.Contains(detail, "messages") {
+				messageReads++
+				if messageRead < 0 {
+					messageRead = strings.Index(joined, detail)
+				}
+			}
 		}
-		if !strings.Contains(joined, "MATERIALIZE m") || messageRead < 0 || messageRead > strings.Index(joined, "LEFT-JOIN") {
-			t.Fatalf("messages must be aggregated once before inventory join:\n%s", joined)
+		if !strings.Contains(joined, "MATERIALIZE m") || messageReads != 1 || messageRead < 0 ||
+			messageRead > strings.Index(joined, "LEFT-JOIN") || strings.Contains(joined, "CORRELATED") {
+			t.Fatalf("messages must be scanned once and aggregated before inventory join:\n%s", joined)
 		}
 	}
 }

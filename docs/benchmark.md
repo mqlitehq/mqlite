@@ -167,6 +167,11 @@ go test ./engine -run '^$' \
   -benchmem -count=3
 ```
 
+This fixture is 300,000 rows present at the same time, not 300,000 messages
+processed over the broker's lifetime. Its original form makes every row active;
+completed messages are normally deleted at settlement and do not accumulate as
+history.
+
 `ObserveAllQueuesRefresh` forces a new grouped scan on each iteration;
 `ObserveAllQueuesCacheHit` prewarms the process-local snapshot. A three-run sample
 on an Apple M1 Pro with Go 1.26.9 at commit `0407013` used the exact command above.
@@ -261,6 +266,46 @@ errors or missed calls, and zero ending backlog. Baseline WAL peaks were
 3.96–3.98 MiB and monitored peaks were 10.29–13.03 MiB; every passive checkpoint
 fully drained its frames and every following truncating checkpoint left a
 zero-byte WAL.
+
+MQLITE-134 keeps the same one-scan query and replaces per-state `SUM`
+expressions with selective `COUNT ... FILTER` aggregates. The committed benchmark
+also adds an even six-state fixture. On the same Apple M1 Pro with Go 1.26.9, the
+`5d7a163` benchmark fixture ran both the `SUM` query text from `6ed7f88` and the
+candidate `FILTER` query three times with three measured refreshes per run:
+
+```bash
+go test ./engine -run '^$' \
+  -bench '^BenchmarkObservationDeepBacklog/ObserveAllQueuesRefresh(MixedStates)?$' \
+  -benchmem -benchtime=3x -count=3
+```
+
+| Current retained distribution | `SUM` median (range) | `FILTER` median (range) | Median change |
+|---|---:|---:|---:|
+| 300,000 active | 248.369 ms (237.138–249.820) | 210.754 ms (209.695–214.042) | -15.14% |
+| 50,000 in each of six states, mixed within every queue | 244.973 ms (238.955–250.814) | 210.518 ms (207.978–216.448) | -14.06% |
+
+Median allocation counts stayed at 3,594 per all-active refresh and 3,294 per
+six-state refresh; reported bytes per operation differed by less than 0.1%. A
+separate seven-round query harness also covered all-locked and 70%-active skewed
+data and reported lower medians. These temporary local-file measurements
+isolate the aggregate expression; they are not a deployment capacity result.
+
+A three-pair local-file check then used a 300,000-row cold active backlog, 1,000
+scheduled sends/s, three per-second `Stats` callers, a 5-second UI observer and a
+15-second Prometheus observer. Each 16-second monitored phase performed exactly
+two global refreshes. With `FILTER`, the paired median monitored-versus-baseline
+throughput change was -0.36% and the offered-slot drop change was +0.34 percentage
+points. Every admitted message completed, every phase ended with zero hot-queue
+backlog, and monitored WAL peaks of 14.1–16.8 MiB were fully checkpointed and
+truncated. The median of the per-trial maximum UI observation latency was 273.334
+ms, versus 338.873 ms in the old-query control.
+
+Foreground tails remained noisy and did not pass the earlier 10% investigation
+threshold: candidate paired-median changes were -29.6% Send p99, +37.4% Receive
+p99, +35.5% Complete p99 and +337.1% end-to-end p99, with individual pairs moving
+in both directions. Three short sequential pairs cannot attribute those tail
+changes to the query. The result supports lower refresh cost and completed work
+accounting, not a claim that observation has no foreground latency cost.
 
 ## 1 · Throughput & write amplification
 

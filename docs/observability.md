@@ -217,12 +217,18 @@ for memory/remote backends, not a fabricated zero-byte database.
 ### Collection cost and interval
 
 Each observation runs a storage read probe. A cache refresh also collects the full
-queue inventory with one grouped message scan. Concurrent refreshes share that
-scan, and successful rows are reused for about 10 seconds; failed scans are not
-cached, so later requests can retry. The scan includes retained rows, so refresh
-cost grows with backlog as well as queue count. Exact per-queue `Stats` uses one
-literal branch per message state and the existing queue-prefixed partial indexes,
-so it does not scan unrelated queues.
+queue inventory with one grouped message scan. State-filtered aggregates avoid
+updating every state counter for every row, but the exact refresh still reads all
+retained rows. Concurrent refreshes share that scan, and successful rows are
+reused for about 10 seconds; failed scans are not cached, so later requests can
+retry. Refresh cost therefore grows with current backlog as well as queue count.
+Here retained means rows present in `messages` at the sample time, not lifetime
+throughput. Completed messages are normally deleted immediately; active, locked,
+deferred, scheduled and dead-lettered rows remain until their corresponding
+lifecycle action, while an abnormal retained `completed` row is still counted in
+`total` and `unexpected`. Exact per-queue `Stats` uses one literal branch per
+message state and the existing queue-prefixed partial indexes, so it does not scan
+unrelated queues.
 
 The cache retains one queue-gauge slice whose size grows with queue inventory,
 not backlog depth. Each request receives its own slice and still allocates and
