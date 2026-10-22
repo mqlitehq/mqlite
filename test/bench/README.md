@@ -48,7 +48,12 @@ comparison:
 
 produce ×{1,4,8 producers} · batch ×{16,64} · e2e(4×4) · drain(200k prefill, then empty)
 · sessions(64 groups) · produce FULL (fsync control) · message properties · body-size
-sweep · fill/drain reclamation · load ramp-down · consumer churn.
+sweep · exact fill/drain footprint · load ramp-down · consumer churn.
+
+The fill/drain scenario samples its full backlog and then the state after a short
+1.9-second idle. The local page-reclaim janitor runs every 60 seconds, so this
+scenario reports immediate file state; use a sustained run or an explicit
+`Compact(false)` measurement to evaluate page reclamation.
 
 `lifecycle_churn` is opt-in because create/delete churn is expensive on a remote
 backend. Each cycle reuses a fixed 64-name working set only after the previous

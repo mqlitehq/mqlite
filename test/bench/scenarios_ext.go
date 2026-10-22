@@ -254,30 +254,18 @@ func propsRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration
 	return total, mergeAll(hs)
 }
 
-// bloatRun fills `prefill` messages then drains ALL of them (Complete = DELETE),
-// returning the drained count. The sampler captures the DB-file PEAK (after fill)
-// vs the FINAL size (after drain + idle): does the file shrink when the queue
-// empties? SQLite has no auto-VACUUM, so freed pages go to the freelist and are
-// reused — this scenario measures that bloat empirically.
-func bloatRun(ctx context.Context, eng *engine.Engine, q string, prefillN, batch, msg int) (int64, *hist) {
-	if batch <= 0 {
-		batch = 64
-	}
-	b := body(msg)
-	ms := make([]engine.OutMessage, batch)
-	for i := range ms {
-		ms[i] = engine.OutMessage{Body: b}
-	}
-	for i := 0; i < prefillN; i += batch {
-		eng.Send(ctx, q, ms...)
-	}
+// bloatRun drains the messages already inserted by the common prefill path. The
+// caller samples the full backlog before entering this function, then records an
+// immediate snapshot after a short idle. Background page reclamation has a
+// 60-second cadence and is outside this scenario's observation window.
+func bloatRun(ctx context.Context, eng *engine.Engine, q string, prefilled int) (int64, *hist, error) {
 	h := newHist()
 	var drained int64
 	empty := 0
 	for {
 		msgs, err := eng.Receive(ctx, q, engine.ReceiveOptions{MaxMessages: 256, WaitMs: 0})
 		if err != nil {
-			continue
+			return drained, h, fmt.Errorf("receive after draining %d of %d messages: %w", drained, prefilled, err)
 		}
 		if len(msgs) == 0 {
 			if empty++; empty > 3 {
@@ -288,13 +276,17 @@ func bloatRun(ctx context.Context, eng *engine.Engine, q string, prefillN, batch
 		empty = 0
 		for _, m := range msgs {
 			t := time.Now()
-			if eng.Complete(ctx, q, m.SeqNumber, m.LockToken) == nil {
-				h.add(time.Since(t))
-				drained++
+			if err := eng.Complete(ctx, q, m.SeqNumber, m.LockToken); err != nil {
+				return drained, h, fmt.Errorf("complete message %d after draining %d of %d: %w", m.SeqNumber, drained, prefilled, err)
 			}
+			h.add(time.Since(t))
+			drained++
 		}
 	}
-	return drained, h
+	if drained != int64(prefilled) {
+		return drained, h, fmt.Errorf("drained %d messages; prefilled %d", drained, prefilled)
+	}
+	return drained, h, nil
 }
 
 // rampDownRun produces hard for the first ~55% of d, then STOPS producing while

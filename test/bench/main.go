@@ -28,6 +28,12 @@ import (
 
 const maxUs = 100_000
 
+const (
+	postWorkloadIdleBeforeGC = 1500 * time.Millisecond
+	postWorkloadIdleAfterGC  = 400 * time.Millisecond
+	postWorkloadIdle         = postWorkloadIdleBeforeGC + postWorkloadIdleAfterGC
+)
+
 type hist struct {
 	b               []uint32
 	count, sum, max uint64
@@ -137,7 +143,7 @@ const clkTck = 100.0 // _SC_CLK_TCK on Linux
 
 type scen struct {
 	Name                              string
-	Kind                              string // produce|batch|e2e|drain|sessions|lifecycle
+	Kind                              string // produce|batch|e2e|drain|sessions|props|bloat|rampdown|churn|lifecycle
 	P, C, Batch, Groups, Prefill, Msg int
 	Sync                              string
 }
@@ -170,13 +176,15 @@ type Result struct {
 	HeapMB          float64 `json:"heap_mb"`
 	DBSizeMB        float64 `json:"db_size_mb"`
 	WALSizeMB       float64 `json:"wal_size_mb"`
-	// resource time-series (sampler): peak vs after-idle, to show reclamation
+	// Resource time-series (sampler): peak vs the snapshot after a short,
+	// fixed post-workload idle. That snapshot does not imply that the 60-second
+	// storage janitor has run.
 	RSSPeakMB       float64  `json:"rss_peak_mb"`
 	RSSFinalMB      float64  `json:"rss_final_mb"`
 	HeapInusePeakMB float64  `json:"heap_inuse_peak_mb"`
 	HeapReleasedMB  float64  `json:"heap_released_mb"`
 	DBPeakMB        float64  `json:"db_peak_mb"`  // db+wal peak (during load)
-	DBFinalMB       float64  `json:"db_final_mb"` // db+wal after drain+idle
+	DBFinalMB       float64  `json:"db_final_mb"` // db+wal after the short post-workload idle
 	FileBytesPerMsg float64  `json:"file_bytes_per_msg"`
 	Series          []sample `json:"series,omitempty"`
 	Note            string   `json:"note,omitempty"`
@@ -236,9 +244,9 @@ func main() {
 		{Name: "size_1KB", Kind: "produce", P: 4, Msg: 1024},
 		{Name: "size_4KB", Kind: "produce", P: 4, Msg: 4096},
 		{Name: "size_16KB", Kind: "produce", P: 4, Msg: 16384},
-		// ── DB file bloat + reclamation: fill then drain, does the file shrink? ──
+		// ── DB file footprint: fill exactly once, drain, then take a short-idle snapshot ──
 		{Name: "bloat_50k", Kind: "bloat", Prefill: 50_000, Batch: 64, Msg: *msg},
-		// ── Load ramp: load up then down; memory/file reclamation after idle ──
+		// ── Load ramp: load up then down; memory/file state after a short idle ──
 		{Name: "rampdown_4x4", Kind: "rampdown", P: 4, C: 4, Msg: *msg},
 		{Name: "churn_consumers", Kind: "churn", P: 4, C: 4, Msg: *msg},
 		// Queue lifecycle churn is opt-in through -only. It deliberately creates
@@ -252,6 +260,7 @@ func main() {
 		runtime.GOMAXPROCS(0), *dur, *msg, runtime.GOOS == "linux")
 
 	var results []Result
+	failed := false
 	for _, s := range scens {
 		if s.Kind == "lifecycle" && *only == "" {
 			continue
@@ -259,13 +268,21 @@ func main() {
 		if *only != "" && !strings.Contains(s.Name, *only) {
 			continue
 		}
-		r := run(s)
+		r, err := run(s)
 		results = append(results, r)
+		status := "done"
+		if err != nil {
+			failed = true
+			status = "fail"
+		}
 		// incremental line so a later OOM (e.g. on a 256MB cloud box) does not lose
 		// the scenarios that already finished
-		fmt.Printf("[done] %-16s ops/s=%-7s p99us=%-7d wB/op=%-6.0f rssPeak=%4.0fM rssEnd=%4.0fM dbPeak=%5.1fM dbEnd=%5.1fM\n",
-			r.Name, hnum(r.OpsPerSec), r.P99us, r.WriteBytesPerOp,
+		fmt.Printf("[%s] %-16s ops/s=%-7s p99us=%-7d wB/op=%-6.0f rssPeak=%4.0fM rssIdle=%4.0fM dbPeak=%5.1fM dbIdle=%5.1fM\n",
+			status, r.Name, hnum(r.OpsPerSec), r.P99us, r.WriteBytesPerOp,
 			r.RSSPeakMB, r.RSSFinalMB, r.DBPeakMB, r.DBFinalMB)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "benchmark %s failed: %v\n", r.Name, err)
+		}
 	}
 
 	printTable(results)
@@ -275,16 +292,19 @@ func main() {
 		"meta": map[string]any{
 			"gomaxprocs": runtime.GOMAXPROCS(0), "duration_s": dur.Seconds(),
 			"msg_size": *msg, "goos": runtime.GOOS, "goarch": runtime.GOARCH,
-			"num_cpu": runtime.NumCPU(),
+			"num_cpu": runtime.NumCPU(), "post_workload_idle_s": postWorkloadIdle.Seconds(),
 		},
 		"results": results,
 	}, "", "  "); err == nil {
 		_ = os.WriteFile(*outPath, b, 0o644)
 		fmt.Printf("\nresults written to %s\n", *outPath)
 	}
+	if failed {
+		os.Exit(1)
+	}
 }
 
-func run(s scen) Result {
+func run(s scen) (Result, error) {
 	remote := *dbDSN != ""
 	var dbPath, dbArg, q string
 	if remote {
@@ -306,11 +326,13 @@ func run(s scen) Result {
 		Synchronous:       s.Sync,
 	})
 	if err != nil {
-		return Result{Name: s.Name, Note: "open error: " + err.Error()}
+		return Result{Name: s.Name, Note: "open error: " + err.Error()}, err
 	}
 	defer eng.Close()
 	if s.Kind != "lifecycle" {
-		_ = eng.CreateQueue(ctx, q, engine.QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 1000})
+		if err := eng.CreateQueue(ctx, q, engine.QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 1000}); err != nil {
+			return Result{Name: s.Name, Kind: s.Kind, Note: "create queue error: " + err.Error()}, err
+		}
 	}
 
 	res := Result{Name: s.Name, Kind: s.Kind, Producers: s.P, Consumers: s.C,
@@ -321,8 +343,13 @@ func run(s scen) Result {
 	if *prefillCap > 0 && prefillN > *prefillCap {
 		prefillN = *prefillCap
 	}
+	prefilled := 0
 	if prefillN > 0 {
-		prefill(ctx, eng, q, prefillN, s.Batch, s.Msg)
+		prefilled, err = prefill(ctx, eng, q, prefillN, s.Batch, s.Msg)
+		if err != nil {
+			res.Note = "prefill error: " + err.Error()
+			return res, err
+		}
 	}
 
 	runtime.GC()
@@ -331,6 +358,11 @@ func run(s scen) Result {
 	p0 := readProc()
 	samp := newSampler(dbPath, 200*time.Millisecond)
 	samp.start()
+	if prefilled > 0 {
+		// Make the full-backlog footprint deterministic even when a small prefill
+		// drains before the first periodic sample.
+		samp.snap()
+	}
 	t0 := time.Now()
 
 	var ops int64
@@ -350,7 +382,7 @@ func run(s scen) Result {
 	case "props":
 		ops, h = propsRun(ctx, eng, q, *dur, s.P, s.Batch, s.Msg)
 	case "bloat":
-		ops, h = bloatRun(ctx, eng, q, prefillN, s.Batch, s.Msg)
+		ops, h, workloadErr = bloatRun(ctx, eng, q, prefilled)
 	case "rampdown":
 		ops, h = rampDownRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
 	case "churn":
@@ -376,13 +408,14 @@ func run(s scen) Result {
 	p1 := readProc()
 	runtime.ReadMemStats(&m1)
 
-	// ── reclamation phase: idle so background settles, force GC + return memory
-	// to the OS, re-measure. RSS-final vs RSS-peak shows whether memory is freed;
-	// DB-final vs DB-peak shows whether the file shrinks once the queue empties. ──
-	time.Sleep(1500 * time.Millisecond)
+	// ── Short post-workload snapshot: pause briefly, force GC + return memory
+	// to the OS, then re-measure. This 1.9-second window is intentionally shorter
+	// than the 60-second storage-janitor interval, so DB-final is an immediate
+	// post-idle state rather than evidence of background page reclamation. ──
+	time.Sleep(postWorkloadIdleBeforeGC)
 	runtime.GC()
 	debug.FreeOSMemory()
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(postWorkloadIdleAfterGC)
 	samp.stop()
 	fin := samp.snap()
 	rssPeak, heapPeak, dbPeak := samp.peaks()
@@ -430,11 +463,11 @@ func run(s scen) Result {
 			res.FileBytesPerMsg = float64(dbPeak) / float64(ops)
 		}
 	case "bloat":
-		if prefillN > 0 {
-			res.FileBytesPerMsg = float64(dbPeak) / float64(prefillN)
+		if prefilled > 0 {
+			res.FileBytesPerMsg = float64(dbPeak) / float64(prefilled)
 		}
 	}
-	return res
+	return res, workloadErr
 }
 
 // ── workloads ────────────────────────────────────────────────────────────────
@@ -627,7 +660,7 @@ func drain(ctx context.Context, eng *engine.Engine, q string, C int) (int64, *hi
 	return total, mergeAll(hs)
 }
 
-func prefill(ctx context.Context, eng *engine.Engine, q string, n, batch, msg int) {
+func prefill(ctx context.Context, eng *engine.Engine, q string, n, batch, msg int) (int, error) {
 	if batch <= 0 {
 		batch = 64
 	}
@@ -636,9 +669,22 @@ func prefill(ctx context.Context, eng *engine.Engine, q string, n, batch, msg in
 	for i := range ms {
 		ms[i] = engine.OutMessage{Body: b}
 	}
-	for i := 0; i < n; i += batch {
-		eng.Send(ctx, q, ms...)
+	prefilled := 0
+	for prefilled < n {
+		remaining := n - prefilled
+		if remaining > batch {
+			remaining = batch
+		}
+		seqs, err := eng.Send(ctx, q, ms[:remaining]...)
+		if err != nil {
+			return prefilled, fmt.Errorf("send batch after %d of %d messages: %w", prefilled, n, err)
+		}
+		if len(seqs) != remaining {
+			return prefilled, fmt.Errorf("send batch after %d of %d messages returned %d sequence numbers for %d messages", prefilled, n, len(seqs), remaining)
+		}
+		prefilled += len(seqs)
 	}
+	return prefilled, nil
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -680,10 +726,11 @@ func printTable(rs []Result) {
 }
 
 // printResourceTable shows the memory + disk story the throughput table omits:
-// peak vs after-idle RSS/heap (reclamation) and DB-file peak vs final (bloat).
+// peak vs the snapshot after a short 1.9-second idle. The storage janitor runs
+// every 60 seconds, so these columns do not claim background file reclamation.
 func printResourceTable(rs []Result) {
 	fmt.Printf("\n%-16s %8s %8s %9s %8s %8s %8s %10s\n",
-		"scenario", "rssPeak", "rssEnd", "heapPeak", "heapRel", "dbPeak", "dbEnd", "fileB/msg")
+		"scenario", "rssPeak", "rssIdle", "heapPeak", "heapRel", "dbPeak", "dbIdle", "fileB/msg")
 	fmt.Println(strings.Repeat("-", 92))
 	for _, r := range rs {
 		fmt.Printf("%-16s %7.1fM %7.1fM %8.1fM %7.1fM %7.1fM %7.1fM %10.0f\n",

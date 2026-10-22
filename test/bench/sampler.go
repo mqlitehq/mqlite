@@ -53,7 +53,9 @@ type sample struct {
 
 // sampler polls RSS + Go heap + DB/WAL file sizes on an interval, in the
 // background, so a scenario gets a memory/disk time-series (not a single
-// end-snapshot) and we can see growth vs reclamation across an idle phase.
+// end-snapshot) and we can compare load with the short post-workload idle. The
+// default idle is shorter than the storage janitor interval, so the series does
+// not by itself demonstrate background page reclamation.
 type sampler struct {
 	dbPath   string
 	interval time.Duration
