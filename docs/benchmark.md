@@ -85,11 +85,13 @@ part of this repository. Reproduce cloud measurements by deploying the committed
 `test/bench/Dockerfile` with your own explicit machine, region, volume and cleanup
 configuration, and record those inputs with the result.
 
-Each scenario runs `dur` seconds (here 3s), then an **idle + GC + FreeOSMemory**
-phase so we can measure what is *reclaimed*. A 200 ms background sampler records
-RSS + Go heap + DB/WAL file sizes the whole time; each scenario prints a `[done]`
-line as it finishes (so a constrained box that runs out of time still yields the
-scenarios that completed).
+Time-driven scenarios run for `dur` (3 seconds in the historical matrix); the
+fixed-volume drain and bloat scenarios instead run until their capped prefill is
+accounted for. Every scenario then enters an **idle + GC + FreeOSMemory** phase so
+we can measure what is *reclaimed*. A 200 ms background sampler records RSS + Go
+heap + DB/WAL file sizes throughout, and each scenario prints a `[done]` or `[fail]`
+line as it finishes (so a constrained box that stops early still leaves diagnostics
+for the scenarios already attempted).
 
 The runner fails closed on workload operation errors: fixed-volume drains must match
 their exact prefill, mixed workloads reconcile accepted messages with completed plus
