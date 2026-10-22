@@ -1517,6 +1517,112 @@ func TestReceiveAttemptExpiryAfterWriterWait(t *testing.T) {
 	}
 }
 
+func TestReceiveAttemptUsesOneExpiryInstantForGuardAndReplay(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	seqs, err := e.Send(ctx, "q", OutMessage{Body: []byte("replay")}, OutMessage{Body: []byte("untouched")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "boundary"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(first) != 1 || first[0].SeqNumber != seqs[0] {
+		t.Fatalf("initial receive=%+v, %v", first, err)
+	}
+	q, err := e.loadQueue(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := atomic.LoadInt64(clock) + 2
+	if _, err := e.db.exec(ctx,
+		`UPDATE receive_attempts SET expires_at=? WHERE queue='q' AND attempt_id=?`, boundary, attemptID); err != nil {
+		t.Fatal(err)
+	}
+	// The first claim instant is boundary-1, so its UPDATE sees a live attempt.
+	// Queue classification advances to boundary. Reusing that later instant for
+	// lookup would miss the record and return an empty batch.
+	tick := boundary - 2
+	e.now = func() int64 { return atomic.AddInt64(&tick, 1) }
+	replay, err := e.claimRound(ctx, q, 1, PeekLock, attemptID)
+	if err != nil || len(replay) != 1 || replay[0].SeqNumber != first[0].SeqNumber || replay[0].LockToken != first[0].LockToken {
+		t.Fatalf("boundary replay=%+v, %v; want original %+v", replay, err, first)
+	}
+	if tick < boundary {
+		t.Fatalf("test did not cross attempt expiry: clock=%d boundary=%d", tick, boundary)
+	}
+	var state string
+	var deliveries int
+	if err := e.db.queryRowScan(ctx, []any{&state, &deliveries},
+		`SELECT state,delivery_count FROM messages WHERE id=?`, seqs[1]); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(StateActive) || deliveries != 0 {
+		t.Fatalf("replay claimed the next message: state=%s delivery_count=%d", state, deliveries)
+	}
+}
+
+func TestClaimRefreshesStaleCachedConfiguration(t *testing.T) {
+	t.Run("lease", func(t *testing.T) {
+		ctx := context.Background()
+		e, _ := testEngine(t)
+		const currentLease = 9_000
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: currentLease})
+		seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("lease")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		current, err := e.loadQueue(ctx, "q")
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := current
+		stale.lockDurationMs = 1_000
+		msgs, err := e.claimRound(ctx, stale, 1, PeekLock, "")
+		if err != nil || len(msgs) != 1 || msgs[0].SeqNumber != seq {
+			t.Fatalf("claim=%+v, %v", msgs, err)
+		}
+		if got := msgs[0].LockedUntilMs - e.now(); got != currentLease {
+			t.Fatalf("lease=%dms, want refreshed %dms", got, currentLease)
+		}
+	})
+
+	t.Run("strict_fifo", func(t *testing.T) {
+		ctx := context.Background()
+		e, _ := testEngine(t)
+		mustQueue(t, e, "q", QueueConfig{Ordering: OrderStrictFIFO})
+		seqs, err := e.Send(ctx, "q",
+			OutMessage{Body: []byte("head"), GroupID: "a"},
+			OutMessage{Body: []byte("blocked"), GroupID: "b"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		head := recvOne(t, e, "q")
+		if head.SeqNumber != seqs[0] {
+			t.Fatalf("head=%d, want %d", head.SeqNumber, seqs[0])
+		}
+		current, err := e.loadQueue(ctx, "q")
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := current
+		stale.ordering = OrderStandard
+		msgs, err := e.claimRound(ctx, stale, 1, PeekLock, "")
+		if err != nil || len(msgs) != 0 {
+			t.Fatalf("stale standard config bypassed strict head: %+v, %v", msgs, err)
+		}
+		var state string
+		var deliveries int
+		if err := e.db.queryRowScan(ctx, []any{&state, &deliveries},
+			`SELECT state,delivery_count FROM messages WHERE id=?`, seqs[1]); err != nil {
+			t.Fatal(err)
+		}
+		if state != string(StateActive) || deliveries != 0 {
+			t.Fatalf("blocked message changed: state=%s delivery_count=%d", state, deliveries)
+		}
+	})
+}
+
 func TestClaimBatchTTLBetweenItems(t *testing.T) {
 	for _, path := range []string{"plain", "attempt", "deferred"} {
 		t.Run(path, func(t *testing.T) {
