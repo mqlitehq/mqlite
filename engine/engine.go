@@ -294,7 +294,7 @@ func (e *Engine) DeleteQueue(ctx context.Context, name string) error {
 // (CreateQueue, Subscribe) keep the name guards and insert atomic.
 //
 // Queue, subscription and topic names share ONE flat namespace and must stay
-// disjoint (review F2 / MQLITE-57): a queue and topic sharing one address would
+// disjoint (MQLITE-57): a queue and topic sharing one address would
 // make Send routing ambiguous. Refuse the collision at creation so every valid
 // name has exactly one meaning.
 // The upsert path for an existing queue of the same name stays open ONLY for
@@ -414,11 +414,10 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 // share a namespace and same-name creation conflicts):
 //   - the subscription name must not belong to a plain queue or to a different
 //     topic's subscription — reusing it would silently merge two delivery
-//     targets into one backing queue (pub/sub isolation breach, eval report r2
-//     §architecture/P0-3);
+//     targets into one backing queue (a pub/sub isolation breach);
 //   - the TOPIC name must not belong to any existing queue or subscription —
 //     otherwise queue and fan-out routing would share one address and a Send
-//     could not resolve it unambiguously (review F2);
+//     could not resolve it unambiguously;
 //   - topic == name is rejected: it would make the backing queue's own name
 //     resolve as the topic.
 //

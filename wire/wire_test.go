@@ -99,12 +99,12 @@ func TestDeleteQueueJSONContract(t *testing.T) {
 		{body: `{"deleted":"false","state":"deleting"}`},
 		{body: `{"deleted":false,"state":"deleting"}{}`},
 	} {
-		got, decodeErr := wire.DecodeDeleteQueueResponse([]byte(tc.body))
+		got, decodeErr := wire.DecodeDeleteResponse([]byte(tc.body))
 		if tc.ok && (decodeErr != nil || got != tc.want) {
-			t.Errorf("DecodeDeleteQueueResponse(%s) = %+v, %v; want %+v", tc.body, got, decodeErr, tc.want)
+			t.Errorf("DecodeDeleteResponse(%s) = %+v, %v; want %+v", tc.body, got, decodeErr, tc.want)
 		}
 		if !tc.ok && decodeErr == nil {
-			t.Errorf("DecodeDeleteQueueResponse(%s) accepted %+v", tc.body, got)
+			t.Errorf("DecodeDeleteResponse(%s) accepted %+v", tc.body, got)
 		}
 	}
 }
@@ -185,20 +185,12 @@ func TestSubscriptionLifecycleJSONContract(t *testing.T) {
 	if string(legacyResponse) != `{"subscriptions":[{"topic":"events","name":"worker"}]}` {
 		t.Fatalf("legacy response = %s", legacyResponse)
 	}
-
-	for _, body := range []string{`{"deleted":true,"state":"deleted"}`, `{"deleted":false,"state":"deleting"}`} {
-		generic, genericErr := wire.DecodeDeleteResponse([]byte(body))
-		legacy, legacyErr := wire.DecodeDeleteQueueResponse([]byte(body))
-		if genericErr != nil || legacyErr != nil || generic != legacy {
-			t.Fatalf("shared deletion acknowledgement %s = %+v/%v, %+v/%v", body, generic, genericErr, legacy, legacyErr)
-		}
-	}
 }
 
-func TestReadDeleteQueueResponseBound(t *testing.T) {
-	for _, size := range []int{0, 1, wire.MaxDeleteQueueResponseBytes, wire.MaxDeleteQueueResponseBytes + 1} {
-		data, err := wire.ReadDeleteQueueResponse(strings.NewReader(strings.Repeat("x", size)))
-		if size > wire.MaxDeleteQueueResponseBytes {
+func TestReadDeleteResponseBound(t *testing.T) {
+	for _, size := range []int{0, 1, wire.MaxDeleteResponseBytes, wire.MaxDeleteResponseBytes + 1} {
+		data, err := wire.ReadDeleteResponse(strings.NewReader(strings.Repeat("x", size)))
+		if size > wire.MaxDeleteResponseBytes {
 			if err == nil || data != nil {
 				t.Fatal("oversized response accepted or partially returned")
 			}
@@ -206,7 +198,7 @@ func TestReadDeleteQueueResponseBound(t *testing.T) {
 			t.Fatalf("bounded response rejected: size=%d err=%v", size, err)
 		}
 	}
-	data, err := wire.ReadDeleteQueueResponse(failedKeyResponseReader{})
+	data, err := wire.ReadDeleteResponse(failedKeyResponseReader{})
 	if err == nil || data != nil || strings.Contains(err.Error(), "partial-secret") {
 		t.Fatal("truncated response returned partial content")
 	}
