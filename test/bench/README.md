@@ -54,6 +54,13 @@ result-file operation fails; a printed `[fail]` line or nonzero exit means parti
 numbers are diagnostic only. Unprefixed queues and queues from another run namespace
 are never cleanup targets.
 
+Remote timings depend on region, network path, and backend load; each enqueue also
+includes a durable Hrana commit round trip. See the repository's
+[benchmark methodology and shipped results](../../docs/benchmark.md). Historical
+comparison reports or raw runs kept outside this repository are external evidence:
+they are not available or reproducible from a source checkout unless supplied
+separately.
+
 ## Scenarios
 
 produce ×{1,4,8 producers} · batch ×{16,64} · e2e(4×4) · drain(200k prefill, then empty)
@@ -76,6 +83,12 @@ convergence latency, and peak live payload; the standard sampler records DB/WAL,
 RSS, CPU, and write amplification. Generic `ops/s` is fully converged queue
 lifecycles per second, while the generic latency columns are force-delete
 acknowledgement latency.
+
+For results and analysis shipped with the code, see
+[docs/benchmark.md](../../docs/benchmark.md). Generated files under
+`test/bench/out/` describe only the local run that produced them. Any report or raw
+dataset kept outside this repository is external evidence and must identify its
+own source revision, environment, and collection method before comparison.
 
 > Record the host architecture, virtualization, and emulation alongside results.
 > The in-process probe adds overhead to microsecond-scale operations.

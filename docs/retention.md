@@ -1,19 +1,22 @@
 # Retention, deletion, and storage reclamation
 
 This page describes the implemented behavior on `main`, an unreleased v0.4.0
-candidate. The latest supported release is v0.3.2; it has the DLQ retention and
-local reclamation behavior below, but it does not have the candidate queue and
-subscription lifecycle APIs.
+candidate. The latest supported release is v0.3.2; the v0.3.3 artifacts are
+withdrawn, while `main`'s retraction directive will become visible to Go module
+tools only after a later version containing it is tagged. v0.3.2 has the DLQ
+retention and local reclamation behavior below, but it does not have the candidate
+queue and subscription lifecycle APIs.
 
 ## What removes retained messages
 
-MQLite is at-least-once during normal delivery. A durable message stays retained
-until a documented lifecycle action removes or moves it:
+Default Peek-Lock delivery is at-least-once. Receive-and-delete is the explicit
+at-most-once alternative and removes a message before returning it. A durable
+message stays retained until a documented lifecycle action removes or moves it:
 
 | Stored state | Normal lifecycle | Other authorized removal |
 |---|---|---|
 | `active` | Receive, then Complete or receive-and-delete | message TTL with discard; forced queue/subscription deletion; subscription expiry |
-| `locked` | Complete, or lock expiry returns it to `active` / moves it to the DLQ at the delivery limit | forced queue/subscription deletion; subscription expiry |
+| `locked` | Complete, or lock expiry returns it to `active` / moves it to the DLQ at the delivery limit | message TTL with discard; forced queue/subscription deletion; subscription expiry |
 | `deferred` | ReceiveDeferred, then settle | message TTL with discard; forced queue/subscription deletion; subscription expiry |
 | `scheduled` | activation at its due time, or Cancel | message TTL with discard; forced queue/subscription deletion; subscription expiry |
 | `dead_lettered` | Redrive or Purge | configured DLQ retention; forced queue/subscription deletion; subscription expiry |
@@ -28,9 +31,11 @@ own bounded cleanup. They are operational replay metadata, not a message archive
 
 ## DLQ retention
 
-`mqlite serve` bounds dead letters by default. Every 60 seconds the retention
-worker deletes the oldest matching dead letters in bounded batches. It never
-deletes active, locked, deferred, or scheduled rows.
+`mqlite serve` applies default retention targets to dead letters. Every 60 seconds
+the retention worker deletes the oldest matching dead letters in bounded batches.
+These are asynchronous cleanup targets, not admission limits: a queue can
+temporarily exceed its age, count, or byte target between passes or while cleanup
+catches up. The worker never deletes active, locked, deferred, or scheduled rows.
 
 | Setting | Broker default | Meaning |
 |---|---:|---|
@@ -76,10 +81,12 @@ completion path; TTL is a forgotten-cleanup backstop.
 An accepted deletion first commits the resource as `deleting`. The name stays
 reserved while restart-safe cleanup removes its rows. The foreground request
 removes at most 1,000 rows and targets about 8 MiB. Each continuation pass removes
-at most 4,096 rows and targets about 8 MiB across at most 32 local resources, or
-one resource on remote Turso/libSQL. Empty subscriptions also use a set-based path
-that removes at most 512 mappings in one transaction. One oversized row may exceed
-the byte target so cleanup can still make progress.
+at most 4,096 physical rows and targets about 8 MiB. Its ordinary path visits at
+most 32 local resources with retained state, or one such resource on remote
+Turso/libSQL. A separate set-based path can finalize up to 512 empty subscriptions
+without consuming that 32-or-1 resource-count allowance; their mapping and backing
+queue rows still consume the shared row budget. One oversized row may exceed the
+byte target so cleanup can still make progress.
 
 The default subscription capacity is 10,000 active plus deleting mappings. A
 mapping continues to occupy a slot until physical cleanup finishes. Large forced
@@ -137,5 +144,7 @@ MQLite has no built-in archive sink. An operator can use existing operations:
    queue whose consumer writes each message to the archive before completing it.
 
 Peek is non-destructive and does not make the export and purge one transaction.
-Applications that require an atomic archival handoff should Redrive to a dedicated
-queue and make the archive consumer idempotent.
+Redrive moves each selected internal batch atomically: source deletion and target
+insertion commit together. Delivery from the dedicated queue to an external
+archive remains at-least-once, so the archive consumer must be idempotent; Redrive
+does not make the external archival handoff one transaction.

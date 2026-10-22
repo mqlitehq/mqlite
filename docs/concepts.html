@@ -247,7 +247,13 @@
             original lease expires.</p>
           <p><b>The DLQ is not another queue</b> — it is the same queue's
             <code>state='dead_lettered'</code> sub-state, worked with
-            <code>peek</code> / <code>redrive</code> / <code>purge</code>.</p>
+            <code>peek</code> / <code>redrive</code> / <code>purge</code>. Retention
+            targets are applied asynchronously in bounded background passes, so a
+            DLQ can temporarily exceed them while cleanup catches up.</p>
+          <p><b>Redrive atomicity is internal.</b> Each database batch moves
+            completely or not at all, including source deletion plus target insertion
+            for a cross-queue move. Consumers still receive redriven work at least
+            once, so handlers and external effects must remain idempotent.</p>
         </div>
       </div>
 

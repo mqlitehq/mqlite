@@ -27,7 +27,7 @@ do not establish a safe backlog threshold or the current release image size.
 │ memory      │ 19 MB idle               │ 256 MB used in the historical test   │
 │             │ 38 MB @ 50k msgs queued  │ validate current peak memory first   │
 │             │                          │ no universal backlog threshold        │
-│ disk        │ ~0.4 KB / 256 B message  │ 1 GB volume  (~2M messages)           │
+│ disk        │ ~0.4 KB / 256 B message  │ 1 GB volume  (~1.1M planned msgs)     │
 │             │ + ~4 MB WAL (constant)   │   size = backlog × 0.6 KB × 1.5       │
 │ vCPU        │ tiny/op; 1000s/s batched │ 1 shared vCPU in the measured setup   │
 │ image       │ 10.9 MiB static binary   │ distroless/scratch ≈ 15 MB image,     │
@@ -290,13 +290,12 @@ sample, while `summary.json.final_maintenance` is the post-close terminal state.
 A runner cancellation or outer test timeout can interrupt final cleanup; the
 next run's `TestMain` reset and namespaced startup cleanup remove that residue.
 
-The first-to-last window change is descriptive and has no performance threshold.
-GitHub-hosted runner placement, shared CPU and network path add noise, so this is
-a stability and trend test rather than an SLA or capacity result. Turso does not
-expose physical database or WAL file sizes through this client; those JSON fields
-are `null`, never a misleading zero. Settlement receipts have 30-minute
-retention, so a 30-minute run's final receipt count is a current retention
-snapshot rather than a lifetime completion total.
+The first-to-last window change is descriptive and has no performance threshold
+because GitHub-hosted runner placement, shared CPU and network path add noise.
+Turso does not expose physical database or WAL file sizes through this client;
+those JSON fields are `null`, never a misleading zero. Settlement receipts have
+30-minute retention, so a 30-minute run's final receipt count is a current
+retention snapshot rather than a lifetime completion total.
 
 ## 1 · Throughput & write amplification
 
@@ -466,6 +465,7 @@ contention uses the bounded retry policy described in [turso.md](turso.md).
 6. **NORMAL vs FULL** is an ~11× durability dial (local); pick per host failure model.
 7. **Properties are affordable**; large bodies are byte-bound and storage-linear.
 
-_Raw data: `test/bench/out/results.json` (local) and the `mqlite-bench` Fly logs
-(cloud, 14 scenarios captured before the heaviest 200k-prefill scenarios on the
-1-core box)._
+The historical source artifacts were captured in `test/bench/out/results.json`
+and the `mqlite-bench` Fly logs; they are not shipped in this repository. Treat
+the table as historical evidence and rerun the commands above before using the
+numbers for a current deployment decision.

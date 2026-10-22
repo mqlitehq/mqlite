@@ -97,13 +97,17 @@ Every transition, with its trigger and the condition under which it fires:
 | active / locked / deferred / scheduled | TTL expiry | ✗ removed | queue has `dead_letter_on_expire=0` (discard) |
 | dead_lettered | `Redrive` | active | back to this (or a target) queue; `count` reset to 0 |
 | dead_lettered | `Purge` | ✗ removed | manual deletion |
-| dead_lettered | DLQ retention | ✗ removed | background janitor bounds (age / count / bytes); touches **only** dead-letter rows |
+| dead_lettered | DLQ retention | ✗ removed | asynchronous background cleanup targets age / count / bytes and can temporarily lag; touches **only** dead-letter rows |
 
 - **The DLQ is not a separate queue.** It is messages in the same queue with
   `state='dead_lettered'`. A message lands there when its `delivery_count` reaches
   `max_delivery_count` (i.e. `≥`), on an explicit `reject`, or on TTL expiry (when the
   queue's `dead_letter_on_expire=1`). Inspect with `peek state=dead_lettered`, send back
   with `redrive`, or delete with `purge`.
+- **Redrive atomicity is internal.** Each database batch moves completely or not at
+  all, including source deletion plus target insertion for a cross-queue move.
+  Consumers still receive redriven work at least once, so handlers and external
+  effects must remain idempotent.
 - **Lease deadlines fence every settlement and renewal.** A new effect requires the
   current token and `locked_until_ms > now`; equality is expired, even before the
   reaper runs. Renew before that deadline. A live receipt can replay an already

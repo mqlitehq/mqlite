@@ -25,7 +25,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_DIAGNOSTIC_LOG` | optional private rotating JSONL failure/recovery log path for `serve`; parent must exist; use persistent storage |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_MAX_SUBSCRIPTIONS` | active plus deleting subscription capacity (default 10,000; embedded/serve and direct embedded CLI commands) |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous broker DLQ retention targets (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
 
 The DB string is **never compiled in** — it comes from the environment. The endpoint comes
 from the environment too, or from `--endpoint` (below), which overrides it.

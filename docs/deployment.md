@@ -23,7 +23,7 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_METRICS` | v0.3.2+: opt-in authenticated `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
 | `MQLITE_MAX_SUBSCRIPTIONS` | main / planned v0.4.0: active plus deleting subscription capacity (default 10,000); pending cleanup continues to occupy a slot |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | DLQ retention bounds (defaults 14d / 1,000,000 per queue; byte cap off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous DLQ retention targets (defaults 14d / 1,000,000 per queue; byte target off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
 | `MQLITE_UI` | serve the embedded admin console at `/ui` (default on; `off` runs headless) |
 
@@ -49,9 +49,13 @@ and error reference: [api-reference.md](api-reference.md).
 
 > **Version and upgrade compatibility.**
 > The latest supported release is **v0.3.2**, with default port **6754** and
-> schema token **5**. v0.3.3 is retracted. Pin the exact v0.3.2 binary or image;
+> schema token **5**. The v0.3.3 release artifacts are withdrawn. Pin the exact
+> v0.3.2 binary or image;
 > do not select v0.3.3, and do not rely on a moving image alias to choose a
 > production version.
+>
+> `main` declares `retract v0.3.3`, but Go module tools will discover that
+> directive only after a later version containing it is tagged.
 >
 > The `main` branch is an unreleased v0.4.0 candidate with schema token 7. It
 > cannot open a v0.3.x database and no in-place migration exists. Schema 6 was
@@ -220,7 +224,7 @@ Follow the [production runbook](operations.md#consistent-backups) for read-only
 online snapshots, offline directory copies, isolated restore validation and rollback.
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
-**v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and retracted
+**v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and withdrawn
 v0.3.3 use schema 5; `main`, the unreleased v0.4.0 candidate, uses schema 7.**
 Intermediate untagged lifecycle builds used schema 6. There is no in-place
 migration between these tokens. Before testing a different token, account for

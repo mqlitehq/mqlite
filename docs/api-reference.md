@@ -25,7 +25,9 @@ values replace earlier ones, while repeated object and map values may merge.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
-- **At-least-once:** normal delivery may repeat, so consumers must be idempotent.
+- **Delivery mode:** default Peek-Lock delivery is at-least-once and may repeat,
+  so consumers must be idempotent. Receive-and-delete is an explicit at-most-once
+  path that removes a message before returning it.
   Message TTL configured to discard, DLQ retention, forced resource deletion and
   fixed subscription expiry are explicit removal paths; see
   [retention.md](retention.md).
@@ -438,8 +440,9 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 ### DeleteQueue
 
 The corrected name-only contract below is on **main** and planned for v0.4.0. The
-incompatible request shape from v0.3.3 was withdrawn and that module version is
-retracted.
+incompatible request shape and v0.3.3 release artifacts were withdrawn. `main`
+declares `retract v0.3.3`, but Go module tools will discover that directive only
+after a later version containing it is tagged.
 
 Deletes a **plain queue**. Requires administrator/manage permission. The default
 is empty-only; force is a separate, explicit authorization to discard retained
@@ -468,12 +471,15 @@ work.
   cleanup needs no follow-up delete.
 - One foreground call removes at most 1,000 physical queue-owned rows and targets
   about 8 MiB. A single larger row is still removed so cleanup can progress. A
-  pending delete wakes a background pass that globally caps cleanup at 4,096 rows,
-  about 8 MiB and 32 queues on a local store. Further passes are paced one second
-  apart; an idle broker does not poll for lifecycle work. A remote Turso/libSQL pass handles one queue,
-  which bounds network round trips inside the write transaction. The persisted
-  cursor rotates through pending names fairly on both backends, so a large or
-  bursty deletion cannot monopolize the single writer.
+  pending delete wakes a background pass that globally caps cleanup at 4,096 rows
+  and targets about 8 MiB. The ordinary path visits at most 32 loaded resources on
+  a local store or one loaded resource on remote Turso/libSQL, bounding remote
+  round trips inside the write transaction. A separate set-based path can finalize
+  up to 512 empty subscriptions without using that resource-count allowance; its
+  mapping and backing rows still use the shared row budget. Further passes are
+  paced one second apart; an idle broker does not poll for lifecycle work. The
+  persisted cursor rotates through pending names fairly on both backends, so a
+  large or bursty deletion cannot monopolize the single writer.
   Startup resumes one bounded pass before crash recovery. The row and name vanish
   only after messages, deduplication, settlement receipts and receive-attempt
   records are gone. Message sequence numbers are not reset, and process event
@@ -586,6 +592,10 @@ Config is **queue-level**: it's set here, not per `Send`/`Receive`.
 | `dlq_max_age_ms` | int (ms) | `0` = inherit | per-queue DLQ retention override: drop dead letters older than this. `0` inherits the broker default, `-1` = unbounded. See [retention.md](retention.md). |
 | `dlq_max_count` | int | `0` = inherit | keep at most N dead letters (oldest dropped first). `0` inherits, `-1` = unbounded. |
 | `dlq_max_bytes` | int | `0` = inherit | cap total dead-letter **body** bytes. `0` inherits, `-1` = unbounded. |
+
+The DLQ values configure asynchronous retention targets. They do not reject new
+dead letters or synchronously enforce a hard cap, so a queue may temporarily
+exceed them between worker passes or while bounded cleanup catches up.
 
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
@@ -721,7 +731,11 @@ Available on **main** and planned for v0.4.0.
 
 ### Redrive
 
-Move dead-lettered messages back to active (or to another queue).
+Move dead-lettered messages back to active (or to another queue). Each internal
+batch is atomic: a same-queue state change commits as one unit, and a cross-queue
+source deletion commits with its target insertion. With `rate_per_sec`, each
+throttled chunk is a separate atomic batch. Later delivery to a consumer remains
+at-least-once, so handlers and external effects must remain idempotent.
 
 - **Request** `RedriveRequest`: `queue`, `target` (string, optional — cross-queue),
   `max` (int), `older_than_ms` (int), `rate_per_sec` (int). **Response**

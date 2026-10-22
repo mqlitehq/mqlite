@@ -3,7 +3,7 @@
 # mqlite
 
 [![CI](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.3.2.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.3.2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mqlitehq/mqlite)](https://goreportcard.com/report/github.com/mqlitehq/mqlite)
 [![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
 [![Supported release: v0.3.2](https://img.shields.io/badge/release-v0.3.2-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.3.2)
@@ -18,8 +18,10 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
 
-> **Release status:** v0.3.2 is the latest supported release; v0.3.3 is
-> retracted. `main` is an unreleased v0.4.0 candidate. Pin production installs to
+> **Release status:** v0.3.2 is the latest supported release; the v0.3.3 release
+> artifacts are withdrawn. `main` is an unreleased v0.4.0 candidate. Its
+> `retract v0.3.3` directive will be recognized by Go module tools only after a
+> later version containing that directive is tagged. Pin production installs to
 > the exact v0.3.2 release or `ghcr.io/mqlitehq/mqlite:0.3.2`.
 
 ## Goal
@@ -52,7 +54,9 @@ rather than competing with Kafka-scale streaming.
 - **One file, one binary.** Local SQLite (`modernc.org/sqlite`, pure Go) or
   remote **Turso/libSQL** — the *same* SQL and semantics, selected by a
   connection string.
-- **Service Bus semantics, honestly at-least-once.** Peek-Lock + four-way settle
+- **Service Bus semantics with explicit delivery modes.** Peek-Lock is
+  at-least-once; receive-and-delete is the caller-selected at-most-once path.
+  Peek-Lock supports four-way settle
   (`Complete`/`Abandon`/`Reject`/`Defer`), visibility timeout with fencing
   tokens, `delivery_count` → DLQ, `Renew`, scheduled/deferred messages.
 - **Approximate order by default, strict order opt-in.** Plain queues are
@@ -270,7 +274,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_METRICS` | enable authenticated Prometheus `/metrics` on the API port (`on`/`true`/`1`; default `off`); requires administrator auth |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
 | `MQLITE_MAX_SUBSCRIPTIONS` | main / planned v0.4.0: maximum active plus deleting subscriptions (default 10,000) |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous broker DLQ retention targets (defaults 14d / 1,000,000 per queue, drop-oldest; byte target off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
 > The DB connection string is **only ever read from the environment** — it is
 > never compiled into the binary. `.env.example` lists the variables mqlite reads;
@@ -332,39 +336,45 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 
 ## Durability
 
-mqlite stores everything in SQLite/libSQL with **WAL** journaling. State is durable
-across a normal process crash: on restart, in-flight (`locked`) messages are
-reclaimed and redelivered (at-least-once), and settled work stays settled.
+For a local SQLite file, mqlite uses **WAL** journaling. Successfully committed
+state survives a normal process crash when the filesystem provides SQLite's
+required locking and flush semantics: on restart, in-flight (`locked`) messages
+are reclaimed and redelivered (at-least-once), and settled work stays settled.
 
 The one knob is SQLite's `synchronous` level (database-wide — SQLite has no
 per-queue setting):
 
 | Level | Guarantee | Cost |
 |---|---|---|
-| `NORMAL` *(default)* | Durable across an app/process crash. A sudden **OS or power loss** can drop the last few commits not yet checkpointed to the main DB file. | Fast — fsync per WAL checkpoint, not per commit. |
-| `FULL` | Every commit is fsync'd before it returns — survives OS/power loss. | Slower under high enqueue throughput. |
+| `NORMAL` *(default)* | Protects acknowledged commits across an app/process crash. A sudden **OS or power loss** can lose recent commits that were not safely flushed. | Fast — fsync per WAL checkpoint, not per commit. |
+| `FULL` | Requests an fsync before each commit returns; designed to survive OS/power loss when the storage stack honors flushes. | Slower under high enqueue throughput. |
 
 Set it with the embedded option `mqlite.WithSynchronous("FULL")`, or `MQLITE_SYNC=FULL`
 for the `serve`/CLI path. Remote **Turso** DSNs ignore this — durability there is the
 server's responsibility.
 
-> **Durability and retention boundary:** mqlite is honestly **at-least-once**, not
-> exactly-once. Under `NORMAL`, a power cut can lose a handful of just-enqueued
-> messages that hadn't reached disk yet; choose `FULL` if that window is
-> unacceptable. Once a message is durably written, normal delivery retains it
-> until a documented lifecycle action removes it. Explicit force deletion, subscription expiry,
+> **Durability and retention boundary:** default Peek-Lock delivery is
+> **at-least-once**, not exactly-once; receive-and-delete explicitly trades
+> redelivery for at-most-once removal. Under `NORMAL`, a power cut can lose a
+> handful of just-enqueued messages that hadn't reached disk yet; choose `FULL`
+> if that window is unacceptable. Once a message is durably written, normal
+> delivery retains it until a documented lifecycle action removes it. Explicit
+> force deletion, subscription expiry,
 > message TTL with discard, and configured DLQ retention are authorized discard
 > paths; handlers must still tolerate redelivery.
 
 ## Retention
 
 Completed messages are deleted on settle and TTL'd messages expire, so a healthy
-queue's size tracks its in-flight backlog. The one sink that can grow without bound
-is the **dead-letter queue** — so `serve` bounds it by default: a background pass
-drops dead letters oldest-first once they are older than **14 days** or beyond
-**1,000,000 per queue** (`MQLITE_DLQ_MAX_AGE` / `MQLITE_DLQ_MAX_COUNT`; an optional
+queue's size tracks its retained backlog. Active work has no automatic retention
+ceiling and can grow when producers outrun consumers. For dead-lettered work,
+`serve` applies default retention targets: a background pass drops dead letters
+oldest-first once they are older than **14 days** or beyond **1,000,000 per
+queue** (`MQLITE_DLQ_MAX_AGE` / `MQLITE_DLQ_MAX_COUNT`; an optional
 per-queue byte cap `MQLITE_DLQ_MAX_BYTES` is off by default; `MQLITE_DLQ_RETENTION=off`
-disables all). That retention worker touches only dead letters; it never deletes
+disables all). Cleanup is asynchronous and bounded, so a DLQ can temporarily
+exceed an age, count, or byte target between passes or while the worker catches
+up. That retention worker touches only dead letters; it never deletes
 active, locked, deferred, or scheduled work. Other documented lifecycle actions
 can remove retained work: message TTL may discard on expiry, fixed subscription
 TTL authorizes forced cleanup, and explicit force deletion discards the selected
@@ -463,7 +473,10 @@ throughput, memory, and disk methodology and numbers:
 
 The latest supported release is **v0.3.2** (port 6754, schema token 5). Pin
 production binaries to the v0.3.2 release and containers to
-`ghcr.io/mqlitehq/mqlite:0.3.2`; v0.3.3 is retracted.
+`ghcr.io/mqlitehq/mqlite:0.3.2`; the v0.3.3 release artifacts are withdrawn.
+The retraction directive currently exists only on the unreleased `main` branch,
+so Go module tools will not report v0.3.3 as retracted until a later version
+containing that directive is tagged.
 
 The `main` branch is an **unreleased v0.4.0 candidate** with schema token 7. It
 removes v0.3.3's public queue `Generation` contract and adds the corrected resource

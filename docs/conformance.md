@@ -5,10 +5,11 @@ This is the normative spec of how mqlite **must** behave — the invariants that
 hermetic test (cross-referenced); together these are mqlite's TCK. If a change would
 break a **MUST** here, it is a behavior change, not a refactor.
 
-mqlite is honestly **at-least-once** during normal delivery: redelivery is
-possible, so handlers must be idempotent. Documented discard paths include message
-TTL configured to discard, DLQ retention, forced resource deletion, and fixed
-subscription expiry. (§3, §8, §14)
+Default Peek-Lock delivery is **at-least-once**: redelivery is possible, so
+handlers must be idempotent. Receive-and-delete is the caller's explicit
+at-most-once path and removes a message before returning it. Other documented
+discard paths include message TTL configured to discard, DLQ retention, forced
+resource deletion, and fixed subscription expiry. (§1.7, §3, §8, §14)
 
 ## 1 · Peek-Lock lifecycle
 
@@ -166,7 +167,9 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 
 - **8.1** With a bound set, `reapDLQ` MUST drop **oldest-first** dead letters past the
   max age, per-queue count, or per-queue body bytes — and MUST touch **only**
-  `state='dead_lettered'` (never undelivered/in-flight/scheduled work).
+  `state='dead_lettered'` (never undelivered/in-flight/scheduled work). These are
+  asynchronous retention targets rather than admission limits; a DLQ MAY exceed
+  them temporarily between bounded worker passes.
   *(engine/retention_dlq_test.go)*
 - **8.2** With no bound (the engine default), the DLQ is unbounded — no auto-deletion.
   *(engine/retention_dlq_test.go `TestDLQRetentionDisabledByDefault`)*

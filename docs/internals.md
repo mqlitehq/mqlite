@@ -258,9 +258,9 @@ force authorization and never changes on retry, filter update or message activit
 
 The accepting call removes no more than 1,000 physical rows and targets about
 8 MiB. Each lifecycle pass globally caps cleanup at 4,096 rows and targets about
-8 MiB, across at most 32 backing queues
-locally or one queue on remote Turso/libSQL. The remote cap bounds Hrana round
-trips inside one write transaction; the persisted cursor provides fair rotation.
+8 MiB. Its ordinary path visits at most 32 backing queues with retained state
+locally, or one such queue on remote Turso/libSQL. The remote cap bounds Hrana
+round trips inside one write transaction; the persisted cursor provides fair rotation.
 `Open` runs a pass before lock recovery. The marker is therefore both the restart
 cursor and the force authorization. A crash cannot reactivate the queue or require
 an operator to re-authorize discard. A single oversized row may exceed the byte
@@ -271,11 +271,12 @@ idle polling round trip on remote stores. The one exception is a remote deletion
 or cleanup transaction whose commit acknowledgement is uncertain: after the
 immediate pass, the worker performs 30 delayed probes one second apart so a commit
 that becomes visible after the first inventory snapshot is still discovered.
-Restart recovery remains the durable fallback after that window. Metadata work
-uses the same global budget: finalizing a subscription consumes two rows in the
-pass budget, one queue row and one subscription mapping. The common empty case
-deletes up to 512 mappings and backing rows with two set-based statements in one
-transaction, checking exact affected-row counts even when foreign keys are off.
+Restart recovery remains the durable fallback after that window. A separate
+set-based path handles the common empty case before the ordinary resource scan. It
+can delete up to 512 subscription mappings and their backing queue rows in one
+transaction without consuming the ordinary 32-local/1-remote resource-count
+allowance. Those two rows per subscription still consume the shared 4,096-row
+budget. Exact affected-row checks keep this safe even when foreign keys are off.
 Subscriptions with any retained state remain on the ordinary fair row/byte path.
 
 **Crash recovery is one statement.** On `Open`, every `locked` row is an orphan

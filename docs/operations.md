@@ -2,8 +2,10 @@
 
 This runbook covers the latest supported release, v0.3.2 (port 6754, schema
 token 5), and the `main` branch's unreleased v0.4.0 candidate (port 6754, schema
-token 7). v0.3.3 is retracted; pin production deployments to v0.3.2 until a
-corrected release is tagged.
+token 7). The v0.3.3 release artifacts are withdrawn; pin production deployments
+to v0.3.2 until a corrected release is tagged. Although `main` declares
+`retract v0.3.3`, Go module tools will discover that directive only after a later
+version containing it is tagged.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -239,7 +241,7 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
-For a future **v0.3.0, v0.3.1, v0.3.2 or retracted v0.3.3 → v0.4.0**
+For a future **v0.3.0, v0.3.1, v0.3.2 or withdrawn v0.3.3 → v0.4.0**
 cutover, the schema changes
 from **5 → 7** while port **6754** stays unchanged. Durable queue lifecycle and
 fixed subscription-expiry columns and indexes make the database incompatible;

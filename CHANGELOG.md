@@ -12,7 +12,7 @@ upgrade notes before replacing a broker.
 
 ## Unreleased — planned v0.4.0
 
-> **Planned upgrade from v0.3.2 or retracted v0.3.3:** port **6754** remains
+> **Planned upgrade from v0.3.2 or withdrawn v0.3.3:** port **6754** remains
 > unchanged, but
 > the canonical schema token changes from **5 → 7**. There is no in-place
 > migration. Stop writers, take a consistent backup, account for every retained
@@ -21,10 +21,12 @@ upgrade notes before replacing a broker.
 > pin production deployments to v0.3.2. Schema 6 belonged only to intermediate
 > unreleased lifecycle builds and is refused as well; it was never a tagged release.
 >
-> v0.3.3 remains retracted. Its public queue `Generation` contract was removed;
-> this unreleased line addresses resources by name and requires one owner to
-> serialize deletion with same-name recreation. Upgrade the broker, SDK, CLI, MCP and console
-> together when adopting the corrected deletion APIs.
+> The v0.3.3 release artifacts remain withdrawn. `main` contains a retraction
+> directive, but Go module tools will discover it only after a later version
+> containing the directive is tagged. Its public queue `Generation` contract was
+> removed; this unreleased line addresses resources by name and requires one owner
+> to serialize deletion with same-name recreation. Upgrade the broker, SDK, CLI,
+> MCP and console together when adopting the corrected deletion APIs.
 >
 > **Prometheus migration:** the aliases `mqlite_queue_total` and
 > `mqlite_queue_oldest_message_age_ms`, deprecated in v0.3.2, are removed.
@@ -197,10 +199,11 @@ upgrade notes before replacing a broker.
   resumes after a restart; one foreground request removes at most 1,000 physical
   rows/about 8 MiB. Accepted pending deletes wake an event-driven worker, whose
   continuation passes are one second apart and each globally caps cleanup at 4,096
-  rows/about 8 MiB across at most 32 queues locally; idle stores do not poll. Remote Turso/libSQL cleans
-  one queue per pass so network round trips do not extend one write transaction
-  across a large resource batch; the durable cursor still rotates fairly. One
-  individually oversized row may exceed the byte target so cleanup always progresses.
+  rows/about 8 MiB. The ordinary loaded-resource path visits at most 32 queues
+  locally or one queue on remote Turso/libSQL, so network round trips do not extend
+  one write transaction across a large resource batch; the durable cursor still
+  rotates fairly. One individually oversized row may exceed the byte target so
+  cleanup always progresses.
   An uncertain remote delete commit arms a bounded 30-second discovery window;
   normal idle brokers perform no lifecycle polling.
 - Keep the final queue-row retirement bounded even beside an unrelated deep
@@ -233,8 +236,9 @@ upgrade notes before replacing a broker.
   from the engine, HTTP API, Go SDK, CLI, MCP server, console, and documentation.
   Queue identity remains name-only; MQLITE-126 later adds a force-only deletion
   option without bringing lifetime identity into data-plane requests.
-- This is an intentional breaking correction for v0.3.3 clients. The v0.3.3 Go
-  module is retracted; v0.3.2 clients are unaffected. This correction itself kept
+- This is an intentional breaking correction for v0.3.3 clients. The v0.3.3
+  artifacts are withdrawn and `main` carries a pending retraction directive;
+  v0.3.2 clients are unaffected. This correction itself kept
   schema token **5**; MQLITE-126 advanced the v0.4.0 development line to token 6,
   and MQLITE-128 advanced the unreleased candidate schema to token 7.
 - Make the name-reuse boundary explicit. Queue deletion and same-name recreation
@@ -245,11 +249,13 @@ upgrade notes before replacing a broker.
   stable shared reply subscription and dispatch replies by correlation ID instead
   of creating one subscription per request.
 
-## v0.3.3 — 2026-10-13 (retracted)
+## v0.3.3 — 2026-10-13 (withdrawn; retraction pending a later tag)
 
-> **Retracted:** this release exposed queue lifetime metadata as a public API and
+> **Withdrawn:** this release exposed queue lifetime metadata as a public API and
 > spread it through deletion clients. That contract is removed on `main` for the
-> planned v0.4.0 release. Pin production use to v0.3.2 until that release is tagged.
+> planned v0.4.0 release. `main` also declares `retract v0.3.3`; Go module tools
+> will recognize it only after a later version containing that directive is tagged.
+> Pin production use to v0.3.2 until then.
 
 > **Upgrade from v0.3.2:** port **6754**, schema token **5**, message data and
 > managed-key storage remain compatible. Keep one active broker per database and
