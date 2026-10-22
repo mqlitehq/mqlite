@@ -1874,7 +1874,7 @@ func (r *tursoSoakRunner) summary(status string, failure *tursoSoakFailure) turs
 		RemotePhysicalFileMetrics: map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
 		Notes: []string{
 			"Trend evidence only; no performance threshold or SLA verdict is applied.",
-			fmt.Sprintf("One Engine connects directly to the dedicated verification database with four closed-loop lanes, at most %d harness database calls in flight, and fixed %d ms lane-start staggering.", tursoSoakMaxInFlight, tursoSoakLaneStagger.Milliseconds()),
+			fmt.Sprintf("One Engine connects directly to the dedicated verification database with four closed-loop lanes, a harness database-call concurrency limit of %d, and fixed %d ms lane-start staggering.", tursoSoakMaxInFlight, tursoSoakLaneStagger.Milliseconds()),
 			"The workload deliberately keeps harness foreground calls below the four-connection remote pool limit to provide headroom for background maintenance; it is not a capacity test.",
 			"Settlement receipts expire after 30 minutes, so their count is a retention snapshot rather than a lifetime completion ledger.",
 			"Remote Turso does not expose physical database or WAL sizes.",
