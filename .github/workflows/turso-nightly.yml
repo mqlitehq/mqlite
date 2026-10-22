@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: turso-verification-db
+  cancel-in-progress: false
+
 jobs:
   turso:
     name: real Turso integration
@@ -20,7 +24,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
-      - name: TestTurso* (skips if secrets absent)
+      - name: TestTurso* against dedicated verification database
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
@@ -28,5 +32,13 @@ jobs:
           if [ -z "$MQLITE_TEST_DB" ]; then
             echo "MQLITE_TEST_DB secret not set — skipping remote integration."
             exit 0
+          fi
+          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
+            echo "MQLITE_TEST_DB_AUTH_TOKEN is required when MQLITE_TEST_DB is configured."
+            exit 1
+          fi
+          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
+            echo "MQLITE_TEST_DB is not the dedicated verification database."
+            exit 1
           fi
           go test ./engine/ -run TestTurso -count=1 -v -timeout 300s

@@ -1,11 +1,20 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -859,5 +868,1376 @@ func TestTursoBatchSettle(t *testing.T) {
 	}
 	if m, err := e.Stats(ctx, q); err != nil || m.Total != 0 {
 		t.Fatalf("total=%d after settling the batch remotely, want 0 (err %v)", m.Total, err)
+	}
+}
+
+// The performance soak is a deliberately opt-in, closed-loop test of the real
+// verification database. It lives beside the other live Turso tests so the
+// credentials gate and destructive TestMain reset remain visible in one place.
+const (
+	tursoSoakDurationEnv    = "MQLITE_TURSO_SOAK_DURATION"
+	tursoSoakWindowEnv      = "MQLITE_TURSO_SOAK_WINDOW"
+	tursoSoakCallTimeoutEnv = "MQLITE_TURSO_SOAK_CALL_TIMEOUT"
+	tursoSoakOutputEnv      = "MQLITE_TURSO_SOAK_OUTPUT"
+	tursoSoakConfirmEnv     = "MQLITE_TURSO_SOAK_CONFIRM_TEST_DB"
+	tursoSoakBodyBytes      = 256
+)
+
+type tursoSoakConfig struct {
+	Duration    time.Duration
+	Window      time.Duration
+	CallTimeout time.Duration
+	OutputDir   string
+}
+
+func readTursoSoakConfig() (tursoSoakConfig, bool, error) {
+	rawDuration := strings.TrimSpace(os.Getenv(tursoSoakDurationEnv))
+	if rawDuration == "" {
+		return tursoSoakConfig{}, false, nil
+	}
+	parse := func(name, raw string, fallback time.Duration) (time.Duration, error) {
+		if strings.TrimSpace(raw) == "" {
+			return fallback, nil
+		}
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil || d <= 0 {
+			return 0, fmt.Errorf("%s must be a positive Go duration", name)
+		}
+		return d, nil
+	}
+	duration, err := parse(tursoSoakDurationEnv, rawDuration, 0)
+	if err != nil {
+		return tursoSoakConfig{}, true, err
+	}
+	window, err := parse(tursoSoakWindowEnv, os.Getenv(tursoSoakWindowEnv), time.Minute)
+	if err != nil {
+		return tursoSoakConfig{}, true, err
+	}
+	callTimeout, err := parse(tursoSoakCallTimeoutEnv, os.Getenv(tursoSoakCallTimeoutEnv), 30*time.Second)
+	if err != nil {
+		return tursoSoakConfig{}, true, err
+	}
+	if window < 100*time.Millisecond {
+		return tursoSoakConfig{}, true, fmt.Errorf("%s must be at least 100ms", tursoSoakWindowEnv)
+	}
+	out := strings.TrimSpace(os.Getenv(tursoSoakOutputEnv))
+	if out == "" {
+		out = "turso-soak-results"
+	}
+	out, err = filepath.Abs(out)
+	if err != nil {
+		return tursoSoakConfig{}, true, err
+	}
+	return tursoSoakConfig{Duration: duration, Window: window, CallTimeout: callTimeout, OutputDir: out}, true, nil
+}
+
+type tursoSoakLaneSpec struct {
+	Name     string
+	Queue    string
+	Ordering OrderingMode
+	GroupID  string
+}
+
+var tursoSoakLanes = []tursoSoakLaneSpec{
+	{Name: "standard_a", Queue: "mqlite_turso_soak_standard_a", Ordering: OrderStandard},
+	{Name: "standard_b", Queue: "mqlite_turso_soak_standard_b", Ordering: OrderStandard},
+	{Name: "group_fifo", Queue: "mqlite_turso_soak_group_fifo", Ordering: OrderGroupFIFO, GroupID: "soak-group"},
+	{Name: "strict_fifo", Queue: "mqlite_turso_soak_strict_fifo", Ordering: OrderStrictFIFO},
+}
+
+func tursoSoakBody(lane string, cycle uint64) []byte {
+	body := make([]byte, tursoSoakBodyBytes)
+	prefix := fmt.Sprintf("mqlite-turso-soak/%s/%020d/", lane, cycle)
+	copy(body, prefix)
+	for i := len(prefix); i < len(body); i++ {
+		body[i] = byte('a' + (int(cycle)+i)%26)
+	}
+	return body
+}
+
+type tursoSoakHistogram struct {
+	DurationHistogram
+	Max time.Duration
+}
+
+func newTursoSoakHistogram() tursoSoakHistogram {
+	return tursoSoakHistogram{DurationHistogram: newDurationHistogram()}
+}
+
+func (h *tursoSoakHistogram) observe(d time.Duration) {
+	h.DurationHistogram.observe(d)
+	if d > h.Max {
+		h.Max = d
+	}
+}
+
+func (h *tursoSoakHistogram) merge(other tursoSoakHistogram) {
+	if h.BucketCounts == nil {
+		*h = newTursoSoakHistogram()
+	}
+	for i, n := range other.BucketCounts {
+		h.BucketCounts[i] += n
+	}
+	h.Count += other.Count
+	h.SumSeconds += other.SumSeconds
+	if other.Max > h.Max {
+		h.Max = other.Max
+	}
+}
+
+func (h tursoSoakHistogram) quantile(q float64) time.Duration {
+	if h.Count == 0 {
+		return 0
+	}
+	want := uint64(math.Ceil(q * float64(h.Count)))
+	if want == 0 {
+		want = 1
+	}
+	for i, seen := range h.BucketCounts {
+		if seen >= want {
+			bound := time.Duration(h.BoundsSeconds[i] * float64(time.Second))
+			if bound > h.Max {
+				return h.Max
+			}
+			return bound
+		}
+	}
+	return h.Max
+}
+
+type tursoSoakLatency struct {
+	Count uint64  `json:"count"`
+	P50Ms float64 `json:"p50_ms"`
+	P95Ms float64 `json:"p95_ms"`
+	P99Ms float64 `json:"p99_ms"`
+	MaxMs float64 `json:"max_ms"`
+}
+
+func (h tursoSoakHistogram) summary() tursoSoakLatency {
+	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+	return tursoSoakLatency{Count: h.Count, P50Ms: ms(h.quantile(.50)), P95Ms: ms(h.quantile(.95)), P99Ms: ms(h.quantile(.99)), MaxMs: ms(h.Max)}
+}
+
+type tursoSoakCounters struct {
+	Cycles    uint64
+	Sends     uint64
+	Receives  uint64
+	Completes uint64
+	Empty     uint64
+	Errors    uint64
+	Send      tursoSoakHistogram
+	Receive   tursoSoakHistogram
+	Complete  tursoSoakHistogram
+	EndToEnd  tursoSoakHistogram
+}
+
+func newTursoSoakCounters() tursoSoakCounters {
+	return tursoSoakCounters{
+		Send: newTursoSoakHistogram(), Receive: newTursoSoakHistogram(),
+		Complete: newTursoSoakHistogram(), EndToEnd: newTursoSoakHistogram(),
+	}
+}
+
+func (c *tursoSoakCounters) merge(other tursoSoakCounters) {
+	c.Cycles += other.Cycles
+	c.Sends += other.Sends
+	c.Receives += other.Receives
+	c.Completes += other.Completes
+	c.Empty += other.Empty
+	c.Errors += other.Errors
+	c.Send.merge(other.Send)
+	c.Receive.merge(other.Receive)
+	c.Complete.merge(other.Complete)
+	c.EndToEnd.merge(other.EndToEnd)
+}
+
+func (c tursoSoakCounters) clone() tursoSoakCounters {
+	for _, histogram := range []*tursoSoakHistogram{&c.Send, &c.Receive, &c.Complete, &c.EndToEnd} {
+		histogram.DurationHistogram = cloneHistogram(histogram.DurationHistogram)
+	}
+	return c
+}
+
+type tursoSoakLaneState struct {
+	spec   tursoSoakLaneSpec
+	mu     sync.Mutex
+	window tursoSoakCounters
+	total  tursoSoakCounters
+}
+
+func newTursoSoakLaneState(spec tursoSoakLaneSpec) *tursoSoakLaneState {
+	return &tursoSoakLaneState{spec: spec, window: newTursoSoakCounters(), total: newTursoSoakCounters()}
+}
+
+func (s *tursoSoakLaneState) record(operation string, elapsed time.Duration, success, empty bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range []*tursoSoakCounters{&s.window, &s.total} {
+		switch operation {
+		case "send":
+			c.Send.observe(elapsed)
+			if success {
+				c.Sends++
+			}
+		case "receive":
+			c.Receive.observe(elapsed)
+			if success && !empty {
+				c.Receives++
+			}
+			if empty {
+				c.Empty++
+			}
+		case "complete":
+			c.Complete.observe(elapsed)
+			if success {
+				c.Completes++
+			}
+		}
+		if !success {
+			c.Errors++
+		}
+	}
+}
+
+func (s *tursoSoakLaneState) recordCycle(elapsed time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range []*tursoSoakCounters{&s.window, &s.total} {
+		c.Cycles++
+		c.EndToEnd.observe(elapsed)
+	}
+}
+
+func (s *tursoSoakLaneState) takeWindow() tursoSoakCounters {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.window
+	s.window = newTursoSoakCounters()
+	return out
+}
+
+func (s *tursoSoakLaneState) totalSnapshot() tursoSoakCounters {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.total.clone()
+}
+
+type tursoSoakBacklog struct {
+	Active       int64 `json:"active"`
+	Locked       int64 `json:"locked"`
+	Deferred     int64 `json:"deferred"`
+	Scheduled    int64 `json:"scheduled"`
+	DeadLettered int64 `json:"dead_lettered"`
+	Total        int64 `json:"total"`
+}
+
+func tursoSoakBacklogFromMetrics(m Metrics) tursoSoakBacklog {
+	return tursoSoakBacklog{Active: m.Active, Locked: m.Locked, Deferred: m.Deferred, Scheduled: m.Scheduled, DeadLettered: m.DeadLettered, Total: m.Total}
+}
+
+func (b *tursoSoakBacklog) add(other tursoSoakBacklog) {
+	b.Active += other.Active
+	b.Locked += other.Locked
+	b.Deferred += other.Deferred
+	b.Scheduled += other.Scheduled
+	b.DeadLettered += other.DeadLettered
+	b.Total += other.Total
+}
+
+type tursoSoakCounterReport struct {
+	Cycles          uint64           `json:"cycles"`
+	CyclesPerSecond float64          `json:"cycles_per_second"`
+	Sends           uint64           `json:"sends"`
+	Receives        uint64           `json:"receives"`
+	Completes       uint64           `json:"completes"`
+	EmptyReceives   uint64           `json:"empty_receives"`
+	Errors          uint64           `json:"errors"`
+	Send            tursoSoakLatency `json:"send"`
+	Receive         tursoSoakLatency `json:"receive"`
+	Complete        tursoSoakLatency `json:"complete"`
+	EndToEnd        tursoSoakLatency `json:"end_to_end"`
+}
+
+func tursoSoakCounterReportFor(c tursoSoakCounters, elapsed time.Duration) tursoSoakCounterReport {
+	rate := 0.0
+	if elapsed > 0 {
+		rate = float64(c.Cycles) / elapsed.Seconds()
+	}
+	return tursoSoakCounterReport{
+		Cycles: c.Cycles, CyclesPerSecond: rate, Sends: c.Sends, Receives: c.Receives,
+		Completes: c.Completes, EmptyReceives: c.Empty, Errors: c.Errors,
+		Send: c.Send.summary(), Receive: c.Receive.summary(), Complete: c.Complete.summary(), EndToEnd: c.EndToEnd.summary(),
+	}
+}
+
+type tursoSoakLaneWindow struct {
+	Name               string                 `json:"name"`
+	Ordering           OrderingMode           `json:"ordering"`
+	Work               tursoSoakCounterReport `json:"work"`
+	Backlog            *tursoSoakBacklog      `json:"stats_backlog"`
+	SettlementReceipts *int64                 `json:"settlement_receipts"`
+}
+
+type tursoSoakStorageOperation struct {
+	Operation string `json:"operation"`
+	Outcome   string `json:"outcome"`
+	ErrorCode string `json:"error_code"`
+	Count     uint64 `json:"count"`
+	Retries   uint64 `json:"retries"`
+}
+
+type tursoSoakStorageWindow struct {
+	Operations      []tursoSoakStorageOperation `json:"operations"`
+	PoolMaxOpen     int                         `json:"pool_max_open"`
+	PoolOpen        int                         `json:"pool_open"`
+	PoolInUse       int                         `json:"pool_in_use"`
+	PoolIdle        int                         `json:"pool_idle"`
+	PoolWaitCount   int64                       `json:"pool_wait_count"`
+	PoolWaitSeconds float64                     `json:"pool_wait_seconds"`
+}
+
+func tursoSoakStorageDelta(before, after StorageObservation) tursoSoakStorageWindow {
+	type key struct{ operation, outcome, code string }
+	prior := make(map[key]StorageOperation, len(before.Operations))
+	for _, op := range before.Operations {
+		prior[key{op.Operation, op.Outcome, op.ErrorCode}] = op
+	}
+	out := tursoSoakStorageWindow{
+		Operations:      []tursoSoakStorageOperation{},
+		PoolMaxOpen:     after.Pool.MaxOpen,
+		PoolOpen:        after.Pool.Open,
+		PoolInUse:       after.Pool.InUse,
+		PoolIdle:        after.Pool.Idle,
+		PoolWaitCount:   after.Pool.WaitCount - before.Pool.WaitCount,
+		PoolWaitSeconds: after.Pool.WaitDurationSeconds - before.Pool.WaitDurationSeconds,
+	}
+	for _, op := range after.Operations {
+		p := prior[key{op.Operation, op.Outcome, op.ErrorCode}]
+		count, retries := op.Duration.Count-p.Duration.Count, op.Retries-p.Retries
+		if count == 0 && retries == 0 {
+			continue
+		}
+		out.Operations = append(out.Operations, tursoSoakStorageOperation{
+			Operation: op.Operation, Outcome: op.Outcome, ErrorCode: op.ErrorCode, Count: count, Retries: retries,
+		})
+	}
+	return out
+}
+
+type tursoSoakResources struct {
+	RSSBytes               *uint64  `json:"rss_bytes"`
+	HeapAllocBytes         uint64   `json:"heap_alloc_bytes"`
+	HeapInuseBytes         uint64   `json:"heap_inuse_bytes"`
+	Goroutines             int      `json:"goroutines"`
+	GCCount                uint32   `json:"gc_count"`
+	GCPauseTotalSeconds    float64  `json:"gc_pause_total_seconds"`
+	ProcessCPUSecondsTotal *float64 `json:"process_cpu_seconds_total"`
+}
+
+func tursoSoakResourceSnapshot() tursoSoakResources {
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	return tursoSoakResources{
+		RSSBytes: readTursoSoakRSS(), HeapAllocBytes: memory.HeapAlloc, HeapInuseBytes: memory.HeapInuse,
+		Goroutines: runtime.NumGoroutine(), GCCount: memory.NumGC,
+		GCPauseTotalSeconds:    float64(memory.PauseTotalNs) / float64(time.Second),
+		ProcessCPUSecondsTotal: readTursoSoakCPU(),
+	}
+}
+
+func readTursoSoakRSS() *uint64 {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return nil
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "VmRSS:" {
+			kb, err := strconv.ParseUint(fields[1], 10, 64)
+			if err == nil {
+				value := kb * 1024
+				return &value
+			}
+		}
+	}
+	return nil
+}
+
+func readTursoSoakCPU() *float64 {
+	// Linux exposes process user/system time as clock ticks in /proc. GitHub's
+	// ubuntu-24.04 runners use 100 Hz; on other hosts report unavailable instead
+	// of inventing a zero or guessing another platform's representation.
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	b, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return nil
+	}
+	end := strings.LastIndexByte(string(b), ')')
+	if end < 0 {
+		return nil
+	}
+	fields := strings.Fields(string(b[end+1:]))
+	if len(fields) <= 12 {
+		return nil
+	}
+	user, errUser := strconv.ParseUint(fields[11], 10, 64)
+	system, errSystem := strconv.ParseUint(fields[12], 10, 64)
+	if errUser != nil || errSystem != nil {
+		return nil
+	}
+	seconds := float64(user+system) / 100
+	return &seconds
+}
+
+type tursoSoakWindow struct {
+	Sequence           int                    `json:"sequence"`
+	StartedAt          time.Time              `json:"started_at"`
+	EndedAt            time.Time              `json:"ended_at"`
+	DurationSeconds    float64                `json:"duration_seconds"`
+	Partial            bool                   `json:"partial"`
+	Lanes              []tursoSoakLaneWindow  `json:"lanes"`
+	Overall            tursoSoakCounterReport `json:"overall"`
+	StatsBacklog       *tursoSoakBacklog      `json:"stats_backlog"`
+	SettlementReceipts *int64                 `json:"settlement_receipts"`
+	Storage            tursoSoakStorageWindow `json:"storage"`
+	Resources          tursoSoakResources     `json:"resources"`
+	MonitorError       string                 `json:"monitor_error,omitempty"`
+}
+
+func tursoSoakWindowPartial(_ time.Duration, final bool) bool {
+	// A final sample includes stop signalling and in-flight cycle drain. Even if
+	// that takes a full interval, it is not comparable to a periodic load window.
+	return final
+}
+
+type tursoSoakFailure struct {
+	Lane      string `json:"lane,omitempty"`
+	Operation string `json:"operation"`
+	Code      string `json:"code"`
+}
+
+func (f tursoSoakFailure) Error() string {
+	if f.Lane == "" {
+		return fmt.Sprintf("%s failed (%s)", f.Operation, f.Code)
+	}
+	return fmt.Sprintf("lane %s %s failed (%s)", f.Lane, f.Operation, f.Code)
+}
+
+func safeTursoSoakFailure(lane, operation string, err error) error {
+	return tursoSoakFailure{Lane: lane, Operation: operation, Code: storageErrorCode(err)}
+}
+
+type tursoSoakLogHandler struct {
+	report func(error)
+}
+
+func (h tursoSoakLogHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelWarn
+}
+func (h tursoSoakLogHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelWarn {
+		h.report(tursoSoakFailure{Operation: "background", Code: "warning"})
+	}
+	return nil
+}
+func (h tursoSoakLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h tursoSoakLogHandler) WithGroup(string) slog.Handler      { return h }
+
+type tursoSoakEvidence struct {
+	dir     string
+	windows *os.File
+}
+
+func newTursoSoakEvidence(dir string) (*tursoSoakEvidence, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	for _, name := range []string{"metadata.json", "windows.jsonl", "summary.json", "summary.md"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "windows.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return &tursoSoakEvidence{dir: dir, windows: f}, nil
+}
+
+func (e *tursoSoakEvidence) close() error {
+	if e == nil || e.windows == nil {
+		return nil
+	}
+	windows := e.windows
+	e.windows = nil
+	return windows.Close()
+}
+
+func (e *tursoSoakEvidence) writeJSON(name string, value any) error {
+	b, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return tursoSoakAtomicWrite(filepath.Join(e.dir, name), b)
+}
+
+func tursoSoakAtomicWrite(path string, body []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		// Windows does not replace an existing destination with Rename. The soak
+		// workflow runs on Linux (atomic replacement); this fallback keeps the
+		// hermetic harness smoke portable across the normal CI matrix.
+		if runtime.GOOS != "windows" {
+			return err
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return removeErr
+		}
+		if err := os.Rename(tmpName, path); err != nil {
+			return err
+		}
+	}
+	ok = true
+	return nil
+}
+
+func (e *tursoSoakEvidence) appendWindow(window tursoSoakWindow) error {
+	b, err := json.Marshal(window)
+	if err != nil {
+		return err
+	}
+	if _, err := e.windows.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return e.windows.Sync()
+}
+
+type tursoSoakTrend struct {
+	FirstCyclesPerSecond float64  `json:"first_cycles_per_second"`
+	LastCyclesPerSecond  float64  `json:"last_cycles_per_second"`
+	ChangePercent        *float64 `json:"change_percent"`
+	WindowCount          int      `json:"window_count"`
+}
+
+func tursoSoakTrendFor(first, last *tursoSoakWindow, count int) tursoSoakTrend {
+	trend := tursoSoakTrend{WindowCount: count}
+	if first == nil || last == nil {
+		return trend
+	}
+	trend.FirstCyclesPerSecond = first.Overall.CyclesPerSecond
+	trend.LastCyclesPerSecond = last.Overall.CyclesPerSecond
+	if count >= 2 && trend.FirstCyclesPerSecond > 0 {
+		change := (trend.LastCyclesPerSecond/trend.FirstCyclesPerSecond - 1) * 100
+		trend.ChangePercent = &change
+	}
+	return trend
+}
+
+type tursoSoakSummary struct {
+	Status                    string                 `json:"status"`
+	RequestedDurationSeconds  float64                `json:"requested_duration_seconds"`
+	ElapsedSeconds            float64                `json:"elapsed_seconds"`
+	WindowSeconds             float64                `json:"window_seconds"`
+	WindowTrend               tursoSoakTrend         `json:"window_trend"`
+	Overall                   tursoSoakCounterReport `json:"overall"`
+	Lanes                     []tursoSoakLaneWindow  `json:"lanes"`
+	FinalStatsBacklog         *tursoSoakBacklog      `json:"final_stats_backlog"`
+	FinalSettlementReceipts   *int64                 `json:"final_settlement_receipts"`
+	AccountingValid           bool                   `json:"accounting_valid"`
+	DurationCompleted         bool                   `json:"duration_completed"`
+	CleanupComplete           bool                   `json:"cleanup_complete"`
+	Failure                   *tursoSoakFailure      `json:"failure,omitempty"`
+	RemotePhysicalFileMetrics map[string]*uint64     `json:"remote_physical_file_metrics"`
+	Notes                     []string               `json:"notes"`
+}
+
+func (s tursoSoakSummary) markdown() []byte {
+	var b strings.Builder
+	fmt.Fprintln(&b, "# Turso performance soak")
+	fmt.Fprintf(&b, "\n- Status: **%s**\n", s.Status)
+	fmt.Fprintf(&b, "- Duration: %.1fs / %.1fs requested\n", s.ElapsedSeconds, s.RequestedDurationSeconds)
+	fmt.Fprintf(&b, "- Completed cycles: %d (%.2f cycles/s over elapsed time)\n", s.Overall.Cycles, s.Overall.CyclesPerSecond)
+	fmt.Fprintf(&b, "- Accounting valid: %t; final backlog: ", s.AccountingValid)
+	if s.FinalStatsBacklog == nil {
+		fmt.Fprintln(&b, "unavailable")
+	} else {
+		fmt.Fprintf(&b, "%d\n", s.FinalStatsBacklog.Total)
+	}
+	fmt.Fprintln(&b, "\n| Lane | Cycles | cycles/s | e2e p50 ms | e2e p95 ms | e2e p99 ms | max ms | Errors |")
+	fmt.Fprintln(&b, "|---|---:|---:|---:|---:|---:|---:|---:|")
+	for _, lane := range s.Lanes {
+		fmt.Fprintf(&b, "| %s | %d | %.2f | %.3f | %.3f | %.3f | %.3f | %d |\n",
+			lane.Name, lane.Work.Cycles, lane.Work.CyclesPerSecond, lane.Work.EndToEnd.P50Ms,
+			lane.Work.EndToEnd.P95Ms, lane.Work.EndToEnd.P99Ms, lane.Work.EndToEnd.MaxMs, lane.Work.Errors)
+	}
+	fmt.Fprintln(&b, "\n## Window trend")
+	fmt.Fprintf(&b, "\nFirst %.2f cycles/s; last %.2f cycles/s across %d window(s)",
+		s.WindowTrend.FirstCyclesPerSecond, s.WindowTrend.LastCyclesPerSecond, s.WindowTrend.WindowCount)
+	if s.WindowTrend.ChangePercent == nil {
+		fmt.Fprintln(&b, "; change unavailable until two windows complete.")
+	} else {
+		fmt.Fprintf(&b, "; change %.2f%%. No performance pass/fail threshold is applied.\n", *s.WindowTrend.ChangePercent)
+	}
+	if s.Failure != nil {
+		fmt.Fprintf(&b, "\nFailure: %s\n", s.Failure.Error())
+	}
+	fmt.Fprintln(&b, "\nRemote physical database and WAL sizes are unavailable; null values are intentional.")
+	return []byte(b.String())
+}
+
+type tursoSoakRunner struct {
+	e             *Engine
+	cfg           tursoSoakConfig
+	evidence      *tursoSoakEvidence
+	started       time.Time
+	finished      time.Time
+	windowStarted time.Time
+	states        []*tursoSoakLaneState
+	failureSignal chan struct{}
+	failureMu     sync.Mutex
+	firstFailure  error
+	stop          chan struct{}
+	stopOnce      sync.Once
+	storage       StorageObservation
+	firstWindow   *tursoSoakWindow
+	lastWindow    *tursoSoakWindow
+	latestWindow  *tursoSoakWindow
+	windowCount   int
+	fullWindows   int
+	lastBacklog   *tursoSoakBacklog
+	lastReceipts  *int64
+	durationDone  bool
+	cleanupDone   bool
+}
+
+func (r *tursoSoakRunner) report(err error) {
+	if err == nil {
+		return
+	}
+	r.failureMu.Lock()
+	first := r.firstFailure == nil
+	if first {
+		r.firstFailure = err
+	}
+	r.failureMu.Unlock()
+	if !first {
+		return
+	}
+	select {
+	case r.failureSignal <- struct{}{}:
+	default:
+	}
+}
+
+func (r *tursoSoakRunner) failure() error {
+	r.failureMu.Lock()
+	defer r.failureMu.Unlock()
+	return r.firstFailure
+}
+
+func (r *tursoSoakRunner) stopLanes() { r.stopOnce.Do(func() { close(r.stop) }) }
+
+func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
+	return tursoSoakBoundedCall(context.Background(), r.cfg.CallTimeout, fn)
+}
+
+func tursoSoakBoundedCall(parent context.Context, timeout time.Duration, fn func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	return fn(ctx)
+}
+
+func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState) {
+	for cycle := uint64(1); ; cycle++ {
+		select {
+		case <-r.stop:
+			return
+		default:
+		}
+		body := tursoSoakBody(state.spec.Name, cycle)
+		message := OutMessage{Body: body, MessageID: fmt.Sprintf("%s-%d", state.spec.Name, cycle), GroupID: state.spec.GroupID}
+		cycleStart := time.Now()
+		started := time.Now()
+		err := r.call(func(ctx context.Context) error {
+			_, err := r.e.SendOne(ctx, state.spec.Queue, message)
+			return err
+		})
+		state.record("send", time.Since(started), err == nil, false)
+		if err != nil {
+			r.report(safeTursoSoakFailure(state.spec.Name, "send", err))
+			return
+		}
+
+		var received []*Message
+		started = time.Now()
+		err = r.call(func(ctx context.Context) error {
+			var err error
+			received, err = r.e.Receive(ctx, state.spec.Queue, ReceiveOptions{MaxMessages: 1})
+			return err
+		})
+		empty := err == nil && len(received) == 0
+		validCount := err == nil && len(received) == 1
+		state.record("receive", time.Since(started), validCount, empty)
+		if err != nil {
+			r.report(safeTursoSoakFailure(state.spec.Name, "receive", err))
+			return
+		}
+		if len(received) != 1 {
+			r.report(tursoSoakFailure{Lane: state.spec.Name, Operation: "receive", Code: "unexpected_message_count"})
+			return
+		}
+		if !bytes.Equal(received[0].Body, body) || received[0].MessageID != message.MessageID || received[0].GroupID != message.GroupID {
+			state.mu.Lock()
+			state.window.Errors++
+			state.total.Errors++
+			state.mu.Unlock()
+			r.report(tursoSoakFailure{Lane: state.spec.Name, Operation: "verify", Code: "message_mismatch"})
+			return
+		}
+
+		started = time.Now()
+		err = r.call(func(ctx context.Context) error {
+			return r.e.Complete(ctx, state.spec.Queue, received[0].SeqNumber, received[0].LockToken)
+		})
+		state.record("complete", time.Since(started), err == nil, false)
+		if err != nil {
+			r.report(safeTursoSoakFailure(state.spec.Name, "complete", err))
+			return
+		}
+		state.recordCycle(time.Since(cycleStart))
+	}
+}
+
+func (r *tursoSoakRunner) collectStats() ([]*tursoSoakBacklog, map[string]int64, error) {
+	backlogs := make([]*tursoSoakBacklog, len(r.states))
+	for i, state := range r.states {
+		var metrics Metrics
+		err := r.call(func(ctx context.Context) error {
+			var err error
+			metrics, err = r.e.Stats(ctx, state.spec.Queue)
+			return err
+		})
+		if err != nil {
+			return backlogs, nil, safeTursoSoakFailure(state.spec.Name, "stats", err)
+		}
+		backlog := tursoSoakBacklogFromMetrics(metrics)
+		backlogs[i] = &backlog
+		if backlog.Total > 1 || backlog.Deferred != 0 || backlog.Scheduled != 0 || backlog.DeadLettered != 0 {
+			return backlogs, nil, tursoSoakFailure{Lane: state.spec.Name, Operation: "stats", Code: "working_set_invariant"}
+		}
+	}
+	receipts := make(map[string]int64, len(r.states))
+	err := r.call(func(ctx context.Context) error {
+		return r.e.db.queryRows(ctx, `SELECT queue,COUNT(*) FROM settlement_receipts
+			WHERE queue IN (?,?,?,?) GROUP BY queue`, func(rows *sql.Rows) error {
+			for rows.Next() {
+				var queue string
+				var count int64
+				if err := rows.Scan(&queue, &count); err != nil {
+					return err
+				}
+				receipts[queue] = count
+			}
+			return rows.Err()
+		}, r.states[0].spec.Queue, r.states[1].spec.Queue, r.states[2].spec.Queue, r.states[3].spec.Queue)
+	})
+	if err != nil {
+		return backlogs, nil, safeTursoSoakFailure("", "receipt_count", err)
+	}
+	return backlogs, receipts, nil
+}
+
+func (r *tursoSoakRunner) flushWindow(final bool) error {
+	ended := time.Now()
+	elapsed := ended.Sub(r.windowStarted)
+	window := tursoSoakWindow{
+		Sequence: r.windowCount + 1, StartedAt: r.windowStarted.UTC(), EndedAt: ended.UTC(),
+		DurationSeconds: elapsed.Seconds(), Partial: tursoSoakWindowPartial(elapsed, final),
+		Lanes: make([]tursoSoakLaneWindow, 0, len(r.states)),
+	}
+	windowCounters := make([]tursoSoakCounters, len(r.states))
+	for i, state := range r.states {
+		windowCounters[i] = state.takeWindow()
+	}
+	backlogs, receipts, monitorErr := r.collectStats()
+	overallCounters := newTursoSoakCounters()
+	overallBacklog := tursoSoakBacklog{}
+	var receiptTotal int64
+	for i, state := range r.states {
+		counters := windowCounters[i]
+		overallCounters.merge(counters)
+		lane := tursoSoakLaneWindow{
+			Name: state.spec.Name, Ordering: state.spec.Ordering,
+			Work: tursoSoakCounterReportFor(counters, elapsed), Backlog: backlogs[i],
+		}
+		if backlogs[i] != nil {
+			overallBacklog.add(*backlogs[i])
+		}
+		if receipts != nil {
+			count := receipts[state.spec.Queue]
+			lane.SettlementReceipts = &count
+			receiptTotal += count
+		}
+		window.Lanes = append(window.Lanes, lane)
+	}
+	window.Overall = tursoSoakCounterReportFor(overallCounters, elapsed)
+	if monitorErr == nil {
+		window.StatsBacklog = &overallBacklog
+		window.SettlementReceipts = &receiptTotal
+		r.lastBacklog = &overallBacklog
+		r.lastReceipts = &receiptTotal
+	} else {
+		window.MonitorError = monitorErr.Error()
+	}
+	currentStorage := r.e.db.storage.snapshot(r.e.db.poolStats())
+	window.Storage = tursoSoakStorageDelta(r.storage, currentStorage)
+	r.storage = currentStorage
+	window.Resources = tursoSoakResourceSnapshot()
+	if err := r.evidence.appendWindow(window); err != nil {
+		return err
+	}
+	r.windowCount++
+	r.recordWindow(window)
+	r.windowStarted = ended
+	if err := r.writeSummary("RUNNING", nil); err != nil {
+		return err
+	}
+	return monitorErr
+}
+
+func (r *tursoSoakRunner) recordWindow(window tursoSoakWindow) {
+	latest := window
+	r.latestWindow = &latest
+	r.recordTrendWindow(window)
+}
+
+func (r *tursoSoakRunner) recordTrendWindow(window tursoSoakWindow) {
+	if window.Partial {
+		return
+	}
+	if r.firstWindow == nil {
+		copy := window
+		r.firstWindow = &copy
+	}
+	copy := window
+	r.lastWindow = &copy
+	r.fullWindows++
+}
+
+func (r *tursoSoakRunner) totals(elapsed time.Duration) (tursoSoakCounterReport, []tursoSoakLaneWindow, bool) {
+	overall := newTursoSoakCounters()
+	lanes := make([]tursoSoakLaneWindow, 0, len(r.states))
+	valid := true
+	for _, state := range r.states {
+		c := state.totalSnapshot()
+		if c.Cycles == 0 || c.Errors != 0 || c.Empty != 0 || c.Sends != c.Cycles || c.Receives != c.Cycles || c.Completes != c.Cycles {
+			valid = false
+		}
+		overall.merge(c)
+		lane := tursoSoakLaneWindow{Name: state.spec.Name, Ordering: state.spec.Ordering, Work: tursoSoakCounterReportFor(c, elapsed)}
+		if r.latestWindow != nil {
+			for _, last := range r.latestWindow.Lanes {
+				if last.Name == state.spec.Name {
+					lane.Backlog, lane.SettlementReceipts = last.Backlog, last.SettlementReceipts
+					break
+				}
+			}
+		}
+		lanes = append(lanes, lane)
+	}
+	return tursoSoakCounterReportFor(overall, elapsed), lanes, valid
+}
+
+func (r *tursoSoakRunner) summary(status string, failure *tursoSoakFailure) tursoSoakSummary {
+	elapsed := r.elapsed()
+	overall, lanes, valid := r.totals(elapsed)
+	return tursoSoakSummary{
+		Status: status, RequestedDurationSeconds: r.cfg.Duration.Seconds(), ElapsedSeconds: elapsed.Seconds(),
+		WindowSeconds: r.cfg.Window.Seconds(), WindowTrend: tursoSoakTrendFor(r.firstWindow, r.lastWindow, r.fullWindows),
+		Overall: overall, Lanes: lanes, FinalStatsBacklog: r.lastBacklog, FinalSettlementReceipts: r.lastReceipts,
+		AccountingValid: valid, DurationCompleted: r.durationDone, CleanupComplete: r.cleanupDone, Failure: failure,
+		RemotePhysicalFileMetrics: map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
+		Notes: []string{
+			"Trend evidence only; no performance threshold or SLA verdict is applied.",
+			"One Engine connects directly to the dedicated verification database with four closed-loop lanes.",
+			"Settlement receipts expire after 30 minutes, so their count is a retention snapshot rather than a lifetime completion ledger.",
+			"Remote Turso does not expose physical database or WAL sizes.",
+		},
+	}
+}
+
+func (r *tursoSoakRunner) elapsed() time.Duration {
+	if !r.finished.IsZero() {
+		return r.finished.Sub(r.started)
+	}
+	return time.Since(r.started)
+}
+
+func (r *tursoSoakRunner) writeSummary(status string, failure *tursoSoakFailure) error {
+	summary := r.summary(status, failure)
+	if err := r.evidence.writeJSON("summary.json", summary); err != nil {
+		return err
+	}
+	return tursoSoakAtomicWrite(filepath.Join(r.evidence.dir, "summary.md"), summary.markdown())
+}
+
+func (r *tursoSoakRunner) run() error {
+	var workers sync.WaitGroup
+	for _, state := range r.states {
+		workers.Add(1)
+		go func(state *tursoSoakLaneState) {
+			defer workers.Done()
+			r.runLane(state)
+		}(state)
+	}
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	duration := time.NewTimer(r.cfg.Duration)
+	defer duration.Stop()
+	windows := time.NewTicker(r.cfg.Window)
+	defer windows.Stop()
+	var runErr error
+	for {
+		select {
+		case <-duration.C:
+			r.durationDone = true
+			r.stopLanes()
+		case <-r.failureSignal:
+			if runErr == nil {
+				runErr = r.failure()
+			}
+			r.stopLanes()
+		case <-windows.C:
+			// A tick can race with the duration or failure signal. Once stopping
+			// begins, leave all remaining work for the final partial window.
+			if r.durationDone || runErr != nil {
+				continue
+			}
+			if err := r.flushWindow(false); err != nil && runErr == nil {
+				runErr = err
+				r.stopLanes()
+			}
+		case <-done:
+			if err := r.failure(); err != nil && runErr == nil {
+				runErr = err
+			}
+			if err := r.flushWindow(true); err != nil && runErr == nil {
+				runErr = err
+			}
+			r.finished = time.Now()
+			return runErr
+		}
+	}
+}
+
+func tursoSoakCleanup(ctx context.Context, e *Engine, callTimeout time.Duration) error {
+	queues := []any{tursoSoakLanes[0].Queue, tursoSoakLanes[1].Queue, tursoSoakLanes[2].Queue, tursoSoakLanes[3].Queue}
+	subscriptions := append(append([]any{}, queues...), queues...)
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM messages WHERE queue IN (?,?,?,?)`, queues},
+		{`DELETE FROM dedup WHERE queue IN (?,?,?,?)`, queues},
+		{`DELETE FROM settlement_receipts WHERE queue IN (?,?,?,?)`, queues},
+		{`DELETE FROM receive_attempts WHERE queue IN (?,?,?,?)`, queues},
+		{`DELETE FROM subscriptions WHERE subscription IN (?,?,?,?) OR topic IN (?,?,?,?)`, subscriptions},
+		{`DELETE FROM queues WHERE name IN (?,?,?,?)`, queues},
+	} {
+		err := tursoSoakBoundedCall(ctx, callTimeout, func(callCtx context.Context) error {
+			_, err := e.db.exec(callCtx, statement.query, statement.args...)
+			return err
+		})
+		if err != nil {
+			return safeTursoSoakFailure("", "cleanup", err)
+		}
+	}
+	e.qmu.Lock()
+	for _, spec := range tursoSoakLanes {
+		delete(e.qcache, spec.Queue)
+	}
+	e.qepoch++
+	e.qmu.Unlock()
+	e.observation.mu.Lock()
+	for _, spec := range tursoSoakLanes {
+		e.observation.forgetLocked(spec.Queue)
+	}
+	e.observation.mu.Unlock()
+	for _, check := range []struct {
+		query string
+		args  []any
+	}{
+		{`SELECT COUNT(*) FROM messages WHERE queue IN (?,?,?,?)`, queues},
+		{`SELECT COUNT(*) FROM dedup WHERE queue IN (?,?,?,?)`, queues},
+		{`SELECT COUNT(*) FROM settlement_receipts WHERE queue IN (?,?,?,?)`, queues},
+		{`SELECT COUNT(*) FROM receive_attempts WHERE queue IN (?,?,?,?)`, queues},
+		{`SELECT COUNT(*) FROM subscriptions WHERE subscription IN (?,?,?,?) OR topic IN (?,?,?,?)`, subscriptions},
+		{`SELECT COUNT(*) FROM queues WHERE name IN (?,?,?,?)`, queues},
+	} {
+		var count int64
+		err := tursoSoakBoundedCall(ctx, callTimeout, func(callCtx context.Context) error {
+			return e.db.queryRowScan(callCtx, []any{&count}, check.query, check.args...)
+		})
+		if err != nil {
+			return safeTursoSoakFailure("", "cleanup_verify", err)
+		}
+		if count != 0 {
+			return tursoSoakFailure{Operation: "cleanup_verify", Code: "rows_remain"}
+		}
+	}
+	return nil
+}
+
+type tursoSoakJudgement struct {
+	DurationCompleted bool
+	AccountingValid   bool
+	FinalBacklog      *tursoSoakBacklog
+	CleanupComplete   bool
+	Failure           error
+}
+
+func judgeTursoSoak(j tursoSoakJudgement) error {
+	if j.Failure != nil {
+		return j.Failure
+	}
+	if !j.DurationCompleted {
+		return tursoSoakFailure{Operation: "duration", Code: "ended_early"}
+	}
+	if !j.AccountingValid {
+		return tursoSoakFailure{Operation: "accounting", Code: "invariant_failed"}
+	}
+	if j.FinalBacklog == nil {
+		return tursoSoakFailure{Operation: "final_stats", Code: "unavailable"}
+	}
+	if j.FinalBacklog.Total != 0 {
+		return tursoSoakFailure{Operation: "final_stats", Code: "backlog_remaining"}
+	}
+	if !j.CleanupComplete {
+		return tursoSoakFailure{Operation: "cleanup", Code: "incomplete"}
+	}
+	return nil
+}
+
+func tursoSoakControlTimeout(callTimeout time.Duration) time.Duration {
+	if timeout := 4 * callTimeout; timeout > 2*time.Minute {
+		return timeout
+	}
+	return 2 * time.Minute
+}
+
+func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
+	evidence, err := newTursoSoakEvidence(cfg.OutputDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := evidence.close(); err != nil {
+			resultErr = errors.Join(resultErr, err)
+		}
+	}()
+	started := time.Now()
+	metadata := map[string]any{
+		"schema_version": 1, "started_at": started.UTC(), "duration_seconds": cfg.Duration.Seconds(),
+		"window_seconds": cfg.Window.Seconds(), "call_timeout_seconds": cfg.CallTimeout.Seconds(),
+		"backend": "remote Turso/libSQL", "engine_count": 1, "message_body_bytes": tursoSoakBodyBytes,
+		"background_maintenance": true, "latency_method": "fixed-memory logarithmic histogram over each complete window",
+		"go_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
+		"git_sha":                             strings.TrimSpace(os.Getenv("GITHUB_SHA")),
+		"remote_physical_file_metrics":        map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
+		"remote_physical_file_metrics_reason": "remote Turso does not expose database or WAL file sizes",
+		"lanes":                               tursoSoakLanes,
+	}
+	if err := evidence.writeJSON("metadata.json", metadata); err != nil {
+		return err
+	}
+
+	runner := &tursoSoakRunner{
+		cfg: cfg, evidence: evidence, failureSignal: make(chan struct{}, 1), stop: make(chan struct{}),
+	}
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), cfg.CallTimeout)
+	e, err := Open(openCtx, Options{
+		DB: os.Getenv("MQLITE_TEST_DB"), AuthToken: os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"),
+		Logger: slog.New(tursoSoakLogHandler{report: runner.report}),
+	})
+	cancelOpen()
+	if err != nil {
+		failure := tursoSoakFailure{Operation: "open", Code: storageErrorCode(err)}
+		summary := tursoSoakSummary{
+			Status: "FAIL", RequestedDurationSeconds: cfg.Duration.Seconds(), ElapsedSeconds: time.Since(started).Seconds(),
+			WindowSeconds: cfg.Window.Seconds(), Failure: &failure, RemotePhysicalFileMetrics: map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
+		}
+		_ = evidence.writeJSON("summary.json", summary)
+		_ = tursoSoakAtomicWrite(filepath.Join(evidence.dir, "summary.md"), summary.markdown())
+		return failure
+	}
+	runner.e = e
+
+	setupErr := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), tursoSoakControlTimeout(cfg.CallTimeout))
+		defer cancel()
+		if err := tursoSoakCleanup(ctx, e, cfg.CallTimeout); err != nil {
+			return err
+		}
+		for _, lane := range tursoSoakLanes {
+			err := tursoSoakBoundedCall(ctx, cfg.CallTimeout, func(callCtx context.Context) error {
+				return e.CreateQueue(callCtx, lane.Queue, QueueConfig{
+					LockDurationMs: 60_000, MaxDeliveryCount: 5, Ordering: lane.Ordering,
+				})
+			})
+			if err != nil {
+				return safeTursoSoakFailure(lane.Name, "create_queue", err)
+			}
+		}
+		return nil
+	}()
+
+	workloadStarted := time.Now()
+	runner.started, runner.windowStarted = workloadStarted, workloadStarted
+	runner.storage = e.db.storage.snapshot(e.db.poolStats())
+	for _, lane := range tursoSoakLanes {
+		runner.states = append(runner.states, newTursoSoakLaneState(lane))
+	}
+	var workloadErr error
+	if setupErr == nil {
+		if backgroundErr := runner.failure(); backgroundErr != nil {
+			workloadErr = backgroundErr
+		} else {
+			workloadErr = runner.run()
+		}
+	} else {
+		workloadErr = setupErr
+	}
+
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), tursoSoakControlTimeout(cfg.CallTimeout))
+	cleanupErr := tursoSoakCleanup(cleanupCtx, e, cfg.CallTimeout)
+	cancelCleanup()
+	runner.cleanupDone = cleanupErr == nil
+	closeErr := e.Close()
+	if closeErr != nil {
+		closeErr = tursoSoakFailure{Operation: "close", Code: storageErrorCode(closeErr)}
+	}
+	evidenceCloseErr := evidence.close()
+	backgroundErr := runner.failure()
+	_, _, accountingValid := runner.totals(runner.elapsed())
+	judgementErr := judgeTursoSoak(tursoSoakJudgement{
+		DurationCompleted: runner.durationDone, AccountingValid: accountingValid,
+		FinalBacklog: runner.lastBacklog, CleanupComplete: runner.cleanupDone,
+		Failure: errors.Join(workloadErr, backgroundErr, cleanupErr, closeErr, evidenceCloseErr),
+	})
+	status := "PASS"
+	var failure *tursoSoakFailure
+	if judgementErr != nil {
+		status = "FAIL"
+		var typed tursoSoakFailure
+		if errors.As(judgementErr, &typed) {
+			failure = &typed
+		} else {
+			failure = &tursoSoakFailure{Operation: "harness", Code: "evidence_io"}
+		}
+	}
+	if err := runner.writeSummary(status, failure); err != nil {
+		judgementErr = errors.Join(judgementErr, err)
+	}
+	return judgementErr
+}
+
+// TestTursoPerformanceSoak runs only when an explicit duration and a second
+// verification-database acknowledgement are present. TestMain independently
+// checks the host before its destructive reset, so a misconfigured secret fails
+// closed before this function is reached.
+func TestTursoPerformanceSoak(t *testing.T) {
+	cfg, enabled, err := readTursoSoakConfig()
+	if !enabled {
+		t.Skip("set MQLITE_TURSO_SOAK_DURATION to run the dedicated Turso performance soak")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv(tursoSoakConfirmEnv) != "1" {
+		t.Fatalf("%s=1 is required", tursoSoakConfirmEnv)
+	}
+	dsn, token := os.Getenv("MQLITE_TEST_DB"), os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN")
+	if !approvedTursoSoakDSN(dsn) {
+		t.Fatal("Turso soak refused: MQLITE_TEST_DB is not the dedicated verification database")
+	}
+	if token == "" {
+		t.Fatal("MQLITE_TEST_DB_AUTH_TOKEN is required")
+	}
+	if err := runTursoPerformanceSoak(cfg); err != nil {
+		t.Fatalf("Turso performance soak failed: %v", err)
+	}
+}
+
+func TestTursoSoakHistogramBounded(t *testing.T) {
+	h := newTursoSoakHistogram()
+	for _, d := range []time.Duration{time.Millisecond, 2 * time.Millisecond, 10 * time.Millisecond, 100 * time.Millisecond} {
+		h.observe(d)
+	}
+	s := h.summary()
+	if len(h.BucketCounts) != len(durationBounds) || s.Count != 4 || s.P50Ms <= 0 || s.P50Ms > s.P95Ms || s.P95Ms > s.P99Ms || s.P99Ms > s.MaxMs || s.MaxMs != 100 {
+		t.Fatalf("unexpected fixed histogram summary: %+v", s)
+	}
+	for i := 0; i < 10_000; i++ {
+		h.observe(time.Duration(i+1) * time.Microsecond)
+	}
+	if len(h.BucketCounts) != len(durationBounds) {
+		t.Fatal("histogram storage grew with observations")
+	}
+}
+
+func TestTursoSoakConfigurationGate(t *testing.T) {
+	t.Setenv(tursoSoakDurationEnv, "")
+	if _, enabled, err := readTursoSoakConfig(); enabled || err != nil {
+		t.Fatalf("disabled config: enabled=%v err=%v", enabled, err)
+	}
+	t.Setenv(tursoSoakDurationEnv, "2m")
+	t.Setenv(tursoSoakWindowEnv, "1s")
+	t.Setenv(tursoSoakCallTimeoutEnv, "3s")
+	t.Setenv(tursoSoakOutputEnv, t.TempDir())
+	cfg, enabled, err := readTursoSoakConfig()
+	if err != nil || !enabled || cfg.Duration != 2*time.Minute || cfg.Window != time.Second || cfg.CallTimeout != 3*time.Second || !filepath.IsAbs(cfg.OutputDir) {
+		t.Fatalf("valid config: %+v enabled=%v err=%v", cfg, enabled, err)
+	}
+	t.Setenv(tursoSoakWindowEnv, "1ms")
+	if _, enabled, err := readTursoSoakConfig(); !enabled || err == nil {
+		t.Fatalf("short window: enabled=%v err=%v", enabled, err)
+	}
+}
+
+func TestTursoSoakHostGuard(t *testing.T) {
+	if !approvedTursoSoakDSN("libsql://" + tursoSoakVerificationHost) {
+		t.Fatal("verification DSN rejected")
+	}
+	for _, dsn := range []string{
+		"libsql://unexpected-verification-host.turso.io",
+		"https://" + tursoSoakVerificationHost,
+		"libsql://user@" + tursoSoakVerificationHost,
+		"libsql://" + tursoSoakVerificationHost + "?token=secret",
+	} {
+		if approvedTursoSoakDSN(dsn) {
+			t.Fatalf("unsafe DSN accepted")
+		}
+	}
+}
+
+func TestTursoSoakPartialWindowAndJudgement(t *testing.T) {
+	if tursoSoakWindowPartial(time.Minute, false) {
+		t.Fatal("periodic full window marked partial")
+	}
+	for _, elapsed := range []time.Duration{20 * time.Second, 80 * time.Second} {
+		if !tursoSoakWindowPartial(elapsed, true) {
+			t.Fatal("final drain window must remain partial regardless of elapsed length")
+		}
+	}
+	zero := &tursoSoakBacklog{}
+	if err := judgeTursoSoak(tursoSoakJudgement{DurationCompleted: true, AccountingValid: true, FinalBacklog: zero, CleanupComplete: true}); err != nil {
+		t.Fatalf("valid run rejected: %v", err)
+	}
+	if err := judgeTursoSoak(tursoSoakJudgement{DurationCompleted: true, AccountingValid: false, FinalBacklog: zero, CleanupComplete: true}); err == nil {
+		t.Fatal("broken accounting accepted")
+	}
+	if err := judgeTursoSoak(tursoSoakJudgement{DurationCompleted: true, AccountingValid: true, FinalBacklog: &tursoSoakBacklog{Total: 1}, CleanupComplete: true}); err == nil {
+		t.Fatal("remaining backlog accepted")
+	}
+	runner := &tursoSoakRunner{}
+	runner.recordWindow(tursoSoakWindow{Overall: tursoSoakCounterReport{CyclesPerSecond: 10}})
+	runner.recordWindow(tursoSoakWindow{Partial: true, Overall: tursoSoakCounterReport{CyclesPerSecond: 0}})
+	trend := tursoSoakTrendFor(runner.firstWindow, runner.lastWindow, runner.fullWindows)
+	if trend.WindowCount != 1 || trend.FirstCyclesPerSecond != 10 || trend.LastCyclesPerSecond != 10 || trend.ChangePercent != nil {
+		t.Fatalf("short final partial changed full-window trend: %+v", trend)
+	}
+	if runner.latestWindow == nil || !runner.latestWindow.Partial {
+		t.Fatal("latest final-state sample did not retain the partial window")
+	}
+}
+
+func TestTursoSoakFirstFailurePersists(t *testing.T) {
+	runner := &tursoSoakRunner{failureSignal: make(chan struct{}, 1)}
+	first := tursoSoakFailure{Operation: "send", Code: "busy"}
+	runner.report(first)
+	<-runner.failureSignal // model a select consuming the notification before done
+	runner.report(tursoSoakFailure{Operation: "complete", Code: "connection"})
+	if got := runner.failure(); !errors.Is(got, first) {
+		t.Fatalf("first failure was lost: %v", got)
+	}
+}
+
+func TestTursoSoakBodyIsFixedAndUnique(t *testing.T) {
+	a, b := tursoSoakBody("standard_a", 1), tursoSoakBody("standard_a", 2)
+	if len(a) != tursoSoakBodyBytes || len(b) != tursoSoakBodyBytes || bytes.Equal(a, b) {
+		t.Fatal("soak bodies are not fixed-size and unique")
+	}
+}
+
+func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
+	e, _ := testEngine(t)
+	for _, lane := range tursoSoakLanes {
+		mustQueue(t, e, lane.Queue, QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 5, Ordering: lane.Ordering})
+	}
+	evidence, err := newTursoSoakEvidence(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = evidence.close() })
+	started := time.Now()
+	runner := &tursoSoakRunner{
+		e: e, cfg: tursoSoakConfig{Duration: 300 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: time.Second},
+		evidence: evidence, started: started, windowStarted: started, states: make([]*tursoSoakLaneState, 0, len(tursoSoakLanes)),
+		failureSignal: make(chan struct{}, 1), stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
+	}
+	for _, lane := range tursoSoakLanes {
+		runner.states = append(runner.states, newTursoSoakLaneState(lane))
+	}
+	if err := runner.run(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tursoSoakCleanup(ctx, e, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	runner.cleanupDone = true
+	_, _, accounting := runner.totals(runner.elapsed())
+	if err := judgeTursoSoak(tursoSoakJudgement{
+		DurationCompleted: runner.durationDone, AccountingValid: accounting,
+		FinalBacklog: runner.lastBacklog, CleanupComplete: runner.cleanupDone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.writeSummary("PASS", nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(evidence.dir, "windows.jsonl"))
+	if err != nil || bytes.Count(data, []byte{'\n'}) < 1 {
+		t.Fatalf("window evidence missing: lines=%d err=%v", bytes.Count(data, []byte{'\n'}), err)
 	}
 }
