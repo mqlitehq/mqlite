@@ -1337,8 +1337,42 @@ func (h tursoSoakLogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= slog.LevelWarn
 }
 func (h tursoSoakLogHandler) Handle(_ context.Context, r slog.Record) error {
+	// storage.failure is emitted synchronously before the foreground API returns.
+	// The lane records that returned error with its queue and operation, so reporting
+	// the log here would win the first-failure race and hide the useful attribution.
+	if r.Message == "storage.failure" {
+		return nil
+	}
+	if r.Level >= slog.LevelError && r.Message == "maintenance.failure" {
+		operation, code := "maintenance", "unknown"
+		r.Attrs(func(attr slog.Attr) bool {
+			switch attr.Key {
+			case "task":
+				if task := attr.Value.String(); task != "" {
+					operation += "/" + task
+				}
+			case "stage":
+				if stage := attr.Value.String(); stage != "" {
+					operation += "/" + stage
+				}
+			case "category":
+				if category := attr.Value.String(); category != "" {
+					code = category
+				}
+			}
+			return true
+		})
+		h.report(tursoSoakFailure{Operation: operation, Code: code})
+		return nil
+	}
+	// Preserve fail-closed behavior for a future warning/error event that the soak
+	// has not classified yet, without copying its potentially sensitive message.
 	if r.Level >= slog.LevelWarn {
-		h.report(tursoSoakFailure{Operation: "background", Code: "warning"})
+		code := "warning"
+		if r.Level >= slog.LevelError {
+			code = "error"
+		}
+		h.report(tursoSoakFailure{Operation: "engine_log", Code: "unclassified_" + code})
 	}
 	return nil
 }
@@ -1947,6 +1981,15 @@ func judgeTursoSoak(j tursoSoakJudgement) error {
 	return nil
 }
 
+func joinTursoSoakFailures(workloadErr, backgroundErr error, additional ...error) error {
+	errs := []error{workloadErr}
+	if backgroundErr != nil && !errors.Is(workloadErr, backgroundErr) {
+		errs = append(errs, backgroundErr)
+	}
+	errs = append(errs, additional...)
+	return errors.Join(errs...)
+}
+
 func tursoSoakControlTimeout(callTimeout time.Duration) time.Duration {
 	if timeout := 4 * callTimeout; timeout > 2*time.Minute {
 		return timeout
@@ -2051,7 +2094,7 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	judgementErr := judgeTursoSoak(tursoSoakJudgement{
 		DurationCompleted: runner.durationDone, AccountingValid: accountingValid,
 		FinalBacklog: runner.lastBacklog, CleanupComplete: runner.cleanupDone,
-		Failure: errors.Join(workloadErr, backgroundErr, cleanupErr, closeErr, evidenceCloseErr),
+		Failure: joinTursoSoakFailures(workloadErr, backgroundErr, cleanupErr, closeErr, evidenceCloseErr),
 	})
 	status := "PASS"
 	var failure *tursoSoakFailure
@@ -2188,6 +2231,68 @@ func TestTursoSoakFirstFailurePersists(t *testing.T) {
 	runner.report(tursoSoakFailure{Operation: "complete", Code: "connection"})
 	if got := runner.failure(); !errors.Is(got, first) {
 		t.Fatalf("first failure was lost: %v", got)
+	}
+}
+
+func TestTursoSoakLogHandlerAttributesFailures(t *testing.T) {
+	newLogger := func() (*tursoSoakRunner, *slog.Logger) {
+		runner := &tursoSoakRunner{failureSignal: make(chan struct{}, 1)}
+		return runner, slog.New(tursoSoakLogHandler{report: runner.report})
+	}
+	waitFailure := func(t *testing.T, runner *tursoSoakRunner) error {
+		t.Helper()
+		select {
+		case <-runner.failureSignal:
+			return runner.failure()
+		case <-time.After(time.Second):
+			t.Fatal("engine log failure was not reported")
+			return nil
+		}
+	}
+
+	t.Run("foreground storage log defers to lane", func(t *testing.T) {
+		runner, logger := newLogger()
+		logger.Error("storage.failure", "operation", "transaction", "category", "busy")
+		select {
+		case <-runner.failureSignal:
+			t.Fatal("foreground storage failure was misclassified as background maintenance")
+		default:
+		}
+		want := tursoSoakFailure{Lane: "standard_b", Operation: "send", Code: "busy"}
+		runner.report(want)
+		if got := waitFailure(t, runner); !errors.Is(got, want) {
+			t.Fatalf("foreground failure = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("maintenance", func(t *testing.T) {
+		runner, logger := newLogger()
+		logger.Error("maintenance.failure", "task", "ttl", "stage", "expire_to_dlq", "category", "busy")
+		want := tursoSoakFailure{Operation: "maintenance/ttl/expire_to_dlq", Code: "busy"}
+		if got := waitFailure(t, runner); !errors.Is(got, want) {
+			t.Fatalf("maintenance failure = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("unknown event fails closed", func(t *testing.T) {
+		runner, logger := newLogger()
+		logger.Warn("future.engine.warning", "secret", "must not be copied")
+		want := tursoSoakFailure{Operation: "engine_log", Code: "unclassified_warning"}
+		if got := waitFailure(t, runner); !errors.Is(got, want) {
+			t.Fatalf("unclassified failure = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestJoinTursoSoakFailuresDoesNotRepeatFirstFailure(t *testing.T) {
+	first := tursoSoakFailure{Lane: "standard_b", Operation: "send", Code: "busy"}
+	if got := joinTursoSoakFailures(first, first); strings.Count(got.Error(), first.Error()) != 1 {
+		t.Fatalf("same first failure was repeated: %q", got)
+	}
+	second := tursoSoakFailure{Operation: "cleanup", Code: "connection"}
+	got := joinTursoSoakFailures(first, second)
+	if !errors.Is(got, first) || !errors.Is(got, second) {
+		t.Fatalf("distinct failures were not preserved: %v", got)
 	}
 }
 
