@@ -316,8 +316,20 @@ It is separate from the HTTP broker and uses four closed-loop lanes: two standar
 queues, one `group_fifo` queue and one `strict_fifo` queue. Each lane repeatedly
 sends one unique 256-byte body, receives and verifies that exact body, then
 completes it before starting the next cycle. This keeps the live message working
-set bounded while exercising the four-connection remote pool and normal
-background maintenance.
+set bounded while exercising normal background maintenance.
+
+The four logical lanes share a fixed admission limit of one harness database
+call in flight (`foreground_max_in_flight=1` in `metadata.json`). Their initial
+starts use nominal 0, 250, 500 and 750 ms offsets, recorded as a 250 ms lane-start
+stagger in the metadata. Against the four-connection remote pool, this avoids a
+synchronized startup burst and keeps foreground call demand below the pool limit,
+providing headroom for normal background maintenance. The profile is deliberately
+a sustainable stability and trend load. It is not a capacity test, and its
+throughput must not be read as the backend's maximum.
+
+The admission limit applies only to calls made by the harness. Engine background
+workers bypass it, and it does not reserve the Turso primary's serialized write
+lock.
 
 Choose 2, 10 or 30 minutes when dispatching the workflow. Start with 2 minutes to
 verify credentials, cleanup and evidence collection; use 30 minutes for the
@@ -330,11 +342,32 @@ production database.
 Each minute, and once more for a final partial window, the artifact records
 per-lane and overall cycles/s; Send, Receive, Complete and end-to-end p50/p95/p99
 and maximum latency; empty/error counts; queue backlog; settlement-receipt
-counts; storage outcomes and retries; pool waits; Go heap, RSS, goroutines, GC and
-process CPU where the runner exposes them. `metadata.json`, `windows.jsonl`,
+counts; storage outcomes and retries; pool waits; background-maintenance pass
+state; Go heap, RSS, goroutines, GC and process CPU where the runner exposes them.
+The maintenance snapshot is copied from process memory and does not issue an
+additional remote database query. `metadata.json`, `windows.jsonl`,
 `summary.json`, `summary.md` and the test log are retained for 14 days. Errors,
 body mismatches, accounting failures, final backlog or exact cleanup failures
 fail the run, while the evidence written before a failure remains uploadable.
+
+A single non-final `Stats` or settlement-receipt-count sample that fails with the
+`connection` category is recorded as a gap and may recover at the next scheduled
+sample; the harness does not issue an extra query to force recovery. During that
+gap, the overall and per-lane backlog and settlement-receipt fields are `null`,
+and older values are not presented as final state. A second monitoring failure
+anywhere in the run, any other operation or error category (including a
+working-set invariant), or a failed final sample fails the soak. Each window
+records structured monitoring status, and the summary records the failed-sample
+count and recovery status.
+
+A single failed maintenance pass may recover on that task's next complete pass.
+Two consecutive failed passes, or one still unrecovered at the end of the run,
+fail the soak. Recovered failures remain visible in the cumulative maintenance
+counters and bounded diagnostic history. The final maintenance judgement is a
+process-memory snapshot taken after `Engine.Close` has stopped and joined the
+background workers; the harness does not trigger an extra maintenance pass to
+change the result. Thus the last `windows.jsonl` entry is the pre-cleanup workload
+sample, while `summary.json.final_maintenance` is the post-close terminal state.
 A runner cancellation or outer test timeout can interrupt final cleanup; the
 next run's `TestMain` reset and namespaced startup cleanup remove that residue.
 

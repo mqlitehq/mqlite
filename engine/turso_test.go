@@ -881,6 +881,8 @@ const (
 	tursoSoakOutputEnv      = "MQLITE_TURSO_SOAK_OUTPUT"
 	tursoSoakConfirmEnv     = "MQLITE_TURSO_SOAK_CONFIRM_TEST_DB"
 	tursoSoakBodyBytes      = 256
+	tursoSoakMaxInFlight    = 1
+	tursoSoakLaneStagger    = 250 * time.Millisecond
 )
 
 type tursoSoakConfig struct {
@@ -1292,18 +1294,24 @@ func readTursoSoakCPU() *float64 {
 }
 
 type tursoSoakWindow struct {
-	Sequence           int                    `json:"sequence"`
-	StartedAt          time.Time              `json:"started_at"`
-	EndedAt            time.Time              `json:"ended_at"`
-	DurationSeconds    float64                `json:"duration_seconds"`
-	Partial            bool                   `json:"partial"`
-	Lanes              []tursoSoakLaneWindow  `json:"lanes"`
-	Overall            tursoSoakCounterReport `json:"overall"`
-	StatsBacklog       *tursoSoakBacklog      `json:"stats_backlog"`
-	SettlementReceipts *int64                 `json:"settlement_receipts"`
-	Storage            tursoSoakStorageWindow `json:"storage"`
-	Resources          tursoSoakResources     `json:"resources"`
-	MonitorError       string                 `json:"monitor_error,omitempty"`
+	Sequence           int                      `json:"sequence"`
+	StartedAt          time.Time                `json:"started_at"`
+	EndedAt            time.Time                `json:"ended_at"`
+	DurationSeconds    float64                  `json:"duration_seconds"`
+	Partial            bool                     `json:"partial"`
+	Lanes              []tursoSoakLaneWindow    `json:"lanes"`
+	Overall            tursoSoakCounterReport   `json:"overall"`
+	StatsBacklog       *tursoSoakBacklog        `json:"stats_backlog"`
+	SettlementReceipts *int64                   `json:"settlement_receipts"`
+	Storage            tursoSoakStorageWindow   `json:"storage"`
+	Maintenance        []MaintenanceObservation `json:"maintenance"`
+	Resources          tursoSoakResources       `json:"resources"`
+	Monitor            tursoSoakMonitorWindow   `json:"monitor"`
+}
+
+type tursoSoakMonitorWindow struct {
+	Status  string            `json:"status"`
+	Failure *tursoSoakFailure `json:"failure,omitempty"`
 }
 
 func tursoSoakWindowPartial(_ time.Duration, final bool) bool {
@@ -1334,7 +1342,7 @@ type tursoSoakLogHandler struct {
 }
 
 func (h tursoSoakLogHandler) Enabled(_ context.Context, level slog.Level) bool {
-	return level >= slog.LevelWarn
+	return level >= slog.LevelInfo
 }
 func (h tursoSoakLogHandler) Handle(_ context.Context, r slog.Record) error {
 	// storage.failure is emitted synchronously before the foreground API returns.
@@ -1343,18 +1351,18 @@ func (h tursoSoakLogHandler) Handle(_ context.Context, r slog.Record) error {
 	if r.Message == "storage.failure" {
 		return nil
 	}
-	if r.Level >= slog.LevelError && r.Message == "maintenance.failure" {
-		operation, code := "maintenance", "unknown"
+	// A tracked maintenance failure is emitted before runMaintenance records its
+	// complete pass. Per-window snapshots below use that authoritative state so
+	// one transient failure gets a chance to recover. Startup/manual failures do
+	// not enter that state and therefore remain immediately fatal.
+	if r.Message == "maintenance.failure" {
+		code, task, stage := "unknown", "", ""
 		r.Attrs(func(attr slog.Attr) bool {
 			switch attr.Key {
 			case "task":
-				if task := attr.Value.String(); task != "" {
-					operation += "/" + task
-				}
+				task = attr.Value.String()
 			case "stage":
-				if stage := attr.Value.String(); stage != "" {
-					operation += "/" + stage
-				}
+				stage = attr.Value.String()
 			case "category":
 				if category := attr.Value.String(); category != "" {
 					code = category
@@ -1362,7 +1370,43 @@ func (h tursoSoakLogHandler) Handle(_ context.Context, r slog.Record) error {
 			}
 			return true
 		})
-		h.report(tursoSoakFailure{Operation: operation, Code: code})
+		if !tursoSoakTrackedMaintenanceTask(task) {
+			operation := "maintenance"
+			if task != "" {
+				operation += "/" + task
+			}
+			if stage != "" {
+				operation += "/" + stage
+			}
+			h.report(tursoSoakFailure{Operation: operation, Code: code})
+		}
+		return nil
+	}
+	// A fast maintenance task can fail twice and recover between minute samples.
+	// The recovery event carries the completed pass streak, so retain the same
+	// two-pass policy without polling the database or expanding production state.
+	if r.Message == "maintenance.recovered" {
+		task := "unknown"
+		var failures uint64
+		r.Attrs(func(attr slog.Attr) bool {
+			switch attr.Key {
+			case "task":
+				if value := attr.Value.String(); value != "" {
+					task = value
+				}
+			case "consecutive_failures":
+				if attr.Value.Kind() == slog.KindUint64 {
+					failures = attr.Value.Uint64()
+				}
+			}
+			return true
+		})
+		if failures >= 2 {
+			h.report(tursoSoakFailure{Operation: "maintenance/" + task, Code: "repeated_failure"})
+		}
+		return nil
+	}
+	if r.Message == "maintenance.interrupted" {
 		return nil
 	}
 	// Preserve fail-closed behavior for a future warning/error event that the soak
@@ -1378,6 +1422,77 @@ func (h tursoSoakLogHandler) Handle(_ context.Context, r slog.Record) error {
 }
 func (h tursoSoakLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h tursoSoakLogHandler) WithGroup(string) slog.Handler      { return h }
+
+func tursoSoakTrackedMaintenanceTask(task string) bool {
+	for _, tracked := range MaintenanceTaskNames() {
+		if task == tracked {
+			return true
+		}
+	}
+	return false
+}
+
+func tursoSoakMaintenanceSnapshot(e *Engine) []MaintenanceObservation {
+	e.observation.mu.Lock()
+	defer e.observation.mu.Unlock()
+
+	reclaimEnabled := false
+	if e.db != nil && !e.db.remote {
+		_, reclaimEnabled = localFilePath(e.db.dsn)
+	}
+	out := make([]MaintenanceObservation, 0, len(MaintenanceTaskNames()))
+	for _, task := range MaintenanceTaskNames() {
+		m := e.observation.maintenance[task]
+		m.Task = task
+		m.Enabled = e.observation.background && (task != "reclaim" || reclaimEnabled)
+		m.Duration = cloneHistogram(m.Duration)
+		if m.Diagnostics == nil {
+			m.Diagnostics = &MaintenanceDiagnostics{LastOutcome: "never", RecentFailures: []MaintenanceFailure{}}
+		} else {
+			diagnostics := *m.Diagnostics
+			diagnostics.RecentFailures = append([]MaintenanceFailure{}, diagnostics.RecentFailures...)
+			m.Diagnostics = &diagnostics
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func tursoSoakMaintenanceFailure(m MaintenanceObservation) tursoSoakFailure {
+	failure := tursoSoakFailure{Operation: "maintenance/" + m.Task, Code: "unknown"}
+	if m.Diagnostics == nil || len(m.Diagnostics.RecentFailures) == 0 {
+		return failure
+	}
+	recent := m.Diagnostics.RecentFailures[len(m.Diagnostics.RecentFailures)-1]
+	if recent.Stage != "" {
+		failure.Operation += "/" + recent.Stage
+	}
+	if recent.Error.Category != "" {
+		failure.Code = recent.Error.Category
+	}
+	return failure
+}
+
+func tursoSoakMaintenanceHealth(maintenance []MaintenanceObservation, final bool) error {
+	for _, m := range maintenance {
+		if !m.Enabled || m.Diagnostics == nil {
+			continue
+		}
+		failures := m.Diagnostics.ConsecutiveFailures
+		if failures >= 2 || (final && failures > 0) {
+			return tursoSoakMaintenanceFailure(m)
+		}
+	}
+	return nil
+}
+
+func tursoSoakWindowMaintenanceHealth(maintenance []MaintenanceObservation) error {
+	return tursoSoakMaintenanceHealth(maintenance, false)
+}
+
+func tursoSoakTerminalMaintenanceHealth(maintenance []MaintenanceObservation) error {
+	return tursoSoakMaintenanceHealth(maintenance, true)
+}
 
 type tursoSoakEvidence struct {
 	dir     string
@@ -1494,21 +1609,28 @@ func tursoSoakTrendFor(first, last *tursoSoakWindow, count int) tursoSoakTrend {
 }
 
 type tursoSoakSummary struct {
-	Status                    string                 `json:"status"`
-	RequestedDurationSeconds  float64                `json:"requested_duration_seconds"`
-	ElapsedSeconds            float64                `json:"elapsed_seconds"`
-	WindowSeconds             float64                `json:"window_seconds"`
-	WindowTrend               tursoSoakTrend         `json:"window_trend"`
-	Overall                   tursoSoakCounterReport `json:"overall"`
-	Lanes                     []tursoSoakLaneWindow  `json:"lanes"`
-	FinalStatsBacklog         *tursoSoakBacklog      `json:"final_stats_backlog"`
-	FinalSettlementReceipts   *int64                 `json:"final_settlement_receipts"`
-	AccountingValid           bool                   `json:"accounting_valid"`
-	DurationCompleted         bool                   `json:"duration_completed"`
-	CleanupComplete           bool                   `json:"cleanup_complete"`
-	Failure                   *tursoSoakFailure      `json:"failure,omitempty"`
-	RemotePhysicalFileMetrics map[string]*uint64     `json:"remote_physical_file_metrics"`
-	Notes                     []string               `json:"notes"`
+	Status                    string                   `json:"status"`
+	RequestedDurationSeconds  float64                  `json:"requested_duration_seconds"`
+	ElapsedSeconds            float64                  `json:"elapsed_seconds"`
+	WindowSeconds             float64                  `json:"window_seconds"`
+	WindowTrend               tursoSoakTrend           `json:"window_trend"`
+	Overall                   tursoSoakCounterReport   `json:"overall"`
+	Lanes                     []tursoSoakLaneWindow    `json:"lanes"`
+	FinalStatsBacklog         *tursoSoakBacklog        `json:"final_stats_backlog"`
+	FinalSettlementReceipts   *int64                   `json:"final_settlement_receipts"`
+	FinalMaintenance          []MaintenanceObservation `json:"final_maintenance"`
+	AccountingValid           bool                     `json:"accounting_valid"`
+	DurationCompleted         bool                     `json:"duration_completed"`
+	CleanupComplete           bool                     `json:"cleanup_complete"`
+	Failure                   *tursoSoakFailure        `json:"failure,omitempty"`
+	Monitor                   tursoSoakMonitorSummary  `json:"monitor"`
+	RemotePhysicalFileMetrics map[string]*uint64       `json:"remote_physical_file_metrics"`
+	Notes                     []string                 `json:"notes"`
+}
+
+type tursoSoakMonitorSummary struct {
+	FailedSamples  uint64 `json:"failed_samples"`
+	RecoveryStatus string `json:"recovery_status"`
 }
 
 func (s tursoSoakSummary) markdown() []byte {
@@ -1530,6 +1652,27 @@ func (s tursoSoakSummary) markdown() []byte {
 			lane.Name, lane.Work.Cycles, lane.Work.CyclesPerSecond, lane.Work.EndToEnd.P50Ms,
 			lane.Work.EndToEnd.P95Ms, lane.Work.EndToEnd.P99Ms, lane.Work.EndToEnd.MaxMs, lane.Work.Errors)
 	}
+	fmt.Fprintln(&b, "\n## Maintenance")
+	if len(s.FinalMaintenance) == 0 {
+		fmt.Fprintln(&b, "\nUnavailable; the engine did not open far enough to collect a snapshot.")
+	} else {
+		fmt.Fprintln(&b, "\n| Task | Runs | Failed passes | Last outcome | Consecutive failures |")
+		fmt.Fprintln(&b, "|---|---:|---:|---|---:|")
+		for _, maintenance := range s.FinalMaintenance {
+			outcome := "unknown"
+			var consecutive uint64
+			if maintenance.Diagnostics != nil {
+				outcome = maintenance.Diagnostics.LastOutcome
+				consecutive = maintenance.Diagnostics.ConsecutiveFailures
+			}
+			if !maintenance.Enabled {
+				outcome = "disabled"
+			}
+			fmt.Fprintf(&b, "| %s | %d | %d | %s | %d |\n", maintenance.Task, maintenance.Runs, maintenance.Failures, outcome, consecutive)
+		}
+	}
+	fmt.Fprintln(&b, "\n## Monitoring")
+	fmt.Fprintf(&b, "\nFailed samples: %d; recovery status: %s.\n", s.Monitor.FailedSamples, s.Monitor.RecoveryStatus)
 	fmt.Fprintln(&b, "\n## Window trend")
 	fmt.Fprintf(&b, "\nFirst %.2f cycles/s; last %.2f cycles/s across %d window(s)",
 		s.WindowTrend.FirstCyclesPerSecond, s.WindowTrend.LastCyclesPerSecond, s.WindowTrend.WindowCount)
@@ -1546,28 +1689,33 @@ func (s tursoSoakSummary) markdown() []byte {
 }
 
 type tursoSoakRunner struct {
-	e             *Engine
-	cfg           tursoSoakConfig
-	evidence      *tursoSoakEvidence
-	started       time.Time
-	finished      time.Time
-	windowStarted time.Time
-	states        []*tursoSoakLaneState
-	failureSignal chan struct{}
-	failureMu     sync.Mutex
-	firstFailure  error
-	stop          chan struct{}
-	stopOnce      sync.Once
-	storage       StorageObservation
-	firstWindow   *tursoSoakWindow
-	lastWindow    *tursoSoakWindow
-	latestWindow  *tursoSoakWindow
-	windowCount   int
-	fullWindows   int
-	lastBacklog   *tursoSoakBacklog
-	lastReceipts  *int64
-	durationDone  bool
-	cleanupDone   bool
+	e               *Engine
+	cfg             tursoSoakConfig
+	evidence        *tursoSoakEvidence
+	admission       *tursoSoakAdmission
+	started         time.Time
+	finished        time.Time
+	windowStarted   time.Time
+	states          []*tursoSoakLaneState
+	failureSignal   chan struct{}
+	failureMu       sync.Mutex
+	firstFailure    error
+	stop            chan struct{}
+	stopOnce        sync.Once
+	storage         StorageObservation
+	firstWindow     *tursoSoakWindow
+	lastWindow      *tursoSoakWindow
+	latestWindow    *tursoSoakWindow
+	windowCount     int
+	fullWindows     int
+	lastBacklog     *tursoSoakBacklog
+	lastReceipts    *int64
+	lastMaintenance []MaintenanceObservation
+	monitorFailures uint64
+	monitorPending  bool
+	monitorFatal    bool
+	durationDone    bool
+	cleanupDone     bool
 }
 
 func (r *tursoSoakRunner) report(err error) {
@@ -1598,7 +1746,56 @@ func (r *tursoSoakRunner) failure() error {
 func (r *tursoSoakRunner) stopLanes() { r.stopOnce.Do(func() { close(r.stop) }) }
 
 func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
-	return tursoSoakBoundedCall(context.Background(), r.cfg.CallTimeout, fn)
+	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.CallTimeout)
+	defer cancel()
+	if err := r.admission.acquire(ctx); err != nil {
+		return err
+	}
+	defer r.admission.release()
+	return fn(ctx)
+}
+
+// tursoSoakAdmission bounds every harness-originated database call. Limiting the
+// harness to one call keeps foreground demand below the remote pool's
+// four-connection limit while all four logical lanes remain active, providing
+// headroom for background maintenance. Background workers do not use this gate,
+// and it does not reserve the Turso primary's serialized write lock.
+type tursoSoakAdmission struct {
+	slots chan struct{}
+}
+
+func newTursoSoakAdmission(limit int) *tursoSoakAdmission {
+	return &tursoSoakAdmission{slots: make(chan struct{}, limit)}
+}
+
+func (a *tursoSoakAdmission) acquire(ctx context.Context) error {
+	select {
+	case a.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *tursoSoakAdmission) release() { <-a.slots }
+
+func tursoSoakWaitForLaneStart(stop <-chan struct{}, delay time.Duration) bool {
+	if delay <= 0 {
+		select {
+		case <-stop:
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-stop:
+		return false
+	}
 }
 
 func tursoSoakBoundedCall(parent context.Context, timeout time.Duration, fn func(context.Context) error) error {
@@ -1607,7 +1804,10 @@ func tursoSoakBoundedCall(parent context.Context, timeout time.Duration, fn func
 	return fn(ctx)
 }
 
-func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState) {
+func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState, startDelay time.Duration) {
+	if !tursoSoakWaitForLaneStart(r.stop, startDelay) {
+		return
+	}
 	for cycle := uint64(1); ; cycle++ {
 		select {
 		case <-r.stop:
@@ -1707,6 +1907,65 @@ func (r *tursoSoakRunner) collectStats() ([]*tursoSoakBacklog, map[string]int64,
 	return backlogs, receipts, nil
 }
 
+func (r *tursoSoakRunner) applyMonitorSample(window *tursoSoakWindow, final bool, backlogs []*tursoSoakBacklog, receipts map[string]int64, monitorErr error) error {
+	if monitorErr == nil {
+		overall := tursoSoakBacklog{}
+		var receiptTotal int64
+		for i, state := range r.states {
+			window.Lanes[i].Backlog = backlogs[i]
+			if backlogs[i] != nil {
+				overall.add(*backlogs[i])
+			}
+			count := receipts[state.spec.Queue]
+			window.Lanes[i].SettlementReceipts = &count
+			receiptTotal += count
+		}
+		window.StatsBacklog = &overall
+		window.SettlementReceipts = &receiptTotal
+		r.lastBacklog = &overall
+		r.lastReceipts = &receiptTotal
+		window.Monitor.Status = "ok"
+		if r.monitorPending {
+			window.Monitor.Status = "recovered"
+			r.monitorPending = false
+		}
+		return nil
+	}
+
+	// A failed sample is wholly unavailable even when Stats succeeded for an
+	// earlier lane. Never mix a partial sample into the evidence or retain an
+	// older successful value as the apparent final state.
+	r.lastBacklog = nil
+	r.lastReceipts = nil
+	r.monitorFailures++
+	failure := tursoSoakFailure{Operation: "monitor", Code: "unknown"}
+	if !errors.As(monitorErr, &failure) {
+		monitorErr = failure
+	}
+	window.Monitor = tursoSoakMonitorWindow{Status: "failed", Failure: &failure}
+	knownSample := failure.Operation == "stats" || failure.Operation == "receipt_count"
+	if !final && r.monitorFailures == 1 && failure.Code == "connection" && knownSample {
+		window.Monitor.Status = "gap"
+		r.monitorPending = true
+		return nil
+	}
+	r.monitorPending = false
+	r.monitorFatal = true
+	return monitorErr
+}
+
+func (r *tursoSoakRunner) monitorSummary() tursoSoakMonitorSummary {
+	status := "not_needed"
+	if r.monitorFatal {
+		status = "failed"
+	} else if r.monitorPending {
+		status = "awaiting_recovery"
+	} else if r.monitorFailures != 0 {
+		status = "recovered"
+	}
+	return tursoSoakMonitorSummary{FailedSamples: r.monitorFailures, RecoveryStatus: status}
+}
+
 func (r *tursoSoakRunner) flushWindow(final bool) error {
 	ended := time.Now()
 	elapsed := ended.Sub(r.windowStarted)
@@ -1721,38 +1980,26 @@ func (r *tursoSoakRunner) flushWindow(final bool) error {
 	}
 	backlogs, receipts, monitorErr := r.collectStats()
 	overallCounters := newTursoSoakCounters()
-	overallBacklog := tursoSoakBacklog{}
-	var receiptTotal int64
 	for i, state := range r.states {
 		counters := windowCounters[i]
 		overallCounters.merge(counters)
 		lane := tursoSoakLaneWindow{
 			Name: state.spec.Name, Ordering: state.spec.Ordering,
-			Work: tursoSoakCounterReportFor(counters, elapsed), Backlog: backlogs[i],
-		}
-		if backlogs[i] != nil {
-			overallBacklog.add(*backlogs[i])
-		}
-		if receipts != nil {
-			count := receipts[state.spec.Queue]
-			lane.SettlementReceipts = &count
-			receiptTotal += count
+			Work: tursoSoakCounterReportFor(counters, elapsed),
 		}
 		window.Lanes = append(window.Lanes, lane)
 	}
 	window.Overall = tursoSoakCounterReportFor(overallCounters, elapsed)
-	if monitorErr == nil {
-		window.StatsBacklog = &overallBacklog
-		window.SettlementReceipts = &receiptTotal
-		r.lastBacklog = &overallBacklog
-		r.lastReceipts = &receiptTotal
-	} else {
-		window.MonitorError = monitorErr.Error()
-	}
+	monitorHealthErr := r.applyMonitorSample(&window, final, backlogs, receipts, monitorErr)
 	currentStorage := r.e.db.storage.snapshot(r.e.db.poolStats())
 	window.Storage = tursoSoakStorageDelta(r.storage, currentStorage)
 	r.storage = currentStorage
 	window.Resources = tursoSoakResourceSnapshot()
+	window.Maintenance = tursoSoakMaintenanceSnapshot(r.e)
+	// A window, including the final workload sample, is not the engine terminal
+	// state: an already-running maintenance pass can still finish during cleanup.
+	// Close waits for those workers; its snapshot below performs the strict check.
+	maintenanceErr := tursoSoakWindowMaintenanceHealth(window.Maintenance)
 	if err := r.evidence.appendWindow(window); err != nil {
 		return err
 	}
@@ -1762,12 +2009,13 @@ func (r *tursoSoakRunner) flushWindow(final bool) error {
 	if err := r.writeSummary("RUNNING", nil); err != nil {
 		return err
 	}
-	return monitorErr
+	return errors.Join(monitorHealthErr, maintenanceErr)
 }
 
 func (r *tursoSoakRunner) recordWindow(window tursoSoakWindow) {
 	latest := window
 	r.latestWindow = &latest
+	r.lastMaintenance = window.Maintenance
 	r.recordTrendWindow(window)
 }
 
@@ -1815,11 +2063,17 @@ func (r *tursoSoakRunner) summary(status string, failure *tursoSoakFailure) turs
 		Status: status, RequestedDurationSeconds: r.cfg.Duration.Seconds(), ElapsedSeconds: elapsed.Seconds(),
 		WindowSeconds: r.cfg.Window.Seconds(), WindowTrend: tursoSoakTrendFor(r.firstWindow, r.lastWindow, r.fullWindows),
 		Overall: overall, Lanes: lanes, FinalStatsBacklog: r.lastBacklog, FinalSettlementReceipts: r.lastReceipts,
-		AccountingValid: valid, DurationCompleted: r.durationDone, CleanupComplete: r.cleanupDone, Failure: failure,
+		FinalMaintenance: r.lastMaintenance,
+		AccountingValid:  valid, DurationCompleted: r.durationDone, CleanupComplete: r.cleanupDone, Failure: failure,
+		Monitor:                   r.monitorSummary(),
 		RemotePhysicalFileMetrics: map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
 		Notes: []string{
 			"Trend evidence only; no performance threshold or SLA verdict is applied.",
-			"One Engine connects directly to the dedicated verification database with four closed-loop lanes.",
+			fmt.Sprintf("One Engine connects directly to the dedicated verification database with four closed-loop lanes, a harness database-call concurrency limit of %d, and fixed %d ms lane-start staggering.", tursoSoakMaxInFlight, tursoSoakLaneStagger.Milliseconds()),
+			"The workload deliberately keeps harness foreground calls below the four-connection remote pool limit to provide headroom for background maintenance; it is not a capacity test.",
+			"A single failed maintenance pass may recover on the task's next complete pass; two consecutive failures or a failure still unrecovered after background workers stop fail the run, and recovered incidents remain in the evidence.",
+			"Maintenance evidence is copied from process-local observations and adds no remote database calls.",
+			"At most one non-final Stats or receipt-count sample with a connection failure may be a recorded gap; the next scheduled sample must recover, while another monitoring failure, any other operation or error code, or a final-sample failure fails the run.",
 			"Settlement receipts expire after 30 minutes, so their count is a retention snapshot rather than a lifetime completion ledger.",
 			"Remote Turso does not expose physical database or WAL sizes.",
 		},
@@ -1843,12 +2097,12 @@ func (r *tursoSoakRunner) writeSummary(status string, failure *tursoSoakFailure)
 
 func (r *tursoSoakRunner) run() error {
 	var workers sync.WaitGroup
-	for _, state := range r.states {
+	for i, state := range r.states {
 		workers.Add(1)
-		go func(state *tursoSoakLaneState) {
+		go func(state *tursoSoakLaneState, startDelay time.Duration) {
 			defer workers.Done()
-			r.runLane(state)
-		}(state)
+			r.runLane(state, startDelay)
+		}(state, time.Duration(i)*tursoSoakLaneStagger)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -2012,7 +2266,10 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 		"schema_version": 1, "started_at": started.UTC(), "duration_seconds": cfg.Duration.Seconds(),
 		"window_seconds": cfg.Window.Seconds(), "call_timeout_seconds": cfg.CallTimeout.Seconds(),
 		"backend": "remote Turso/libSQL", "engine_count": 1, "message_body_bytes": tursoSoakBodyBytes,
-		"background_maintenance": true, "latency_method": "fixed-memory logarithmic histogram over each complete window",
+		"foreground_max_in_flight":        tursoSoakMaxInFlight,
+		"lane_start_stagger_milliseconds": tursoSoakLaneStagger.Milliseconds(),
+		"load_intent":                     "sustained stability and trend workload, not a capacity test",
+		"background_maintenance":          true, "latency_method": "fixed-memory logarithmic histogram over each complete window",
 		"go_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
 		"git_sha":                             strings.TrimSpace(os.Getenv("GITHUB_SHA")),
 		"remote_physical_file_metrics":        map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
@@ -2024,7 +2281,8 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	}
 
 	runner := &tursoSoakRunner{
-		cfg: cfg, evidence: evidence, failureSignal: make(chan struct{}, 1), stop: make(chan struct{}),
+		cfg: cfg, evidence: evidence, admission: newTursoSoakAdmission(tursoSoakMaxInFlight),
+		failureSignal: make(chan struct{}, 1), stop: make(chan struct{}),
 	}
 	openCtx, cancelOpen := context.WithTimeout(context.Background(), cfg.CallTimeout)
 	e, err := Open(openCtx, Options{
@@ -2036,7 +2294,9 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 		failure := tursoSoakFailure{Operation: "open", Code: storageErrorCode(err)}
 		summary := tursoSoakSummary{
 			Status: "FAIL", RequestedDurationSeconds: cfg.Duration.Seconds(), ElapsedSeconds: time.Since(started).Seconds(),
-			WindowSeconds: cfg.Window.Seconds(), Failure: &failure, RemotePhysicalFileMetrics: map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
+			WindowSeconds: cfg.Window.Seconds(), Failure: &failure,
+			Monitor:                   tursoSoakMonitorSummary{RecoveryStatus: "not_started"},
+			RemotePhysicalFileMetrics: map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
 		}
 		_ = evidence.writeJSON("summary.json", summary)
 		_ = tursoSoakAtomicWrite(filepath.Join(evidence.dir, "summary.md"), summary.markdown())
@@ -2085,6 +2345,9 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	cancelCleanup()
 	runner.cleanupDone = cleanupErr == nil
 	closeErr := e.Close()
+	terminalMaintenance := tursoSoakMaintenanceSnapshot(e)
+	runner.lastMaintenance = terminalMaintenance
+	maintenanceErr := tursoSoakTerminalMaintenanceHealth(terminalMaintenance)
 	if closeErr != nil {
 		closeErr = tursoSoakFailure{Operation: "close", Code: storageErrorCode(closeErr)}
 	}
@@ -2094,7 +2357,7 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	judgementErr := judgeTursoSoak(tursoSoakJudgement{
 		DurationCompleted: runner.durationDone, AccountingValid: accountingValid,
 		FinalBacklog: runner.lastBacklog, CleanupComplete: runner.cleanupDone,
-		Failure: joinTursoSoakFailures(workloadErr, backgroundErr, cleanupErr, closeErr, evidenceCloseErr),
+		Failure: joinTursoSoakFailures(workloadErr, backgroundErr, cleanupErr, closeErr, maintenanceErr, evidenceCloseErr),
 	})
 	status := "PASS"
 	var failure *tursoSoakFailure
@@ -2176,6 +2439,65 @@ func TestTursoSoakConfigurationGate(t *testing.T) {
 	}
 }
 
+func TestTursoSoakAdmissionLimit(t *testing.T) {
+	admission := newTursoSoakAdmission(tursoSoakMaxInFlight)
+	for i := 0; i < tursoSoakMaxInFlight; i++ {
+		if err := admission.acquire(context.Background()); err != nil {
+			t.Fatalf("acquire slot %d: %v", i, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := admission.acquire(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("fourth concurrent call admitted: %v", err)
+	}
+	admission.release()
+	if err := admission.acquire(context.Background()); err != nil {
+		t.Fatalf("call not admitted after release: %v", err)
+	}
+	for i := 0; i < tursoSoakMaxInFlight; i++ {
+		admission.release()
+	}
+}
+
+func TestTursoSoakAdmissionWaitUsesCallTimeout(t *testing.T) {
+	admission := newTursoSoakAdmission(1)
+	if err := admission.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer admission.release()
+	runner := &tursoSoakRunner{
+		cfg:       tursoSoakConfig{CallTimeout: 20 * time.Millisecond},
+		admission: admission,
+	}
+	called := false
+	err := runner.call(func(context.Context) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("admission wait error = %v, want context deadline exceeded", err)
+	}
+	if called {
+		t.Fatal("database call ran without admission")
+	}
+}
+
+func TestTursoSoakLaneStaggerStopsPromptly(t *testing.T) {
+	stop := make(chan struct{})
+	done := make(chan bool, 1)
+	go func() { done <- tursoSoakWaitForLaneStart(stop, time.Hour) }()
+	close(stop)
+	select {
+	case started := <-done:
+		if started {
+			t.Fatal("stopped lane was allowed to start")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lane stagger did not respond to stop")
+	}
+}
+
 func TestTursoSoakHostGuard(t *testing.T) {
 	if !approvedTursoSoakDSN("libsql://" + tursoSoakVerificationHost) {
 		t.Fatal("verification DSN rejected")
@@ -2234,6 +2556,203 @@ func TestTursoSoakFirstFailurePersists(t *testing.T) {
 	}
 }
 
+func TestTursoSoakMonitorSamplePolicy(t *testing.T) {
+	newRunner := func() *tursoSoakRunner {
+		return &tursoSoakRunner{states: []*tursoSoakLaneState{
+			newTursoSoakLaneState(tursoSoakLaneSpec{Name: "lane_a", Queue: "queue_a"}),
+			newTursoSoakLaneState(tursoSoakLaneSpec{Name: "lane_b", Queue: "queue_b"}),
+		}}
+	}
+	newWindow := func() tursoSoakWindow {
+		return tursoSoakWindow{Lanes: []tursoSoakLaneWindow{{Name: "lane_a"}, {Name: "lane_b"}}}
+	}
+	connection := tursoSoakFailure{Lane: "lane_b", Operation: "stats", Code: "connection"}
+	partialBacklogs := []*tursoSoakBacklog{{Active: 1, Total: 1}, nil}
+	partialReceipts := map[string]int64{"queue_a": 9}
+
+	t.Run("one gap clears partial and stale state then recovers", func(t *testing.T) {
+		runner := newRunner()
+		staleBacklog, staleReceipts := tursoSoakBacklog{Total: 7}, int64(11)
+		runner.lastBacklog, runner.lastReceipts = &staleBacklog, &staleReceipts
+		gap := newWindow()
+		if err := runner.applyMonitorSample(&gap, false, partialBacklogs, partialReceipts, connection); err != nil {
+			t.Fatalf("first connection gap failed the run: %v", err)
+		}
+		if gap.Monitor.Status != "gap" || gap.Monitor.Failure == nil || !errors.Is(*gap.Monitor.Failure, connection) {
+			t.Fatalf("gap evidence = %+v", gap.Monitor)
+		}
+		if gap.StatsBacklog != nil || gap.SettlementReceipts != nil || runner.lastBacklog != nil || runner.lastReceipts != nil {
+			t.Fatal("monitor gap retained overall partial or stale values")
+		}
+		for _, lane := range gap.Lanes {
+			if lane.Backlog != nil || lane.SettlementReceipts != nil {
+				t.Fatalf("monitor gap retained lane partial values: %+v", lane)
+			}
+		}
+		encoded, err := json.Marshal(gap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Count(encoded, []byte(`"stats_backlog":null`)) != 3 || bytes.Count(encoded, []byte(`"settlement_receipts":null`)) != 3 {
+			t.Fatalf("gap JSON did not preserve null monitor fields: %s", encoded)
+		}
+		if summary := runner.monitorSummary(); summary.FailedSamples != 1 || summary.RecoveryStatus != "awaiting_recovery" {
+			t.Fatalf("pending summary = %+v", summary)
+		}
+
+		recovered := newWindow()
+		backlogs := []*tursoSoakBacklog{{}, {}}
+		receipts := map[string]int64{"queue_a": 10, "queue_b": 12}
+		if err := runner.applyMonitorSample(&recovered, false, backlogs, receipts, nil); err != nil {
+			t.Fatal(err)
+		}
+		if recovered.Monitor.Status != "recovered" || runner.lastBacklog == nil || runner.lastReceipts == nil || *runner.lastReceipts != 22 {
+			t.Fatalf("recovered sample = %+v backlog=%+v receipts=%v", recovered.Monitor, runner.lastBacklog, runner.lastReceipts)
+		}
+		if summary := runner.monitorSummary(); summary.FailedSamples != 1 || summary.RecoveryStatus != "recovered" {
+			t.Fatalf("recovered summary = %+v", summary)
+		}
+	})
+
+	t.Run("second failure is fatal even after recovery", func(t *testing.T) {
+		runner := newRunner()
+		first := newWindow()
+		if err := runner.applyMonitorSample(&first, false, partialBacklogs, partialReceipts, connection); err != nil {
+			t.Fatal(err)
+		}
+		recovered := newWindow()
+		if err := runner.applyMonitorSample(&recovered, false, []*tursoSoakBacklog{{}, {}}, map[string]int64{}, nil); err != nil {
+			t.Fatal(err)
+		}
+		second := newWindow()
+		if err := runner.applyMonitorSample(&second, false, partialBacklogs, partialReceipts, connection); !errors.Is(err, connection) {
+			t.Fatalf("second monitor failure = %v, want %v", err, connection)
+		}
+		if summary := runner.monitorSummary(); summary.FailedSamples != 2 || summary.RecoveryStatus != "failed" {
+			t.Fatalf("failed summary = %+v", summary)
+		}
+	})
+
+	t.Run("receipt count connection is an eligible gap", func(t *testing.T) {
+		runner := newRunner()
+		window := newWindow()
+		failure := tursoSoakFailure{Operation: "receipt_count", Code: "connection"}
+		if err := runner.applyMonitorSample(&window, false, partialBacklogs, partialReceipts, failure); err != nil {
+			t.Fatalf("receipt-count connection gap failed the run: %v", err)
+		}
+		if window.Monitor.Status != "gap" || window.Monitor.Failure == nil || !errors.Is(*window.Monitor.Failure, failure) {
+			t.Fatalf("receipt-count gap evidence = %+v", window.Monitor)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		final bool
+		err   tursoSoakFailure
+	}{
+		{name: "non-connection", err: tursoSoakFailure{Operation: "receipt_count", Code: "busy"}},
+		{name: "unknown connection operation", err: tursoSoakFailure{Operation: "future_monitor", Code: "connection"}},
+		{name: "working-set invariant", err: tursoSoakFailure{Lane: "lane_a", Operation: "stats", Code: "working_set_invariant"}},
+		{name: "final connection", final: true, err: connection},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := newRunner()
+			window := newWindow()
+			if err := runner.applyMonitorSample(&window, tc.final, partialBacklogs, partialReceipts, tc.err); !errors.Is(err, tc.err) {
+				t.Fatalf("monitor failure = %v, want %v", err, tc.err)
+			}
+			if window.Monitor.Status != "failed" || runner.monitorSummary().RecoveryStatus != "failed" {
+				t.Fatalf("fatal monitor evidence = %+v summary=%+v", window.Monitor, runner.monitorSummary())
+			}
+		})
+	}
+}
+
+func TestTursoSoakMonitorSummaryEvidence(t *testing.T) {
+	summary := tursoSoakSummary{
+		Status:  "RUNNING",
+		Monitor: tursoSoakMonitorSummary{FailedSamples: 1, RecoveryStatus: "recovered"},
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"monitor":{"failed_samples":1,"recovery_status":"recovered"}`)) {
+		t.Fatalf("monitor JSON missing: %s", encoded)
+	}
+	markdown := summary.markdown()
+	if !bytes.Contains(markdown, []byte("## Monitoring")) || !bytes.Contains(markdown, []byte("Failed samples: 1; recovery status: recovered.")) {
+		t.Fatalf("monitor Markdown missing: %s", markdown)
+	}
+}
+
+func TestTursoSoakMaintenanceHealth(t *testing.T) {
+	observation := func(enabled bool, consecutive uint64, outcome string) []MaintenanceObservation {
+		return []MaintenanceObservation{{
+			Enabled: enabled, Task: "receipts", Runs: 2, Failures: 1,
+			Diagnostics: &MaintenanceDiagnostics{
+				LastOutcome: outcome, ConsecutiveFailures: consecutive,
+				RecentFailures: []MaintenanceFailure{{
+					Stage: "prune_settlement_receipts",
+					Error: ErrorDetail{Category: "connection"},
+				}},
+			},
+		}}
+	}
+
+	pending := observation(true, 1, "failed")
+	if err := tursoSoakWindowMaintenanceHealth(pending); err != nil {
+		t.Fatalf("single pass was not allowed to recover: %v", err)
+	}
+	if err := tursoSoakTerminalMaintenanceHealth(observation(true, 0, "ok")); err != nil {
+		t.Fatalf("recovered incident failed final judgement: %v", err)
+	}
+	want := tursoSoakFailure{Operation: "maintenance/receipts/prune_settlement_receipts", Code: "connection"}
+	if got := tursoSoakWindowMaintenanceHealth(observation(true, 2, "failed")); !errors.Is(got, want) {
+		t.Fatalf("repeated window failure = %v, want %v", got, want)
+	}
+	if got := tursoSoakTerminalMaintenanceHealth(pending); !errors.Is(got, want) {
+		t.Fatalf("unrecovered terminal failure = %v, want %v", got, want)
+	}
+	if err := tursoSoakTerminalMaintenanceHealth(observation(false, 2, "failed")); err != nil {
+		t.Fatalf("disabled maintenance task affected judgement: %v", err)
+	}
+}
+
+func TestTursoSoakMaintenanceSnapshotIsIsolated(t *testing.T) {
+	duration := newDurationHistogram()
+	duration.observe(time.Second)
+	e := &Engine{db: &db{remote: true}}
+	e.observation.background = true
+	e.observation.maintenance = map[string]MaintenanceObservation{
+		"locks": {
+			Runs: 1, Duration: duration,
+			Diagnostics: &MaintenanceDiagnostics{
+				LastOutcome: "failed", ConsecutiveFailures: 1,
+				RecentFailures: []MaintenanceFailure{{Stage: "reclaim_locks", Error: ErrorDetail{Category: "busy"}}},
+			},
+		},
+	}
+
+	snapshot := tursoSoakMaintenanceSnapshot(e)
+	if len(snapshot) != len(MaintenanceTaskNames()) {
+		t.Fatalf("unexpected maintenance task inventory: %+v", snapshot)
+	}
+	byTask := make(map[string]*MaintenanceObservation, len(snapshot))
+	for i := range snapshot {
+		byTask[snapshot[i].Task] = &snapshot[i]
+	}
+	if !byTask["locks"].Enabled || byTask["reclaim"].Enabled {
+		t.Fatalf("unexpected remote maintenance enablement: %+v", snapshot)
+	}
+	byTask["locks"].Duration.BoundsSeconds[0] = 99
+	byTask["locks"].Diagnostics.RecentFailures[0].Stage = "mutated"
+	original := e.observation.maintenance["locks"]
+	if original.Duration.BoundsSeconds[0] == 99 || original.Diagnostics.RecentFailures[0].Stage != "reclaim_locks" {
+		t.Fatal("maintenance snapshot aliases engine observation state")
+	}
+}
+
 func TestTursoSoakLogHandlerAttributesFailures(t *testing.T) {
 	newLogger := func() (*tursoSoakRunner, *slog.Logger) {
 		runner := &tursoSoakRunner{failureSignal: make(chan struct{}, 1)}
@@ -2265,12 +2784,41 @@ func TestTursoSoakLogHandlerAttributesFailures(t *testing.T) {
 		}
 	})
 
-	t.Run("maintenance", func(t *testing.T) {
+	t.Run("maintenance defers to pass state", func(t *testing.T) {
 		runner, logger := newLogger()
 		logger.Error("maintenance.failure", "task", "ttl", "stage", "expire_to_dlq", "category", "busy")
-		want := tursoSoakFailure{Operation: "maintenance/ttl/expire_to_dlq", Code: "busy"}
+		select {
+		case <-runner.failureSignal:
+			t.Fatal("maintenance log bypassed pass-level recovery policy")
+		default:
+		}
+	})
+
+	t.Run("untracked maintenance remains fail closed", func(t *testing.T) {
+		runner, logger := newLogger()
+		logger.Error("maintenance.failure", "task", "manual", "stage", "resource_cleanup", "category", "connection")
+		want := tursoSoakFailure{Operation: "maintenance/manual/resource_cleanup", Code: "connection"}
 		if got := waitFailure(t, runner); !errors.Is(got, want) {
-			t.Fatalf("maintenance failure = %v, want %v", got, want)
+			t.Fatalf("untracked maintenance failure = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("single recovered maintenance pass is retained as evidence", func(t *testing.T) {
+		runner, logger := newLogger()
+		logger.Info("maintenance.recovered", "task", "locks", "consecutive_failures", uint64(1))
+		select {
+		case <-runner.failureSignal:
+			t.Fatal("one recovered maintenance pass failed the soak")
+		default:
+		}
+	})
+
+	t.Run("recovered repeated maintenance failures still fail", func(t *testing.T) {
+		runner, logger := newLogger()
+		logger.Info("maintenance.recovered", "task", "locks", "consecutive_failures", uint64(2))
+		want := tursoSoakFailure{Operation: "maintenance/locks", Code: "repeated_failure"}
+		if got := waitFailure(t, runner); !errors.Is(got, want) {
+			t.Fatalf("recovered maintenance streak = %v, want %v", got, want)
 		}
 	})
 
@@ -2315,9 +2863,10 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 	t.Cleanup(func() { _ = evidence.close() })
 	started := time.Now()
 	runner := &tursoSoakRunner{
-		e: e, cfg: tursoSoakConfig{Duration: 300 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: time.Second},
+		e: e, cfg: tursoSoakConfig{Duration: 1250 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: time.Second},
 		evidence: evidence, started: started, windowStarted: started, states: make([]*tursoSoakLaneState, 0, len(tursoSoakLanes)),
-		failureSignal: make(chan struct{}, 1), stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
+		admission: newTursoSoakAdmission(tursoSoakMaxInFlight), failureSignal: make(chan struct{}, 1),
+		stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
 	}
 	for _, lane := range tursoSoakLanes {
 		runner.states = append(runner.states, newTursoSoakLaneState(lane))
@@ -2344,5 +2893,22 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(evidence.dir, "windows.jsonl"))
 	if err != nil || bytes.Count(data, []byte{'\n'}) < 1 {
 		t.Fatalf("window evidence missing: lines=%d err=%v", bytes.Count(data, []byte{'\n'}), err)
+	}
+	lines := bytes.Split(bytes.TrimSpace(data), []byte{'\n'})
+	var window tursoSoakWindow
+	if err := json.Unmarshal(lines[len(lines)-1], &window); err != nil || len(window.Maintenance) != len(MaintenanceTaskNames()) || window.Monitor.Status != "ok" {
+		t.Fatalf("window evidence missing: tasks=%d monitor=%+v err=%v", len(window.Maintenance), window.Monitor, err)
+	}
+	var summary tursoSoakSummary
+	data, err = os.ReadFile(filepath.Join(evidence.dir, "summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &summary); err != nil || len(summary.FinalMaintenance) != len(MaintenanceTaskNames()) || summary.Monitor.RecoveryStatus != "not_needed" {
+		t.Fatalf("summary evidence missing: tasks=%d monitor=%+v err=%v", len(summary.FinalMaintenance), summary.Monitor, err)
+	}
+	data, err = os.ReadFile(filepath.Join(evidence.dir, "summary.md"))
+	if err != nil || !bytes.Contains(data, []byte("## Maintenance")) || !bytes.Contains(data, []byte("## Monitoring")) {
+		t.Fatalf("summary markdown missing: err=%v", err)
 	}
 }
