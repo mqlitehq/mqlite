@@ -1849,7 +1849,15 @@ func TestSubscriptionExpiryWorkerFastContinuesFullBatches(t *testing.T) {
 
 	workerCtx, cancel := context.WithCancel(context.Background())
 	e.startSubscriptionExpiry(workerCtx)
-	deadline := time.Now().Add(2 * time.Second)
+	drainTimeout := 2 * time.Second
+	if raceEnabled {
+		// modernc.org/sqlite is pure Go, so -race instruments the database itself.
+		// Leave enough room for the initial one-second tick and three bounded
+		// transition transactions on slower runners. The non-race budget remains
+		// tight, while the direct pass test below pins the fast-retry contract.
+		drainTimeout = 10 * time.Second
+	}
+	deadline := time.Now().Add(drainTimeout)
 	for {
 		var active int
 		if err := e.db.queryRowScan(ctx, []any{&active}, `SELECT COUNT(*) FROM queues
@@ -1878,6 +1886,27 @@ func TestSubscriptionExpiryWorkerFastContinuesFullBatches(t *testing.T) {
 	foregroundCancel()
 	cancel()
 	e.bgWG.Wait()
+}
+
+func TestSubscriptionExpiryPassRequestsFastRetryOnlyForFullBatch(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	const count = subscriptionExpiryBatch + 1
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,expires_at,created_at,updated_at)
+	  SELECT printf('due-%04d',i),'subscription','active',?,?,? FROM n`, count-1, *clock, *clock-1, *clock-1); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, fastRetry, err := e.transitionExpiredSubscriptionsPass(ctx)
+	if err != nil || changed != subscriptionExpiryBatch || !fastRetry {
+		t.Fatalf("full transition changed=%d fast-retry=%t err=%v, want %d/true/nil", changed, fastRetry, err, subscriptionExpiryBatch)
+	}
+	changed, fastRetry, err = e.transitionExpiredSubscriptionsPass(ctx)
+	if err != nil || changed != 1 || fastRetry {
+		t.Fatalf("tail transition changed=%d fast-retry=%t err=%v, want 1/false/nil", changed, fastRetry, err)
+	}
 }
 
 func TestSubscriptionExpiryFailureDoesNotRequestFastRetry(t *testing.T) {
