@@ -115,7 +115,11 @@ func lifecycleChurnRun(ctx context.Context, eng *engine.Engine, prefix string, d
 			if i < lifecycleHeavyQueues {
 				messages = heavyBatch
 			}
-			if _, err := eng.Send(ctx, name, messages...); err != nil {
+			seqs, err := eng.Send(ctx, name, messages...)
+			if err != nil {
+				return result, fmt.Errorf("send batch to %q: %w", name, err)
+			}
+			if err := validateBatchSequences(seqs, len(messages)); err != nil {
 				return result, fmt.Errorf("send batch to %q: %w", name, err)
 			}
 			result.messages += int64(len(messages))
@@ -214,9 +218,11 @@ func propMsg(b []byte, i int) engine.OutMessage {
 }
 
 // propsRun produces enriched (KV-property) messages — single or batched.
-func propsRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, batch, msg int) (int64, *hist) {
+func propsRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, batch, msg int) (int64, *hist, error) {
 	b := body(msg)
 	deadline := time.Now().Add(d)
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	hs := make([]*hist, P)
 	var total int64
 	var wg sync.WaitGroup
@@ -226,32 +232,50 @@ func propsRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration
 		go func(h *hist, seed int) {
 			defer wg.Done()
 			var local int64
+			defer func() { atomic.AddInt64(&total, local) }()
 			i := seed * 1_000_000
-			for time.Now().Before(deadline) {
+			for time.Now().Before(deadline) && !work.stopped() {
 				t := time.Now()
 				if batch > 1 {
 					ms := make([]engine.OutMessage, batch)
 					for k := range ms {
 						ms[k] = propMsg(b, i+k)
 					}
-					if _, err := eng.Send(ctx, q, ms...); err == nil {
-						h.add(time.Since(t))
-						local += int64(batch)
+					seqs, err := eng.Send(work.ctx, q, ms...)
+					if err != nil {
+						work.fail(fmt.Errorf("send property batch to %q after %d accepted messages: %w", q, local, err))
+						return
 					}
+					if err := validateBatchSequences(seqs, batch); err != nil {
+						work.fail(fmt.Errorf("send property batch to %q after %d accepted messages: %w", q, local, err))
+						return
+					}
+					h.add(time.Since(t))
+					local += int64(batch)
 					i += batch
 				} else {
-					if _, err := eng.SendOne(ctx, q, propMsg(b, i)); err == nil {
-						h.add(time.Since(t))
-						local++
+					seq, err := eng.SendOne(work.ctx, q, propMsg(b, i))
+					if err != nil {
+						work.fail(fmt.Errorf("send property message to %q after %d accepted messages: %w", q, local, err))
+						return
 					}
+					if seq <= 0 {
+						work.fail(fmt.Errorf("send property message to %q returned invalid sequence number %d", q, seq))
+						return
+					}
+					h.add(time.Since(t))
+					local++
 					i++
 				}
 			}
-			atomic.AddInt64(&total, local)
 		}(hs[p], p)
 	}
 	wg.Wait()
-	return total, mergeAll(hs)
+	h := mergeAll(hs)
+	if err := work.result(); err != nil {
+		return total, h, err
+	}
+	return total, h, nil
 }
 
 // bloatRun drains the messages already inserted by the common prefill path. The
@@ -293,63 +317,95 @@ func bloatRun(ctx context.Context, eng *engine.Engine, q string, prefilled int) 
 // consumers keep draining for the remainder — the "load ramp" (load up then down)
 // curve. The sampler captures peak RSS/heap/DB during the busy phase vs the idle
 // tail, so we see whether memory and file are reclaimed once load goes away.
-func rampDownRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, msg int) (int64, *hist) {
+func rampDownRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, msg int) (int64, *hist, int64, error) {
 	b := body(msg)
 	start := time.Now()
 	busy := start.Add(time.Duration(float64(d) * 0.55))
 	end := start.Add(d)
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	stop := make(chan struct{})
-	var produced int64
+	var accepted int64
 	var wg sync.WaitGroup
 	for p := 0; p < P; p++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for time.Now().Before(busy) {
-				if _, err := eng.SendOne(ctx, q, engine.OutMessage{Body: b}); err == nil {
-					atomic.AddInt64(&produced, 1)
+			for time.Now().Before(busy) && !work.stopped() {
+				seq, err := eng.SendOne(work.ctx, q, engine.OutMessage{Body: b})
+				if err != nil {
+					work.fail(fmt.Errorf("send ramp-down message to %q: %w", q, err))
+					return
 				}
+				if seq <= 0 {
+					work.fail(fmt.Errorf("send ramp-down message to %q returned invalid sequence number %d", q, seq))
+					return
+				}
+				atomic.AddInt64(&accepted, 1)
 			}
 		}()
 	}
-	cons := consumeUntil(ctx, eng, q, C, stop)
-	wg.Wait()                   // producers stopped — the down-ramp
-	time.Sleep(time.Until(end)) // idle tail: consumers drain the backlog, then idle
+	cons := consumeUntil(work, eng, q, C, stop)
+	wg.Wait() // producers stopped — the down-ramp
+	if !work.stopped() {
+		_ = waitUntil(work.ctx, end) // consumers continue through the idle tail
+	}
 	close(stop)
-	n, h := cons()
-	_ = produced
-	return n, h
+	completed, h, err := cons()
+	return completed, h, atomic.LoadInt64(&accepted), err
 }
 
 // churnRun keeps producers steady while consumers cycle online/offline (a worker
 // fleet scaling in and out). Checks that per-cycle connect/disconnect doesn't leak
 // memory — RSS should stay flat across cycles, not stair-step up.
-func churnRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, msg int) (int64, *hist) {
+func churnRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, msg int) (int64, *hist, int64, error) {
 	b := body(msg)
 	deadline := time.Now().Add(d)
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	var prodStop int32
+	var accepted int64
 	var wg sync.WaitGroup
 	for p := 0; p < P; p++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for atomic.LoadInt32(&prodStop) == 0 {
-				eng.SendOne(ctx, q, engine.OutMessage{Body: b})
+			for atomic.LoadInt32(&prodStop) == 0 && !work.stopped() {
+				seq, err := eng.SendOne(work.ctx, q, engine.OutMessage{Body: b})
+				if err != nil {
+					work.fail(fmt.Errorf("send consumer-churn message to %q: %w", q, err))
+					return
+				}
+				if seq <= 0 {
+					work.fail(fmt.Errorf("send consumer-churn message to %q returned invalid sequence number %d", q, seq))
+					return
+				}
+				atomic.AddInt64(&accepted, 1)
 			}
 		}()
 	}
 	h := newHist()
 	var consumed int64
-	for time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && !work.stopped() {
 		stop := make(chan struct{})
-		cons := consumeUntil(ctx, eng, q, C, stop) // a fresh consumer cohort comes online
-		time.Sleep(250 * time.Millisecond)
+		cons := consumeUntil(work, eng, q, C, stop) // a fresh consumer cohort comes online
+		cohortEnd := time.Now().Add(250 * time.Millisecond)
+		if cohortEnd.After(deadline) {
+			cohortEnd = deadline
+		}
+		_ = waitUntil(work.ctx, cohortEnd)
 		close(stop) // ...then all go offline
-		n, hh := cons()
+		n, hh, err := cons()
 		consumed += n
 		h.merge(hh)
+		if err != nil {
+			break
+		}
 	}
 	atomic.StoreInt32(&prodStop, 1)
 	wg.Wait()
-	return consumed, h
+	if err := work.result(); err != nil {
+		return consumed, h, atomic.LoadInt64(&accepted), err
+	}
+	return consumed, h, atomic.LoadInt64(&accepted), nil
 }

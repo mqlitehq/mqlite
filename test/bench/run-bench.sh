@@ -15,6 +15,13 @@ MSG="${BENCH_MSG:-256}"
 ONLY="${BENCH_ONLY:-}"
 NAME="mqlite-bench-run"
 
+cleanup() {
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 echo "==> building bench image (linux/amd64)"
@@ -22,12 +29,23 @@ docker build --platform linux/amd64 -f "$HERE/Dockerfile" -t mqlite-bench:latest
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 echo "==> running matrix (dur=$DUR msg=${MSG}B only=${ONLY:-default}) — DB on container fs"
+set +e
 docker run --platform linux/amd64 --name "$NAME" -e BENCH_DUR="$DUR" -e BENCH_MSG="$MSG" -e BENCH_ONLY="$ONLY" mqlite-bench:latest
+RC=$?
 
 echo "==> copying results out"
 docker cp "$NAME:/data/." "$OUT/"
-docker rm -f "$NAME" >/dev/null 2>&1 || true
+COPY_RC=$?
+set -e
+if [ "$RC" -eq 0 ] && [ "$COPY_RC" -ne 0 ]; then
+  RC=$COPY_RC
+fi
 
 echo "==> artifacts:"
 ls -la "$OUT"
-echo "results.json -> $OUT/results.json"
+if [ -f "$OUT/results.json" ]; then
+  echo "results.json -> $OUT/results.json"
+else
+  echo "results.json was not produced"
+fi
+exit "$RC"

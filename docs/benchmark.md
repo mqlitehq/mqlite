@@ -89,6 +89,13 @@ RSS + Go heap + DB/WAL file sizes the whole time; each scenario prints a `[done]
 line as it finishes (so a constrained box that runs out of time still yields the
 scenarios that completed).
 
+The runner fails closed on workload operation errors: fixed-volume drains must match
+their exact prefill, mixed workloads reconcile accepted messages with completed plus
+remaining messages, and result-file failures produce a nonzero exit. For remote `-db`
+runs, use a dedicated non-production database. Each process uses a unique queue
+namespace, force-deletes only that namespace after every scenario, and drives bounded
+cleanup; an interrupted process can still leave its private namespace behind.
+
 The opt-in `lifecycle_churn` scenario uses a fixed set of 64 queue names and never
 reuses a name until deletion has converged. Each cycle creates the queues, sends
 small batches, accepts forced deletion, and runs bounded maintenance until every

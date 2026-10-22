@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -149,6 +150,8 @@ type scen struct {
 }
 
 type Result struct {
+	OK              bool    `json:"ok"`
+	Error           string  `json:"error,omitempty"`
 	Name            string  `json:"name"`
 	Kind            string  `json:"kind"`
 	Producers       int     `json:"producers"`
@@ -208,14 +211,15 @@ type Result struct {
 var dir = flag.String("dir", "/data", "data directory for bench DBs (local-file mode)")
 var dur = flag.Duration("dur", 5*time.Second, "duration per timed scenario")
 var msg = flag.Int("msgsize", 256, "message body size in bytes")
-var outPath = flag.String("out", "/data/results.json", "JSON results output path")
+var outPath = flag.String("out", "", "JSON results output path (default: -dir/results.json locally, ./results.json remotely)")
 var only = flag.String("only", "", "run only scenarios whose name contains this substring")
 
 // dbDSN selects the storage backend. Empty (default) = a fresh local SQLite file per
 // scenario under -dir (local-disk benchmark). A shared DSN — e.g. a remote
-// libsql://host (Turso) — runs every scenario against that one database instead, with
-// a per-scenario queue for isolation; the auth token comes from MQLITE_DB_AUTH_TOKEN.
-// File-size metrics are N/A in shared mode (the store is remote).
+// libsql://host (Turso) — runs every scenario against that one database instead. A
+// process-unique namespace isolates each run and is force-deleted after every scenario;
+// the auth token comes from MQLITE_DB_AUTH_TOKEN. File-size metrics are N/A in shared
+// mode (the store is remote).
 var dbDSN = flag.String("db", "", "shared DB DSN (libsql://… for Turso); empty = a fresh local file per scenario")
 
 // prefillCap bounds each scenario's (unmeasured) prefill so the fixed-volume
@@ -223,9 +227,23 @@ var dbDSN = flag.String("db", "", "shared DB DSN (libsql://… for Turso); empty
 // passed to every backend so the matrix stays comparable. 0 = no cap.
 var prefillCap = flag.Int("prefillcap", 0, "cap each scenario's prefill at N messages (0 = no cap)")
 
+var benchmarkRunID = fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+
+const minRemoteCleanupTimeout = 30 * time.Second
+
 func main() {
 	flag.Parse()
-	_ = os.MkdirAll(*dir, 0o755)
+	if *dbDSN == "" {
+		if err := ensureBenchmarkDir(*dir); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	resultPath := resolveBenchmarkOutputPath(*outPath, *dir, *dbDSN != "")
+	if err := validateBenchmarkOutputPath(resultPath); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	scens := []scen{
 		{Name: "produce_p1", Kind: "produce", P: 1, Msg: *msg},
@@ -288,33 +306,43 @@ func main() {
 	printTable(results)
 	printResourceTable(results)
 	printLifecycleTable(results)
-	if b, err := json.MarshalIndent(map[string]any{
+	if err := writeBenchmarkJSON(resultPath, map[string]any{
 		"meta": map[string]any{
 			"gomaxprocs": runtime.GOMAXPROCS(0), "duration_s": dur.Seconds(),
 			"msg_size": *msg, "goos": runtime.GOOS, "goarch": runtime.GOARCH,
 			"num_cpu": runtime.NumCPU(), "post_workload_idle_s": postWorkloadIdle.Seconds(),
 		},
 		"results": results,
-	}, "", "  "); err == nil {
-		_ = os.WriteFile(*outPath, b, 0o644)
-		fmt.Printf("\nresults written to %s\n", *outPath)
+	}); err != nil {
+		failed = true
+		fmt.Fprintln(os.Stderr, err)
+	} else {
+		fmt.Printf("\nresults written to %s\n", resultPath)
 	}
 	if failed {
 		os.Exit(1)
 	}
 }
 
-func run(s scen) (Result, error) {
+func run(s scen) (res Result, runErr error) {
+	defer func() {
+		res.OK = runErr == nil
+		if runErr != nil {
+			res.Error = runErr.Error()
+		}
+	}()
+	res = Result{Name: s.Name, Kind: s.Kind, Producers: s.P, Consumers: s.C,
+		Batch: s.Batch, MsgSize: s.Msg, Sync: orDefault(s.Sync, "NORMAL")}
 	remote := *dbDSN != ""
 	var dbPath, dbArg, q string
 	if remote {
-		// Shared remote store: one DB, a per-scenario queue for isolation. No local
-		// file to wipe or measure.
-		dbArg, q = *dbDSN, s.Name
+		// Shared remote store: every process gets its own namespace, and every run
+		// removes that namespace before returning. No local file is measured.
+		dbArg, q = *dbDSN, benchmarkQueueName(s.Name)
 	} else {
 		dbPath = filepath.Join(*dir, s.Name+".db")
-		for _, ext := range []string{"", "-wal", "-shm"} {
-			os.Remove(dbPath + ext)
+		if err := resetBenchmarkDBFiles(dbPath); err != nil {
+			return res, err
 		}
 		dbArg, q = "file:"+dbPath, "bench"
 	}
@@ -326,17 +354,26 @@ func run(s scen) (Result, error) {
 		Synchronous:       s.Sync,
 	})
 	if err != nil {
-		return Result{Name: s.Name, Note: "open error: " + err.Error()}, err
+		return res, err
 	}
-	defer eng.Close()
+	defer func() {
+		if remote {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), remoteCleanupTimeout(*dur))
+			cleanupErr := cleanupBenchmarkQueues(cleanupCtx, eng, q)
+			cancel()
+			if cleanupErr != nil {
+				runErr = errors.Join(runErr, cleanupErr)
+			}
+		}
+		if closeErr := eng.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close benchmark engine: %w", closeErr))
+		}
+	}()
 	if s.Kind != "lifecycle" {
 		if err := eng.CreateQueue(ctx, q, engine.QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 1000}); err != nil {
-			return Result{Name: s.Name, Kind: s.Kind, Note: "create queue error: " + err.Error()}, err
+			return res, err
 		}
 	}
-
-	res := Result{Name: s.Name, Kind: s.Kind, Producers: s.P, Consumers: s.C,
-		Batch: s.Batch, MsgSize: s.Msg, Sync: orDefault(s.Sync, "NORMAL")}
 
 	// prefill (not measured) for drain/bloat, capped for slow backends.
 	prefillN := s.Prefill
@@ -347,7 +384,6 @@ func run(s scen) (Result, error) {
 	if prefillN > 0 {
 		prefilled, err = prefill(ctx, eng, q, prefillN, s.Batch, s.Msg)
 		if err != nil {
-			res.Note = "prefill error: " + err.Error()
 			return res, err
 		}
 	}
@@ -368,25 +404,36 @@ func run(s scen) (Result, error) {
 	var ops int64
 	var h *hist
 	var workloadErr error
+	var accepted, completed int64
+	var checkAccounting, requireEmpty bool
 	switch s.Kind {
 	case "produce":
-		ops, h = produce(ctx, eng, q, *dur, s.P, s.Msg, "")
+		ops, h, workloadErr = produce(ctx, eng, q, *dur, s.P, s.Msg, "")
+		accepted, checkAccounting = ops, true
 	case "batch":
-		ops, h = batchProduce(ctx, eng, q, *dur, s.P, s.Batch, s.Msg)
+		ops, h, workloadErr = batchProduce(ctx, eng, q, *dur, s.P, s.Batch, s.Msg)
+		accepted, checkAccounting = ops, true
 	case "sessions":
-		ops, h = sessionsRun(ctx, eng, q, *dur, s.P, s.C, s.Groups, s.Msg)
+		ops, h, accepted, workloadErr = sessionsRun(ctx, eng, q, *dur, s.P, s.C, s.Groups, s.Msg)
+		completed, checkAccounting = ops, true
 	case "e2e":
-		ops, h = e2eRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+		ops, h, accepted, workloadErr = e2eRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+		completed, checkAccounting = ops, true
 	case "drain":
-		ops, h = drain(ctx, eng, q, s.C)
+		ops, h, workloadErr = drain(ctx, eng, q, s.C)
+		accepted, completed, checkAccounting, requireEmpty = int64(prefilled), ops, true, true
 	case "props":
-		ops, h = propsRun(ctx, eng, q, *dur, s.P, s.Batch, s.Msg)
+		ops, h, workloadErr = propsRun(ctx, eng, q, *dur, s.P, s.Batch, s.Msg)
+		accepted, checkAccounting = ops, true
 	case "bloat":
 		ops, h, workloadErr = bloatRun(ctx, eng, q, prefilled)
+		accepted, completed, checkAccounting, requireEmpty = int64(prefilled), ops, true, true
 	case "rampdown":
-		ops, h = rampDownRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+		ops, h, accepted, workloadErr = rampDownRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+		completed, checkAccounting = ops, true
 	case "churn":
-		ops, h = churnRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+		ops, h, accepted, workloadErr = churnRun(ctx, eng, q, *dur, s.P, s.C, s.Msg)
+		completed, checkAccounting = ops, true
 	case "lifecycle":
 		var lifecycle lifecycleRunResult
 		lifecycle, workloadErr = lifecycleChurnRun(ctx, eng, q, *dur, s.Msg, samp)
@@ -402,6 +449,8 @@ func run(s scen) (Result, error) {
 		res.LifecycleConvergeP99Ms = lifecycle.convergeLatency.pctMs(.99)
 		res.LifecycleConvergeMaxMs = lifecycle.convergeLatency.maxMs()
 		res.LifecyclePeakPayloadBytes = lifecycle.peakPayloadBytes
+	default:
+		workloadErr = fmt.Errorf("unknown benchmark scenario kind %q", s.Kind)
 	}
 
 	elapsed := time.Since(t0)
@@ -419,6 +468,9 @@ func run(s scen) (Result, error) {
 	samp.stop()
 	fin := samp.snap()
 	rssPeak, heapPeak, dbPeak := samp.peaks()
+	if workloadErr == nil && checkAccounting {
+		_, workloadErr = verifyQueueAccounting(ctx, eng, q, accepted, completed, requireEmpty)
+	}
 
 	res.DurationS = elapsed.Seconds()
 	res.Ops = ops
@@ -451,12 +503,6 @@ func run(s scen) (Result, error) {
 	if s.Kind == "lifecycle" {
 		res.Note = "ops count queues whose force deletion converged; latency columns measure delete acknowledgement"
 	}
-	if workloadErr != nil {
-		if res.Note != "" {
-			res.Note += "; "
-		}
-		res.Note += "workload error: " + workloadErr.Error()
-	}
 	switch s.Kind { // file bytes per resident message — only where messages stay resident
 	case "produce", "batch", "props":
 		if ops > 0 {
@@ -480,9 +526,83 @@ func body(n int) []byte {
 	return b
 }
 
-func produce(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, msg int, _ string) (int64, *hist) {
+type workloadControl struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	once   sync.Once
+	mu     sync.Mutex
+	err    error
+}
+
+func newWorkloadControl(parent context.Context) *workloadControl {
+	ctx, cancel := context.WithCancel(parent)
+	return &workloadControl{ctx: ctx, cancel: cancel}
+}
+
+func (w *workloadControl) fail(err error) {
+	if err == nil {
+		return
+	}
+	w.once.Do(func() {
+		w.mu.Lock()
+		w.err = err
+		w.mu.Unlock()
+		w.cancel()
+	})
+}
+
+func (w *workloadControl) stopped() bool {
+	return w.ctx.Err() != nil
+}
+
+func (w *workloadControl) result() error {
+	w.mu.Lock()
+	err := w.err
+	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return w.ctx.Err()
+}
+
+func verifyQueueAccounting(ctx context.Context, eng *engine.Engine, q string, accepted, completed int64, requireEmpty bool) (int64, error) {
+	stats, err := eng.Stats(ctx, q)
+	if err != nil {
+		return 0, fmt.Errorf("read final queue accounting for %q: %w", q, err)
+	}
+	remaining := stats.Total
+	if stats.Locked != 0 {
+		return remaining, fmt.Errorf("queue accounting for %q left %d locked messages (accepted=%d completed=%d remaining=%d)", q, stats.Locked, accepted, completed, remaining)
+	}
+	if accepted != completed+remaining {
+		return remaining, fmt.Errorf("queue accounting for %q does not reconcile: accepted=%d completed=%d remaining=%d", q, accepted, completed, remaining)
+	}
+	if requireEmpty && remaining != 0 {
+		return remaining, fmt.Errorf("queue %q retained %d messages after draining %d of %d", q, remaining, completed, accepted)
+	}
+	return remaining, nil
+}
+
+func waitUntil(ctx context.Context, deadline time.Time) error {
+	d := time.Until(deadline)
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func produce(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, msg int, _ string) (int64, *hist, error) {
 	b := body(msg)
 	deadline := time.Now().Add(d)
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	hs := make([]*hist, P)
 	var total int64
 	var wg sync.WaitGroup
@@ -492,27 +612,36 @@ func produce(ctx context.Context, eng *engine.Engine, q string, d time.Duration,
 		go func(h *hist) {
 			defer wg.Done()
 			var local int64
-			for time.Now().Before(deadline) {
+			defer func() { atomic.AddInt64(&total, local) }()
+			for time.Now().Before(deadline) && !work.stopped() {
 				t := time.Now()
-				if _, err := eng.SendOne(ctx, q, engine.OutMessage{Body: b}); err == nil {
-					h.add(time.Since(t))
-					local++
+				seq, err := eng.SendOne(work.ctx, q, engine.OutMessage{Body: b})
+				if err != nil {
+					work.fail(fmt.Errorf("send one to %q after %d accepted messages: %w", q, local, err))
+					return
 				}
+				if seq <= 0 {
+					work.fail(fmt.Errorf("send one to %q returned invalid sequence number %d", q, seq))
+					return
+				}
+				h.add(time.Since(t))
+				local++
 			}
-			atomic.AddInt64(&total, local)
 		}(hs[p])
 	}
 	wg.Wait()
-	return total, mergeAll(hs)
+	return total, mergeAll(hs), work.result()
 }
 
-func batchProduce(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, batch, msg int) (int64, *hist) {
+func batchProduce(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, batch, msg int) (int64, *hist, error) {
 	b := body(msg)
 	ms := make([]engine.OutMessage, batch)
 	for i := range ms {
 		ms[i] = engine.OutMessage{Body: b}
 	}
 	deadline := time.Now().Add(d)
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	hs := make([]*hist, P)
 	var total int64
 	var wg sync.WaitGroup
@@ -522,70 +651,99 @@ func batchProduce(ctx context.Context, eng *engine.Engine, q string, d time.Dura
 		go func(h *hist) {
 			defer wg.Done()
 			var local int64
-			for time.Now().Before(deadline) {
+			defer func() { atomic.AddInt64(&total, local) }()
+			for time.Now().Before(deadline) && !work.stopped() {
 				t := time.Now()
-				if _, err := eng.Send(ctx, q, ms...); err == nil {
-					h.add(time.Since(t)) // per-batch latency
-					local += int64(batch)
+				seqs, err := eng.Send(work.ctx, q, ms...)
+				if err != nil {
+					work.fail(fmt.Errorf("send batch to %q after %d accepted messages: %w", q, local, err))
+					return
 				}
+				if err := validateBatchSequences(seqs, batch); err != nil {
+					work.fail(fmt.Errorf("send batch to %q after %d accepted messages: %w", q, local, err))
+					return
+				}
+				h.add(time.Since(t)) // per-batch latency
+				local += int64(batch)
 			}
-			atomic.AddInt64(&total, local)
 		}(hs[p])
 	}
 	wg.Wait()
-	return total, mergeAll(hs)
+	return total, mergeAll(hs), work.result()
 }
 
-func sessionsRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, groups, msg int) (int64, *hist) {
+func sessionsRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, groups, msg int) (int64, *hist, int64, error) {
 	b := body(msg)
 	deadline := time.Now().Add(d)
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	stop := make(chan struct{})
-	var prod int64
+	var accepted int64
 	var wg sync.WaitGroup
 	for p := 0; p < P; p++ {
 		wg.Add(1)
 		go func(seed int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(int64(seed) + 1))
-			for time.Now().Before(deadline) {
+			for time.Now().Before(deadline) && !work.stopped() {
 				gid := "g" + strconv.Itoa(rng.Intn(groups))
-				if _, err := eng.SendOne(ctx, q, engine.OutMessage{Body: b, GroupID: gid}); err == nil {
-					atomic.AddInt64(&prod, 1)
+				seq, err := eng.SendOne(work.ctx, q, engine.OutMessage{Body: b, GroupID: gid})
+				if err != nil {
+					work.fail(fmt.Errorf("send session message to %q: %w", q, err))
+					return
 				}
+				if seq <= 0 {
+					work.fail(fmt.Errorf("send session message to %q returned invalid sequence number %d", q, seq))
+					return
+				}
+				atomic.AddInt64(&accepted, 1)
 			}
 		}(p)
 	}
-	cons := consumeUntil(ctx, eng, q, C, stop)
+	cons := consumeUntil(work, eng, q, C, stop)
 	wg.Wait()
 	close(stop)
-	_ = prod
-	return cons()
+	completed, h, err := cons()
+	return completed, h, atomic.LoadInt64(&accepted), err
 }
 
-func e2eRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, msg int) (int64, *hist) {
+func e2eRun(ctx context.Context, eng *engine.Engine, q string, d time.Duration, P, C, msg int) (int64, *hist, int64, error) {
 	b := body(msg)
 	deadline := time.Now().Add(d)
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	stop := make(chan struct{})
+	var accepted int64
 	var wg sync.WaitGroup
 	for p := 0; p < P; p++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for time.Now().Before(deadline) {
-				eng.SendOne(ctx, q, engine.OutMessage{Body: b})
+			for time.Now().Before(deadline) && !work.stopped() {
+				seq, err := eng.SendOne(work.ctx, q, engine.OutMessage{Body: b})
+				if err != nil {
+					work.fail(fmt.Errorf("send e2e message to %q: %w", q, err))
+					return
+				}
+				if seq <= 0 {
+					work.fail(fmt.Errorf("send e2e message to %q returned invalid sequence number %d", q, seq))
+					return
+				}
+				atomic.AddInt64(&accepted, 1)
 			}
 		}()
 	}
-	cons := consumeUntil(ctx, eng, q, C, stop)
+	cons := consumeUntil(work, eng, q, C, stop)
 	wg.Wait()
 	close(stop)
-	return cons()
+	completed, h, err := cons()
+	return completed, h, atomic.LoadInt64(&accepted), err
 }
 
 // consumeUntil starts C consumers that Receive(16)+Ack until stop closes.
 // Returns a func that (after stop) blocks until all consumers finish, then
 // returns the consumed count and the merged per-message Ack-latency histogram.
-func consumeUntil(ctx context.Context, eng *engine.Engine, q string, C int, stop <-chan struct{}) func() (int64, *hist) {
+func consumeUntil(work *workloadControl, eng *engine.Engine, q string, C int, stop <-chan struct{}) func() (int64, *hist, error) {
 	hs := make([]*hist, C)
 	var total int64
 	var wg sync.WaitGroup
@@ -595,33 +753,43 @@ func consumeUntil(ctx context.Context, eng *engine.Engine, q string, C int, stop
 		go func(h *hist) {
 			defer wg.Done()
 			var local int64
+			defer func() { atomic.AddInt64(&total, local) }()
 			for {
 				select {
 				case <-stop:
-					atomic.AddInt64(&total, local)
+					return
+				case <-work.ctx.Done():
 					return
 				default:
 				}
-				msgs, err := eng.Receive(ctx, q, engine.ReceiveOptions{MaxMessages: 16, WaitMs: 20})
+				msgs, err := eng.Receive(work.ctx, q, engine.ReceiveOptions{MaxMessages: 16, WaitMs: 20})
 				if err != nil {
-					continue
+					work.fail(fmt.Errorf("receive from %q after %d completed messages: %w", q, local, err))
+					return
 				}
 				for _, m := range msgs {
 					t := time.Now()
-					if eng.Complete(ctx, q, m.SeqNumber, m.LockToken) == nil {
-						h.add(time.Since(t))
-						local++
+					if err := eng.Complete(work.ctx, q, m.SeqNumber, m.LockToken); err != nil {
+						work.fail(fmt.Errorf("complete message %d from %q after %d completed messages: %w", m.SeqNumber, q, local, err))
+						return
 					}
+					h.add(time.Since(t))
+					local++
 				}
 			}
 		}(hs[c])
 	}
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
-	return func() (int64, *hist) { <-done; return atomic.LoadInt64(&total), mergeAll(hs) }
+	return func() (int64, *hist, error) {
+		<-done
+		return atomic.LoadInt64(&total), mergeAll(hs), work.result()
+	}
 }
 
-func drain(ctx context.Context, eng *engine.Engine, q string, C int) (int64, *hist) {
+func drain(ctx context.Context, eng *engine.Engine, q string, C int) (int64, *hist, error) {
+	work := newWorkloadControl(ctx)
+	defer work.cancel()
 	hs := make([]*hist, C)
 	var total int64
 	var wg sync.WaitGroup
@@ -631,11 +799,13 @@ func drain(ctx context.Context, eng *engine.Engine, q string, C int) (int64, *hi
 		go func(h *hist) {
 			defer wg.Done()
 			var local int64
+			defer func() { atomic.AddInt64(&total, local) }()
 			empty := 0
-			for {
-				msgs, err := eng.Receive(ctx, q, engine.ReceiveOptions{MaxMessages: 64, WaitMs: 0})
+			for !work.stopped() {
+				msgs, err := eng.Receive(work.ctx, q, engine.ReceiveOptions{MaxMessages: 64, WaitMs: 0})
 				if err != nil {
-					continue
+					work.fail(fmt.Errorf("receive while draining %q after %d completed messages: %w", q, local, err))
+					return
 				}
 				if len(msgs) == 0 {
 					empty++
@@ -647,17 +817,18 @@ func drain(ctx context.Context, eng *engine.Engine, q string, C int) (int64, *hi
 				empty = 0
 				for _, m := range msgs {
 					t := time.Now()
-					if eng.Complete(ctx, q, m.SeqNumber, m.LockToken) == nil {
-						h.add(time.Since(t))
-						local++
+					if err := eng.Complete(work.ctx, q, m.SeqNumber, m.LockToken); err != nil {
+						work.fail(fmt.Errorf("complete message %d while draining %q after %d completed messages: %w", m.SeqNumber, q, local, err))
+						return
 					}
+					h.add(time.Since(t))
+					local++
 				}
 			}
-			atomic.AddInt64(&total, local)
 		}(hs[c])
 	}
 	wg.Wait()
-	return total, mergeAll(hs)
+	return total, mergeAll(hs), work.result()
 }
 
 func prefill(ctx context.Context, eng *engine.Engine, q string, n, batch, msg int) (int, error) {
@@ -679,8 +850,8 @@ func prefill(ctx context.Context, eng *engine.Engine, q string, n, batch, msg in
 		if err != nil {
 			return prefilled, fmt.Errorf("send batch after %d of %d messages: %w", prefilled, n, err)
 		}
-		if len(seqs) != remaining {
-			return prefilled, fmt.Errorf("send batch after %d of %d messages returned %d sequence numbers for %d messages", prefilled, n, len(seqs), remaining)
+		if err := validateBatchSequences(seqs, remaining); err != nil {
+			return prefilled, fmt.Errorf("send batch after %d of %d messages: %w", prefilled, n, err)
 		}
 		prefilled += len(seqs)
 	}
@@ -688,6 +859,108 @@ func prefill(ctx context.Context, eng *engine.Engine, q string, n, batch, msg in
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+func resolveBenchmarkOutputPath(configured, dataDir string, remote bool) string {
+	if configured != "" {
+		return configured
+	}
+	if remote {
+		return "results.json"
+	}
+	return filepath.Join(dataDir, "results.json")
+}
+
+func validateBenchmarkOutputPath(path string) error {
+	parent := filepath.Dir(path)
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("inspect benchmark result directory %q: %w", parent, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("benchmark result directory %q is not a directory", parent)
+	}
+	return nil
+}
+
+func ensureBenchmarkDir(path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("create benchmark data directory %q: %w", path, err)
+	}
+	return nil
+}
+
+func resetBenchmarkDBFiles(dbPath string) error {
+	for _, ext := range []string{"", "-wal", "-shm"} {
+		path := dbPath + ext
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale benchmark database file %q: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func writeBenchmarkJSON(path string, value any) error {
+	b, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode benchmark results: %w", err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return fmt.Errorf("write benchmark results to %q: %w", path, err)
+	}
+	return nil
+}
+
+func benchmarkQueueName(scenario string) string {
+	return fmt.Sprintf("mqlite-bench-%s-%s", benchmarkRunID, scenario)
+}
+
+func remoteCleanupTimeout(workloadDuration time.Duration) time.Duration {
+	if workloadDuration > minRemoteCleanupTimeout {
+		return workloadDuration
+	}
+	return minRemoteCleanupTimeout
+}
+
+func cleanupBenchmarkQueues(ctx context.Context, eng *engine.Engine, prefix string) error {
+	var cleanupErr error
+	for pass := 0; ; pass++ {
+		queues, err := eng.ListQueues(ctx)
+		if err != nil {
+			return errors.Join(cleanupErr, fmt.Errorf("list benchmark queues for cleanup: %w", err))
+		}
+		remaining := 0
+		for _, q := range queues {
+			if q.Name != prefix && !strings.HasPrefix(q.Name, prefix+"-") {
+				continue
+			}
+			remaining++
+			if q.Kind != "queue" {
+				return errors.Join(cleanupErr, fmt.Errorf("refuse to clean benchmark namespace %q containing %s %q", prefix, q.Kind, q.Name))
+			}
+			if _, err := eng.DeleteQueueWithOptions(ctx, q.Name, engine.DeleteOptions{Force: true}); err != nil && !errors.Is(err, engine.ErrQueueNotFound) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("force delete benchmark queue %q: %w", q.Name, err))
+			}
+		}
+		if remaining == 0 {
+			return cleanupErr
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(cleanupErr, fmt.Errorf("clean %d benchmark queues under %q after %d delete passes: %w", remaining, prefix, pass+1, err))
+		}
+	}
+}
+
+func validateBatchSequences(seqs []int64, want int) error {
+	if len(seqs) != want {
+		return fmt.Errorf("returned %d sequence numbers for %d messages", len(seqs), want)
+	}
+	for i, seq := range seqs {
+		if seq <= 0 {
+			return fmt.Errorf("returned invalid sequence number %d at index %d", seq, i)
+		}
+	}
+	return nil
+}
 
 func mergeAll(hs []*hist) *hist {
 	m := newHist()

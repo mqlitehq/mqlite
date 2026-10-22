@@ -25,24 +25,34 @@ Artifacts land in `test/bench/out/`: `results.json`, `iostat.log`, `vmstat.log`,
 
 Builds and runs use `--platform linux/amd64`. Use an amd64 Linux host for performance
 measurements; an ARM host may emulate the image, so a successful smoke run there
-only verifies functionality.
+only verifies functionality. `run-bench.sh` is the local-file Docker wrapper; run
+the Go command directly for a remote backend.
 
 ## Backend: local file vs remote Turso (MQLITE-41)
 
-By default each scenario opens its own local SQLite file (local-disk stress). Two
-switches run the same matrix against **remote Turso**, for a "local SSD vs cloud Turso"
-comparison:
+By default each scenario opens its own local SQLite file (local-disk stress). Run the
+same matrix against **remote Turso** with the benchmark flags directly:
 
-- `-db libsql://<host>` (or `BENCH_DB`): all scenarios share this one remote database,
-  each isolated by its own queue; the auth token comes from the `MQLITE_DB_AUTH_TOKEN`
-  environment variable. File-size metrics don't apply in remote mode.
-- `-prefillcap N` (or `BENCH_PREFILLCAP`): caps the drain/bloat prefill volume so it's
+```bash
+MQLITE_DB_AUTH_TOKEN=<jwt> go run ./test/bench \
+  -db libsql://<host> -prefillcap 100 -out /tmp/mqlite-bench-results.json
+```
+
+- `-db libsql://<host>`: all scenarios share this one remote database,
+  each isolated by a process-unique queue namespace; the auth token comes from the
+  `MQLITE_DB_AUTH_TOKEN` environment variable. The runner force-deletes only that
+  namespace after each scenario and drives bounded cleanup to convergence. File-size
+  metrics don't apply in remote mode.
+- `-prefillcap N`: caps the drain/bloat prefill volume so it's
   feasible on a slow remote backend (~tens-to-hundreds of ms/op); pass the same cap to
-  all three backends so the numbers compare item by item.
+  every compared backend so the numbers compare item by item.
 
-> Each remote enqueue is one durable Hrana commit round-trip (~45–57ms, even in-region),
-> so throughput is 100–1000× lower than a local SSD. The three-way comparison report is
-> `MQLite-cloud-bench-report.{md,html}` (raw data in `bench-3way-raw/`).
+Use a dedicated non-production database for remote benchmarks. The workload is
+intentionally write-heavy, and a killed process cannot run its final cleanup. A
+normal run exits nonzero if any send, receive, completion, accounting, cleanup, or
+result-file operation fails; a printed `[fail]` line or nonzero exit means partial
+numbers are diagnostic only. Unprefixed queues and queues from another run namespace
+are never cleanup targets.
 
 ## Scenarios
 
@@ -66,9 +76,6 @@ convergence latency, and peak live payload; the standard sampler records DB/WAL,
 RSS, CPU, and write amplification. Generic `ops/s` is fully converged queue
 lifecycles per second, while the generic latency columns are force-delete
 acknowledgement latency.
-
-For the full results and analysis, see the stress report in the design repo
-(`mqlite-stress-report.{md,html}`).
 
 > Record the host architecture, virtualization, and emulation alongside results.
 > The in-process probe adds overhead to microsecond-scale operations.
