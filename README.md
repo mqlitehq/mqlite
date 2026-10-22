@@ -6,7 +6,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mqlitehq/mqlite)](https://goreportcard.com/report/github.com/mqlitehq/mqlite)
 [![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
-[![Release](https://img.shields.io/github/v/release/mqlitehq/mqlite?sort=semver)](https://github.com/mqlitehq/mqlite/releases)
+[![Supported release: v0.3.2](https://img.shields.io/badge/release-v0.3.2-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.3.2)
 [![Go](https://img.shields.io/github/go-mod/go-version/mqlitehq/mqlite)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -17,6 +17,10 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > **Embed it like goqite, or serve it like a broker — the same engine.**
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
+
+> **Release status:** v0.3.2 is the latest supported release; v0.3.3 is
+> retracted. `main` is an unreleased v0.4.0 candidate. Pin production installs to
+> the exact v0.3.2 release or `ghcr.io/mqlitehq/mqlite:0.3.2`.
 
 ## Goal
 
@@ -30,7 +34,7 @@ to stay friendly to both humans and AI agents:
 - **Reliable under concurrency.** At-least-once delivery with fencing tokens,
   single-broker crash recovery, idempotent send/receive/settle, and O(log n) claims
   on a deep backlog — built to take high enqueue/dequeue throughput without losing
-  or double-delivering messages.
+  durably committed work. Delivery can repeat, so handlers must be idempotent.
 - **Simple, unambiguous interface.** Every operation is one plain HTTP `POST` with
   a JSON body — curl-able, trivially scriptable, and easy for an LLM or agent to
   drive — with exactly one settlement verb per outcome and no aliased calls.
@@ -265,7 +269,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_MONITOR_TOKENS` | optional, distinct read-only credentials for `observe` and `/metrics`; administrator auth must remain enabled |
 | `MQLITE_METRICS` | enable authenticated Prometheus `/metrics` on the API port (`on`/`true`/`1`; default `off`); requires administrator auth |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
-| `MQLITE_MAX_SUBSCRIPTIONS` | v0.4.0+: maximum active plus deleting subscriptions (default 10,000) |
+| `MQLITE_MAX_SUBSCRIPTIONS` | main / planned v0.4.0: maximum active plus deleting subscriptions (default 10,000) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | broker DLQ retention (defaults 14d / 1,000,000 per queue, drop-oldest; byte cap off by default; `MQLITE_DLQ_RETENTION=off` disables) |
 
 > The DB connection string is **only ever read from the environment** — it is
@@ -344,11 +348,13 @@ Set it with the embedded option `mqlite.WithSynchronous("FULL")`, or `MQLITE_SYN
 for the `serve`/CLI path. Remote **Turso** DSNs ignore this — durability there is the
 server's responsibility.
 
-> **What "no message loss" means here:** mqlite is honestly **at-least-once**, not
+> **Durability and retention boundary:** mqlite is honestly **at-least-once**, not
 > exactly-once. Under `NORMAL`, a power cut can lose a handful of just-enqueued
 > messages that hadn't reached disk yet; choose `FULL` if that window is
-> unacceptable. Once a message is durably written it is delivered at least once and
-> never silently dropped.
+> unacceptable. Once a message is durably written, normal delivery retains it
+> until a documented lifecycle action removes it. Explicit force deletion, subscription expiry,
+> message TTL with discard, and configured DLQ retention are authorized discard
+> paths; handlers must still tolerate redelivery.
 
 ## Retention
 
@@ -358,14 +364,17 @@ is the **dead-letter queue** — so `serve` bounds it by default: a background p
 drops dead letters oldest-first once they are older than **14 days** or beyond
 **1,000,000 per queue** (`MQLITE_DLQ_MAX_AGE` / `MQLITE_DLQ_MAX_COUNT`; an optional
 per-queue byte cap `MQLITE_DLQ_MAX_BYTES` is off by default; `MQLITE_DLQ_RETENTION=off`
-disables all). Only the DLQ is ever touched — undelivered and in-flight
-work is never auto-deleted. The embedded library leaves this off unless you opt in
+disables all). That retention worker touches only dead letters; it never deletes
+active, locked, deferred, or scheduled work. Other documented lifecycle actions
+can remove retained work: message TTL may discard on expiry, fixed subscription
+TTL authorizes forced cleanup, and explicit force deletion discards the selected
+resource. The embedded library leaves DLQ retention off unless you opt in
 with `mqlite.WithDLQRetention(...)`. Freed pages are reused, and a background janitor
 hands them back to the OS via `incremental_vacuum`, so the file grows to the peak backlog
 and then shrinks back gradually as the queue drains (a full `VACUUM` rewrite stays
 manual-only, via `mqlite vacuum`). See [docs/retention.md](docs/retention.md).
 
-In v0.4.0 and later, queue and subscription deletion follow the same
+On main (planned for v0.4.0), queue and subscription deletion follow the same
 bounded-storage principle. They
 are empty-only by default; `--force` explicitly discards active, locked,
 scheduled, deferred and dead-letter work. Acceptance first persists a `deleting`
@@ -410,9 +419,10 @@ docker run --platform linux/amd64 -p 6754:6754 \
   -e MQLITE_TOKENS=mqk_dev mqlite:dev
 ```
 
-**Footprint:** ~11 MB static (CGO-free) binary, ~19 MB idle RSS, ~0.4 KB per message
-on disk — fits Fly's smallest 256 MB machine with room to spare. Measured numbers and
-Fly.io machine/volume sizing: [docs/benchmark.md](docs/benchmark.md).
+**Historical footprint sample:** ~11 MB static (CGO-free) binary, ~19 MB idle
+RSS, and ~0.4 KB per 256-byte message in the recorded benchmark environment. These
+are sizing inputs, not current-release limits. Fly.io machine and volume guidance:
+[docs/benchmark.md](docs/benchmark.md).
 
 Full copy-runnable recipes — Docker/GHCR, **Fly.io** (minimal-cost, scale-to-zero),
 **systemd**, and **Turso** — with auth and verification:
@@ -424,7 +434,7 @@ Full copy-runnable recipes — Docker/GHCR, **Fly.io** (minimal-cost, scale-to-z
 ```bash
 go test ./...                 # hermetic unit + invariant (TCK-style) tests
 go test -bench=. ./engine     # embedded throughput benchmarks (msg/s)
-go test ./engine -run TestMessageIntegrity      # no-loss + content-hash sweep (default 1k)
+go test ./engine -run TestMessageIntegrity      # accounting + content-hash sweep (default 1k)
 MQLITE_INTEGRITY_N=500000 go test ./engine -run TestMessageIntegrity  # large sweep
 # destructive live remote suite against a dedicated, disposable Turso test DB:
 MQLITE_TEST_DB=libsql://<db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
@@ -443,32 +453,33 @@ a dedicated disposable database; the explicit reset confirmation is required eve
 when selecting one `TestTurso*` test with `-run`.
 
 A contiguous `1..N` sequence is sent with random bodies (each hashed into a
-property) and consumed concurrently with redelivery stress; the test asserts every
-value arrives exactly once (**no loss**) and every body still matches its hash (**no
-corruption**). Local + cloud (Fly) throughput/memory/disk methodology and numbers:
+property) and consumed concurrently with redelivery stress; the test accounts for
+every sent value and verifies every body hash. Its uniqueness assertion is a
+test-run invariant, not an exactly-once delivery promise. Local and cloud (Fly)
+throughput, memory, and disk methodology and numbers:
 [docs/benchmark.md](docs/benchmark.md). The large sweep also runs weekly in CI.
 
 ## Status
 
-This source tree targets **v0.4.0**, with default broker port **6754** and schema
-token **7**. It replaces retracted v0.3.3 and removes that release's public queue
-`Generation` contract; queue operations address a queue by name. See
-[CHANGELOG.md](CHANGELOG.md) for the corrected deletion contract and upgrade notes.
-Use matching binaries from [tagged releases](https://github.com/mqlitehq/mqlite/releases)
-or pin the image to `ghcr.io/mqlitehq/mqlite:0.4.0`; see
-[deployment](docs/deployment.md) for configuration.
+The latest supported release is **v0.3.2** (port 6754, schema token 5). Pin
+production binaries to the v0.3.2 release and containers to
+`ghcr.io/mqlitehq/mqlite:0.3.2`; v0.3.3 is retracted.
 
-**Moving from v0.3.0/v0.3.1/v0.3.2 or retracted v0.3.3 to v0.4.0 requires a
-fresh database.** Those builds use schema token 5; MQLite deliberately
-has no in-place schema migration. Stop writers, take a consistent backup, account
-for retained work in every state, and keep the old binary/database pair for
-rollback. Do not restamp or point schema-7 code at the old file. A schema-6
-database made by an intermediate unreleased lifecycle build is refused as well;
-schema 6 was never released.
-See [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
+The `main` branch is an **unreleased v0.4.0 candidate** with schema token 7. It
+removes v0.3.3's public queue `Generation` contract and adds the corrected resource
+lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md). Build it from source only
+when deliberately testing the candidate; there is no v0.4.0 tag or published
+`0.4.0` image yet.
 
-v0.4.0 also removes the deprecated Prometheus aliases `mqlite_queue_total` and
-`mqlite_queue_oldest_message_age_ms`. Migrate to
+**Moving a schema-5 database to a future v0.4.0 release will require a fresh
+database.** Stop writers, take a consistent backup, account for retained work in
+every state, and preserve the old binary/database pair for rollback. Do not restamp
+or point schema-7 code at the old file. Schema 6 belonged only to intermediate
+unreleased lifecycle builds and is also refused. See
+[upgrade and rollback](docs/operations.md#upgrade-and-rollback).
+
+The planned v0.4.0 release also removes the deprecated Prometheus aliases
+`mqlite_queue_total` and `mqlite_queue_oldest_message_age_ms`. Migrate to
 `mqlite_queue_retained_messages` and
 `mqlite_queue_oldest_message_age_seconds` before upgrading. The native JSON field
 `oldest_message_age_ms` remains unchanged.

@@ -5,8 +5,10 @@ This is the normative spec of how mqlite **must** behave — the invariants that
 hermetic test (cross-referenced); together these are mqlite's TCK. If a change would
 break a **MUST** here, it is a behavior change, not a refactor.
 
-mqlite is honestly **at-least-once**: a durably-written message is delivered at least
-once and never silently dropped; handlers must be idempotent. (§3)
+mqlite is honestly **at-least-once** during normal delivery: redelivery is
+possible, so handlers must be idempotent. Documented discard paths include message
+TTL configured to discard, DLQ retention, forced resource deletion, and fixed
+subscription expiry. (§3, §8, §14)
 
 ## 1 · Peek-Lock lifecycle
 
@@ -261,7 +263,7 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestAccessKeySchemaConflict, TestAccessKeyCreationIndexUpgradeAndConflicts;
   test/production/restore/run.py, compat.py)*
 - **10.5** Durable resource lifecycle and fixed subscription-expiry columns and
-  indexes make current schema token 7 incompatible with the released schema-5
+  indexes make the unreleased candidate schema token 7 incompatible with the released schema-5
   layout and intermediate schema-6 layout. Each binary MUST refuse the other's
   database rather than adding columns, restamping the token or partially opening
   it. Operators must create a fresh database and preserve the matching old

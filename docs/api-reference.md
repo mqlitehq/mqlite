@@ -6,6 +6,10 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
+This reference follows `main`, the unreleased v0.4.0 candidate. The latest
+supported release is v0.3.2; use the documentation in that tag for its smaller
+management surface. Sections for candidate-only methods are labeled below.
+
 Every RPC body must be exactly one non-null JSON object, including operations
 whose request is otherwise empty (`{}`). Unknown fields and data after that object
 are rejected. Repeated fields retain Go's `encoding/json` behavior: later scalar
@@ -21,9 +25,10 @@ values replace earlier ones, while repeated object and map values may merge.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
-- **At-least-once:** consumers must be idempotent. A message is delivered at least
-  once and never silently dropped (see [retention.md](retention.md) for what is and
-  isn't auto-deleted).
+- **At-least-once:** normal delivery may repeat, so consumers must be idempotent.
+  Message TTL configured to discard, DLQ retention, forced resource deletion and
+  fixed subscription expiry are explicit removal paths; see
+  [retention.md](retention.md).
 - **One settlement verb per outcome** — `Complete` / `Abandon` / `Reject` / `Defer`,
   no aliases. New effects require the `lock_token` from `Receive` and an unexpired
   lease; exact-request receipt replays are described below.
@@ -432,7 +437,7 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 
 ### DeleteQueue
 
-The corrected name-only contract below is available in **v0.4.0 and later**. The
+The corrected name-only contract below is on **main** and planned for v0.4.0. The
 incompatible request shape from v0.3.3 was withdrawn and that module version is
 retracted.
 
@@ -507,7 +512,8 @@ authorize discard and receive the `Deleted` / `State` outcome. Reconcile a
 progresses without another delete.
 
 The public identity remains the queue name; force does not introduce a lifetime
-token. Durable deletion and fixed-lifetime metadata make v0.4.0 schema token 7,
+token. Durable deletion and fixed-lifetime metadata make the unreleased v0.4.0
+candidate schema token 7,
 which refuses schema-5 and schema-6 files rather than migrating them. Schema 6
 belonged only to intermediate unreleased builds and was never tagged.
 The console exposes **delete queue** in a plain queue's detail page and requires
@@ -519,7 +525,7 @@ operation as unsupported.
 
 ### DeleteSubscription
 
-Available in **v0.4.0 and later**.
+Available on **main** and planned for v0.4.0.
 
 Deletes one exact topic/subscription pair. It uses the same durable, bounded
 lifecycle as `DeleteQueue`, but owns both the topic roster mapping and the
@@ -603,7 +609,7 @@ Register subscription `name` under `topic` (creates its backing queue).
   bytes. A malformed expr or name is rejected with `400 invalid_argument`.
   **Response** `{}`.
 - The same route accepts `SubscribeWithOptionsRequest`, which adds optional
-  `ttl_ms` in **v0.4.0 and later**. A positive integer stores a fixed lifetime
+  `ttl_ms` on **main**, planned for v0.4.0. A positive integer stores a fixed lifetime
   from the first successful creation; omitted or zero creates a permanent
   subscription when the name is new, and preserves an existing subscription's
   lifetime. JSON `null`, fractions,
@@ -652,7 +658,7 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 ### ListQueues
 
 The `state` field and deleting-resource visibility below are available in
-**v0.4.0 and later**.
+**main**, planned for v0.4.0.
 
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
   `state`, `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`,
@@ -674,7 +680,7 @@ The `state` field and deleting-resource visibility below are available in
 
 ### ListSubscriptionsPage
 
-Available in **v0.4.0 and later**.
+Available on **main** and planned for v0.4.0.
 
 - POST `/mqlite.v1.AdminService/ListSubscriptionsPage`.
 - Request fields: `topic` (optional exact topic), `after` (an opaque cursor from

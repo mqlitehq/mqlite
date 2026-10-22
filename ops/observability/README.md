@@ -13,13 +13,15 @@ loopback ports. All container builds and this example's runtime platform are
 explicitly `linux/amd64`.
 An ARM host uses Docker's emulation; this does not benchmark native ARM performance.
 
-Use the matching release tag so the broker, dashboard and rules come from the same
-version. Before that tag is published, use the exact reviewed candidate commit
-for a release rehearsal instead.
+Use the matching release checkout so the broker, dashboard and rules come from the
+same source. The latest supported tag is v0.3.2. This `main` checkout describes
+the unreleased schema-7 candidate; use an exact reviewed commit for a release
+rehearsal.
 
 Stop the v0.3.2 starter before launching this stack because both versions publish
 the same loopback ports. From its old checkout, run `docker compose down` in
-`ops/observability`. If the checkout has already moved to v0.4.0 and the old
+`ops/observability`. If the checkout has already moved to the schema-7 candidate
+and the old
 pointer was saved as `.env.v0.3.2`, stop that project explicitly:
 
 ```sh
@@ -30,8 +32,10 @@ This stops the old containers without deleting their schema-5 data. Preserve tha
 data with the matching old binary; the schema-7 broker cannot open it.
 
 ```sh
-git clone --branch v0.4.0 --depth 1 https://github.com/mqlitehq/mqlite.git
-cd mqlite/ops/observability
+git clone https://github.com/mqlitehq/mqlite.git
+cd mqlite
+git checkout <reviewed-main-commit-sha>
+cd ops/observability
 python3 init.py
 docker compose up --build -d
 docker compose ps
@@ -42,12 +46,14 @@ credentials. Secrets and persistent data live **outside the source checkout**, b
 default at `$XDG_STATE_HOME/mqlite-observability-040`, or
 `~/.local/state/mqlite-observability-040` when XDG_STATE_HOME is unset. The new
 directory prevents a schema-5 demo database from being reused by the schema-7
-broker. `init.py` records the stack version in `.env` and refuses an older pointer;
-preserve that old data and move `.env` aside before initializing v0.4.0. To
+broker. The `040` directory/project suffix and `OBS_STACK_VERSION` are candidate
+compatibility namespaces; they do not indicate that a v0.4.0 tag exists. `init.py`
+records the stack version in `.env` and refuses an older pointer. Preserve that
+old data and move `.env` aside before initializing the schema-7 candidate. To
 select another location, set `OBS_DATA_DIR` before the first initialization.
-Existing v0.4.0 credentials are preserved. Files are mode 0600 and directories
-0700; services run
-as your numeric UID/GID so file permissions need not be relaxed.
+Existing candidate-stack credentials are preserved. Files are mode 0600,
+directories are 0700, and services run as your numeric UID/GID so permissions
+need not be relaxed.
 
 | Service | Local URL | Credentials |
 | --- | --- | --- |
@@ -211,7 +217,7 @@ python3 test/observability/check_config.py
 
 After initialization, this uses the pinned `promtool` to validate Compose,
 Prometheus configuration, operating/demo rules and the entire exposition fixture.
-It requires the v0.4.0 exposition contract to pass metric-name validation without
+It requires the candidate exposition contract to pass metric-name validation without
 warnings, and verifies that malformed exposition is rejected. Run the real-stack
 driver as well: parsing configuration alone cannot prove credentials, networking,
 scrapes, alert transitions or Grafana queries work.

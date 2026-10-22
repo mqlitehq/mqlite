@@ -16,8 +16,8 @@ def main():
                         if line and not line.startswith("#") and "=" in line)
         if previous.get("OBS_STACK_VERSION") != "0.4.0":
             raise SystemExit(
-                "Existing .env predates the v0.4.0 schema boundary. Preserve its data, "
-                "move .env aside, and initialize a fresh v0.4.0 directory."
+                "Existing .env targets another schema boundary. Preserve its data, "
+                "move .env aside, and initialize a fresh schema-7 candidate directory."
             )
     state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
     configured = previous.get("OBS_DATA_DIR", "").strip('"')
