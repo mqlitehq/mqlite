@@ -342,11 +342,21 @@ production database.
 Each minute, and once more for a final partial window, the artifact records
 per-lane and overall cycles/s; Send, Receive, Complete and end-to-end p50/p95/p99
 and maximum latency; empty/error counts; queue backlog; settlement-receipt
-counts; storage outcomes and retries; pool waits; Go heap, RSS, goroutines, GC and
-process CPU where the runner exposes them. `metadata.json`, `windows.jsonl`,
+counts; storage outcomes and retries; pool waits; background-maintenance pass
+state; Go heap, RSS, goroutines, GC and process CPU where the runner exposes them.
+The maintenance snapshot is copied from process memory and does not issue an
+additional remote database query. `metadata.json`, `windows.jsonl`,
 `summary.json`, `summary.md` and the test log are retained for 14 days. Errors,
 body mismatches, accounting failures, final backlog or exact cleanup failures
-fail the run, while the evidence written before a failure remains uploadable.
+fail the run, while the evidence written before a failure remains uploadable. A
+single failed maintenance pass may recover on that task's next complete pass.
+Two consecutive failed passes, or one still unrecovered at the end of the run,
+fail the soak. Recovered failures remain visible in the cumulative maintenance
+counters and bounded diagnostic history. The final maintenance judgement is a
+process-memory snapshot taken after `Engine.Close` has stopped and joined the
+background workers; the harness does not trigger an extra maintenance pass to
+change the result. Thus the last `windows.jsonl` entry is the pre-cleanup workload
+sample, while `summary.json.final_maintenance` is the post-close terminal state.
 A runner cancellation or outer test timeout can interrupt final cleanup; the
 next run's `TestMain` reset and namespaced startup cleanup remove that residue.
 
