@@ -333,7 +333,8 @@ class WorkflowContractTests(unittest.TestCase):
             "release-image.yml": "00ce4b311619e3f573537516713741efc523d0fb2b1692cacb81d8e5e5219643",
         }
         self.assertEqual({p.name for p in (ROOT / ".github/workflows").iterdir()},
-                         {"ci.yml", "release.yml", "release-image.yml", "turso-nightly.yml", "integrity-weekly.yml"})
+                         {"ci.yml", "release.yml", "release-image.yml", "turso-nightly.yml",
+                          "turso-performance-soak.yml", "integrity-weekly.yml"})
         for name, digest in expected.items():
             with self.subTest(workflow=name):
                 self.assertEqual(hashlib.sha256((ROOT / ".github/workflows" / name).read_bytes()).hexdigest(), digest,
