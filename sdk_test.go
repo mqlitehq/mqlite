@@ -2498,7 +2498,7 @@ func TestRemoteDeleteQueueLostAcknowledgementCanBeReconciled(t *testing.T) {
 		if r.URL.Path == wire.PathDeleteQueue && loseFirstAck.CompareAndSwap(true, false) {
 			recorder := httptest.NewRecorder()
 			realHandler.ServeHTTP(recorder, r)
-			ack, decodeErr := wire.DecodeDeleteQueueResponse(recorder.Body.Bytes())
+			ack, decodeErr := wire.DecodeDeleteResponse(recorder.Body.Bytes())
 			if recorder.Code != http.StatusOK || decodeErr != nil || ack.Deleted || ack.State != "deleting" {
 				t.Errorf("broker pending acknowledgement = status %d body %q: %v", recorder.Code, recorder.Body.String(), decodeErr)
 			}
@@ -2751,7 +2751,7 @@ func TestDeleteQueueAcknowledgementContract(t *testing.T) {
 		{name: "missing deleted", response: `{"state":"deleting"}`, wantErr: mqlite.ErrOutcomeUnknown},
 		{name: "wrong deleted type", response: `{"deleted":"false","state":"deleting"}`, wantErr: mqlite.ErrOutcomeUnknown},
 		{name: "trailing object", response: `{"deleted":false,"state":"deleting"}{}`, wantErr: mqlite.ErrOutcomeUnknown},
-		{name: "oversized", response: strings.Repeat(" ", wire.MaxDeleteQueueResponseBytes+1), wantErr: mqlite.ErrOutcomeUnknown},
+		{name: "oversized", response: strings.Repeat(" ", wire.MaxDeleteResponseBytes+1), wantErr: mqlite.ErrOutcomeUnknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := make(chan capturedRequest, 1)

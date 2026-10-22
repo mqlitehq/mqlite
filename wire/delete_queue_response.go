@@ -13,10 +13,6 @@ var errDeleteResponse = errors.New("mqlite: invalid deletion response")
 // broker or intermediary. A valid response contains only two small fields.
 const MaxDeleteResponseBytes = 4 << 10
 
-// MaxDeleteQueueResponseBytes bounds the complete acknowledgement returned by a
-// broker or intermediary. Kept for source compatibility.
-const MaxDeleteQueueResponseBytes = MaxDeleteResponseBytes
-
 // ReadDeleteResponse reads one bounded acknowledgement so truncated or
 // oversized successes cannot be mistaken for an accepted deletion.
 func ReadDeleteResponse(reader io.Reader) ([]byte, error) {
@@ -25,13 +21,6 @@ func ReadDeleteResponse(reader io.Reader) ([]byte, error) {
 		return nil, errDeleteResponse
 	}
 	return data, nil
-}
-
-// ReadDeleteQueueResponse reads one bounded acknowledgement so truncated or
-// oversized successes cannot be mistaken for an accepted deletion. Kept for
-// source compatibility; new code can use ReadDeleteResponse.
-func ReadDeleteQueueResponse(reader io.Reader) ([]byte, error) {
-	return ReadDeleteResponse(reader)
 }
 
 // DecodeDeleteResponse requires an explicit, internally consistent
@@ -57,10 +46,4 @@ func DecodeDeleteResponse(data []byte) (DeleteResponse, error) {
 		return DeleteResponse{}, errDeleteResponse
 	}
 	return response, nil
-}
-
-// DecodeDeleteQueueResponse validates the shared lifecycle acknowledgement.
-// Kept for source compatibility; new code can use DecodeDeleteResponse.
-func DecodeDeleteQueueResponse(data []byte) (DeleteQueueResponse, error) {
-	return DecodeDeleteResponse(data)
 }
