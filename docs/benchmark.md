@@ -415,12 +415,13 @@ amplification. Enriched batched sends (`props_batch64`) hold 6.7k/s.
 **FULL durability** costs ~11× locally; on the already-CPU-bound cloud box the gap
 narrows (468 vs 567) because fsync isn't the bottleneck there — the core is.
 
-## 2 · Memory footprint & reclamation
+## 2 · Memory footprint after a short idle
 
-Whole-process **RSS** (not just Go heap), peak during load vs after the idle+GC
-phase — "how much memory, and is it released?"
+Whole-process **RSS** (not just Go heap), peak during load vs after the harness's
+short 1.9-second idle and forced GC. This end snapshot describes immediate process
+state; it does not imply that the 60-second storage janitor has run.
 
-| scenario | local peak → end | cloud peak → end |
+| scenario | local peak → short idle | cloud peak → short idle |
 |---|---:|---:|
 | produce_p8 | 34 → 27 MB | 27 → 20 MB |
 | batch_64_p4 | 32 → 27 MB | 28 → 23 MB |
@@ -435,32 +436,21 @@ load stopped; no sustained growth was observed in these runs. Larger messages,
 more concurrent requests or queues, and monitoring can change the footprint.
 Measure the current workload before choosing a memory limit.
 
-## 3 · DB-file bloat vs reclamation
+## 3 · DB-file footprint and reclamation
 
-`bloat_50k` fills 50k messages then **drains every one** (Complete = `DELETE`),
-sampling the file the whole time (local):
+`bloat_50k` now inserts exactly 50,000 messages once, samples the full backlog,
+drains exactly that count with `Complete`, and rejects any send, receive, settle,
+or accounting error. `file_bytes_per_msg` uses the count actually accepted during
+prefill. Older results from this scenario are not comparable: the previous harness
+prefilled twice, rounded each tail batch up, and still divided file size by 50,000.
 
-```
- t_ms     db      wal     (queue state)
-    1   16.1MB   4.0MB    filling
- 2209   32.2MB   7.7MB    full (50k resident)
- 3403   32.2MB   7.7MB    drained — queue EMPTY
-27018   32.2MB   7.7MB    still 32.2MB after 24s idle
-```
-
-**The file does not shrink when the queue empties.** mqlite deletes the rows, but
-SQLite has no auto-VACUUM, so freed pages go to the **freelist and are reused** by
-the next messages — the on-disk high-water mark persists. The same signature shows in
-*every* scenario's `dbPeak == dbEnd` on both boxes. This is correct, predictable
-behaviour (steady-state queues plateau; no per-message file thrash), but **size disk
-for the peak backlog, not the average**. *(A known property, not a surprise.)*
-
-> **Update (MQLITE-53):** a background pass now runs `PRAGMA incremental_vacuum` when the
-> freelist grows, so a local file DB **does** return freed pages to the OS over time —
-> without a manual `VACUUM` or stopping the broker. The table above predates that and
-> shows the old plateau-forever behaviour; with auto-reclaim the file shrinks after a
-> drain instead of holding the high-water mark. (`auto_vacuum=INCREMENTAL` is set at DB
-> creation; remote Turso manages its own storage.)
+The scenario's `db_final_mb` is the immediate state after the same 1.9-second idle
+used by the other scenarios. It is useful for comparing the peak with the drained
+file, but it does not verify background page reclamation. Local file databases use
+`auto_vacuum=INCREMENTAL`; the background janitor checks every 60 seconds and
+reclaims a bounded number of pages once its freelist threshold is met. Use a run
+that spans that interval, or measure an explicit `Compact(false)`, when evaluating
+reclamation. Remote Turso manages its own storage.
 
 ## 4 · Enriched messages — KV properties
 
