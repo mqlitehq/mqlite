@@ -18,8 +18,10 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
 
-> **Release status:** v0.3.2 is the latest supported release; the v0.3.3 release
-> artifacts are withdrawn. `main` is an unreleased v0.4.0 candidate. Its
+> **Release status:** v0.3.2 is the latest supported release; v0.3.3 is withdrawn
+> and unsupported. Its public assets and exact image remain available for
+> forensic or compatibility inspection and must not be deployed. `main` is an
+> unreleased v0.4.0 candidate. Its
 > `retract v0.3.3` directive will be recognized by Go module tools only after a
 > later version containing that directive is tagged. Pin production installs to
 > the exact v0.3.2 release or `ghcr.io/mqlitehq/mqlite:0.3.2`.
@@ -55,7 +57,8 @@ rather than competing with Kafka-scale streaming.
   remote **Turso/libSQL** — the *same* SQL and semantics, selected by a
   connection string.
 - **Service Bus semantics with explicit delivery modes.** Peek-Lock is
-  at-least-once; receive-and-delete is the caller-selected at-most-once path.
+  at-least-once; receive-and-delete is the caller-selected at-most-once
+  broker-removal path.
   Peek-Lock supports four-way settle
   (`Complete`/`Abandon`/`Reject`/`Defer`), visibility timeout with fencing
   tokens, `delivery_count` → DLQ, `Renew`, scheduled/deferred messages.
@@ -274,7 +277,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_METRICS` | enable authenticated Prometheus `/metrics` on the API port (`on`/`true`/`1`; default `off`); requires administrator auth |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
 | `MQLITE_MAX_SUBSCRIPTIONS` | main / planned v0.4.0: maximum active plus deleting subscriptions (default 10,000) |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous broker DLQ retention targets (defaults 14d / 1,000,000 per queue, drop-oldest; byte target off by default; `MQLITE_DLQ_RETENTION=off` disables) |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous broker DLQ retention targets (defaults 14d / 1,000,000 per queue, drop-oldest; byte target off by default; `MQLITE_DLQ_RETENTION=off` disables broker-wide defaults) |
 
 > The DB connection string is **only ever read from the environment** — it is
 > never compiled into the binary. `.env.example` lists the variables mqlite reads;
@@ -355,7 +358,7 @@ server's responsibility.
 
 > **Durability and retention boundary:** default Peek-Lock delivery is
 > **at-least-once**, not exactly-once; receive-and-delete explicitly trades
-> redelivery for at-most-once removal. Under `NORMAL`, a power cut can lose a
+> redelivery for at-most-once broker removal. Under `NORMAL`, a power cut can lose a
 > handful of just-enqueued messages that hadn't reached disk yet; choose `FULL`
 > if that window is unacceptable. Once a message is durably written, normal
 > delivery retains it until a documented lifecycle action removes it. Explicit
@@ -365,36 +368,41 @@ server's responsibility.
 
 ## Retention
 
-Completed messages are deleted on settle and TTL'd messages expire, so a healthy
-queue's size tracks its retained backlog. Active work has no automatic retention
+Completed messages are deleted on settle and TTL'd messages expire, so retained
+backlog is the primary storage driver. Active work has no automatic retention
 ceiling and can grow when producers outrun consumers. For dead-lettered work,
 `serve` applies default retention targets: a background pass drops dead letters
 oldest-first once they are older than **14 days** or beyond **1,000,000 per
 queue** (`MQLITE_DLQ_MAX_AGE` / `MQLITE_DLQ_MAX_COUNT`; an optional
-per-queue byte cap `MQLITE_DLQ_MAX_BYTES` is off by default; `MQLITE_DLQ_RETENTION=off`
-disables all). Cleanup is asynchronous and bounded, so a DLQ can temporarily
+per-queue byte cap `MQLITE_DLQ_MAX_BYTES` is off by default;
+`MQLITE_DLQ_RETENTION=off` disables the broker-wide defaults). Cleanup is
+asynchronous and bounded, so a DLQ can temporarily
 exceed an age, count, or byte target between passes or while the worker catches
 up. That retention worker touches only dead letters; it never deletes
 active, locked, deferred, or scheduled work. Other documented lifecycle actions
 can remove retained work: message TTL may discard on expiry, fixed subscription
 TTL authorizes forced cleanup, and explicit force deletion discards the selected
-resource. The embedded library leaves DLQ retention off unless you opt in
-with `mqlite.WithDLQRetention(...)`. Freed pages are reused, and a background janitor
-hands them back to the OS via `incremental_vacuum`, so the file grows to the peak backlog
-and then shrinks back gradually as the queue drains (a full `VACUUM` rewrite stays
-manual-only, via `mqlite vacuum`). See [docs/retention.md](docs/retention.md).
+resource. The embedded library leaves engine-wide DLQ retention defaults off
+unless you opt in with `mqlite.WithDLQRetention(...)`; positive per-queue bounds
+still apply. Freed pages are reused. For local files, a bounded background
+`incremental_vacuum` pass gradually returns eligible free pages after its threshold
+is reached; cleanup lag and long readers can delay or limit shrinkage. Size storage
+for retained data plus WAL, indexes, fragmentation, reclamation lag and backups.
+A full `VACUUM` rewrite stays manual-only via `mqlite vacuum`. See
+[docs/retention.md](docs/retention.md).
 
 On main (planned for v0.4.0), queue and subscription deletion follow the same
 bounded-storage principle. They
 are empty-only by default; `--force` explicitly discards active, locked,
-scheduled, deferred and dead-letter work. Acceptance first persists a `deleting`
-state, which immediately blocks the backing queue, removes a subscription from
-topic fan-out, and reserves the name. The response reports either `deleted` or
-`deleting`; background cleanup resumes after restart. The final removal of a
+scheduled, deferred and dead-letter work. The accepting transaction moves the
+resource out of the data plane and starts bounded cleanup. If cleanup finishes,
+that commit removes the resource and returns `deleted`; otherwise it commits a
+`deleting` marker that reserves the name, and background cleanup resumes after
+restart. The final removal of a
 subscription backing queue also removes its topic mapping. An implicit topic
-becomes unavailable for fan-out once it has no active subscriptions, while its
-address remains reserved by any deleting mapping until physical cleanup
-completes. A locked delivery may already have produced an external side effect,
+becomes unavailable for fan-out once it has no active subscriptions. Any deleting
+mapping continues to reserve that address until physical cleanup completes. A
+locked delivery may already have produced an external side effect,
 which deletion cannot undo. Serialize deletion
 and same-name recreation, use globally unique one-use names for temporary
 subscriptions, and wait until the relevant inventory no longer shows the name
@@ -473,10 +481,11 @@ throughput, memory, and disk methodology and numbers:
 
 The latest supported release is **v0.3.2** (port 6754, schema token 5). Pin
 production binaries to the v0.3.2 release and containers to
-`ghcr.io/mqlitehq/mqlite:0.3.2`; the v0.3.3 release artifacts are withdrawn.
-The retraction directive currently exists only on the unreleased `main` branch,
-so Go module tools will not report v0.3.3 as retracted until a later version
-containing that directive is tagged.
+`ghcr.io/mqlitehq/mqlite:0.3.2`. v0.3.3 is withdrawn and unsupported; its public
+assets and exact image remain available for forensic or compatibility inspection
+and must not be deployed. The retraction directive currently exists only on the
+unreleased `main` branch, so Go module tools will not report v0.3.3 as retracted
+until a later version containing that directive is tagged.
 
 The `main` branch is an **unreleased v0.4.0 candidate** with schema token 7. It
 removes v0.3.3's public queue `Generation` contract and adds the corrected resource

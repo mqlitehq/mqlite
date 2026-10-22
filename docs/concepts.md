@@ -212,13 +212,13 @@ boundary.
 
 Subscriptions can be deleted explicitly. The default operation succeeds only
 when the backing queue has no retained message in any state; force is a deliberate
-authorization to discard them. Acceptance durably marks the backing queue
-`deleting`, immediately removes it from topic fan-out and the data plane, and
-keeps its name reserved while bounded cleanup runs. The mapping disappears with
-the final backing-queue row. Consequently, an implicit topic becomes unavailable
-for fan-out as soon as its last active subscription is retired, even if physical
-cleanup is pending. Its address remains reserved by a deleting mapping until that
-cleanup completes.
+authorization to discard them. The accepting transaction immediately removes the
+subscription from topic fan-out and the data plane and starts bounded cleanup. If
+cleanup finishes, the same commit removes its mapping and backing queue; otherwise
+it commits a `deleting` marker that reserves the name for reconciliation. An
+implicit topic becomes unavailable for fan-out as soon as its last active
+subscription is retired. Its address remains reserved only while a deleting
+mapping persists.
 
 Subscription creation may include a **fixed lifetime**. The broker saves one
 absolute `expires_at_ms` from the first successful creation. Ordinary retries,

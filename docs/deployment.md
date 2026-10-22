@@ -23,7 +23,7 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_METRICS` | v0.3.2+: opt-in authenticated `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
 | `MQLITE_MAX_SUBSCRIPTIONS` | main / planned v0.4.0: active plus deleting subscription capacity (default 10,000); pending cleanup continues to occupy a slot |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous DLQ retention targets (defaults 14d / 1,000,000 per queue; byte target off; `MQLITE_DLQ_RETENTION=off` to disable) — see [retention.md](retention.md) |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous DLQ retention targets (defaults 14d / 1,000,000 per queue; byte target off; `MQLITE_DLQ_RETENTION=off` disables broker-wide defaults) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
 | `MQLITE_UI` | serve the embedded admin console at `/ui` (default on; `off` runs headless) |
 
@@ -49,8 +49,9 @@ and error reference: [api-reference.md](api-reference.md).
 
 > **Version and upgrade compatibility.**
 > The latest supported release is **v0.3.2**, with default port **6754** and
-> schema token **5**. The v0.3.3 release artifacts are withdrawn. Pin the exact
-> v0.3.2 binary or image;
+> schema token **5**. v0.3.3 is withdrawn and unsupported; its public assets and
+> exact image remain available for forensic or compatibility inspection and must
+> not be deployed. Pin the exact v0.3.2 binary or image;
 > do not select v0.3.3, and do not rely on a moving image alias to choose a
 > production version.
 >

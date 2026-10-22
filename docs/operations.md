@@ -2,10 +2,11 @@
 
 This runbook covers the latest supported release, v0.3.2 (port 6754, schema
 token 5), and the `main` branch's unreleased v0.4.0 candidate (port 6754, schema
-token 7). The v0.3.3 release artifacts are withdrawn; pin production deployments
-to v0.3.2 until a corrected release is tagged. Although `main` declares
-`retract v0.3.3`, Go module tools will discover that directive only after a later
-version containing it is tagged.
+token 7). v0.3.3 is withdrawn and unsupported; its public assets and exact image
+remain available for forensic or compatibility inspection and must not be
+deployed. Pin production deployments to v0.3.2 until a corrected release is
+tagged. Although `main` declares `retract v0.3.3`, Go module tools will discover
+that directive only after a later version containing it is tagged.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -36,14 +37,21 @@ for metric definitions and alerts.
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
   when retrying within their documented retention windows; do not treat an HTTP
   timeout as proof that a write failed.
+
+The next three boundaries apply to the unreleased `main` candidate. v0.3.2 has
+the complete active-only `ListSubscriptions` operation, but it does not provide
+queue/subscription deletion, lifecycle-aware paged subscription inventory, the
+subscription capacity setting, or fixed subscription TTL.
+
 - Give one controller exclusive ownership of queue or subscription deletion and
   same-name recreation. Quiesce producers and consumers. Use the empty-only
   default unless permanent loss is intended; force also discards locked work whose
-  external effects may already have happened. An accepted resource enters durable
-  `deleting`, stops serving data and reserves its name; an accepted subscription
-  also leaves topic fan-out immediately. Confirm the name is absent before
-  recreating it. Keep the name reserved while reconciling an uncertain result,
-  and never replay an old delete after a replacement exists.
+  external effects may already have happened. The accepting transaction moves the
+  resource to `deleting` and starts cleanup. The marker reserves its
+  name when cleanup continues; a small deletion can instead complete in that same
+  commit. An accepted subscription leaves topic fan-out immediately. Confirm the
+  name is absent before recreating it. Keep the name reserved while reconciling an
+  uncertain result, and never replay an old delete after a replacement exists.
 - Treat the default 10,000 active-plus-deleting subscription limit as a metadata
   safety ceiling. Choose a lower limit when the application needs a stricter
   bound. Measure fan-out latency, database growth and observation cost at the

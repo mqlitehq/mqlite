@@ -242,10 +242,12 @@ it is small and boring on purpose:
 **Resource deletion is a durable state machine.** An empty-only queue or
 subscription delete verifies every message state in the same transaction that
 changes the backing `queues.lifecycle_state` from `active` to `deleting`; force
-skips the empty check because its caller explicitly authorized discard. The state
-change invalidates cached configuration, wakes long polls, rejects further queue
-work and keeps the namespace occupied. A subscription stops participating in
-fan-out in that same committed state transition. Physical cleanup then removes
+skips the empty check because its caller explicitly authorized discard. That
+transaction also starts bounded physical cleanup. If cleanup finishes, the same
+commit removes the resource and there is no observable intermediate `deleting`
+state. Otherwise it commits the marker, which invalidates cached configuration,
+wakes long polls, rejects further queue work and keeps the namespace occupied. A
+subscription stops participating in fan-out in that commit. Later passes remove
 messages, dedup rows and both receipt tables before deleting the queue row itself;
 the subscription mapping and backing queue are removed explicitly in one transaction.
 
@@ -258,14 +260,15 @@ force authorization and never changes on retry, filter update or message activit
 
 The accepting call removes no more than 1,000 physical rows and targets about
 8 MiB. Each lifecycle pass globally caps cleanup at 4,096 rows and targets about
-8 MiB. Its ordinary path visits at most 32 backing queues with retained state
-locally, or one such queue on remote Turso/libSQL. The remote cap bounds Hrana
+8 MiB. Its ordinary per-resource path visits at most 32 backing queues locally,
+or one such queue on remote Turso/libSQL. The remote cap bounds Hrana
 round trips inside one write transaction; the persisted cursor provides fair rotation.
 `Open` runs a pass before lock recovery. The marker is therefore both the restart
 cursor and the force authorization. A crash cannot reactivate the queue or require
 an operator to re-authorize discard. A single oversized row may exceed the byte
 target to guarantee forward progress. Accepted pending deletes wake the worker;
-bursts coalesce into one signal, and unfinished passes schedule another after one
+bursts coalesce into one signal. A full 512-subscription empty fast-path batch
+schedules its next pass after 10 ms; other unfinished passes continue after one
 second. With no deleting resource the worker opens no transaction, which avoids an
 idle polling round trip on remote stores. The one exception is a remote deletion
 or cleanup transaction whose commit acknowledgement is uncertain: after the

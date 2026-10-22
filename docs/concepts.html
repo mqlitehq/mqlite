@@ -339,11 +339,12 @@
       create a replacement. Never replay an old deletion after recreation. Keep a
       name reserved while an uncertain result is being reconciled.</p>
     <p>Subscriptions can also be deleted, empty-only by default or with explicit
-      force. Acceptance marks the backing queue <code>deleting</code>, removes it from
-      topic fan-out immediately, and keeps its mapping and name for reconciliation
-      until bounded cleanup completes. The implicit topic becomes unavailable for
-      fan-out when its last active subscription is retired, while a deleting mapping
-      reserves its address until cleanup completes.</p>
+      force. The accepting transaction removes the subscription from topic fan-out
+      immediately and starts bounded cleanup. If cleanup finishes, the same commit
+      removes the mapping and backing queue; otherwise a committed
+      <code>deleting</code> marker reserves the name for reconciliation. The implicit
+      topic becomes unavailable for fan-out when its last active subscription is
+      retired, and its address remains reserved only while a deleting mapping persists.</p>
     <p>Subscription creation may set a fixed lifetime. The broker saves one absolute
       deadline from the first successful creation; retries, filter updates and message
       activity never extend it. At the exact deadline the subscription leaves fan-out

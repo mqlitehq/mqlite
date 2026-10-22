@@ -27,7 +27,8 @@ values replace earlier ones, while repeated object and map values may merge.
   the message lives. You never set them.
 - **Delivery mode:** default Peek-Lock delivery is at-least-once and may repeat,
   so consumers must be idempotent. Receive-and-delete is an explicit at-most-once
-  path that removes a message before returning it.
+  broker-removal path that removes a message before returning it; an explicit
+  retry with the same receive attempt ID can replay its saved response.
   Message TTL configured to discard, DLQ retention, forced resource deletion and
   fixed subscription expiry are explicit removal paths; see
   [retention.md](retention.md).
@@ -405,7 +406,8 @@ Enqueue for future delivery (same wire shape as `Send`).
 
 ### Cancel
 
-Delete a not-yet-activated scheduled message.
+Delete a scheduled send that has never been delivered (`delivery_count=0`). A
+delayed `Abandon` may also be in `scheduled`, but it cannot be cancelled.
 
 - **Request** `CancelRequest`: `queue`, `seq_number`. **Response** `SettleResponse`.
 
@@ -440,9 +442,10 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 ### DeleteQueue
 
 The corrected name-only contract below is on **main** and planned for v0.4.0. The
-incompatible request shape and v0.3.3 release artifacts were withdrawn. `main`
-declares `retract v0.3.3`, but Go module tools will discover that directive only
-after a later version containing it is tagged.
+incompatible request shape shipped in the withdrawn, unsupported v0.3.3 release;
+its public artifacts remain available for forensic or compatibility inspection
+and must not be deployed. `main` declares `retract v0.3.3`, but Go module tools
+will discover that directive only after a later version containing it is tagged.
 
 Deletes a **plain queue**. Requires administrator/manage permission. The default
 is empty-only; force is a separate, explicit authorization to discard retained
@@ -461,8 +464,10 @@ work.
   side effect; deleting its broker record cannot undo that effect.
 - Subscription backing queues are rejected with HTTP 400, `invalid_argument`;
   this operation does not remove topic subscriptions.
-- Acceptance durably changes the queue to `deleting` before cleanup. From that
-  point, queue operations are rejected without taking effect. Name-addressed
+- The accepting transaction changes the queue to `deleting` and starts bounded
+  cleanup. If cleanup finishes, the same commit removes the queue and returns
+  `deleted`; otherwise it commits the `deleting` marker. From that point, queue
+  operations are rejected without taking effect. Name-addressed
   operations such as Send, Receive, Peek and Stats return `not_found`; a stale
   lock settlement may instead report `lock_lost`. An existing long poll is woken,
   `CreateQueue` with that name returns
@@ -476,8 +481,9 @@ work.
   a local store or one loaded resource on remote Turso/libSQL, bounding remote
   round trips inside the write transaction. A separate set-based path can finalize
   up to 512 empty subscriptions without using that resource-count allowance; its
-  mapping and backing rows still use the shared row budget. Further passes are
-  paced one second apart; an idle broker does not poll for lifecycle work. The
+  mapping and backing rows still use the shared row budget. A full 512-subscription
+  fast-path batch schedules its next pass after 10 ms. Other required continuation
+  passes are paced one second apart; an idle broker does not poll for lifecycle work. The
   persisted cursor rotates through pending names fairly on both backends, so a
   large or bursty deletion cannot monopolize the single writer.
   Startup resumes one bounded pass before crash recovery. The row and name vanish
@@ -545,10 +551,11 @@ subscription's backing queue.
   `{"deleted":false,"state":"deleting"}`. Without force, any retained
   message state returns `409 subscription_not_empty`. Force is the caller's
   durable authorization to discard all states, including locked deliveries.
-- The accepted transaction first marks the backing queue `deleting`. It is then
-  excluded from topic fan-out and direct queue operations immediately, while its
-  mapping and name remain available for reconciliation. Final physical removal
-  removes the mapping in the same transaction. Retiring the last active
+- The accepted transaction marks the backing queue `deleting` and begins bounded
+  cleanup. If cleanup finishes, the same commit removes the mapping and backing
+  queue and returns `deleted`; otherwise the committed mapping and name remain
+  available for reconciliation while the subscription is excluded from fan-out
+  and direct queue operations. Retiring the last active
   subscription therefore makes the implicit topic unavailable for fan-out
   immediately. A deleting mapping keeps the topic address reserved until physical
   cleanup completes.

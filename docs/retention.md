@@ -1,16 +1,20 @@
 # Retention, deletion, and storage reclamation
 
 This page describes the implemented behavior on `main`, an unreleased v0.4.0
-candidate. The latest supported release is v0.3.2; the v0.3.3 artifacts are
-withdrawn, while `main`'s retraction directive will become visible to Go module
-tools only after a later version containing it is tagged. v0.3.2 has the DLQ
-retention and local reclamation behavior below, but it does not have the candidate
-queue and subscription lifecycle APIs.
+candidate. The latest supported release is v0.3.2. v0.3.3 is withdrawn and
+unsupported; its public artifacts remain available for forensic or compatibility
+inspection and must not be deployed. `main`'s retraction directive will become
+visible to Go module tools only after a later version containing it is tagged.
+v0.3.2 has DLQ retention
+and automatic local reclamation, but the work budgets below describe `main` unless
+a version difference is stated. v0.3.2 does not have the candidate queue and
+subscription lifecycle APIs.
 
 ## What removes retained messages
 
 Default Peek-Lock delivery is at-least-once. Receive-and-delete is the explicit
-at-most-once alternative and removes a message before returning it. A durable
+at-most-once broker-removal alternative and removes a message before returning it;
+retrying the same receive attempt ID can replay its saved response. A durable
 message stays retained until a documented lifecycle action removes or moves it:
 
 | Stored state | Normal lifecycle | Other authorized removal |
@@ -18,7 +22,7 @@ message stays retained until a documented lifecycle action removes or moves it:
 | `active` | Receive, then Complete or receive-and-delete | message TTL with discard; forced queue/subscription deletion; subscription expiry |
 | `locked` | Complete, or lock expiry returns it to `active` / moves it to the DLQ at the delivery limit | message TTL with discard; forced queue/subscription deletion; subscription expiry |
 | `deferred` | ReceiveDeferred, then settle | message TTL with discard; forced queue/subscription deletion; subscription expiry |
-| `scheduled` | activation at its due time, or Cancel | message TTL with discard; forced queue/subscription deletion; subscription expiry |
+| `scheduled` | activation at its due time; Cancel only for a scheduled send that has never been delivered | message TTL with discard; forced queue/subscription deletion; subscription expiry |
 | `dead_lettered` | Redrive or Purge | configured DLQ retention; forced queue/subscription deletion; subscription expiry |
 
 Complete and receive-and-delete remove the row immediately. A message TTL either
@@ -27,7 +31,8 @@ moves an expired message to the DLQ or discards it according to
 delivered again, so consumers must be idempotent.
 
 Deduplication rows, settlement receipts, and receive-attempt records have their
-own bounded cleanup. They are operational replay metadata, not a message archive.
+own expiry-based background cleanup. They are operational replay metadata, not a
+message archive; those expiry deletes are not row-budgeted per pass.
 
 ## DLQ retention
 
@@ -44,8 +49,9 @@ catches up. The worker never deletes active, locked, deferred, or scheduled rows
 | `MQLITE_DLQ_MAX_BYTES` | `0` | optional per-queue cap on dead-letter body bytes; zero disables this bound |
 | `MQLITE_DLQ_RETENTION` | enabled | set to `off` to disable all broker defaults |
 
-Embedded engines leave DLQ retention disabled unless the application passes
-`WithDLQRetention(maxAge, maxCount, maxBytes)`.
+Embedded engines leave engine-wide DLQ retention defaults disabled unless the
+application passes `WithDLQRetention(maxAge, maxCount, maxBytes)`. A positive
+per-queue bound still enables that dimension for its queue.
 
 Each queue can override the engine or broker defaults through `QueueConfig`, the
 wire `config` object, or `mqlite create-queue`:
@@ -78,12 +84,14 @@ deadline the subscription immediately leaves topic fan-out and its data plane.
 Physical cleanup follows in the background. Explicit deletion remains the normal
 completion path; TTL is a forgotten-cleanup backstop.
 
-An accepted deletion first commits the resource as `deleting`. The name stays
-reserved while restart-safe cleanup removes its rows. The foreground request
-removes at most 1,000 rows and targets about 8 MiB. Each continuation pass removes
-at most 4,096 physical rows and targets about 8 MiB. Its ordinary path visits at
-most 32 local resources with retained state, or one such resource on remote
-Turso/libSQL. A separate set-based path can finalize up to 512 empty subscriptions
+The accepting transaction changes the resource to `deleting` and starts bounded
+cleanup. If that cleanup finishes, the same commit removes the resource and the
+call returns `deleted`; otherwise the committed `deleting` marker reserves the
+name while restart-safe cleanup removes its rows. The foreground request removes
+at most 1,000 rows and targets about 8 MiB. Each continuation pass removes
+at most 4,096 physical rows and targets about 8 MiB. Its ordinary per-resource
+path visits at most 32 local resources, or one such resource on remote Turso/libSQL.
+A separate set-based path can finalize up to 512 empty subscriptions
 without consuming that 32-or-1 resource-count allowance; their mapping and backing
 queue rows still consume the shared row budget. One oversized row may exceed the
 byte target so cleanup can still make progress.
@@ -110,11 +118,12 @@ Deleting a row makes SQLite pages reusable immediately; it does not promise that
 the database or WAL file will shrink at once. New local databases use
 `auto_vacuum=INCREMENTAL`.
 
-The background reclaimer runs every 60 seconds. Once at least 256 pages are free,
-it checkpoints and returns at most 256 pages per pass to the operating system.
-One-off large deletions can therefore need several passes. WAL size can also grow
-while a reader holds a snapshot, then shrink after checkpointing when that reader
-finishes.
+On `main`, the background reclaimer runs every 60 seconds. Once at least 256 pages
+are free, it checkpoints and returns at most 256 pages per pass to the operating
+system. One-off large deletions can therefore need several passes. v0.3.2 uses the
+same interval and threshold but attempts to drain the current freelist in one pass;
+it does not have `main`'s 256-page work cap. WAL size can also grow while a reader
+holds a snapshot, then shrink after checkpointing when that reader finishes.
 
 Operator commands provide explicit reclamation:
 

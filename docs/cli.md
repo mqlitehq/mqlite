@@ -25,7 +25,7 @@ mqlite <command> [flags] [args]
 | `MQLITE_DIAGNOSTIC_LOG` | optional private rotating JSONL failure/recovery log path for `serve`; parent must exist; use persistent storage |
 | `MQLITE_SYNC` | `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` durability (embedded/serve). An unrecognized value is **rejected at startup** — a typo never silently downgrades to `NORMAL`. |
 | `MQLITE_MAX_SUBSCRIPTIONS` | active plus deleting subscription capacity (default 10,000; embedded/serve and direct embedded CLI commands) |
-| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous broker DLQ retention targets (`serve`); on by default, disable with `MQLITE_DLQ_RETENTION=off` |
+| `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous broker DLQ retention targets (`serve`); broker-wide defaults are on, and `MQLITE_DLQ_RETENTION=off` disables those defaults while positive per-queue bounds still apply |
 
 The DB string is **never compiled in** — it comes from the environment. The endpoint comes
 from the environment too, or from `--endpoint` (below), which overrides it.
@@ -256,8 +256,8 @@ echo '{"id":2}' | mqlite send orders -
 
 ### `receive <queue>` — consume (Peek-Lock)
 By default it receives and auto-Completes. Use `--no-ack` to leave messages locked and
-print each `lock-token` (settle them later — see settlement commands below), or `--delete`
-for at-most-once.
+print each `lock-token` (settle them later — see settlement commands below), or
+`--delete` for at-most-once broker removal.
 ```bash
 mqlite receive orders --max 10 --wait 5s
 ```
@@ -266,7 +266,7 @@ mqlite receive orders --max 10 --wait 5s
 | `--max` | 1 | max messages |
 | `--wait` | 0 | long-poll wait (e.g. `5s`) |
 | `--no-ack` | false | leave messages locked (don't Complete) |
-| `--delete` | false | receive-and-delete (at-most-once, no lock) |
+| `--delete` | false | receive-and-delete (at-most-once broker removal, no lock) |
 
 **Auto-ack never acknowledges output you can't see.** A message is only Completed *after* its
 body is written to stdout successfully. If the write fails (broken pipe) the message is left

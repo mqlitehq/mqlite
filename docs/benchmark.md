@@ -28,7 +28,7 @@ do not establish a safe backlog threshold or the current release image size.
 │             │ 38 MB @ 50k msgs queued  │ validate current peak memory first   │
 │             │                          │ no universal backlog threshold        │
 │ disk        │ ~0.4 KB / 256 B message  │ 1 GB volume  (~1.1M planned msgs)     │
-│             │ + ~4 MB WAL (constant)   │   size = backlog × 0.6 KB × 1.5       │
+│             │ + ~4 MB WAL in this run  │   size = backlog × 0.6 KB × 1.5       │
 │ vCPU        │ tiny/op; 1000s/s batched │ 1 shared vCPU in the measured setup   │
 │ image       │ 10.9 MiB static binary   │ distroless/scratch ≈ 15 MB image,     │
 │             │   (CGO-free)             │   cold start < 1 s (scale-to-zero ok) │
@@ -41,9 +41,11 @@ not horizontally scale several machines onto the same SQLite file. Turso/libSQL
 provides managed remote storage, but it does not make overlapping brokers safe; see
 [turso.md](turso.md).
 
-Disk is sized by **peak backlog depth**, not lifetime throughput (`Complete`/`Purge`
-delete rows); files plateau at the high-water mark, and a background `incremental_vacuum`
-returns freed pages to the OS over time (see §3):
+Peak backlog depth is a primary disk-sizing input, rather than lifetime throughput
+(`Complete`/`Purge` delete rows). Also budget for WAL growth, SQLite page and index
+overhead, reclamation lag, readers that delay checkpoints, and backups. Background
+`incremental_vacuum` returns freed pages to the OS over time (see §3), but does not
+make the backlog estimate a hard file-size ceiling:
 
 | backlog depth (256 B msgs) | DB on disk | Fly volume |
 |--------------:|-----------:|:-----------|
@@ -76,13 +78,12 @@ BENCH_DUR=3s ./test/bench/run-bench.sh          # → test/bench/out/results.jso
 
 # opt-in queue create/send/force-delete/converge churn
 BENCH_ONLY=lifecycle_churn BENCH_DUR=2s ./test/bench/run-bench.sh
-
-# cloud — Fly remote-builds test/bench/Dockerfile, runs once on a 256MB machine
-cd mqlite && FLY_API_TOKEN=... flyctl deploy . \
-  --config ../deploy-fly/bench.toml --dockerfile test/bench/Dockerfile \
-  --app mqlite-bench --ha=false --wait-timeout 30 --yes
-flyctl logs --app mqlite-bench          # [done] lines + tables ; then destroy the app
 ```
+
+The historical Fly run used an environment-specific deployment file that is not
+part of this repository. Reproduce cloud measurements by deploying the committed
+`test/bench/Dockerfile` with your own explicit machine, region, volume and cleanup
+configuration, and record those inputs with the result.
 
 Each scenario runs `dur` seconds (here 3s), then an **idle + GC + FreeOSMemory**
 phase so we can measure what is *reclaimed*. A 200 ms background sampler records
@@ -107,10 +108,11 @@ convergence latency, peak payload, and DB/WAL size. Here `ops/s` means fully
 converged queue lifecycles per second; the generic latency columns measure the
 initial delete acknowledgement.
 
-A 2-second native force-deletion smoke run on an Apple M1 Pro completed
-640 queue lifecycles (10 cycles) at about 312 lifecycles/s. All 640 deletions were
+A final 2-second native force-deletion smoke run on an Apple M1 Pro completed
+640 queue lifecycles (10 cycles) at 289.17 lifecycles/s. All 640 deletions were
 accepted, 40 required background-style cleanup, convergence p99/max was
-42.9/43.0 ms, and DB+WAL peaked at 5.7 MiB before ending at 0.8 MiB. This short run
+67.519/85.309 ms, and the database peaked at 5.528 MiB before ending at
+0.480 MiB with a zero-byte WAL. This short run
 is a regression signal, not a deployment capacity claim; reproduce it on the target
 CPU, filesystem, durability mode, message sizes, and remote backend when applicable.
 
@@ -123,12 +125,12 @@ go test ./engine -run '^$' \
   -benchmem -count=5
 ```
 
-On an Apple M1 Pro with Go 1.26.9, one recorded run measured
-382.402 µs per create/delete lifecycle with 100 retained subscriptions and
-389.064 µs with 10,000 retained subscriptions (1.017×). A 100-item page with
-an exact total measured 0.660 ms at 1,000 subscriptions and 5.245 ms at 10,000.
-A smoke with 5,000 queued messages acknowledged force deletion in 4.100 ms and
-converged in one 30.707 ms maintenance pass. These control-plane measurements
+On an Apple M1 Pro with Go 1.26.9, the final recorded medians were
+323.955 µs per create/delete lifecycle with 100 retained subscriptions and
+328.866 µs with 10,000 retained subscriptions (1.015×). A 100-item page with
+an exact total measured 0.652 ms at 1,000 subscriptions and 5.168 ms at 10,000.
+A smoke with 5,000 queued messages acknowledged force deletion in 3.203 ms and
+converged in one 29.367 ms maintenance pass. These control-plane measurements
 found no strong lifecycle regression, but the exact count scales with inventory;
 do not treat the 10,000-subscription safety ceiling as a low-latency guarantee.
 
@@ -142,17 +144,18 @@ go test ./engine -run '^$' \
 ```
 
 On the same Apple M1 Pro with Go 1.26.9, seven alternating one-second rounds
-compared the fixed-lifetime implementation with the same suite before TTL support. Median latency
-changed by +6.52% for `SendOne`, +0.67% for `SendBatch64`, +1.14% for 32-way
-topic fan-out, +0.31% for 256-way fan-out, and -0.28% for receive plus complete.
-All remained below the 10% investigation threshold. The 32-way fixed-lifetime
-fan-out median was 1.456 ms; it added 32 allocations and 257 bytes per publish
-relative to permanent subscriptions in the same run, with no measured latency
-penalty beyond host variation.
+compared the fixed-lifetime implementation with the same suite before TTL support.
+Median latency changed by +2.50% for `SendOne`, -0.43% for `SendBatch64`, -3.32%
+for 32-way topic fan-out, -0.45% for 256-way fan-out, and +0.86% for receive plus
+complete. All remained below the 10% investigation threshold. In a separate
+same-binary comparison, 32-way fixed-lifetime fan-out had a 1.512 ms median,
+3.62% above permanent subscriptions by independent medians; it added 32
+allocations and 255 bytes per publish. Shared-host variation means neither the
+small gains nor this small cost is an optimization or SLA claim.
 
-An indexed expiry scan over 10,000 future deadlines took 63.468 µs per no-work
-pass (15,756 passes/s). Transitioning a full 1,000-subscription due batch took
-3.562 ms (280,749 subscriptions/s). A controlled burst created 10,000
+An indexed expiry scan over 10,000 future deadlines took 56.808 µs per no-work
+pass (17,603 passes/s). Transitioning a full 1,000-subscription due batch took
+3.306 ms (302,459 subscriptions/s). A controlled burst created 10,000
 subscriptions with one 5,000-message backlog, then advanced them to one common
 deadline. Data-plane fencing was immediate; 19 manually driven bounded passes
 discarded the backlog and removed all metadata in 338 ms. With normal background
@@ -163,8 +166,8 @@ This is the expected bounded tail-latency cost of many simultaneous expirations,
 not a capacity promise; stagger deadlines and load-test the target backend.
 
 Adding required lifecycle timestamps to 100-item subscription pages changed the
-1,000-item inventory median from 0.658 ms to 0.717 ms (+8.87%) and the 10,000-item
-median from 5.187 ms to 5.376 ms (+3.65%). Page memory fell from about 39 KB to
+1,000-item inventory median from 0.658 ms to 0.712 ms (+8.21%) and the 10,000-item
+median from 5.187 ms to 5.325 ms (+2.66%). Page memory fell from about 39 KB to
 30 KB after exact preallocation; allocation counts stayed effectively flat.
 
 ## Observation cost under a deep current backlog
@@ -316,9 +319,11 @@ throttled core** — read the two columns as "engine character" vs "cheapest rea
 | props_p4 | NORMAL | 15,909 | 1,000 | 10,577 | 10,493 |
 | props_batch64 | NORMAL | 24,161 | **6,700** | 1,641 | 1,622 |
 
-**Write amplification is platform-independent** — every cloud `wB/op` is within ~3 %
-of local. It's a property of SQLite + WAL (a 256 B message costs ~9.7 KB written
-single, ~1.1 KB batched), not of the host. That makes capacity planning portable.
+**Write amplification was similar in these two runs** — every cloud `wB/op` is
+within 5% of its local counterpart. The samples suggest that SQLite + WAL dominate
+this cost (a 256 B message was about 9.7 KB written singly and 1.1 KB batched), but
+two environments do not establish a platform-independent constant. Measure the
+target filesystem and workload before capacity planning.
 
 **On a single fractional core, concurrency *hurts*** — `produce_p1` 4.0k >
 `produce_p4` 567 > `produce_p8` 322. With `GOMAXPROCS=1` there's no parallelism to
@@ -399,9 +404,11 @@ the KV map becomes the dominant work.
 | 4 KB | 12,547 | 454 | 22,205 | 4,740 |
 | 16 KB | 7,988 | 259 | 46,939 | 17,091 |
 
-On-disk storage scales ~linearly with body size plus a small fixed row+index overhead
-(~150–250 B). Throughput is commit-bound up to ~256 B, then byte-bound for large
-bodies. Default body cap is 1 MiB (`MaxMessageBytes`).
+On-disk storage was roughly linear with body size in this sweep. The measured
+difference between body size and `fileB/msg` ranged from 153 to 707 bytes, so the
+table does not support one fixed row/index-overhead constant. Throughput was
+commit-bound up to about 256 B and then increasingly byte-bound. Default body cap
+is 1 MiB (`MaxMessageBytes`).
 
 ## 6 · Load ramp & consumer churn (local)
 
@@ -419,8 +426,8 @@ The Fly `shared-cpu-1x` is `GOMAXPROCS=1` with CPU-steal. Versus the 12-core loc
 1. **Memory stayed low in the measured scenarios.** Peak RSS was 27–29 MB for
    the cloud scenarios in §2, with reclamation after load. This does not establish
    the memory required by other workloads or current releases.
-2. **Write amplification: no change.** Within 3 % of local everywhere — portable
-   capacity planning.
+2. **Write amplification was close in these two runs.** Cloud values were within
+   5% of local; validate that relationship on the target storage stack.
 3. **Throughput: core-bound, and concurrency backfires.** Single-send multi-producer
    collapses (567/s at p4, 322/s at p8) because there's no second core. **Batch, and
    throughput recovers to thousands/s** (6.0–6.7k).
@@ -428,9 +435,9 @@ The Fly `shared-cpu-1x` is `GOMAXPROCS=1` with CPU-steal. Versus the 12-core loc
    multi-goroutine scenarios (CPU-steal stalls); single-producer scenarios keep p99
    under ~5 ms.
 
-**The bottom line for the cheapest box:** **with batching, ~6k msg/s sustained** on a
-shared-cpu-1x; **without batching (concurrent single sends), only hundreds/s.** The
-"thousands per second" figure holds *only when* the client batches.
+In this short historical sample, batching reached about 6k msg/s on a
+shared-cpu-1x, while concurrent single sends reached only hundreds/s. These are
+workload observations, not a sustained-capacity or SLA claim.
 
 ## Tuning knobs
 
@@ -440,7 +447,7 @@ mqlite ships sensible defaults; most deployments change nothing. In rough order 
 |---|---|---|
 | **batch size** (`messages:[…]`) | — | the biggest lever — ~9× less write amplification, ~2× throughput. Batch whenever you can. |
 | **`MQLITE_SYNC`** | `NORMAL` | `FULL` only if a power cut losing the last few commits is unacceptable; it costs ~11–18× on single sends, so pair it with batching. |
-| `wal_autocheckpoint` | 1000 pages (~4 MB) | matches the observed WAL plateau; raise for fewer checkpoints at the cost of a larger WAL + slower crash recovery. |
+| `wal_autocheckpoint` | 1000 pages (~4 MB) | matched the no-long-reader historical baseline; observation snapshots and other readers can cause a larger transient WAL. Raise only after measuring the checkpoint and recovery trade-off. |
 | `cache_size` | ~2 MB | the working set (queue heads + indexes) is small; raise only after profiling shows cache pressure under deep backlogs — it costs RAM on a 256 MB machine. |
 | `mmap_size` | off | `modernc.org/sqlite` is pure-Go; don't assume C-SQLite mmap gains — measure first. |
 | writer/provider pool | local writer 1 / remote provider 4 | **don't change** — the local writer pool stays at one for atomic claims; local files also have one read-only observation connection. The remote pool is scoped to one broker and Turso serializes commits. |
@@ -456,12 +463,14 @@ contention uses the bounded retry policy described in [turso.md](turso.md).
    and ramp-down tests; validate the current workload separately.
 2. **Batch to go fast** — ~9× less write amplification, and on a single core the
    difference between *hundreds/s* and *thousands/s*.
-3. **Write amplification is a portable constant** (~9.7 KB/op single, ~1.1 KB batched)
-   — same on arm64 local and amd64 cloud.
+3. **Write amplification was similar in two historical environments** (~9.7 KB/op
+   single, ~1.1 KB batched, with local/cloud pairs within 5%); it is not a universal
+   platform constant.
 4. **Single-writer model**: more producers ≠ more write throughput; on one core they
    make it *worse*. Prefer one batching producer.
-5. **Files plateau at the peak backlog**, then a background `incremental_vacuum` returns
-   freed pages to the OS over time; size disk for the peak, not the average.
+5. **Peak backlog is a primary sizing input.** Add headroom for WAL, page/index
+   overhead, fragmentation, reclamation lag, long readers and backups; background
+   `incremental_vacuum` returns eligible free pages over time.
 6. **NORMAL vs FULL** is an ~11× durability dial (local); pick per host failure model.
 7. **Properties are affordable**; large bodies are byte-bound and storage-linear.
 

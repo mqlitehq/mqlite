@@ -849,8 +849,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "c03dde2b018618a787e65c5c49546036b78305b61a7db61732bc21bd0ed65d32",
-		"concepts.html": "9481d44add7e2cfb6144cd41f5e98634d06e4c23190e0d27ec9e7c092d3a5314",
+		"concepts.md":   "b83540a78187f051de01cb5f52a6da352b2fd3a148f57b61cca7c7a8f0de548c",
+		"concepts.html": "8e9027873481e3f908fac5392fb944b51ffe756a89bb7dfd907ac3a45f574d62",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {

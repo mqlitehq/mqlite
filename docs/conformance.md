@@ -7,7 +7,8 @@ break a **MUST** here, it is a behavior change, not a refactor.
 
 Default Peek-Lock delivery is **at-least-once**: redelivery is possible, so
 handlers must be idempotent. Receive-and-delete is the caller's explicit
-at-most-once path and removes a message before returning it. Other documented
+at-most-once broker-removal path and removes a message before returning it; the
+same receive attempt ID can replay its saved response. Other documented
 discard paths include message TTL configured to discard, DLQ retention, forced
 resource deletion, and fixed subscription expiry. (§1.7, §3, §8, §14)
 
@@ -318,11 +319,13 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **12.3 Subscription lifecycle.** Deletion MUST select the exact `(topic,name)`
   pair. By default it MUST reject every retained message state with
   `ErrSubscriptionNotEmpty`; force is durable authorization to discard all states.
-  Acceptance atomically marks the backing queue `deleting`, excludes it from
-  fan-out and the data plane, and preserves the mapping and name until bounded
-  cleanup removes the queue and mapping in the same transaction. Restart MUST resume accepted
-  cleanup without another force authorization. The last active subscription's
-  retirement makes its implicit topic unavailable immediately.
+  Acceptance MUST atomically exclude the backing queue from fan-out and the data
+  plane and start bounded cleanup. If that cleanup finishes in the accepting
+  transaction, it MUST remove the queue and mapping and return `deleted`. Otherwise
+  it MUST commit a `deleting` marker that preserves the mapping and name until a
+  later transaction removes both. Restart MUST resume accepted pending cleanup
+  without another force authorization. The last active subscription's retirement
+  makes its implicit topic unavailable immediately.
 - **12.4 Bounded inventory.** The compatibility `ListSubscriptions` operation MUST
   return every active subscription in `(topic,name)` order. The paged operation
   MUST use the same order, default to 100, reject limits above 1,000, return an

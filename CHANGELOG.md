@@ -21,9 +21,11 @@ upgrade notes before replacing a broker.
 > pin production deployments to v0.3.2. Schema 6 belonged only to intermediate
 > unreleased lifecycle builds and is refused as well; it was never a tagged release.
 >
-> The v0.3.3 release artifacts remain withdrawn. `main` contains a retraction
-> directive, but Go module tools will discover it only after a later version
-> containing the directive is tagged. Its public queue `Generation` contract was
+> The v0.3.3 release remains withdrawn and unsupported. Its public assets and exact
+> image remain available for forensic or compatibility inspection and must not be
+> deployed. `main` contains a retraction directive, but Go module tools will
+> discover it only after a later version containing the directive is tagged. Its
+> public queue `Generation` contract was
 > removed; this unreleased line addresses resources by name and requires one owner
 > to serialize deletion with same-name recreation. Upgrade the broker, SDK, CLI,
 > MCP and console together when adopting the corrected deletion APIs.
@@ -152,13 +154,13 @@ upgrade notes before replacing a broker.
 ### Delete and inventory subscriptions safely (MQLITE-127)
 
 - Add empty-only subscription deletion and an explicit `force` option that
-  durably authorizes discarding every retained message state. An accepted
-  subscription becomes `deleting` in the same transaction, immediately leaves
-  topic fan-out and the data plane, keeps its globally unique name reserved, and
-  finishes through the same bounded, restart-safe cleanup worker as a queue.
-  The topic/name pair must match exactly. The final backing-queue removal also
-  removes its roster mapping. The implicit topic therefore becomes unavailable
-  as soon as its last active subscription is retired.
+  durably authorizes discarding every retained message state. The accepting
+  transaction immediately removes the subscription from topic fan-out and the
+  data plane and starts bounded cleanup. It returns `deleted` if that cleanup
+  removes the backing queue and mapping in the same commit; otherwise a durable
+  `deleting` marker reserves the globally unique name while the restart-safe
+  worker continues. The topic/name pair must match exactly. The implicit topic
+  therefore becomes unavailable as soon as its last active subscription is retired.
 - Keep the existing `ListSubscriptions` API as a complete, active-only inventory
   for compatibility, including its three-field Go `SubscriptionInfo`,
   `wire.SubscriptionJSON`, and JSON shape. Add `ListSubscriptionsPage` with
@@ -193,9 +195,10 @@ upgrade notes before replacing a broker.
 - Keep queue deletion empty-only by default. `force=true` is an explicit,
   persisted authorization to discard every retained message state plus queue-owned
   deduplication, settlement-receipt and receive-attempt records.
-- Retire an accepted queue durably as `deleting` before cleanup. Queue work is
-  immediately rejected without taking effect, its name remains reserved, and
-  `ListQueues` reports the state until bounded cleanup removes the row. Cleanup
+- Transition an accepted queue to `deleting` and start bounded cleanup in one
+  transaction. If cleanup finishes, that commit removes the queue; otherwise the
+  committed marker rejects queue work, reserves the name, and remains visible in
+  `ListQueues` until continuation cleanup removes the row. Cleanup
   resumes after a restart; one foreground request removes at most 1,000 physical
   rows/about 8 MiB. Accepted pending deletes wake an event-driven worker, whose
   continuation passes are one second apart and each globally caps cleanup at 4,096
@@ -237,8 +240,9 @@ upgrade notes before replacing a broker.
   Queue identity remains name-only; MQLITE-126 later adds a force-only deletion
   option without bringing lifetime identity into data-plane requests.
 - This is an intentional breaking correction for v0.3.3 clients. The v0.3.3
-  artifacts are withdrawn and `main` carries a pending retraction directive;
-  v0.3.2 clients are unaffected. This correction itself kept
+  release is withdrawn and unsupported; its public artifacts remain available for
+  forensic or compatibility inspection and must not be deployed. `main` carries a
+  pending retraction directive; v0.3.2 clients are unaffected. This correction itself kept
   schema token **5**; MQLITE-126 advanced the v0.4.0 development line to token 6,
   and MQLITE-128 advanced the unreleased candidate schema to token 7.
 - Make the name-reuse boundary explicit. Queue deletion and same-name recreation
