@@ -50,7 +50,7 @@ jobs:
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
-          MQLITE_TURSO_SOAK_CONFIRM_TEST_DB: '1'
+          MQLITE_TEST_DB_RESET_CONFIRM: '1'
           MQLITE_TURSO_SOAK_DURATION: ${{ inputs.duration_minutes }}m
           MQLITE_TURSO_SOAK_OUTPUT: ${{ runner.temp }}/turso-performance-soak
         run: |

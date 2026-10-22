@@ -28,6 +28,7 @@ jobs:
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+          MQLITE_TEST_DB_RESET_CONFIRM: '1'
         run: |
           if [ -z "$MQLITE_TEST_DB" ]; then
             echo "MQLITE_TEST_DB secret not set — skipping remote integration."

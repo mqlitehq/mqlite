@@ -125,10 +125,13 @@ hermetic (always, in CI)   engine/storage_test.go    conn-error retry classifier
 live  (creds-gated, nightly) engine/turso_test.go     full lifecycle vs real Turso
 ```
 
-Run the live suite against your own DB:
+Run the live suite only against a dedicated, disposable test database. `TestMain`
+drops every MQLite-managed table before the selected tests begin, including when
+`-run` selects one test, so the reset requires an explicit confirmation:
 
 ```sh
 MQLITE_TEST_DB=libsql://<db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
+  MQLITE_TEST_DB_RESET_CONFIRM=1 \
   go test ./engine -run TestTurso -v
 ```
 

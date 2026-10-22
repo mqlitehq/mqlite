@@ -55,9 +55,14 @@ go test ./engine -run TestClaimDeepBacklogBounded -v  # a single test (package +
 go test ./engine -run 'TestClaim/<subtest>' -v        # a single table-driven subtest
 
 # live remote round-trip (otherwise skipped); also runs in the Turso nightly workflow:
-MQLITE_TEST_DB=libsql://<db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
+MQLITE_TEST_DB=libsql://<dedicated-test-db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
+  MQLITE_TEST_DB_RESET_CONFIRM=1 \
   go test ./engine -run TestTurso -v
 ```
+
+The live Turso suite is destructive: `TestMain` drops every MQLite-managed table
+before the selected tests run. Use only a dedicated disposable test database and
+keep the explicit reset confirmation in every manual or automated invocation.
 
 Before committing, match CI locally: `go build ./...` · `go vet ./...` ·
 `gofmt -l .` (must be empty) · `go mod tidy` (no diff) · `go test -race ./...` ·

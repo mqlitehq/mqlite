@@ -10,6 +10,7 @@ import (
 )
 
 const tursoSoakVerificationHost = "mqlite-verify-jiba.aws-ap-northeast-1.turso.io"
+const remoteTestResetConfirmEnv = "MQLITE_TEST_DB_RESET_CONFIRM"
 
 // TestMain gives the remote Turso suite a clean slate. mqlite's schema guard refuses
 // a database whose schema token differs from this build's, so when MQLITE_TEST_DB is
@@ -18,17 +19,48 @@ const tursoSoakVerificationHost = "mqlite-verify-jiba.aws-ap-northeast-1.turso.i
 // tests run unchanged.
 func TestMain(m *testing.M) {
 	if dsn := os.Getenv("MQLITE_TEST_DB"); dsn != "" {
-		// The soak opt-in is allowed to erase only the dedicated verification DB.
-		// This check must precede resetRemoteTestDB: checking inside the test would
-		// be too late because TestMain resets the remote schema before m.Run.
-		if os.Getenv("MQLITE_TURSO_SOAK_DURATION") != "" &&
-			(os.Getenv(tursoSoakConfirmEnv) != "1" || !approvedTursoSoakDSN(dsn)) {
-			fmt.Fprintln(os.Stderr, "Turso soak refused: dedicated verification database acknowledgement or host check failed")
+		// This check must precede resetRemoteTestDB: checking inside a test would be
+		// too late because TestMain resets the remote schema before m.Run.
+		if err := validateRemoteTestReset(dsn, os.Getenv(remoteTestResetConfirmEnv), os.Getenv(tursoSoakDurationEnv)); err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
 		resetRemoteTestDB(dsn, os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"))
 	}
 	os.Exit(m.Run())
+}
+
+func validateRemoteTestReset(dsn, confirmation, soakDuration string) error {
+	if confirmation != "1" {
+		return fmt.Errorf("remote Turso test reset refused: %s=1 is required because the suite drops all MQLite tables", remoteTestResetConfirmEnv)
+	}
+	if soakDuration != "" && !approvedTursoSoakDSN(dsn) {
+		return fmt.Errorf("Turso soak refused: MQLITE_TEST_DB is not the dedicated verification database")
+	}
+	return nil
+}
+
+func TestRemoteTestResetGate(t *testing.T) {
+	approved := "libsql://" + tursoSoakVerificationHost
+	for _, tc := range []struct {
+		name         string
+		dsn          string
+		confirmation string
+		soakDuration string
+		wantErr      bool
+	}{
+		{name: "ordinary suite without confirmation", dsn: approved, wantErr: true},
+		{name: "ordinary suite explicitly confirmed", dsn: "libsql://owned-test-db.turso.io", confirmation: "1"},
+		{name: "soak on wrong host", dsn: "libsql://owned-test-db.turso.io", confirmation: "1", soakDuration: "2m", wantErr: true},
+		{name: "soak on verification host", dsn: approved, confirmation: "1", soakDuration: "2m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRemoteTestReset(tc.dsn, tc.confirmation, tc.soakDuration)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateRemoteTestReset() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
 }
 
 func approvedTursoSoakDSN(dsn string) bool {
