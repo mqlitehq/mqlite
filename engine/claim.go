@@ -33,26 +33,50 @@ func claimSQLFor(ordering OrderingMode) string {
 	return claimSQL
 }
 
-// claimSQL atomically locks the eligible head message (design §5.2 + §11.1).
-// Only state='active' is claimable — this keeps the hot path on the partial
-// idx_msg_active(queue,id) index (O(log n) even with a deep backlog). Expired
-// locks are returned to 'active' by the reaper (§8.8), so visibility-timeout
-// redelivery happens within the reaper interval rather than on the claim path.
-// group_id IS NULL  -> the message is its own group (never group-blocked);
-// otherwise the group head is released only when no earlier same-group message
-// is still locked/deferred/scheduled (in-order, FIFO-per-group).
-// The locked probe deliberately ignores locked_until (MQLITE-56): an expired
-// lock keeps blocking its group until the reaper resettles the head, so a
-// consumer timeout stalls the group for ≤ the reaper interval instead of
-// letting successors overtake the head (out-of-order delivery) — SQS FIFO
-// behaves the same way. A slow-but-alive consumer should Renew instead.
-const claimSQL = `
+// firstClaimSQLFor picks the write-first claim used at the start of a Receive
+// transaction. Besides message eligibility, it fences the cached queue fields
+// that determine claim ordering, lease length and lifetime. An AttemptID adds a
+// live-record guard so a replay cannot lock another message before it is
+// recognized by the zero-row classification path.
+func firstClaimSQLFor(ordering OrderingMode, withAttempt bool) string {
+	if ordering == OrderStrictFIFO {
+		if withAttempt {
+			return firstClaimStrictAttemptSQL
+		}
+		return firstClaimStrictSQL
+	}
+	if withAttempt {
+		return firstClaimAttemptSQL
+	}
+	return firstClaimSQL
+}
+
+const claimUpdatePrefix = `
 UPDATE messages
    SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
- WHERE id = (
+ WHERE id = (`
+
+const claimUnfencedCandidate = `
    SELECT m.id FROM messages m
-    WHERE m.queue=? AND m.state='active'
-      AND m.visible_at<=? AND (m.expires_at=0 OR m.expires_at>?)
+    WHERE m.queue=?`
+
+const claimFencedCandidate = `
+   SELECT m.id FROM queues q
+   JOIN messages m ON m.queue=q.name
+    WHERE q.name=? AND q.lifecycle_state='active'
+      AND (q.expires_at=0 OR q.expires_at>?)
+      AND q.lock_duration_ms=? AND q.ordering_mode=? AND q.expires_at=?`
+
+const claimAttemptGuard = `
+      AND NOT EXISTS (
+          SELECT 1 FROM receive_attempts ra
+           WHERE ra.queue=q.name AND ra.attempt_id=? AND ra.expires_at>?)`
+
+const claimMessageEligibility = `
+      AND m.state='active'
+      AND m.visible_at<=? AND (m.expires_at=0 OR m.expires_at>?)`
+
+const claimGroupHeadEligibility = `
       AND ( m.group_id IS NULL
          OR NOT (  -- MQLITE-22: one EXISTS per in-flight state, each a single
                    -- state= equality so SQLite seeks the covering index
@@ -71,27 +95,9 @@ UPDATE messages
                           AND b.state='scheduled' AND b.id < m.id )
            OR EXISTS ( SELECT 1 FROM messages b
                         WHERE b.queue=m.queue AND b.group_id=m.group_id
-                          AND b.state='locked' AND b.id < m.id ) ) )
-    ORDER BY m.id ASC LIMIT 1)
-RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
-          reply_to, subject, content_type, properties, enqueued_at, locked_until`
+                          AND b.state='locked' AND b.id < m.id ) ) )`
 
-// claimStrictSQL is the strict_fifo variant: identical to claimSQL except the
-// per-group head condition is replaced by a *global* head-of-line block — a
-// message is claimable only when no earlier id in the queue is still in flight
-// (locked/deferred/scheduled), regardless of group. The whole queue therefore
-// delivers strictly one-at-a-time in id order. Parameter layout is identical to
-// claimSQL (lockUntil, token, queue, now, now) so claimOneTx just swaps the
-// SQL string per the queue's ordering mode. Like claimSQL, the locked probe
-// ignores locked_until (MQLITE-56) so an expired lock never lets successors
-// overtake the head.
-const claimStrictSQL = `
-UPDATE messages
-   SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
- WHERE id = (
-   SELECT m.id FROM messages m
-    WHERE m.queue=? AND m.state='active'
-      AND m.visible_at<=? AND (m.expires_at=0 OR m.expires_at>?)
+const claimStrictHeadEligibility = `
       AND NOT (  -- MQLITE-22: one EXISTS per in-flight state (single state=
                  -- equality each) so each seeks an index instead of a backward
                  -- rowid scan: deferred -> idx_msg_deferred(queue,id),
@@ -106,10 +112,58 @@ UPDATE messages
                           AND b.state='scheduled' AND b.id < m.id )
            OR EXISTS ( SELECT 1 FROM messages b
                         WHERE b.queue=m.queue
-                          AND b.state='locked' AND b.id < m.id ) )
+                          AND b.state='locked' AND b.id < m.id ) )`
+
+const claimCandidateSuffix = `
     ORDER BY m.id ASC LIMIT 1)
 RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
           reply_to, subject, content_type, properties, enqueued_at, locked_until`
+
+// claimSQL atomically locks the eligible head message (design §5.2 + §11.1).
+// Only state='active' is claimable — this keeps the hot path on the partial
+// idx_msg_active(queue,id) index (O(log n) even with a deep backlog). Expired
+// locks are returned to 'active' by the reaper (§8.8), so visibility-timeout
+// redelivery happens within the reaper interval rather than on the claim path.
+// group_id IS NULL  -> the message is its own group (never group-blocked);
+// otherwise the group head is released only when no earlier same-group message
+// is still locked/deferred/scheduled (in-order, FIFO-per-group).
+// The locked probe deliberately ignores locked_until (MQLITE-56): an expired
+// lock keeps blocking its group until the reaper resettles the head, so a
+// consumer timeout stalls the group for ≤ the reaper interval instead of
+// letting successors overtake the head (out-of-order delivery) — SQS FIFO
+// behaves the same way. A slow-but-alive consumer should Renew instead.
+const claimSQL = claimUpdatePrefix + claimUnfencedCandidate + claimMessageEligibility +
+	claimGroupHeadEligibility + claimCandidateSuffix
+
+// claimStrictSQL is the strict_fifo variant: identical to claimSQL except the
+// per-group head condition is replaced by a *global* head-of-line block — a
+// message is claimable only when no earlier id in the queue is still in flight
+// (locked/deferred/scheduled), regardless of group. The whole queue therefore
+// delivers strictly one-at-a-time in id order. Parameter layout is identical to
+// claimSQL (lockUntil, token, queue, now, now) so claimOneTx just swaps the
+// SQL string per the queue's ordering mode. Like claimSQL, the locked probe
+// ignores locked_until (MQLITE-56) so an expired lock never lets successors
+// overtake the head.
+const claimStrictSQL = claimUpdatePrefix + claimUnfencedCandidate + claimMessageEligibility +
+	claimStrictHeadEligibility + claimCandidateSuffix
+
+// These variants begin a Receive transaction with a write. libSQL and SQLite
+// begin database/sql transactions as deferred transactions; reading queue
+// metadata first can therefore create a read snapshot that later fails to
+// upgrade when another writer commits. The UPDATE both acquires write intent and
+// proves that the cached claim configuration still names a live queue. A zero
+// row result is classified afterwards inside the now-write transaction.
+const firstClaimSQL = claimUpdatePrefix + claimFencedCandidate + claimMessageEligibility +
+	claimGroupHeadEligibility + claimCandidateSuffix
+
+const firstClaimStrictSQL = claimUpdatePrefix + claimFencedCandidate + claimMessageEligibility +
+	claimStrictHeadEligibility + claimCandidateSuffix
+
+const firstClaimAttemptSQL = claimUpdatePrefix + claimFencedCandidate + claimAttemptGuard +
+	claimMessageEligibility + claimGroupHeadEligibility + claimCandidateSuffix
+
+const firstClaimStrictAttemptSQL = claimUpdatePrefix + claimFencedCandidate + claimAttemptGuard +
+	claimMessageEligibility + claimStrictHeadEligibility + claimCandidateSuffix
 
 // Receive claims up to opts.MaxMessages messages (Peek-Lock by default), with
 // long-poll up to opts.WaitMs (clamped to 20s, §11.3).

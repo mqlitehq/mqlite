@@ -781,7 +781,8 @@ type busyState struct {
 	failsLeft       int
 	args            [][]driver.NamedValue // the args of every attempt, in order
 	queries         []string
-	noEffect        bool // a fenced write matched no message; exercise receipt lookup instead
+	statements      []string // every query/exec, including lifecycle reads excluded from queries
+	noEffect        bool     // a fenced write matched no message; exercise receipt lookup instead
 	commitErr       error
 	execErr         error
 	onCommit        func()
@@ -829,6 +830,7 @@ func (c *busyConn) record(query string, args []driver.NamedValue) bool {
 }
 
 func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	c.st.statements = append(c.st.statements, query)
 	// Lifecycle guards read the current queue inside the mutation transaction.
 	// Keep that metadata probe outside the injected mutation failures so these
 	// tests still count retries of the time-sensitive statement itself.
@@ -882,6 +884,7 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 }
 
 func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	c.st.statements = append(c.st.statements, query)
 	if !c.record(query, args) {
 		return nil, errors.New("database is locked")
 	}
@@ -1131,6 +1134,48 @@ func TestAttemptReceiveReadsLifecycleMetadataOnce(t *testing.T) {
 	}
 	if state.queueReads != 1 {
 		t.Fatalf("attempt receive metadata reads=%d, want 1", state.queueReads)
+	}
+}
+
+func TestClaimTransactionStartsWithFencedUpdate(t *testing.T) {
+	for _, attemptID := range []string{"", "attempt"} {
+		name := "plain"
+		if attemptID != "" {
+			name = "attempt"
+		}
+		t.Run(name, func(t *testing.T) {
+			d, state := remoteDBFailingFirst(t, 0)
+			e := fakeRemoteEngine(d)
+			q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1000, ordering: OrderStandard}
+			msgs, err := e.claimRound(context.Background(), q, 1, PeekLock, attemptID)
+			if err != nil || len(msgs) != 0 {
+				t.Fatalf("claim=%v, %v", msgs, err)
+			}
+			if len(state.statements) < 2 {
+				t.Fatalf("statements=%v, want claim followed by zero-row classification", state.statements)
+			}
+			first := strings.Join(strings.Fields(state.statements[0]), " ")
+			for _, fragment := range []string{
+				"UPDATE messages", "FROM queues q JOIN messages m", "q.lifecycle_state='active'",
+				"(q.expires_at=0 OR q.expires_at>?)", "q.lock_duration_ms=?",
+				"q.ordering_mode=?", "q.expires_at=?",
+			} {
+				if !strings.Contains(first, fragment) {
+					t.Errorf("first claim statement lacks %q:\n%s", fragment, first)
+				}
+			}
+			if attemptID == "" && strings.Contains(first, "receive_attempts") {
+				t.Errorf("ordinary claim unexpectedly pays for AttemptID guard:\n%s", first)
+			}
+			if attemptID != "" && (!strings.Contains(first, "NOT EXISTS") ||
+				!strings.Contains(first, "receive_attempts") || !strings.Contains(first, "ra.expires_at>?")) {
+				t.Errorf("AttemptID claim lacks live replay guard:\n%s", first)
+			}
+			second := strings.Join(strings.Fields(state.statements[1]), " ")
+			if !strings.HasPrefix(second, "SELECT "+queueSelectColumns[:4]) || !strings.Contains(second, "FROM queues WHERE name=?") {
+				t.Fatalf("second statement must classify current queue after the write:\n%s", second)
+			}
+		})
 	}
 }
 
@@ -1668,7 +1713,7 @@ func TestClaimTimeRefreshesOnRemoteRetry(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			d, st := remoteDBFailingFirst(t, 2)
 			tick := int64(100_000)
-			q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1_000}
+			q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1_000, ordering: OrderStandard}
 			e := &Engine{db: d, qcache: map[string]queueRow{"q": q}, now: func() int64 {
 				tick += 2_000
 				return tick
@@ -1686,16 +1731,23 @@ func TestClaimTimeRefreshesOnRemoteRetry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(st.args) < 3 {
-				t.Fatalf("want two failed attempts and a successful one: %v", st.args)
+			var claimArgs [][]driver.NamedValue
+			for i, query := range st.queries {
+				if strings.HasPrefix(strings.TrimSpace(query), "UPDATE messages") {
+					claimArgs = append(claimArgs, st.args[i])
+				}
+			}
+			if len(claimArgs) != 3 {
+				t.Fatalf("claim attempts=%d, want two failures and one success: queries=%v args=%v", len(claimArgs), st.queries, st.args)
 			}
 			var previous int64
-			for i, args := range st.args {
-				now, ok := args[len(args)-1].Value.(int64)
+			for i, args := range claimArgs {
+				nowIndex := len(args) - 1
+				now, ok := args[nowIndex].Value.(int64)
 				if !ok || now <= previous {
 					t.Fatalf("attempt %d reused stale time: args=%v previous=%d", i, args, previous)
 				}
-				if len(args) == 5 && args[0].Value != now+q.lockDurationMs {
+				if path != "deferred" && args[0].Value != now+q.lockDurationMs {
 					t.Fatalf("claim lease and eligibility use different times: %v", args)
 				}
 				previous = now

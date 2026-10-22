@@ -34,18 +34,49 @@ func explainPlan(t *testing.T, e *Engine, q string, args ...any) string {
 	return b.String()
 }
 
-// TestClaimPlanPinning pins the two invariants that keep claim O(log n): the outer
-// seek uses idx_msg_active (r1 fix), and no inner head-of-line probe plans as the
-// `rowid<?` backward scan (the O(n^2) signature).
+// TestClaimPlanPinning pins the invariants that keep both the continuation and
+// write-first claim variants O(log n): the candidate seek uses idx_msg_active,
+// lifecycle and AttemptID fences use their primary keys, and no inner
+// head-of-line probe plans as the `rowid<?` backward scan (the O(n^2)
+// signature).
 func TestClaimPlanPinning(t *testing.T) {
 	e, _ := testEngine(t)
 	seedMixedBacklog(t, e) // a few queues × every in-flight state, ANALYZEd
 
-	dummy := []any{int64(0), "tok", "q2", int64(0), int64(0)} // lockUntil,token,queue,now,now
-	for _, tc := range []struct{ name, sql string }{{"group_fifo", claimSQL}, {"strict_fifo", claimStrictSQL}} {
-		plan := explainPlan(t, e, tc.sql, dummy...)
+	for _, tc := range []struct {
+		name                   string
+		sql                    string
+		args                   []any
+		wantQueue, wantAttempt bool
+		wantHeadOfLineIndexes  []string
+	}{
+		{"group_fifo/continuation", claimSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(0)}, false, false, []string{"idx_msg_group_inflight"}},
+		{"strict_fifo/continuation", claimStrictSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(0)}, false, false, []string{"idx_msg_deferred", "idx_msg_sched_head", "idx_msg_locked_head"}},
+		{"group_fifo/first", firstClaimSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "group_fifo", int64(0), int64(0), int64(0)}, true, false, []string{"idx_msg_group_inflight"}},
+		{"strict_fifo/first", firstClaimStrictSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "strict_fifo", int64(0), int64(0), int64(0)}, true, false, []string{"idx_msg_deferred", "idx_msg_sched_head", "idx_msg_locked_head"}},
+		{"group_fifo/attempt", firstClaimAttemptSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "group_fifo", int64(0), "attempt", int64(0), int64(0), int64(0)}, true, true, []string{"idx_msg_group_inflight"}},
+		{"strict_fifo/attempt", firstClaimStrictAttemptSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "strict_fifo", int64(0), "attempt", int64(0), int64(0), int64(0)}, true, true, []string{"idx_msg_deferred", "idx_msg_sched_head", "idx_msg_locked_head"}},
+	} {
+		plan := explainPlan(t, e, tc.sql, tc.args...)
 		if !strings.Contains(plan, "idx_msg_active") {
 			t.Errorf("%s: outer claim no longer seeks idx_msg_active (r1 regression):\n%s", tc.name, plan)
+		}
+		if tc.wantQueue && !strings.Contains(plan, "sqlite_autoindex_queues_1") {
+			t.Errorf("%s: lifecycle/config fence no longer seeks the queue primary key:\n%s", tc.name, plan)
+		}
+		if tc.wantAttempt && !strings.Contains(plan, "sqlite_autoindex_receive_attempts_1") {
+			t.Errorf("%s: AttemptID guard no longer seeks the receive-attempt primary key:\n%s", tc.name, plan)
+		}
+		for _, index := range tc.wantHeadOfLineIndexes {
+			if !strings.Contains(plan, index) {
+				t.Errorf("%s: head-of-line probe no longer seeks %s:\n%s", tc.name, index, plan)
+			}
 		}
 		if strings.Contains(plan, "rowid<") {
 			t.Errorf("%s: head-of-line probe scans rowid<? (O(n^2) regression):\n%s", tc.name, plan)

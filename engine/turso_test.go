@@ -735,7 +735,7 @@ func TestTursoConcurrent(t *testing.T) {
 			for {
 				ms, err := e.Receive(ctx, q, ReceiveOptions{MaxMessages: 1})
 				if err != nil {
-					cerrs <- err
+					cerrs <- fmt.Errorf("receive: %w", err)
 					return
 				}
 				if len(ms) == 0 {
@@ -745,7 +745,7 @@ func TestTursoConcurrent(t *testing.T) {
 				claimed[ms[0].SeqNumber]++
 				mu.Unlock()
 				if err := e.Complete(ctx, q, ms[0].SeqNumber, ms[0].LockToken); err != nil {
-					cerrs <- err
+					cerrs <- fmt.Errorf("complete: %w", err)
 					return
 				}
 			}

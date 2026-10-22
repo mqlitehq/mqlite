@@ -34,10 +34,11 @@ do not establish a safe backlog threshold or the current release image size.
 └─────────────┴──────────────────────────┴──────────────────────────────────────┘
 ```
 
-**Topology:** mqlite is **single-writer** (one process holds a file lock per DB), so run
-**one machine per volume** — do not horizontally scale several machines onto the same
-SQLite file. Need HA / multi-region? Point the broker at a Turso/libSQL DSN instead of a
-local file ([turso.md](turso.md)).
+**Topology:** mqlite is **single-writer**: run one broker or embedded `Engine` per
+database. A local process holds a file lock, so run one machine per volume and do
+not horizontally scale several machines onto the same SQLite file. Turso/libSQL
+provides managed remote storage, but it does not make overlapping brokers safe; see
+[turso.md](turso.md).
 
 Disk is sized by **peak backlog depth**, not lifetime throughput (`Complete`/`Purge`
 delete rows); files plateau at the high-water mark, and a background `incremental_vacuum`
@@ -465,7 +466,9 @@ mqlite ships sensible defaults; most deployments change nothing. In rough order 
 | `mmap_size` | off | `modernc.org/sqlite` is pure-Go; don't assume C-SQLite mmap gains — measure first. |
 | connection pool | local 1 / remote 4 | **don't change** — local=1 *is* the single writer (atomic claims); remote=4 is tuned for Turso's Hrana streams. |
 
-`busy_timeout=5000` and `temp_store=MEMORY` are already set by mqlite.
+`busy_timeout=5000` and `temp_store=MEMORY` are set on local modernc SQLite
+connections. They do not apply to remote Turso/libSQL connections, whose transient
+contention uses the bounded retry policy described in [turso.md](turso.md).
 
 ## Findings summary
 

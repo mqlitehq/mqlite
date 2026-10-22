@@ -53,7 +53,9 @@ wrapped, `database/sql` will not transparently retry it, so MQLite does:
 - **Writes retry only when the statement provably never applied** — `retryableWrite =
   remote && (ErrBadConn || isBusyErr)`. A closed stream (`ErrBadConn`) or a `SQLITE_BUSY`
   (lock never acquired) guarantees the write never ran, so replaying `exec` / the `inTx`
-  commit cannot double-apply. `busy_timeout(5000)` absorbs most `SQLITE_BUSY` first.
+  commit cannot double-apply. The retry is bounded by `maxConnAttempts`; exhaustion is
+  returned to the caller. The `busy_timeout(5000)` DSN pragma belongs to local modernc
+  SQLite connections and does not apply to Turso/libSQL.
 - **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
   other transport drop on a write/commit — the primary may have durably committed before
   the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead
@@ -77,6 +79,20 @@ The classifier that decides all this is unit-tested hermetically — see
 `engine/storage_test.go`, and the broker→SDK propagation in `TestFailOutcomeUnknown`
 (server) + `TestRemoteOutcomeUnknownPropagates` (root) — so the retry contract can't
 silently drift without creds.
+
+Ordinary and AttemptID `Receive` transactions issue their fenced
+`UPDATE messages ... RETURNING` before reading queue or receive-attempt metadata.
+This avoids upgrading a deferred read snapshot after another pooled connection has
+committed a write. The first update also verifies the queue lifecycle, absolute
+subscription expiry and claim-relevant cached configuration. If it returns no row,
+the same write transaction reads current metadata to distinguish an empty queue,
+deletion/expiry, stale configuration and an AttemptID replay. Batch continuation
+then uses the smaller indexed claim statement.
+
+This write-first shape addresses claim transactions in one broker or embedded
+`Engine`. Remote retries remain bounded, other operations may still surface
+`SQLITE_BUSY`, and the change does not make overlapping brokers against one database
+safe.
 
 ## Embedded replicas — evaluated, not adopted
 
