@@ -348,8 +348,19 @@ The maintenance snapshot is copied from process memory and does not issue an
 additional remote database query. `metadata.json`, `windows.jsonl`,
 `summary.json`, `summary.md` and the test log are retained for 14 days. Errors,
 body mismatches, accounting failures, final backlog or exact cleanup failures
-fail the run, while the evidence written before a failure remains uploadable. A
-single failed maintenance pass may recover on that task's next complete pass.
+fail the run, while the evidence written before a failure remains uploadable.
+
+A single non-final `Stats` or settlement-receipt-count sample that fails with the
+`connection` category is recorded as a gap and may recover at the next scheduled
+sample; the harness does not issue an extra query to force recovery. During that
+gap, the overall and per-lane backlog and settlement-receipt fields are `null`,
+and older values are not presented as final state. A second monitoring failure
+anywhere in the run, any other operation or error category (including a
+working-set invariant), or a failed final sample fails the soak. Each window
+records structured monitoring status, and the summary records the failed-sample
+count and recovery status.
+
+A single failed maintenance pass may recover on that task's next complete pass.
 Two consecutive failed passes, or one still unrecovered at the end of the run,
 fail the soak. Recovered failures remain visible in the cumulative maintenance
 counters and bounded diagnostic history. The final maintenance judgement is a
