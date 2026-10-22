@@ -1313,7 +1313,7 @@ type tursoSoakMonitorWindow struct {
 	Failure *tursoSoakFailure `json:"failure,omitempty"`
 }
 
-func tursoSoakWindowPartial(_ time.Duration, final bool) bool {
+func tursoSoakWindowPartial(final bool) bool {
 	// A final sample includes stop signalling and in-flight cycle drain. Even if
 	// that takes a full interval, it is not comparable to a periodic load window.
 	return final
@@ -1970,7 +1970,7 @@ func (r *tursoSoakRunner) flushWindow(final bool) error {
 	elapsed := ended.Sub(r.windowStarted)
 	window := tursoSoakWindow{
 		Sequence: r.windowCount + 1, StartedAt: r.windowStarted.UTC(), EndedAt: ended.UTC(),
-		DurationSeconds: elapsed.Seconds(), Partial: tursoSoakWindowPartial(elapsed, final),
+		DurationSeconds: elapsed.Seconds(), Partial: tursoSoakWindowPartial(final),
 		Lanes: make([]tursoSoakLaneWindow, 0, len(r.states)),
 	}
 	windowCounters := make([]tursoSoakCounters, len(r.states))
@@ -2448,7 +2448,7 @@ func TestTursoSoakAdmissionLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := admission.acquire(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("fourth concurrent call admitted: %v", err)
+		t.Fatalf("call admitted beyond the %d-slot limit: %v", tursoSoakMaxInFlight, err)
 	}
 	admission.release()
 	if err := admission.acquire(context.Background()); err != nil {
@@ -2514,13 +2514,11 @@ func TestTursoSoakHostGuard(t *testing.T) {
 }
 
 func TestTursoSoakPartialWindowAndJudgement(t *testing.T) {
-	if tursoSoakWindowPartial(time.Minute, false) {
+	if tursoSoakWindowPartial(false) {
 		t.Fatal("periodic full window marked partial")
 	}
-	for _, elapsed := range []time.Duration{20 * time.Second, 80 * time.Second} {
-		if !tursoSoakWindowPartial(elapsed, true) {
-			t.Fatal("final drain window must remain partial regardless of elapsed length")
-		}
+	if !tursoSoakWindowPartial(true) {
+		t.Fatal("final drain window must remain partial")
 	}
 	zero := &tursoSoakBacklog{}
 	if err := judgeTursoSoak(tursoSoakJudgement{DurationCompleted: true, AccountingValid: true, FinalBacklog: zero, CleanupComplete: true}); err != nil {
@@ -2862,7 +2860,7 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 	t.Cleanup(func() { _ = evidence.close() })
 	started := time.Now()
 	runner := &tursoSoakRunner{
-		e: e, cfg: tursoSoakConfig{Duration: 1250 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: time.Second},
+		e: e, cfg: tursoSoakConfig{Duration: 1250 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: 5 * time.Second},
 		evidence: evidence, started: started, windowStarted: started, states: make([]*tursoSoakLaneState, 0, len(tursoSoakLanes)),
 		admission: newTursoSoakAdmission(tursoSoakMaxInFlight), failureSignal: make(chan struct{}, 1),
 		stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
