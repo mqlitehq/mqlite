@@ -881,7 +881,7 @@ const (
 	tursoSoakOutputEnv      = "MQLITE_TURSO_SOAK_OUTPUT"
 	tursoSoakConfirmEnv     = "MQLITE_TURSO_SOAK_CONFIRM_TEST_DB"
 	tursoSoakBodyBytes      = 256
-	tursoSoakMaxInFlight    = 2
+	tursoSoakMaxInFlight    = 1
 	tursoSoakLaneStagger    = 250 * time.Millisecond
 )
 
@@ -1611,7 +1611,7 @@ func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
 }
 
 // tursoSoakAdmission bounds every harness-originated database call. Limiting the
-// harness to two calls keeps foreground demand below the remote pool's
+// harness to one call keeps foreground demand below the remote pool's
 // four-connection limit while all four logical lanes remain active, providing
 // headroom for background maintenance.
 type tursoSoakAdmission struct {
