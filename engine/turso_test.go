@@ -879,7 +879,6 @@ const (
 	tursoSoakWindowEnv      = "MQLITE_TURSO_SOAK_WINDOW"
 	tursoSoakCallTimeoutEnv = "MQLITE_TURSO_SOAK_CALL_TIMEOUT"
 	tursoSoakOutputEnv      = "MQLITE_TURSO_SOAK_OUTPUT"
-	tursoSoakConfirmEnv     = "MQLITE_TURSO_SOAK_CONFIRM_TEST_DB"
 	tursoSoakBodyBytes      = 256
 	tursoSoakMaxInFlight    = 1
 	tursoSoakLaneStagger    = 250 * time.Millisecond
@@ -2388,8 +2387,8 @@ func TestTursoPerformanceSoak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if os.Getenv(tursoSoakConfirmEnv) != "1" {
-		t.Fatalf("%s=1 is required", tursoSoakConfirmEnv)
+	if os.Getenv(remoteTestResetConfirmEnv) != "1" {
+		t.Fatalf("%s=1 is required", remoteTestResetConfirmEnv)
 	}
 	dsn, token := os.Getenv("MQLITE_TEST_DB"), os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN")
 	if !approvedTursoSoakDSN(dsn) {
