@@ -316,8 +316,16 @@ It is separate from the HTTP broker and uses four closed-loop lanes: two standar
 queues, one `group_fifo` queue and one `strict_fifo` queue. Each lane repeatedly
 sends one unique 256-byte body, receives and verifies that exact body, then
 completes it before starting the next cycle. This keeps the live message working
-set bounded while exercising the four-connection remote pool and normal
-background maintenance.
+set bounded while exercising normal background maintenance.
+
+The four logical lanes share a fixed admission limit of three harness database
+calls in flight (`foreground_max_in_flight=3` in `metadata.json`). Their initial
+starts use nominal 0, 250, 500 and 750 ms offsets, recorded as a 250 ms lane-start
+stagger in the metadata. Against the four-connection remote pool, this avoids a
+synchronized startup burst and keeps foreground call demand below the pool limit,
+providing headroom for normal background maintenance. The profile is deliberately
+a sustainable stability and trend load. It is not a capacity test, and its
+throughput must not be read as the backend's maximum.
 
 Choose 2, 10 or 30 minutes when dispatching the workflow. Start with 2 minutes to
 verify credentials, cleanup and evidence collection; use 30 minutes for the

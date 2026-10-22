@@ -881,6 +881,8 @@ const (
 	tursoSoakOutputEnv      = "MQLITE_TURSO_SOAK_OUTPUT"
 	tursoSoakConfirmEnv     = "MQLITE_TURSO_SOAK_CONFIRM_TEST_DB"
 	tursoSoakBodyBytes      = 256
+	tursoSoakMaxInFlight    = 3
+	tursoSoakLaneStagger    = 250 * time.Millisecond
 )
 
 type tursoSoakConfig struct {
@@ -1549,6 +1551,7 @@ type tursoSoakRunner struct {
 	e             *Engine
 	cfg           tursoSoakConfig
 	evidence      *tursoSoakEvidence
+	admission     *tursoSoakAdmission
 	started       time.Time
 	finished      time.Time
 	windowStarted time.Time
@@ -1598,7 +1601,55 @@ func (r *tursoSoakRunner) failure() error {
 func (r *tursoSoakRunner) stopLanes() { r.stopOnce.Do(func() { close(r.stop) }) }
 
 func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
-	return tursoSoakBoundedCall(context.Background(), r.cfg.CallTimeout, fn)
+	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.CallTimeout)
+	defer cancel()
+	if err := r.admission.acquire(ctx); err != nil {
+		return err
+	}
+	defer r.admission.release()
+	return fn(ctx)
+}
+
+// tursoSoakAdmission bounds every harness-originated database call. Limiting the
+// harness to three calls keeps foreground demand below the remote pool's
+// four-connection limit while all four logical lanes remain active, providing
+// headroom for background maintenance.
+type tursoSoakAdmission struct {
+	slots chan struct{}
+}
+
+func newTursoSoakAdmission(limit int) *tursoSoakAdmission {
+	return &tursoSoakAdmission{slots: make(chan struct{}, limit)}
+}
+
+func (a *tursoSoakAdmission) acquire(ctx context.Context) error {
+	select {
+	case a.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *tursoSoakAdmission) release() { <-a.slots }
+
+func tursoSoakWaitForLaneStart(stop <-chan struct{}, delay time.Duration) bool {
+	if delay <= 0 {
+		select {
+		case <-stop:
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-stop:
+		return false
+	}
 }
 
 func tursoSoakBoundedCall(parent context.Context, timeout time.Duration, fn func(context.Context) error) error {
@@ -1607,7 +1658,10 @@ func tursoSoakBoundedCall(parent context.Context, timeout time.Duration, fn func
 	return fn(ctx)
 }
 
-func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState) {
+func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState, startDelay time.Duration) {
+	if !tursoSoakWaitForLaneStart(r.stop, startDelay) {
+		return
+	}
 	for cycle := uint64(1); ; cycle++ {
 		select {
 		case <-r.stop:
@@ -1819,7 +1873,8 @@ func (r *tursoSoakRunner) summary(status string, failure *tursoSoakFailure) turs
 		RemotePhysicalFileMetrics: map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
 		Notes: []string{
 			"Trend evidence only; no performance threshold or SLA verdict is applied.",
-			"One Engine connects directly to the dedicated verification database with four closed-loop lanes.",
+			fmt.Sprintf("One Engine connects directly to the dedicated verification database with four closed-loop lanes, at most %d harness database calls in flight, and fixed %d ms lane-start staggering.", tursoSoakMaxInFlight, tursoSoakLaneStagger.Milliseconds()),
+			"The workload deliberately keeps harness foreground calls below the four-connection remote pool limit to provide headroom for background maintenance; it is not a capacity test.",
 			"Settlement receipts expire after 30 minutes, so their count is a retention snapshot rather than a lifetime completion ledger.",
 			"Remote Turso does not expose physical database or WAL sizes.",
 		},
@@ -1843,12 +1898,12 @@ func (r *tursoSoakRunner) writeSummary(status string, failure *tursoSoakFailure)
 
 func (r *tursoSoakRunner) run() error {
 	var workers sync.WaitGroup
-	for _, state := range r.states {
+	for i, state := range r.states {
 		workers.Add(1)
-		go func(state *tursoSoakLaneState) {
+		go func(state *tursoSoakLaneState, startDelay time.Duration) {
 			defer workers.Done()
-			r.runLane(state)
-		}(state)
+			r.runLane(state, startDelay)
+		}(state, time.Duration(i)*tursoSoakLaneStagger)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -2012,7 +2067,10 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 		"schema_version": 1, "started_at": started.UTC(), "duration_seconds": cfg.Duration.Seconds(),
 		"window_seconds": cfg.Window.Seconds(), "call_timeout_seconds": cfg.CallTimeout.Seconds(),
 		"backend": "remote Turso/libSQL", "engine_count": 1, "message_body_bytes": tursoSoakBodyBytes,
-		"background_maintenance": true, "latency_method": "fixed-memory logarithmic histogram over each complete window",
+		"foreground_max_in_flight":        tursoSoakMaxInFlight,
+		"lane_start_stagger_milliseconds": tursoSoakLaneStagger.Milliseconds(),
+		"load_intent":                     "sustained stability and trend workload, not a capacity test",
+		"background_maintenance":          true, "latency_method": "fixed-memory logarithmic histogram over each complete window",
 		"go_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
 		"git_sha":                             strings.TrimSpace(os.Getenv("GITHUB_SHA")),
 		"remote_physical_file_metrics":        map[string]*uint64{"database_bytes": nil, "wal_bytes": nil},
@@ -2024,7 +2082,8 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	}
 
 	runner := &tursoSoakRunner{
-		cfg: cfg, evidence: evidence, failureSignal: make(chan struct{}, 1), stop: make(chan struct{}),
+		cfg: cfg, evidence: evidence, admission: newTursoSoakAdmission(tursoSoakMaxInFlight),
+		failureSignal: make(chan struct{}, 1), stop: make(chan struct{}),
 	}
 	openCtx, cancelOpen := context.WithTimeout(context.Background(), cfg.CallTimeout)
 	e, err := Open(openCtx, Options{
@@ -2176,6 +2235,65 @@ func TestTursoSoakConfigurationGate(t *testing.T) {
 	}
 }
 
+func TestTursoSoakAdmissionLimit(t *testing.T) {
+	admission := newTursoSoakAdmission(tursoSoakMaxInFlight)
+	for i := 0; i < tursoSoakMaxInFlight; i++ {
+		if err := admission.acquire(context.Background()); err != nil {
+			t.Fatalf("acquire slot %d: %v", i, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := admission.acquire(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("fourth concurrent call admitted: %v", err)
+	}
+	admission.release()
+	if err := admission.acquire(context.Background()); err != nil {
+		t.Fatalf("call not admitted after release: %v", err)
+	}
+	for i := 0; i < tursoSoakMaxInFlight; i++ {
+		admission.release()
+	}
+}
+
+func TestTursoSoakAdmissionWaitUsesCallTimeout(t *testing.T) {
+	admission := newTursoSoakAdmission(1)
+	if err := admission.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer admission.release()
+	runner := &tursoSoakRunner{
+		cfg:       tursoSoakConfig{CallTimeout: 20 * time.Millisecond},
+		admission: admission,
+	}
+	called := false
+	err := runner.call(func(context.Context) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("admission wait error = %v, want context deadline exceeded", err)
+	}
+	if called {
+		t.Fatal("database call ran without admission")
+	}
+}
+
+func TestTursoSoakLaneStaggerStopsPromptly(t *testing.T) {
+	stop := make(chan struct{})
+	done := make(chan bool, 1)
+	go func() { done <- tursoSoakWaitForLaneStart(stop, time.Hour) }()
+	close(stop)
+	select {
+	case started := <-done:
+		if started {
+			t.Fatal("stopped lane was allowed to start")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lane stagger did not respond to stop")
+	}
+}
+
 func TestTursoSoakHostGuard(t *testing.T) {
 	if !approvedTursoSoakDSN("libsql://" + tursoSoakVerificationHost) {
 		t.Fatal("verification DSN rejected")
@@ -2315,9 +2433,10 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 	t.Cleanup(func() { _ = evidence.close() })
 	started := time.Now()
 	runner := &tursoSoakRunner{
-		e: e, cfg: tursoSoakConfig{Duration: 300 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: time.Second},
+		e: e, cfg: tursoSoakConfig{Duration: 1250 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: time.Second},
 		evidence: evidence, started: started, windowStarted: started, states: make([]*tursoSoakLaneState, 0, len(tursoSoakLanes)),
-		failureSignal: make(chan struct{}, 1), stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
+		admission: newTursoSoakAdmission(tursoSoakMaxInFlight), failureSignal: make(chan struct{}, 1),
+		stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
 	}
 	for _, lane := range tursoSoakLanes {
 		runner.states = append(runner.states, newTursoSoakLaneState(lane))
