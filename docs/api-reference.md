@@ -6,6 +6,10 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
+This reference follows `main`, the unreleased v0.4.0 candidate. The latest
+supported release is v0.3.2; use the documentation in that tag for its smaller
+management surface. Sections for candidate-only methods are labeled below.
+
 Every RPC body must be exactly one non-null JSON object, including operations
 whose request is otherwise empty (`{}`). Unknown fields and data after that object
 are rejected. Repeated fields retain Go's `encoding/json` behavior: later scalar
@@ -21,9 +25,13 @@ values replace earlier ones, while repeated object and map values may merge.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
-- **At-least-once:** consumers must be idempotent. A message is delivered at least
-  once and never silently dropped (see [retention.md](retention.md) for what is and
-  isn't auto-deleted).
+- **Delivery mode:** default Peek-Lock delivery is at-least-once and may repeat,
+  so consumers must be idempotent. Receive-and-delete is an explicit at-most-once
+  broker-removal path that removes a message before returning it; an explicit
+  retry with the same receive attempt ID can replay its saved response.
+  Message TTL configured to discard, DLQ retention, forced resource deletion and
+  fixed subscription expiry are explicit removal paths; see
+  [retention.md](retention.md).
 - **One settlement verb per outcome** — `Complete` / `Abandon` / `Reject` / `Defer`,
   no aliases. New effects require the `lock_token` from `Receive` and an unexpired
   lease; exact-request receipt replays are described below.
@@ -398,7 +406,8 @@ Enqueue for future delivery (same wire shape as `Send`).
 
 ### Cancel
 
-Delete a not-yet-activated scheduled message.
+Delete a scheduled send that has never been delivered (`delivery_count=0`). A
+delayed `Abandon` may also be in `scheduled`, but it cannot be cancelled.
 
 - **Request** `CancelRequest`: `queue`, `seq_number`. **Response** `SettleResponse`.
 
@@ -432,9 +441,11 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 
 ### DeleteQueue
 
-The corrected name-only contract below is available in **v0.4.0 and later**. The
-incompatible request shape from v0.3.3 was withdrawn and that module version is
-retracted.
+The corrected name-only contract below is on **main** and planned for v0.4.0. The
+incompatible request shape shipped in the withdrawn, unsupported v0.3.3 release;
+its public artifacts remain available for forensic or compatibility inspection
+and must not be deployed. `main` declares `retract v0.3.3`, but Go module tools
+will discover that directive only after a later version containing it is tagged.
 
 Deletes a **plain queue**. Requires administrator/manage permission. The default
 is empty-only; force is a separate, explicit authorization to discard retained
@@ -453,8 +464,10 @@ work.
   side effect; deleting its broker record cannot undo that effect.
 - Subscription backing queues are rejected with HTTP 400, `invalid_argument`;
   this operation does not remove topic subscriptions.
-- Acceptance durably changes the queue to `deleting` before cleanup. From that
-  point, queue operations are rejected without taking effect. Name-addressed
+- The accepting transaction changes the queue to `deleting` and starts bounded
+  cleanup. If cleanup finishes, the same commit removes the queue and returns
+  `deleted`; otherwise it commits the `deleting` marker. From that point, queue
+  operations are rejected without taking effect. Name-addressed
   operations such as Send, Receive, Peek and Stats return `not_found`; a stale
   lock settlement may instead report `lock_lost`. An existing long poll is woken,
   `CreateQueue` with that name returns
@@ -463,12 +476,16 @@ work.
   cleanup needs no follow-up delete.
 - One foreground call removes at most 1,000 physical queue-owned rows and targets
   about 8 MiB. A single larger row is still removed so cleanup can progress. A
-  pending delete wakes a background pass that globally caps cleanup at 4,096 rows,
-  about 8 MiB and 32 queues on a local store. Further passes are paced one second
-  apart; an idle broker does not poll for lifecycle work. A remote Turso/libSQL pass handles one queue,
-  which bounds network round trips inside the write transaction. The persisted
-  cursor rotates through pending names fairly on both backends, so a large or
-  bursty deletion cannot monopolize the single writer.
+  pending delete wakes a background pass that globally caps cleanup at 4,096 rows
+  and targets about 8 MiB. The ordinary path visits at most 32 loaded resources on
+  a local store or one loaded resource on remote Turso/libSQL, bounding remote
+  round trips inside the write transaction. A separate set-based path can finalize
+  up to 512 empty subscriptions without using that resource-count allowance; its
+  mapping and backing rows still use the shared row budget. A full 512-subscription
+  fast-path batch schedules its next pass after 10 ms. Other required continuation
+  passes are paced one second apart; an idle broker does not poll for lifecycle work. The
+  persisted cursor rotates through pending names fairly on both backends, so a
+  large or bursty deletion cannot monopolize the single writer.
   Startup resumes one bounded pass before crash recovery. The row and name vanish
   only after messages, deduplication, settlement receipts and receive-attempt
   records are gone. Message sequence numbers are not reset, and process event
@@ -507,7 +524,8 @@ authorize discard and receive the `Deleted` / `State` outcome. Reconcile a
 progresses without another delete.
 
 The public identity remains the queue name; force does not introduce a lifetime
-token. Durable deletion and fixed-lifetime metadata make v0.4.0 schema token 7,
+token. Durable deletion and fixed-lifetime metadata make the unreleased v0.4.0
+candidate schema token 7,
 which refuses schema-5 and schema-6 files rather than migrating them. Schema 6
 belonged only to intermediate unreleased builds and was never tagged.
 The console exposes **delete queue** in a plain queue's detail page and requires
@@ -519,7 +537,7 @@ operation as unsupported.
 
 ### DeleteSubscription
 
-Available in **v0.4.0 and later**.
+Available on **main** and planned for v0.4.0.
 
 Deletes one exact topic/subscription pair. It uses the same durable, bounded
 lifecycle as `DeleteQueue`, but owns both the topic roster mapping and the
@@ -533,10 +551,11 @@ subscription's backing queue.
   `{"deleted":false,"state":"deleting"}`. Without force, any retained
   message state returns `409 subscription_not_empty`. Force is the caller's
   durable authorization to discard all states, including locked deliveries.
-- The accepted transaction first marks the backing queue `deleting`. It is then
-  excluded from topic fan-out and direct queue operations immediately, while its
-  mapping and name remain available for reconciliation. Final physical removal
-  removes the mapping in the same transaction. Retiring the last active
+- The accepted transaction marks the backing queue `deleting` and begins bounded
+  cleanup. If cleanup finishes, the same commit removes the mapping and backing
+  queue and returns `deleted`; otherwise the committed mapping and name remain
+  available for reconciliation while the subscription is excluded from fan-out
+  and direct queue operations. Retiring the last active
   subscription therefore makes the implicit topic unavailable for fan-out
   immediately. A deleting mapping keeps the topic address reserved until physical
   cleanup completes.
@@ -581,6 +600,10 @@ Config is **queue-level**: it's set here, not per `Send`/`Receive`.
 | `dlq_max_count` | int | `0` = inherit | keep at most N dead letters (oldest dropped first). `0` inherits, `-1` = unbounded. |
 | `dlq_max_bytes` | int | `0` = inherit | cap total dead-letter **body** bytes. `0` inherits, `-1` = unbounded. |
 
+The DLQ values configure asynchronous retention targets. They do not reject new
+dead letters or synchronously enforce a hard cap, so a queue may temporarily
+exceed them between worker passes or while bounded cleanup catches up.
+
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   --data '{"name":"orders","config":{
@@ -603,7 +626,7 @@ Register subscription `name` under `topic` (creates its backing queue).
   bytes. A malformed expr or name is rejected with `400 invalid_argument`.
   **Response** `{}`.
 - The same route accepts `SubscribeWithOptionsRequest`, which adds optional
-  `ttl_ms` in **v0.4.0 and later**. A positive integer stores a fixed lifetime
+  `ttl_ms` on **main**, planned for v0.4.0. A positive integer stores a fixed lifetime
   from the first successful creation; omitted or zero creates a permanent
   subscription when the name is new, and preserves an existing subscription's
   lifetime. JSON `null`, fractions,
@@ -652,7 +675,7 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 ### ListQueues
 
 The `state` field and deleting-resource visibility below are available in
-**v0.4.0 and later**.
+**main**, planned for v0.4.0.
 
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
   `state`, `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`,
@@ -674,7 +697,7 @@ The `state` field and deleting-resource visibility below are available in
 
 ### ListSubscriptionsPage
 
-Available in **v0.4.0 and later**.
+Available on **main** and planned for v0.4.0.
 
 - POST `/mqlite.v1.AdminService/ListSubscriptionsPage`.
 - Request fields: `topic` (optional exact topic), `after` (an opaque cursor from
@@ -715,7 +738,11 @@ Available in **v0.4.0 and later**.
 
 ### Redrive
 
-Move dead-lettered messages back to active (or to another queue).
+Move dead-lettered messages back to active (or to another queue). Each internal
+batch is atomic: a same-queue state change commits as one unit, and a cross-queue
+source deletion commits with its target insertion. With `rate_per_sec`, each
+throttled chunk is a separate atomic batch. Later delivery to a consumer remains
+at-least-once, so handlers and external effects must remain idempotent.
 
 - **Request** `RedriveRequest`: `queue`, `target` (string, optional — cross-queue),
   `max` (int), `older_than_ms` (int), `rate_per_sec` (int). **Response**

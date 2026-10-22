@@ -1,8 +1,12 @@
 # Production operations
 
-This runbook covers v0.4.0 (port 6754, schema token 7) and
-v0.3.0/v0.3.1/v0.3.2 (port 6754, schema token 5). v0.3.3 is retracted; use
-v0.3.2 or v0.4.0 and later.
+This runbook covers the latest supported release, v0.3.2 (port 6754, schema
+token 5), and the `main` branch's unreleased v0.4.0 candidate (port 6754, schema
+token 7). v0.3.3 is withdrawn and unsupported; its public assets and exact image
+remain available for forensic or compatibility inspection and must not be
+deployed. Pin production deployments to v0.3.2 until a corrected release is
+tagged. Although `main` declares `retract v0.3.3`, Go module tools will discover
+that directive only after a later version containing it is tagged.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -13,7 +17,8 @@ for metric definitions and alerts.
 ## Operating boundaries
 
 - Run one active broker per database. A local file has one MQLite owner and one
-  SQL connection; use HTTP clients for other processes. A second broker sharing a
+  writer connection; it may also open one read-only observation connection. Use
+  HTTP clients for other processes. A second broker sharing a
   Turso database is also unsupported: startup recovery assumes the previous owner
   has stopped. Do not perform a rolling overlap against the same database.
 - Keep local storage on a persistent local filesystem or attached block volume,
@@ -32,14 +37,21 @@ for metric definitions and alerts.
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
   when retrying within their documented retention windows; do not treat an HTTP
   timeout as proof that a write failed.
+
+The next three boundaries apply to the unreleased `main` candidate. v0.3.2 has
+the complete active-only `ListSubscriptions` operation, but it does not provide
+queue/subscription deletion, lifecycle-aware paged subscription inventory, the
+subscription capacity setting, or fixed subscription TTL.
+
 - Give one controller exclusive ownership of queue or subscription deletion and
   same-name recreation. Quiesce producers and consumers. Use the empty-only
   default unless permanent loss is intended; force also discards locked work whose
-  external effects may already have happened. An accepted resource enters durable
-  `deleting`, stops serving data and reserves its name; an accepted subscription
-  also leaves topic fan-out immediately. Confirm the name is absent before
-  recreating it. Keep the name reserved while reconciling an uncertain result,
-  and never replay an old delete after a replacement exists.
+  external effects may already have happened. The accepting transaction moves the
+  resource to `deleting` and starts cleanup. The marker reserves its
+  name when cleanup continues; a small deletion can instead complete in that same
+  commit. An accepted subscription leaves topic fan-out immediately. Confirm the
+  name is absent before recreating it. Keep the name reserved while reconciling an
+  uncertain result, and never replay an old delete after a replacement exists.
 - Treat the default 10,000 active-plus-deleting subscription limit as a metadata
   safety ceiling. Choose a lower limit when the application needs a stricter
   bound. Measure fan-out latency, database growth and observation cost at the
@@ -237,19 +249,22 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
-For **v0.3.0, v0.3.1, v0.3.2 or retracted v0.3.3 → v0.4.0**, schema changes
+For a future **v0.3.0, v0.3.1, v0.3.2 or withdrawn v0.3.3 → v0.4.0**
+cutover, the schema changes
 from **5 → 7** while port **6754** stays unchanged. Durable queue lifecycle and
 fixed subscription-expiry columns and indexes make the database incompatible;
 there is no in-place migration. Schema 6 belonged only to an intermediate
 unreleased lifecycle build, was never tagged, and is refused too.
 Follow the different-token procedure above: stop producers and consumers, take a
 consistent schema-5 backup, account for every retained message state and managed
-key, preserve the matching old binary/database pair, and start v0.4.0 with
+key, preserve the matching old binary/database pair, and start the candidate or
+eventual v0.4.0 release with
 a fresh database. Do not edit the schema token or point schema-7 code at the old
 file. Move work through an application-level drain/replay process with stable
 business identities if it must survive the cutover.
 
-v0.4.0 clients also change the deletion contract to `{name,force?}` with a typed
+The unreleased candidate clients also change the deletion contract to
+`{name,force?}` with a typed
 `{deleted,state}` result; update broker, SDK, CLI, MCP and console together. A
 rollback after schema-7 accepts writes requires preserving and reconciling those
 writes before restoring the schema-5 snapshot. Retain broker stderr externally for
@@ -259,7 +274,8 @@ separate from access logs and database backups.
 Before the cutover, replace Prometheus `mqlite_queue_total` queries with
 `mqlite_queue_retained_messages`. Replace
 `mqlite_queue_oldest_message_age_ms` with
-`mqlite_queue_oldest_message_age_seconds` and divide thresholds by 1,000. v0.4.0
+`mqlite_queue_oldest_message_age_seconds` and divide thresholds by 1,000. The
+planned v0.4.0 release
 removes both deprecated aliases; native `Observe` JSON keeps
 `queues[].oldest_message_age_ms`. Validate recording rules, alerts and dashboards
 against the candidate before resuming traffic.
@@ -281,8 +297,8 @@ restore the previous authorized scraper/rule configuration; the old `/metrics`
 endpoint requires an administrator. Keep administrator authentication enabled.
 Preserve writes accepted by the candidate rather than blindly restoring the
 pre-upgrade snapshot. The two deprecated metric aliases remain available in
-v0.3.2 but are removed in v0.4.0; see
-[metric compatibility](observability.md#compatibility-and-v040-migration).
+v0.3.2 and are removed on `main` for the planned v0.4.0 release; see
+[metric compatibility](observability.md#compatibility-and-planned-v040-migration).
 
 For **v0.3.0 → v0.3.1 or v0.3.2**, schema token **5** and the port remain unchanged.
 The candidate adds the independent `access_keys` table without rewriting existing

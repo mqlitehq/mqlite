@@ -2,7 +2,7 @@
 
 The canonical `Observe` interface, configured monitor credentials and the
 monitoring starter require **v0.3.2 or later**. Earlier releases expose only the
-original metrics described under [compatibility](#compatibility-and-v040-migration).
+original metrics described under [compatibility](#compatibility-and-planned-v040-migration).
 
 MQLite exposes one canonical observation through `AdminService/Observe`, the Go
 SDK, CLI, MCP, console and Prometheus `/metrics`. Queue snapshots and committed
@@ -87,7 +87,7 @@ durability remain the operator's responsibility.
 
 ## Maintenance failure diagnosis
 
-v0.4.0 adds optional `maintenance[].diagnostics` and
+The unreleased v0.4.0 candidate adds optional `maintenance[].diagnostics` and
 `storage.operations[].last_error` fields to Observe. v0.3.2 and older snapshots
 remain valid; missing diagnostics mean **not reported**, not healthy. Existing
 Prometheus labels and cumulative error buckets are unchanged.
@@ -383,17 +383,18 @@ and completion means the consumer reported success, not independently verified
 business-side processing. Broker redelivery, client HTTP retry and storage retry
 are separate concepts.
 
-### Compatibility and v0.4.0 migration
+### Compatibility and planned v0.4.0 migration
 
 Prometheus scraping has been disabled by default since v0.3.2. On upgrade, enable
 `MQLITE_METRICS=on` or `--metrics` to keep scraping the same API port, and configure
 a monitor token for the collector.
 
-v0.4.0 removes the two ambiguous aliases whose removal was announced in v0.3.2.
+The unreleased candidate removes the two ambiguous aliases whose removal was
+announced in v0.3.2.
 Update recording rules, alerts, dashboards and direct PromQL before replacing the
 broker:
 
-| Removed in v0.4.0 | Replacement |
+| Removed on main / planned v0.4.0 | Replacement |
 | --- | --- |
 | `mqlite_queue_total` | `mqlite_queue_retained_messages` (same gauge value) |
 | `mqlite_queue_oldest_message_age_ms` | `mqlite_queue_oldest_message_age_seconds` (divide old thresholds by 1,000) |

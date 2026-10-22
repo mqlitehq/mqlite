@@ -10,19 +10,25 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## v0.4.0 — 2026-10-22
+## Unreleased — planned v0.4.0
 
-> **Upgrade from v0.3.2 or retracted v0.3.3:** port **6754** is unchanged, but
+> **Planned upgrade from v0.3.2 or withdrawn v0.3.3:** port **6754** remains
+> unchanged, but
 > the canonical schema token changes from **5 → 7**. There is no in-place
 > migration. Stop writers, take a consistent backup, account for every retained
 > message and managed key, preserve the schema-5 binary/database pair, and start
-> v0.4.0 with a fresh database. Schema 6 belonged only to intermediate unreleased
-> lifecycle builds and is refused as well; it was never a tagged release.
+> the eventual v0.4.0 release with a fresh database. Until that release is tagged,
+> pin production deployments to v0.3.2. Schema 6 belonged only to intermediate
+> unreleased lifecycle builds and is refused as well; it was never a tagged release.
 >
-> v0.3.3 remains retracted. Its public queue `Generation` contract was removed;
-> v0.4.0 addresses resources by name and requires one owner to serialize deletion
-> with same-name recreation. Upgrade the broker, SDK, CLI, MCP and console
-> together when adopting the corrected deletion APIs.
+> The v0.3.3 release remains withdrawn and unsupported. Its public assets and exact
+> image remain available for forensic or compatibility inspection and must not be
+> deployed. `main` contains a retraction directive, but Go module tools will
+> discover it only after a later version containing the directive is tagged. Its
+> public queue `Generation` contract was
+> removed; this unreleased line addresses resources by name and requires one owner
+> to serialize deletion with same-name recreation. Upgrade the broker, SDK, CLI,
+> MCP and console together when adopting the corrected deletion APIs.
 >
 > **Prometheus migration:** the aliases `mqlite_queue_total` and
 > `mqlite_queue_oldest_message_age_ms`, deprecated in v0.3.2, are removed.
@@ -33,9 +39,9 @@ upgrade notes before replacing a broker.
 ### Remove deprecated Prometheus aliases (MQLITE-129)
 
 - Remove the `mqlite_queue_total` and `mqlite_queue_oldest_message_age_ms`
-  compatibility families on the announced v0.4.0 boundary. The canonical
+  compatibility families on the planned v0.4.0 boundary. The canonical
   retained-depth and age-in-seconds families remain exact projections of the
-  native observation snapshot, and the shipped dashboard, rules and verifier use
+  native observation snapshot, and the bundled dashboard, rules and verifier use
   only those canonical names.
 - Require the complete exposition fixture to pass `promtool check metrics`
   without the two former naming warnings. This changes Prometheus exposition
@@ -76,6 +82,16 @@ upgrade notes before replacing a broker.
   is current backlog rather than cumulative broker throughput.
 - Add mixed-state equivalence coverage, a six-state deep-backlog benchmark and a
   deterministic query-shape check that runs in the existing CI matrix.
+
+### Make Turso receive claims write-first (MQLITE-136)
+
+- Start ordinary and AttemptID receive transactions with the fenced claim update,
+  then classify a zero-row result inside the same write transaction. This avoids a
+  Turso/libSQL deferred read snapshot failing when it is upgraded after another
+  pooled connection commits.
+- Preserve ordering, lifecycle, batching, replay and observability semantics. The
+  fix applies within one broker or embedded engine; remote retries remain bounded
+  and overlapping owners of the same Turso database remain unsupported.
 
 ### Add destructive-operation audit evidence (MQLITE-131)
 
@@ -138,13 +154,13 @@ upgrade notes before replacing a broker.
 ### Delete and inventory subscriptions safely (MQLITE-127)
 
 - Add empty-only subscription deletion and an explicit `force` option that
-  durably authorizes discarding every retained message state. An accepted
-  subscription becomes `deleting` in the same transaction, immediately leaves
-  topic fan-out and the data plane, keeps its globally unique name reserved, and
-  finishes through the same bounded, restart-safe cleanup worker as a queue.
-  The topic/name pair must match exactly. The final backing-queue removal also
-  removes its roster mapping. The implicit topic therefore becomes unavailable
-  as soon as its last active subscription is retired.
+  durably authorizes discarding every retained message state. The accepting
+  transaction immediately removes the subscription from topic fan-out and the
+  data plane and starts bounded cleanup. It returns `deleted` if that cleanup
+  removes the backing queue and mapping in the same commit; otherwise a durable
+  `deleting` marker reserves the globally unique name while the restart-safe
+  worker continues. The topic/name pair must match exactly. The implicit topic
+  therefore becomes unavailable as soon as its last active subscription is retired.
 - Keep the existing `ListSubscriptions` API as a complete, active-only inventory
   for compatibility, including its three-field Go `SubscriptionInfo`,
   `wire.SubscriptionJSON`, and JSON shape. Add `ListSubscriptionsPage` with
@@ -179,16 +195,18 @@ upgrade notes before replacing a broker.
 - Keep queue deletion empty-only by default. `force=true` is an explicit,
   persisted authorization to discard every retained message state plus queue-owned
   deduplication, settlement-receipt and receive-attempt records.
-- Retire an accepted queue durably as `deleting` before cleanup. Queue work is
-  immediately rejected without taking effect, its name remains reserved, and
-  `ListQueues` reports the state until bounded cleanup removes the row. Cleanup
+- Transition an accepted queue to `deleting` and start bounded cleanup in one
+  transaction. If cleanup finishes, that commit removes the queue; otherwise the
+  committed marker rejects queue work, reserves the name, and remains visible in
+  `ListQueues` until continuation cleanup removes the row. Cleanup
   resumes after a restart; one foreground request removes at most 1,000 physical
   rows/about 8 MiB. Accepted pending deletes wake an event-driven worker, whose
   continuation passes are one second apart and each globally caps cleanup at 4,096
-  rows/about 8 MiB across at most 32 queues locally; idle stores do not poll. Remote Turso/libSQL cleans
-  one queue per pass so network round trips do not extend one write transaction
-  across a large resource batch; the durable cursor still rotates fairly. One
-  individually oversized row may exceed the byte target so cleanup always progresses.
+  rows/about 8 MiB. The ordinary loaded-resource path visits at most 32 queues
+  locally or one queue on remote Turso/libSQL, so network round trips do not extend
+  one write transaction across a large resource batch; the durable cursor still
+  rotates fairly. One individually oversized row may exceed the byte target so
+  cleanup always progresses.
   An uncertain remote delete commit arms a bounded 30-second discovery window;
   normal idle brokers perform no lifecycle polling.
 - Keep the final queue-row retirement bounded even beside an unrelated deep
@@ -221,10 +239,12 @@ upgrade notes before replacing a broker.
   from the engine, HTTP API, Go SDK, CLI, MCP server, console, and documentation.
   Queue identity remains name-only; MQLITE-126 later adds a force-only deletion
   option without bringing lifetime identity into data-plane requests.
-- This is an intentional breaking correction for v0.3.3 clients. The v0.3.3 Go
-  module is retracted; v0.3.2 clients are unaffected. This correction itself kept
+- This is an intentional breaking correction for v0.3.3 clients. The v0.3.3
+  release is withdrawn and unsupported; its public artifacts remain available for
+  forensic or compatibility inspection and must not be deployed. `main` carries a
+  pending retraction directive; v0.3.2 clients are unaffected. This correction itself kept
   schema token **5**; MQLITE-126 advanced the v0.4.0 development line to token 6,
-  and MQLITE-128 advanced the released schema to token 7.
+  and MQLITE-128 advanced the unreleased candidate schema to token 7.
 - Make the name-reuse boundary explicit. Queue deletion and same-name recreation
   must be serialized by one owner. Do not replay an old deletion after recreation;
   reconcile an uncertain result before allowing the name to be reused.
@@ -233,11 +253,13 @@ upgrade notes before replacing a broker.
   stable shared reply subscription and dispatch replies by correlation ID instead
   of creating one subscription per request.
 
-## v0.3.3 — 2026-10-13 (retracted)
+## v0.3.3 — 2026-10-13 (withdrawn; retraction pending a later tag)
 
-> **Retracted:** this release exposed queue lifetime metadata as a public API and
-> spread it through deletion clients. That contract was removed on `main` before
-> v0.4.0. Use v0.3.2 or v0.4.0 and later.
+> **Withdrawn:** this release exposed queue lifetime metadata as a public API and
+> spread it through deletion clients. That contract is removed on `main` for the
+> planned v0.4.0 release. `main` also declares `retract v0.3.3`; Go module tools
+> will recognize it only after a later version containing that directive is tagged.
+> Pin production use to v0.3.2 until then.
 
 > **Upgrade from v0.3.2:** port **6754**, schema token **5**, message data and
 > managed-key storage remain compatible. Keep one active broker per database and

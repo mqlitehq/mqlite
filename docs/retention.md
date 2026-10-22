@@ -1,311 +1,159 @@
-# Retention & archival — design (MQLITE-21)
+# Retention, deletion, and storage reclamation
 
-MQLite targets high throughput, and a high-throughput store on SQLite grows fast.
-If nothing ever shrinks the database, write latency climbs, the volume fills, and
-the broker eventually stalls — the opposite of the "lightweight, reliable" goal.
-This note is the design investigation: what MQLite keeps today, how other queues
-bound their storage, the full design space (triggers, actions, safe deletion,
-space reclamation, archival), and the *smallest* subset to ship first (Tier 1 shipped
-without a schema change; Tier 2 added per-queue columns once that was worthwhile).
+This page describes the implemented behavior on `main`, an unreleased v0.4.0
+candidate. The latest supported release is v0.3.2. v0.3.3 is withdrawn and
+unsupported; its public artifacts remain available for forensic or compatibility
+inspection and must not be deployed. `main`'s retraction directive will become
+visible to Go module tools only after a later version containing it is tagged.
+v0.3.2 has DLQ retention
+and automatic local reclamation, but the work budgets below describe `main` unless
+a version difference is stated. v0.3.2 does not have the candidate queue and
+subscription lifecycle APIs.
 
-## What MQLite retains today
+## What removes retained messages
 
-```
-┌────────────────┬───────────────────────────────────┬──────────────────────────┐
-│ message state  │ lifetime                          │ removed by               │
-├────────────────┼───────────────────────────────────┼──────────────────────────┤
-│ completed      │ none — row is DELETEd at settle   │ Complete / receive+delete│
-│ active         │ until received & completed         │ consumer                 │
-│ locked         │ lock_duration, then reclaimed      │ reapLocks loop           │
-│ deferred       │ until ReceiveDeferred + completed  │ consumer                 │
-│ scheduled      │ until its enqueue time / Cancel    │ activation or Cancel     │
-│ expired (TTL)  │ default_ttl_ms, then →DLQ or drop  │ expireTTL loop           │
-│ dead_lettered  │ **forever, until manual action**   │ Redrive / Purge (manual) │
-└────────────────┴───────────────────────────────────┴──────────────────────────┘
-aux tables (dedup, settlement_receipts, receive_attempts) are already GC'd by the
-cleanupDedup / cleanupExpiredAux background loops.
-```
+Default Peek-Lock delivery is at-least-once. Receive-and-delete is the explicit
+at-most-once broker-removal alternative and removes a message before returning it;
+retrying the same receive attempt ID can replay its saved response. A durable
+message stays retained until a documented lifecycle action removes or moves it:
 
-Everything has a bounded lifetime **except `dead_lettered`**. Completed work is
-deleted immediately (no "completed message archive" to grow), locks self-heal, TTL
-is enforced. So the steady-state size of a *healthy* queue is its in-flight backlog
-— which is self-limiting if consumers keep up. **The one unbounded sink is the
-DLQ.**
+| Stored state | Normal lifecycle | Other authorized removal |
+|---|---|---|
+| `active` | Receive, then Complete or receive-and-delete | message TTL with discard; forced queue/subscription deletion; subscription expiry |
+| `locked` | Complete, or lock expiry returns it to `active` / moves it to the DLQ at the delivery limit | message TTL with discard; forced queue/subscription deletion; subscription expiry |
+| `deferred` | ReceiveDeferred, then settle | message TTL with discard; forced queue/subscription deletion; subscription expiry |
+| `scheduled` | activation at its due time; Cancel only for a scheduled send that has never been delivered | message TTL with discard; forced queue/subscription deletion; subscription expiry |
+| `dead_lettered` | Redrive or Purge | configured DLQ retention; forced queue/subscription deletion; subscription expiry |
 
-## The gap: an unbounded DLQ
+Complete and receive-and-delete remove the row immediately. A message TTL either
+moves an expired message to the DLQ or discards it according to
+`dead_letter_on_expire`. Expired locks are reclaimed by the reaper and can be
+delivered again, so consumers must be idempotent.
 
-Dead-lettered messages persist until an operator runs `Redrive` or `purge-dlq`. A
-poison-message storm or an unattended broker grows the volume without limit — at
-~0.4 KB/message ([benchmark.md](benchmark.md)) a runaway producer
-fills a 1 GB Fly volume with ~2.5M dead letters. The DLQ needs a *default ceiling*,
-not just a manual broom. (A secondary, milder risk: a queue whose consumers fall
-permanently behind grows its active backlog — but that is a capacity problem, not a
-retention one; retention must never delete undelivered work.)
+Deduplication rows, settlement receipts, and receive-attempt records have their
+own expiry-based background cleanup. They are operational replay metadata, not a
+message archive; those expiry deletes are not row-budgeted per pass.
 
-## How other queues bound their storage
+## DLQ retention
 
-| system | knobs | over-limit policy | reclamation |
-|---|---|---|---|
-| **Kafka** | `retention.ms`, `retention.bytes`; log compaction (keep latest per key) | delete oldest **segment** (cheap, whole-file) | drop closed segment files |
-| **RabbitMQ** | message/queue TTL, `max-length`, `max-length-bytes` | `drop-head` (evict oldest) or `reject-publish` | per-queue; lazy queues page to disk |
-| **Redis Streams** | `MAXLEN`, `MINID` via `XTRIM` / `XADD` | trim oldest; `~` = **approximate** trim for speed | in-memory, radix-tree reclaim |
-| **NATS JetStream** | `MaxMsgs`, `MaxBytes`, `MaxAge`; `retention=limits\|interest\|workqueue` | `discard=old\|new` | per-stream block deletion |
-| **AWS SQS** | message retention period (max 14 days) | auto-delete past retention | managed |
+`mqlite serve` applies default retention targets to dead letters. Every 60 seconds
+the retention worker deletes the oldest matching dead letters in bounded batches.
+These are asynchronous cleanup targets, not admission limits: a queue can
+temporarily exceed its age, count, or byte target between passes or while cleanup
+catches up. The worker never deletes active, locked, deferred, or scheduled rows.
 
-**Takeaways for MQLite:**
+| Setting | Broker default | Meaning |
+|---|---:|---|
+| `MQLITE_DLQ_MAX_AGE` | `336h` (14 days) | delete dead letters older than this, measured from original enqueue time |
+| `MQLITE_DLQ_MAX_COUNT` | `1000000` per queue | keep at most this many dead letters |
+| `MQLITE_DLQ_MAX_BYTES` | `0` | optional per-queue cap on dead-letter body bytes; zero disables this bound |
+| `MQLITE_DLQ_RETENTION` | enabled | set to `off` to disable all broker defaults |
 
-1. Every mature system bounds storage by some combination of **age / count / bytes**
-   — not just age. MQLite already has per-message **TTL** (≈ SQS retention) and a
-   DLQ; what it lacks is a bound on the *DLQ* itself.
-2. The common over-limit policies are **drop-oldest** (Kafka/Rabbit drop-head,
-   Redis/NATS) vs **reject-new** (Rabbit reject-publish, NATS discard=new). For a
-   DLQ, drop-oldest is the sane default (a dead letter losing the *oldest* failures
-   first is acceptable; refusing to dead-letter new failures is not).
-3. Kafka's cheap **segment deletion** and Redis's **approximate** trim both say the
-   same thing: *bulk, amortized deletion beats per-message work*. On SQLite that
-   maps to **batched, range-based DELETEs that never hold a long write lock** —
-   see below.
+Embedded engines leave engine-wide DLQ retention defaults disabled unless the
+application passes `WithDLQRetention(maxAge, maxCount, maxBytes)`. A positive
+per-queue bound still enables that dimension for its queue.
 
-## Design space
+Each queue can override the engine or broker defaults through `QueueConfig`, the
+wire `config` object, or `mqlite create-queue`:
 
-A retention policy is `(trigger, action, scope)`:
+| Per-queue value | Effective behavior |
+|---:|---|
+| `0` | inherit the engine or broker default |
+| positive | use this queue-specific bound |
+| negative | explicitly leave that dimension unbounded |
 
-- **Trigger** (any combination): `max_age` (dead letters older than T), `max_count`
-  (keep at most N per queue), `max_bytes` (cap the DLQ's byte footprint). Plus a
-  manual trigger — which already exists as `purge-dlq`.
-- **Action**: `purge` (delete) or `archive-then-purge` (export to cold storage,
-  then delete). **Never** touch undelivered / in-flight / unsettled messages — only
-  `dead_lettered` (and, by extension, already-`completed` rows, which are already
-  deleted at settle).
-- **Scope**: broker-wide default, optionally overridden per queue (a short-lived
-  high-volume queue vs a long-retention audit queue).
+The fields are `dlq_max_age_ms`, `dlq_max_count`, and `dlq_max_bytes`. Age uses
+`enqueued_at`, not the time at which the message entered the DLQ. Count and byte
+limits drop the oldest dead letters first.
 
-## Safe deletion under high concurrency
+Monitor DLQ count, age, and storage size even when defaults are enabled. A growing
+active backlog is a consumer-capacity problem and is deliberately outside the DLQ
+retention policy.
 
-This is the part that matters for the North Star: the broker is a **single writer**,
-so a careless retention sweep that takes a long write lock would stall *all*
-producers. Rules:
+## Queue and subscription retirement
 
-- **Batch, don't sweep.** Delete in bounded chunks (`Purge` already supports
-  `Max`): `DELETE ... WHERE id IN (SELECT id ... ORDER BY id LIMIT k)`. Each batch
-  is a short transaction; the writer yields between batches.
-- **Rate-limit.** Sleep briefly between batches so retention is a background trickle,
-  not a burst that competes with live traffic. Reuse the existing janitor cadence.
-- **Range by primary key.** Deleting by an indexed predicate (`state='dead_lettered'
-  AND enqueued_at < cutoff`, ordered by `id`) seeks the `idx_msg_dlq` index instead
-  of scanning — the same per-state-index discipline as the claim path (MQLITE-22).
-- **WAL-friendly.** Many small commits let WAL checkpoints interleave; one giant
-  DELETE balloons the WAL and blocks checkpointing.
+On `main`, queue and subscription deletion is empty-only by default. `force=true`
+is durable authorization to discard all retained states, including locked work,
+plus resource-owned deduplication and replay metadata. A locked delivery may
+already have caused an external effect; deleting its row cannot undo that effect.
 
-## Forced resource retirement
+A fixed subscription TTL grants the same discard authorization in advance. Its
+absolute deadline is saved on first creation and does not move when the filter is
+updated, a message is published or received, or creation is retried. At the
+deadline the subscription immediately leaves topic fan-out and its data plane.
+Physical cleanup follows in the background. Explicit deletion remains the normal
+completion path; TTL is a forgotten-cleanup backstop.
 
-Queue and subscription deletion are empty-only by default and are separate from
-automatic retention. `force=true` is operator authorization to discard every
-message state, including locked deliveries, plus the backing queue's deduplication
-and replay records. A locked delivery may already have caused an external side
-effect; deleting its stored row cannot undo that effect.
+The accepting transaction changes the resource to `deleting` and starts bounded
+cleanup. If that cleanup finishes, the same commit removes the resource and the
+call returns `deleted`; otherwise the committed `deleting` marker reserves the
+name while restart-safe cleanup removes its rows. The foreground request removes
+at most 1,000 rows and targets about 8 MiB. Each continuation pass removes
+at most 4,096 physical rows and targets about 8 MiB. Its ordinary per-resource
+path visits at most 32 local resources, or one such resource on remote Turso/libSQL.
+A separate set-based path can finalize up to 512 empty subscriptions
+without consuming that 32-or-1 resource-count allowance; their mapping and backing
+queue rows still consume the shared row budget. One oversized row may exceed the
+byte target so cleanup can still make progress.
 
-A fixed subscription deadline grants the same discard authorization in advance.
-The absolute deadline is stored once and never slides. At
-`now >= expires_at`, routing, receive, settlement, renewal, redrive, purge and
-direct observation reject the subscription immediately; a maintenance scan later
-persists `deleting` and resumes the same restart-safe cleanup. Leases and long
-polls are capped at the deadline. Normal completion should still call
-`DeleteSubscription`; TTL covers forgotten cleanup after a caller is lost.
+The default subscription capacity is 10,000 active plus deleting mappings. A
+mapping continues to occupy a slot until physical cleanup finishes. Large forced
+deletes or simultaneous expiry waves can therefore create cleanup backlog, grow
+the WAL, delay name reuse, and temporarily reject new subscription creation.
 
-An accepted delete first commits `state=deleting`. That immediately rejects new
-queue work and reserves the name while physical cleanup proceeds. For a
-subscription it also removes the entry from topic fan-out; the topic mapping stays
-available for reconciliation until final removal deletes it in the same
-transaction as the backing queue. Retiring the last active subscription therefore
-makes the implicit topic unavailable for fan-out immediately, while a deleting
-mapping keeps the topic address reserved until physical cleanup completes.
-The foreground request removes at most 1,000 physical rows and targets about
-8 MiB. Every
-one-second background pass globally caps cleanup at 4,096 rows and targets about
-8 MiB, across at most 32
-deleting queues locally or one queue on remote Turso/libSQL. The smaller remote
-resource cap bounds network round trips inside one write transaction; a durable
-cursor rotates fairly on both backends. Startup runs one recovery pass. These
-bounds keep one large retirement from holding the single writer indefinitely and
-make a crash restartable. One individually oversized row may exceed the byte
-target so it cannot block cleanup forever.
+For routine request/reply traffic, keep a stable reply subscription and dispatch
+with `correlation_id`. If a temporary subscription is necessary, use a globally
+unique one-use name, delete it explicitly when finished, add a fixed TTL as a
+backstop, and stagger deadlines. Drain before deletion when practical. Reserve
+force for intentional abandonment.
 
-Empty deleting subscriptions use an additional set-based metadata path. One
-transaction selects at most 512 mappings whose messages, dedup entries,
-settlement receipts and receive attempts are all empty, deletes the mappings
-first and their backing queues second, and verifies both affected-row counts.
-This stays correct when remote libSQL foreign-key enforcement is unavailable and
-releases bursts of empty temporary subscriptions without the one-resource remote
-rate. Each transaction releases the writer before continuing. Any subscription
-with retained state stays on the ordinary row/byte/resource-budgeted path.
+One controller must serialize deletion and same-name recreation. After an
+uncertain response, use the read-only paged inventory with deleting entries
+included. Wait until the name is absent before recreating it, and do not replay an
+old delete after a replacement exists.
 
-Bursts of forced deletion across deep queues or subscriptions can still create a
-cleanup backlog, grow the WAL, consume subscription-capacity slots and delay name
-reuse. Prefer draining and reusing stable resources for routine traffic; reserve
-force for intentional abandonment. List the relevant inventory, including
-deleting subscriptions, and wait for the row to disappear before reusing its name.
-The accepted discard permission is already durable. Cleanup continues while the
-engine stays open and resumes with a bounded startup pass after a restart. Do not
-use another delete as a status check or automatically replay a lifecycle write
-after a transport failure, redirect, HTTP 5xx response or malformed
-acknowledgement. Configure custom transports and proxies not to retry these routes.
+## Local file reclamation
 
-The default global subscription capacity is 10,000 active plus deleting entries.
-It bounds metadata growth, not publish cost: fan-out work and stored copies remain
-proportional to the matching subscription count. Deleting entries retain their
-slot until cleanup finishes, so sustained create/delete churn can apply temporary
-backpressure instead of growing metadata without a bound. Use stable subscriptions
-for routine request/reply traffic and globally unique, one-use names when a
-temporary subscription is unavoidable.
+Deleting a row makes SQLite pages reusable immediately; it does not promise that
+the database or WAL file will shrink at once. New local databases use
+`auto_vacuum=INCREMENTAL`.
 
-TTL does not make unconsumed work free. A simultaneous wave becomes logically
-unavailable at one deadline, but physical convergence depends on roster size,
-retained rows, body bytes, storage latency and competing writes. Expired and
-deleting rows keep their capacity slot until removal. Stagger deadlines when
-possible, drain before expiry, alert on sustained `deleting` counts and
-`subscription_expiry` / `lifecycle` maintenance failures, and load-test the
-largest planned expiry burst on the target backend.
+On `main`, the background reclaimer runs every 60 seconds. Once at least 256 pages
+are free, it checkpoints and returns at most 256 pages per pass to the operating
+system. One-off large deletions can therefore need several passes. v0.3.2 uses the
+same interval and threshold but attempts to drain the current freelist in one pass;
+it does not have `main`'s 256-page work cap. WAL size can also grow while a reader
+holds a snapshot, then shrink after checkpointing when that reader finishes.
 
-## Space reclamation
+Operator commands provide explicit reclamation:
 
-Deleting rows frees SQLite *pages*. mqlite opens every DB with
-`auto_vacuum=INCREMENTAL` (set at creation), and a background janitor runs
-`PRAGMA incremental_vacuum` once enough pages free up. Row deletion therefore
-makes pages logically free and immediately reusable, but it does not promise an
-immediate reduction in the database or WAL file visible to the OS. Local files
-**shrink back gradually** without a full rewrite. The mechanisms, in order of cost:
+- `mqlite vacuum` checkpoints and exhausts the current incremental-vacuum
+  freelist. It is the normal manual choice after a large purge.
+- `mqlite vacuum --full` rewrites the database and holds the global writer. Use it
+  only in a deliberate maintenance window.
 
-- **Reuse + background incremental_vacuum (default).** Free pages are reused by later
-  inserts. Every 60 seconds, when the freelist contains at least 256 pages, the
-  janitor checkpoints and returns at most 256 pages to the OS.
-  For a steady-state queue the file churns in place; after a one-off DLQ flush it recovers
-  the disk over multiple passes. No action is normally needed.
-- **`mqlite vacuum`** runs the same checkpoint → `incremental_vacuum` → checkpoint
-  sequence on demand and exhausts the current freelist instead of using the
-  background 256-page bound.
-- **`mqlite vacuum --full`** (a full `VACUUM`) rewrites the whole DB and takes a
-  **global write lock** for the duration — unacceptable on the hot path; only ever in an
-  explicit maintenance window, never automatic.
+Remote Turso/libSQL manages its physical storage. The client does not expose its
+database or WAL file size, and local vacuum commands do not apply.
 
-Recommendation: rely on the default (reuse + background reclaim); reach for
-`mqlite vacuum` to force an immediate incremental reclaim, and keep `--full` for rare,
-deliberate maintenance.
+Size local storage for the peak simultaneous backlog, WAL growth, backup space,
+and the time needed for bounded cleanup and reclamation. Alert on free disk,
+retained/deleting inventory, maintenance failures, and oldest message age rather
+than assuming file size will fall immediately after a delete.
 
-## Archive sink interface (if archival is ever built)
+## Exporting dead letters before deletion
 
-v0.1 ships **no** archival subsystem — but if demand appears, the seam is a single
-narrow interface invoked by the retention janitor *before* it deletes a batch:
+MQLite has no built-in archive sink. An operator can use existing operations:
 
-```go
-// ArchiveSink receives dead letters about to be purged. Implementations write to
-// cold storage (file/JSONL, object storage, another SQLite). A nil sink = purge
-// without archiving (today's behaviour).
-type ArchiveSink interface {
-    Archive(ctx context.Context, msgs []PeekedMessage) error
-}
-```
+1. Quiesce or otherwise coordinate changes to the selected DLQ range.
+2. Read dead letters with `Peek(state=dead_lettered)`, advancing `from` past the
+   last exported sequence number, and durably write them to external storage.
+3. Verify the external copy.
+4. After quiescing, purge only after the export covers the intended DLQ. Use
+   `max` or `older_than` bounds where appropriate. Alternatively, Redrive to a
+   queue whose consumer writes each message to the archive before completing it.
 
-Contract: the janitor only deletes a batch **after** `Archive` returns nil, so a
-sink failure stops deletion (at-least-once export, no silent loss). This stays a
-*future* extension point, not v0.1 code — the operator pattern below covers real
-needs without it.
-
-### Archival as an operator pattern (v0.1)
-
-The existing primitives already compose into archival; document, don't build:
-
-- **Inspect / export:** `Peek(state=dead_lettered)` pages the DLQ; a small script
-  writes the bodies wherever you want before purging.
-- **Move aside:** `Redrive(--to archive-<queue>)` shovels dead letters into a plain
-  archive queue that a separate, slow consumer drains to cold storage.
-
-## Recommendation — tiered, minimal
-
-### Tier 1 (SHIPPED, no schema change): broker-default DLQ retention by age + count + bytes
-
-A `reapDLQ` background loop (alongside the existing janitors) bounds the DLQ by
-**age, per-queue count, and per-queue body bytes** — drop-oldest, **batched +
-rate-limited**, touching **only `state='dead_lettered'`** (undelivered / in-flight /
-scheduled work is never deleted). All three are broker-wide settings enforced over
-existing columns (`enqueued_at`, `length(body)`), so Tier 1 needed no schema change.
-
-**On by default for the broker** so it is safe to run online long-term out of the
-box (the maintainer's call — the one unbounded sink should not silently fill the
-disk). The engine itself defaults to *off* (zero bounds), so the embedded library
-never auto-deletes a caller's dead letters unless asked:
-
-```
-# mqlite serve (broker) — defaults applied unless overridden:
-MQLITE_DLQ_MAX_AGE=336h        # default 14d; dead letters older (by enqueued_at) are dropped
-MQLITE_DLQ_MAX_COUNT=1000000   # default 1,000,000 dead letters per queue (drop oldest)
-MQLITE_DLQ_MAX_BYTES=0         # optional per-queue body-byte cap; 0 = off (deployment-specific)
-MQLITE_DLQ_RETENTION=off       # disable entirely
-
-# embedded library — off unless you opt in:
-mqlite.WithDLQRetention(14*24*time.Hour, 1_000_000, 0)
-```
-
-Implemented in `engine/background.go` (`reapDLQ`), `engine.Options.{DLQMaxAgeMs,
-DLQMaxCount,DLQMaxBytes}`, the `WithDLQRetention` embedded option, and the broker
-defaults in `cmd/mqlite` (`embeddedOpts`). Tested in `engine/retention_dlq_test.go`
-(drop-oldest by each dimension, age boundary, non-DLQ-untouched, off-by-default).
-
-### Tier 2 (SHIPPED): per-queue overrides
-
-Per-queue overrides (MQLITE-29) add three columns to the `queues` table so a
-high-volume queue can keep dead letters an hour while an audit queue keeps them a month
-(the Tier-1 bounds are broker-wide):
-
-```
-queues.dlq_max_age_ms   INTEGER NOT NULL DEFAULT 0
-queues.dlq_max_count    INTEGER NOT NULL DEFAULT 0
-queues.dlq_max_bytes    INTEGER NOT NULL DEFAULT 0
-```
-
-Each value resolves against the broker/engine default (`reapDLQ` → `effectiveBound`):
-
-| per-queue value | effective bound |
-|---|---|
-| `0` (default) | **inherit** the broker/engine default |
-| `> 0` | this queue's own drop-oldest bound |
-| `< 0` (e.g. `-1`) | **explicitly unbounded** — opt out of the broker default |
-
-Set them via `QueueConfig{DLQMaxAge, DLQMaxCount, DLQMaxBytes}` (SDK; `DLQMaxAge` is a
-`time.Duration`), the wire `config.{dlq_max_age_ms,dlq_max_count,dlq_max_bytes}`, or
-`mqlite create-queue --dlq-max-age 336h --dlq-max-count 1000 --dlq-max-bytes 10485760`.
-`reapDLQ` now resolves each DLQ-bearing queue's effective bounds and applies age /
-count / bytes per queue (still drop-oldest, batched, `state='dead_lettered'` only).
-
-> These columns changed the schema **incompatibly**. mqlite keeps a single canonical
-> schema with no migrations, so (pre-1.0, experimental) `Open` refuses any database
-> created before this change (`ErrSchemaVersionMismatch`) — recreate it.
-
-## Caveat: age is measured from `enqueued_at`
-
-`Purge(OlderThanMs)` ages dead letters by their original `enqueued_at`, not the
-moment they were dead-lettered (there is no `dead_lettered_at` column — adding one
-is a Tier-2 schema change). In practice a message is dead-lettered soon after
-enqueue, so `enqueued_at` is a close, arguably-more-honest proxy for total message
-age. Tier 1 documents this; Tier 2 can add `dead_lettered_at` for a precise
-dead-letter-relative TTL if ever needed.
-
-## Sub-tickets
-
-Tracked in Plane as children of MQLITE-21:
-
-```
-MQLITE-28  Tier 1: reapDLQ loop + MQLITE_DLQ_MAX_AGE/MAX_COUNT/MAX_BYTES, default   SHIPPED
-           ON for the broker; batched + rate-limited; only state='dead_lettered'; no schema.
-MQLITE-29  Tier 2: per-queue overrides (dlq_max_age_ms / dlq_max_count /            SHIPPED
-           dlq_max_bytes) — schema change; inherit(0) / override(>0) / unbounded(<0).
-MQLITE-30  Document the operator archival pattern (Peek/Redrive/Purge) in README. docs
-MQLITE-31  incremental_vacuum maintenance step (CLI `vacuum`, --full) for disk     SHIPPED
-           give-back; new local DBs default to auto_vacuum=INCREMENTAL.
-```
-
-Status: **MQLITE-28 and MQLITE-29 are shipped** — the broker bounds its DLQ by age +
-count + bytes on by default (Tier 1), and each queue may override those bounds with its
-own age/count/bytes (Tier 2). **MQLITE-30** is a short README addition.
-**MQLITE-31 is shipped**: the broker performs bounded automatic reclaim, while
-`mqlite vacuum` remains the operator path for immediate full incremental reclaim.
+Peek is non-destructive and does not make the export and purge one transaction.
+Redrive moves each selected internal batch atomically: source deletion and target
+insertion commit together. Delivery from the dedicated queue to an external
+archive remains at-least-once, so the archive consumer must be idempotent; Redrive
+does not make the external archival handoff one transaction.

@@ -9,7 +9,7 @@ used.
 
 ## Concurrency model
 
-MQLite is a **single logical writer** in both modes: each database has exactly one
+MQLite has a **single logical owner** in both modes: each database has exactly one
 active MQLite broker or embedded `Engine`. Replace that owner stop-then-start after
 confirming the old process has exited. Do not use rolling overlap against the same
 database. What differs between storage modes is the connection pool:
@@ -18,8 +18,8 @@ database. What differs between storage modes is the connection pool:
 ┌─────────────────┬──────────────────────────┬────────────────────────────────────┐
 │                 │ local file / :memory:    │ remote Turso / libSQL              │
 ├─────────────────┼──────────────────────────┼────────────────────────────────────┤
-│ writer          │ 1 conn = the writer      │ broker is the writer; the Turso    │
-│                 │ (file lock, MQLITE-6)    │ primary serializes commits         │
+│ write ownership │ 1 conn = local writer    │ one broker owns a 4-connection     │
+│                 │ (file lock, MQLITE-6)    │ pool; Turso serializes commits     │
 │ writer pool     │ MaxOpen=1, MaxIdle=1     │ MaxOpen=4, MaxIdle=2               │
 │ observation     │ file: 1 read-only conn;  │ existing provider pool             │
 │                 │ :memory: writer conn     │                                    │
@@ -106,7 +106,7 @@ fit for MQLite, for two independent reasons:
    claim must see its own state change atomically. A replica that lags the primary
    by even a sync interval could re-hand-out an already-claimed message or hide a
    just-enqueued one — exactly the correctness the Peek-Lock model exists to
-   prevent. The broker is the single writer, so it gains nothing from a read
+   prevent. The broker is the single logical owner, so it gains nothing from a read
    replica of its own writes.
 2. **They require CGO.** Embedded replicas live in the native `go-libsql` binding,
    not the pure-Go `libsql-client-go` Hrana client MQLite uses. Adopting them would

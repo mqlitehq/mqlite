@@ -5,8 +5,12 @@ This is the normative spec of how mqlite **must** behave — the invariants that
 hermetic test (cross-referenced); together these are mqlite's TCK. If a change would
 break a **MUST** here, it is a behavior change, not a refactor.
 
-mqlite is honestly **at-least-once**: a durably-written message is delivered at least
-once and never silently dropped; handlers must be idempotent. (§3)
+Default Peek-Lock delivery is **at-least-once**: redelivery is possible, so
+handlers must be idempotent. Receive-and-delete is the caller's explicit
+at-most-once broker-removal path and removes a message before returning it; the
+same receive attempt ID can replay its saved response. Other documented
+discard paths include message TTL configured to discard, DLQ retention, forced
+resource deletion, and fixed subscription expiry. (§1.7, §3, §8, §14)
 
 ## 1 · Peek-Lock lifecycle
 
@@ -164,7 +168,9 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 
 - **8.1** With a bound set, `reapDLQ` MUST drop **oldest-first** dead letters past the
   max age, per-queue count, or per-queue body bytes — and MUST touch **only**
-  `state='dead_lettered'` (never undelivered/in-flight/scheduled work).
+  `state='dead_lettered'` (never undelivered/in-flight/scheduled work). These are
+  asynchronous retention targets rather than admission limits; a DLQ MAY exceed
+  them temporarily between bounded worker passes.
   *(engine/retention_dlq_test.go)*
 - **8.2** With no bound (the engine default), the DLQ is unbounded — no auto-deletion.
   *(engine/retention_dlq_test.go `TestDLQRetentionDisabledByDefault`)*
@@ -261,7 +267,7 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestAccessKeySchemaConflict, TestAccessKeyCreationIndexUpgradeAndConflicts;
   test/production/restore/run.py, compat.py)*
 - **10.5** Durable resource lifecycle and fixed subscription-expiry columns and
-  indexes make current schema token 7 incompatible with the released schema-5
+  indexes make the unreleased candidate schema token 7 incompatible with the released schema-5
   layout and intermediate schema-6 layout. Each binary MUST refuse the other's
   database rather than adding columns, restamping the token or partially opening
   it. Operators must create a fresh database and preserve the matching old
@@ -313,11 +319,13 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **12.3 Subscription lifecycle.** Deletion MUST select the exact `(topic,name)`
   pair. By default it MUST reject every retained message state with
   `ErrSubscriptionNotEmpty`; force is durable authorization to discard all states.
-  Acceptance atomically marks the backing queue `deleting`, excludes it from
-  fan-out and the data plane, and preserves the mapping and name until bounded
-  cleanup removes the queue and mapping in the same transaction. Restart MUST resume accepted
-  cleanup without another force authorization. The last active subscription's
-  retirement makes its implicit topic unavailable immediately.
+  Acceptance MUST atomically exclude the backing queue from fan-out and the data
+  plane and start bounded cleanup. If that cleanup finishes in the accepting
+  transaction, it MUST remove the queue and mapping and return `deleted`. Otherwise
+  it MUST commit a `deleting` marker that preserves the mapping and name until a
+  later transaction removes both. Restart MUST resume accepted pending cleanup
+  without another force authorization. The last active subscription's retirement
+  makes its implicit topic unavailable immediately.
 - **12.4 Bounded inventory.** The compatibility `ListSubscriptions` operation MUST
   return every active subscription in `(topic,name)` order. The paged operation
   MUST use the same order, default to 100, reject limits above 1,000, return an
