@@ -294,7 +294,8 @@ func TestSubscriptionToolsContract(t *testing.T) {
 
 	malformed := callTool("delete_subscription", map[string]any{"topic": "events", "name": "bad-ack"})
 	text := malformed["content"].([]map[string]any)[0]["text"].(string)
-	if malformed["isError"] != true || !strings.Contains(text, "outcome unknown") || !strings.Contains(text, "list_subscriptions") {
+	if malformed["isError"] != true || !strings.Contains(text, "outcome unknown") ||
+		!strings.Contains(text, "list_subscriptions(include_deleting: true)") {
 		t.Fatalf("malformed acknowledgement presented as success: %v", malformed)
 	}
 	<-requests
@@ -364,7 +365,7 @@ func TestLifecycleDeleteToolTransportFailureIsUnknownAndNotRetried(t *testing.T)
 		hint string
 	}{
 		{wire.PathDeleteQueue, wire.DeleteQueueRequest{Name: "orders", Force: true}, "list_queues"},
-		{wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: "events", Name: "audit", Force: true}, "list_subscriptions"},
+		{wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: "events", Name: "audit", Force: true}, "list_subscriptions(include_deleting: true)"},
 	} {
 		var calls atomic.Int32
 		broker.endpoint = "http://broker.invalid"
@@ -395,7 +396,7 @@ func TestLifecycleDeleteToolServerErrorsAreUnknownAndNotRetried(t *testing.T) {
 		hint string
 	}{
 		{"delete_queue", map[string]any{"name": "orders", "force": true}, wire.PathDeleteQueue, "list_queues"},
-		{"delete_subscription", map[string]any{"topic": "events", "name": "audit", "force": true}, wire.PathDeleteSubscription, "list_subscriptions"},
+		{"delete_subscription", map[string]any{"topic": "events", "name": "audit", "force": true}, wire.PathDeleteSubscription, "list_subscriptions(include_deleting: true)"},
 	} {
 		var calls atomic.Int32
 		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -469,7 +470,7 @@ func TestLifecycleDeleteToolDoesNotFollowRedirect(t *testing.T) {
 		hint string
 	}{
 		{"delete_queue", map[string]any{"name": "orders"}, wire.PathDeleteQueue, "list_queues"},
-		{"delete_subscription", map[string]any{"topic": "events", "name": "audit"}, wire.PathDeleteSubscription, "list_subscriptions"},
+		{"delete_subscription", map[string]any{"topic": "events", "name": "audit"}, wire.PathDeleteSubscription, "list_subscriptions(include_deleting: true)"},
 	} {
 		var sourceCalls atomic.Int32
 		var targetCalls atomic.Int32
