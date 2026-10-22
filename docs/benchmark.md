@@ -318,8 +318,8 @@ sends one unique 256-byte body, receives and verifies that exact body, then
 completes it before starting the next cycle. This keeps the live message working
 set bounded while exercising normal background maintenance.
 
-The four logical lanes share a fixed admission limit of three harness database
-calls in flight (`foreground_max_in_flight=3` in `metadata.json`). Their initial
+The four logical lanes share a fixed admission limit of two harness database
+calls in flight (`foreground_max_in_flight=2` in `metadata.json`). Their initial
 starts use nominal 0, 250, 500 and 750 ms offsets, recorded as a 250 ms lane-start
 stagger in the metadata. Against the four-connection remote pool, this avoids a
 synchronized startup burst and keeps foreground call demand below the pool limit,
