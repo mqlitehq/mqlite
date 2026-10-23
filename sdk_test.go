@@ -2569,7 +2569,7 @@ func TestRemoteLifecycleDeleteServerErrorsAreOutcomeUnknown(t *testing.T) {
 		hint string
 	}{
 		{"queue", wire.PathDeleteQueue, "ListQueues"},
-		{"subscription", wire.PathDeleteSubscription, "ListSubscriptionsPage"},
+		{"subscription", wire.PathDeleteSubscription, "ListSubscriptionsWithOptions with IncludeDeleting: true"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -2667,7 +2667,8 @@ func TestRemoteDeleteSubscriptionTransportSafety(t *testing.T) {
 		}
 		_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker", mqlite.DeleteSubscriptionOpts{Force: true})
 		if !errors.Is(err, mqlite.ErrOutcomeUnknown) || errors.Is(err, transportFailure) ||
-			!strings.Contains(err.Error(), transportFailure.Error()) || !strings.Contains(err.Error(), "ListSubscriptionsPage") {
+			!strings.Contains(err.Error(), transportFailure.Error()) ||
+			!strings.Contains(err.Error(), "ListSubscriptionsWithOptions with IncludeDeleting: true") {
 			t.Fatalf("delete transport failure = %v", err)
 		}
 		if got := calls.Load(); got != 1 {
@@ -2693,7 +2694,8 @@ func TestRemoteDeleteSubscriptionTransportSafety(t *testing.T) {
 		}
 		defer client.Close()
 		_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker", mqlite.DeleteSubscriptionOpts{Force: true})
-		if !errors.Is(err, mqlite.ErrOutcomeUnknown) || !strings.Contains(err.Error(), "ListSubscriptionsPage") {
+		if !errors.Is(err, mqlite.ErrOutcomeUnknown) ||
+			!strings.Contains(err.Error(), "ListSubscriptionsWithOptions with IncludeDeleting: true") {
 			t.Fatalf("redirected delete = %v", err)
 		}
 		if sourceCalls.Load() != 1 || targetCalls.Load() != 0 {
@@ -2718,7 +2720,8 @@ func TestRemoteDeleteSubscriptionTransportSafety(t *testing.T) {
 		}
 		defer client.Close()
 		_, err = client.DeleteSubscriptionWithOptions(context.Background(), "events", "worker", mqlite.DeleteSubscriptionOpts{Force: true})
-		if !errors.Is(err, mqlite.ErrOutcomeUnknown) || !strings.Contains(err.Error(), "ListSubscriptionsPage") {
+		if !errors.Is(err, mqlite.ErrOutcomeUnknown) ||
+			!strings.Contains(err.Error(), "ListSubscriptionsWithOptions with IncludeDeleting: true") {
 			t.Fatalf("invalid acknowledgement = %v", err)
 		}
 		if calls.Load() != 1 {

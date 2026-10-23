@@ -556,7 +556,7 @@ func callTool(name string, args map[string]any) map[string]any {
 					var response wire.DeleteSubscriptionResponse
 					response, err = wire.DecodeDeleteResponse([]byte(text))
 					if err != nil {
-						err = fmt.Errorf("outcome unknown: invalid deletion acknowledgement; inspect list_subscriptions to reconcile")
+						err = fmt.Errorf("outcome unknown: invalid deletion acknowledgement; inspect list_subscriptions(include_deleting: true) to reconcile")
 					} else {
 						validated = response
 					}
@@ -696,7 +696,7 @@ func isLifecycleDeletePath(path string) bool {
 
 func deletionReconcileHint(path string) string {
 	if path == wire.PathDeleteSubscription {
-		return "inspect list_subscriptions to reconcile"
+		return "inspect list_subscriptions(include_deleting: true) to reconcile"
 	}
 	return "inspect list_queues to reconcile"
 }

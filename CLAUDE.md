@@ -274,11 +274,13 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
 - **Resource names are the public address.** Do not expose an internal incarnation,
   generation or storage token through engine, wire, SDK, CLI, MCP or console types.
   Name-only deletion cannot fence an ABA delete/recreate race, so callers must own
-  and serialize deletion with same-name recreation. An accepted deletion first
-  persists `deleting`; queue operations are rejected without taking effect and
-  creation returns name-conflict until bounded cleanup removes the row. Keep this
-  limitation explicit in API and operational documentation rather than spreading
-  identity metadata through otherwise unrelated send and receive paths.
+  and serialize deletion with same-name recreation. An accepted transaction first
+  fences the resource and performs bounded cleanup. It commits `deleted` when that
+  cleanup finishes in the transaction; otherwise it persists `deleting`, rejects
+  queue operations without effect, and returns name-conflict on creation until
+  later cleanup removes the row. Keep this limitation explicit in API and operational
+  documentation rather than spreading identity metadata through otherwise unrelated
+  send and receive paths.
 - **One SQL statement per `exec`** — remote Hrana (libSQL) requires it; schema is a
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
 - **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do

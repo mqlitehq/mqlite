@@ -64,7 +64,7 @@ func isLifecycleDeletePath(path string) bool {
 
 func lifecycleReconcileHint(path string) string {
 	if path == wire.PathDeleteSubscription {
-		return "ListSubscriptionsPage"
+		return "ListSubscriptionsWithOptions with IncludeDeleting: true"
 	}
 	return "ListQueues"
 }
@@ -525,7 +525,7 @@ func (c *Client) DeleteSubscriptionWithOptions(ctx context.Context, topic, name 
 	}
 	resp, err := wire.DecodeDeleteResponse(data)
 	if err != nil {
-		return DeleteResult{}, fmt.Errorf("%w: invalid deletion acknowledgement; inspect ListSubscriptionsPage to reconcile", ErrOutcomeUnknown)
+		return DeleteResult{}, fmt.Errorf("%w: invalid deletion acknowledgement; inspect ListSubscriptionsWithOptions with IncludeDeleting: true to reconcile", ErrOutcomeUnknown)
 	}
 	return DeleteResult{Deleted: resp.Deleted, State: resp.State}, nil
 }
