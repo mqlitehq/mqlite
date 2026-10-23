@@ -2859,8 +2859,10 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = evidence.close() })
 	started := time.Now()
+	// This short local smoke leaves periodic sampling to focused policy tests. It
+	// exercises workload drain, final sampling, and evidence generation.
 	runner := &tursoSoakRunner{
-		e: e, cfg: tursoSoakConfig{Duration: 1250 * time.Millisecond, Window: 100 * time.Millisecond, CallTimeout: 5 * time.Second},
+		e: e, cfg: tursoSoakConfig{Duration: 1250 * time.Millisecond, Window: time.Minute, CallTimeout: 5 * time.Second},
 		evidence: evidence, started: started, windowStarted: started, states: make([]*tursoSoakLaneState, 0, len(tursoSoakLanes)),
 		admission: newTursoSoakAdmission(tursoSoakMaxInFlight), failureSignal: make(chan struct{}, 1),
 		stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
@@ -2892,8 +2894,11 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 		t.Fatalf("window evidence missing: lines=%d err=%v", bytes.Count(data, []byte{'\n'}), err)
 	}
 	lines := bytes.Split(bytes.TrimSpace(data), []byte{'\n'})
+	if len(lines) != 1 {
+		t.Fatalf("window evidence lines=%d, want one final window", len(lines))
+	}
 	var window tursoSoakWindow
-	if err := json.Unmarshal(lines[len(lines)-1], &window); err != nil || len(window.Maintenance) != len(MaintenanceTaskNames()) || window.Monitor.Status != "ok" {
+	if err := json.Unmarshal(lines[0], &window); err != nil || !window.Partial || len(window.Maintenance) != len(MaintenanceTaskNames()) || window.Monitor.Status != "ok" {
 		t.Fatalf("window evidence missing: tasks=%d monitor=%+v err=%v", len(window.Maintenance), window.Monitor, err)
 	}
 	var summary tursoSoakSummary
