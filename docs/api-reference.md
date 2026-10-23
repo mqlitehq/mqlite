@@ -6,9 +6,9 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
-This reference follows `main`, the unreleased v0.4.0 candidate. The latest
-supported release is v0.3.2; use the documentation in that tag for its smaller
-management surface. Sections for candidate-only methods are labeled below.
+This reference describes v0.4.0, the latest supported release. v0.3.3 is
+withdrawn and unsupported; use the documentation in the v0.3.2 tag when working
+with its smaller management surface.
 
 Every RPC body must be exactly one non-null JSON object, including operations
 whose request is otherwise empty (`{}`). Unknown fields and data after that object
@@ -441,11 +441,10 @@ All paths are `/mqlite.v1.AdminService/<Method>`.
 
 ### DeleteQueue
 
-The corrected name-only contract below is on **main** and planned for v0.4.0. The
-incompatible request shape shipped in the withdrawn, unsupported v0.3.3 release;
-its public artifacts remain available for forensic or compatibility inspection
-and must not be deployed. `main` declares `retract v0.3.3`, but Go module tools
-will discover that directive only after a later version containing it is tagged.
+v0.4.0 uses the corrected name-only contract below. The incompatible request
+shape shipped in the withdrawn, unsupported v0.3.3 release; its public artifacts
+remain available for forensic or compatibility inspection and must not be
+deployed. v0.4.0 carries the `retract v0.3.3` directive for Go module tools.
 
 Deletes a **plain queue**. Requires administrator/manage permission. The default
 is empty-only; force is a separate, explicit authorization to discard retained
@@ -524,8 +523,7 @@ authorize discard and receive the `Deleted` / `State` outcome. Reconcile a
 progresses without another delete.
 
 The public identity remains the queue name; force does not introduce a lifetime
-token. Durable deletion and fixed-lifetime metadata make the unreleased v0.4.0
-candidate schema token 7,
+token. Durable deletion and fixed-lifetime metadata make v0.4.0 schema token 7,
 which refuses schema-5 and schema-6 files rather than migrating them. Schema 6
 belonged only to intermediate unreleased builds and was never tagged.
 The console exposes **delete queue** in a plain queue's detail page and requires
@@ -537,7 +535,7 @@ operation as unsupported.
 
 ### DeleteSubscription
 
-Available on **main** and planned for v0.4.0.
+Available in v0.4.0.
 
 Deletes one exact topic/subscription pair. It uses the same durable, bounded
 lifecycle as `DeleteQueue`, but owns both the topic roster mapping and the
@@ -626,7 +624,7 @@ Register subscription `name` under `topic` (creates its backing queue).
   bytes. A malformed expr or name is rejected with `400 invalid_argument`.
   **Response** `{}`.
 - The same route accepts `SubscribeWithOptionsRequest`, which adds optional
-  `ttl_ms` on **main**, planned for v0.4.0. A positive integer stores a fixed lifetime
+  `ttl_ms` in v0.4.0. A positive integer stores a fixed lifetime
   from the first successful creation; omitted or zero creates a permanent
   subscription when the name is new, and preserves an existing subscription's
   lifetime. JSON `null`, fractions,
@@ -674,8 +672,7 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 
 ### ListQueues
 
-The `state` field and deleting-resource visibility below are available in
-**main**, planned for v0.4.0.
+The `state` field and deleting-resource visibility below are available in v0.4.0.
 
 - **Request** `{}`. **Response** `ListQueuesResponse`: `queues` ([{`name`, `kind`,
   `state`, `lock_duration_ms`, `max_delivery_count`, `default_ttl_ms`,
@@ -697,7 +694,7 @@ The `state` field and deleting-resource visibility below are available in
 
 ### ListSubscriptionsPage
 
-Available on **main** and planned for v0.4.0.
+Available in v0.4.0.
 
 - POST `/mqlite.v1.AdminService/ListSubscriptionsPage`.
 - Request fields: `topic` (optional exact topic), `after` (an opaque cursor from

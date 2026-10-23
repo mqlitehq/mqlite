@@ -1,12 +1,10 @@
 # Production operations
 
-This runbook covers the latest supported release, v0.3.2 (port 6754, schema
-token 5), and the `main` branch's unreleased v0.4.0 candidate (port 6754, schema
+This runbook covers the latest supported release, v0.4.0 (port 6754, schema
 token 7). v0.3.3 is withdrawn and unsupported; its public assets and exact image
 remain available for forensic or compatibility inspection and must not be
-deployed. Pin production deployments to v0.3.2 until a corrected release is
-tagged. Although `main` declares `retract v0.3.3`, Go module tools will discover
-that directive only after a later version containing it is tagged.
+deployed. The v0.4.0 module retracts v0.3.3. Upgrading from v0.3.2 or another
+schema-5 release requires a fresh database as described below.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
@@ -38,7 +36,7 @@ for metric definitions and alerts.
   when retrying within their documented retention windows; do not treat an HTTP
   timeout as proof that a write failed.
 
-The next three boundaries apply to the unreleased `main` candidate. v0.3.2 has
+The next three boundaries apply to v0.4.0 and later. v0.3.2 has
 the complete active-only `ListSubscriptions` operation, but it does not provide
 queue/subscription deletion, lifecycle-aware paged subscription inventory, the
 subscription capacity setting, or fixed subscription TTL.
@@ -249,21 +247,20 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
 
-For a future **v0.3.0, v0.3.1, v0.3.2 or withdrawn v0.3.3 → v0.4.0**
-cutover, the schema changes
+For a cutover from **v0.3.0, v0.3.1, v0.3.2 or withdrawn v0.3.3 to v0.4.0**,
+the schema changes
 from **5 → 7** while port **6754** stays unchanged. Durable queue lifecycle and
 fixed subscription-expiry columns and indexes make the database incompatible;
 there is no in-place migration. Schema 6 belonged only to an intermediate
 unreleased lifecycle build, was never tagged, and is refused too.
 Follow the different-token procedure above: stop producers and consumers, take a
 consistent schema-5 backup, account for every retained message state and managed
-key, preserve the matching old binary/database pair, and start the candidate or
-eventual v0.4.0 release with
-a fresh database. Do not edit the schema token or point schema-7 code at the old
+key, preserve the matching old binary/database pair, and start v0.4.0 with a
+fresh database. Do not edit the schema token or point schema-7 code at the old
 file. Move work through an application-level drain/replay process with stable
 business identities if it must survive the cutover.
 
-The unreleased candidate clients also change the deletion contract to
+The v0.4.0 clients use the deletion contract
 `{name,force?}` with a typed
 `{deleted,state}` result; update broker, SDK, CLI, MCP and console together. A
 rollback after schema-7 accepts writes requires preserving and reconciling those
@@ -275,10 +272,9 @@ Before the cutover, replace Prometheus `mqlite_queue_total` queries with
 `mqlite_queue_retained_messages`. Replace
 `mqlite_queue_oldest_message_age_ms` with
 `mqlite_queue_oldest_message_age_seconds` and divide thresholds by 1,000. The
-planned v0.4.0 release
-removes both deprecated aliases; native `Observe` JSON keeps
+v0.4.0 release removes both deprecated aliases; native `Observe` JSON keeps
 `queues[].oldest_message_age_ms`. Validate recording rules, alerts and dashboards
-against the candidate before resuming traffic.
+against v0.4.0 before resuming traffic.
 
 For **v0.3.1 → v0.3.2**, schema token **5**, port **6754**, message data and
 managed-key storage remain unchanged. Follow the same-schema procedure above;
@@ -297,11 +293,11 @@ restore the previous authorized scraper/rule configuration; the old `/metrics`
 endpoint requires an administrator. Keep administrator authentication enabled.
 Preserve writes accepted by the candidate rather than blindly restoring the
 pre-upgrade snapshot. The two deprecated metric aliases remain available in
-v0.3.2 and are removed on `main` for the planned v0.4.0 release; see
-[metric compatibility](observability.md#compatibility-and-planned-v040-migration).
+v0.3.2 and are removed in v0.4.0; see
+[metric compatibility](observability.md#compatibility-and-v040-migration).
 
 For **v0.3.0 → v0.3.1 or v0.3.2**, schema token **5** and the port remain unchanged.
-The candidate adds the independent `access_keys` table without rewriting existing
+The newer release adds the independent `access_keys` table without rewriting existing
 queue or message tables. Rehearse opening a restored copy first. Rolling back to
 v0.3.0 preserves that extra table, but the old binary cannot authenticate managed
 keys or enforce their permissions: reconnect clients with configured administrator

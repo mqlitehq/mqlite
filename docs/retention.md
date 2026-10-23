@@ -1,14 +1,11 @@
 # Retention, deletion, and storage reclamation
 
-This page describes the implemented behavior on `main`, an unreleased v0.4.0
-candidate. The latest supported release is v0.3.2. v0.3.3 is withdrawn and
+This page describes v0.4.0, the latest supported release. v0.3.3 is withdrawn and
 unsupported; its public artifacts remain available for forensic or compatibility
-inspection and must not be deployed. `main`'s retraction directive will become
-visible to Go module tools only after a later version containing it is tagged.
-v0.3.2 has DLQ retention
-and automatic local reclamation, but the work budgets below describe `main` unless
-a version difference is stated. v0.3.2 does not have the candidate queue and
-subscription lifecycle APIs.
+inspection and must not be deployed. The v0.4.0 module retracts v0.3.3. v0.3.2
+has DLQ retention and automatic local reclamation, but the work budgets below
+describe v0.4.0 unless a version difference is stated. v0.3.2 does not have the
+queue and subscription lifecycle APIs introduced in v0.4.0.
 
 ## What removes retained messages
 

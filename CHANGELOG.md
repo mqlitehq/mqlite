@@ -10,25 +10,26 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## Unreleased — planned v0.4.0
+## v0.4.0 — 2026-10-23
 
-> **Planned upgrade from v0.3.2 or withdrawn v0.3.3:** port **6754** remains
+> **Upgrade from v0.3.2 or withdrawn v0.3.3:** port **6754** remains
 > unchanged, but
 > the canonical schema token changes from **5 → 7**. There is no in-place
 > migration. Stop writers, take a consistent backup, account for every retained
 > message and managed key, preserve the schema-5 binary/database pair, and start
-> the eventual v0.4.0 release with a fresh database. Until that release is tagged,
-> pin production deployments to v0.3.2. Schema 6 belonged only to intermediate
+> v0.4.0 with a fresh database. Schema 6 belonged only to intermediate
 > unreleased lifecycle builds and is refused as well; it was never a tagged release.
 >
 > The v0.3.3 release remains withdrawn and unsupported. Its public assets and exact
 > image remain available for forensic or compatibility inspection and must not be
-> deployed. `main` contains a retraction directive, but Go module tools will
-> discover it only after a later version containing the directive is tagged. Its
-> public queue `Generation` contract was
-> removed; this unreleased line addresses resources by name and requires one owner
-> to serialize deletion with same-name recreation. Upgrade the broker, SDK, CLI,
-> MCP and console together when adopting the corrected deletion APIs.
+> deployed. v0.4.0 carries the retraction directive, so Go module tools avoid
+> v0.3.3. The withdrawn release's public queue `Generation` contract was removed;
+> v0.4.0 addresses resources by name and requires one owner to serialize deletion
+> with same-name recreation. Upgrade the broker, SDK, CLI, MCP and console together
+> when adopting the corrected deletion APIs. v0.4.0 retains the bounded maintenance
+> diagnostics and private diagnostic log first shipped in v0.3.3 while replacing
+> v0.3.3's public queue-lifetime contract; the earlier release remains withdrawn
+> as a whole.
 >
 > **Prometheus migration:** the aliases `mqlite_queue_total` and
 > `mqlite_queue_oldest_message_age_ms`, deprecated in v0.3.2, are removed.
@@ -39,7 +40,7 @@ upgrade notes before replacing a broker.
 ### Remove deprecated Prometheus aliases (MQLITE-129)
 
 - Remove the `mqlite_queue_total` and `mqlite_queue_oldest_message_age_ms`
-  compatibility families on the planned v0.4.0 boundary. The canonical
+  compatibility families on the v0.4.0 boundary. The canonical
   retained-depth and age-in-seconds families remain exact projections of the
   native observation snapshot, and the bundled dashboard, rules and verifier use
   only those canonical names.
@@ -241,10 +242,10 @@ upgrade notes before replacing a broker.
   option without bringing lifetime identity into data-plane requests.
 - This is an intentional breaking correction for v0.3.3 clients. The v0.3.3
   release is withdrawn and unsupported; its public artifacts remain available for
-  forensic or compatibility inspection and must not be deployed. `main` carries a
-  pending retraction directive; v0.3.2 clients are unaffected. This correction itself kept
+  forensic or compatibility inspection and must not be deployed. v0.4.0 carries
+  its retraction directive; v0.3.2 clients are unaffected. This correction itself kept
   schema token **5**; MQLITE-126 advanced the v0.4.0 development line to token 6,
-  and MQLITE-128 advanced the unreleased candidate schema to token 7.
+  and MQLITE-128 advanced the release schema to token 7.
 - Make the name-reuse boundary explicit. Queue deletion and same-name recreation
   must be serialized by one owner. Do not replay an old deletion after recreation;
   reconcile an uncertain result before allowing the name to be reused.
@@ -253,13 +254,12 @@ upgrade notes before replacing a broker.
   stable shared reply subscription and dispatch replies by correlation ID instead
   of creating one subscription per request.
 
-## v0.3.3 — 2026-10-13 (withdrawn; retraction pending a later tag)
+## v0.3.3 — 2026-10-13 (withdrawn; retracted by v0.4.0)
 
 > **Withdrawn:** this release exposed queue lifetime metadata as a public API and
-> spread it through deletion clients. That contract is removed on `main` for the
-> planned v0.4.0 release. `main` also declares `retract v0.3.3`; Go module tools
-> will recognize it only after a later version containing that directive is tagged.
-> Pin production use to v0.3.2 until then.
+> spread it through deletion clients. That contract is removed in v0.4.0, which
+> also declares `retract v0.3.3`. Use v0.4.0 or later, or remain on v0.3.2 when an
+> immediate schema-5 to schema-7 cutover is not possible.
 
 > **Upgrade from v0.3.2:** port **6754**, schema token **5**, message data and
 > managed-key storage remain compatible. Keep one active broker per database and

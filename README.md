@@ -3,10 +3,10 @@
 # mqlite
 
 [![CI](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.3.2.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.3.2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.4.0.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.4.0)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mqlitehq/mqlite)](https://goreportcard.com/report/github.com/mqlitehq/mqlite)
 [![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
-[![Supported release: v0.3.2](https://img.shields.io/badge/release-v0.3.2-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.3.2)
+[![Supported release: v0.4.0](https://img.shields.io/badge/release-v0.4.0-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.0)
 [![Go](https://img.shields.io/github/go-mod/go-version/mqlitehq/mqlite)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -18,13 +18,11 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
 
-> **Release status:** v0.3.2 is the latest supported release; v0.3.3 is withdrawn
+> **Release status:** v0.4.0 is the latest supported release; v0.3.3 is withdrawn
 > and unsupported. Its public assets and exact image remain available for
-> forensic or compatibility inspection and must not be deployed. `main` is an
-> unreleased v0.4.0 candidate. Its
-> `retract v0.3.3` directive will be recognized by Go module tools only after a
-> later version containing that directive is tagged. Pin production installs to
-> the exact v0.3.2 release or `ghcr.io/mqlitehq/mqlite:0.3.2`.
+> forensic or compatibility inspection and must not be deployed. v0.4.0 carries
+> its retraction directive. Pin production installs to the exact v0.4.0 release or
+> `ghcr.io/mqlitehq/mqlite:0.4.0`.
 
 ## Goal
 
@@ -276,7 +274,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 | `MQLITE_MONITOR_TOKENS` | optional, distinct read-only credentials for `observe` and `/metrics`; administrator auth must remain enabled |
 | `MQLITE_METRICS` | enable authenticated Prometheus `/metrics` on the API port (`on`/`true`/`1`; default `off`); requires administrator auth |
 | `MQLITE_SYNC` | durability level: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (an unknown value is rejected at startup) |
-| `MQLITE_MAX_SUBSCRIPTIONS` | main / planned v0.4.0: maximum active plus deleting subscriptions (default 10,000) |
+| `MQLITE_MAX_SUBSCRIPTIONS` | v0.4.0+: maximum active plus deleting subscriptions (default 10,000) |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous broker DLQ retention targets (defaults 14d / 1,000,000 per queue, drop-oldest; byte target off by default; `MQLITE_DLQ_RETENTION=off` disables broker-wide defaults) |
 
 > The DB connection string is **only ever read from the environment** — it is
@@ -391,7 +389,7 @@ for retained data plus WAL, indexes, fragmentation, reclamation lag and backups.
 A full `VACUUM` rewrite stays manual-only via `mqlite vacuum`. See
 [docs/retention.md](docs/retention.md).
 
-On main (planned for v0.4.0), queue and subscription deletion follow the same
+Starting with v0.4.0, queue and subscription deletion follow the same
 bounded-storage principle. They
 are empty-only by default; `--force` explicitly discards active, locked,
 scheduled, deferred and dead-letter work. The accepting transaction moves the
@@ -479,28 +477,23 @@ throughput, memory, and disk methodology and numbers:
 
 ## Status
 
-The latest supported release is **v0.3.2** (port 6754, schema token 5). Pin
-production binaries to the v0.3.2 release and containers to
-`ghcr.io/mqlitehq/mqlite:0.3.2`. v0.3.3 is withdrawn and unsupported; its public
+The latest supported release is **v0.4.0** (port 6754, schema token 7). Pin
+production binaries to the v0.4.0 release and containers to
+`ghcr.io/mqlitehq/mqlite:0.4.0`. v0.3.3 is withdrawn and unsupported; its public
 assets and exact image remain available for forensic or compatibility inspection
-and must not be deployed. The retraction directive currently exists only on the
-unreleased `main` branch, so Go module tools will not report v0.3.3 as retracted
-until a later version containing that directive is tagged.
+and must not be deployed. v0.4.0 carries its retraction directive.
 
-The `main` branch is an **unreleased v0.4.0 candidate** with schema token 7. It
-removes v0.3.3's public queue `Generation` contract and adds the corrected resource
-lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md). Build it from source only
-when deliberately testing the candidate; there is no v0.4.0 tag or published
-`0.4.0` image yet.
+v0.4.0 removes v0.3.3's public queue `Generation` contract and adds the corrected
+resource lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md).
 
-**Moving a schema-5 database to a future v0.4.0 release will require a fresh
-database.** Stop writers, take a consistent backup, account for retained work in
+**Moving a schema-5 database to v0.4.0 requires a fresh database.** Stop writers,
+take a consistent backup, account for retained work in
 every state, and preserve the old binary/database pair for rollback. Do not restamp
 or point schema-7 code at the old file. Schema 6 belonged only to intermediate
 unreleased lifecycle builds and is also refused. See
 [upgrade and rollback](docs/operations.md#upgrade-and-rollback).
 
-The planned v0.4.0 release also removes the deprecated Prometheus aliases
+v0.4.0 also removes the deprecated Prometheus aliases
 `mqlite_queue_total` and `mqlite_queue_oldest_message_age_ms`. Migrate to
 `mqlite_queue_retained_messages` and
 `mqlite_queue_oldest_message_age_seconds` before upgrading. The native JSON field

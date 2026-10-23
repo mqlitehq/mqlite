@@ -22,7 +22,7 @@ Everything is read from the environment — the DB string is never compiled in.
 | `MQLITE_MONITOR_TOKENS` | v0.3.2+: optional comma-separated credentials for `Observe` and `/metrics` only; requires auth and distinct administrator credentials |
 | `MQLITE_METRICS` | v0.3.2+: opt-in authenticated `/metrics` on the API port; `on`/`true`/`1` enables, `off`/`false`/`0` disables (default); requires administrator auth |
 | `MQLITE_SYNC` | durability: `NORMAL` (default) / `FULL` / `OFF` / `EXTRA` (local file only); an unrecognized value is rejected at startup |
-| `MQLITE_MAX_SUBSCRIPTIONS` | main / planned v0.4.0: active plus deleting subscription capacity (default 10,000); pending cleanup continues to occupy a slot |
+| `MQLITE_MAX_SUBSCRIPTIONS` | v0.4.0+: active plus deleting subscription capacity (default 10,000); pending cleanup continues to occupy a slot |
 | `MQLITE_DLQ_MAX_AGE` · `MQLITE_DLQ_MAX_COUNT` · `MQLITE_DLQ_MAX_BYTES` | asynchronous DLQ retention targets (defaults 14d / 1,000,000 per queue; byte target off; `MQLITE_DLQ_RETENTION=off` disables broker-wide defaults) — see [retention.md](retention.md) |
 | `MQLITE_MAX_MESSAGE_BYTES` | reject larger bodies (default 1 MiB) |
 | `MQLITE_UI` | serve the embedded admin console at `/ui` (default on; `off` runs headless) |
@@ -48,23 +48,18 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> The latest supported release is **v0.3.2**, with default port **6754** and
-> schema token **5**. v0.3.3 is withdrawn and unsupported; its public assets and
-> exact image remain available for forensic or compatibility inspection and must
-> not be deployed. Pin the exact v0.3.2 binary or image;
-> do not select v0.3.3, and do not rely on a moving image alias to choose a
-> production version.
+> The latest supported release is **v0.4.0**, with default port **6754** and
+> schema token **7**. Pin the exact v0.4.0 binary or image rather than relying on
+> a moving image alias. v0.3.3 is withdrawn, unsupported, and retracted by
+> v0.4.0; its public assets and exact image remain available for forensic or
+> compatibility inspection and must not be deployed.
 >
-> `main` declares `retract v0.3.3`, but Go module tools will discover that
-> directive only after a later version containing it is tagged.
->
-> The `main` branch is an unreleased v0.4.0 candidate with schema token 7. It
-> cannot open a v0.3.x database and no in-place migration exists. Schema 6 was
-> used only by intermediate untagged lifecycle builds and is also refused. Before
-> testing the candidate, preserve the matching schema-5 binary/database pair, take
-> a consistent backup, account for retained work, and start with a fresh database.
-> The candidate also removes the deprecated Prometheus aliases described in
-> [observability](observability.md#compatibility-and-planned-v040-migration).
+> v0.4.0 cannot open a v0.3.x schema-5 database and no in-place migration exists.
+> Schema 6 was used only by intermediate untagged lifecycle builds and is also
+> refused. Preserve the matching schema-5 binary/database pair, take a consistent
+> backup, account for retained work, and start v0.4.0 with a fresh database.
+> v0.4.0 also removes the deprecated Prometheus aliases described in
+> [observability](observability.md#compatibility-and-v040-migration).
 > **v0.2.0 uses port 8080 and schema token 2.** Follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before
 > replacing it.
@@ -72,35 +67,23 @@ and error reference: [api-reference.md](api-reference.md).
 The exact supported image is multi-arch (amd64 + arm64):
 
 ```bash
-# v0.3.2, default port 6754
+# v0.4.0, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.3.2
+  ghcr.io/mqlitehq/mqlite:0.4.0
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin exact `0.3.2` in production. Images `>= 0.3.0` listen on `6754`;
+- Pin exact `0.4.0` in production. Images `>= 0.3.0` listen on `6754`;
   **`0.2.x` and earlier listen on `8080`**.
 - Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. Metrics is
   disabled by default. For a private broker or an ingress that blocks public
   `/metrics`, add `-e MQLITE_METRICS=on` and give the collector a monitor token.
   Scraping uses the same API port; enabled discovery includes `"metrics":"/metrics"`.
-
-To evaluate the unreleased candidate, build a reviewed `main` commit locally and
-tag that image with its commit rather than a release number:
-
-```bash
-git clone https://github.com/mqlitehq/mqlite.git
-cd mqlite
-git checkout <reviewed-commit-sha>
-docker build --pull -t mqlite:main-<reviewed-commit-sha> .
-```
-
-Do not point this candidate at a schema-5 production database.
 
 ## Fly.io (minimal cost)
 
@@ -112,7 +95,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.3.2"   # latest supported exact image
+  image = "ghcr.io/mqlitehq/mqlite:0.4.0"   # latest supported exact image
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -226,15 +209,15 @@ online snapshots, offline directory copies, isolated restore validation and roll
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
 **v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and withdrawn
-v0.3.3 use schema 5; `main`, the unreleased v0.4.0 candidate, uses schema 7.**
+v0.3.3 use schema 5; v0.4.0 uses schema 7.**
 Intermediate untagged lifecycle builds used schema 6. There is no in-place
 migration between these tokens. Before testing a different token, account for
 retained work in every state, keep the old binary/database pair and a consistent
-backup, and create the candidate database separately. Do not restamp an old file.
+backup, and create the v0.4.0 database separately. Do not restamp an old file.
 Within the tagged schema-5 line, v0.3.0 → v0.3.1 adds compatible managed-key
 storage and v0.3.1 → v0.3.2 leaves the schema unchanged. `Observe` and configured
 monitor credentials require v0.3.2; restore compatible monitoring configuration
-when rolling back. Follow the runbook before a future v0.4.0 fresh-database cutover
+when rolling back. Follow the runbook before a v0.4.0 fresh-database cutover
 and metric-name migration.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).
 
