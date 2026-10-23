@@ -267,7 +267,7 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestAccessKeySchemaConflict, TestAccessKeyCreationIndexUpgradeAndConflicts;
   test/production/restore/run.py, compat.py)*
 - **10.5** Durable resource lifecycle and fixed subscription-expiry columns and
-  indexes make the unreleased candidate schema token 7 incompatible with the released schema-5
+  indexes make the v0.4.0 schema token 7 incompatible with the older schema-5
   layout and intermediate schema-6 layout. Each binary MUST refuse the other's
   database rather than adding columns, restamping the token or partially opening
   it. Operators must create a fresh database and preserve the matching old

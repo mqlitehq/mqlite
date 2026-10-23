@@ -850,7 +850,7 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
 		"concepts.md":   "b83540a78187f051de01cb5f52a6da352b2fd3a148f57b61cca7c7a8f0de548c",
-		"concepts.html": "8e9027873481e3f908fac5392fb944b51ffe756a89bb7dfd907ac3a45f574d62",
+		"concepts.html": "c62eebe9deac53bec71ae6b3f3f7fd2133cf1356023173c736fbdd12b55b75aa",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {

@@ -9,7 +9,7 @@ multi-core box) and on a deliberately tiny **cloud** box so the two tell differe
 
 > Philosophy: measure before claiming. Each result below names its harness and
 > environment; committed harnesses include `test/bench/` and native Go benchmarks.
-> These are historical workload measurements, not v0.3.2 capacity guarantees.
+> These are historical workload measurements, not capacity guarantees for any release.
 > Recheck the current binary
 > with your message sizes, concurrency, queue count and monitoring load before
 > selecting a memory or CPU limit.
