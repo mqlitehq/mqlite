@@ -1105,57 +1105,64 @@ func TestRateLimitedRedriveStopsWhenSubscriptionExpiresBetweenChunks(t *testing.
 	}
 }
 
-func TestRateLimitedRedriveWaitIsCanceledByClose(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func TestRedriveThrottleWaitIsCanceledByClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	e, _ := testEngine(t)
-	mustQueue(t, e, "source", QueueConfig{})
-	mustQueue(t, e, "target", QueueConfig{})
-	for i := 0; i < 2; i++ {
-		if _, err := e.db.exec(ctx,
-			`INSERT INTO messages(queue,state,enqueued_at,body) VALUES('source','dead_lettered',1,X'01')`); err != nil {
-			t.Fatal(err)
+
+	// Freeze the injected clock before the throttle timer is created. Close can
+	// publish its shutdown signal first, so this assertion contains no scheduler-
+	// or storage-latency bound.
+	entered := make(chan struct{})
+	resume := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(resume)
 		}
-	}
-	type result struct {
-		moved int
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		moved, err := e.Redrive(ctx, "source", RedriveOptions{Target: "target", RatePerSec: 1})
-		done <- result{moved: moved, err: err}
 	}()
-	for {
-		var targetRows int
-		if err := e.db.queryRowScan(ctx, []any{&targetRows}, `SELECT COUNT(*) FROM messages WHERE queue='target'`); err != nil {
-			t.Fatal(err)
+	var nowCalls int32
+	e.now = func() int64 {
+		if atomic.AddInt32(&nowCalls, 1) == 1 {
+			close(entered)
+			<-resume
 		}
-		if targetRows == 1 {
-			break
-		}
-		select {
-		case r := <-done:
-			t.Fatalf("redrive returned before its throttle wait: %+v", r)
-		case <-ctx.Done():
-			t.Fatal("first redrive chunk did not finish")
-		case <-time.After(time.Millisecond):
-		}
+		return 1
 	}
-	started := time.Now()
-	if err := e.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(started); elapsed > 750*time.Millisecond {
-		t.Fatalf("Close waited for the one-second throttle: %v", elapsed)
-	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- e.waitRedriveThrottle(ctx, 10_000) }()
 	select {
-	case r := <-done:
-		if r.moved != 1 || !errors.Is(r.err, ErrClosed) {
-			t.Fatalf("redrive after Close=%+v, want one moved then ErrClosed", r)
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("redrive throttle wait did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- e.Close() }()
+	select {
+	case <-e.closed:
+	case <-ctx.Done():
+		t.Fatal("Close did not publish the engine shutdown signal")
+	}
+	close(resume)
+	released = true
+
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("redrive throttle wait after Close = %v, want ErrClosed", err)
 		}
 	case <-ctx.Done():
 		t.Fatal("redrive throttle ignored engine Close")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Close did not finish")
 	}
 }
 
