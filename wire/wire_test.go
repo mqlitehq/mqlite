@@ -700,6 +700,31 @@ func TestObserveResponseRequiresCompleteCounterMatrices(t *testing.T) {
 	check(v, true)
 	v.Messages = append([]engine.MessageCounter{}, base.Messages...)
 	check(v, true) // Counter-only historical queues remain complete after inventory removal.
+	retired := make([]engine.MessageCounter, 0, len(engine.MessageEventNames()))
+	for _, row := range base.Messages {
+		if row.Queue == base.Queues[0].Queue {
+			row.Queue = ""
+			retired = append(retired, row)
+		}
+	}
+	if len(retired) != len(engine.MessageEventNames()) {
+		t.Fatalf("retired fixture domain = %d, want %d", len(retired), len(engine.MessageEventNames()))
+	}
+	v = base
+	v.Messages = append(append([]engine.MessageCounter{}, base.Messages...), retired...)
+	check(v, true) // The empty queue is the documented aggregate for retired resources.
+	for i := range retired {
+		missing := v
+		missing.Messages = append(append([]engine.MessageCounter{}, v.Messages[:len(base.Messages)+i]...), v.Messages[len(base.Messages)+i+1:]...)
+		check(missing, false)
+	}
+	duplicate := v
+	duplicate.Messages = append(append([]engine.MessageCounter{}, v.Messages...), retired[0])
+	check(duplicate, false)
+	emptyEvent := v
+	emptyEvent.Messages = append([]engine.MessageCounter{}, v.Messages...)
+	emptyEvent.Messages[len(base.Messages)].Event = ""
+	check(emptyEvent, false)
 	v.Collection.State, v.Collection.ErrorCode, v.Queues = "unavailable", "closed", nil
 	check(v, true)
 	v.Messages = []engine.MessageCounter{}

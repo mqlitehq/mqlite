@@ -70,6 +70,45 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+// Deleting a queue folds its process-lifetime message effects into the documented
+// queue="" retired aggregate. The HTTP observation must remain decodable so the
+// console, CLI, and SDK do not become unusable after a normal lifecycle action.
+func TestObserveRetiredAggregateDecodesAfterQueueDeletion(t *testing.T) {
+	ctx := context.Background()
+	eng := keyTestEngine(t, nil)
+	if err := eng.CreateQueue(ctx, "retired", engine.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.SendOne(ctx, "retired", engine.OutMessage{Body: []byte("work")}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := eng.DeleteQueueWithOptions(ctx, "retired", engine.DeleteOptions{Force: true})
+	if err != nil || !result.Deleted {
+		t.Fatalf("delete = %+v, %v", result, err)
+	}
+
+	s := server.New(eng, []string{"administrator-secret"})
+	s.MonitorTokens = []string{"monitor-secret"}
+	r := keyTestRequest(s.Handler(), http.MethodPost, wire.PathObserve, "monitor-secret", wire.ObserveRequest{})
+	keyTestStatus(t, r, http.StatusOK, "")
+	out, err := wire.DecodeObserveResponse(r.Body.Bytes())
+	if err != nil {
+		t.Fatalf("retired observation rejected: %v", err)
+	}
+	if out.QueueCount != 0 || out.SubscriptionCount != 0 || len(out.Queues) != 0 {
+		t.Fatalf("retired queue remained in inventory: %+v", out.Queues)
+	}
+	retired := make(map[string]uint64)
+	for _, row := range out.Messages {
+		if row.Queue == "" {
+			retired[row.Event] = row.Count
+		}
+	}
+	if len(retired) != len(engine.MessageEventNames()) || retired["enqueued"] != 1 {
+		t.Fatalf("retired event domain = %+v", retired)
+	}
+}
+
 // The exporter is off by default, including anonymous development mode.
 // Observe also remains protected even while data-plane RPCs are anonymous.
 func TestMetricsDefaultOffAndAnonymousObserveDenied(t *testing.T) {

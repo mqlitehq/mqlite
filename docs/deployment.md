@@ -48,37 +48,41 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> The latest supported release is **v0.4.0**, with default port **6754** and
-> schema token **7**. Pin the exact v0.4.0 binary or image rather than relying on
+> The latest supported release is **v0.4.1**, with default port **6754** and
+> schema token **7**. Pin the exact v0.4.1 binary or image rather than relying on
 > a moving image alias. v0.3.3 is withdrawn, unsupported, and retracted by
-> v0.4.0; its public assets and exact image remain available for forensic or
-> compatibility inspection and must not be deployed.
+> v0.4.0 and later; its public assets and exact image remain available for
+> forensic or compatibility inspection and must not be deployed.
 >
-> v0.4.0 cannot open a v0.3.x schema-5 database and no in-place migration exists.
+> v0.4.x cannot open a v0.3.x schema-5 database and no in-place migration exists.
 > Schema 6 was used only by intermediate untagged lifecycle builds and is also
 > refused. Preserve the matching schema-5 binary/database pair, take a consistent
-> backup, account for retained work, and start v0.4.0 with a fresh database.
+> backup, account for retained work, and start v0.4.1 with a fresh database.
 > v0.4.0 also removes the deprecated Prometheus aliases described in
 > [observability](observability.md#compatibility-and-v040-migration).
 > **v0.2.0 uses port 8080 and schema token 2.** Follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before
 > replacing it.
 
+v0.4.0 → v0.4.1 is a same-schema replacement. It fixes console, CLI and Go SDK
+observation validation after deleting a resource with process-lifetime message
+effects; it does not require a database rebuild.
+
 The exact supported image is multi-arch (amd64 + arm64):
 
 ```bash
-# v0.4.0, default port 6754
+# v0.4.1, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.4.0
+  ghcr.io/mqlitehq/mqlite:0.4.1
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin exact `0.4.0` in production. Images `>= 0.3.0` listen on `6754`;
+- Pin exact `0.4.1` in production. Images `>= 0.3.0` listen on `6754`;
   **`0.2.x` and earlier listen on `8080`**.
 - Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. Metrics is
   disabled by default. For a private broker or an ingress that blocks public
@@ -95,7 +99,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.4.0"   # latest supported exact image
+  image = "ghcr.io/mqlitehq/mqlite:0.4.1"   # latest supported exact image
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -209,15 +213,15 @@ online snapshots, offline directory copies, isolated restore validation and roll
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
 **v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and withdrawn
-v0.3.3 use schema 5; v0.4.0 uses schema 7.**
+v0.3.3 use schema 5; v0.4.0 and v0.4.1 use schema 7.**
 Intermediate untagged lifecycle builds used schema 6. There is no in-place
 migration between these tokens. Before testing a different token, account for
 retained work in every state, keep the old binary/database pair and a consistent
-backup, and create the v0.4.0 database separately. Do not restamp an old file.
+backup, and create the v0.4.x database separately. Do not restamp an old file.
 Within the tagged schema-5 line, v0.3.0 → v0.3.1 adds compatible managed-key
 storage and v0.3.1 → v0.3.2 leaves the schema unchanged. `Observe` and configured
 monitor credentials require v0.3.2; restore compatible monitoring configuration
-when rolling back. Follow the runbook before a v0.4.0 fresh-database cutover
+when rolling back. Follow the runbook before a v0.4.x fresh-database cutover
 and metric-name migration.
 See [upgrade and rollback](operations.md#upgrade-and-rollback).
 
