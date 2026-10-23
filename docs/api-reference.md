@@ -6,7 +6,7 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
-This reference describes v0.4.0, the latest supported release. v0.3.3 is
+This reference describes v0.4.1, the latest supported release. v0.3.3 is
 withdrawn and unsupported; use the documentation in the v0.3.2 tag when working
 with its smaller management surface.
 
@@ -170,6 +170,12 @@ clock value. Counters reset on engine/process restart; they are not a durable
 message ledger. Histograms contain cumulative finite buckets and a total count
 that is also the Prometheus `+Inf` bucket. The existing handler histogram excludes
 authentication; whole-request duration includes it and normal Receive long polls.
+
+After a queue or subscription is physically deleted, its process-lifetime message
+effects move to the documented `messages[].queue == ""` retired aggregate. v0.4.1
+corrects the Go decoder and bundled console to accept that special label while
+still requiring a complete, unique event domain. The HTTP shape and schema token
+are unchanged from v0.4.0.
 
 The shared decoder bounds observations to 32 MiB and rejects incomplete objects,
 inconsistent availability and malformed histogram data. The complete JSON schema

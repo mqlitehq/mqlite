@@ -10,6 +10,26 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
+## v0.4.1 — 2026-10-24
+
+> **Patch upgrade from v0.4.0:** the canonical schema token remains **7** and no
+> database rebuild is required. Upgrade the broker, Go client/CLI and bundled
+> console together so every observation consumer applies the same validation.
+
+### Keep observations usable after resource retirement (MQLITE-147)
+
+- Accept the documented `messages[].queue == ""` aggregate that carries
+  process-lifetime effects from deleted queues and subscriptions. v0.4.0 brokers
+  emitted this valid aggregate, but its strict Go decoder and bundled console
+  rejected it after a message-bearing resource was deleted, preventing CLI/SDK
+  Observe calls and console login until the broker restarted.
+- Keep validation fail-closed: the retired aggregate must still contain one
+  unique row for every message-event label, and an empty event or an incomplete
+  or duplicate domain is rejected.
+- Add the exact create, send, force-delete, Observe/decode regression and a
+  logged-out browser login regression. The wire shape, HTTP API and schema remain
+  unchanged.
+
 ## v0.4.0 — 2026-10-23
 
 > **Upgrade from v0.3.2 or withdrawn v0.3.3:** port **6754** remains

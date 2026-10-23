@@ -3,10 +3,10 @@
 # mqlite
 
 [![CI](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.4.0.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.4.0)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.4.1.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.4.1)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mqlitehq/mqlite)](https://goreportcard.com/report/github.com/mqlitehq/mqlite)
 [![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
-[![Supported release: v0.4.0](https://img.shields.io/badge/release-v0.4.0-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.0)
+[![Supported release: v0.4.1](https://img.shields.io/badge/release-v0.4.1-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.1)
 [![Go](https://img.shields.io/github/go-mod/go-version/mqlitehq/mqlite)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -18,11 +18,11 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
 
-> **Release status:** v0.4.0 is the latest supported release; v0.3.3 is withdrawn
+> **Release status:** v0.4.1 is the latest supported release; v0.3.3 is withdrawn
 > and unsupported. Its public assets and exact image remain available for
-> forensic or compatibility inspection and must not be deployed. v0.4.0 carries
-> its retraction directive. Pin production installs to the exact v0.4.0 release or
-> `ghcr.io/mqlitehq/mqlite:0.4.0`.
+> forensic or compatibility inspection and must not be deployed. v0.4.1 carries
+> its retraction directive. Pin production installs to the exact v0.4.1 release or
+> `ghcr.io/mqlitehq/mqlite:0.4.1`.
 
 ## Goal
 
@@ -477,11 +477,15 @@ throughput, memory, and disk methodology and numbers:
 
 ## Status
 
-The latest supported release is **v0.4.0** (port 6754, schema token 7). Pin
-production binaries to the v0.4.0 release and containers to
-`ghcr.io/mqlitehq/mqlite:0.4.0`. v0.3.3 is withdrawn and unsupported; its public
+The latest supported release is **v0.4.1** (port 6754, schema token 7). Pin
+production binaries to the v0.4.1 release and containers to
+`ghcr.io/mqlitehq/mqlite:0.4.1`. v0.3.3 is withdrawn and unsupported; its public
 assets and exact image remain available for forensic or compatibility inspection
-and must not be deployed. v0.4.0 carries its retraction directive.
+and must not be deployed. v0.4.1 carries its retraction directive.
+
+v0.4.1 is a schema-compatible patch for v0.4.0. It keeps the console, CLI and Go
+SDK usable after a deleted resource contributes to the documented retired
+observation aggregate; no database rebuild is required for this patch upgrade.
 
 v0.4.0 removes v0.3.3's public queue `Generation` contract and adds the corrected
 resource lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md).

@@ -1,16 +1,23 @@
 # Production operations
 
-This runbook covers the latest supported release, v0.4.0 (port 6754, schema
+This runbook covers the latest supported release, v0.4.1 (port 6754, schema
 token 7). v0.3.3 is withdrawn and unsupported; its public assets and exact image
 remain available for forensic or compatibility inspection and must not be
-deployed. The v0.4.0 module retracts v0.3.3. Upgrading from v0.3.2 or another
-schema-5 release requires a fresh database as described below.
+deployed. The v0.4.1 module retains v0.4.0's retraction of v0.3.3. Upgrading
+from v0.3.2 or another schema-5 release requires a fresh database as described
+below.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
 Upgrading from v0.2.0 changes both its default port (8080) and schema token (2);
 follow [upgrade and rollback](#upgrade-and-rollback) before replacing the broker.
 See [deployment](deployment.md) for installation and [observability](observability.md)
 for metric definitions and alerts.
+
+v0.4.0 → v0.4.1 is a same-schema patch upgrade. It fixes strict Observe clients
+and the console rejecting the documented retired message aggregate after a
+message-bearing queue or subscription is deleted. No database rebuild or metric
+migration is required; still quiesce clients and avoid overlapping brokers during
+the binary replacement.
 
 ## Operating boundaries
 

@@ -14,12 +14,12 @@ explicitly `linux/amd64`.
 An ARM host uses Docker's emulation; this does not benchmark native ARM performance.
 
 Use the matching release checkout so the broker, dashboard and rules come from the
-same source. The latest supported tag is v0.4.0, which uses schema token 7.
+same source. The latest supported tag is v0.4.1, which uses schema token 7.
 
 Stop the v0.3.2 starter before launching this stack because both versions publish
 the same loopback ports. From its old checkout, run `docker compose down` in
-`ops/observability`. If the checkout has already moved to v0.4.0 and the old
-pointer was saved as `.env.v0.3.2`, stop that project explicitly:
+`ops/observability`. If the checkout has already moved to v0.4.0 or v0.4.1 and
+the old pointer was saved as `.env.v0.3.2`, stop that project explicitly:
 
 ```sh
 docker compose -p mqlite-observability-032 --env-file .env.v0.3.2 down
@@ -31,7 +31,7 @@ data with the matching old binary; the schema-7 broker cannot open it.
 ```sh
 git clone https://github.com/mqlitehq/mqlite.git
 cd mqlite
-git checkout v0.4.0
+git checkout v0.4.1
 cd ops/observability
 python3 init.py
 docker compose up --build -d
@@ -48,7 +48,7 @@ compatibility namespaces. `init.py`
 records the stack version in `.env` and refuses an older pointer. Preserve that
 old data and move `.env` aside before initializing the schema-7 stack. To
 select another location, set `OBS_DATA_DIR` before the first initialization.
-Existing v0.4.0 stack credentials are preserved. Files are mode 0600,
+Existing schema-7 v0.4.x stack credentials are preserved. Files are mode 0600,
 directories are 0700, and services run as your numeric UID/GID so permissions
 need not be relaxed.
 

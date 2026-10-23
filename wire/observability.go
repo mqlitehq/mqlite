@@ -132,7 +132,10 @@ func DecodeObserveResponse(data []byte) (ObserveResponse, error) {
 		messageEvents[q.Queue] = nil
 	}
 	for _, m := range out.Messages {
-		valid = valid && m.Queue != "" && m.Event != ""
+		// An empty queue is the documented, bounded aggregate for effects from
+		// retired queues. It is not an addressable queue name. The event must
+		// still be nonempty, unique, and part of a complete event domain below.
+		valid = valid && m.Event != ""
 		messageEvents[m.Queue] = append(messageEvents[m.Queue], m.Event)
 	}
 	for _, events := range messageEvents {

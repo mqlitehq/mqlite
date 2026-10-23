@@ -360,6 +360,11 @@ name starts a fresh named series while the prior counts remain in the aggregate.
 Include `queue=""` when querying total process activity, or filter it out when a
 query is intended to describe current named queues only.
 
+v0.4.1 corrects the official Go decoder and bundled console to accept this
+documented empty label. v0.4.0 already emitted the aggregate, but its strict
+clients rejected the otherwise complete observation after such a retirement.
+The wire shape, event semantics and schema token do not change in v0.4.1.
+
 Raw SQL through `EngineTx.SQL` is supported only for caller-owned tables; those
 writes produce no message-effect events. Direct access to mqlite-owned tables is
 unsupported and can bypass lifecycle and observability invariants.
