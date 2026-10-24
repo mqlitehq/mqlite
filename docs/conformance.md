@@ -176,13 +176,29 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   *(engine/functional_test.go: TestAbandonDelayHoldsGroupOrder)*
 - **7.2 TTL** — an expired message (`expires_at`) MUST move to the DLQ when the queue
   has `dead_letter_on_expire`, else be discarded. The two branches cover the **same
-  state set** — every non-terminal state including `scheduled`: a row the scheduler
-  has not yet activated when its TTL lapses (broker downtime, scheduler lag) is
-  dead-lettered in place, not resurrected first. (TTL is anchored at `visible_at`,
-  so for scheduled messages the clock starts at their delivery time.) Message TTL
-  is independent of the lock lease: it may expire a locked row, and Renew MUST NOT
-  extend it.
-  *(engine/functional_test.go: TestTTLScheduledToDeadLetter)*
+  state set** — every non-terminal state including `scheduled`. The TTL sweep can
+  expire a scheduled row directly. If the scheduler observes an overdue row first,
+  it may change that row to `active`, but claim eligibility still excludes it at
+  `now >= expires_at`; the TTL sweep then terminates it without delivery. The queue
+  default is both the default and ceiling for an explicit message TTL. Expiry is
+  anchored at the message's initial `visible_at`, so for scheduled messages the
+  clock starts at their delivery time; later delayed Abandon and scheduler
+  activation MUST NOT recompute it. Message TTL is independent of the lock lease:
+  it may expire a locked row, and Renew MUST NOT extend it. Embedded and remote
+  batch Send MUST preserve each item's requested TTL; a uniform HTTP batch may use
+  the batch-wide field, while a mixed batch uses per-message fields. A request that
+  combines a positive batch-wide TTL with positive per-message TTLs, or supplies a
+  negative TTL in either location, MUST fail as invalid. The Go SDK MUST also reject
+  a positive message TTL below the wire's 1 ms precision before sending or writing,
+  and an effective deadline that overflows epoch milliseconds MUST fail without
+  committing any item in the batch.
+  *(engine/functional_test.go: TestTTLScheduledToDeadLetter,
+  TestTTLCapAtQueueDefault, TestNegativeMessageTTLRejectedBeforeWrite,
+  TestMessageTTLExpiryOverflowRejectedAtomically,
+  TestMessageTTLDeadlineSurvivesRenewAndDelayedRetry; sdk_test.go:
+  TestBatchTTLRemoteEmbeddedParity, TestNegativeMessageTTLSDKParity,
+  TestRemoteBatchTTLWireCompatibility; server/send_dedup_test.go:
+  TestServerSendPerMessageTTL; test/api_tests.py: t_message_ttl_contract)*
 
 ## 8 · DLQ retention
 

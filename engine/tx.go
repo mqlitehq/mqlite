@@ -54,6 +54,9 @@ func (t *EngineTx) Context() context.Context { return t.ctx }
 
 // SendOne enqueues a message inside the open transaction.
 func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
+	if m.TTLMs < 0 {
+		return 0, fmt.Errorf("%w: ttl_ms must be non-negative", ErrInvalidArgument)
+	}
 	if int64(len(m.Body)) > t.e.maxMsgBytes {
 		return 0, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(m.Body), t.e.maxMsgBytes)
 	}

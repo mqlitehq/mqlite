@@ -246,6 +246,15 @@ still locked. `ReceiveDeferred` is an explicit-retrieval exception:
 it increments the count but does not currently reject a claim merely because the
 count is already at the configured maximum. See [Core concepts](docs/concepts.md#queue).
 
+Message TTL is separate from both the delivery attempt and subscription lifetime.
+A positive queue default is also the ceiling for an explicit Send TTL. The effective
+TTL starts at the message's initial visibility time, so scheduled waiting does not
+consume it; Renew and delayed Abandon do not restart or extend it. Expiry ends normal
+delivery and either moves the message to the DLQ (the default) or discards it when
+`dead_letter_on_expire=false`. Batched SDK sends may give each message a different
+TTL; v0.4.1 preserves those values over HTTP instead of applying one item’s TTL to
+the whole batch.
+
 ### 5. CLI
 
 The `mqlite` binary is a first-party client for the common broker operations — the same
@@ -380,9 +389,11 @@ server's responsibility.
 
 ## Retention
 
-Completed messages are deleted on settle and TTL'd messages expire, so retained
-backlog is the primary storage driver. Active work has no automatic retention
-ceiling and can grow when producers outrun consumers. For dead-lettered work,
+Completed messages are deleted on settle, but message TTL expiry only ends normal
+delivery: it enters the DLQ by default and is discarded immediately only when queue
+policy requests that. Retained active and dead-letter backlog therefore drives
+storage use. Active work has no automatic retention ceiling and can grow when
+producers outrun consumers. For dead-lettered work,
 `serve` applies default retention targets: a background pass drops dead letters
 oldest-first once they are older than **14 days** or beyond **1,000,000 per
 queue** (`MQLITE_DLQ_MAX_AGE` / `MQLITE_DLQ_MAX_COUNT`; an optional
@@ -500,8 +511,10 @@ and must not be deployed. v0.4.1 carries its retraction directive.
 v0.4.1 is a schema-compatible patch for v0.4.0. It keeps the console, CLI and Go
 SDK usable after a deleted resource contributes to the documented retired
 observation aggregate, exposes the broker lifecycle clock and makes subscription
-deadlines visible in the console's topic list and detail view; no database rebuild
-is required for this patch upgrade.
+deadlines visible in the console's topic list and detail view, and preserves each
+message TTL in remote mixed-TTL batches. Upgrade the v0.4.0 broker and Go client
+together before relying on mixed batch TTLs; no database rebuild is required for
+this patch upgrade.
 
 v0.4.0 removes v0.3.3's public queue `Generation` contract and adds the corrected
 resource lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md).

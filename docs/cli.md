@@ -171,8 +171,8 @@ mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering st
 | Flag | Default | |
 |---|---|---|
 | `--lock` | 0 → 30s | Peek-Lock duration (`0` inherits the engine default, 30s) |
-| `--max-delivery` | 0 → 10 | deliveries before a message goes to the DLQ (`0` inherits 10) |
-| `--ttl` | 0 (unlimited) | default message TTL |
+| `--max-delivery` | 0 → 10 | ordinary Peek-Lock claim budget: the Nth claim is a usable final attempt; only failure of that locked attempt sends it to the DLQ (`0` inherits 10) |
+| `--ttl` | 0 (unlimited) | default **and ceiling** for message TTL; a shorter Send TTL is honored, a longer one is capped |
 | `--dedup` | 0 (off) | dedup window |
 | `--ordering` | `standard` | `standard` / `group_fifo` / `strict_fifo` |
 | `--dlq-max-age` | 0 (inherit) | per-queue DLQ retention: drop dead letters older than this |
@@ -252,7 +252,7 @@ echo '{"id":2}' | mqlite send orders -
 | `--group` | group id (ordering / session key) |
 | `--subject` | subject (label) |
 | `--reply-to` | reply-to address |
-| `--ttl` | per-message TTL |
+| `--ttl` | per-message TTL; starts at initial visibility and is capped by a positive queue default |
 
 ### `receive <queue>` — consume (Peek-Lock)
 By default it receives and auto-Completes. Use `--no-ack` to leave messages locked and
@@ -364,7 +364,9 @@ mqlite schedule orders '{"id":1}' --at 2027-01-02T15:04:05Z    # or an absolute 
 | `--at` | required | delivery time: RFC3339 or a duration (`30m`, `2h`) |
 | `--file` · `--message-id` · `--group` · `--subject` | | same as `send` |
 
-Cancel a scheduled message before it activates with **`cancel <queue> <seq>`**.
+Cancel a never-delivered scheduled Send (`delivery_count=0`) before it activates
+with **`cancel <queue> <seq>`**. A retry parked in `scheduled` by delayed
+`Abandon` has already been delivered and cannot be cancelled this way.
 
 ### `receive-deferred <queue> --seq …` — fetch deferred messages by seq
 ```bash

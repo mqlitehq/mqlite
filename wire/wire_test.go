@@ -386,6 +386,22 @@ func TestConversions(t *testing.T) {
 		t.Errorf("ToOut: %+v", out)
 	}
 
+	send := wire.SendMessage{Message: wire.Message{Body: []byte("ttl")}, TTLMs: 1234}
+	encoded, err := json.Marshal(send)
+	if err != nil {
+		t.Fatalf("marshal SendMessage: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"body":"dHRs"`) || !strings.Contains(string(encoded), `"ttl_ms":1234`) {
+		t.Fatalf("SendMessage JSON=%s", encoded)
+	}
+	var decoded wire.SendMessage
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal SendMessage: %v", err)
+	}
+	if out := decoded.ToOut(); string(out.Body) != "ttl" || out.TTLMs != 1234 {
+		t.Errorf("SendMessage.ToOut: %+v", out)
+	}
+
 	p := &engine.PeekedMessage{
 		SeqNumber: 4, State: engine.StateDeadLettered, Body: []byte("z"),
 		DeadLetterReason: "rr", DeadLetterDescription: "dd", VisibleAtMs: 5,

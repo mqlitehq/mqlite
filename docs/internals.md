@@ -185,9 +185,13 @@ rapid calls do not stack durations. A live exact-request receipt can replay an
 already committed settlement (§7).
 
 The lease is only the ownership window for one attempt. Message TTL is a separate
-row-lifetime deadline and can expire the message while it is locked; a subscription
-lifetime is a resource deadline that caps every lease and eventually removes the
-backing queue. Renewal extends neither one.
+normal-delivery deadline and can expire the message while it is locked; expiry
+dead-letters it by default and removes the row only when discard is configured.
+The queue default is also a ceiling for an explicit message TTL. The effective TTL
+is anchored at the message's initial `visible_at`, so scheduled waiting does not
+consume it and delayed Abandon does not restart it. A subscription lifetime is a
+resource deadline that caps every lease and eventually removes the backing queue.
+Renewal extends neither one.
 
 Receive-and-delete removes the claimed row in the same transaction. It grants no
 lease: both its token and deadline are cleared before the response or attempt record

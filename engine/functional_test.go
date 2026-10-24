@@ -260,6 +260,139 @@ func TestTTLNoQueueDefault(t *testing.T) {
 	}
 }
 
+// Negative TTL is an invalid request, never an alias for unlimited retention.
+// Validate the complete public enqueue surface before a transaction can write an
+// earlier item from the same batch.
+func TestNegativeMessageTTLRejectedBeforeWrite(t *testing.T) {
+	ctx := context.Background()
+	negative := OutMessage{Body: []byte("negative"), TTLMs: -1}
+	valid := OutMessage{Body: []byte("must-not-commit")}
+	for _, tc := range []struct {
+		name string
+		run  func(*Engine, int64) error
+	}{
+		{"SendOne", func(e *Engine, _ int64) error {
+			_, err := e.SendOne(ctx, "q", negative)
+			return err
+		}},
+		{"Send", func(e *Engine, _ int64) error {
+			_, err := e.Send(ctx, "q", valid, negative)
+			return err
+		}},
+		{"Schedule", func(e *Engine, at int64) error {
+			_, err := e.Schedule(ctx, "q", negative, at)
+			return err
+		}},
+		{"ScheduleBatch", func(e *Engine, at int64) error {
+			_, err := e.ScheduleBatch(ctx, "q", []OutMessage{valid, negative}, at)
+			return err
+		}},
+		{"EngineTx.SendOne", func(e *Engine, _ int64) error {
+			return e.Tx(ctx, func(tx *EngineTx) error {
+				_, err := tx.SendOne("q", negative)
+				return err
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{})
+			if err := tc.run(e, e.now()+time.Minute.Milliseconds()); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("error=%v, want ErrInvalidArgument", err)
+			}
+			stats, err := e.Stats(ctx, "q")
+			if err != nil {
+				t.Fatalf("stats: %v", err)
+			}
+			if stats.Total != 0 {
+				t.Fatalf("invalid request wrote %d rows", stats.Total)
+			}
+		})
+	}
+}
+
+func TestMessageTTLExpiryOverflowRejectedAtomically(t *testing.T) {
+	ctx := context.Background()
+	overflow := OutMessage{Body: []byte("overflow"), TTLMs: math.MaxInt64}
+	valid := OutMessage{Body: []byte("must-not-commit")}
+	for _, tc := range []struct {
+		name string
+		run  func(*Engine, int64) error
+	}{
+		{"SendOne", func(e *Engine, _ int64) error {
+			_, err := e.SendOne(ctx, "q", overflow)
+			return err
+		}},
+		{"SendBatch", func(e *Engine, _ int64) error {
+			_, err := e.Send(ctx, "q", valid, overflow)
+			return err
+		}},
+		{"Schedule", func(e *Engine, at int64) error {
+			_, err := e.Schedule(ctx, "q", overflow, at)
+			return err
+		}},
+		{"ScheduleBatch", func(e *Engine, at int64) error {
+			_, err := e.ScheduleBatch(ctx, "q", []OutMessage{valid, overflow}, at)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{})
+			if err := tc.run(e, e.now()+time.Minute.Milliseconds()); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("error=%v, want ErrInvalidArgument", err)
+			}
+			stats, err := e.Stats(ctx, "q")
+			if err != nil {
+				t.Fatalf("stats: %v", err)
+			}
+			if stats.Total != 0 {
+				t.Fatalf("overflowing batch committed %d rows", stats.Total)
+			}
+		})
+	}
+}
+
+func TestMessageTTLDeadlineSurvivesRenewAndDelayedRetry(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 10_000})
+	const ttl = int64(60_000)
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x"), TTLMs: ttl}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	wantExpiry := atomicNow(clock) + ttl
+	assertStateAndExpiry := func(wantState State) {
+		t.Helper()
+		messages, err := e.Peek(ctx, "q", PeekOptions{Max: 10})
+		if err != nil {
+			t.Fatalf("peek: %v", err)
+		}
+		if len(messages) != 1 || messages[0].State != wantState || messages[0].ExpiresAtMs != wantExpiry {
+			t.Fatalf("message=%+v, want state=%s expires_at=%d", messages, wantState, wantExpiry)
+		}
+	}
+	assertStateAndExpiry(StateActive)
+
+	message := recvOne(t, e, "q")
+	if message == nil {
+		t.Fatal("receive returned no message")
+	}
+	assertStateAndExpiry(StateLocked)
+	advance(clock, time.Second)
+	if err := e.Renew(ctx, "q", message.SeqNumber, message.LockToken); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	assertStateAndExpiry(StateLocked)
+	if err := e.Abandon(ctx, "q", message.SeqNumber, message.LockToken, 2_000); err != nil {
+		t.Fatalf("delayed abandon: %v", err)
+	}
+	assertStateAndExpiry(StateScheduled)
+	advance(clock, 3*time.Second)
+	e.RunMaintenanceOnce(ctx)
+	assertStateAndExpiry(StateActive)
+}
+
 // Cancel prevents a future scheduled message from ever activating.
 func TestCancelScheduled(t *testing.T) {
 	ctx := context.Background()

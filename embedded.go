@@ -164,6 +164,9 @@ func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
 // SendOne enqueues one message. A dedup conflict surfaces as ErrDedupConflict.
 // SendOpts.At schedules delayed delivery.
 func (e *Embedded) SendOne(ctx context.Context, queue string, m OutMessage, opts ...SendOpts) (int64, error) {
+	if err := validateOutMessageTTL(m); err != nil {
+		return 0, err
+	}
 	o := firstOpt(opts)
 	if !o.At.IsZero() {
 		return e.eng.Schedule(ctx, queue, m.toEngine(), o.At.UnixMilli())
@@ -175,12 +178,16 @@ func (e *Embedded) SendOne(ctx context.Context, queue string, m OutMessage, opts
 func (e *Embedded) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]int64, error) {
 	outs := make([]engine.OutMessage, len(msgs))
 	for i, m := range msgs {
+		if err := validateOutMessageTTL(m); err != nil {
+			return nil, fmt.Errorf("message %d: %w", i, err)
+		}
 		outs[i] = m.toEngine()
 	}
 	return e.eng.Send(ctx, queue, outs...)
 }
 
-// Cancel deletes a not-yet-activated scheduled message.
+// Cancel deletes a never-delivered scheduled Send. It cannot cancel a retry
+// parked in scheduled by delayed Abandon.
 func (e *Embedded) Cancel(ctx context.Context, queue string, seq int64) error {
 	return e.eng.Cancel(ctx, queue, seq)
 }

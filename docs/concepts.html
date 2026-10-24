@@ -256,10 +256,14 @@
             effect-bearing arguments recorded in a live receipt, including after the
             original lease expires.</p>
           <p>The lease, message TTL and subscription lifetime are different clocks.
-            A lease fences one attempt; message TTL may expire the row while locked;
-            subscription lifetime caps locks and eventually removes the backing queue.
-            Renew extends only the lease. Expired messages are dead-lettered or
-            discarded according to the queue policy.</p>
+            A lease fences one attempt. Message TTL bounds normal delivery eligibility
+            and may expire a message while locked; expiry dead-letters it by default,
+            while <code>dead_letter_on_expire=false</code> discards the row. A positive
+            queue default is also the ceiling for an explicit Send TTL. The effective
+            message TTL starts at its initial <code>visible_at</code> (the scheduled
+            delivery time for a scheduled Send), and delayed Abandon does not restart
+            it. Subscription lifetime caps locks and eventually removes the backing
+            queue. Renew extends only the lease.</p>
           <p><b>The DLQ is not another queue</b> — it is the same queue's
             <code>state='dead_lettered'</code> sub-state, worked with
             <code>peek</code> / <code>redrive</code> / <code>purge</code>. Retention

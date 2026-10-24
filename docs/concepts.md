@@ -131,10 +131,14 @@ Every transition, with its trigger and the condition under which it fires:
   operation and effect-bearing arguments, including after the original lease
   expires.
 - **Lease, message TTL, and subscription lifetime are different clocks.** The lease
-  temporarily fences one delivery attempt. Message TTL bounds how long the row may
-  live and can expire it while locked. A fixed subscription lifetime bounds the
-  whole backing queue and caps its locks. `Renew` changes only the lease; it extends
-  neither message TTL nor subscription lifetime.
+  temporarily fences one delivery attempt. Message TTL bounds normal delivery
+  eligibility and can expire a message while locked; expiry moves it to the DLQ by
+  default, while `dead_letter_on_expire=false` discards the row. A positive queue
+  default is also the ceiling for an explicit Send TTL. The effective message TTL
+  starts at its initial `visible_at` (the scheduled delivery time for a scheduled
+  Send), and delayed Abandon does not restart it. A fixed subscription lifetime
+  bounds the whole backing queue and caps its locks. `Renew` changes only the lease;
+  it extends neither message TTL nor subscription lifetime.
 - **Two redelivery paths.** `Abandon` is an explicit, client-driven settlement; **lock
   expiry** is automatic — the reaper (~1s) reclaims a lock held past `lock_duration`
   without settling. Both redeliver while `count < max` and dead-letter once `count ≥ max`.

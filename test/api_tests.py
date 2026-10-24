@@ -255,6 +255,65 @@ def t_schedule():
     check(len(r["messages"]) == 1, "visible after scheduled time")
 
 
+def t_message_ttl_contract():
+    section("message TTL: mixed batch, validation and scheduled anchor")
+    q = f"{RUNID}_py_message_ttl"
+    status, _ = create_queue(q, {"default_ttl_ms": 5000})
+    check(status == 200, "TTL queue created")
+
+    status, result = call("/mqlite.v1.QueueService/Send", {
+        "queue": q,
+        "messages": [
+            {"body": b64("default")},
+            {"body": b64("short"), "ttl_ms": 1000},
+            {"body": b64("capped"), "ttl_ms": 10000},
+        ],
+    })
+    check(status == 200 and len(result.get("seq_numbers", [])) == 3,
+          "mixed per-message TTL batch accepted")
+    status, browsed = peek(q, mx=10)
+    messages = {base64.b64decode(item["body"]).decode(): item
+                for item in browsed.get("messages", [])}
+    check(status == 200 and {"default", "short", "capped"}.issubset(messages) and
+          messages["default"]["expires_at_ms"] - messages["default"]["visible_at_ms"] == 5000 and
+          messages["short"]["expires_at_ms"] - messages["short"]["visible_at_ms"] == 1000 and
+          messages["capped"]["expires_at_ms"] - messages["capped"]["visible_at_ms"] == 5000,
+          "per-message TTL uses queue default and ceiling")
+    check(all("ttl_ms" not in item for item in browsed.get("messages", [])),
+          "peek response exposes expires_at_ms, not send-only ttl_ms")
+
+    status, problem = call("/mqlite.v1.QueueService/Send", {
+        "queue": q,
+        "ttl_ms": 1000,
+        "messages": [{"body": b64("ambiguous"), "ttl_ms": 500}],
+    })
+    check(status == 400 and problem.get("code") == "invalid_argument",
+          "batch-wide and per-message TTL conflict is rejected")
+    status, problem = call("/mqlite.v1.QueueService/Send", {
+        "queue": q,
+        "messages": [{"body": b64("negative"), "ttl_ms": -1}],
+    })
+    check(status == 400 and problem.get("code") == "invalid_argument",
+          "negative per-message TTL is rejected")
+
+    scheduled_at = now_ms() + 10000
+    status, result = call("/mqlite.v1.QueueService/Schedule", {
+        "queue": q,
+        "scheduled_enqueue_time_ms": scheduled_at,
+        "messages": [{"body": b64("scheduled-ttl"), "ttl_ms": 1000}],
+    })
+    seqs = result.get("seq_numbers", [])
+    check(status == 200 and len(seqs) == 1 and seqs[0] > 0,
+          "Schedule accepts per-message TTL")
+    status, scheduled = peek(q, state="scheduled", mx=10)
+    scheduled_items = [item for item in scheduled.get("messages", [])
+                       if base64.b64decode(item["body"]).decode() == "scheduled-ttl"]
+    check(status == 200 and len(scheduled_items) == 1 and
+          scheduled_items[0]["expires_at_ms"] - scheduled_items[0]["visible_at_ms"] == 1000 and
+          "ttl_ms" not in scheduled_items[0],
+          "scheduled TTL starts at visibility and remains send-only")
+
+
 def t_dedup():
     section("dedup window: silent drop + conflict on same id / different body")
     q = f"{RUNID}_py_dedup"
@@ -582,7 +641,8 @@ def t_subscription_ttl():
 def main():
     print(f"Python behavioural suite — endpoint={ENDPOINT} runid={RUNID}")
     for fn in (t_lifecycle, t_batch, t_visibility_timeout, t_dlq_redrive,
-               t_explicit_deadletter, t_defer, t_schedule, t_dedup, t_sessions,
+               t_explicit_deadletter, t_defer, t_schedule, t_message_ttl_contract,
+               t_dedup, t_sessions,
                t_receive_and_delete, t_fencing,
                t_all_fields, t_max_size, t_abandon_delay, t_cancel_scheduled, t_access_keys,
                t_queue_deletion, t_subscription_ttl):

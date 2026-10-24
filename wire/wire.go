@@ -73,6 +73,32 @@ type SendRequest struct {
 	TTLMs                  int64     `json:"ttl_ms,omitempty"`
 }
 
+// SendMessage is the send-only extension for a message in a mixed-TTL batch.
+// Embedding keeps the JSON object flat without changing the released Message
+// struct (and therefore without breaking its external unkeyed literals).
+type SendMessage struct {
+	Message
+	TTLMs int64 `json:"ttl_ms,omitempty"`
+}
+
+// ToOut converts a send-only wire message to the engine form.
+func (m SendMessage) ToOut() engine.OutMessage {
+	out := m.Message.ToOut()
+	out.TTLMs = m.TTLMs
+	return out
+}
+
+// SendWithMessageTTLsRequest represents either the legacy request-level TTL or
+// the additive per-message form on the same route; positive values must not be
+// set in both places. The server decodes this superset, while clients continue
+// to send SendRequest for a uniform batch.
+type SendWithMessageTTLsRequest struct {
+	Queue                  string        `json:"queue"`
+	Messages               []SendMessage `json:"messages"`
+	ScheduledEnqueueTimeMs int64         `json:"scheduled_enqueue_time_ms,omitempty"`
+	TTLMs                  int64         `json:"ttl_ms,omitempty"`
+}
+
 // SendResponse returns one sequence number per input message, positionally.
 // In a multi-message batch a slot is 0 when that message hit a dedup conflict
 // (same message_id, different body): the offending message is skipped so the rest

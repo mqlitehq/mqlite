@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"math"
 )
 
 func sha256hex(b []byte) string {
@@ -30,6 +32,9 @@ func (e *Engine) insertOne(ctx context.Context, tx *txn, q queueRow, m OutMessag
 	}
 	var expiresAt int64
 	if ttl > 0 {
+		if visibleAt > math.MaxInt64-ttl {
+			return 0, false, fmt.Errorf("%w: ttl_ms overflows expires_at_ms", ErrInvalidArgument)
+		}
 		expiresAt = visibleAt + ttl // TTL anchored at visible_at (§8.7)
 	}
 

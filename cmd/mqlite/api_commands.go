@@ -197,7 +197,7 @@ func parseWhen(s string) (time.Time, error) {
 	return when, nil
 }
 
-// ─── cancel: delete a not-yet-activated scheduled message ───────────────────────────
+// ─── cancel: delete a never-delivered scheduled send ────────────────────────────
 func cmdCancel(ctx context.Context, args []string) error {
 	fs := newFlags("cancel")
 	pos, err := parseInterspersed(fs, args)

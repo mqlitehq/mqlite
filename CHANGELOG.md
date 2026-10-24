@@ -14,7 +14,28 @@ upgrade notes before replacing a broker.
 
 > **Patch upgrade from v0.4.0:** the canonical schema token remains **7** and no
 > database rebuild is required. Upgrade the broker, Go client/CLI and bundled
-> console together so every observation consumer applies the same validation.
+> console together so every observation consumer applies the same validation and
+> remote mixed-TTL batches use the per-message wire form described below.
+
+### Preserve per-message TTL in remote batches (MQLITE-156)
+
+- Preserve each `OutMessage.TTL` in a remote Go SDK batch. A single message or a
+  uniform-TTL batch keeps the existing request-level `ttl_ms`; a mixed batch uses
+  the additive `messages[].ttl_ms` input supported by v0.4.1 brokers. Embedded
+  batches already retained each value. Older strict brokers reject the new mixed
+  shape, so upgrade broker and client together before relying on it; older Go
+  clients cannot express this corrected mixed form.
+- Reject negative message TTL, positive durations below the wire's 1 ms precision,
+  ambiguous requests that set both positive batch-wide and per-message TTL, and
+  effective TTL deadlines that overflow epoch milliseconds. Invalid batches fail
+  before commit and leave no partial rows.
+- Document the existing clock rules: a positive queue default is both the default
+  and ceiling; TTL starts at initial visibility (so initial scheduled waiting does
+  not consume it); Renew and delayed Abandon do not extend it; expiry ends normal
+  delivery and either dead-letters or discards according to queue policy.
+- Keep schema token 7 and add no database statement or background work. Validation
+  adds only constant arithmetic inside the existing SDK, server and engine
+  per-message loops.
 
 ### Keep observations usable after resource retirement (MQLITE-147)
 

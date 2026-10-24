@@ -83,7 +83,17 @@ type OutMessage struct {
 	Subject       string // = ASB Label
 	ContentType   string
 	Properties    map[string]string // custom KV (headers)
-	TTL           time.Duration     // 0 -> queue default
+	TTL           time.Duration     // 0 -> queue default; positive values must be >=1ms; a positive queue default caps longer values
+}
+
+func validateOutMessageTTL(m OutMessage) error {
+	if m.TTL < 0 {
+		return fmt.Errorf("%w: message TTL cannot be negative", ErrInvalidArgument)
+	}
+	if m.TTL > 0 && m.TTL < time.Millisecond {
+		return fmt.Errorf("%w: message TTL must be at least 1ms", ErrInvalidArgument)
+	}
+	return nil
 }
 
 func (m OutMessage) toEngine() engine.OutMessage {
@@ -103,8 +113,8 @@ func (m OutMessage) toEngine() engine.OutMessage {
 // QueueConfig configures a queue (durations as time.Duration).
 type QueueConfig struct {
 	LockDuration       time.Duration
-	MaxDeliveryCount   int
-	DefaultTTL         time.Duration
+	MaxDeliveryCount   int           // ordinary claim budget; the final claim remains usable
+	DefaultTTL         time.Duration // default and ceiling for message TTL; 0 -> unlimited
 	DeadLetterOnExpire *bool
 	DedupWindow        time.Duration
 	Ordering           OrderingMode // "" -> standard
