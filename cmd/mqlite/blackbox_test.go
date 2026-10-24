@@ -205,11 +205,22 @@ func TestBlackboxReceiveBrokenPipe(t *testing.T) {
 	cmd.Stdout = w
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
+	// Close the only reader before starting the child. Closing it after Start races
+	// with the child's small stdout write, which can otherwise succeed and ack the
+	// message before the parent closes the pipe.
+	if err := r.Close(); err != nil {
+		_ = w.Close()
+		t.Fatalf("close pipe reader: %v", err)
+	}
 	if err := cmd.Start(); err != nil {
+		_ = w.Close()
 		t.Fatal(err)
 	}
-	_ = w.Close() // parent's write end
-	_ = r.Close() // no reader → the child's stdout write breaks the pipe
+	if err := w.Close(); err != nil { // parent's write end
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("close parent pipe writer: %v", err)
+	}
 	werr := cmd.Wait()
 
 	if werr == nil {
