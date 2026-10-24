@@ -313,6 +313,9 @@ func cmdStatus(ctx context.Context, args []string) error {
 	fmt.Printf("backend:       %s\n", s.Backend)
 	fmt.Printf("location:      %s\n", s.Location)
 	fmt.Printf("schema:        %s\n", s.SchemaVersion)
+	if s.ServerTimeMs > 0 {
+		fmt.Printf("broker time:   %s\n", time.UnixMilli(s.ServerTimeMs).UTC().Format(time.RFC3339Nano))
+	}
 	fmt.Printf("ping:          %d ms\n", s.PingMs)
 	if !s.Remote {
 		fmt.Printf("size:          %d bytes\n", s.DBSizeBytes)

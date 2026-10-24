@@ -623,7 +623,7 @@ func (c *Client) Status(ctx context.Context) (StatusInfo, error) {
 		Version: resp.Version, Backend: resp.Backend, Remote: resp.Remote, Location: resp.Location,
 		SchemaVersion: resp.SchemaVersion, PingMs: resp.PingMs, DBSizeBytes: resp.DBSizeBytes,
 		Queues: resp.Queues, Subscriptions: resp.Subscriptions,
-		UptimeMs: resp.UptimeMs, Auth: resp.Auth,
+		ServerTimeMs: resp.ServerTimeMs, UptimeMs: resp.UptimeMs, Auth: resp.Auth,
 	}, nil
 }
 

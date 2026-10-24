@@ -18,6 +18,7 @@ type Status struct {
 	SchemaVersion string
 	PingMs        int64 // a SELECT 1 read round-trip (the durable read latency); -1 if it failed
 	SizeBytes     int64 // local on-disk footprint (db + -wal + -shm); 0 for memory/remote
+	ServerTimeMs  int64 // the injectable engine clock after the runtime probe
 }
 
 // Status probes the engine's backend without exposing any secret. The ping is a real
@@ -43,6 +44,7 @@ func (e *Engine) Status(ctx context.Context) Status {
 	runtime, pingMs := e.runtimeObservation(ctx)
 	s.PingMs = pingMs
 	s.SizeBytes = runtime.DBSizeBytes
+	s.ServerTimeMs = e.now()
 
 	return s
 }

@@ -314,6 +314,7 @@ type StatusResponse struct {
 	DBSizeBytes   int64  `json:"db_size_bytes"` // local on-disk footprint; 0 for memory/remote
 	Queues        int    `json:"queues"`
 	Subscriptions int    `json:"subscriptions"`
+	ServerTimeMs  int64  `json:"server_time_ms,omitempty"` // lifecycle clock near response assembly; absent means unavailable
 	UptimeMs      int64  `json:"uptime_ms"`
 	Auth          bool   `json:"auth"`
 }

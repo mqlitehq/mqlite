@@ -249,7 +249,9 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   engine close gate. The global queue snapshot MAY be reused for about 10
   seconds, MUST preserve its original
   `sampled_at_ms` and internal topology fence as one cache entry, MUST coalesce
-  concurrent refreshes, and MUST NOT cache a failed refresh. Per-queue `Stats`
+  concurrent refreshes, and MUST NOT cache a failed refresh. Observe
+  `server_time_ms` MUST be read separately from the same injectable lifecycle
+  clock and MUST NOT be retained in that queue snapshot cache. Per-queue `Stats`
   remains a fresh indexed read.
   *(engine/storage_test.go, engine/observability_performance_test.go)*
 - **10.2** `Open` MUST refuse a DB whose recorded `schemaVersion` differs from the

@@ -910,6 +910,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if version == "" {
 		version = "dev"
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, wire.StatusResponse{
 		Version:       version,
 		Backend:       st.Backend,
@@ -920,6 +921,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		DBSizeBytes:   st.SizeBytes,
 		Queues:        queues,
 		Subscriptions: subs,
+		ServerTimeMs:  st.ServerTimeMs,
 		UptimeMs:      time.Since(s.started).Milliseconds(),
 		Auth:          s.authenticationEnabled(),
 	})

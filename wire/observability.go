@@ -102,6 +102,12 @@ func DecodeObserveResponse(data []byte) (ObserveResponse, error) {
 		return ObserveResponse{}, fmt.Errorf("%w: %w", bad, err)
 	}
 	valid := out.Collection.State == "available" || out.Collection.State == "unavailable"
+	// server_time_ms is additive: missing/zero means unavailable (including on an
+	// older broker). Required-field validation rejects a present null; typed unmarshal
+	// rejects non-integral and overflowing JSON. Reject negatives here without
+	// reparsing the bounded response into another complete object tree merely to
+	// distinguish equivalent missing and zero encodings.
+	valid = valid && out.ServerTimeMs >= 0
 	valid = valid && (out.Access == "manage" || out.Access == "monitor" || out.Access == "anonymous" || out.Access == "embedded")
 	valid = valid && (out.Backend == "memory" || out.Backend == "local" || out.Backend == "remote")
 	valid = valid && out.Version != "" && nonnegative(out.Collection.DurationSeconds)

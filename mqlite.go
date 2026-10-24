@@ -204,6 +204,9 @@ type StatusInfo struct {
 	DBSizeBytes   int64  `json:"db_size_bytes"` // local on-disk footprint; 0 for memory/remote
 	Queues        int    `json:"queues"`
 	Subscriptions int    `json:"subscriptions"`
+	// ServerTimeMs is the broker engine clock used for TTL and other lifecycle deadlines.
+	// Zero means unavailable, including when a remote broker predates this field.
+	ServerTimeMs int64 `json:"server_time_ms,omitempty"`
 	// Broker-only facts: zero/false in embedded mode, which has no process uptime and no auth.
 	UptimeMs int64 `json:"uptime_ms"`
 	Auth     bool  `json:"auth"`

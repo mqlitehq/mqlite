@@ -27,8 +27,21 @@ upgrade notes before replacing a broker.
   unique row for every message-event label, and an empty event or an incomplete
   or duplicate domain is rejected.
 - Add the exact create, send, force-delete, Observe/decode regression and a
-  logged-out browser login regression. The wire shape, HTTP API and schema remain
-  unchanged.
+  logged-out browser login regression. That retirement fix does not change the
+  wire shape, HTTP API or schema.
+
+### Expose the lifecycle clock (MQLITE-148)
+
+- Add `server_time_ms` to Status and Observe so operators and the console can
+  compare absolute subscription deadlines with the same injectable broker clock
+  used for TTL, scheduling and lease decisions. `sampled_at_ms` remains the
+  possibly cached queue-gauge sampling time; it is not presented as current time.
+- Keep mixed-version clients compatible: the new field is additive, and a current
+  client treats its absence on an older broker as unavailable instead of epoch zero.
+- Show each subscription's creation time, fixed absolute deadline (or permanent
+  lifetime), and remaining lifetime against that broker clock in the console.
+  Lifecycle inventory is fetched only when its detail view is opened or refreshed,
+  not from the periodic observation loop.
 
 ## v0.4.0 — 2026-10-23
 
