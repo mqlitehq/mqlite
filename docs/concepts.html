@@ -230,21 +230,36 @@
           <h3 style="margin-top:0">Queue</h3>
           <p>A named container, the only place messages live. A receive moves
             <code>active → locked</code> and increments <code>delivery_count</code>.
-            Complete deletes the row. Below the delivery limit, immediate Abandon or
-            lock expiry returns it to active; Abandon with a delay parks it in
-            <code>scheduled</code>. At the limit, Abandon, lock expiry or startup
-            recovery moves it to <b>DLQ</b> with <code>MaxDeliveryCountExceeded</code>.</p>
-          <p>Delayed retries retain head-of-line ordering. Defer parks a message in
-            <code>deferred</code> for <code>ReceiveDeferred</code> by sequence number.
-            Cancel only removes a scheduled row that has never been delivered
-            (<code>delivery_count=0</code>). TTL applies before every claim, including
-            deferred receives; expired rows are dead-lettered or discarded by policy.</p>
+            <code>ReceiveDeferred</code> also increments it when explicitly reclaiming
+            a deferred row. Renewal, Abandon and scheduled activation do not. With a
+            maximum of 10, ordinary Peek-Lock <code>Receive</code> 10 is a full final attempt:
+            it may renew repeatedly and Complete. If it is Abandoned, its lease expires, or it
+            remains locked across startup, it moves to <b>DLQ</b> instead of ordinary
+            Peek-Lock <code>Receive</code> number 11. Explicit <code>ReceiveDeferred</code> currently
+            differs: it increments the count but has no maximum admission
+            check.</p>
+          <p>Abandon with a delay intentionally parks the same row in
+            <code>scheduled</code> as retry backoff; the scheduler later returns it to
+            active without incrementing the count. Delayed retries retain head-of-line
+            ordering. Cancel only removes a scheduled row that has never been delivered
+            (<code>delivery_count=0</code>), so it cannot cancel this backoff. Defer
+            instead parks a message in <code>deferred</code> for
+            <code>ReceiveDeferred</code> by sequence number.</p>
           <p>New settlement and renewal effects require the current lock token and
             <code>locked_until_ms &gt; now</code>. Equality is expired, even before the
-            reaper runs; renew before that deadline. A lost-response replay
+            reaper runs; renew before that deadline. Renew stays in the same attempt,
+            preserves the token and count, and cannot revive an expired lease. On a
+            queue or subscription without a fixed expiry, its deadline is the later of
+            the existing deadline and broker <code>now + lock_duration</code>; rapid calls do not stack durations,
+            and a fixed subscription lifetime caps the candidate. A lost-response replay
             succeeds only for the exact queue, sequence, token, operation and
             effect-bearing arguments recorded in a live receipt, including after the
             original lease expires.</p>
+          <p>The lease, message TTL and subscription lifetime are different clocks.
+            A lease fences one attempt; message TTL may expire the row while locked;
+            subscription lifetime caps locks and eventually removes the backing queue.
+            Renew extends only the lease. Expired messages are dead-lettered or
+            discarded according to the queue policy.</p>
           <p><b>The DLQ is not another queue</b> — it is the same queue's
             <code>state='dead_lettered'</code> sub-state, worked with
             <code>peek</code> / <code>redrive</code> / <code>purge</code>. Retention

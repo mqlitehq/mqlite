@@ -393,16 +393,16 @@ var tools = []tool{
 		},
 	},
 	{
-		name: "abandon", desc: "Abandon a received message so it is redelivered.",
+		name: "abandon", desc: "End this delivery attempt: retry now or later below the delivery limit, otherwise dead-letter.",
 		schema: obj(map[string]any{
-			"queue": strProp("queue name"), "seq_number": intProp("message seq number"), "lock_token": strProp("lock token"), "delay_ms": intProp("optional redelivery delay ms"),
+			"queue": strProp("queue name"), "seq_number": intProp("message seq number"), "lock_token": strProp("lock token"), "delay_ms": intProp("optional retry delay ms"),
 		}, "queue", "seq_number", "lock_token"),
 		forward: func(a map[string]any) (string, any) {
 			return wire.PathAbandon, wire.SettleRequest{Queue: str(a, "queue"), SeqNumber: num(a, "seq_number"), LockToken: str(a, "lock_token"), DelayMs: num(a, "delay_ms")}
 		},
 	},
 	{
-		name: "renew", desc: "Renew a received message's lock so it isn't redelivered while long work continues.",
+		name: "renew", desc: "Extend the same live delivery lock without increasing delivery_count; an expired lock cannot be revived.",
 		schema: obj(map[string]any{
 			"queue": strProp("queue name"), "seq_number": intProp("message seq number"), "lock_token": strProp("lock token from receive"),
 		}, "queue", "seq_number", "lock_token"),
