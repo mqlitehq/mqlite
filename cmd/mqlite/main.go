@@ -190,10 +190,10 @@ usage: mqlite <command> [flags]
   receive <queue>           receive (Peek-Lock, auto-Complete unless --no-ack)
   receive-deferred <queue>  fetch deferred messages back by seq (--seq 42,57)
   complete <queue> <seq> <token>   settle a --no-ack message: done
-  abandon  <queue> <seq> <token>   settle: release for retry (--delay)
+  abandon  <queue> <seq> <token>   settle: retry/backoff, or DLQ at delivery limit
   reject   <queue> <seq> <token>   settle: dead-letter (--reason --detail)
   defer    <queue> <seq> <token>   settle: set aside for receive-deferred
-  renew    <queue> <seq> <token>   extend the lock lease
+  renew    <queue> <seq> <token>   extend this delivery's live lock lease
 
   version | help
 

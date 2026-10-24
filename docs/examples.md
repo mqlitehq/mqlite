@@ -50,7 +50,9 @@ func main() {
 	}
 	for _, m := range msgs {
 		fmt.Printf("got: %s\n", m.Body)
-		if err := m.Complete(ctx); err != nil { // or m.Abandon(ctx) to retry, m.Reject(ctx) -> DLQ
+		// Alternatives: Abandon retries below max and sends a failed final attempt
+		// to the DLQ; Reject sends directly to the DLQ.
+		if err := m.Complete(ctx); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -114,8 +116,9 @@ directly modifying mqlite's internal tables is unsupported. See the
 ## 3. Remote client + hands-off consumer
 
 Talk to a running broker over HTTP. The `Receiver` runs a managed consume loop:
-return `nil` → Complete, return an error → Abandon (with auto lock-renewal and
-configurable concurrency).
+return `nil` → Complete, return an error → Abandon (redelivery below the maximum;
+the failed final attempt goes to the DLQ), with auto lock-renewal and configurable
+concurrency.
 
 ```go
 package main
@@ -140,7 +143,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// consume: nil -> Complete, error -> Abandon; auto-renew the lock; 4 in flight.
+	// nil -> Complete; error -> Abandon (retry below max; DLQ at max).
+	// Auto-renew the lock; keep up to 4 messages in flight.
 	err = cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
 		Run(ctx, func(ctx context.Context, m *mqlite.Message) error {
 			return process(m.Body) // MUST be idempotent (at-least-once)
@@ -152,6 +156,14 @@ func main() {
 
 func process(body []byte) error { log.Printf("got: %s", body); return nil }
 ```
+
+`WithAutoRenew` keeps the current delivery attempt alive; it does not spend another
+`delivery_count`. Each successful renewal keeps the later of the existing lease
+deadline and the broker's fresh `now + lock_duration` candidate (capped at a fixed
+subscription expiry), rather than adding a duration to the old deadline. It must
+arrive before the current lease expires and it cannot extend message TTL or a fixed
+subscription lifetime. Renewal or its response can still fail late, so the handler
+remains idempotent: another consumer may receive the message after the lease is lost.
 
 ## 4. Topic subscription lifecycle
 

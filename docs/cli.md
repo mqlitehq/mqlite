@@ -345,11 +345,14 @@ Settle a message received earlier with `receive --no-ack` (which printed its
 in practice (a broker holds the lock between calls — see the note under Global flags).
 ```bash
 mqlite complete orders 42 lt_9f3a…                 # done
-mqlite abandon  orders 42 lt_9f3a… --delay 60s     # release for retry, after a backoff
+mqlite abandon  orders 42 lt_9f3a… --delay 60s     # retry after backoff, or DLQ at the limit
 mqlite reject   orders 42 lt_9f3a… --reason bad    # dead-letter it (--detail …)
 mqlite defer    orders 42 lt_9f3a…                 # set aside for receive-deferred
-mqlite renew    orders 42 lt_9f3a…                 # extend the lock lease
+mqlite renew    orders 42 lt_9f3a…                 # extend the same live delivery's lease
 ```
+
+`renew` does not create another delivery attempt or increase `delivery_count`, and
+it cannot revive a lease after it expires.
 
 ### `schedule <queue> <body>` — enqueue for future delivery
 ```bash

@@ -58,9 +58,9 @@ models misuse them):
 | `send` | send a message (`queue`, `body`, optional `message_id`/`group_id`) |
 | `receive` | peek-lock messages → returns `seq_number` + `lock_token` |
 | `complete` | acknowledge a message (`queue`, `seq_number`, `lock_token`) |
-| `abandon` | release a message for redelivery |
+| `abandon` | end this delivery attempt; retry now/later below the limit, otherwise dead-letter |
 | `reject` | dead-letter a message |
-| `renew` | extend a message's lock so long-running work isn't redelivered |
+| `renew` | extend the same live delivery lock without increasing `delivery_count`; cannot revive an expired lock |
 | `defer` | set a message aside for later retrieval by `seq_number` |
 | `receive_deferred` | retrieve deferred messages by their `seq_numbers` |
 | `peek` | browse without locking (optionally by `state`) |

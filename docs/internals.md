@@ -155,6 +155,12 @@ A batch `Receive` runs this in a loop **inside one transaction** — one commit,
 one fsync, for the whole batch (that change alone took a 1-vCPU broker from 591
 to 1,507 msg/s of sustained drain).
 
+`ReceiveDeferred` uses a separate by-sequence claim, but it likewise increments
+`delivery_count` in the same UPDATE that moves `deferred → locked`. It currently
+has no `max_delivery_count` predicate: the maximum is enforced when a failed lock
+is Abandoned, reaped, or recovered, not as an admission check on explicit deferred
+recovery. Settlement, renewal, and the scheduler never increment the count.
+
 **The lock is a lease plus a fencing token.** `locked_until` is a timestamp —
 not a connection, not a heartbeat — so a dead consumer's lock simply *expires*.
 `lock_token` is 128 random bits handed only to the claimer, and every
@@ -171,8 +177,17 @@ is already expired, including before the background reaper runs. The broker samp
 time after local writer admission and afresh for every settlement statement and remote
 retry. A stale consumer's new settlement affects zero rows and returns `lock_lost`.
 After redelivery, the changed token also fences the previous owner. `Renew` and
-`RenewBatch` require the same live lease and never revive an expired one. A live
-exact-request receipt can replay an already committed settlement (§7).
+`RenewBatch` require the same live lease and never revive an expired one. They keep
+the token, state, and `delivery_count` unchanged. On a queue or subscription without a fixed expiry, the write is
+`locked_until = MAX(locked_until, broker_now + lock_duration)`; the candidate is
+capped at a fixed subscription lifetime. Thus renewal cannot shorten a lease and
+rapid calls do not stack durations. A live exact-request receipt can replay an
+already committed settlement (§7).
+
+The lease is only the ownership window for one attempt. Message TTL is a separate
+row-lifetime deadline and can expire the message while it is locked; a subscription
+lifetime is a resource deadline that caps every lease and eventually removes the
+backing queue. Renewal extends neither one.
 
 Receive-and-delete removes the claimed row in the same transaction. It grants no
 lease: both its token and deadline are cleared before the response or attempt record
@@ -235,7 +250,7 @@ it is small and boring on purpose:
 | lifecycle | event-driven; 10 ms after a full empty-subscription batch, otherwise 1 s between continuation passes | continue bounded physical cleanup for queues and subscription backing queues durably marked `deleting` |
 | subscription expiry | 1 s discovery; 10 ms between full due batches | transition a bounded indexed batch whose fixed absolute deadline has arrived; data-plane fencing does not wait for this scan |
 | reaper | 1 s | expired locks → back to `active` — or to the DLQ once `delivery_count ≥ max` |
-| scheduler | 1 s | `scheduled` rows whose time arrived → `active` |
+| scheduler | 1 s | `scheduled` rows whose time arrived → `active`; `delivery_count` unchanged |
 | TTL sweep | 10 s | expired messages → DLQ (or discard), from *any* non-terminal state |
 | janitors | 60 s | prune old receipts and dedup entries; reclaim up to 256 local free pages once 256 accumulate |
 
@@ -287,12 +302,17 @@ of a previous process (locks are rows, remember) and is reclaimed — back to
 `active`, or straight to the dead-letter state if it died on its final allowed
 attempt. Same rule as the reaper; a crash never buys an extra delivery.
 
-**Retries are bounded by data.** `delivery_count` is incremented *at claim time*
-inside the claim UPDATE itself, so no failure mode can lose count. When it
-reaches the queue's `max_delivery_count`, the reaper/recovery route the message
-to `state='dead_lettered'` — the DLQ is not a separate queue, just a state you
-can `Peek`, `Redrive` (back to active, count reset) or `Purge`, with retention
-bounds (age/count/bytes) so an unattended broker doesn't grow forever.
+**Ordinary retries are bounded by data.** `delivery_count` is incremented *at
+claim time* inside the claim UPDATE itself, so no failure mode can lose count.
+Reaching the maximum does not interrupt that claim: with `max_delivery_count=10`,
+ordinary Peek-Lock claim 10 is a full final attempt that can be renewed repeatedly and
+completed. If it is Abandoned, its lock expires, or startup recovery finds it
+still locked, that transition sees `delivery_count >= max_delivery_count` and
+moves it to `state='dead_lettered'` instead of allowing ordinary Peek-Lock claim 11.
+`ReceiveDeferred` is the explicit exception described in §4: it increments the
+count without a maximum admission check. The DLQ is not a separate queue, just a
+state you can `Peek`, `Redrive` (back to active, count reset) or `Purge`, with
+retention bounds (age/count/bytes) so an unattended broker doesn't grow forever.
 
 ## 7 · Honest at-least-once, and the two receipt tables
 

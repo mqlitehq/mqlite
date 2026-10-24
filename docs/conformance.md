@@ -19,7 +19,10 @@ resource deletion, and fixed subscription expiry. (§1.7, §3, §8, §14)
 - **1.2** A `locked` message MUST be invisible to other `Receive` calls until it is
   settled or its lock expires — no message is delivered to two consumers at once.
   *(engine/functional_test.go `TestCompetingConsumersNoDouble`)*
-- **1.3** Each claim increments `delivery_count`. *(engine/engine_test.go)*
+- **1.3** Each newly granted `Receive` or `ReceiveDeferred` claim increments
+  `delivery_count` exactly once. Renewal, settlement, lock reaping, scheduled
+  activation and replay of a live receive attempt MUST NOT increment it.
+  *(engine/engine_test.go, engine/ga_fixes_test.go, engine/functional_test.go)*
 - **1.4** When a lock expires, the reaper returns the message to `active` (redelivery)
   — or to `dead_lettered` once `delivery_count >= max_delivery_count`. *(engine/engine_test.go)*
 - **1.5** Claims are O(log n) on a deep backlog (a partial index on `active` rows; the
@@ -43,11 +46,12 @@ Exactly one verb per outcome; new effects require the `lock_token` from `Receive
 and an unexpired lease, with the exact-request replay exception in §2.6.
 
 - **2.1 Complete** removes the message. *(engine/functional_test.go)*
-- **2.2 Abandon** returns it to `active` for redelivery (or `dead_lettered` if over
+- **2.2 Abandon** returns it to `active` for redelivery (or `dead_lettered` at/above
   max). With `delay_ms > 0` it parks in `scheduled` until the backoff lapses
   (scheduler re-activates it); on an **ordered** queue the parked head holds
   head-of-line exactly like a scheduled send — successors cannot overtake it
-  (§5.5). *(engine/engine_test.go; engine/functional_test.go:
+  (§5.5). Neither Abandon nor scheduled activation increments `delivery_count`;
+  the next claim does. *(engine/engine_test.go; engine/functional_test.go:
   TestAbandonDelayHoldsGroupOrder)*
 - **2.3 Reject** moves it to `dead_lettered` with a reason. *(engine/functional_test.go)*
 - **2.4 Defer** sets it aside; it is retrieved later by seq via `ReceiveDeferred`.
@@ -55,9 +59,16 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   message **holds the head-of-line** — later messages in its group (or the whole queue
   under `strict_fifo`) are not claimable until it is retrieved and settled; other groups
   proceed. There is no automatic recovery without a TTL (the reaper never reclaims
-  deferred rows); recover a lost seq via `Peek state=deferred`.
+  deferred rows); recover a lost seq via `Peek state=deferred`. A successful
+  `ReceiveDeferred` increments `delivery_count` but does not gate that explicit
+  by-sequence claim on `max_delivery_count`; it can therefore return a count above
+  the ordinary delivery budget. Subsequent settlement follows the usual rules.
   *(engine/functional_test.go: TestDeferHoldsHeadOfLine)*
-- **2.5 Renew** extends the lock by the queue's lock duration. *(engine/ga_fixes_test.go)*
+- **2.5 Renew** MUST preserve the same state, token, and `delivery_count`. For a
+  queue or subscription without a fixed expiry it sets the deadline to
+  `max(old locked_until, broker now + lock_duration)`; a fixed subscription
+  lifetime caps the candidate deadline. It MUST NOT shorten a lease or revive one
+  whose current deadline has passed. *(engine/ga_fixes_test.go)*
 - **2.6** Settling with a wrong/expired token MUST fail with `ErrLockLost` (HTTP 409)
   — **except** an idempotent replay with a live receipt for the exact request (§3.2) returns
   success. Matching the token alone is insufficient: new settlement and renewal effects
@@ -81,8 +92,9 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   broker's STATEMENT finished — the answer still has to travel, so `locked_until_ms` is the
   authoritative fact and the caller compares it against its own clock. A renewal whose write
   outlived the lock reports `ok=false` rather than handing back a lock the caller never held, and a
-  renewal never *shortens* a lease. Capped at 512 messages — a claim about a live lease is only
-  keepable within a single statement.
+  renewal never *shortens* a lease. Each successful item uses the same deadline rule
+  as §2.5 and preserves state, token, and `delivery_count`. Capped at 512 messages —
+  a claim about a live lease is only keepable within a single statement.
   *(engine/complete_batch_test.go)*
 
 ## 3 · Idempotency & at-least-once
@@ -144,8 +156,13 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 
 ## 6 · Dead-letter queue
 
-- **6.1** A message reaching `max_delivery_count` MUST be dead-lettered with reason
-  `MaxDeliveryCountExceeded`. *(engine/engine_test.go)*
+- **6.1** Reaching `max_delivery_count` on an ordinary Peek-Lock `Receive` MUST NOT itself
+  dead-letter the message: the Nth ordinary Peek-Lock claim is a full final attempt and may
+  be renewed and completed. If that locked attempt is Abandoned, its lease expires,
+  or it is recovered at startup with `delivery_count >= max_delivery_count`, it MUST be
+  dead-lettered with reason `MaxDeliveryCountExceeded` instead of becoming active
+  for an ordinary Peek-Lock N+1 claim. This ordinary retry bound does not override the
+  explicit `ReceiveDeferred` behavior in §2.4. *(engine/engine_test.go)*
 - **6.2** `Redrive` moves dead letters back to `active` (or to a target queue); `Purge`
   permanently deletes them (scoped by `Max`/`OlderThanMs`). *(engine/redrive — functional tests)*
 
@@ -155,13 +172,16 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   until its time, then the scheduler activates it; `Cancel` deletes a scheduled
   message that has never been delivered (`delivery_count=0`) — a backoff-parked
   redelivery (§2.2) is NOT cancellable and stays under the retry/DLQ discipline.
+  Scheduler activation MUST NOT increment `delivery_count`.
   *(engine/functional_test.go: TestAbandonDelayHoldsGroupOrder)*
 - **7.2 TTL** — an expired message (`expires_at`) MUST move to the DLQ when the queue
   has `dead_letter_on_expire`, else be discarded. The two branches cover the **same
   state set** — every non-terminal state including `scheduled`: a row the scheduler
   has not yet activated when its TTL lapses (broker downtime, scheduler lag) is
   dead-lettered in place, not resurrected first. (TTL is anchored at `visible_at`,
-  so for scheduled messages the clock starts at their delivery time.)
+  so for scheduled messages the clock starts at their delivery time.) Message TTL
+  is independent of the lock lease: it may expire a locked row, and Renew MUST NOT
+  extend it.
   *(engine/functional_test.go: TestTTLScheduledToDeadLetter)*
 
 ## 8 · DLQ retention
@@ -352,7 +372,8 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   filter update, message activity and restart MUST NOT extend the deadline. At
   `now >= expires_at` fan-out and every direct data-plane effect MUST reject the
   subscription, cached metadata included. Locks and long polls MUST end no later
-  than the deadline, and idempotency records MUST NOT authorize work after it.
+  than the deadline; Renew MUST NOT extend it, and idempotency records MUST NOT
+  authorize work after it.
   *(engine/functional_test.go, engine/engine_test.go,
   engine/complete_batch_test.go; sdk_test.go; server/subscriptions_test.go)*
 - **12.7 Expiry cleanup.** Expiry is durable advance authorization to discard all

@@ -99,7 +99,7 @@ func cmdSettle(ctx context.Context, verb string, args []string) error {
 	var delay time.Duration
 	var reason, detail string
 	if verb == "abandon" {
-		fs.DurationVar(&delay, "delay", 0, "re-hide this long before redelivery (backoff)")
+		fs.DurationVar(&delay, "delay", 0, "retry backoff below the delivery limit")
 	}
 	if verb == "reject" {
 		fs.StringVar(&reason, "reason", "", "dead-letter reason")

@@ -40,7 +40,9 @@ func (m *Message) Complete(ctx context.Context) error {
 	return m.s.complete(ctx, m.queue, m.SequenceNumber, m.lockToken)
 }
 
-// Abandon releases the lock for immediate redelivery (optionally after a delay).
+// Abandon ends the current delivery attempt. Below the delivery limit the message
+// becomes available again immediately or after the optional delay; at the limit it
+// is dead-lettered instead.
 func (m *Message) Abandon(ctx context.Context, opts ...AbandonOpts) error {
 	o := firstOpt(opts)
 	return m.s.abandon(ctx, m.queue, m.SequenceNumber, m.lockToken, o.Delay.Milliseconds())
@@ -57,7 +59,8 @@ func (m *Message) Defer(ctx context.Context) error {
 	return m.s.deferMsg(ctx, m.queue, m.SequenceNumber, m.lockToken)
 }
 
-// Renew extends the lock lease (for long-running handlers).
+// Renew extends this delivery's live lock lease without increasing DeliveryCount.
+// It cannot revive an expired lease.
 func (m *Message) Renew(ctx context.Context) error {
 	return m.s.renew(ctx, m.queue, m.SequenceNumber, m.lockToken)
 }

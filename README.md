@@ -124,7 +124,7 @@ eng.SendOne(ctx, "orders", mqlite.OutMessage{Body: []byte("hello"), GroupID: "or
 msgs, _ := eng.Receive(ctx, "orders", mqlite.RecvOpts{Wait: 5 * time.Second})
 for _, m := range msgs {
     if err := handle(m.Body); err != nil {
-        _ = m.Abandon(ctx)   // release the lock → redelivered (or DLQ past max)
+        _ = m.Abandon(ctx)   // retry below max; this failed attempt goes to DLQ at max
         continue
     }
     _ = m.Complete(ctx)      // remove it (idempotent under retries)
@@ -235,6 +235,16 @@ cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
         return process(m.Body) // MUST be idempotent (at-least-once)
     })
 ```
+
+`delivery_count` counts claims, not time spent processing: `Receive` and explicit
+`ReceiveDeferred` claims increment it; `Renew`, `RenewBatch`, `Abandon`, and the
+scheduler do not. With `max_delivery_count=10`, the tenth ordinary Peek-Lock `Receive` is a
+full final attempt — it may be renewed repeatedly and completed successfully. It
+does not dead-letter merely because the claim reached 10; max-delivery handling
+runs if that attempt is abandoned, its lease expires, or startup recovery finds it
+still locked. `ReceiveDeferred` is an explicit-retrieval exception:
+it increments the count but does not currently reject a claim merely because the
+count is already at the configured maximum. See [Core concepts](docs/concepts.md#queue).
 
 ### 5. CLI
 
