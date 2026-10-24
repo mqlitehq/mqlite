@@ -1126,6 +1126,95 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 	t.Fatal("no `go 1.x` directive found in go.mod")
 }
 
+// TestReleaseDocsPinLatestDatedRelease keeps an unreleased source version from
+// becoming a fictional install target (MQLITE-158). CHANGELOG's first dated,
+// non-withdrawn entry is the repository's offline release source of truth. The
+// website generator uses the same rule; keep the hand-written repository docs in
+// lockstep so a candidate cannot advertise a tag, module or image that does not
+// exist yet.
+func TestReleaseDocsPinLatestDatedRelease(t *testing.T) {
+	changelog, err := os.ReadFile("CHANGELOG.md")
+	if err != nil {
+		t.Fatalf("read CHANGELOG.md: %v", err)
+	}
+	releaseRE := regexp.MustCompile(`(?m)^## (v\d+\.\d+\.\d+(?:-rc\.\d+)?) — \d{4}-\d{2}-\d{2}(?: \(([^)]*)\))?\s*$`)
+	withdrawnRE := regexp.MustCompile(`(?i)\b(?:withdrawn|retracted)\b`)
+	latest := ""
+	for _, match := range releaseRE.FindAllStringSubmatch(string(changelog), -1) {
+		if !withdrawnRE.MatchString(match[2]) {
+			latest = match[1]
+			break
+		}
+	}
+	if latest == "" {
+		t.Fatal("CHANGELOG.md has no dated, supported release heading")
+	}
+
+	versionFile, err := os.ReadFile(filepath.Join("internal", "version", "version.go"))
+	if err != nil {
+		t.Fatalf("read source version: %v", err)
+	}
+	versionMatch := regexp.MustCompile(`(?m)^const Version = "(\d+\.\d+\.\d+)"$`).FindStringSubmatch(string(versionFile))
+	if len(versionMatch) != 2 {
+		t.Fatal("cannot read the single source version constant")
+	}
+	sourceTag := "v" + versionMatch[1]
+	releaseNumber := strings.TrimPrefix(latest, "v")
+
+	docPaths := []string{
+		"README.md",
+		filepath.Join("docs", "api-reference.md"),
+		filepath.Join("docs", "deployment.md"),
+		filepath.Join("docs", "operations.md"),
+		filepath.Join("docs", "retention.md"),
+		filepath.Join("ops", "observability", "README.md"),
+	}
+	docs := make(map[string]string, len(docPaths))
+	var allDocs strings.Builder
+	for _, name := range docPaths {
+		body, readErr := os.ReadFile(name)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", name, readErr)
+		}
+		docs[name] = string(body)
+		allDocs.Write(body)
+		allDocs.WriteByte('\n')
+	}
+	for name, needles := range map[string][]string{
+		"README.md": {
+			"github.com/mqlitehq/mqlite@" + latest,
+			"releases/tag/" + latest,
+			"ghcr.io/mqlitehq/mqlite:" + releaseNumber,
+		},
+		filepath.Join("docs", "deployment.md"): {
+			"ghcr.io/mqlitehq/mqlite:" + releaseNumber,
+		},
+		filepath.Join("ops", "observability", "README.md"): {
+			"git checkout " + latest,
+		},
+	} {
+		for _, needle := range needles {
+			if !strings.Contains(docs[name], needle) {
+				t.Errorf("%s does not pin latest dated release %s: missing %q", name, latest, needle)
+			}
+		}
+	}
+
+	if sourceTag == latest {
+		return
+	}
+	for _, forbidden := range []string{
+		"github.com/mqlitehq/mqlite@" + sourceTag,
+		"releases/tag/" + sourceTag,
+		"ghcr.io/mqlitehq/mqlite:" + strings.TrimPrefix(sourceTag, "v"),
+		"git checkout " + sourceTag,
+	} {
+		if strings.Contains(allDocs.String(), forbidden) {
+			t.Errorf("release docs advertise unreleased source %s via %q; latest dated release is %s", sourceTag, forbidden, latest)
+		}
+	}
+}
+
 // TestConceptsCompanionReview requires deliberate review of the complete concepts
 // pair. The HTML contains hand-written interactive examples, so it is not generated
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).

@@ -48,8 +48,8 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> The latest supported release is **v0.4.1**, with default port **6754** and
-> schema token **7**. Pin the exact v0.4.1 binary or image rather than relying on
+> The latest supported release is **v0.4.0**, with default port **6754** and
+> schema token **7**. Pin the exact v0.4.0 binary or image rather than relying on
 > a moving image alias. v0.3.3 is withdrawn, unsupported, and retracted by
 > v0.4.0 and later; its public assets and exact image remain available for
 > forensic or compatibility inspection and must not be deployed.
@@ -57,35 +57,37 @@ and error reference: [api-reference.md](api-reference.md).
 > v0.4.x cannot open a v0.3.x schema-5 database and no in-place migration exists.
 > Schema 6 was used only by intermediate untagged lifecycle builds and is also
 > refused. Preserve the matching schema-5 binary/database pair, take a consistent
-> backup, account for retained work, and start v0.4.1 with a fresh database.
+> backup, account for retained work, and start v0.4.0 with a fresh database.
 > v0.4.0 also removes the deprecated Prometheus aliases described in
 > [observability](observability.md#compatibility-and-v040-migration).
 > **v0.2.0 uses port 8080 and schema token 2.** Follow the
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before
 > replacing it.
 
-v0.4.0 → v0.4.1 is a same-schema replacement. It fixes console, CLI and Go SDK
-observation validation after deleting a resource with process-lifetime message
-effects, exposes the broker lifecycle clock and makes subscription deadlines
-visible in the console. It also preserves each message TTL in a remote mixed-TTL
-batch; upgrade the v0.4.0 broker and Go client together before relying on that
-additive input shape. It does not require a database rebuild.
+Current `main` reports v0.4.1 as an unreleased same-schema candidate. It fixes
+observation validation in the console, CLI and Go SDK after deleting a resource
+with process-lifetime message effects; it also exposes the broker lifecycle clock
+and makes subscription deadlines visible in the console. The candidate preserves
+each message TTL in a remote mixed-TTL batch as well. Upgrade the v0.4.0 broker and
+Go client together before relying on that additive input shape once the patch is
+released. No v0.4.1 tag or image exists yet; production deployments must remain
+pinned to v0.4.0. The candidate does not require a database rebuild.
 
 The exact supported image is multi-arch (amd64 + arm64):
 
 ```bash
-# v0.4.1, default port 6754
+# v0.4.0, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.4.1
+  ghcr.io/mqlitehq/mqlite:0.4.0
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin exact `0.4.1` in production. Images `>= 0.3.0` listen on `6754`;
+- Pin exact `0.4.0` in production. Images `>= 0.3.0` listen on `6754`;
   **`0.2.x` and earlier listen on `8080`**.
 - Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. Metrics is
   disabled by default. For a private broker or an ingress that blocks public
@@ -102,7 +104,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.4.1"   # latest supported exact image
+  image = "ghcr.io/mqlitehq/mqlite:0.4.0"   # latest supported exact image
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
