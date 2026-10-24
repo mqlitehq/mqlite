@@ -198,7 +198,8 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestMessageTTLDeadlineSurvivesRenewAndDelayedRetry; sdk_test.go:
   TestBatchTTLRemoteEmbeddedParity, TestNegativeMessageTTLSDKParity,
   TestRemoteBatchTTLWireCompatibility; server/send_dedup_test.go:
-  TestServerSendPerMessageTTL; test/api_tests.py: t_message_ttl_contract)*
+  TestServerSendPerMessageTTL; engine/turso_test.go:
+  TestTursoMessageTTLParity; test/api_tests.py: t_message_ttl_contract)*
 
 ## 8 · DLQ retention
 
@@ -311,6 +312,16 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   it. Operators must create a fresh database and preserve the matching old
   binary/backup pair. *(engine/storage_test.go:
   TestSchemaVersionGuard, TestSchemaContentPinnedToVersionToken)*
+- **10.6 Backend parity.** Given the same committed state, broker time and request,
+  local SQLite and remote Turso/libSQL MUST produce the same successful result,
+  validation outcome, state transition and logical sentinel error. Latency,
+  temporary availability, remote transport failures (including
+  `ErrOutcomeUnknown`), remote transaction-callback replay and explicitly
+  operational deployment, maintenance and observation behavior MAY differ; they
+  MUST NOT silently change deterministic queue semantics.
+  *(engine/turso_test.go: TestTursoIntegration, TestTursoExtended,
+  TestTursoMessageTTLParity, TestTursoConcurrent, TestTursoBatchSettle;
+  engine/storage_test.go; server/errors_test.go; sdk_test.go)*
 
 ## 11 · Subscription filters
 
