@@ -206,6 +206,15 @@ so after an unusually slow scan the gauges can trail current messages by the sca
 duration plus roughly one cache window. Per-queue `Stats` remains a fresh indexed
 read.
 
+On a current broker, the console's five-second loop calls only `Observe`. Managed
+queue and subscription topology is loaded on connection and refreshed explicitly
+or after configuration changes; publishing, receiving, and settlement do not scan
+it. Subscription pages include deleting rows and are grouped by topic in the
+browser. Opening or refreshing one subscription detail performs a bounded lookup
+scoped to that topic. An Observe-unsupported broker instead polls `Stats` for its
+cached queue set and uses the legacy subscription list without repeatedly probing
+the paged route.
+
 Counts describe stored states at the sample time, not guaranteed immediate
 delivery eligibility: visibility, TTL, lease expiry awaiting maintenance and
 ordering rules can affect claims. Runtime probes, process counters and queue

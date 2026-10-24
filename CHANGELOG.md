@@ -43,6 +43,19 @@ upgrade notes before replacing a broker.
   Lifecycle inventory is fetched only when its detail view is opened or refreshed,
   not from the periodic observation loop.
 
+### Show lifecycle-aware topic inventory without hot-path scans (MQLITE-150)
+
+- Group the paged subscription inventory by topic in the console and show each
+  subscription as permanent, expiring, expired, or deleting. Exact deadlines and
+  remaining time use `Observe.server_time_ms`, never the browser clock.
+- Keep the current-broker five-second loop to one `Observe` call. Initial loads,
+  explicit refreshes, and configuration changes refresh the lifecycle inventory;
+  publishing, receiving, and settlement do not. Concurrent topology refreshes are
+  coalesced and only the newest result is committed.
+- Retain compatibility with older brokers by probing the paged route once, then
+  caching a legacy-list fallback whose lifecycle fields are marked unavailable.
+  This changes only the bundled console; the schema and HTTP/wire API are unchanged.
+
 ## v0.4.0 — 2026-10-23
 
 > **Upgrade from v0.3.2 or withdrawn v0.3.3:** port **6754** remains

@@ -213,8 +213,12 @@ Full endpoint, request/response, and error reference: [docs/api-reference.md](do
 The broker bakes a web console into the binary and serves it at **`/ui`** (e.g.
 `http://127.0.0.1:6754/ui`) — no separate process or Node runtime. Paste your broker URL
 + token and you can list queues with live counts, browse messages, send/receive/settle,
-edit subscription filters, and redrive a DLQ. It's on by default; set `MQLITE_UI=off` to
-run headless. (The same console is also published standalone for hosting elsewhere.)
+edit subscription filters, inspect permanent or fixed subscription lifetimes in the
+topic list, and redrive a DLQ. Current brokers use `Observe` alone for the five-second
+poll; subscription inventory is refreshed on connection, explicit refresh, and
+configuration changes instead of on message operations. It's on by default; set
+`MQLITE_UI=off` to run headless. (The same console is also published standalone for
+hosting elsewhere.)
 
 Starting with v0.3.2, a configured monitor token opens only the read-only overview
 and metrics views; administration still requires `manage`.
@@ -486,8 +490,8 @@ and must not be deployed. v0.4.1 carries its retraction directive.
 v0.4.1 is a schema-compatible patch for v0.4.0. It keeps the console, CLI and Go
 SDK usable after a deleted resource contributes to the documented retired
 observation aggregate, exposes the broker lifecycle clock and makes subscription
-deadlines visible in the console; no database rebuild is required for this patch
-upgrade.
+deadlines visible in the console's topic list and detail view; no database rebuild
+is required for this patch upgrade.
 
 v0.4.0 removes v0.3.3's public queue `Generation` contract and adds the corrected
 resource lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md).
