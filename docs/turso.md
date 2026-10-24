@@ -7,6 +7,39 @@ HTTP via `libsql-client-go`, so the single static binary still has no native dep
 This note records how concurrency is handled and why embedded replicas are *not*
 used.
 
+## Backend parity contract
+
+Storage selection is a deployment detail, not a second API mode. Given the same
+committed state, broker time and request, local SQLite and remote Turso/libSQL
+MUST produce the same successful result, validation outcome, message/resource
+state transition and logical sentinel error. The HTTP status/code mapping and Go
+SDK `errors.Is` behavior therefore do not change when an operator changes the
+broker's database DSN. In particular, scheduling, delivery counts, settlement,
+ordering, deduplication, topic fan-out, deletion and TTL use one engine contract.
+
+This is parity of deterministic queue behavior, not a claim that a local file and
+a network service have identical failure or performance envelopes. The documented
+differences are operational or failure-boundary concerns:
+
+- latency, throughput and temporary availability caused by the remote round trip;
+- remote transport/storage failures, including `ErrOutcomeUnknown` when a write
+  may have committed but its acknowledgement was lost;
+- retry and cancellation mechanics during a storage fault — notably, a remote
+  transactional-outbox callback may run more than once and must keep its effects
+  transaction-bound;
+- deployment and maintenance controls: the local file lock, SQLite synchronous
+  mode, file-size accounting and compaction have no identical remote operation;
+  Turso still requires one logical MQLite owner but cannot use that local OS lock;
+  and
+- explicitly operational observation fields such as backend identity and
+  connection-pool data.
+
+Those differences MUST NOT silently change a successful operation's queue
+semantics or turn a documented logical error into a backend-specific one. The
+hermetic suite locks the shared engine and error mappings on every PR; the
+credentials-gated nightly suite compares representative lifecycle, concurrency,
+settlement, access-key and TTL contracts with a real Turso database.
+
 ## Concurrency model
 
 MQLite has a **single logical owner** in both modes: each database has exactly one

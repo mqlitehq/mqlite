@@ -16,9 +16,11 @@ for metric definitions and alerts.
 v0.4.0 → v0.4.1 is a same-schema patch upgrade. It fixes strict Observe clients
 and the console rejecting the documented retired message aggregate after a
 message-bearing queue or subscription is deleted, exposes the lifecycle clock,
-and makes fixed subscription deadlines visible in the console. No database
-rebuild or metric migration is required; still quiesce clients and avoid
-overlapping brokers during the binary replacement.
+and makes fixed subscription deadlines visible in the console. It also preserves
+per-message TTLs in remote mixed-TTL batches; upgrade broker and Go client together
+before relying on that additive input shape. No database rebuild or metric
+migration is required; still quiesce clients and avoid overlapping brokers during
+the binary replacement.
 
 ## Operating boundaries
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -116,5 +117,104 @@ func TestServerPublishNoSubscriberIsNoOp(t *testing.T) {
 	}
 	if sr := pub("silver"); len(sr.SeqNumbers) != 1 || sr.SeqNumbers[0] != 0 {
 		t.Fatalf("no-subscriber publish: seqs=%v, want [0] (200 no-op, not 409)", sr.SeqNumbers)
+	}
+}
+
+// TestServerSendPerMessageTTL pins the additive batch contract: legacy callers may
+// keep using the request-level ttl_ms, while a mixed batch carries ttl_ms on each
+// message. Ambiguous or negative inputs fail before any row is written.
+func TestServerSendPerMessageTTL(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	const queueTTL = int64(300_000)
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{DefaultTTLMs: queueTTL}); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+
+	ts := httptest.NewServer(server.New(eng, nil).Handler())
+	defer ts.Close()
+	post := func(req any) (int, []byte) {
+		t.Helper()
+		jb, err := json.Marshal(req)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		resp, err := http.Post(ts.URL+wire.PathSend, "application/json", bytes.NewReader(jb))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		rb, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return resp.StatusCode, rb
+	}
+	assertInvalid := func(name string, req any) {
+		t.Helper()
+		status, body := post(req)
+		var problem wire.ErrorBody
+		_ = json.Unmarshal(body, &problem)
+		if status != http.StatusBadRequest || problem.Code != "invalid_argument" {
+			t.Fatalf("%s: status=%d body=%s, want 400 invalid_argument", name, status, body)
+		}
+	}
+
+	status, body := post(wire.SendWithMessageTTLsRequest{Queue: "q", Messages: []wire.SendMessage{
+		{Message: wire.Message{Body: []byte("default")}},
+		{Message: wire.Message{Body: []byte("short")}, TTLMs: 60_000},
+		{Message: wire.Message{Body: []byte("capped")}, TTLMs: 600_000},
+		{Message: wire.Message{Body: []byte("huge-capped")}, TTLMs: math.MaxInt64},
+	}})
+	if status != http.StatusOK {
+		t.Fatalf("mixed TTL: status=%d body=%s", status, body)
+	}
+	peeked, err := eng.Peek(ctx, "q", engine.PeekOptions{Max: 10})
+	if err != nil {
+		t.Fatalf("peek: %v", err)
+	}
+	wantTTL := map[string]int64{
+		"default": queueTTL, "short": 60_000, "capped": queueTTL, "huge-capped": queueTTL,
+	}
+	if len(peeked) != len(wantTTL) {
+		t.Fatalf("peek count=%d, want %d", len(peeked), len(wantTTL))
+	}
+	for _, msg := range peeked {
+		if got, want := msg.ExpiresAtMs-msg.VisibleAtMs, wantTTL[string(msg.Body)]; got != want {
+			t.Errorf("%s effective TTL=%d, want %d", msg.Body, got, want)
+		}
+	}
+
+	assertInvalid("request and message TTL conflict", wire.SendWithMessageTTLsRequest{
+		Queue: "q", TTLMs: 1_000,
+		Messages: []wire.SendMessage{{Message: wire.Message{Body: []byte("x")}, TTLMs: 500}},
+	})
+	assertInvalid("negative request TTL", wire.SendRequest{
+		Queue: "q", TTLMs: -1, Messages: []wire.Message{{Body: []byte("x")}},
+	})
+	assertInvalid("negative message TTL", wire.SendWithMessageTTLsRequest{
+		Queue: "q", Messages: []wire.SendMessage{{Message: wire.Message{Body: []byte("x")}, TTLMs: -1}},
+	})
+	stats, err := eng.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.Total != int64(len(wantTTL)) {
+		t.Fatalf("invalid requests wrote rows: total=%d, want %d", stats.Total, len(wantTTL))
+	}
+
+	if err := eng.CreateQueue(ctx, "unlimited", engine.QueueConfig{}); err != nil {
+		t.Fatalf("create unlimited queue: %v", err)
+	}
+	assertInvalid("TTL expiry overflow", wire.SendRequest{
+		Queue: "unlimited", TTLMs: math.MaxInt64,
+		Messages: []wire.Message{{Body: []byte("overflow")}},
+	})
+	if stats, err := eng.Stats(ctx, "unlimited"); err != nil || stats.Total != 0 {
+		t.Fatalf("overflow request wrote rows: stats=%+v err=%v", stats, err)
 	}
 }

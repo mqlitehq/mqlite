@@ -186,7 +186,7 @@ usage: mqlite <command> [flags]
  messages
   send <queue> <body>       send now (body "-" reads stdin; --file reads a file)
   schedule <queue> <body>   send for future delivery (--at RFC3339|duration)
-  cancel <queue> <seq>      delete a not-yet-activated scheduled message
+  cancel <queue> <seq>      delete a never-delivered scheduled send
   receive <queue>           receive (Peek-Lock, auto-Complete unless --no-ack)
   receive-deferred <queue>  fetch deferred messages back by seq (--seq 42,57)
   complete <queue> <seq> <token>   settle a --no-ack message: done
@@ -723,8 +723,8 @@ func isLoopbackListen(addr string) bool {
 func cmdCreateQueue(ctx context.Context, args []string) error {
 	fs := newFlags("create-queue")
 	lock := fs.Duration("lock", 0, "lock duration (e.g. 30s)")
-	maxdc := fs.Int("max-delivery", 0, "max delivery count before DLQ")
-	ttl := fs.Duration("ttl", 0, "default message TTL")
+	maxdc := fs.Int("max-delivery", 0, "ordinary claim budget; the final claim remains usable")
+	ttl := fs.Duration("ttl", 0, "default and maximum message TTL (0=unlimited)")
 	dedup := fs.Duration("dedup", 0, "dedup window (0=off)")
 	ordering := fs.String("ordering", "", "ordering mode: standard|group_fifo|strict_fifo (default standard)")
 	dlqAge := fs.Duration("dlq-max-age", 0, "per-queue DLQ retention: drop dead letters older than this (0=inherit broker default)")

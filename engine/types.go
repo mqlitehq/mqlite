@@ -73,8 +73,8 @@ var (
 type QueueConfig struct {
 	Kind               string       // "queue" (default) or "subscription"
 	LockDurationMs     int64        // Peek-Lock default lock duration; 0 -> 30000
-	MaxDeliveryCount   int          // 0 -> 10
-	DefaultTTLMs       int64        // 0 -> unlimited
+	MaxDeliveryCount   int          // ordinary claim budget; 0 -> 10, and the final claim remains usable
+	DefaultTTLMs       int64        // default and ceiling for message TTL; 0 -> unlimited
 	DeadLetterOnExpire *bool        // nil -> true
 	DedupWindowMs      int64        // 0 -> dedup disabled
 	Ordering           OrderingMode // "" -> standard
@@ -101,7 +101,7 @@ type OutMessage struct {
 	Subject       string // = ASB Label
 	ContentType   string
 	Properties    map[string]string // custom KV (headers), JSON-encoded; broker does not interpret
-	TTLMs         int64             // 0 -> use queue default
+	TTLMs         int64             // 0 -> queue default; negative is invalid; a positive queue default caps longer values
 }
 
 // ReceiveMode selects Peek-Lock (default) or Receive-and-Delete (at-most-once fast path).

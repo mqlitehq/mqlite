@@ -456,15 +456,30 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 // ── QueueService handlers ───────────────────────────────────────────────────
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
-	var req wire.SendRequest
+	var req wire.SendWithMessageTTLsRequest
 	if err := decode(r, &req); err != nil {
 		decodeErr(w, err)
 		return
 	}
 	ctx := r.Context()
 	logf(w, "queue", req.Queue)
+	if req.TTLMs < 0 {
+		s.fail(w, fmt.Errorf("%w: ttl_ms must be non-negative", engine.ErrInvalidArgument))
+		return
+	}
+	// ttl_ms is the legacy whole-request form. A mixed batch uses the additive
+	// send-only SendMessage.ttl_ms field; accepting both would leave precedence
+	// ambiguous for raw HTTP clients.
 	outs := make([]engine.OutMessage, len(req.Messages))
 	for i, m := range req.Messages {
+		if m.TTLMs < 0 {
+			s.fail(w, fmt.Errorf("%w: messages[%d].ttl_ms must be non-negative", engine.ErrInvalidArgument, i))
+			return
+		}
+		if req.TTLMs > 0 && m.TTLMs > 0 {
+			s.fail(w, fmt.Errorf("%w: ttl_ms and messages[%d].ttl_ms cannot both be set", engine.ErrInvalidArgument, i))
+			return
+		}
 		o := m.ToOut()
 		if req.TTLMs > 0 {
 			o.TTLMs = req.TTLMs

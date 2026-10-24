@@ -275,6 +275,288 @@ func TestRemoteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBatchTTLRemoteEmbeddedParity(t *testing.T) {
+	ctx := context.Background()
+	cli, embedded := newBroker(t, "mqk_ttl")
+	const queueTTL = 5 * time.Minute
+	for _, tc := range []struct {
+		name   string
+		create func(string) error
+		send   func(string, ...mqlite.OutMessage) ([]int64, error)
+		peek   func(string, ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error)
+	}{
+		{
+			name: "remote",
+			create: func(queue string) error {
+				return cli.CreateQueue(ctx, queue, mqlite.QueueConfig{DefaultTTL: queueTTL})
+			},
+			send: func(queue string, messages ...mqlite.OutMessage) ([]int64, error) {
+				return cli.Send(ctx, queue, messages...)
+			},
+			peek: func(queue string, opts ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error) {
+				return cli.Peek(ctx, queue, opts...)
+			},
+		},
+		{
+			name: "embedded",
+			create: func(queue string) error {
+				return embedded.CreateQueue(ctx, queue, mqlite.QueueConfig{DefaultTTL: queueTTL})
+			},
+			send: func(queue string, messages ...mqlite.OutMessage) ([]int64, error) {
+				return embedded.Send(ctx, queue, messages...)
+			},
+			peek: func(queue string, opts ...mqlite.PeekOpts) ([]*mqlite.PeekedMessage, error) {
+				return embedded.Peek(ctx, queue, opts...)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			queue := "mixed-ttl-" + tc.name
+			if err := tc.create(queue); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			messages := []mqlite.OutMessage{
+				{Body: []byte("default")},
+				{Body: []byte("short"), TTL: time.Minute},
+				{Body: []byte("capped"), TTL: 10 * time.Minute},
+			}
+			if _, err := tc.send(queue, messages...); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			peeked, err := tc.peek(queue, mqlite.PeekOpts{Max: 10})
+			if err != nil {
+				t.Fatalf("peek: %v", err)
+			}
+			want := map[string]time.Duration{"default": queueTTL, "short": time.Minute, "capped": queueTTL}
+			if len(peeked) != len(want) {
+				t.Fatalf("peek count=%d, want %d", len(peeked), len(want))
+			}
+			for _, message := range peeked {
+				if got, expected := message.ExpiresAt.Sub(message.VisibleAt), want[string(message.Body)]; got != expected {
+					t.Errorf("%s effective TTL=%s, want %s", message.Body, got, expected)
+				}
+			}
+		})
+	}
+}
+
+func TestNegativeMessageTTLSDKParity(t *testing.T) {
+	ctx := context.Background()
+	cli, embedded := newBroker(t, "mqk_negative_ttl")
+	for _, tc := range []struct {
+		name      string
+		create    func(string) error
+		sendOne   func(string, mqlite.OutMessage) (int64, error)
+		sendBatch func(string, ...mqlite.OutMessage) ([]int64, error)
+		stats     func(string) (mqlite.Metrics, error)
+	}{
+		{
+			name:    "remote",
+			create:  func(queue string) error { return cli.CreateQueue(ctx, queue, mqlite.QueueConfig{}) },
+			sendOne: func(queue string, message mqlite.OutMessage) (int64, error) { return cli.SendOne(ctx, queue, message) },
+			sendBatch: func(queue string, messages ...mqlite.OutMessage) ([]int64, error) {
+				return cli.Send(ctx, queue, messages...)
+			},
+			stats: func(queue string) (mqlite.Metrics, error) { return cli.Stats(ctx, queue) },
+		},
+		{
+			name:   "embedded",
+			create: func(queue string) error { return embedded.CreateQueue(ctx, queue, mqlite.QueueConfig{}) },
+			sendOne: func(queue string, message mqlite.OutMessage) (int64, error) {
+				return embedded.SendOne(ctx, queue, message)
+			},
+			sendBatch: func(queue string, messages ...mqlite.OutMessage) ([]int64, error) {
+				return embedded.Send(ctx, queue, messages...)
+			},
+			stats: func(queue string) (mqlite.Metrics, error) { return embedded.Stats(ctx, queue) },
+		},
+	} {
+		for _, invalid := range []struct {
+			name string
+			ttl  time.Duration
+		}{{"negative", -time.Nanosecond}, {"positive_sub_millisecond", time.Nanosecond}} {
+			for _, operation := range []string{"SendOne", "Send"} {
+				t.Run(tc.name+"/"+invalid.name+"/"+operation, func(t *testing.T) {
+					queue := fmt.Sprintf("invalid-ttl-%s-%s-%s", tc.name, invalid.name, operation)
+					if err := tc.create(queue); err != nil {
+						t.Fatalf("create: %v", err)
+					}
+					message := mqlite.OutMessage{Body: []byte("invalid"), TTL: invalid.ttl}
+					var err error
+					if operation == "SendOne" {
+						_, err = tc.sendOne(queue, message)
+					} else {
+						_, err = tc.sendBatch(queue, mqlite.OutMessage{Body: []byte("must-not-commit")}, message)
+					}
+					if !errors.Is(err, mqlite.ErrInvalidArgument) {
+						t.Fatalf("error=%v, want ErrInvalidArgument", err)
+					}
+					stats, err := tc.stats(queue)
+					if err != nil {
+						t.Fatalf("stats: %v", err)
+					}
+					if stats.Total != 0 {
+						t.Fatalf("invalid request wrote %d rows", stats.Total)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRemoteBatchTTLWireCompatibility(t *testing.T) {
+	ctx := context.Background()
+	t.Run("uniform batch keeps legacy request TTL", func(t *testing.T) {
+		var requests atomic.Int64
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			var raw struct {
+				TTLMs    int64                        `json:"ttl_ms"`
+				Messages []map[string]json.RawMessage `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+				t.Errorf("decode: %v", err)
+			}
+			if raw.TTLMs != 60_000 || (len(raw.Messages) != 1 && len(raw.Messages) != 2) {
+				t.Errorf("request TTL=%d messages=%d", raw.TTLMs, len(raw.Messages))
+			}
+			for i, message := range raw.Messages {
+				if _, present := message["ttl_ms"]; present {
+					t.Errorf("messages[%d] unexpectedly carried ttl_ms", i)
+				}
+			}
+			seqs := make([]int64, len(raw.Messages))
+			for i := range seqs {
+				seqs[i] = int64(i + 1)
+			}
+			_ = json.NewEncoder(w).Encode(wire.SendResponse{SeqNumbers: seqs})
+		}))
+		defer stub.Close()
+		cli, err := mqlite.Open(ctx, stub.URL)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer cli.Close()
+		if _, err := cli.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("single"), TTL: time.Minute}); err != nil {
+			t.Fatalf("send one: %v", err)
+		}
+		if _, err := cli.Send(ctx, "q",
+			mqlite.OutMessage{Body: []byte("a"), TTL: time.Minute},
+			mqlite.OutMessage{Body: []byte("b"), TTL: time.Minute}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		if got := requests.Load(); got != 2 {
+			t.Fatalf("requests=%d, want SendOne plus Send", got)
+		}
+	})
+
+	t.Run("mixed batch uses per-message TTL", func(t *testing.T) {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var raw map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+				t.Errorf("decode: %v", err)
+			}
+			if _, present := raw["ttl_ms"]; present {
+				t.Error("mixed request unexpectedly carried top-level ttl_ms")
+			}
+			var messages []map[string]json.RawMessage
+			if err := json.Unmarshal(raw["messages"], &messages); err != nil {
+				t.Errorf("messages: %v", err)
+			}
+			if len(messages) != 3 {
+				t.Fatalf("messages=%d, want 3", len(messages))
+			}
+			if _, present := messages[0]["ttl_ms"]; present {
+				t.Error("zero per-message TTL should be omitted")
+			}
+			for i, want := range []int64{60_000, 120_000} {
+				var got int64
+				if err := json.Unmarshal(messages[i+1]["ttl_ms"], &got); err != nil || got != want {
+					t.Errorf("messages[%d].ttl_ms=%d err=%v, want %d", i+1, got, err, want)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(wire.SendResponse{SeqNumbers: []int64{1, 2, 3}})
+		}))
+		defer stub.Close()
+		cli, err := mqlite.Open(ctx, stub.URL)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer cli.Close()
+		if _, err := cli.Send(ctx, "q",
+			mqlite.OutMessage{Body: []byte("default")},
+			mqlite.OutMessage{Body: []byte("one"), TTL: time.Minute},
+			mqlite.OutMessage{Body: []byte("two"), TTL: 2 * time.Minute}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	})
+
+	t.Run("invalid SDK TTL never contacts an old broker", func(t *testing.T) {
+		var requests atomic.Int64
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			_ = json.NewEncoder(w).Encode(wire.SendResponse{SeqNumbers: []int64{1, 2}})
+		}))
+		defer stub.Close()
+		cli, err := mqlite.Open(ctx, stub.URL)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer cli.Close()
+		for _, ttl := range []time.Duration{-time.Nanosecond, time.Nanosecond} {
+			if _, err := cli.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("x"), TTL: ttl}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+				t.Errorf("SendOne TTL=%s error=%v, want ErrInvalidArgument", ttl, err)
+			}
+			if _, err := cli.Send(ctx, "q",
+				mqlite.OutMessage{Body: []byte("valid")},
+				mqlite.OutMessage{Body: []byte("invalid"), TTL: ttl}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+				t.Errorf("Send TTL=%s error=%v, want ErrInvalidArgument", ttl, err)
+			}
+		}
+		if got := requests.Load(); got != 0 {
+			t.Fatalf("invalid SDK TTL issued %d HTTP requests", got)
+		}
+	})
+
+	t.Run("old strict broker fails closed for mixed batch", func(t *testing.T) {
+		type legacyMessage struct {
+			Body []byte `json:"body,omitempty"`
+		}
+		type legacySendRequest struct {
+			Queue    string          `json:"queue"`
+			Messages []legacyMessage `json:"messages"`
+			TTLMs    int64           `json:"ttl_ms,omitempty"`
+		}
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			decoder := json.NewDecoder(r.Body)
+			decoder.DisallowUnknownFields()
+			var legacy legacySendRequest
+			if err := decoder.Decode(&legacy); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "invalid_argument", Message: err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(wire.SendResponse{SeqNumbers: []int64{1, 2}})
+		}))
+		defer stub.Close()
+		cli, err := mqlite.Open(ctx, stub.URL)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer cli.Close()
+		if _, err := cli.Send(ctx, "q",
+			mqlite.OutMessage{Body: []byte("default")},
+			mqlite.OutMessage{Body: []byte("short"), TTL: time.Minute}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+			t.Fatalf("mixed batch error=%v, want ErrInvalidArgument", err)
+		}
+		if _, err := cli.Send(ctx, "q",
+			mqlite.OutMessage{Body: []byte("a"), TTL: time.Minute},
+			mqlite.OutMessage{Body: []byte("b"), TTL: time.Minute}); err != nil {
+			t.Fatalf("uniform legacy batch: %v", err)
+		}
+	})
+}
+
 func TestRemoteAuth(t *testing.T) {
 	ctx := context.Background()
 	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
@@ -849,8 +1131,8 @@ func TestGoModFloorStaysAt121(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "8508d6204b50999b17de1f81150ee2b3124b7831d4ba4016da6ef39bd3fbc3e3",
-		"concepts.html": "f0018fd931c5c2b15212f203350ed7e1ebeb4f1db12b3118a041dbd66d9322a8",
+		"concepts.md":   "3ff47a5d29f6fbc8f47ad4e9bff93375f9f3a86604f53233dadc16adba756ef5",
+		"concepts.html": "7f50260b6e7592f0db7062472c9712ed0a98e08c8c8a5d98888b0aaaf8c09266",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {

@@ -1012,6 +1012,9 @@ func (e *Engine) send(ctx context.Context, name string, ms []OutMessage, atMs in
 // ErrDedupConflict for a publish that simply had no interested subscriber.
 func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, atMs int64, forced State) ([]int64, []bool, error) {
 	for i := range ms {
+		if ms[i].TTLMs < 0 {
+			return nil, nil, fmt.Errorf("%w: messages[%d].ttl_ms must be non-negative", ErrInvalidArgument, i)
+		}
 		if int64(len(ms[i].Body)) > e.maxMsgBytes {
 			return nil, nil, fmt.Errorf("%w: %d > %d bytes", ErrMessageTooLarge, len(ms[i].Body), e.maxMsgBytes)
 		}

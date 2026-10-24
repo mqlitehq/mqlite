@@ -288,6 +288,9 @@ func msToTime(ms int64) time.Time {
 // SendOne enqueues one message and returns its seq. A dedup conflict (same id,
 // different body) surfaces as ErrDedupConflict. SendOpts.At schedules delayed delivery.
 func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts ...SendOpts) (int64, error) {
+	if err := validateOutMessageTTL(m); err != nil {
+		return 0, err
+	}
 	o := firstOpt(opts)
 	path := wire.PathSend
 	req := wire.SendRequest{Queue: queue, Messages: []wire.Message{outToWire(m)}, TTLMs: m.TTL.Milliseconds()}
@@ -310,27 +313,53 @@ func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts .
 }
 
 // Send enqueues one or many messages in one request/transaction (use SendOne
-// for a single seq return or At() scheduling).
+// for a single seq return or At() scheduling). Batches whose messages use
+// different TTL values require a broker that supports per-message ttl_ms;
+// older strict brokers reject that additive field rather than applying it wrongly.
 func (c *Client) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]int64, error) {
 	if len(msgs) == 0 {
 		return nil, nil
 	}
-	wm := make([]wire.Message, len(msgs))
-	var ttl int64
 	for i, m := range msgs {
-		wm[i] = outToWire(m)
-		if ttl == 0 {
-			ttl = m.TTL.Milliseconds()
+		if err := validateOutMessageTTL(m); err != nil {
+			return nil, fmt.Errorf("message %d: %w", i, err)
 		}
 	}
+	ttl := msgs[0].TTL.Milliseconds()
+	uniformTTL := true
+	for _, m := range msgs[1:] {
+		if m.TTL.Milliseconds() != ttl {
+			uniformTTL = false
+			break
+		}
+	}
+	// Preserve the legacy request-level field for uniform batches so new clients
+	// remain compatible with old strict brokers. Only a mixed batch needs the
+	// additive per-message field; an old broker rejects it instead of silently
+	// applying one message's TTL to every row.
+	var request any
+	if uniformTTL {
+		messages := make([]wire.Message, len(msgs))
+		for i, m := range msgs {
+			messages[i] = outToWire(m)
+		}
+		request = wire.SendRequest{Queue: queue, Messages: messages, TTLMs: ttl}
+	} else {
+		messages := make([]wire.SendMessage, len(msgs))
+		for i, m := range msgs {
+			messages[i] = wire.SendMessage{Message: outToWire(m), TTLMs: m.TTL.Milliseconds()}
+		}
+		request = wire.SendWithMessageTTLsRequest{Queue: queue, Messages: messages}
+	}
 	var resp wire.SendResponse
-	if err := c.post(ctx, wire.PathSend, wire.SendRequest{Queue: queue, Messages: wm, TTLMs: ttl}, &resp); err != nil {
+	if err := c.post(ctx, wire.PathSend, request, &resp); err != nil {
 		return nil, err
 	}
 	return resp.SeqNumbers, nil
 }
 
-// Cancel deletes a not-yet-activated scheduled message.
+// Cancel deletes a never-delivered scheduled Send. It cannot cancel a retry
+// parked in scheduled by delayed Abandon.
 func (c *Client) Cancel(ctx context.Context, queue string, seq int64) error {
 	return c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: seq}, &wire.SettleResponse{})
 }

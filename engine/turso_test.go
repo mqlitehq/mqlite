@@ -640,6 +640,149 @@ func TestTursoExtended(t *testing.T) {
 	t.Logf("Turso extended OK: dedup + idempotent receive/settle + DLQ redrive/purge + #11 subscription guard + topic filter")
 }
 
+// TestTursoMessageTTLParity runs one normalized message-TTL scenario against a
+// local SQLite file and a real Turso database. Transport-shape parity is covered
+// in sdk_test.go; this comparison locks the two storage backends to the same
+// effective deadlines, validation errors and batch atomicity.
+func TestTursoMessageTTLParity(t *testing.T) {
+	dsn := os.Getenv("MQLITE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set MQLITE_TEST_DB (and MQLITE_TEST_DB_AUTH_TOKEN) to run the Turso integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	var now atomic.Int64
+	now.Store(time.Now().UnixMilli())
+	open := func(db, token string) *Engine {
+		t.Helper()
+		e, err := Open(ctx, Options{DB: db, AuthToken: token, DisableBackground: true, Now: now.Load})
+		if err != nil {
+			t.Fatalf("open %q: %v", db, err)
+		}
+		t.Cleanup(func() {
+			if err := e.Close(); err != nil {
+				t.Errorf("close %q: %v", db, err)
+			}
+		})
+		return e
+	}
+
+	remote := open(dsn, os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"))
+	if !remote.Remote() {
+		t.Fatalf("expected remote store for dsn %q", dsn)
+	}
+	local := open(filepath.Join(t.TempDir(), "ttl-parity.db"), "")
+	if local.Remote() {
+		t.Fatal("temporary SQLite file unexpectedly reported remote")
+	}
+
+	run := time.Now().UnixNano()
+	remoteQueue := fmt.Sprintf("ttl_%d", run)
+	remoteUncapped := remoteQueue + "_uncapped"
+	cleanupTursoQueues(t, remote, remoteQueue, remoteUncapped)
+
+	type result struct {
+		Expiries       [4]int64
+		ScheduledState State
+		ScheduledAt    int64
+		NegativeError  string
+		NegativeRows   int64
+		OverflowError  string
+		OverflowRows   int64
+	}
+	errorClass := func(err error) string {
+		switch {
+		case err == nil:
+			return ""
+		case errors.Is(err, ErrInvalidArgument):
+			return "invalid_argument"
+		default:
+			return "other"
+		}
+	}
+	runScenario := func(e *Engine, queue, uncapped string) result {
+		t.Helper()
+		if err := e.CreateQueue(ctx, queue, QueueConfig{DefaultTTLMs: 10_000}); err != nil {
+			t.Fatalf("create capped queue %q: %v", queue, err)
+		}
+		if err := e.CreateQueue(ctx, uncapped, QueueConfig{}); err != nil {
+			t.Fatalf("create uncapped queue %q: %v", uncapped, err)
+		}
+
+		base := now.Load()
+		seqs, err := e.Send(ctx, queue,
+			OutMessage{Body: []byte("default")},
+			OutMessage{Body: []byte("short"), TTLMs: 2_000},
+			OutMessage{Body: []byte("capped"), TTLMs: 20_000},
+		)
+		if err != nil || len(seqs) != 3 {
+			t.Fatalf("mixed TTL batch on %q: seqs=%v err=%v", queue, seqs, err)
+		}
+		scheduledAt := base + 60_000
+		scheduled, err := e.Schedule(ctx, queue, OutMessage{Body: []byte("scheduled"), TTLMs: 3_000}, scheduledAt)
+		if err != nil {
+			t.Fatalf("schedule with TTL on %q: %v", queue, err)
+		}
+
+		peeked, err := e.Peek(ctx, queue, PeekOptions{Max: 10})
+		if err != nil {
+			t.Fatalf("peek TTL deadlines on %q: %v", queue, err)
+		}
+		bySeq := make(map[int64]*PeekedMessage, len(peeked))
+		for _, message := range peeked {
+			bySeq[message.SeqNumber] = message
+		}
+		ordered := [4]int64{seqs[0], seqs[1], seqs[2], scheduled}
+		var got result
+		for i, seq := range ordered {
+			message := bySeq[seq]
+			if message == nil {
+				t.Fatalf("seq %d missing from %q", seq, queue)
+			}
+			got.Expiries[i] = message.ExpiresAtMs
+		}
+		got.ScheduledState = bySeq[scheduled].State
+		got.ScheduledAt = bySeq[scheduled].VisibleAtMs
+
+		valid := OutMessage{Body: []byte("must-not-commit")}
+		_, err = e.Send(ctx, uncapped, valid, OutMessage{Body: []byte("negative"), TTLMs: -1})
+		got.NegativeError = errorClass(err)
+		stats, statsErr := e.Stats(ctx, uncapped)
+		if statsErr != nil {
+			t.Fatalf("stats after negative TTL on %q: %v", uncapped, statsErr)
+		}
+		got.NegativeRows = stats.Total
+
+		_, err = e.Send(ctx, uncapped, valid, OutMessage{Body: []byte("overflow"), TTLMs: math.MaxInt64})
+		got.OverflowError = errorClass(err)
+		stats, statsErr = e.Stats(ctx, uncapped)
+		if statsErr != nil {
+			t.Fatalf("stats after overflowing TTL on %q: %v", uncapped, statsErr)
+		}
+		got.OverflowRows = stats.Total
+		return got
+	}
+
+	localResult := runScenario(local, "ttl_local", "ttl_local_uncapped")
+	remoteResult := runScenario(remote, remoteQueue, remoteUncapped)
+	if localResult != remoteResult {
+		t.Fatalf("message TTL backend drift:\nlocal  = %+v\nremote = %+v", localResult, remoteResult)
+	}
+	want := result{
+		Expiries:       [4]int64{now.Load() + 10_000, now.Load() + 2_000, now.Load() + 10_000, now.Load() + 63_000},
+		ScheduledState: StateScheduled,
+		ScheduledAt:    now.Load() + 60_000,
+		NegativeError:  "invalid_argument",
+		OverflowError:  "invalid_argument",
+	}
+	if remoteResult != want {
+		t.Fatalf("message TTL contract:\ngot  = %+v\nwant = %+v", remoteResult, want)
+	}
+
+	t.Log("SQLite/Turso message TTL parity OK: mixed deadlines, queue ceiling, scheduled anchor and atomic validation")
+}
+
 // TestTursoConcurrent stresses the two correctness invariants that the remote
 // connection pool (MaxOpen=4) could threaten but the single-logical-writer model
 // must still uphold against a real Turso/libSQL primary (MQLITE-4, evaluation

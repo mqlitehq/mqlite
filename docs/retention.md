@@ -25,8 +25,10 @@ message stays retained until a documented lifecycle action removes or moves it:
 
 Complete and receive-and-delete remove the row immediately. A message TTL either
 moves an expired message to the DLQ or discards it according to
-`dead_letter_on_expire`. Expired locks are reclaimed by the reaper and can be
-delivered again, so consumers must be idempotent.
+`dead_letter_on_expire`. The queue default is also a ceiling for an explicit Send
+TTL. Its clock starts at the message's initial visibility time, so scheduled waiting
+does not consume it; later delayed Abandon does not restart it. Expired locks are
+reclaimed by the reaper and can be delivered again, so consumers must be idempotent.
 
 Deduplication rows, settlement receipts, and receive-attempt records have their
 own expiry-based background cleanup. They are operational replay metadata, not a
