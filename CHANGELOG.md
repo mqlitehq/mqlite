@@ -10,7 +10,12 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## v0.4.1 — 2026-10-24
+## Unreleased
+
+> The current source reports version **0.4.1**, but no v0.4.1 tag or release
+> exists yet. The latest supported release remains **v0.4.0**. The entries below
+> describe the v0.4.1 candidate on `main`; publish and installation links must
+> continue to use v0.4.0 until the release is actually created.
 
 > **Patch upgrade from v0.4.0:** the canonical schema token remains **7** and no
 > database rebuild is required. Upgrade the broker, Go client/CLI and bundled

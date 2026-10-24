@@ -6,9 +6,10 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
-This reference describes v0.4.1, the latest supported release. v0.3.3 is
-withdrawn and unsupported; use the documentation in the v0.3.2 tag when working
-with its smaller management surface.
+This reference follows current `main`, which reports v0.4.1 as an unreleased
+candidate. The latest supported release is v0.4.0; use that tag's documentation
+for deployed v0.4.0 brokers. v0.3.3 is withdrawn and unsupported; use the
+documentation in the v0.3.2 tag when working with its smaller management surface.
 
 Every RPC body must be exactly one non-null JSON object, including operations
 whose request is otherwise empty (`{}`). Unknown fields and data after that object

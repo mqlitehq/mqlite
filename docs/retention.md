@@ -1,10 +1,12 @@
 # Retention, deletion, and storage reclamation
 
-This page describes v0.4.1, the latest supported release. v0.3.3 is withdrawn and
-unsupported; its public artifacts remain available for forensic or compatibility
-inspection and must not be deployed. The v0.4.1 module retains v0.4.0's
-retraction of v0.3.3. v0.3.2 has DLQ retention and automatic local reclamation,
-but the work budgets below describe v0.4.1 unless a version difference is stated.
+This page follows current `main`, which reports v0.4.1 as an unreleased candidate.
+The latest supported release is v0.4.0; use that tag's documentation for deployed
+v0.4.0 brokers. v0.3.3 is withdrawn and unsupported; its public artifacts remain
+available for forensic or compatibility inspection and must not be deployed. The
+v0.4.1 candidate retains v0.4.0's retraction of v0.3.3. v0.3.2 has DLQ retention
+and automatic local reclamation, but the work budgets below describe current
+`main` unless a version difference is stated.
 v0.3.2 does not have the
 queue and subscription lifecycle APIs introduced in v0.4.0.
 
