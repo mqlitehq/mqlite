@@ -398,8 +398,13 @@ credentials are configured at startup and cannot be created through `key create`
 
 ### `status` — backend snapshot
 ```bash
-mqlite status                 # backend, location, schema, ping, size, queue/subscription counts
+mqlite status                 # backend, broker UTC clock, schema, ping, size, queue/subscription counts
 ```
+
+Current brokers print the lifecycle clock as `broker time`; JSON output exposes
+the same value as `server_time_ms`. It is the clock used for TTL, scheduling and
+lease deadlines. Older compatible brokers omit it, which means unavailable rather
+than Unix epoch zero.
 
 ### `list-subscriptions` — subscriptions with topic + filter
 ```bash

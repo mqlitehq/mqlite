@@ -15,9 +15,10 @@ for metric definitions and alerts.
 
 v0.4.0 → v0.4.1 is a same-schema patch upgrade. It fixes strict Observe clients
 and the console rejecting the documented retired message aggregate after a
-message-bearing queue or subscription is deleted. No database rebuild or metric
-migration is required; still quiesce clients and avoid overlapping brokers during
-the binary replacement.
+message-bearing queue or subscription is deleted, exposes the lifecycle clock,
+and makes fixed subscription deadlines visible in the console. No database
+rebuild or metric migration is required; still quiesce clients and avoid
+overlapping brokers during the binary replacement.
 
 ## Operating boundaries
 
@@ -74,6 +75,8 @@ subscription capacity setting, or fixed subscription TTL.
   Subscription deadlines, scheduled delivery, message TTL and lock expiry all use
   that clock. A forward step can make deadlines arrive early; a backward step can
   delay a subscription expiry that has not yet been durably marked `deleting`.
+  Compare absolute deadlines with Status or Observe `server_time_ms`; do not use
+  the browser clock or cached `sampled_at_ms` as the lifecycle reference.
 - Treat global queue gauges as sampled monitoring data. Within one broker process,
   `Observe`, `/metrics` and the console share them for about 10 seconds and expose
   the original `sampled_at_ms`; use fresh per-queue `Stats` when an operation needs
@@ -95,8 +98,9 @@ MQLite version and schema token. Use the same configuration when rehearsing and
 running the service, especially durability, message limits and DLQ retention.
 
 `GET /healthz` is a process liveness check; its handler does not query storage.
-Use authenticated `AdminService/Status` to inspect the backend (`ping_ms >= 0`),
-then a dedicated canary queue to verify a complete write/consume/settle cycle.
+Use authenticated `AdminService/Status` to inspect the backend (`ping_ms >= 0`)
+and its lifecycle clock (`server_time_ms`), then a dedicated canary queue to
+verify a complete write/consume/settle cycle.
 A successful read does not prove that disk space remains for a write.
 
 ```bash

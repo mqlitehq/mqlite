@@ -147,6 +147,7 @@ and console. Requires `manage` or a configured monitor credential.
 
 | Field | Meaning |
 |---|---|
+| `server_time_ms` | Broker lifecycle clock near response assembly; absent or zero means unavailable, including on an older compatible broker |
 | `sampled_at_ms`, `started_at_ms`, `backend`, `version` | Queue sampling instant, engine lifetime and non-sensitive identity |
 | `access` | Request capability: `manage`, `monitor` or `anonymous`; SDK embedded mode uses `embedded` |
 | `collection` | Queue collection `state`, `last_success_at_ms`, latest queue-gauge refresh `duration_seconds`, bounded `error_code` |
@@ -170,12 +171,16 @@ clock value. Counters reset on engine/process restart; they are not a durable
 message ledger. Histograms contain cumulative finite buckets and a total count
 that is also the Prometheus `+Inf` bucket. The existing handler histogram excludes
 authentication; whole-request duration includes it and normal Receive long polls.
+`server_time_ms` is read separately near response assembly, from the same broker
+clock used for lifecycle deadlines. It can therefore advance while a cache hit
+correctly preserves an older `sampled_at_ms`.
 
 After a queue or subscription is physically deleted, its process-lifetime message
 effects move to the documented `messages[].queue == ""` retired aggregate. v0.4.1
 corrects the Go decoder and bundled console to accept that special label while
-still requiring a complete, unique event domain. The HTTP shape and schema token
-are unchanged from v0.4.0.
+still requiring a complete, unique event domain. Its event semantics and schema
+token are unchanged from v0.4.0; v0.4.1 separately adds the optional,
+forward-compatible `server_time_ms` observation field described above.
 
 The shared decoder bounds observations to 32 MiB and rejects incomplete objects,
 inconsistent availability and malformed histogram data. The complete JSON schema
@@ -770,7 +775,10 @@ or auth token.
   local path, or a masked remote host like `libsql://***.turso.io`), `schema_version`,
   `ping_ms` (a `SELECT 1` read round-trip; `-1` if it failed), `db_size_bytes` (local
   on-disk footprint: db + WAL + shm; `0` for memory/remote), `queues`, `subscriptions`,
-  `uptime_ms`, `auth` (bool).
+  `server_time_ms` (UTC epoch milliseconds from the broker clock used for lifecycle
+  deadlines), `uptime_ms`, `auth` (bool). An absent or zero `server_time_ms` means
+  the clock is unavailable, including when a current client connects to an older
+  broker that omitted it.
 
 ## The `Message` object
 

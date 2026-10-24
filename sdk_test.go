@@ -949,6 +949,38 @@ func TestStatusInfoMatchesWireStatus(t *testing.T) {
 	}
 }
 
+func TestStatusUsesLifecycleClockAndAcceptsLegacyBroker(t *testing.T) {
+	ctx := context.Background()
+	const now = int64(1_800_000_000_123)
+	embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithClock(func() int64 { return now }), mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	status, err := embedded.Status(ctx)
+	if err != nil || status.ServerTimeMs != now {
+		t.Fatalf("embedded status server_time_ms=%d, want %d: %v", status.ServerTimeMs, now, err)
+	}
+
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wire.PathStatus {
+			t.Errorf("path = %q, want %q", r.URL.Path, wire.PathStatus)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":"0.4.0","backend":"memory","remote":false,"location":":memory:","schema_version":"7","ping_ms":0,"db_size_bytes":0,"queues":0,"subscriptions":0,"uptime_ms":1,"auth":false}`))
+	}))
+	defer legacy.Close()
+	client, err := mqlite.Open(ctx, legacy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	status, err = client.Status(ctx)
+	if err != nil || status.ServerTimeMs != 0 {
+		t.Fatalf("legacy status clock=%d, want unavailable zero: %v", status.ServerTimeMs, err)
+	}
+}
+
 // TestSubMsOlderThanIsBounded is the row-count proof the round-2 report asked for: a POSITIVE
 // sub-millisecond age bound must stay a BOUND. `purge-dlq --older-than 1ns` used to truncate to
 // OlderThanMs=0 — which the engine reads as "no bound" — and wipe the entire DLQ while looking

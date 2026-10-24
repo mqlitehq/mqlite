@@ -184,17 +184,22 @@ token. See the
 
 ## Availability and freshness
 
-The native snapshot includes `sampled_at_ms`, a collection status, last successful
-collection time and elapsed collection duration. A failed queue read is unavailable,
-not an empty list of healthy queues. Prometheus responds with available in-process
-measurements and `mqlite_collection_success 0`, omitting queue gauges that could not
-be collected. Failure before the endpoint, including invalid scrape credentials,
-causes Prometheus `up` to become zero instead.
+The native snapshot includes `server_time_ms`, `sampled_at_ms`, a collection
+status, last successful collection time and elapsed collection duration.
+`server_time_ms` is the broker lifecycle clock read near response assembly; it is
+the reference for TTL, scheduling and lease deadlines. A failed queue read is
+unavailable, not an empty list of healthy queues. Prometheus responds with
+available in-process measurements and `mqlite_collection_success 0`, omitting
+queue gauges that could not be collected. Failure before the endpoint, including
+invalid scrape credentials, causes Prometheus `up` to become zero instead.
 
 Queue gauges come from an exact grouped database query at the reported
 `sampled_at_ms`. One process-local gauge snapshot is shared across native
 `Observe`, `/metrics` and console requests for about 10 seconds. A cache hit
 preserves the original timestamp instead of presenting cached rows as new.
+Every native Observe response reads a fresh `server_time_ms` after assembling its
+measurements, so it is not part of that cache and must not be substituted for the
+queue sample time.
 Message writes and polling do not extend the fixed cache deadline; a queue create
 or delete invalidates the snapshot. The deadline begins when a refresh finishes,
 so after an unusually slow scan the gauges can trail current messages by the scan
@@ -363,7 +368,9 @@ query is intended to describe current named queues only.
 v0.4.1 corrects the official Go decoder and bundled console to accept this
 documented empty label. v0.4.0 already emitted the aggregate, but its strict
 clients rejected the otherwise complete observation after such a retirement.
-The wire shape, event semantics and schema token do not change in v0.4.1.
+The retired-aggregate event semantics and schema token do not change in v0.4.1.
+The same release adds optional `server_time_ms`; older clients ignore it, and
+current clients treat its absence from an older broker as unavailable.
 
 Raw SQL through `EngineTx.SQL` is supported only for caller-owned tables; those
 writes produce no message-effect events. Direct access to mqlite-owned tables is

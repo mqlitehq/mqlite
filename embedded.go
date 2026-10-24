@@ -389,7 +389,7 @@ func (e *Embedded) Status(ctx context.Context) (StatusInfo, error) {
 	info := StatusInfo{
 		Backend: s.Backend, Remote: s.Remote, Location: s.Location,
 		SchemaVersion: s.SchemaVersion, PingMs: s.PingMs, DBSizeBytes: s.SizeBytes,
-		Queues: queues, Subscriptions: subscriptions,
+		Queues: queues, Subscriptions: subscriptions, ServerTimeMs: s.ServerTimeMs,
 	}
 
 	return info, nil

@@ -244,7 +244,7 @@ mqlite schedule orders "later" --at 30m          # future delivery; cancel <queu
 mqlite receive orders --wait 5s                  # auto-Complete; --no-ack prints lock tokens
 mqlite complete orders 42 <lock-token>           # settle a --no-ack message (also abandon/reject/defer/renew)
 mqlite peek orders --state dead_lettered
-mqlite status                                    # backend / ping / counts
+mqlite status                                    # backend / broker clock / ping / counts
 mqlite observe --output json                     # unified observation; monitor or manage
 mqlite subscribe replies instance-7 --ttl 15m   # fixed lifetime; omit --ttl for permanent
 mqlite list-subscriptions --topic events --limit 100
@@ -485,7 +485,9 @@ and must not be deployed. v0.4.1 carries its retraction directive.
 
 v0.4.1 is a schema-compatible patch for v0.4.0. It keeps the console, CLI and Go
 SDK usable after a deleted resource contributes to the documented retired
-observation aggregate; no database rebuild is required for this patch upgrade.
+observation aggregate, exposes the broker lifecycle clock and makes subscription
+deadlines visible in the console; no database rebuild is required for this patch
+upgrade.
 
 v0.4.0 removes v0.3.3's public queue `Generation` contract and adds the corrected
 resource lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md).

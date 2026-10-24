@@ -88,6 +88,7 @@ type FilterCounter struct {
 // Queues is nil when collection fails; the in-memory event domains remain usable.
 type ObservabilitySnapshot struct {
 	SampledAtMs       int64                    `json:"sampled_at_ms"`
+	ServerTimeMs      int64                    `json:"server_time_ms,omitempty"`
 	StartedAtMs       int64                    `json:"started_at_ms"`
 	Backend           string                   `json:"backend"`
 	Runtime           RuntimeObservation       `json:"runtime"`
@@ -646,6 +647,10 @@ func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 		return s.Messages[i].Event < s.Messages[j].Event
 	})
 	s.Storage = e.db.storage.snapshot(e.db.poolStats())
+	// Queue gauges may be served from the shared cache, so SampledAtMs deliberately
+	// remains their original collection time. Read the lifecycle clock again at the
+	// end of every request to expose the engine's current deadline reference.
+	s.ServerTimeMs = e.now()
 	return s
 }
 
@@ -654,6 +659,9 @@ func (e *Engine) Observability(ctx context.Context) ObservabilitySnapshot {
 func (e *Engine) RuntimeStatus(ctx context.Context) (Status, int, int) {
 	s := e.Status(ctx)
 	queues, err := e.ListQueues(ctx)
+	// Status may spend time waiting on inventory after its storage probe. Report the
+	// same injectable clock TTL and other lifecycle decisions would read now.
+	s.ServerTimeMs = e.now()
 	if err != nil {
 		return s, 0, 0
 	}

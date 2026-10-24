@@ -275,6 +275,25 @@ func TestGlobalObservationCacheKeepsAtomicFreshnessAndCopies(t *testing.T) {
 	}
 }
 
+func TestObservationServerTimeAdvancesAcrossCachedQueueSnapshot(t *testing.T) {
+	e, clock := testEngine(t)
+	ctx := context.Background()
+	mustQueue(t, e, "q", QueueConfig{})
+
+	first := e.Observability(ctx)
+	if first.SampledAtMs != *clock || first.ServerTimeMs != *clock {
+		t.Fatalf("first observation sample=%d server=%d clock=%d", first.SampledAtMs, first.ServerTimeMs, *clock)
+	}
+	advance(clock, time.Second)
+	second := e.Observability(ctx)
+	if second.SampledAtMs != first.SampledAtMs {
+		t.Fatalf("cache hit moved sampled_at_ms: %d, want %d", second.SampledAtMs, first.SampledAtMs)
+	}
+	if second.ServerTimeMs != *clock || second.ServerTimeMs == first.ServerTimeMs {
+		t.Fatalf("cache hit server_time_ms=%d, want fresh lifecycle clock %d", second.ServerTimeMs, *clock)
+	}
+}
+
 func queueObservationByName(rows []QueueObservation, name string) (QueueObservation, bool) {
 	for _, row := range rows {
 		if row.Queue == name {

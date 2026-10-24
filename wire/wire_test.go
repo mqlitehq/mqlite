@@ -329,6 +329,27 @@ func TestObserveResponseCompleteShape(t *testing.T) {
 	if _, err := wire.DecodeObserveResponse(b); err != nil {
 		t.Fatal("forward-compatible field rejected")
 	}
+	withServerTime := decode()
+	withServerTime["server_time_ms"] = float64(1_700_000_002_750)
+	b, _ = json.Marshal(withServerTime)
+	decoded, err := wire.DecodeObserveResponse(b)
+	if err != nil || decoded.ServerTimeMs != 1_700_000_002_750 {
+		t.Fatalf("valid optional broker clock rejected: value=%d err=%v", decoded.ServerTimeMs, err)
+	}
+	for _, unavailableTime := range []any{float64(0)} {
+		compatible := decode()
+		compatible["server_time_ms"] = unavailableTime
+		b, _ = json.Marshal(compatible)
+		decoded, err := wire.DecodeObserveResponse(b)
+		if err != nil || decoded.ServerTimeMs != 0 {
+			t.Fatalf("compatible unavailable broker clock rejected: value=%d err=%v", decoded.ServerTimeMs, err)
+		}
+	}
+	for _, invalidTime := range []any{nil, float64(-1), 1.5, "1700000002750"} {
+		invalid := decode()
+		invalid["server_time_ms"] = invalidTime
+		reject(invalid)
+	}
 	if _, err := wire.ReadObserveResponse(strings.NewReader(strings.Repeat("x", wire.MaxObserveResponseBytes+1))); err == nil {
 		t.Fatal("unbounded observation body")
 	}

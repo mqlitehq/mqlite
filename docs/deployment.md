@@ -66,7 +66,8 @@ and error reference: [api-reference.md](api-reference.md).
 
 v0.4.0 → v0.4.1 is a same-schema replacement. It fixes console, CLI and Go SDK
 observation validation after deleting a resource with process-lifetime message
-effects; it does not require a database rebuild.
+effects, exposes the broker lifecycle clock and makes subscription deadlines
+visible in the console; it does not require a database rebuild.
 
 The exact supported image is multi-arch (amd64 + arm64):
 

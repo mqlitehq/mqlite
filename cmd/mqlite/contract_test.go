@@ -180,6 +180,30 @@ func TestCLIContractGuards(t *testing.T) {
 	}
 }
 
+func TestStatusDisplaysLifecycleClock(t *testing.T) {
+	embeddedEnv(t)
+	ctx := context.Background()
+	human, err := captureStdout(t, func() error { return cmdStatus(ctx, nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human, "broker time:   ") || !strings.Contains(human, "Z\n") {
+		t.Fatalf("human status omitted UTC broker clock:\n%s", human)
+	}
+
+	encoded, err := captureStdout(t, func() error { return cmdStatus(ctx, []string{"--output", "json"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status mqlite.StatusInfo
+	if err := json.Unmarshal([]byte(encoded), &status); err != nil {
+		t.Fatalf("status JSON: %v\n%s", err, encoded)
+	}
+	if status.ServerTimeMs <= 0 {
+		t.Fatalf("status JSON lifecycle clock=%d, want positive epoch milliseconds", status.ServerTimeMs)
+	}
+}
+
 func TestDeleteQueueCommandReportsAcceptedState(t *testing.T) {
 	resetGlobals(t)
 	ctx := context.Background()

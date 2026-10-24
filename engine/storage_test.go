@@ -2712,7 +2712,7 @@ func TestObservabilitySnapshotAndCompatibility(t *testing.T) {
 	}
 	before := e.db.storage.snapshot(e.db.sql.Stats())
 	s := e.Observability(ctx)
-	if s.Collection.State != "available" || s.Collection.LastSuccessAtMs != *clock || s.SampledAtMs != *clock || s.StartedAtMs != *clock || s.Backend != "local" {
+	if s.Collection.State != "available" || s.Collection.LastSuccessAtMs != *clock || s.SampledAtMs != *clock || s.ServerTimeMs != *clock || s.StartedAtMs != *clock || s.Backend != "local" {
 		t.Fatalf("snapshot %+v", s)
 	}
 	if s.QueueCount != 2 || s.SubscriptionCount != 1 || len(s.Queues) != 3 || len(s.Messages) != 3*len(MessageEventNames()) {
@@ -2764,9 +2764,12 @@ func TestObservabilitySnapshotAndCompatibility(t *testing.T) {
 			}
 		}
 	}
-	_, queues, subscriptions := e.RuntimeStatus(ctx)
+	status, queues, subscriptions := e.RuntimeStatus(ctx)
 	if queues != 2 || subscriptions != 1 {
 		t.Fatal("legacy runtime inventory diverged")
+	}
+	if status.ServerTimeMs != *clock {
+		t.Fatalf("status lifecycle clock=%d, want %d", status.ServerTimeMs, *clock)
 	}
 	if err := e.Close(); err != nil {
 		t.Fatal(err)

@@ -15,7 +15,8 @@ import (
 
 func TestStatusEndpoint(t *testing.T) {
 	ctx := context.Background()
-	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	const now = int64(1_800_000_000_123)
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, Now: func() int64 { return now }})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -56,6 +57,12 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 	if st.SchemaVersion == "" {
 		t.Error("missing schema version")
+	}
+	if st.ServerTimeMs != now {
+		t.Errorf("server_time_ms=%d, want lifecycle clock %d", st.ServerTimeMs, now)
+	}
+	if got := res.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control=%q, want no-store", got)
 	}
 
 	// Behind auth: no token → 401.
