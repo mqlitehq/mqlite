@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 
 	libsql "github.com/tursodatabase/libsql-client-go/libsql"
 )
@@ -58,48 +59,31 @@ func (c singleLeaseConnector) Connect(ctx context.Context) (driver.Conn, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &singleLeaseConn{Conn: conn}, nil
+	httpConn, ok := conn.(httpHranaConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("libsql HTTP connection does not provide the required context interfaces")
+	}
+	return &singleLeaseConn{httpHranaConn: httpConn}, nil
 }
 
 // singleLeaseConn deliberately reports itself invalid when database/sql returns
-// it to the pool. Optional context-aware interfaces are forwarded so wrapping the
-// driver does not change query, transaction, or cancellation behavior.
-type singleLeaseConn struct {
+// it to the pool. Requiring and embedding the current driver's context-aware
+// interface set preserves query, transaction, and cancellation behavior without
+// falling back to the deprecated driver.Conn.Begin method.
+type httpHranaConn interface {
 	driver.Conn
+	driver.ConnPrepareContext
+	driver.ConnBeginTx
+	driver.ExecerContext
+	driver.QueryerContext
+}
+
+type singleLeaseConn struct {
+	httpHranaConn
 }
 
 func (*singleLeaseConn) IsValid() bool { return false }
-
-func (c *singleLeaseConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
-	if conn, ok := c.Conn.(driver.ConnPrepareContext); ok {
-		return conn.PrepareContext(ctx, query)
-	}
-	return c.Conn.Prepare(query)
-}
-
-func (c *singleLeaseConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	if conn, ok := c.Conn.(driver.ConnBeginTx); ok {
-		return conn.BeginTx(ctx, opts)
-	}
-	if opts.Isolation != driver.IsolationLevel(sql.LevelDefault) || opts.ReadOnly {
-		return nil, driver.ErrSkip
-	}
-	return c.Conn.Begin()
-}
-
-func (c *singleLeaseConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	if conn, ok := c.Conn.(driver.ExecerContext); ok {
-		return conn.ExecContext(ctx, query, args)
-	}
-	return nil, driver.ErrSkip
-}
-
-func (c *singleLeaseConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if conn, ok := c.Conn.(driver.QueryerContext); ok {
-		return conn.QueryContext(ctx, query, args)
-	}
-	return nil, driver.ErrSkip
-}
 
 var (
 	_ driver.Connector          = libsqlDSNConnector{}
