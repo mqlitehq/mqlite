@@ -513,10 +513,12 @@ Current `main` reports v0.4.1 as an unreleased, schema-compatible candidate. It
 keeps the console, CLI and Go SDK usable after a deleted resource contributes to
 the documented retired observation aggregate, exposes the broker lifecycle clock,
 makes subscription deadlines visible in the console's topic list and detail view,
-and preserves each message TTL in remote mixed-TTL batches. No v0.4.1 tag, module,
-image, or Release exists yet; do not use candidate installation coordinates in
-production. Once released, upgrade the v0.4.0 broker and Go client together before
-relying on mixed batch TTLs; no database rebuild is planned for this patch.
+preserves each message TTL in remote mixed-TTL batches, and prevents closed logical
+Hrana streams from being reused on `libsql://` while retaining physical HTTP/TLS
+keep-alive reuse. No v0.4.1 tag, module, image, or Release exists yet; do not use
+candidate installation coordinates in production. Once released, upgrade the
+v0.4.0 broker and Go client together before relying on mixed batch TTLs; no database
+rebuild is planned for this patch.
 
 v0.4.0 removes v0.3.3's public queue `Generation` contract and adds the corrected
 resource lifecycle APIs described in [CHANGELOG.md](CHANGELOG.md).

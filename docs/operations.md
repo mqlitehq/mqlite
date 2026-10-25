@@ -18,11 +18,13 @@ The v0.4.1 candidate is a same-schema patch over v0.4.0. It fixes strict Observe
 clients and the console rejecting the documented retired message aggregate after
 a message-bearing queue or subscription is deleted, exposes the lifecycle clock,
 and makes fixed subscription deadlines visible in the console. It also preserves
-per-message TTLs in remote mixed-TTL batches; upgrade broker and Go client
-together before relying on that additive input shape. No database rebuild or
-metric migration is planned. No v0.4.1 tag or image exists yet; keep production
-on v0.4.0. Once the patch is released, still quiesce clients and avoid overlapping
-brokers during the binary replacement.
+per-message TTLs in remote mixed-TTL batches and prevents closed logical Hrana
+streams from being reused on `libsql://`, without giving up physical HTTP/TLS
+keep-alive reuse. Upgrade broker and Go client together before relying on the
+additive mixed-TTL input shape. No database rebuild or metric migration is planned.
+No v0.4.1 tag or image exists yet; keep production on v0.4.0. Once the patch is
+released, still quiesce clients and avoid overlapping brokers during the binary
+replacement.
 
 ## Operating boundaries
 
