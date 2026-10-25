@@ -68,10 +68,12 @@ Current `main` reports v0.4.1 as an unreleased same-schema candidate. It fixes
 observation validation in the console, CLI and Go SDK after deleting a resource
 with process-lifetime message effects; it also exposes the broker lifecycle clock
 and makes subscription deadlines visible in the console. The candidate preserves
-each message TTL in a remote mixed-TTL batch as well. Upgrade the v0.4.0 broker and
-Go client together before relying on that additive input shape once the patch is
-released. No v0.4.1 tag or image exists yet; production deployments must remain
-pinned to v0.4.0. The candidate does not require a database rebuild.
+each message TTL in a remote mixed-TTL batch and prevents closed logical Hrana
+streams from being reused on `libsql://`, while physical HTTP/TLS keep-alive reuse
+continues. Upgrade the v0.4.0 broker and Go client together before relying on the
+additive mixed-TTL input shape once the patch is released. No v0.4.1 tag or image
+exists yet; production deployments must remain pinned to v0.4.0. The candidate
+does not require a database rebuild.
 
 The exact supported image is multi-arch (amd64 + arm64):
 
