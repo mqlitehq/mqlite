@@ -47,35 +47,42 @@ active MQLite broker or embedded `Engine`. Replace that owner stop-then-start af
 confirming the old process has exited. Do not use rolling overlap against the same
 database. What differs between storage modes is the connection pool:
 
-```
-┌─────────────────┬──────────────────────────┬────────────────────────────────────┐
-│                 │ local file / :memory:    │ remote Turso / libSQL              │
-├─────────────────┼──────────────────────────┼────────────────────────────────────┤
-│ write ownership │ 1 conn = local writer    │ one broker owns a 4-connection     │
-│                 │ (file lock, MQLITE-6)    │ pool; Turso serializes commits     │
-│ writer pool     │ MaxOpen=1, MaxIdle=1     │ MaxOpen=4, MaxIdle=2               │
-│ observation     │ file: 1 read-only conn;  │ existing provider pool             │
-│                 │ :memory: writer conn     │                                    │
-│ idle handling   │ ConnMaxLifetime=0        │ IdleTime=3s, Lifetime=55s          │
-│ why             │ atomic claims, no        │ recycle conns before Turso closes  │
-│                 │ contention               │ idle Hrana streams                 │
-└─────────────────┴──────────────────────────┴────────────────────────────────────┘
-```
+| | local file / `:memory:` | `libsql://` (HTTP Hrana) | `ws://` / `wss://` |
+|---|---|---|---|
+| write ownership | 1 connection = local writer (file lock, MQLITE-6) | one broker owns a 4-connection pool; Turso serializes commits | same remote ownership |
+| writer pool | MaxOpen=1, MaxIdle=1 | MaxOpen=4, MaxIdle=0 | MaxOpen=4, MaxIdle=2 |
+| observation | file: 1 read-only connection; `:memory:`: writer connection | provider-backed pool | provider-backed pool |
+| lifecycle | ConnMaxLifetime=0 | one logical Hrana connection per `database/sql` lease | IdleTime=3s, Lifetime=55s |
+| physical reuse | SQLite connection stays open | `http.DefaultTransport` still reuses TCP/TLS connections | the WebSocket itself is pooled |
 
 A small remote pool is safe within that one MQLite process because the Turso
 primary serializes writes across its connections; this does not make two brokers
-or embedded `Engine` instances safe. The pool is *more* resilient than a single
-connection because a server-closed idle stream is dropped and replaced instead of
-reused. Each broker process shares its expensive all-queue observation query for
-about 10 seconds on both local and remote backends; separate brokers do not share
-that cache. Per-queue `Stats` and each observation's lightweight storage probe
-still use the backend shown above.
+or embedded `Engine` instances safe. On `libsql://`, a lease is one ordinary
+operation or one complete transaction. Returning the lease discards its logical
+Hrana connection before it can enter an idle slot or be handed directly to a
+waiting caller; this does **not** tear down the shared HTTP transport or its
+TCP/TLS keep-alive connections. Each broker process shares its expensive all-queue
+observation query for about 10 seconds on both local and remote backends; separate
+brokers do not share that cache. Per-queue `Stats` and each observation's
+lightweight storage probe still use the backend shown above.
 
 ## Connection resilience (the remote hardening)
 
-Turso closes idle Hrana streams; `libsql-client-go` then returns a **wrapped**
-`driver.ErrBadConn` (`"stream is closed: driver: bad connection"`). Because it is
-wrapped, `database/sql` will not transparently retry it, so MQLite does:
+An HTTP Hrana response can succeed with a null baton, which means the server has
+closed that logical stream. The pinned `libsql-client-go` records the closed state
+but does not implement `driver.Validator`. Without the MQLite adapter,
+`database/sql` can therefore put a known-closed connection in an idle slot or hand
+it directly to a waiting caller; the next operation then fails locally with a
+wrapped `driver.ErrBadConn` (`"stream is closed: driver: bad connection"`) before
+making an HTTP request. An explicit `*sql.Conn` also cannot exchange its pinned
+driver connection underneath the caller.
+
+MQLite prevents that stale handoff for `libsql://`: its compatibility adapter
+marks every logical connection invalid when the `database/sql` lease ends. A
+transaction remains one uninterrupted lease through commit or rollback. This is
+a connection-validity rule, not broader retry, caching or singleflight; physical
+HTTP/TLS reuse remains owned by Go's shared transport. Normal failure handling is
+still bounded as follows:
 
 - **Bounded retry on transient errors only** — `maxConnAttempts = 6`.
 - **Reads retry on any transport drop.** `retryable = remote && (isConnErr || isBusyErr)`
@@ -107,11 +114,14 @@ wrapped, `database/sql` will not transparently retry it, so MQLite does:
 > response-read failure as `ErrBadConn`, under which a lost commit ack *would* be
 > replayed — prefer `libsql://` for at-least-once remote writes.
 
-The classifier that decides all this is unit-tested hermetically — see
+The null-baton, idle-pool, direct-waiter, authentication and transaction-lease
+contracts are tested hermetically by
+`TestHranaClosedStreamIsDiscardedBeforeFreshReuse` and
+`TestHranaTransactionKeepsOneLease`. The classifier is pinned by
 `TestIsConnErr` / `TestRetryableWrite` / `TestRetryableAndAttempts` in
-`engine/storage_test.go`, and the broker→SDK propagation in `TestFailOutcomeUnknown`
-(server) + `TestRemoteOutcomeUnknownPropagates` (root) — so the retry contract can't
-silently drift without creds.
+`engine/storage_test.go`, and broker→SDK propagation by `TestFailOutcomeUnknown`
+(server) + `TestRemoteOutcomeUnknownPropagates` (root), so the retry contract can't
+silently drift without credentials.
 
 Ordinary and AttemptID `Receive` transactions issue their fenced
 `UPDATE messages ... RETURNING` before reading queue or receive-attempt metadata.
@@ -148,8 +158,8 @@ fit for MQLite, for two independent reasons:
 
 **For HA / geo-distribution:** co-locate the broker next to its Turso primary
 (low-latency Hrana), or run independent broker + DB pairs per region. Revisit this
-decision only if `libsql-client-go` ever ships pure-Go embedded replicas *and* a
-synchronous read-your-writes mode.
+decision only when a maintained pure-Go driver satisfies synchronous
+read-your-writes semantics, the Go 1.21 floor and every supported release target.
 
 ## Validation status
 

@@ -17,8 +17,27 @@ each already requires go ≥ 1.23. So Dependabot bumps like `sqlite → 1.52.0` 
 `x/sys → 0.46.0` are not "upgrades we're behind on"; they are mutually exclusive
 with the go 1.21 floor and fail the `go 1.21.x` CI matrix by construction.
 
-`github.com/tursodatabase/libsql-client-go` (the pure-Go Hrana client) is subject
-to the same floor; the CI matrix is the backstop if a future version raises it.
+## Remote libSQL driver
+
+[`github.com/tursodatabase/libsql-client-go`](https://github.com/tursodatabase/libsql-client-go),
+the pure-Go Hrana client, is pinned even though upstream now marks the repository
+deprecated. This is a temporary compatibility choice, not an assertion that an
+unmaintained dependency is ideal. The upstream-recommended
+[`go-libsql`](https://github.com/tursodatabase/go-libsql) uses CGO and currently
+publishes native libraries for only four Linux/macOS targets, while the newer
+[`tursogo`](https://github.com/tursodatabase/turso/tree/main/bindings/go) module
+requires Go 1.24 and implements a local database plus remote synchronization
+rather than MQLite's current direct-primary Hrana path. Neither currently
+satisfies the combined Go 1.21, CGO-free, six-target and storage-semantics
+contract.
+
+MQLite contains the known HTTP logical-stream lifecycle defect behind a narrow
+single-lease adapter: a `libsql://` driver connection is discarded when its
+`database/sql` lease ends, while Go's shared HTTP transport continues to reuse
+physical TCP/TLS connections. Migration to a maintained driver requires the full
+local/remote conformance suite, live Turso lifecycle and sustained-load runs, and
+all release-platform builds. Do not swap this dependency or remove the adapter
+based only on API similarity; there is no promised replacement or migration date.
 
 ## Security posture
 

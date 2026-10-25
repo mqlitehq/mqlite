@@ -81,7 +81,15 @@ func resetRemoteTestDB(dsn, token string) error {
 	if !remote {
 		return fmt.Errorf("MQLITE_TEST_DB must use a remote libSQL DSN")
 	}
-	db, err := sql.Open(driver, conn)
+	var db *sql.DB
+	var err error
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(dsn)), "libsql://") {
+		// Use the same logical-stream policy as the engine. Reset executes several
+		// independent statements and must not recycle a stream Turso already closed.
+		db, err = openHTTPHranaDB(conn)
+	} else {
+		db, err = sql.Open(driver, conn)
+	}
 	if err != nil {
 		return err
 	}

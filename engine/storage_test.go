@@ -24,6 +24,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -484,6 +486,264 @@ func TestMemoryDBNotLocked(t *testing.T) {
 }
 
 // ─── Remote retry classification ────────────────────────────────────────────
+
+const closedStreamHranaResponse = `{
+  "baton": null,
+  "base_url": null,
+  "results": [{
+    "type": "ok",
+    "response": {
+      "type": "execute",
+      "result": {
+        "cols": [{"name": "value", "decltype": "INTEGER"}],
+        "rows": [[{"type": "integer", "value": "1"}]],
+        "affected_row_count": 1,
+        "last_insert_rowid": "1",
+        "replication_index": "1"
+      }
+    }
+  }]
+}`
+
+func newClosedStreamHranaPool(tb testing.TB, maxOpen, maxIdle int) (*sql.DB, *atomic.Int64) {
+	tb.Helper()
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if r.Method != http.MethodPost || r.URL.Path != "/v2/pipeline" {
+			tb.Errorf("Hrana request = %s %s, want POST /v2/pipeline", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer regression-token" {
+			tb.Errorf("Hrana request authorization was not propagated")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, closedStreamHranaResponse)
+	}))
+	tb.Cleanup(server.Close)
+
+	dsn := "libsql://" + strings.TrimPrefix(server.URL, "http://") + "?tls=0&authToken=regression-token"
+	pool, err := openHTTPHranaDB(dsn)
+	if err != nil {
+		tb.Fatalf("open HTTP Hrana pool: %v", err)
+	}
+	pool.SetMaxOpenConns(maxOpen)
+	pool.SetMaxIdleConns(maxIdle)
+	tb.Cleanup(func() { _ = pool.Close() })
+	return pool, &calls
+}
+
+// The HTTP Hrana server may return a successful result with no baton, which means
+// it closed the logical stream. libsql-client-go remembers that state but lacks a
+// driver.Validator, so an ordinary database/sql pool can hand the known-closed
+// connection to the next explicit *sql.Conn user. MQLite's adapter must discard it
+// before both idle reuse and direct handoff to a waiter (MQLITE-163).
+func TestHranaClosedStreamIsDiscardedBeforeFreshReuse(t *testing.T) {
+	runQuery := func(t *testing.T, pool *sql.DB) {
+		t.Helper()
+		conn, err := pool.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("acquire query connection: %v", err)
+		}
+		defer conn.Close()
+		rows, err := conn.QueryContext(context.Background(), "SELECT 1")
+		if err != nil {
+			t.Fatalf("query on a fresh logical stream: %v", err)
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			t.Fatalf("query returned no row: %v", rows.Err())
+		}
+		var got int64
+		if err := rows.Scan(&got); err != nil || got != 1 {
+			t.Fatalf("query row = %d, %v; want 1", got, err)
+		}
+	}
+
+	t.Run("idle", func(t *testing.T) {
+		pool, calls := newClosedStreamHranaPool(t, 1, 1)
+		runQuery(t, pool)
+		runQuery(t, pool)
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("HTTP calls = %d, want one successful request per lease", got)
+		}
+	})
+
+	t.Run("waiter_handoff", func(t *testing.T) {
+		pool, calls := newClosedStreamHranaPool(t, 1, 1)
+		first, err := pool.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := first.QueryContext(context.Background(), "SELECT 1")
+		if err != nil {
+			t.Fatalf("first query: %v", err)
+		}
+		_ = rows.Close()
+
+		waiter := make(chan *sql.Conn, 1)
+		waitErr := make(chan error, 1)
+		go func() {
+			conn, err := pool.Conn(context.Background())
+			if err != nil {
+				waitErr <- err
+				return
+			}
+			waiter <- conn
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for pool.Stats().WaitCount == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if pool.Stats().WaitCount == 0 {
+			_ = first.Close()
+			t.Fatal("second connection never waited for the MaxOpen=1 lease")
+		}
+		if err := first.Close(); err != nil {
+			t.Fatalf("release first connection: %v", err)
+		}
+
+		var second *sql.Conn
+		select {
+		case second = <-waiter:
+		case err := <-waitErr:
+			t.Fatalf("waiter acquire: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("waiter did not receive a replacement connection")
+		}
+		defer second.Close()
+		rows, err = second.QueryContext(context.Background(), "SELECT 1")
+		if err != nil {
+			t.Fatalf("waiter reused the closed logical stream: %v", err)
+		}
+		_ = rows.Close()
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("HTTP calls = %d, want two successful requests on separate leases", got)
+		}
+	})
+
+	t.Run("exec", func(t *testing.T) {
+		pool, calls := newClosedStreamHranaPool(t, 1, 1)
+		for i := 0; i < 2; i++ {
+			conn, err := pool.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, execErr := conn.ExecContext(context.Background(), "DELETE FROM messages WHERE 0")
+			closeErr := conn.Close()
+			if execErr != nil || closeErr != nil {
+				t.Fatalf("exec lease %d: exec=%v close=%v", i+1, execErr, closeErr)
+			}
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("HTTP calls = %d, want one successful request per lease", got)
+		}
+	})
+}
+
+// BenchmarkHranaSingleLeaseExec tracks the cost of the conservative lifecycle
+// adapter without a noisy pass/fail latency threshold. Each operation gets a new
+// logical driver connection after a successful null-baton response, while the
+// loopback HTTP transport remains shared. The weekly benchmark workflow records
+// time and allocations for trend comparison.
+func BenchmarkHranaSingleLeaseExec(b *testing.B) {
+	pool, calls := newClosedStreamHranaPool(b, 4, 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+			b.Fatalf("exec %d: %v", i, err)
+		}
+	}
+	b.StopTimer()
+	got := calls.Load()
+	if got != int64(b.N) {
+		b.Fatalf("HTTP calls = %d, want %d", got, b.N)
+	}
+	b.ReportMetric(float64(got)/float64(b.N), "http_req/op")
+}
+
+// A single database/sql lease spans the entire transaction. Validator must not
+// discard the wrapped connection between BEGIN, the body, and COMMIT; it only
+// rejects the connection after the transaction returns its lease to the pool.
+func TestHranaTransactionKeepsOneLease(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if r.Method != http.MethodPost || r.URL.Path != "/v2/pipeline" {
+			t.Errorf("Hrana request = %s %s, want POST /v2/pipeline", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer regression-token" {
+			t.Errorf("Hrana request authorization was not propagated")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read Hrana request: %v", err)
+			http.Error(w, "read request", http.StatusInternalServerError)
+			return
+		}
+		n := calls.Add(1)
+		wantSQL := []string{"BEGIN", "UPDATE messages SET state='active'", "COMMIT", "DELETE FROM messages WHERE 0"}
+		if n > int64(len(wantSQL)) {
+			t.Errorf("unexpected Hrana request %d: %s", n, body)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		if !bytes.Contains(body, []byte(wantSQL[n-1])) {
+			t.Errorf("Hrana request %d does not contain %q: %s", n, wantSQL[n-1], body)
+		}
+		if n == 1 {
+			if bytes.Contains(body, []byte(`"baton":"transaction-baton"`)) {
+				t.Errorf("BEGIN unexpectedly carried an existing baton: %s", body)
+			}
+		} else if n <= 3 && !bytes.Contains(body, []byte(`"baton":"transaction-baton"`)) {
+			t.Errorf("transaction request %d lost its baton: %s", n, body)
+		}
+
+		response := closedStreamHranaResponse
+		if n < 3 {
+			response = strings.Replace(response, `"baton": null`, `"baton": "transaction-baton"`, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, response)
+	}))
+	t.Cleanup(server.Close)
+
+	dsn := "libsql://" + strings.TrimPrefix(server.URL, "http://") + "?tls=0&authToken=regression-token"
+	pool, err := openHTTPHranaDB(dsn)
+	if err != nil {
+		t.Fatalf("open HTTP Hrana pool: %v", err)
+	}
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = pool.Close() })
+
+	tx, err := pool.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if _, err := tx.ExecContext(context.Background(), "UPDATE messages SET state='active'"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("transaction body: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit transaction: %v", err)
+	}
+	if _, err := pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+		t.Fatalf("fresh post-transaction lease: %v", err)
+	}
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("HTTP calls = %d, want BEGIN, body, COMMIT, and one fresh lease", got)
+	}
+}
 
 // The remote (Turso/libSQL) retry path turns on exactly when isConnErr says an
 // error is a dropped Hrana stream — never on a logical error, where a blind retry
@@ -1395,6 +1655,11 @@ func TestMemoryDBSurvivesRepeatedFreshStatements(t *testing.T) {
 		t.Fatalf("stats after 200 renewals: %v (the in-memory database was destroyed)", err)
 	} else if m.Locked != 1 {
 		t.Errorf("locked=%d after renewals, want 1", m.Locked)
+	}
+	pool := e.db.sql.Stats()
+	if pool.MaxOpenConnections != 1 || pool.MaxLifetimeClosed != 0 {
+		t.Errorf("local pool changed by remote compatibility policy: max_open=%d max_lifetime_closed=%d, want 1/0",
+			pool.MaxOpenConnections, pool.MaxLifetimeClosed)
 	}
 }
 

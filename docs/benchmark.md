@@ -78,6 +78,9 @@ BENCH_DUR=3s ./test/bench/run-bench.sh          # → test/bench/out/results.jso
 
 # opt-in queue create/send/force-delete/converge churn
 BENCH_ONLY=lifecycle_churn BENCH_DUR=2s ./test/bench/run-bench.sh
+
+# hermetic HTTP-Hrana logical-lease trend (loopback; no Turso credentials)
+go test ./engine -run '^$' -bench '^BenchmarkHranaSingleLeaseExec$' -benchmem -benchtime=3s
 ```
 
 The historical Fly run used an environment-specific deployment file that is not
@@ -452,7 +455,7 @@ mqlite ships sensible defaults; most deployments change nothing. In rough order 
 | `wal_autocheckpoint` | 1000 pages (~4 MB) | matched the no-long-reader historical baseline; observation snapshots and other readers can cause a larger transient WAL. Raise only after measuring the checkpoint and recovery trade-off. |
 | `cache_size` | ~2 MB | the working set (queue heads + indexes) is small; raise only after profiling shows cache pressure under deep backlogs — it costs RAM on a 256 MB machine. |
 | `mmap_size` | off | `modernc.org/sqlite` is pure-Go; don't assume C-SQLite mmap gains — measure first. |
-| writer/provider pool | local writer 1 / remote provider 4 | **don't change** — the local writer pool stays at one for atomic claims; local files also have one read-only observation connection. The remote pool is scoped to one broker and Turso serializes commits. |
+| writer/provider pool | local writer 1 / remote provider 4 | **don't change** — the local writer pool stays at one for atomic claims; local files also have one read-only observation connection. The remote pool is scoped to one broker and Turso serializes commits. `libsql://` logical connections are single-lease while the shared HTTP transport retains TCP/TLS reuse; see [turso.md](turso.md). |
 
 `busy_timeout=5000` and `temp_store=MEMORY` are set on local modernc SQLite
 connections. They do not apply to remote Turso/libSQL connections, whose transient

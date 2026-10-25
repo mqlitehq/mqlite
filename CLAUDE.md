@@ -184,10 +184,17 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
   `OpenEmbedded` on the same file — fails fast with `ErrDBLocked`. Sharing a file DB
   across processes is unsupported; run the broker instead (one broker = one writer).
 - **Remote Turso/libSQL** → small pool (`MaxOpenConns(4)`) because the Turso primary
-  serializes writes server-side. Only the remote path **retries** transient errors
-  (closed Hrana stream → `driver.ErrBadConn`; `database is locked` / SQLITE_BUSY)
-  with backoff via `db.exec/query/inTx` — see `attempts()`/`retryable()`. Local never
-  retries. All retries are safe because the failed statement never ran.
+  serializes writes server-side. The documented `libsql://` HTTP transport gives
+  each logical driver connection one `database/sql` lease (a whole transaction is
+  one lease), then rejects it before idle reuse or direct waiter handoff; Go's
+  shared HTTP transport still reuses physical TCP/TLS connections. `ws://` and
+  `wss://` retain bounded pooling. Only the remote path **retries** transient
+  errors (closed Hrana stream → `driver.ErrBadConn`; `database is locked` /
+  SQLITE_BUSY) with backoff via `db.exec/query/inTx` — see
+  `attempts()`/`retryable()`. The validator prevents a known-closed stream from
+  being reused; it is not a retry. Local SQLite remains unchanged and never
+  retries. All transparent write retries are limited to failures known to occur
+  before the statement ran.
 
 ### Claim path — do not "simplify" the SQL
 

@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	// Pure-Go drivers, no CGO (design D2 default + L-Turso remote).
-	_ "github.com/tursodatabase/libsql-client-go/libsql" // driver "libsql" (remote Turso, Hrana)
-	_ "modernc.org/sqlite"                               // driver "sqlite"  (local file/:memory:)
+	// Pure-Go local driver, no CGO (design D2 default). The remote libSQL
+	// connector is opened explicitly in libsql_conn.go.
+	_ "modernc.org/sqlite" // driver "sqlite" (local file/:memory:)
 )
 
 // db wraps the single-writer *sql.DB plus an optional read-only observation
@@ -173,7 +173,19 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		}
 	}
 
-	sdb, err := sql.Open(driver, conn)
+	// libsql:// is Hrana over HTTP. Its deprecated Go driver does not expose a
+	// closed logical stream through driver.Validator, so open it through the
+	// single-lease adapter. WebSocket transports keep their existing pooled
+	// connection behavior; making those one-shot would reconnect a WebSocket for
+	// every operation. Local SQLite remains on the unchanged sql.Open path.
+	httpHrana := strings.HasPrefix(strings.ToLower(strings.TrimSpace(dsn)), "libsql://")
+	var sdb *sql.DB
+	var err error
+	if httpHrana {
+		sdb, err = openHTTPHranaDB(conn)
+	} else {
+		sdb, err = sql.Open(driver, conn)
+	}
 	if err != nil {
 		if lock != nil {
 			_ = lock.Close()
@@ -182,14 +194,20 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 	}
 	if remote {
 		// Remote Turso/libSQL: the broker is still the single logical writer, but
-		// the Turso primary serializes writes for us, so a tiny pool is safe and
-		// far more resilient — Turso closes idle Hrana streams, and a stale stream
-		// surfaces as a (wrapped) bad-connection error. A short idle timeout makes
-		// database/sql recycle idle conns instead of reusing a server-closed stream.
+		// the Turso primary serializes writes for us, so a tiny pool is safe.
 		sdb.SetMaxOpenConns(4)
-		sdb.SetMaxIdleConns(2)
-		sdb.SetConnMaxIdleTime(3 * time.Second)
-		sdb.SetConnMaxLifetime(55 * time.Second)
+		if httpHrana {
+			// The Validator in singleLeaseConn is the correctness mechanism. Keep
+			// no idle logical streams as the matching explicit pool policy; HTTP's
+			// transport still reuses its own TCP/TLS connections.
+			sdb.SetMaxIdleConns(0)
+		} else {
+			// A WebSocket is the physical connection, so retain the existing small
+			// idle pool and bounded recycling policy for ws:// / wss://.
+			sdb.SetMaxIdleConns(2)
+			sdb.SetConnMaxIdleTime(3 * time.Second)
+			sdb.SetConnMaxLifetime(55 * time.Second)
+		}
 	} else {
 		// Local file/:memory: — one connection IS the single writer (no file-lock
 		// contention, atomic claims).
