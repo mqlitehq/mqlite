@@ -27,7 +27,7 @@ unmaintained dependency is ideal. The upstream-recommended
 publishes native libraries for only four Linux/macOS targets, while the newer
 [`tursogo`](https://github.com/tursodatabase/turso/tree/main/bindings/go) module
 requires Go 1.24 and implements a local database plus remote synchronization
-rather than MQLite's current direct-primary Hrana path. The new official
+rather than MQLite's current direct-primary Hrana path. The official
 [`tursogo-serverless`](https://github.com/tursodatabase/turso/tree/main/serverless/go)
 module is a pure-Go `database/sql` driver that connects directly to Turso Cloud
 over HTTP, but its module also requires Go 1.24 and it has not passed MQLite's
