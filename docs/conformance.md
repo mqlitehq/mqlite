@@ -296,7 +296,14 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   *(engine/storage_test.go)*
 - **10.3** All times are epoch-ms (UTC); the clock is injectable for deterministic
   tests. The remote (Turso) path retries transient errors with backoff; the local
-  path never retries. *(engine/storage_test.go, engine/turso_test.go)*
+  path never retries. A successful null-baton `libsql://` response closes that
+  logical Hrana stream: it MUST NOT be retained in an idle slot or handed directly
+  to a waiting caller. One transaction MUST remain on one logical stream through
+  commit or rollback, and the local pool MUST remain MaxOpen=1 with no connection
+  lifetime recycling. *(engine/storage_test.go:
+  TestHranaClosedStreamIsDiscardedBeforeFreshReuse,
+  TestHranaTransactionKeepsOneLease,
+  TestMemoryDBSurvivesRepeatedFreshStatements; engine/turso_test.go)*
 - **10.4** Access-key table and index additions remain independently additive
   inside the canonical schema. Verify complete backup/restore content,
   including active, expired and revoked credentials.

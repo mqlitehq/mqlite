@@ -22,6 +22,22 @@ upgrade notes before replacing a broker.
 > console together so every observation consumer applies the same validation and
 > remote mixed-TTL batches use the per-message wire form described below.
 
+### Prevent closed Hrana stream reuse (MQLITE-163)
+
+- Treat each `libsql://` logical connection as one `database/sql` lease and
+  discard it before idle reuse or direct handoff to a waiting caller. This
+  prevents a successful null-baton Hrana response from making the next operation
+  fail locally with `stream is closed: driver: bad connection`.
+- Keep a transaction on one logical connection through commit or rollback and
+  retain the remote MaxOpen=4 limit. Go's shared HTTP transport still reuses the
+  physical TCP/TLS connections, so this does not reconnect TLS for every query.
+- Leave local SQLite and `ws://` / `wss://` pooling unchanged. No retry,
+  observation cache or singleflight policy changes, and there is no public API,
+  configuration, wire or schema change.
+- Cover authentication, null-baton query and exec, idle reuse, direct waiter
+  handoff, transaction continuity and the unchanged local pool with hermetic
+  regressions.
+
 ### Preserve per-message TTL in remote batches (MQLITE-156)
 
 - Preserve each `OutMessage.TTL` in a remote Go SDK batch. A single message or a
