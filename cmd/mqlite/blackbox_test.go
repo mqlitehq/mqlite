@@ -157,7 +157,13 @@ func TestBlackboxSubscriptionDeleteAndPagedInventory(t *testing.T) {
 func TestBlackboxSubscribeTTL(t *testing.T) {
 	ctx := context.Background()
 	url, eng := bbBroker(t, "tok")
-	env := append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN=tok")
+	_, listenToken, err := eng.CreateAccessKey(ctx, engine.CreateAccessKeyOptions{
+		ID: strings.Repeat("b", 32), Name: "subscription provisioner", Permissions: engine.KeyListen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(), "MQLITE_ENDPOINT="+url, "MQLITE_TOKEN="+listenToken)
 
 	create := exec.Command(mqliteBin, "subscribe", "requests", "temporary", "--ttl", "1h", "--expr", `subject == "request"`)
 	create.Env = env
@@ -181,6 +187,32 @@ func TestBlackboxSubscribeTTL(t *testing.T) {
 	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "requests"})
 	if err != nil || page.Total != 1 {
 		t.Fatalf("invalid TTL had side effects: %+v, %v", page, err)
+	}
+
+	testFilter := exec.Command(mqliteBin, "test-filter", `subject == "request"`, "--subject", "request")
+	testFilter.Env = env
+	if output, err := testFilter.CombinedOutput(); err != nil {
+		t.Fatalf("listen test-filter: %v: %s", err, output)
+	}
+
+	for _, args := range [][]string{
+		{"list-subscriptions"},
+		{"list-subscriptions", "--topic", "requests"},
+		{"delete-subscription", "requests", "temporary"},
+		{"delete-subscription", "requests", "temporary", "--force"},
+		{"create-queue", "forbidden"},
+	} {
+		cmd := exec.Command(mqliteBin, args...)
+		cmd.Env = env
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		if code, stderr := exitCode(cmd); code == 0 || stdout.Len() != 0 || !strings.Contains(stderr, "permission denied") {
+			t.Fatalf("listen command %v: code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr)
+		}
+	}
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "requests", IncludeDeleting: true})
+	if err != nil || page.Total != 1 || len(page.Subscriptions) != 1 || page.Subscriptions[0].State != "active" {
+		t.Fatalf("denied administration changed subscription: %+v, %v", page, err)
 	}
 }
 

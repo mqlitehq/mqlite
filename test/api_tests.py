@@ -475,6 +475,42 @@ def t_access_keys():
         check(base64.b64decode(message["body"]).decode() == "scoped-canary:" + RUNID, "scoped round-trip payload preserved")
         settlement = {"queue": q, "seq_number": message["seq_number"], "lock_token": message["lock_token"]}
         check(call(queue + "Complete", settlement, consumer)[0] == 200, "listen key settles")
+
+        subscriptions = "/mqlite.v1.AdminService/"
+        topic = f"{RUNID}_py_key_topic"
+        name = f"{RUNID}_py_key_subscription"
+        status, _ = call(subscriptions + "Subscribe", {
+            "topic": topic, "name": name,
+            "filter": {"expr": 'subject == "first"'}, "ttl_ms": 60_000,
+        }, consumer)
+        check(status == 200, "listen key creates a fixed-lifetime subscription")
+        status, _ = call(subscriptions + "Subscribe", {
+            "topic": topic, "name": name, "filter": {"expr": 'subject == "second"'},
+        }, consumer)
+        check(status == 200, "listen key updates a known subscription filter")
+        status, tested = call(subscriptions + "TestFilter", {
+            "expr": 'subject == "second"', "message": {"subject": "second", "body": b64("sample")},
+        }, consumer)
+        check(status == 200 and tested.get("valid") and tested.get("ran") and tested.get("matched"),
+              "listen key dry-runs a subscription filter")
+        check(call(subscriptions + "Subscribe", {"topic": topic, "name": name + "-send"}, producer)[0] == 403 and
+              call(subscriptions + "TestFilter", {"expr": "true"}, producer)[0] == 403,
+              "send key cannot provision or test subscriptions")
+        check(call(subscriptions + "ListSubscriptions", {}, consumer)[0] == 403 and
+              call(subscriptions + "ListSubscriptionsPage", {"topic": topic}, consumer)[0] == 403,
+              "listen key cannot enumerate broker subscriptions")
+        check(call(subscriptions + "CreateQueue", {"name": name + "-queue", "config": {}}, consumer)[0] == 403,
+              "listen key cannot create queues")
+        check(call(subscriptions + "DeleteSubscription", {"topic": topic, "name": name}, consumer)[0] == 403 and
+              call(subscriptions + "DeleteSubscription", {"topic": topic, "name": name, "force": True}, consumer)[0] == 403,
+              "listen key cannot delete subscriptions with or without force")
+        status, page = call(subscriptions + "ListSubscriptionsPage", {"topic": topic}, manager)
+        items = [item for item in page.get("subscriptions", []) if item["name"] == name]
+        check(status == 200 and len(items) == 1 and items[0].get("expr") == 'subject == "second"' and
+              items[0].get("state") == "active", "manager observes listener provisioning without denied side effects")
+        status, deleted = call(subscriptions + "DeleteSubscription", {"topic": topic, "name": name}, manager)
+        check(status == 200 and deleted.get("deleted") is True, "manager retires the listener-created subscription")
+
         check(call(auth + "ListKeys", {}, producer)[0] == 403 and
               call(auth + "RevokeKey", {"id": created[0]}, consumer)[0] == 403,
               "application keys cannot list or revoke credentials")

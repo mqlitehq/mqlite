@@ -333,11 +333,11 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 		{"/mqlite.v1.QueueService/Peek", engine.KeyListen},
 		{"/mqlite.v1.QueueService/Stats", engine.KeyListen},
 		{"/mqlite.v1.AdminService/CreateQueue", engine.KeyManage},
-		{"/mqlite.v1.AdminService/Subscribe", engine.KeyManage},
+		{"/mqlite.v1.AdminService/Subscribe", engine.KeyListen},
 		{"/mqlite.v1.AdminService/ListQueues", engine.KeyManage},
 		{"/mqlite.v1.AdminService/ListSubscriptions", engine.KeyManage},
 		{wire.PathListSubscriptionsPage, engine.KeyManage},
-		{"/mqlite.v1.AdminService/TestFilter", engine.KeyManage},
+		{"/mqlite.v1.AdminService/TestFilter", engine.KeyListen},
 		{"/mqlite.v1.AdminService/Redrive", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Purge", engine.KeyManage},
 		{"/mqlite.v1.AdminService/Status", engine.KeyManage},
@@ -534,6 +534,103 @@ func TestAccessKeyCompletePermissionMatrix(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestListenSubscriptionProvisioningBoundary pins the deliberately asymmetric
+// application contract: a trusted broker-wide listener may provision and test a
+// subscription, while inventory and both deletion modes remain administrative.
+func TestListenSubscriptionProvisioningBoundary(t *testing.T) {
+	ctx := context.Background()
+	now := int64(1_000_000)
+	eng := keyTestEngine(t, func() int64 { return now })
+	_, listenToken := keyTestCreate(t, eng, 1, engine.KeyListen, 0)
+	_, sendToken := keyTestCreate(t, eng, 2, engine.KeySend, 0)
+	h := server.New(eng, []string{"admin"}).Handler()
+
+	const (
+		topic = "requests"
+		name  = "temporary"
+		ttl   = int64(60_000)
+	)
+	subscribe := func(token, expr string) *httptest.ResponseRecorder {
+		return keyTestRequest(h, http.MethodPost, wire.PathSubscribe, token, wire.SubscribeWithOptionsRequest{
+			Topic: topic, Name: name, Filter: &engine.Filter{Expr: expr}, TTLMs: ttl,
+		})
+	}
+
+	keyTestStatus(t, subscribe(listenToken, `subject == "first"`), http.StatusOK, "")
+	page, err := eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: topic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Subscriptions) != 1 {
+		t.Fatalf("subscriptions = %+v, want one", page.Subscriptions)
+	}
+	createdAt, expiresAt := page.Subscriptions[0].CreatedAtMs, page.Subscriptions[0].ExpiresAtMs
+	if createdAt != now || expiresAt != now+ttl {
+		t.Fatalf("lifetime = created %d expires %d, want %d/%d", createdAt, expiresAt, now, now+ttl)
+	}
+
+	now += 1_000
+	keyTestStatus(t, subscribe(listenToken, `subject == "second"`), http.StatusOK, "")
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: topic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := page.Subscriptions[0]
+	if got.Expr != `subject == "second"` || got.CreatedAtMs != createdAt || got.ExpiresAtMs != expiresAt {
+		t.Fatalf("listener upsert changed the wrong fields: %+v", got)
+	}
+
+	filter := keyTestRequest(h, http.MethodPost, wire.PathTestFilter, listenToken, wire.TestFilterRequest{
+		Expr: `subject == "second"`, Message: &wire.Message{Subject: "second"},
+	})
+	keyTestStatus(t, filter, http.StatusOK, "")
+	var filterResult wire.TestFilterResponse
+	if err := json.Unmarshal(filter.Body.Bytes(), &filterResult); err != nil {
+		t.Fatal(err)
+	}
+	if !filterResult.Valid || !filterResult.Ran || !filterResult.Matched {
+		t.Fatalf("unexpected filter result: %+v", filterResult)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body any
+	}{
+		{"legacy list", wire.PathListSubscriptions, wire.Empty{}},
+		{"paged list", wire.PathListSubscriptionsPage, wire.ListSubscriptionsPageRequest{Topic: topic}},
+		{"create queue", wire.PathCreateQueue, wire.CreateQueueRequest{Name: "forbidden"}},
+		{"delete empty-only", wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: topic, Name: name}},
+		{"delete force", wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: topic, Name: name, Force: true}},
+	} {
+		t.Run("listen cannot "+tc.name, func(t *testing.T) {
+			keyTestStatus(t, keyTestRequest(h, http.MethodPost, tc.path, listenToken, tc.body),
+				http.StatusForbidden, "permission_denied")
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		path string
+		body any
+	}{
+		{"subscribe", wire.PathSubscribe, wire.SubscribeWithOptionsRequest{Topic: "other", Name: "other"}},
+		{"test filter", wire.PathTestFilter, wire.TestFilterRequest{Expr: "true"}},
+	} {
+		t.Run("send cannot "+tc.name, func(t *testing.T) {
+			keyTestStatus(t, keyTestRequest(h, http.MethodPost, tc.path, sendToken, tc.body),
+				http.StatusForbidden, "permission_denied")
+		})
+	}
+
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: topic, IncludeDeleting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Subscriptions) != 1 || page.Subscriptions[0].State != "active" {
+		t.Fatalf("denied administration changed subscription: %+v", page.Subscriptions)
 	}
 }
 
