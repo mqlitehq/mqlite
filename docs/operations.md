@@ -1,11 +1,10 @@
 # Production operations
 
-This runbook follows current `main`, which reports v0.4.1 as an unreleased
-candidate (port 6754, schema token 7). The latest supported release is v0.4.0;
-use that tag's runbook for deployed v0.4.0 brokers. v0.3.3 is withdrawn and
+This runbook describes v0.4.1, the latest supported release (port 6754, schema
+token 7). v0.3.3 is withdrawn and
 unsupported; its public assets and exact image remain available for forensic or
-compatibility inspection and must not be deployed. The candidate retains
-v0.4.0's retraction of v0.3.3. Upgrading from v0.3.2 or another schema-5 release
+compatibility inspection and must not be deployed. v0.4.1 retains v0.4.0's
+retraction of v0.3.3. Upgrading from v0.3.2 or another schema-5 release
 requires a fresh database as described below.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
 Unified `Observe` and configured monitor credentials require v0.3.2.
@@ -14,16 +13,15 @@ follow [upgrade and rollback](#upgrade-and-rollback) before replacing the broker
 See [deployment](deployment.md) for installation and [observability](observability.md)
 for metric definitions and alerts.
 
-The v0.4.1 candidate is a same-schema patch over v0.4.0. It fixes strict Observe
+v0.4.1 is a same-schema patch over v0.4.0. It fixes strict Observe
 clients and the console rejecting the documented retired message aggregate after
 a message-bearing queue or subscription is deleted, exposes the lifecycle clock,
 and makes fixed subscription deadlines visible in the console. It also preserves
 per-message TTLs in remote mixed-TTL batches and prevents closed logical Hrana
 streams from being reused on `libsql://`, without giving up physical HTTP/TLS
 keep-alive reuse. Upgrade broker and Go client together before relying on the
-additive mixed-TTL input shape. No database rebuild or metric migration is planned.
-No v0.4.1 tag or image exists yet; keep production on v0.4.0. Once the patch is
-released, still quiesce clients and avoid overlapping brokers during the binary
+additive mixed-TTL input shape. No database rebuild or metric migration is
+required. Still quiesce clients and avoid overlapping brokers during the binary
 replacement.
 
 ## Operating boundaries
