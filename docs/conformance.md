@@ -232,15 +232,18 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   *(server/errors_test.go; see [api-reference.md](api-reference.md))*
 - **9.3** Every registered RPC MUST bind a permission in the route registration.
   Send/Schedule/Cancel require send; all other QueueService methods require listen;
-  AdminService and AuthService require manage, except Observe and the opt-in
-  `/metrics` endpoint also accept configured read-only monitor credentials. Metrics
+  subscription upserts and filter dry-runs require listen; all other AdminService
+  and all AuthService methods require manage, except Observe and the opt-in `/metrics` endpoint also
+  accept configured read-only monitor credentials. Both empty-only and forced
+  subscription deletion require manage. Metrics
   MUST be disabled by default, return 404 while disabled, and appear as `/metrics`
   in discovery only while enabled. Enabling metrics MUST require administrator
   auth. Manage includes both data permissions. Configured and managed
   administrators MUST have identical operation rights, including issuing manage
   keys. Insufficient permission MUST
   fail before the handler can read or change protected data.
-  *(server/errors_test.go: TestAccessKeyCompletePermissionMatrix;
+  *(server/errors_test.go: TestAccessKeyCompletePermissionMatrix,
+  TestListenSubscriptionProvisioningBoundary;
   server/metrics_test.go: TestMetricsDefaultOffAndAnonymousObserveDenied,
   TestMetricsEnabledRequiresAdministratorAuthentication, TestMetricsPermissionMatrix,
   TestMetricsDisabledSkipsDatabaseAuthentication)*

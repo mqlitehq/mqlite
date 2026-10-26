@@ -309,6 +309,10 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 Starting with v0.3.1, create additional keys without restarting the broker using
 `mqlite key create --name producer --permissions send`. Keys can grant `send`,
 `listen`, both, or `manage` (which also grants key issuance and revocation).
+`listen` also permits broker-wide subscription creation/filter updates and filter
+testing; listing or deleting subscriptions still requires `manage`, regardless of
+the delete request's `force` value. Listen-only temporary subscriptions should use
+a fixed TTL as their cleanup backstop.
 Configured administrator tokens remain supported. See [key commands](docs/cli.md#key-createlistrevoke--manage-persistent-access-keys)
 and the [complete access-key guide](docs/access-keys.md).
 

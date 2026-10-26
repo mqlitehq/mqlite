@@ -10,6 +10,22 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
+## Unreleased
+
+### Let listeners provision subscriptions (MQLITE-166)
+
+- Allow broker-wide `listen` keys to call `Subscribe` and `TestFilter`. Subscribe
+  remains an upsert: listeners can create permanent or fixed-lifetime subscriptions
+  and update a known existing subscription's filter.
+- Keep complete and paged subscription inventory plus both empty-only and forced
+  `DeleteSubscription` behind `manage`. Force remains explicit discard approval,
+  not a separate permission level; listen-only temporary clients should set a fixed
+  TTL and rely on a manager for early retirement.
+- Keep the wire, SDK and schema unchanged. Pin the permission boundary in the
+  complete server matrix, a focused listener contract test and a process-level CLI
+  test, and make the broker-wide provisioning/capacity boundary explicit across the
+  CLI, MCP, console and user documentation.
+
 ## v0.4.1 — 2026-10-26
 
 > **Patch upgrade from v0.4.0:** the canonical schema token remains **7** and no

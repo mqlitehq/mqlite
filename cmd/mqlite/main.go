@@ -166,15 +166,15 @@ usage: mqlite <command> [flags]
  broker
   serve                     run the HTTP broker (embedded engine + Serve)
 
- admin
+ resources & inspection
   create-queue <name>       create/update a queue
   delete-queue <name>       delete an empty queue (--force discards retained data)
-  subscribe <topic> <name>  create a subscription under <topic> (--expr 'predicate' --ttl 5m)
-  delete-subscription <topic> <name>  delete an empty subscription (--force discards retained data)
+  subscribe <topic> <name>  create/update a subscription (listen; --expr 'predicate' --ttl 5m)
+  delete-subscription <topic> <name>  delete a subscription (manage; --force discards retained data)
   list                      list queues
-  list-subscriptions        list subscriptions; pagination flags return a page object
+  list-subscriptions        list subscriptions (manage); pagination flags return a page object
   peek <queue>              browse messages without locking (--state --from --max)
-  test-filter <expr>        dry-run a filter expression against an optional sample
+  test-filter <expr>        dry-run a filter expression (listen) against an optional sample
   metrics <queue>           show queue counters
   observe                   unified observation (monitor or manage; --output json)
   status                    backend snapshot (backend, ping, size, counts)

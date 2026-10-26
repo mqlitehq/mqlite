@@ -46,15 +46,19 @@ The agent then sees the tools below and can drive the broker directly.
 Minimal — selected core routes map 1:1 (kept small on purpose — over-specified tools make
 models misuse them):
 
+Permissions follow the HTTP API: producers use `send`, consumers and subscription
+provisioners use `listen`, and broker-wide inventory, lifecycle and key management
+use `manage`. `observe` also accepts a configured monitor credential.
+
 | Tool | Does |
 |---|---|
 | `observe` | complete canonical observation; takes no arguments; requires monitor or manage |
 | `list_queues` | list queues/subscriptions |
 | `create_queue` | create/update a queue by name |
 | `delete_queue` | delete a plain queue; optional `force` explicitly discards retained work |
-| `subscribe` | create a topic subscription or update its filter; optional `ttl_ms` sets a fixed lifetime |
-| `list_subscriptions` | page subscriptions by topic, with total/count and optional deleting entries |
-| `delete_subscription` | delete one exact topic/subscription pair; optional `force` discards retained work |
+| `subscribe` | create a topic subscription or update its filter (`listen`); optional `ttl_ms` sets a fixed lifetime |
+| `list_subscriptions` | page subscriptions by topic, with total/count and optional deleting entries (`manage`) |
+| `delete_subscription` | delete one exact topic/subscription pair (`manage`); optional `force` discards retained work |
 | `send` | send a message (`queue`, `body`, optional `message_id`/`group_id`) |
 | `receive` | peek-lock messages → returns `seq_number` + `lock_token` |
 | `complete` | acknowledge a message (`queue`, `seq_number`, `lock_token`) |
@@ -100,6 +104,8 @@ Configure intermediaries not to retry lifecycle-delete routes.
 the default. An accepted delete removes the subscription from fan-out immediately
 and returns the same `deleted` / `deleting` result as queue deletion. The exact
 topic/name pair is required even though subscription names are globally unique.
+Both deletion modes require `manage`; `force` changes the non-empty precondition,
+not the permission.
 
 Use `list_subscriptions` for bounded inventory and reconciliation. Its optional
 arguments are `topic`, `after`, `limit` (default 100, maximum 1,000), and
@@ -124,6 +130,11 @@ tool rejects an explicit zero. Repeating the original positive TTL is idempotent
 supplying a different positive TTL for the same subscription returns a conflict
 before changing its filter. Updates, retries, traffic, and receives never extend
 the deadline.
+
+`subscribe` requires `listen` and is a broker-wide upsert: a caller can update the
+filter of any known existing `(topic,name)` pair. It does not grant inventory or
+deletion rights. A listen-only agent creating temporary subscriptions should always
+set `ttl_ms`; a manager performs any early retirement and reconciliation.
 
 At the deadline, the broker makes the subscription unavailable and treats the TTL
 as advance authorization to discard its retained messages. Physical cleanup is

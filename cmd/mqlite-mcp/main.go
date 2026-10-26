@@ -305,7 +305,7 @@ var tools = []tool{
 		},
 	},
 	{
-		name: "subscribe", desc: "Create or update a named subscription; ttl_ms is a fixed lifetime from first creation and is never renewed.",
+		name: "subscribe", desc: "Create or update a named subscription (listen); ttl_ms is a fixed lifetime from first creation and is never renewed.",
 		schema: keyObj(map[string]any{
 			"topic":  strProp("topic name"),
 			"name":   strProp("subscription name"),
@@ -319,7 +319,7 @@ var tools = []tool{
 		},
 	},
 	{
-		name: "list_subscriptions", desc: "List one bounded page of subscriptions, optionally scoped to a topic.",
+		name: "list_subscriptions", desc: "List one bounded page of subscriptions (manage), optionally scoped to a topic.",
 		schema: keyObj(map[string]any{
 			"topic":            strProp("optional topic scope; keep it unchanged while paging"),
 			"after":            strProp("opaque next_after cursor from the previous page"),
@@ -344,7 +344,7 @@ var tools = []tool{
 		},
 	},
 	{
-		name: "delete_subscription", desc: "Delete an empty subscription; force discards retained messages and may leave bounded cleanup pending.",
+		name: "delete_subscription", desc: "Delete an empty subscription (manage); force discards retained messages and may leave bounded cleanup pending.",
 		schema: keyObj(map[string]any{
 			"topic": strProp("topic name"),
 			"name":  strProp("subscription name"),
