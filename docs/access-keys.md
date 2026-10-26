@@ -8,14 +8,23 @@ Version v0.3.0 supports configured administrator tokens only.
 | Permission | Operations |
 |---|---|
 | `send` | Send, schedule and cancel scheduled messages |
-| `listen` | Receive, settle, renew, peek and read queue statistics |
+| `listen` | Receive, settle, renew, peek, read queue statistics, and create/update subscriptions and test their filters |
 | `send` + `listen` | Both application roles |
-| `manage` | Both application roles, queue/topic administration, console, metrics, and issuing/revoking keys, including other `manage` keys |
+| `manage` | Both application roles, queue administration, subscription inventory/deletion, console, metrics, and issuing/revoking keys, including other `manage` keys |
 
 Permissions apply across the broker, not to individual queues. A `listen` key can
 delete consumed messages through completion or receive-and-delete; it is not a
 read-only auditing role. A `send` key can cancel scheduled messages from other
 producers. Use separate brokers when applications need a stronger isolation boundary.
+
+`Subscribe` is a broker-wide upsert, not ownership-scoped creation. A `listen` key
+can create a permanent or fixed-lifetime subscription and update the filter of any
+known existing `(topic,name)` pair. It can therefore reserve subscription capacity
+and increase publish fan-out. It cannot enumerate or explicitly delete subscriptions;
+both empty-only and forced deletion require `manage`. Give listen-only temporary
+subscriptions a fixed TTL as a cleanup backstop, and use a manager for early
+retirement. A subscription's TTL is fixed at creation, so a listener cannot add or
+change expiry on an existing subscription.
 
 The keys in `MQLITE_TOKENS` remain administrators. Keep one configured administrator
 available for recovery. Existing configured token strings remain valid; every newly

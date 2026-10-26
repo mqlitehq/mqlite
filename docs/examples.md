@@ -171,19 +171,34 @@ Use one stable subscription for high-rate request/reply traffic and route replie
 inside the consumer by a globally unique `correlation_id`. A subscription per
 request adds metadata and cleanup work to the single writer.
 
+For a remote broker, open the two clients below with separate `listen` and
+`manage` keys. Subscription creation/filter updates are application operations,
+while broker-wide inventory and both deletion modes remain administrative.
+
 ```go
-if err := cli.Subscribe(ctx, "replies", "checkout-instance-7", nil); err != nil {
+listener, err := mqlite.Open(ctx, endpoint, mqlite.WithToken(listenerToken))
+if err != nil {
+	log.Fatal(err)
+}
+defer listener.Close()
+manager, err := mqlite.Open(ctx, endpoint, mqlite.WithToken(managerToken))
+if err != nil {
+	log.Fatal(err)
+}
+defer manager.Close()
+
+if err := listener.Subscribe(ctx, "replies", "checkout-instance-7", nil); err != nil {
 	log.Fatal(err)
 }
 
-// For a genuinely temporary owner, TTL is a cleanup backstop. It is fixed at
-// first creation and does not replace explicit deletion after normal success.
-if err := cli.SubscribeWithOptions(ctx, "replies", "checkout-request-01J...", nil,
+// For a genuinely temporary listener, TTL is the cleanup path. It is fixed at
+// first creation; a manager may explicitly retire the subscription earlier.
+if err := listener.SubscribeWithOptions(ctx, "replies", "checkout-request-01J...", nil,
 	mqlite.SubscribeOptions{TTL: 15 * time.Minute}); err != nil {
 	log.Fatal(err)
 }
 
-page, err := cli.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{
+page, err := manager.ListSubscriptionsWithOptions(ctx, mqlite.ListSubscriptionsOptions{
 	Topic: "replies",
 	Limit: 100,
 })
@@ -193,7 +208,7 @@ if err != nil {
 log.Printf("subscriptions=%d first-page=%d", page.Total, len(page.Subscriptions))
 
 // Empty-only by default. Drain and settle retained replies before retirement.
-if err := cli.DeleteSubscription(ctx, "replies", "checkout-instance-7"); err != nil {
+if err := manager.DeleteSubscription(ctx, "replies", "checkout-instance-7"); err != nil {
 	log.Fatal(err)
 }
 ```

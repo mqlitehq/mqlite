@@ -153,9 +153,10 @@ expired keys remain valid cursors). ID order also accepts absent predecessor IDs
 for reconciling a lost create response.
 
 `send` permits sending, scheduling and cancelling scheduled messages; `listen`
-permits consumption, settlement, renewal, peek and queue stats; `manage` includes
-both and all administration, including issuing other `manage` keys. Permissions
-apply to the whole broker. A 403 is a permission failure, not an invalid token;
+permits consumption, settlement, renewal, peek, queue stats, subscription upsert,
+and filter testing; `manage` includes both and the remaining administrative
+operations, including subscription inventory/deletion and issuing other `manage`
+keys. Permissions apply to the whole broker. A 403 is a permission failure, not an invalid token;
 ordinary send/listen keys cannot use `key`, `list`, `status` or the admin console.
 Existing configured administrator tokens retain their original format and rights.
 
@@ -208,6 +209,9 @@ list.
 
 ### `subscribe <topic> <name>` — create a subscription
 *(alias: `create-subscription`)*
+
+Requires `listen`. This is a broker-wide upsert: the same `(topic,name)` updates
+its filter, rather than creating a caller-owned resource.
 ```bash
 mqlite subscribe orders eu-orders --expr 'subject_parts[0]=="orders" && properties["region"]=="eu"'
 mqlite subscribe replies instance-7 --ttl 15m
@@ -220,10 +224,13 @@ mqlite subscribe replies instance-7 --ttl 15m
 On an existing subscription, omitting `--ttl` or passing zero preserves its lifetime. Repeating
 the original positive value is idempotent; a different positive value returns a
 name conflict before changing the filter. Expiry is advance authorization to
-discard retained messages during bounded cleanup. Explicit deletion remains the
-normal completion path.
+discard retained messages during bounded cleanup. It is the cleanup path for a
+listen-only temporary client; a manager may explicitly retire the subscription
+earlier after normal success.
 
 ### `delete-subscription <topic> <name>` — retire a subscription
+
+Requires `manage` with or without `--force`.
 
 ```bash
 mqlite delete-subscription orders eu-orders
@@ -412,6 +419,8 @@ lease deadlines. Older compatible brokers omit it, which means unavailable rathe
 than Unix epoch zero.
 
 ### `list-subscriptions` — subscriptions with topic + filter
+
+Requires `manage`; it exposes broker-wide subscription names, filters and lifecycle.
 ```bash
 mqlite list-subscriptions                                      # all active (legacy-compatible)
 mqlite list-subscriptions --topic orders --limit 100
@@ -429,6 +438,8 @@ fields; zero expiry means permanent. With `--include-deleting`, an expired row i
 visible as `deleting` even before physical cleanup removes it.
 
 ### `test-filter <expr>` — dry-run a subscription filter
+Requires `listen`; it reads no broker data and makes no persistent change.
+
 Compiles the expression and, with a sample, reports whether it would match (nothing is
 enqueued).
 ```bash

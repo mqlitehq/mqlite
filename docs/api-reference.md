@@ -111,12 +111,15 @@ receiving, settling and renewing change message state.
 | Required permission | Operations |
 |---|---|
 | `send` | `QueueService/Send`, `Schedule`, `Cancel` |
-| `listen` | `QueueService/Receive`, `ReceiveDeferred`, `Peek`, `Stats`, `Complete`, `CompleteBatch`, `Abandon`, `Reject`, `Defer`, `Renew`, `RenewBatch` |
-| `manage` | All `AdminService` methods, all `AuthService` methods, and `/metrics` |
+| `listen` | `QueueService/Receive`, `ReceiveDeferred`, `Peek`, `Stats`, `Complete`, `CompleteBatch`, `Abandon`, `Reject`, `Defer`, `Renew`, `RenewBatch`; `AdminService/Subscribe`, `TestFilter` |
+| `manage` | All other `AdminService` methods, all `AuthService` methods, and `/metrics` |
 | configured monitor | `AdminService/Observe` and `/metrics` only |
 
 Both receive modes require `listen`, including receive-and-delete. Batch and
 idempotent replay paths use the same permission checks as the original operation.
+Subscription inventory and deletion require `manage`; `force` changes the deletion
+precondition, not its permission. A fixed TTL is creation-time advance authorization
+for automatic cleanup and cannot be added to or changed on an existing subscription.
 The console's administration views require `manage`. A configured monitor token
 opens only its observability views. The public static page alone grants no API access.
 
@@ -609,6 +612,9 @@ Deletes one exact topic/subscription pair. It uses the same durable, bounded
 lifecycle as `DeleteQueue`, but owns both the topic roster mapping and the
 subscription's backing queue.
 
+Requires `manage` for both empty-only and forced deletion. The `force` field is
+explicit discard authorization, not a separate permission tier.
+
 - POST `/mqlite.v1.AdminService/DeleteSubscription`
 - Request: `{"topic":"events","name":"worker"}` or the same object with
   `"force":true`. A wrong topic for a globally unique subscription name is
@@ -684,7 +690,15 @@ curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 
 ### Subscribe
 
-Register subscription `name` under `topic` (creates its backing queue).
+Register subscription `name` under `topic` (creates its backing queue). Requires
+`listen`; `manage` includes `listen`.
+
+This is a broker-wide upsert, not create-only ownership. A listener that knows an
+existing `(topic,name)` can update its filter, and a new permanent or temporary
+subscription consumes the shared capacity and adds publish fan-out. Subscription
+inventory and explicit deletion remain `manage` operations. Listen-only clients
+should set a fixed TTL on temporary subscriptions and leave early retirement to a
+manager.
 
 - **Request** `SubscribeRequest`: `topic`, `name`, `filter` (optional —
   `{"expr": "<predicate>"}`, an [expr boolean over the message](concepts.md#subscription-filters-expr); empty/omitted
@@ -752,6 +766,7 @@ The `state` field and deleting-resource visibility below are available in v0.4.0
 
 ### ListSubscriptions
 
+- Requires `manage` because the result inventories broker-wide names and filters.
 - **Request** `{}`. **Response** `{subscriptions: [{topic, name, expr}]}` — every
   active subscription with its topic and [filter expression](concepts.md#subscription-filters-expr) (`expr` empty = match
   all). This compatibility-only route is active/unexpired-only and intentionally
@@ -764,6 +779,7 @@ The `state` field and deleting-resource visibility below are available in v0.4.0
 
 Available in v0.4.0.
 
+- Requires `manage`, including when it is used to reconcile deletion or expiry.
 - POST `/mqlite.v1.AdminService/ListSubscriptionsPage`.
 - Request fields: `topic` (optional exact topic), `after` (an opaque cursor from
   the previous response), `limit` (`0` or omitted = 100, maximum 1,000), and
@@ -794,6 +810,8 @@ Available in v0.4.0.
 
 ### TestFilter
 
+- Requires `listen`; it evaluates only the caller-provided expression and sample
+  and does not read or mutate broker data.
 - **Request** `{expr, message?}` — dry-run a [filter expression](concepts.md#subscription-filters-expr): it
   compiles `expr` and, if `message` (a sample, body base64) is given, evaluates it
   exactly as publish-time fan-out would (nothing is enqueued).
