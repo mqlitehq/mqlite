@@ -223,7 +223,7 @@ hosting elsewhere.)
 Starting with v0.3.2, a configured monitor token opens only the read-only overview
 and metrics views; administration still requires `manage`.
 
-### 4. Or the Go SDK (remote)
+### 4. Or MQLite Remote Client for Go
 
 ```go
 cli, _ := mqlite.Open(ctx, "http://127.0.0.1:6754", mqlite.WithToken("mqk_dev"))
@@ -237,10 +237,11 @@ cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
 ```
 
 Remote-only applications that need a lower source floor can use the official
-[`github.com/mqlitehq/mqlite-go`](https://github.com/mqlitehq/mqlite-go) companion
-module (`go get github.com/mqlitehq/mqlite-go@v0.1.0`). It supports Go 1.13 and
-uses only the standard library: it does not link SQLite, libSQL/Turso, CGO, or
-this main module. Keep using `github.com/mqlitehq/mqlite` for embedded queues,
+[MQLite Remote Client for Go](https://github.com/mqlitehq/mqlite-go), whose
+module path remains `github.com/mqlitehq/mqlite-go`
+(`go get github.com/mqlitehq/mqlite-go@v0.1.1`). It supports Go 1.13 and uses
+only the standard library: it does not link SQLite, libSQL/Turso, CGO, or this
+main module. Keep using `github.com/mqlitehq/mqlite` for embedded queues,
 transactional outbox, canonical `Observe`, or managed access-key administration.
 
 `delivery_count` counts claims, not time spent processing: `Receive` and explicit
@@ -352,7 +353,7 @@ broker with `MQLITE_ENDPOINT` + `MQLITE_TOKEN`. See [docs/mcp.md](docs/mcp.md).
 |---|---|
 | [CLI reference](docs/cli.md) | every command + flags; works embedded or against a broker |
 | [HTTP API reference](docs/api-reference.md) | endpoints, request/response, error codes |
-| [Low-floor remote Go SDK](https://github.com/mqlitehq/mqlite-go) | standard-library-only broker client; Go 1.13 source floor |
+| [MQLite Remote Client for Go](https://github.com/mqlitehq/mqlite-go) | standard-library-only broker client; Go 1.13 source floor |
 | [MCP server](docs/mcp.md) | drive mqlite from an AI agent |
 | [Examples](docs/examples.md) | copy-runnable Go (embedded · outbox · remote) + curl |
 
