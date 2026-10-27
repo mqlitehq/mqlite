@@ -5,6 +5,18 @@ embeddable in projects that haven't moved to a newer toolchain (MQLITE-1). That
 single decision freezes two dependencies — this note records why, what it costs,
 and how the freeze is enforced so it can't be lifted by accident.
 
+## Remote-only companion module
+
+Applications that only call a broker can instead import the official
+[`github.com/mqlitehq/mqlite-go`](https://github.com/mqlitehq/mqlite-go) module.
+Its `v0.1.0` release has a Go 1.13 source floor and uses only the standard
+library; it does not link the embedded engine, SQLite, libSQL/Turso, or CGO.
+The low floor is a compatibility promise, not a recommendation to run an
+end-of-life toolchain in production: build with a supported Go release whenever
+possible. Use this main module when an application needs embedded mode,
+transactional outbox, canonical observation decoding, or managed access-key
+administration.
+
 ## What the floor freezes
 
 | dependency | pinned | next release | why frozen |

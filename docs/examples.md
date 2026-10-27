@@ -120,6 +120,13 @@ return `nil` → Complete, return an error → Abandon (redelivery below the max
 the failed final attempt goes to the DLQ), with auto lock-renewal and configurable
 concurrency.
 
+The core calls in this example also work with the standard-library-only,
+remote-only companion module: install `github.com/mqlitehq/mqlite-go@v0.1.0`
+and change the import to
+`mqlite "github.com/mqlitehq/mqlite-go"`. Its source floor is Go 1.13. Use the
+main module shown below when the same application also needs embedded mode,
+`Observe`, or managed access-key administration.
+
 ```go
 package main
 
