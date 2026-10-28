@@ -48,8 +48,8 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> The latest supported release is **v0.4.1**, with default port **6754** and
-> schema token **7**. Pin the exact v0.4.1 binary or image rather than relying on
+> The latest supported release is **v0.4.2**, with default port **6754** and
+> schema token **7**. Pin the exact v0.4.2 binary or image rather than relying on
 > a moving image alias. v0.3.3 is withdrawn, unsupported, and retracted by
 > v0.4.0 and later; its public assets and exact image remain available for
 > forensic or compatibility inspection and must not be deployed.
@@ -64,30 +64,27 @@ and error reference: [api-reference.md](api-reference.md).
 > [upgrade and rollback procedure](operations.md#upgrade-and-rollback) before
 > replacing it.
 
-v0.4.1 is a same-schema patch over v0.4.0. It fixes
-observation validation in the console, CLI and Go SDK after deleting a resource
-with process-lifetime message effects; it also exposes the broker lifecycle clock
-and makes subscription deadlines visible in the console. It preserves
-each message TTL in a remote mixed-TTL batch and prevents closed logical Hrana
-streams from being reused on `libsql://`, while physical HTTP/TLS keep-alive reuse
-continues. Upgrade the v0.4.0 broker and Go client together before relying on the
-additive mixed-TTL input shape. The patch does not require a database rebuild.
+v0.4.2 is a same-schema patch over v0.4.1. Broker-wide `listen` keys can provision
+or update subscriptions and test filters; subscription inventory and deletion
+remain `manage` operations. Browser root requests that explicitly prefer HTML
+enter the enabled console, while curl and JSON clients retain the discovery
+response. The wire contract is unchanged and no database rebuild is required.
 
 The exact supported image is multi-arch (amd64 + arm64):
 
 ```bash
-# v0.4.1, default port 6754
+# v0.4.2, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.4.1
+  ghcr.io/mqlitehq/mqlite:0.4.2
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin exact `0.4.1` in production. Images `>= 0.3.0` listen on `6754`;
+- Pin exact `0.4.2` in production. Images `>= 0.3.0` listen on `6754`;
   **`0.2.x` and earlier listen on `8080`**.
 - Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. Metrics is
   disabled by default. For a private broker or an ingress that blocks public
@@ -106,7 +103,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.4.1"   # latest supported exact image
+  image = "ghcr.io/mqlitehq/mqlite:0.4.2"   # latest supported exact image
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -220,7 +217,7 @@ online snapshots, offline directory copies, isolated restore validation and roll
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
 **v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and withdrawn
-v0.3.3 use schema 5; v0.4.0 and v0.4.1 use schema 7.**
+v0.3.3 use schema 5; v0.4.0, v0.4.1, and v0.4.2 use schema 7.**
 Intermediate untagged lifecycle builds used schema 6. There is no in-place
 migration between these tokens. Before testing a different token, account for
 retained work in every state, keep the old binary/database pair and a consistent
