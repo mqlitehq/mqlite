@@ -23,11 +23,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,6 +58,43 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestRemoteQueueNotFoundMatchesSpecificAndGeneralErrors(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"code":"not_found","message":"mqlite: queue not found","resource":"queue"}`)
+	}))
+	defer stub.Close()
+
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, err = client.Stats(context.Background(), "missing")
+	if !errors.Is(err, mqlite.ErrQueueNotFound) || !errors.Is(err, mqlite.ErrNotFound) {
+		t.Fatalf("Stats error = %v, want both ErrQueueNotFound and ErrNotFound", err)
+	}
+}
+
+type closeTrackingTransport struct {
+	closeCalls atomic.Int32
+}
+
+func (t *closeTrackingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        make(http.Header),
+		Body:          io.NopCloser(strings.NewReader(`{"queues":[]}`)),
+		ContentLength: int64(len(`{"queues":[]}`)),
+		Request:       req,
+	}, nil
+}
+
+func (t *closeTrackingTransport) CloseIdleConnections() {
+	t.closeCalls.Add(1)
 }
 
 // ─── Harness ────────────────────────────────────────────────────────────────
@@ -223,6 +262,94 @@ func TestRemoteCompleteBatch(t *testing.T) {
 	}
 	if m, _ := cli.Stats(ctx, "orders"); m.Total != 0 {
 		t.Fatalf("queue should be empty after batch complete, total=%d", m.Total)
+	}
+}
+
+func TestRemoteBatchSettlementRejectsMalformedSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+		want error
+	}{
+		{name: "complete missing result", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7,"ok":true}]}`, want: mqlite.ErrOutcomeUnknown},
+		{name: "complete reordered", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":8,"ok":true},{"seq_number":7,"ok":true}]}`, want: mqlite.ErrOutcomeUnknown},
+		{name: "complete with renewal deadline", path: wire.PathCompleteBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":true}]}`, want: mqlite.ErrOutcomeUnknown},
+		{name: "complete truncated JSON", path: wire.PathCompleteBatch, body: `{"results":[`, want: mqlite.ErrOutcomeUnknown},
+		{name: "renew missing deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true},{"seq_number":8,"ok":false}]}`, want: mqlite.ErrOutcomeUnknown},
+		{name: "renew stale with deadline", path: wire.PathRenewBatch, body: `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":1700000000000},{"seq_number":8,"ok":false,"locked_until_ms":1700000000001}]}`, want: mqlite.ErrOutcomeUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tc.path {
+					t.Errorf("path = %q, want %q", r.URL.Path, tc.path)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			messages := []*mqlite.Message{
+				client.Message("jobs", 7, "lock-7"),
+				client.Message("jobs", 8, "lock-8"),
+			}
+			if tc.path == wire.PathCompleteBatch {
+				_, err = client.CompleteBatch(context.Background(), "jobs", messages...)
+			} else {
+				_, err = client.RenewBatch(context.Background(), "jobs", messages...)
+			}
+			if err == nil {
+				t.Fatal("malformed successful response was accepted")
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want errors.Is(_, %v)", err, tc.want)
+			}
+			if strings.Contains(err.Error(), tc.body) {
+				t.Fatalf("error exposed the untrusted response body: %v", err)
+			}
+		})
+	}
+}
+
+func TestRemoteBatchSettlementRejectsNilMessageWithoutRequest(t *testing.T) {
+	var calls atomic.Int32
+	stub := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.CompleteBatch(context.Background(), "jobs", (*mqlite.Message)(nil)); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Fatalf("CompleteBatch error = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := client.RenewBatch(context.Background(), "jobs", (*mqlite.Message)(nil)); !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Fatalf("RenewBatch error = %v, want ErrInvalidArgument", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("invalid calls reached the broker %d times", calls.Load())
+	}
+}
+
+func TestRemoteCompleteBatchHTTPRejectionIsNotOutcomeUnknown(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"code":"permission_denied","message":"not allowed"}`)
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, err = client.CompleteBatch(context.Background(), "jobs", client.Message("jobs", 7, "lock-7"))
+	if !errors.Is(err, mqlite.ErrPermissionDenied) || errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want only ErrPermissionDenied", err)
 	}
 }
 
@@ -555,6 +682,54 @@ func TestRemoteBatchTTLWireCompatibility(t *testing.T) {
 			t.Fatalf("uniform legacy batch: %v", err)
 		}
 	})
+}
+
+func TestRemoteSendRejectsMismatchedSequenceAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seqs []int64
+		call func(*mqlite.Client) error
+	}{
+		{
+			name: "SendOne extra sequence",
+			seqs: []int64{11, 12},
+			call: func(client *mqlite.Client) error {
+				_, err := client.SendOne(context.Background(), "jobs", mqlite.OutMessage{Body: []byte("one")})
+				return err
+			},
+		},
+		{
+			name: "Send missing sequence",
+			seqs: []int64{11},
+			call: func(client *mqlite.Client) error {
+				_, err := client.Send(context.Background(), "jobs",
+					mqlite.OutMessage{Body: []byte("one")},
+					mqlite.OutMessage{Body: []byte("two")})
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				_ = json.NewEncoder(w).Encode(wire.SendResponse{SeqNumbers: tc.seqs})
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			err = tc.call(client)
+			if !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+				t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("Send made %d requests, want one", calls.Load())
+			}
+		})
+	}
 }
 
 func TestRemoteAuth(t *testing.T) {
@@ -1220,8 +1395,8 @@ func TestReleaseDocsPinLatestDatedRelease(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "3ff47a5d29f6fbc8f47ad4e9bff93375f9f3a86604f53233dadc16adba756ef5",
-		"concepts.html": "6ef92acefd5a9c62068ad75edcac7a479503975b066cc39d48b6752b2cea12cc",
+		"concepts.md":   "125f4b5247864a6518d50a738da11ee5086fb8a4125169cd1eaea07ef543723a",
+		"concepts.html": "1aaab8fd4d8b845fb73376a6c7a36c8ef6b424da3f056fad58509a032acfb2ca",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {
@@ -2174,6 +2349,287 @@ func TestManagedKeyCreateLostResponseIsNotRetried(t *testing.T) {
 	}
 }
 
+func TestRemoteHTTPErrorIncludesStatusAndBoundsBodies(t *testing.T) {
+	assertHTTPStatus := func(t *testing.T, err error, want int) {
+		t.Helper()
+		var statusErr *mqlite.HTTPError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode != want || statusErr.HTTPStatus() != want {
+			t.Fatalf("error = %v, want typed HTTP status %d", err, want)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", want)) {
+			t.Fatalf("error = %v, want visible HTTP status", err)
+		}
+	}
+
+	t.Run("empty gateway response retains status", func(t *testing.T) {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer stub.Close()
+		client, err := mqlite.Open(context.Background(), stub.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		_, err = client.Stats(context.Background(), "jobs")
+		if err == nil {
+			t.Fatal("empty 503 response was accepted")
+		}
+		assertHTTPStatus(t, err, http.StatusServiceUnavailable)
+	})
+
+	t.Run("oversized error body is discarded", func(t *testing.T) {
+		const marker = "untrusted-upstream-secret"
+		body := `{"code":"invalid_argument","message":"` + marker + `"}`
+		httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    http.StatusBadGateway,
+				Header:        make(http.Header),
+				Body:          io.NopCloser(strings.NewReader(body)),
+				ContentLength: (64 << 10) + 1,
+				Request:       req,
+			}, nil
+		})}
+		client, err := mqlite.Open(context.Background(), "http://broker.invalid", mqlite.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		_, err = client.ListQueues(context.Background())
+		if err == nil || errors.Is(err, mqlite.ErrInvalidArgument) || strings.Contains(err.Error(), marker) {
+			t.Fatalf("oversized error response was trusted or exposed: %v", err)
+		}
+		assertHTTPStatus(t, err, http.StatusBadGateway)
+	})
+
+	t.Run("unknown length error body is bounded", func(t *testing.T) {
+		const marker = "secret-after-error-limit"
+		body := `{"code":"invalid_argument","message":"` + strings.Repeat("x", 64<<10) + marker + `"}`
+		httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    http.StatusServiceUnavailable,
+				Header:        make(http.Header),
+				Body:          io.NopCloser(strings.NewReader(body)),
+				ContentLength: -1,
+				Request:       req,
+			}, nil
+		})}
+		client, err := mqlite.Open(context.Background(), "http://broker.invalid", mqlite.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		_, err = client.ListQueues(context.Background())
+		if err == nil || errors.Is(err, mqlite.ErrInvalidArgument) || strings.Contains(err.Error(), marker) {
+			t.Fatalf("oversized chunked error response was trusted or exposed: %v", err)
+		}
+		assertHTTPStatus(t, err, http.StatusServiceUnavailable)
+	})
+
+	t.Run("oversized success body is rejected", func(t *testing.T) {
+		body := `{"queues":[]}`
+		httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        make(http.Header),
+				Body:          io.NopCloser(strings.NewReader(body)),
+				ContentLength: (64 << 20) + 1,
+				Request:       req,
+			}, nil
+		})}
+		client, err := mqlite.Open(context.Background(), "http://broker.invalid", mqlite.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		queues, err := client.ListQueues(context.Background())
+		if err == nil || queues != nil {
+			t.Fatalf("oversized successful response = %+v, %v; want rejection", queues, err)
+		}
+	})
+}
+
+func TestRemoteRPCDoesNotFollowRedirect(t *testing.T) {
+	const locationMarker = "redirect-location-secret"
+	var sourceCalls atomic.Int32
+	var targetCalls atomic.Int32
+	var callerRedirectCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		targetCalls.Add(1)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sourceCalls.Add(1)
+		w.Header().Set("Location", target.URL+wire.PathPurge+"?token="+locationMarker)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	callerHTTPClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		callerRedirectCalls.Add(1)
+		return nil
+	}}
+	client, err := mqlite.Open(context.Background(), source.URL, mqlite.WithHTTPClient(callerHTTPClient))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, err = client.Purge(context.Background(), "jobs")
+	var statusErr *mqlite.HTTPError
+	if err == nil || !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("redirect error = %v, want typed HTTP 307", err)
+	}
+	if strings.Contains(err.Error(), locationMarker) || strings.Contains(err.Error(), target.URL) {
+		t.Fatalf("redirect error exposed an untrusted Location: %v", err)
+	}
+	if sourceCalls.Load() != 1 || targetCalls.Load() != 0 {
+		t.Fatalf("redirect calls source=%d target=%d, want 1/0", sourceCalls.Load(), targetCalls.Load())
+	}
+	if callerRedirectCalls.Load() != 0 || callerHTTPClient.CheckRedirect == nil {
+		t.Fatalf("MQLite invoked or mutated caller redirect policy: calls=%d", callerRedirectCalls.Load())
+	}
+}
+
+func TestRemoteDefaultHTTPTransportReusesConcurrentConnections(t *testing.T) {
+	const parallel = 12
+	arrived := [2]chan struct{}{make(chan struct{}, parallel), make(chan struct{}, parallel)}
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var releaseOnce [2]sync.Once
+	releaseWave := func(wave int) {
+		releaseOnce[wave].Do(func() { close(release[wave]) })
+	}
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			cancelRequests()
+			for wave := range release {
+				releaseWave(wave)
+			}
+		})
+	}
+	var calls atomic.Int32
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		wave := int(calls.Add(1)-1) / parallel
+		if wave >= len(arrived) {
+			t.Errorf("unexpected request wave %d", wave)
+			return
+		}
+		arrived[wave] <- struct{}{}
+		select {
+		case <-release[wave]:
+		case <-req.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, `{"queues":[]}`)
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	defer client.Close()
+	// Registered after Client.Close and Server.Close so every failure releases
+	// blocked handlers before either close waits for their connections to exit.
+	defer cleanup()
+
+	runWave := func(ctx context.Context, wave int) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan error, parallel)
+		wg.Add(parallel)
+		for i := 0; i < parallel; i++ {
+			go func() {
+				defer wg.Done()
+				_, callErr := client.ListQueues(ctx)
+				errs <- callErr
+			}()
+		}
+		for i := 0; i < parallel; i++ {
+			select {
+			case <-arrived[wave]:
+			case <-time.After(5 * time.Second):
+				cleanup()
+				wg.Wait()
+				t.Fatalf("wave %d reached only %d/%d concurrent requests", wave, i, parallel)
+			}
+		}
+		releaseWave(wave)
+		wg.Wait()
+		close(errs)
+		for callErr := range errs {
+			if callErr != nil {
+				cleanup()
+				t.Fatalf("wave %d request: %v", wave, callErr)
+			}
+		}
+	}
+
+	runWave(requestCtx, 0)
+	var reused atomic.Int32
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		if info.Reused {
+			reused.Add(1)
+		}
+	}}
+	runWave(httptrace.WithClientTrace(requestCtx, trace), 1)
+	if reused.Load() != parallel {
+		cleanup()
+		t.Fatalf("second wave reused %d/%d connections; default pool is too small", reused.Load(), parallel)
+	}
+}
+
+func TestRemoteClientCloseOwnsOnlyDefaultTransport(t *testing.T) {
+	t.Run("default transport closes its idle connection", func(t *testing.T) {
+		closed := make(chan struct{}, 1)
+		stub := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"queues":[]}`)
+		}))
+		stub.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				select {
+				case closed <- struct{}{}:
+				default:
+				}
+			}
+		}
+		stub.Start()
+		defer stub.Close()
+		client, err := mqlite.Open(context.Background(), stub.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ListQueues(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Client.Close left its default idle connection open")
+		}
+	})
+
+	t.Run("custom transport remains caller owned", func(t *testing.T) {
+		transport := &closeTrackingTransport{}
+		client, err := mqlite.Open(context.Background(), "http://broker.invalid", mqlite.WithHTTPClient(&http.Client{Transport: transport}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ListQueues(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if transport.closeCalls.Load() != 0 {
+			t.Fatalf("Client.Close closed caller-owned transport %d times", transport.closeCalls.Load())
+		}
+	})
+}
+
 func TestHTTPAuthorizationErrorMapping(t *testing.T) {
 	for _, tc := range []struct {
 		name, body string
@@ -2196,8 +2652,13 @@ func TestHTTPAuthorizationErrorMapping(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := c.ListKeys(context.Background(), "", 1); !errors.Is(err, tc.want) {
+			_, err = c.ListKeys(context.Background(), "", 1)
+			if !errors.Is(err, tc.want) {
 				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			var statusErr *mqlite.HTTPError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != tc.status {
+				t.Fatalf("got %v, want typed HTTP status %d", err, tc.status)
 			}
 		})
 	}
@@ -3190,6 +3651,380 @@ func TestDeleteQueueAcknowledgementContract(t *testing.T) {
 			}
 			if got.err != nil || got.path != wire.PathDeleteQueue || !reflect.DeepEqual(got.body, wantBody) {
 				t.Fatalf("delete request = path %q body %v err %v", got.path, got.body, got.err)
+			}
+		})
+	}
+}
+
+// ── Semantic acknowledgement integrity ─────────────────────────────────────
+
+func TestRemoteSingleWriteRequiresSemanticAcknowledgement(t *testing.T) {
+	const marker = "semantic-ack-marker-must-not-be-reflected"
+	for _, operation := range []struct {
+		name string
+		path string
+		call func(context.Context, *mqlite.Client) error
+	}{
+		{name: "complete", path: wire.PathComplete, call: func(ctx context.Context, client *mqlite.Client) error {
+			return client.Message("jobs", 7, "lock-7").Complete(ctx)
+		}},
+		{name: "abandon", path: wire.PathAbandon, call: func(ctx context.Context, client *mqlite.Client) error {
+			return client.Message("jobs", 7, "lock-7").Abandon(ctx)
+		}},
+		{name: "reject", path: wire.PathReject, call: func(ctx context.Context, client *mqlite.Client) error {
+			return client.Message("jobs", 7, "lock-7").Reject(ctx)
+		}},
+		{name: "defer", path: wire.PathDefer, call: func(ctx context.Context, client *mqlite.Client) error {
+			return client.Message("jobs", 7, "lock-7").Defer(ctx)
+		}},
+		{name: "renew", path: wire.PathRenew, call: func(ctx context.Context, client *mqlite.Client) error {
+			return client.Message("jobs", 7, "lock-7").Renew(ctx)
+		}},
+		{name: "cancel", path: wire.PathCancel, call: func(ctx context.Context, client *mqlite.Client) error {
+			return client.Cancel(ctx, "jobs", 7)
+		}},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			var calls int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				if request.URL.Path != operation.path {
+					t.Errorf("path = %q, want %q", request.URL.Path, operation.path)
+				}
+				_, _ = io.WriteString(w, `{"future":"`+marker+`"}`)
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			err = operation.call(context.Background(), client)
+			if !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+				t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("error reflected untrusted successful response: %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestRemoteExplicitNegativeSettlementRemainsLockLost(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":false}`)
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	err = client.Message("jobs", 7, "lock-7").Complete(context.Background())
+	if !errors.Is(err, mqlite.ErrLockLost) || errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want only ErrLockLost", err)
+	}
+}
+
+func TestRemoteCancelRejectsNegativeSuccessfulAcknowledgement(t *testing.T) {
+	var calls int32
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = io.WriteString(w, `{"ok":false}`)
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	err = client.Cancel(context.Background(), "jobs", 7)
+	if !errors.Is(err, mqlite.ErrOutcomeUnknown) || errors.Is(err, mqlite.ErrNotFound) {
+		t.Fatalf("error = %v, want only ErrOutcomeUnknown", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("calls = %d, want 1", got)
+	}
+}
+
+func TestRemoteBatchSettlementRequiresPerItemAcknowledgement(t *testing.T) {
+	const marker = "batch-semantic-ack-marker"
+	for _, operation := range []struct {
+		name        string
+		path        string
+		outcomeLost bool
+		call        func(context.Context, *mqlite.Client, *mqlite.Message) error
+	}{
+		{name: "complete", path: wire.PathCompleteBatch, outcomeLost: true, call: func(ctx context.Context, client *mqlite.Client, message *mqlite.Message) error {
+			_, err := client.CompleteBatch(ctx, "jobs", message)
+			return err
+		}},
+		{name: "renew", path: wire.PathRenewBatch, outcomeLost: true, call: func(ctx context.Context, client *mqlite.Client, message *mqlite.Message) error {
+			_, err := client.RenewBatch(ctx, "jobs", message)
+			return err
+		}},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			var calls int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				if request.URL.Path != operation.path {
+					t.Errorf("path = %q, want %q", request.URL.Path, operation.path)
+				}
+				_, _ = io.WriteString(w, `{"results":[{"seq_number":7,"future":"`+marker+`"}]}`)
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			err = operation.call(context.Background(), client, client.Message("jobs", 7, "lock-7"))
+			if err == nil {
+				t.Fatal("batch response without ok was accepted")
+			}
+			if operation.outcomeLost && !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+				t.Fatalf("error = %v, want ErrOutcomeUnknown", err)
+			}
+			if errors.Is(err, mqlite.ErrLockLost) {
+				t.Fatalf("missing ok was misclassified as ErrLockLost: %v", err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("error reflected untrusted successful response: %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestRemoteReceiveRequiresExplicitMessageBatch(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		body string
+		ok   bool
+	}{
+		{name: "missing", body: `{"future":true}`},
+		{name: "null", body: `{"messages":null}`},
+		{name: "empty", body: `{"messages":[]}`, ok: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, testCase.body)
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			messages, err := client.Receive(context.Background(), "jobs")
+			if testCase.ok {
+				if err != nil || len(messages) != 0 {
+					t.Fatalf("Receive = %+v, %v; want empty success", messages, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Receive accepted %s", testCase.body)
+			}
+		})
+	}
+}
+
+func TestRemoteAtMostOnceReceiveTreatsInvalidSuccessAsOutcomeUnknown(t *testing.T) {
+	const marker = "at-most-once-response-marker-must-not-be-reflected"
+	for _, testCase := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing messages", body: `{"future":"` + marker + `"}`},
+		{name: "null messages", body: `{"messages":null,"future":"` + marker + `"}`},
+		{name: "truncated messages", body: `{"messages":[{"subject":"` + marker + `"}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var calls int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				if request.URL.Path != wire.PathReceive {
+					t.Errorf("path = %q, want %q", request.URL.Path, wire.PathReceive)
+				}
+				_, _ = io.WriteString(w, testCase.body)
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			messages, err := client.Receive(context.Background(), "jobs", mqlite.RecvOpts{AtMostOnce: true})
+			if messages != nil || !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+				t.Fatalf("Receive = %+v, %v; want nil and ErrOutcomeUnknown", messages, err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("error reflected untrusted successful response: %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestRemotePeekLockReceiveKeepsInvalidSuccessRetryable(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, err = client.Receive(context.Background(), "jobs", mqlite.RecvOpts{Attempt: "same-attempt"})
+	if err == nil || errors.Is(err, mqlite.ErrOutcomeUnknown) {
+		t.Fatalf("PeekLock Receive error = %v, want retryable invalid-success classification", err)
+	}
+}
+
+func TestReceiverReplaysExactSettlementAfterInvalidSemanticAcknowledgement(t *testing.T) {
+	const marker = "managed-settlement-marker"
+	var receiveCalls int32
+	var completeCalls int32
+	var requestMu sync.Mutex
+	var completeBodies []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case wire.PathReceive:
+			if atomic.AddInt32(&receiveCalls, 1) == 1 {
+				_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":7,"lock_token":"lock-7","locked_until_ms":%d}]}`, time.Now().Add(time.Minute).UnixMilli())
+				return
+			}
+			<-request.Context().Done()
+		case wire.PathComplete:
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Errorf("read Complete request: %v", err)
+				return
+			}
+			requestMu.Lock()
+			completeBodies = append(completeBodies, string(body))
+			requestMu.Unlock()
+			if atomic.AddInt32(&completeCalls, 1) == 1 {
+				_, _ = io.WriteString(w, `{"future":"`+marker+`"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		default:
+			http.Error(w, "unexpected route", http.StatusNotFound)
+		}
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	runCtx, cancel := context.WithCancel(context.Background())
+	var reportedMu sync.Mutex
+	var reported []error
+	err = client.Receiver("jobs", mqlite.WithConcurrency(1), mqlite.WithPrefetch(1), mqlite.WithErrorHandler(func(err error) {
+		reportedMu.Lock()
+		reported = append(reported, err)
+		reportedMu.Unlock()
+	})).Run(runCtx, func(context.Context, *mqlite.Message) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt32(&completeCalls); got != 2 {
+		t.Fatalf("Complete calls = %d, want exact replay", got)
+	}
+	requestMu.Lock()
+	bodies := append([]string(nil), completeBodies...)
+	requestMu.Unlock()
+	if len(bodies) != 2 || bodies[0] != bodies[1] {
+		t.Fatalf("Complete replay changed request: %q", bodies)
+	}
+	reportedMu.Lock()
+	errorsSeen := append([]error(nil), reported...)
+	reportedMu.Unlock()
+	if len(errorsSeen) != 0 {
+		t.Fatalf("recovered invalid acknowledgement was reported: %v", errorsSeen)
+	}
+}
+
+func TestRemoteSendInvalidSuccessIsOutcomeUnknown(t *testing.T) {
+	const marker = "untrusted-ack-marker"
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		call          func(*mqlite.Client) error
+	}{
+		{
+			name: "SendOne truncated JSON",
+			body: `{"seq_numbers":["` + marker,
+			call: func(client *mqlite.Client) error {
+				_, err := client.SendOne(context.Background(), "jobs", mqlite.OutMessage{Body: []byte("one")})
+				return err
+			},
+		},
+		{
+			name: "Send batch truncated JSON",
+			body: `{"seq_numbers":["` + marker,
+			call: func(client *mqlite.Client) error {
+				_, err := client.Send(context.Background(), "jobs",
+					mqlite.OutMessage{Body: []byte("one")},
+					mqlite.OutMessage{Body: []byte("two")})
+				return err
+			},
+		},
+		{
+			name:          "SendOne oversized acknowledgement",
+			body:          marker,
+			contentLength: 1 << 30,
+			call: func(client *mqlite.Client) error {
+				_, err := client.SendOne(context.Background(), "jobs", mqlite.OutMessage{Body: []byte("one")})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				if test.contentLength != 0 {
+					w.Header().Set("Content-Length", fmt.Sprint(test.contentLength))
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer stub.Close()
+
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			err = test.call(client)
+			if !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+				t.Fatalf("Send error = %v, want ErrOutcomeUnknown", err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("Send error reflected untrusted acknowledgement body: %v", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("Send made %d requests, want one", calls.Load())
 			}
 		})
 	}

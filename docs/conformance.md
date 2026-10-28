@@ -223,7 +223,9 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   the static admin console under `/ui` (when enabled — its own API calls still carry a
   token); a missing/invalid/expired/revoked token → 401 `unauthenticated`.
   *(server/errors_test.go, server/index_test.go, server/console_test.go)*
-- **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status:
+- **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status;
+  `not_found` may add the backward-compatible `resource` discriminator `queue` or
+  `subscription`:
   400 `invalid_argument`/`group_required` · 401 `unauthenticated` · 403
   `permission_denied` · 404 `not_found` · 409
   `already_exists`/`lock_lost`/`name_conflict`/`key_conflict`/

@@ -233,9 +233,27 @@ seq, _ := cli.SendOne(ctx, "orders", mqlite.OutMessage{Body: []byte("hi")})
 // hands-off consumer: nil -> Complete, error -> Abandon, auto lock renewal
 cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
     Run(ctx, func(ctx context.Context, m *mqlite.Message) error {
-        return process(m.Body) // MUST be idempotent (at-least-once)
+        return process(ctx, m.Body) // honor cancellation; MUST stay idempotent
     })
 ```
+
+The managed Receiver replays transient Receive calls with the same attempt ID and
+replays the exact Complete or Abandon request when its acknowledgement is lost.
+`WithConcurrency(C)` limits concurrently executing handlers. Renewal shutdown and
+settlement can overlap later handlers, but the Receiver bounds all claimed work to
+`C + effective prefetch` deliveries (at most `2C`, and `2C` by default).
+With auto-renew enabled, it retries a transient heartbeat while the known lease
+still has time. If the lock is lost or can no longer be confirmed, it cancels that
+message's handler context and skips terminal settlement; handlers must honor
+`ctx.Done()` and remain idempotent because delivery is still at-least-once.
+
+The remote client requires a complete semantic acknowledgement even when HTTP
+returns 2xx. An invalid acknowledgement for Send, Complete/Abandon/Reject/Defer
+(including batch settlement), Renew/RenewBatch, Cancel, or an at-most-once Receive returns
+`ErrOutcomeUnknown`: the broker may already have committed the operation, so do
+not retry blindly. Peek-Lock Receive is replayable instead—reuse the same
+`RecvOpts.Attempt` to recover the exact claimed batch; the managed Receiver does
+this automatically.
 
 Remote-only applications that need a lower source floor can use the official
 [MQLite Remote Client for Go](https://github.com/mqlitehq/mqlite-go), whose

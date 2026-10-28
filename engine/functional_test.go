@@ -14,6 +14,15 @@ import (
 	"time"
 )
 
+func TestQueueNotFoundIsGeneralNotFound(t *testing.T) {
+	if !errors.Is(ErrQueueNotFound, ErrQueueNotFound) {
+		t.Fatal("ErrQueueNotFound must match itself")
+	}
+	if !errors.Is(ErrQueueNotFound, ErrNotFound) {
+		t.Fatal("ErrQueueNotFound must also match the general ErrNotFound category")
+	}
+}
+
 // Every application-set field survives a send -> receive round-trip.
 func TestAllFieldsRoundTrip(t *testing.T) {
 	ctx := context.Background()

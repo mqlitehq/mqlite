@@ -19,6 +19,13 @@ values replace earlier ones, while repeated object and map values may merge.
 
 - **Transport:** HTTP `POST`, `Content-Type: application/json`. Discovery and
   health use open `GET` endpoints; opt-in metrics uses authenticated `GET` on the same port.
+- **Go SDK transport:** RPC clients never follow HTTP redirects. The default
+  client keeps up to 64 idle connections per broker for concurrent receivers and
+  releases its own idle connections on `Client.Close`. A client passed through
+  `WithHTTPClient` remains caller-owned; MQLite preserves its transport and timeout
+  but still disables redirects for RPCs. Size a custom transport's
+  `MaxIdleConnsPerHost` to at least Receiver concurrency plus effective prefetch
+  (the managed pipeline's maximum network work in flight).
 - **`body`** is **base64** in JSON (Go marshals `[]byte` as base64).
 - **Timestamps** are **epoch milliseconds** (UTC) integers. Message durations use
   `*_ms`; observability durations explicitly named `*_seconds` retain fractional seconds.
@@ -433,6 +440,11 @@ a Complete-per-message N+1 (the cheap path for draining).
   for a stale/expired lock on that item (not fatal to the batch). Each item is fenced +
   idempotent exactly like `Complete`.
 
+The Go SDK requires exactly one result per requested message in the same order,
+with no renewal deadline on a completion result. A malformed successful
+acknowledgement returns `ErrOutcomeUnknown`, because some completions may already
+have committed.
+
 ### RenewBatch
 
 Extend the lock lease of a whole received batch in **one round-trip**.
@@ -456,6 +468,10 @@ really held.) Like single-message Renew, the batch operation leaves token, state
 `delivery_count` unchanged and commits the later of the existing deadline and the
 broker's fresh `now + lock_duration` candidate (capped by a fixed subscription
 lifetime).
+
+The Go SDK requires exactly one ordered result per request item. A successful
+renewal must have a positive `locked_until_ms`; a failed renewal must not claim a
+deadline. Malformed renewal results are rejected rather than treated as renewed.
 
 > **Why 512?** Renewal is a claim about the *future* ("this lease is live"), and that claim is
 > only keepable within a single statement: across several, the first batch's lease can expire —
@@ -908,7 +924,9 @@ collision?**
 
 ## Errors
 
-Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP status:
+Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP
+status. A `not_found` response may add an optional `resource` discriminator
+(`"queue"` or `"subscription"`); older clients safely ignore this additive field:
 
 | HTTP | `code` | When |
 |---|---|---|
@@ -916,7 +934,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 400 | `group_required` | a `group_fifo` send with no `group_id` |
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
 | 403 | `permission_denied` | a valid key lacks permission, or key management was attempted with auth disabled (`mqlite.ErrPermissionDenied`) |
-| 404 | `not_found` | the queue, exact topic/subscription pair, or message doesn't exist; or an unknown path |
+| 404 | `not_found` | the queue, exact topic/subscription pair, or message doesn't exist; or an unknown path. Missing queues and subscriptions include the corresponding `resource` when the broker can identify it. |
 | 409 | `already_exists` | single-message dedup conflict (same id, different body) |
 | 409 | `name_conflict` | a queue/subscription/topic name collision at creation time, including a name reserved by a deleting queue — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
 | 409 | `key_conflict` | a managed key ID or token digest is already registered (`mqlite.ErrKeyConflict`); no existing secret is returned |
@@ -939,3 +957,15 @@ The Go SDK re-exports sentinel errors such as `mqlite.ErrLockLost`,
 works in both embedded and client mode. An accepted queue or subscription
 deletion is a successful operation even when its typed HTTP result is
 `state:"deleting"`.
+
+With a resource-aware broker, a missing queue matches both
+`mqlite.ErrQueueNotFound` and the broader `mqlite.ErrNotFound`; this is the same
+hierarchy as embedded mode. A new client connected to an older broker receives
+the legacy envelope without `resource` and can only match `ErrNotFound`.
+
+The Go SDK bounds ordinary successful response bodies at 64 MiB and error bodies
+at 64 KiB. Outside lifecycle deletion's explicit `ErrOutcomeUnknown` cases, a
+non-2xx response is available through `errors.As` as `*mqlite.HTTPError`; its
+`StatusCode` and `HTTPStatus()` retain the HTTP status even when an intermediary
+returned no JSON error code. Redirect errors report only the status and never copy
+the untrusted `Location` value into the error.

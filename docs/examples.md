@@ -151,17 +151,25 @@ func main() {
 	}
 
 	// nil -> Complete; error -> Abandon (retry below max; DLQ at max).
-	// Auto-renew the lock; keep up to 4 messages in flight.
+	// Auto-renew the lock; run up to 4 handlers concurrently.
 	err = cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
 		Run(ctx, func(ctx context.Context, m *mqlite.Message) error {
-			return process(m.Body) // MUST be idempotent (at-least-once)
+			return process(ctx, m.Body) // honor cancellation; MUST stay idempotent
 		})
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func process(body []byte) error { log.Printf("got: %s", body); return nil }
+func process(ctx context.Context, body []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		log.Printf("got: %s", body)
+		return nil
+	}
+}
 ```
 
 `WithAutoRenew` keeps the current delivery attempt alive; it does not spend another
@@ -169,8 +177,13 @@ func process(body []byte) error { log.Printf("got: %s", body); return nil }
 deadline and the broker's fresh `now + lock_duration` candidate (capped at a fixed
 subscription expiry), rather than adding a duration to the old deadline. It must
 arrive before the current lease expires and it cannot extend message TTL or a fixed
-subscription lifetime. Renewal or its response can still fail late, so the handler
-remains idempotent: another consumer may receive the message after the lease is lost.
+subscription lifetime. The Receiver retries transient renewal failures while the
+known lease still leaves time. If renewal is rejected or cannot be confirmed before
+that deadline, it cancels the individual handler context and skips Complete/Abandon
+for that stale delivery. The handler must honor `ctx.Done()` and remain idempotent:
+another consumer may receive the message after the lease is lost. Exact Complete and
+Abandon requests are also replayed within a five-second settlement window when an
+acknowledgement is lost; the broker's settlement receipt makes that replay safe.
 
 ## 4. Topic subscription lifecycle
 

@@ -2,6 +2,16 @@ package engine
 
 import "errors"
 
+// queueNotFoundError is both the queue-specific category and a subtype of the
+// general not-found category. This keeps embedded and remote clients portable:
+// callers that only care about absence can check ErrNotFound, while queue-aware
+// callers retain the more precise ErrQueueNotFound match.
+type queueNotFoundError struct{}
+
+func (queueNotFoundError) Error() string { return "mqlite: queue not found" }
+
+func (queueNotFoundError) Is(target error) bool { return target == ErrNotFound }
+
 // State is the lifecycle state of a message (design §6).
 type State string
 
@@ -39,14 +49,14 @@ const (
 
 // Sentinel errors. The server maps these onto Connect/HTTP error codes.
 var (
-	ErrQueueNotFound    = errors.New("mqlite: queue not found")
+	ErrNotFound         = errors.New("mqlite: not found")
+	ErrQueueNotFound    = error(queueNotFoundError{})
 	ErrLockLost         = errors.New("mqlite: lock lost or already settled")
 	ErrUnauthenticated  = errors.New("mqlite: unauthenticated (bad or missing token)")
 	ErrPermissionDenied = errors.New("mqlite: permission denied")
 	ErrKeyConflict      = errors.New("mqlite: access key id already exists")
 	ErrOutcomeUnknown   = errors.New("mqlite: operation outcome unknown (the acknowledgement was lost or invalid; reconcile the operation's state before retrying)")
 	ErrDedupConflict    = errors.New("mqlite: dedup conflict (same id, different body)")
-	ErrNotFound         = errors.New("mqlite: not found")
 	// ErrUnsupported: the BROKER does not serve this operation — an older broker that predates
 	// it. Distinct from ErrNotFound ("the queue/message does not exist"), which the same broker
 	// answers with a 404 too. A client can use it to fall back to an older equivalent.

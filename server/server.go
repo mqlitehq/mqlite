@@ -472,13 +472,17 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	writeResourceErr(w, status, code, msg, "")
+}
+
+func writeResourceErr(w http.ResponseWriter, status int, code, msg, resource string) {
 	if rec, ok := w.(*statusRecorder); ok {
 		rec.code = code
 	}
 	logf(w, "code", code)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: code, Message: msg})
+	_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: code, Message: msg, Resource: resource})
 }
 
 // mapErr translates engine errors to a Connect-style (status, code) error.
@@ -490,7 +494,11 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusForbidden, "permission_denied", "access key lacks the required permission")
 	case errors.Is(err, engine.ErrKeyConflict):
 		writeErr(w, http.StatusConflict, "key_conflict", err.Error())
-	case errors.Is(err, engine.ErrSubscriptionNotFound), errors.Is(err, engine.ErrQueueNotFound), errors.Is(err, engine.ErrNotFound):
+	case errors.Is(err, engine.ErrSubscriptionNotFound):
+		writeResourceErr(w, http.StatusNotFound, "not_found", err.Error(), "subscription")
+	case errors.Is(err, engine.ErrQueueNotFound):
+		writeResourceErr(w, http.StatusNotFound, "not_found", err.Error(), "queue")
+	case errors.Is(err, engine.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, engine.ErrDedupConflict):
 		writeErr(w, http.StatusConflict, "already_exists", err.Error())

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,17 +40,26 @@ func TestOlderThanMs(t *testing.T) {
 // fakeSource is a receiveSource that records the attempt id of every receiveOne
 // call and can fail the first failN calls, to exercise the Receiver's same-id retry.
 type fakeSource struct {
-	mu                sync.Mutex
-	attempts          []string
-	calls             int
-	failN             int
-	batch             []*Message
-	recvErr           error // if set, receiveOne always returns this (permanent-error test)
-	recvErrAfterBatch error // if set, the receive AFTER the batch returns this instead of quiescing
-	abandonErr        error
-	renewErr          error
-	completeErr       error // if set, complete returns this (settle-error test)
-	unlimited         bool  // if set, every receiveOne returns a fresh single-message batch
+	mu                 sync.Mutex
+	attempts           []string
+	calls              int
+	completeCalls      int
+	abandonCalls       int
+	renewCalls         int
+	deadlineRenewCalls int
+	failN              int
+	batch              []*Message
+	recvErr            error // if set, receiveOne always returns this (permanent-error test)
+	recvErrAfterBatch  error // if set, the receive AFTER the batch returns this instead of quiescing
+	abandonErr         error
+	renewErr           error
+	completeErr        error // if set, complete returns this (settle-error test)
+	unlimited          bool  // if set, every receiveOne returns a fresh single-message batch
+	completeFn         func(context.Context) error
+	abandonFn          func(context.Context) error
+	renewFn            func(context.Context) error
+	renewDeadlineFn    func(context.Context) (time.Time, error)
+	receiveFn          func(context.Context, int, string) ([]*Message, error)
 }
 
 func (f *fakeSource) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
@@ -56,12 +67,16 @@ func (f *fakeSource) receiveOne(ctx context.Context, queue string, max int, wait
 	f.calls++
 	n := f.calls
 	f.attempts = append(f.attempts, attemptID)
+	fn := f.receiveFn
 	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, n, attemptID)
+	}
 	switch {
 	case f.recvErr != nil:
 		return nil, f.recvErr
 	case f.unlimited:
-		return []*Message{{SequenceNumber: int64(n), Body: []byte("x"), queue: queue, s: f}}, nil
+		return []*Message{{SequenceNumber: int64(n), Body: []byte("x"), LockedUntil: time.Now().Add(30 * time.Second), queue: queue, s: f}}, nil
 	case n <= f.failN:
 		return nil, errors.New("simulated transient receive error")
 	case n == f.failN+1:
@@ -76,10 +91,24 @@ func (f *fakeSource) receiveOne(ctx context.Context, queue string, max int, wait
 }
 
 func (f *fakeSource) complete(ctx context.Context, queue string, seq int64, token string) error {
-	return f.completeErr
+	f.mu.Lock()
+	f.completeCalls++
+	fn, err := f.completeFn, f.completeErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return err
 }
 func (f *fakeSource) abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
-	return f.abandonErr
+	f.mu.Lock()
+	f.abandonCalls++
+	fn, err := f.abandonFn, f.abandonErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return err
 }
 func (f *fakeSource) reject(ctx context.Context, queue string, seq int64, token, reason, desc string) error {
 	return nil
@@ -88,7 +117,29 @@ func (f *fakeSource) deferMsg(ctx context.Context, queue string, seq int64, toke
 	return nil
 }
 func (f *fakeSource) renew(ctx context.Context, queue string, seq int64, token string) error {
-	return f.renewErr
+	f.mu.Lock()
+	f.renewCalls++
+	fn, err := f.renewFn, f.renewErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return err
+}
+
+// renewDeadline is the managed Receiver's optional renewal path. Production
+// clients can use a response carrying the deadline actually committed by the
+// broker while Message.Renew keeps its legacy error-only public signature.
+func (f *fakeSource) renewDeadline(ctx context.Context, queue string, seq int64, token string) (time.Time, error) {
+	f.mu.Lock()
+	f.renewCalls++
+	f.deadlineRenewCalls++
+	fn, err := f.renewDeadlineFn, f.renewErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return time.Time{}, err
 }
 
 // MQLITE-8: a transient receive error must be retried ONCE with the SAME attempt
@@ -96,7 +147,7 @@ func (f *fakeSource) renew(ctx context.Context, queue string, seq int64, token s
 // of claiming new messages (no double-delivery).
 func TestReceiverRetriesWithSameAttemptID(t *testing.T) {
 	f := &fakeSource{failN: 1}
-	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
+	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
 
 	// Generous deadline: the receiver only needs one 500ms retry backoff, but a
 	// loaded CI runner under -race can starve the goroutine well past a few seconds.
@@ -163,7 +214,7 @@ func TestReceiverPermanentReceiveErrorReturns(t *testing.T) {
 // Run and reach the error handler, rather than being silently dropped.
 func TestReceiverPermanentSettleErrorStopsRun(t *testing.T) {
 	f := &fakeSource{completeErr: ErrUnauthenticated}
-	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
+	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
 	var mu sync.Mutex
 	var observed error
 	r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(e error) {
@@ -211,11 +262,312 @@ func TestReceiverReservesCapacityBeforeClaim(t *testing.T) {
 	}
 }
 
+// Settlement may overlap the next handler, but the Receiver must keep the
+// combined handler-plus-settlement population bounded. With concurrency one,
+// two blocked settlements fill the 2C total-inflight budget: the second handler
+// must already have run, while a third Receive must not start.
+func TestReceiverOverlapsSettlementWithNextHandlerWithinBound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	releaseSettles := make(chan struct{})
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cancel()
+		cleanupOnce.Do(func() { close(releaseSettles) })
+	}
+	defer cleanup()
+
+	f := &fakeSource{}
+	thirdReceive := make(chan struct{})
+	var thirdOnce sync.Once
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		if call <= 2 {
+			return []*Message{{SequenceNumber: int64(call), LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}, nil
+		}
+		thirdOnce.Do(func() { close(thirdReceive) })
+		<-callCtx.Done()
+		return nil, callCtx.Err()
+	}
+	settlesStarted := make(chan struct{}, 2)
+	f.completeFn = func(settleCtx context.Context) error {
+		settlesStarted <- struct{}{}
+		select {
+		case <-releaseSettles:
+			return nil
+		case <-settleCtx.Done():
+			return settleCtx.Err()
+		}
+	}
+	handlersStarted := make(chan int64, 2)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- newReceiver(f, "q", []ReceiverOption{WithConcurrency(1)}).
+			Run(ctx, func(_ context.Context, message *Message) error {
+				handlersStarted <- message.SequenceNumber
+				return nil
+			})
+	}()
+
+	fail := func(format string, args ...any) {
+		cleanup()
+		select {
+		case <-runDone:
+		case <-time.After(time.Second):
+		}
+		t.Fatalf(format, args...)
+	}
+	waitHandler := func(want int64) {
+		t.Helper()
+		select {
+		case got := <-handlersStarted:
+			if got != want {
+				fail("handler sequence = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			fail("handler %d did not start while the prior settlement was blocked", want)
+		}
+	}
+	waitSettle := func(number int) {
+		t.Helper()
+		select {
+		case <-settlesStarted:
+		case <-time.After(time.Second):
+			fail("settlement %d did not start", number)
+		}
+	}
+
+	waitHandler(1)
+	waitSettle(1)
+	waitHandler(2)
+	waitSettle(2)
+	select {
+	case <-thirdReceive:
+		fail("a third Receive started while the 2C total-inflight budget was full")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Race shutdown with the two settlements releasing total capacity. Even if
+	// capacity wins reservePaired's select, Run must re-check cancellation before
+	// issuing a third Receive, release both reservations, and join the workers.
+	cancel()
+	cleanupOnce.Do(func() { close(releaseSettles) })
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not join settlements after release")
+	}
+	f.mu.Lock()
+	receives := f.calls
+	f.mu.Unlock()
+	if receives != 2 {
+		t.Fatalf("receive calls = %d, want two within the 2C bound", receives)
+	}
+}
+
+// A transport can race cancellation and still decode a successful batch. Once
+// Run is canceled, that batch must be dropped and both reservations released;
+// user code must never be entered with a delivery claimed after shutdown.
+func TestReceiverDropsBatchReturnedAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	receiveStarted := make(chan struct{})
+	f := &fakeSource{}
+	f.receiveFn = func(callCtx context.Context, _ int, _ string) ([]*Message, error) {
+		close(receiveStarted)
+		<-callCtx.Done()
+		return []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}, nil
+	}
+	handlerCalled := make(chan struct{}, 1)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- newReceiver(f, "q", nil).Run(ctx, func(context.Context, *Message) error {
+			handlerCalled <- struct{}{}
+			return nil
+		})
+	}()
+	<-receiveStarted
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run hung while dropping a post-cancellation batch")
+	}
+	select {
+	case <-handlerCalled:
+		t.Fatal("handler ran for a batch returned after cancellation")
+	default:
+	}
+}
+
+// A small prefetch tightens the total pipeline bound rather than always using
+// 2C. With C=2 and prefetch=1, three blocked settlements fill C+batch and a
+// fourth Receive must wait.
+func TestReceiverSmallPrefetchTightensTotalInflightBound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	releaseSettles := make(chan struct{})
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cancel()
+		cleanupOnce.Do(func() { close(releaseSettles) })
+	}
+	defer cleanup()
+
+	f := &fakeSource{}
+	fourthReceive := make(chan struct{})
+	var fourthOnce sync.Once
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		if call <= 3 {
+			return []*Message{{SequenceNumber: int64(call), LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}, nil
+		}
+		fourthOnce.Do(func() { close(fourthReceive) })
+		<-callCtx.Done()
+		return nil, callCtx.Err()
+	}
+	settlesStarted := make(chan struct{}, 3)
+	f.completeFn = func(settleCtx context.Context) error {
+		settlesStarted <- struct{}{}
+		select {
+		case <-releaseSettles:
+			return nil
+		case <-settleCtx.Done():
+			return settleCtx.Err()
+		}
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- newReceiver(f, "q", []ReceiverOption{WithConcurrency(2), WithPrefetch(1)}).
+			Run(ctx, func(context.Context, *Message) error { return nil })
+	}()
+
+	for settlement := 1; settlement <= 3; settlement++ {
+		select {
+		case <-settlesStarted:
+		case <-time.After(time.Second):
+			cleanup()
+			t.Fatalf("settlement %d did not start", settlement)
+		}
+	}
+	select {
+	case <-fourthReceive:
+		cleanup()
+		t.Fatal("a fourth Receive exceeded the C+prefetch total-inflight bound")
+	case <-time.After(150 * time.Millisecond):
+	}
+	cancel()
+	cleanupOnce.Do(func() { close(releaseSettles) })
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not join the bounded settlement pipeline")
+	}
+	f.mu.Lock()
+	receives := f.calls
+	f.mu.Unlock()
+	if receives != 3 {
+		t.Fatalf("receive calls = %d, want C+prefetch = 3", receives)
+	}
+}
+
+func TestReceiverGoexitJoinsAutoRenewBeforeReleasingPipelineSlots(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	renewStarted := make(chan struct{})
+	renewCanceled := make(chan struct{})
+	allowRenewExit := make(chan struct{})
+	renewExited := make(chan struct{})
+	var renewOnce sync.Once
+	f := &fakeSource{}
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		switch call {
+		case 1:
+			return []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(40 * time.Millisecond), queue: "q", s: f}}, nil
+		case 2:
+			return []*Message{{SequenceNumber: 2, LockedUntil: time.Now().Add(time.Hour), queue: "q", s: f}}, nil
+		default:
+			<-callCtx.Done()
+			return nil, callCtx.Err()
+		}
+	}
+	f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
+		renewOnce.Do(func() { close(renewStarted) })
+		<-renewCtx.Done()
+		close(renewCanceled)
+		<-allowRenewExit
+		close(renewExited)
+		return time.Time{}, renewCtx.Err()
+	}
+	secondStarted := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- newReceiver(f, "q", []ReceiverOption{WithConcurrency(1), WithAutoRenew()}).
+			Run(ctx, func(_ context.Context, message *Message) error {
+				if message.SequenceNumber == 1 {
+					select {
+					case <-renewStarted:
+					case <-time.After(2 * time.Second):
+						cancel()
+						return errors.New("renew did not start")
+					}
+					runtime.Goexit()
+				}
+				close(secondStarted)
+				cancel()
+				return nil
+			})
+	}()
+	select {
+	case <-renewCanceled:
+	case <-time.After(2 * time.Second):
+		cancel()
+		close(allowRenewExit)
+		<-runDone
+		t.Fatal("handler Goexit did not cancel auto-renew")
+	}
+	select {
+	case <-secondStarted:
+		cancel()
+		close(allowRenewExit)
+		<-runDone
+		t.Fatal("handler Goexit released pipeline capacity before auto-renew joined")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(allowRenewExit)
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-runDone
+		t.Fatal("pipeline did not continue after auto-renew exited")
+	}
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	select {
+	case <-renewExited:
+	default:
+		t.Fatal("Run returned before Goexit auto-renew joined")
+	}
+	f.mu.Lock()
+	renews, completes := f.renewCalls, f.completeCalls
+	f.mu.Unlock()
+	if renews != 1 || completes != 1 {
+		t.Fatalf("renew/complete calls = %d/%d, want 1/1", renews, completes)
+	}
+}
+
 // MQLITE-77: an expected ErrLockLost on settle (the message was redelivered) is NOT fatal —
 // the loop keeps consuming and Run ends only on ctx cancellation — but it is still observed.
 func TestReceiverLockLostSettleIsNotFatal(t *testing.T) {
 	f := &fakeSource{completeErr: ErrLockLost}
-	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
+	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
 	var mu sync.Mutex
 	var observed error
 	r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(e error) {
@@ -234,13 +586,16 @@ func TestReceiverLockLostSettleIsNotFatal(t *testing.T) {
 	if !errors.Is(observed, ErrLockLost) {
 		t.Fatalf("observer should still see the lost-lock settle error, got %v", observed)
 	}
+	if f.completeCalls != 1 {
+		t.Fatalf("lock_lost settlement calls = %d, want one without retry", f.completeCalls)
+	}
 }
 
 // A clean shutdown (ctx cancelled) still ends Run with ctx.Err(), never a spurious fatal —
 // the contract this change is careful to preserve.
 func TestReceiverGracefulShutdownReturnsCtxErr(t *testing.T) {
 	f := &fakeSource{}
-	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q", s: f}}
+	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
 	r := newReceiver(f, "q", nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	handled := make(chan struct{}, 1)
@@ -274,6 +629,805 @@ func TestNewAttemptIDUnique(t *testing.T) {
 			t.Fatalf("attempt id collided: %s", id)
 		}
 		seen[id] = true
+	}
+}
+
+func TestReceiverBackoffGrowsCapsAndJitters(t *testing.T) {
+	want := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second}
+	for step, expected := range want {
+		if got := exponentialBackoff(receiveBackoffBase, receiveBackoffMax, step); got != expected {
+			t.Fatalf("backoff step %d = %s, want %s", step, got, expected)
+		}
+	}
+	for i := 0; i < 32; i++ {
+		got := jitterDuration(time.Second)
+		if got < 800*time.Millisecond || got > 1200*time.Millisecond {
+			t.Fatalf("jitter = %s, want within 800ms..1.2s", got)
+		}
+	}
+}
+
+func TestAutoRenewDelayUsesHalfOfShortLease(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+		tolerance time.Duration
+	}{
+		{name: "just over one second", remaining: 1010 * time.Millisecond, want: 505 * time.Millisecond, tolerance: 30 * time.Millisecond},
+		{name: "near boundary", remaining: 40 * time.Millisecond, want: 20 * time.Millisecond, tolerance: 10 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := autoRenewDelay(time.Now().Add(tc.remaining))
+			if got < tc.want-tc.tolerance || got > tc.want+tc.tolerance {
+				t.Fatalf("autoRenewDelay(%s) = %s, want %s ± %s", tc.remaining, got, tc.want, tc.tolerance)
+			}
+		})
+	}
+}
+
+func TestManagedRetryClassifiesHTTPStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   bool
+	}{
+		{307, false},
+		{400, false},
+		{408, true},
+		{429, true},
+		{500, true},
+		{503, true},
+	} {
+		err := &HTTPError{StatusCode: tc.status}
+		if got := retryableManagedError(err); got != tc.want {
+			t.Errorf("HTTP %d retryable = %v, want %v", tc.status, got, tc.want)
+		}
+	}
+	if !retryableManagedError(errors.New("connection reset")) {
+		t.Error("transport failure must remain retryable")
+	}
+	if !retryableManagedError(context.DeadlineExceeded) {
+		t.Error("request timeout must remain retryable while the controlling context is live")
+	}
+	if err := (&HTTPError{StatusCode: 503, cause: ErrPermissionDenied}); !retryableManagedError(err) {
+		t.Error("HTTP 503 must be retryable even when an untrusted body maps to permission_denied")
+	}
+	if err := (&HTTPError{StatusCode: 400, cause: errors.New("mqlite: internal")}); retryableManagedError(err) {
+		t.Error("HTTP 400 must not be retryable even when its body claims an internal error")
+	}
+}
+
+func TestSettlementExhaustionPreservesHTTPStatusClassification(t *testing.T) {
+	r := newReceiver(nil, "q", nil)
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantFatal bool
+	}{
+		{name: "503 overrides permission body", err: &HTTPError{StatusCode: 503, cause: ErrPermissionDenied}},
+		{name: "403 permission is fatal", err: &HTTPError{StatusCode: 403, cause: ErrPermissionDenied}, wantFatal: true},
+		{name: "embedded permission is fatal", err: ErrPermissionDenied, wantFatal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fatal := false
+			r.settleErr(tc.err, func() bool { return false }, func(error, bool) { fatal = true })
+			if fatal != tc.wantFatal {
+				t.Fatalf("fatal = %v, want %v for %v", fatal, tc.wantFatal, tc.err)
+			}
+		})
+	}
+}
+
+func TestReceiverReturnsNonRetryableHTTPError(t *testing.T) {
+	httpErr := &HTTPError{StatusCode: 307}
+	f := &fakeSource{recvErr: httpErr}
+	var observed error
+	err := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(err error) { observed = err })}).
+		Run(context.Background(), func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, httpErr) || !errors.Is(observed, httpErr) {
+		t.Fatalf("Run/observed = %v/%v, want HTTP redirect error", err, observed)
+	}
+	f.mu.Lock()
+	calls := f.calls
+	f.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("non-retryable HTTP receive calls = %d, want one", calls)
+	}
+}
+
+func TestReceiverCachesUnsupportedDeadlineRenewal(t *testing.T) {
+	f := &fakeSource{}
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+		return time.Time{}, ErrUnsupported
+	}
+	m := &Message{SequenceNumber: 1, queue: "q", lockToken: "token", s: f}
+	r := newReceiver(f, "q", nil)
+	for i := 0; i < 2; i++ {
+		if _, err := r.renewMessage(context.Background(), m); err != nil {
+			t.Fatalf("renew %d: %v", i+1, err)
+		}
+	}
+	f.mu.Lock()
+	deadlineCalls, allCalls := f.deadlineRenewCalls, f.renewCalls
+	f.mu.Unlock()
+	if deadlineCalls != 1 || allCalls != 3 {
+		t.Fatalf("deadline/all renew calls = %d/%d, want 1/3", deadlineCalls, allCalls)
+	}
+}
+
+func TestEmbeddedReceiverUsesCommittedRenewDeadline(t *testing.T) {
+	now := int64(1_800_000_000_000)
+	ctx := context.Background()
+	embedded, err := OpenEmbedded(ctx, ":memory:", WithClock(func() int64 { return now }), WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	if err := embedded.CreateQueue(ctx, "q", QueueConfig{LockDuration: 2 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := embedded.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := embedded.Receive(ctx, "q")
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("Receive = %d messages, %v", len(messages), err)
+	}
+	original := messages[0].LockedUntil
+	now += 500
+	receiver := embedded.Receiver("q")
+	deadline, err := receiver.renewMessage(ctx, messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.UnixMilli(now + 2000)
+	if !deadline.Equal(want) || !deadline.After(original) {
+		t.Fatalf("committed deadline = %v, want %v after original %v", deadline, want, original)
+	}
+	if err := messages[0].Complete(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Settlement receipts make an exact Complete or Abandon replay safe. The managed
+// Receiver must replay a transiently failed settlement before reporting it.
+func TestReceiverRetriesIdempotentSettlement(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
+			var attempts int
+			settle := func(context.Context) error {
+				attempts++
+				if attempts == 1 {
+					return context.DeadlineExceeded
+				}
+				cancel()
+				return nil
+			}
+			if operation == "complete" {
+				f.completeFn = settle
+			} else {
+				f.abandonFn = settle
+			}
+			var observed int
+			r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(error) {
+				observed++
+				cancel() // makes the old one-shot implementation fail promptly
+			})})
+			err := r.Run(ctx, func(context.Context, *Message) error {
+				if operation == "abandon" {
+					return errors.New("handler failed")
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run = %v, want context.Canceled after successful replay", err)
+			}
+			if attempts != 2 || observed != 0 {
+				t.Fatalf("%s attempts=%d observed=%d, want 2/0", operation, attempts, observed)
+			}
+		})
+	}
+}
+
+// A short outage must not permanently disable auto-renewal while the original
+// lease still leaves time for a safe retry.
+func TestReceiverRenewRecoversWithinLease(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		firstErr error
+	}{
+		{name: "transport timeout", firstErr: context.DeadlineExceeded},
+		{name: "invalid successful acknowledgement", firstErr: &ambiguousAcknowledgementError{
+			operation: "RenewBatch",
+			cause:     &invalidSuccessResponseError{cause: errors.New("missing required ok")},
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			recovered := make(chan struct{})
+			f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+				f.mu.Lock()
+				calls := f.renewCalls
+				f.mu.Unlock()
+				if calls == 1 {
+					return time.Time{}, testCase.firstErr
+				}
+				if calls == 2 {
+					close(recovered)
+				}
+				return time.Now().Add(4 * time.Second), nil
+			}
+			f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(1300 * time.Millisecond), queue: "q", s: f}}
+			var observed int
+			r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(error) {
+				observed++
+				cancel() // the old implementation reports and stops after failure one
+			})})
+			err := r.Run(ctx, func(hctx context.Context, _ *Message) error {
+				select {
+				case <-recovered:
+					cancel()
+					return nil
+				case <-hctx.Done():
+					return hctx.Err()
+				}
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run = %v, want context.Canceled", err)
+			}
+			f.mu.Lock()
+			renews := f.renewCalls
+			f.mu.Unlock()
+			if renews != 2 || observed != 0 {
+				t.Fatalf("renew calls=%d observed=%d, want 2/0", renews, observed)
+			}
+		})
+	}
+}
+
+// Exhausting the known lease cancels only this message, reports one ErrLockLost,
+// and skips a terminal settle that can no longer be authoritative.
+func TestReceiverRenewExhaustionCancelsOnlyMessage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	f := &fakeSource{renewErr: errors.New("renew transport unavailable"), renewDeadlineFn: func(context.Context) (time.Time, error) {
+		return time.Time{}, errors.New("renew transport unavailable")
+	}}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(1300 * time.Millisecond), queue: "q", s: f}}
+	var observed []error
+	r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		if errors.Is(err, ErrLockLost) {
+			cancel()
+		}
+	})})
+	handlerCanceled := make(chan struct{})
+	err := r.Run(ctx, func(hctx context.Context, _ *Message) error {
+		<-hctx.Done()
+		close(handlerCanceled)
+		return hctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation after lock loss", err)
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("lock loss did not cancel the per-message handler context")
+	}
+	if len(observed) != 1 || !errors.Is(observed[0], ErrLockLost) {
+		t.Fatalf("observed errors = %v, want one ErrLockLost", observed)
+	}
+	f.mu.Lock()
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if completeCalls != 0 || abandonCalls != 0 {
+		t.Fatalf("settlement after lost renewal: complete=%d abandon=%d, want 0/0", completeCalls, abandonCalls)
+	}
+}
+
+// A deadline-bearing renew response is authoritative. If it is already expired
+// when received, do not invent a fresh local lease from the previous duration.
+func TestReceiverRejectsExpiredCommittedRenewDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f := &fakeSource{renewDeadlineFn: func(context.Context) (time.Time, error) {
+		return time.Now().Add(-time.Second), nil
+	}}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(200 * time.Millisecond), queue: "q", s: f}}
+	var observed []error
+	r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		if errors.Is(err, ErrLockLost) {
+			cancel()
+		}
+	})})
+	handlerCanceled := make(chan struct{})
+	err := r.Run(ctx, func(hctx context.Context, _ *Message) error {
+		<-hctx.Done()
+		close(handlerCanceled)
+		return hctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation after unusable committed deadline", err)
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("unusable committed deadline did not cancel the handler")
+	}
+	if len(observed) != 1 || !errors.Is(observed[0], ErrLockLost) {
+		t.Fatalf("observed errors = %v, want one ErrLockLost", observed)
+	}
+	f.mu.Lock()
+	renews, completeCalls, abandonCalls := f.renewCalls, f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if renews != 1 || completeCalls != 0 || abandonCalls != 0 {
+		t.Fatalf("calls renew/complete/abandon = %d/%d/%d, want 1/0/0", renews, completeCalls, abandonCalls)
+	}
+}
+
+// Complete must wait until an in-flight Renew has observed cancellation and
+// exited, avoiding a false post-completion lock_lost report.
+func TestReceiverJoinsRenewBeforeSettlement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	renewStarted := make(chan struct{})
+	renewExited := make(chan struct{})
+	var once sync.Once
+	f := &fakeSource{}
+	renew := func(ctx context.Context) error {
+		once.Do(func() { close(renewStarted) })
+		<-ctx.Done()
+		close(renewExited)
+		return ctx.Err()
+	}
+	f.renewFn = renew
+	f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) { return time.Time{}, renew(ctx) }
+	settledBeforeJoin := false
+	f.completeFn = func(context.Context) error {
+		select {
+		case <-renewExited:
+		default:
+			settledBeforeJoin = true
+		}
+		cancel()
+		return nil
+	}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(1300 * time.Millisecond), queue: "q", s: f}}
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew()}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		select {
+		case <-renewStarted:
+			return nil
+		case <-hctx.Done():
+			return hctx.Err()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if settledBeforeJoin {
+		t.Fatal("Complete started before the in-flight Renew exited")
+	}
+}
+
+// A successful renewal reschedules from the committed deadline, not the stale
+// interval calculated from the original Receive response.
+func TestReceiverRenewReschedulesFromCommittedDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	firstRenew := make(chan struct{})
+	secondRenew := make(chan struct{})
+	f := &fakeSource{}
+	recordRenew := func() time.Time {
+		f.mu.Lock()
+		calls := f.renewCalls
+		f.mu.Unlock()
+		switch calls {
+		case 1:
+			close(firstRenew)
+		case 2:
+			close(secondRenew)
+		}
+		return time.Now().Add(4 * time.Second)
+	}
+	f.renewFn = func(context.Context) error { recordRenew(); return nil }
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) { return recordRenew(), nil }
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(1300 * time.Millisecond), queue: "q", s: f}}
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew()}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		select {
+		case <-firstRenew:
+		case <-hctx.Done():
+			return hctx.Err()
+		}
+		timer := time.NewTimer(1200 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-secondRenew:
+			cancel()
+			return errors.New("renewal kept the stale one-second ticker")
+		case <-timer.C:
+			cancel()
+			return nil
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	f.mu.Lock()
+	renews := f.renewCalls
+	f.mu.Unlock()
+	if renews != 1 {
+		t.Fatalf("renew calls = %d, want one before handler return", renews)
+	}
+}
+
+// More than two lost Receive responses still replay the exact same broker claim:
+// the idempotency key survives every backoff.
+func TestReceiverKeepsAttemptIDAcrossBackoff(t *testing.T) {
+	f := &fakeSource{failN: 3}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	err := newReceiver(f, "q", nil).Run(ctx, func(context.Context, *Message) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	f.mu.Lock()
+	attempts := append([]string(nil), f.attempts...)
+	f.mu.Unlock()
+	if len(attempts) < 4 {
+		t.Fatalf("receive calls = %d, want at least four", len(attempts))
+	}
+	for i := 1; i < 4; i++ {
+		if attempts[i] != attempts[0] {
+			t.Fatalf("attempt changed across backoff: %q then %q at call %d", attempts[0], attempts[i], i+1)
+		}
+	}
+}
+
+// A replay can arrive after its original lease expired. It must not enter user
+// code; the Receiver starts a fresh receive round instead.
+func TestReceiverDropsExpiredAttemptReplay(t *testing.T) {
+	testReceiverDropsStaleAttemptReplay(t, time.Now().Add(-time.Second))
+}
+
+func TestReceiverDropsZeroDeadlineAttemptReplay(t *testing.T) {
+	testReceiverDropsStaleAttemptReplay(t, time.Time{})
+}
+
+func TestReceiverDropsZeroDeadlineOnFirstSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		switch call {
+		case 1:
+			return []*Message{{SequenceNumber: 1, queue: "q", s: f}}, nil
+		case 2:
+			return []*Message{{SequenceNumber: 2, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}, nil
+		default:
+			<-callCtx.Done()
+			return nil, callCtx.Err()
+		}
+	}
+	var handled []int64
+	err := newReceiver(f, "q", nil).Run(ctx, func(_ context.Context, message *Message) error {
+		handled = append(handled, message.SequenceNumber)
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if len(handled) != 1 || handled[0] != 2 {
+		t.Fatalf("handled seqs = %v, want only the valid second delivery", handled)
+	}
+}
+
+func TestReceiverFilterCancellationDropsRemainingBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{
+		{SequenceNumber: 1, queue: "q", s: f},
+		{SequenceNumber: 2, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f},
+	}
+	handlerCalled := make(chan struct{}, 1)
+	err := newReceiver(f, "q", []ReceiverOption{
+		WithConcurrency(2),
+		WithErrorHandler(func(error) { cancel() }),
+	}).Run(ctx, func(context.Context, *Message) error {
+		handlerCalled <- struct{}{}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled from filter observer", err)
+	}
+	select {
+	case <-handlerCalled:
+		t.Fatal("filter observer canceled Run but a remaining message reached the handler")
+	default:
+	}
+}
+
+func TestReceiverKeepsNearExpiryOnFirstSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(time.Millisecond), queue: "q", s: f}}
+	err := newReceiver(f, "q", nil).Run(ctx, func(context.Context, *Message) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after preserving first response", err)
+	}
+	f.mu.Lock()
+	completeCalls := f.completeCalls
+	f.mu.Unlock()
+	if completeCalls != 1 {
+		t.Fatalf("near-expiry first response complete calls = %d, want one", completeCalls)
+	}
+}
+
+func TestReceiverConfirmsExpiredInitialLeaseBeforeHandler(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		legacy            bool
+		wantRenewCalls    int
+		wantDeadlineCalls int
+	}{
+		{name: "deadline-bearing", wantRenewCalls: 1, wantDeadlineCalls: 1},
+		{name: "legacy fallback", legacy: true, wantRenewCalls: 2, wantDeadlineCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Millisecond), queue: "q", s: f}}
+			renewStarted := make(chan struct{})
+			allowRenew := make(chan struct{})
+			f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
+				if tc.legacy {
+					return time.Time{}, ErrUnsupported
+				}
+				close(renewStarted)
+				select {
+				case <-allowRenew:
+					return time.Now().Add(time.Minute), nil
+				case <-renewCtx.Done():
+					return time.Time{}, renewCtx.Err()
+				}
+			}
+			f.renewFn = func(renewCtx context.Context) error {
+				close(renewStarted)
+				select {
+				case <-allowRenew:
+					return nil
+				case <-renewCtx.Done():
+					return renewCtx.Err()
+				}
+			}
+
+			handlerStarted := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				done <- newReceiver(f, "q", []ReceiverOption{WithAutoRenew()}).Run(ctx, func(context.Context, *Message) error {
+					close(handlerStarted)
+					cancel()
+					return nil
+				})
+			}()
+			select {
+			case <-renewStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("initial renewal did not start")
+			}
+			select {
+			case <-handlerStarted:
+				t.Fatal("handler started before the initial renewal was confirmed")
+			case <-time.After(100 * time.Millisecond):
+			}
+			close(allowRenew)
+			select {
+			case <-handlerStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("handler did not start after the initial renewal was confirmed")
+			}
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run = %v, want context.Canceled", err)
+			}
+			f.mu.Lock()
+			renewCalls, deadlineCalls := f.renewCalls, f.deadlineRenewCalls
+			completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+			f.mu.Unlock()
+			if renewCalls != tc.wantRenewCalls || deadlineCalls != tc.wantDeadlineCalls {
+				t.Fatalf("renew/deadline calls = %d/%d, want %d/%d", renewCalls, deadlineCalls, tc.wantRenewCalls, tc.wantDeadlineCalls)
+			}
+			if completeCalls != 1 || abandonCalls != 0 {
+				t.Fatalf("complete/abandon calls = %d/%d, want 1/0", completeCalls, abandonCalls)
+			}
+		})
+	}
+}
+
+func TestReceiverInitialRenewalFailureDoesNotDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		renewErr   error
+		wantRun    error
+		wantNotify error
+		forbid     error
+	}{
+		{name: "transient becomes lock lost", renewErr: errors.New("renew transport unavailable"), wantRun: context.Canceled, wantNotify: ErrLockLost},
+		{name: "gateway body stays transient", renewErr: &HTTPError{StatusCode: 503, cause: ErrPermissionDenied}, wantRun: context.Canceled, wantNotify: ErrLockLost, forbid: ErrPermissionDenied},
+		{name: "permanent stops receiver", renewErr: ErrPermissionDenied, wantRun: ErrPermissionDenied, wantNotify: ErrPermissionDenied},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Millisecond), queue: "q", s: f}}
+			f.renewDeadlineFn = func(context.Context) (time.Time, error) { return time.Time{}, tc.renewErr }
+			var observed []error
+			handlerCalls := 0
+			err := newReceiver(f, "q", []ReceiverOption{
+				WithAutoRenew(),
+				WithErrorHandler(func(err error) {
+					observed = append(observed, err)
+					if errors.Is(err, ErrLockLost) {
+						cancel()
+					}
+				}),
+			}).Run(ctx, func(context.Context, *Message) error {
+				handlerCalls++
+				return nil
+			})
+			if !errors.Is(err, tc.wantRun) {
+				t.Fatalf("Run = %v, want %v", err, tc.wantRun)
+			}
+			if len(observed) != 1 || !errors.Is(observed[0], tc.wantNotify) {
+				t.Fatalf("observed = %v, want one %v", observed, tc.wantNotify)
+			}
+			if tc.forbid != nil && errors.Is(observed[0], tc.forbid) {
+				t.Fatalf("observed = %v, must not retain misleading %v classification", observed, tc.forbid)
+			}
+			f.mu.Lock()
+			renewCalls := f.renewCalls
+			completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+			f.mu.Unlock()
+			if handlerCalls != 0 || renewCalls != 1 || completeCalls != 0 || abandonCalls != 0 {
+				t.Fatalf("handler/renew/complete/abandon calls = %d/%d/%d/%d, want 0/1/0/0", handlerCalls, renewCalls, completeCalls, abandonCalls)
+			}
+		})
+	}
+}
+
+func TestReceiverCanceledDuringInitialRenewalDoesNotDispatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Millisecond), queue: "q", s: f}}
+	renewStarted := make(chan struct{})
+	allowRenew := make(chan struct{})
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+		close(renewStarted)
+		<-allowRenew // Deliberately ignore cancellation like a misbehaving transport.
+		return time.Now().Add(time.Minute), nil
+	}
+	handlerStarted := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- newReceiver(f, "q", []ReceiverOption{WithAutoRenew()}).Run(ctx, func(context.Context, *Message) error {
+			close(handlerStarted)
+			return nil
+		})
+	}()
+	select {
+	case <-renewStarted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("initial renewal did not start")
+	}
+	cancel()
+	close(allowRenew)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after cancellation during initial renewal")
+	}
+	select {
+	case <-handlerStarted:
+		t.Fatal("handler started from a renewal acknowledgement returned after cancellation")
+	default:
+	}
+	f.mu.Lock()
+	renewCalls := f.renewCalls
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if renewCalls != 1 || completeCalls != 0 || abandonCalls != 0 {
+		t.Fatalf("renew/complete/abandon calls = %d/%d/%d, want 1/0/0", renewCalls, completeCalls, abandonCalls)
+	}
+}
+
+func testReceiverDropsStaleAttemptReplay(t *testing.T, staleDeadline time.Time) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.receiveFn = func(ctx context.Context, call int, _ string) ([]*Message, error) {
+		switch call {
+		case 1, 2:
+			return nil, errors.New("lost receive response")
+		case 3:
+			return []*Message{{SequenceNumber: 1, LockedUntil: staleDeadline, queue: "q", s: f}}, nil
+		case 4:
+			return []*Message{{SequenceNumber: 2, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}, nil
+		default:
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+	var handled []int64
+	err := newReceiver(f, "q", nil).Run(ctx, func(_ context.Context, message *Message) error {
+		handled = append(handled, message.SequenceNumber)
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if len(handled) != 1 || handled[0] != 2 {
+		t.Fatalf("handled seqs = %v, want [2]", handled)
+	}
+	f.mu.Lock()
+	attempts := append([]string(nil), f.attempts...)
+	f.mu.Unlock()
+	if len(attempts) < 4 || attempts[0] != attempts[1] || attempts[1] != attempts[2] || attempts[3] == attempts[2] {
+		t.Fatalf("attempt sequence = %q, want same ID through replay then a fresh round", attempts)
+	}
+}
+
+// A broken source must not return more messages than the Receiver reserved:
+// extra workers would otherwise block forever releasing slots never acquired.
+func TestReceiverRejectsBatchAboveReservedCapacity(t *testing.T) {
+	f := &fakeSource{}
+	f.batch = []*Message{
+		{SequenceNumber: 1, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f},
+		{SequenceNumber: 2, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	handled := 0
+	go func() {
+		errCh <- newReceiver(f, "q", []ReceiverOption{WithConcurrency(1)}).Run(ctx, func(context.Context, *Message) error {
+			handled++
+			return nil
+		})
+	}()
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "returned 2 messages") {
+			t.Fatalf("Run = %v, want oversized receive-batch protocol error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run hung after source returned more messages than reserved")
+	}
+	if handled != 0 {
+		t.Fatalf("handlers called = %d, want zero", handled)
 	}
 }
 
@@ -353,7 +1507,7 @@ func TestReceiverReturnsOnEngineClosed(t *testing.T) {
 // "captured before cancellation" and must report ErrClosed.
 func TestErrClosedCapturedBeforeCancelKeepsPrecedence(t *testing.T) {
 	f := &fakeSource{
-		batch:             []*Message{{SequenceNumber: 1, Body: []byte("x"), queue: "q"}},
+		batch:             []*Message{{SequenceNumber: 1, Body: []byte("x"), LockedUntil: time.Now().Add(30 * time.Second), queue: "q"}},
 		recvErrAfterBatch: ErrClosed,
 	}
 	f.batch[0].s = f
@@ -393,7 +1547,9 @@ func TestErrorHandlerCancelDoesNotRewriteOrdering(t *testing.T) {
 }
 
 // Permission revocation must terminate every receiver path, including the renew
-// goroutine and both handler outcomes, without a transient receive retry.
+// goroutine and both handler outcomes, without a same-attempt transient retry.
+// A Complete/Abandon failure can race one already-pipelined fresh Receive after
+// its handler slot is released; cancellation must stop that long-poll.
 func TestReceiverPermissionDeniedStopsEveryPath(t *testing.T) {
 	for _, operation := range []string{"receive", "complete", "abandon", "renew"} {
 		t.Run(operation, func(t *testing.T) {
@@ -432,9 +1588,18 @@ func TestReceiverPermissionDeniedStopsEveryPath(t *testing.T) {
 				t.Fatalf("Run = %v, observed = %v", err, observed)
 			}
 			f.mu.Lock()
-			defer f.mu.Unlock()
-			if f.calls != 1 {
-				t.Fatalf("permission failure must not trigger a receive retry; calls=%d", f.calls)
+			calls := f.calls
+			attempts := append([]string(nil), f.attempts...)
+			f.mu.Unlock()
+			if operation == "receive" || operation == "renew" {
+				if calls != 1 {
+					t.Fatalf("%s permission failure receive calls = %d, want one", operation, calls)
+				}
+			} else if calls < 1 || calls > 2 {
+				t.Fatalf("%s permission failure receive calls = %d, want at most one pipelined receive", operation, calls)
+			}
+			if calls == 2 && attempts[0] == attempts[1] {
+				t.Fatalf("%s permission failure retried the same receive attempt %q", operation, attempts[0])
 			}
 		})
 	}

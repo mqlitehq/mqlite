@@ -1026,3 +1026,30 @@ func TestAccessKeyCreationOrderHTTP(t *testing.T) {
 	keyTestStatus(t, keyTestRequest(handler, http.MethodPost, wire.PathListKeys, token, wire.ListKeysRequest{Sort: engine.KeySortCreatedDesc}), 403, "permission_denied")
 	keyTestStatus(t, keyTestRequest(server.New(eng, nil).Handler(), http.MethodPost, wire.PathListKeys, "", wire.ListKeysRequest{Sort: engine.KeySortCreatedDesc}), 403, "permission_denied")
 }
+
+func TestQueueNotFoundKeepsCompatibleCodeAndResource(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	recorder := httptest.NewRecorder()
+	body, err := json.Marshal(wire.MetricsRequest{Queue: "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, wire.PathStats, bytes.NewReader(body))
+	server.New(eng, nil).Handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	var envelope wire.ErrorBody
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Code != "not_found" || envelope.Resource != "queue" {
+		t.Fatalf("error envelope = %+v, want compatible not_found with queue resource", envelope)
+	}
+}
