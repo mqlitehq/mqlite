@@ -1,9 +1,9 @@
 # Production operations
 
-This runbook describes v0.4.1, the latest supported release (port 6754, schema
+This runbook describes v0.4.2, the latest supported release (port 6754, schema
 token 7). v0.3.3 is withdrawn and
 unsupported; its public assets and exact image remain available for forensic or
-compatibility inspection and must not be deployed. v0.4.1 retains v0.4.0's
+compatibility inspection and must not be deployed. v0.4.2 retains v0.4.0's
 retraction of v0.3.3. Upgrading from v0.3.2 or another schema-5 release
 requires a fresh database as described below.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
@@ -13,16 +13,12 @@ follow [upgrade and rollback](#upgrade-and-rollback) before replacing the broker
 See [deployment](deployment.md) for installation and [observability](observability.md)
 for metric definitions and alerts.
 
-v0.4.1 is a same-schema patch over v0.4.0. It fixes strict Observe
-clients and the console rejecting the documented retired message aggregate after
-a message-bearing queue or subscription is deleted, exposes the lifecycle clock,
-and makes fixed subscription deadlines visible in the console. It also preserves
-per-message TTLs in remote mixed-TTL batches and prevents closed logical Hrana
-streams from being reused on `libsql://`, without giving up physical HTTP/TLS
-keep-alive reuse. Upgrade broker and Go client together before relying on the
-additive mixed-TTL input shape. No database rebuild or metric migration is
-required. Still quiesce clients and avoid overlapping brokers during the binary
-replacement.
+v0.4.2 is a same-schema patch over v0.4.1. Broker-wide `listen` keys can provision
+or update subscriptions and test filters; complete inventory and deletion remain
+`manage` operations. Browser root requests that explicitly prefer HTML enter the
+enabled console, while curl and JSON clients retain the discovery response. The
+wire contract is unchanged. No database rebuild or metric migration is required.
+Still quiesce clients and avoid overlapping brokers during the binary replacement.
 
 ## Operating boundaries
 

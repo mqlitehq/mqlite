@@ -14,7 +14,7 @@ explicitly `linux/amd64`.
 An ARM host uses Docker's emulation; this does not benchmark native ARM performance.
 
 Use the matching release checkout so the broker, dashboard and rules come from the
-same source. The latest supported tag is v0.4.1, which uses schema token 7.
+same source. The latest supported tag is v0.4.2, which uses schema token 7.
 
 Stop the v0.3.2 starter before launching this stack because both versions publish
 the same loopback ports. From its old checkout, run `docker compose down` in
@@ -32,7 +32,7 @@ data with the matching old binary; the schema-7 broker cannot open it.
 ```sh
 git clone https://github.com/mqlitehq/mqlite.git
 cd mqlite
-git checkout v0.4.1
+git checkout v0.4.2
 cd ops/observability
 python3 init.py
 docker compose up --build -d

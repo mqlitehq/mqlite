@@ -10,7 +10,14 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
-## Unreleased
+## v0.4.2 — 2026-10-28
+
+> **Patch upgrade from v0.4.1:** the canonical schema token remains **7** and no
+> database rebuild is required. Wire request and response shapes are unchanged.
+> Broker-wide `listen` keys may now provision or update subscriptions and test
+> filters, while subscription inventory and deletion remain `manage` operations.
+> Root requests that explicitly prefer HTML enter the enabled console; curl and
+> JSON clients retain the discovery response.
 
 ### Send interactive browser visits to the console (MQLITE-169)
 

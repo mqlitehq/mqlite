@@ -1221,7 +1221,7 @@ func TestReleaseDocsPinLatestDatedRelease(t *testing.T) {
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
 		"concepts.md":   "3ff47a5d29f6fbc8f47ad4e9bff93375f9f3a86604f53233dadc16adba756ef5",
-		"concepts.html": "7f50260b6e7592f0db7062472c9712ed0a98e08c8c8a5d98888b0aaaf8c09266",
+		"concepts.html": "6ef92acefd5a9c62068ad75edcac7a479503975b066cc39d48b6752b2cea12cc",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {

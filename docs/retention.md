@@ -1,10 +1,10 @@
 # Retention, deletion, and storage reclamation
 
-This page describes v0.4.1, the latest supported release. v0.3.3 is withdrawn and
+This page describes v0.4.2, the latest supported release. v0.3.3 is withdrawn and
 unsupported; its public artifacts remain available for forensic or compatibility
-inspection and must not be deployed. v0.4.1 retains v0.4.0's retraction of
+inspection and must not be deployed. v0.4.2 retains v0.4.0's retraction of
 v0.3.3. v0.3.2 has DLQ retention
-and automatic local reclamation, but the work budgets below describe v0.4.1
+and automatic local reclamation, but the work budgets below describe v0.4.2
 unless a version difference is stated.
 v0.3.2 does not have the
 queue and subscription lifecycle APIs introduced in v0.4.0.

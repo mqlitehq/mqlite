@@ -6,7 +6,7 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
-This reference describes v0.4.1, the latest supported release. v0.3.3 is
+This reference describes v0.4.2, the latest supported release. v0.3.3 is
 withdrawn and unsupported; use the documentation in the v0.3.2 tag when working
 with its smaller management surface.
 
