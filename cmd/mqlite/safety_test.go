@@ -425,7 +425,19 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 			// 256 fsyncs, which timed this test out on a slow Windows runner and told us nothing
 			// about renewal. (Not :memory:, which a cancelled query can destroy — see the note in
 			// the handover: that is a separate, pre-existing engine bug.)
-			eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+			// Production leases deliberately use absolute epoch timestamps so fencing remains
+			// meaningful across processes and restarts. A forward host wall-clock step can
+			// therefore expire existing broker locks, but that is not the delayed-link behavior
+			// under test here. Derive this engine's epoch from Go's monotonic clock so such a
+			// step cannot invalidate the fixture mid-run.
+			clockOrigin := time.Now()
+			stableEpoch := func() int64 {
+				return clockOrigin.UnixMilli() + time.Since(clockOrigin).Milliseconds()
+			}
+			eng, err := engine.Open(ctx, engine.Options{
+				DB:  "file:" + filepath.Join(t.TempDir(), "mq.db"),
+				Now: stableEpoch,
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -468,7 +480,8 @@ func TestBatchRenewalUnderDelayedLink(t *testing.T) {
 				return cmdReceive(ctx, []string{"q", "--max", strconv.Itoa(n)})
 			})
 			if err != nil {
-				t.Fatalf("receive of %d messages over a delayed link must settle cleanly: %v", n, err)
+				t.Fatalf("receive of %d messages over a delayed link must settle cleanly: %v (renew requests=%d, settlement requests=%d)",
+					n, err, renews.Load(), settles.Load())
 			}
 			if got := strings.Count(out, "seq="); got != n {
 				t.Errorf("printed %d message lines, want %d", got, n)
