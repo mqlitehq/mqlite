@@ -252,7 +252,7 @@ replacement key, moving clients, then revoking the old key.
 
 | Method | Path | Returns |
 |---|---|---|
-| `GET` | `/` | JSON discovery card (see below) |
+| `GET` | `/` | JSON discovery card, or the console for an interactive browser (see below) |
 | `GET` | `/healthz` | `200 ok` (liveness) |
 | `GET` | `/ui` | Embedded admin console (when enabled — see below) |
 
@@ -264,6 +264,13 @@ curl "$BASE_URL/"                    # what is this? (no auth)
 #    "health":"/healthz","ui":"/ui"}
 curl "$BASE_URL/healthz"             # ok
 ```
+
+An interactive browser that explicitly prefers `text/html` receives a temporary
+redirect from `/` to `/ui/` when the embedded console is enabled. Requests with no
+`Accept` header, `*/*`, or `application/json` continue to receive the exact JSON
+card above; the response varies on `Accept`. A headless broker (`MQLITE_UI=off`)
+always keeps `/` as JSON. This preserves machine discovery while making direct
+browser navigation useful.
 
 The card's `auth` is `"bearer"` when RPCs require a token or `"none"` when auth is off,
 so an agent can branch on it directly. `endpoints` is the **complete** list of RPC route

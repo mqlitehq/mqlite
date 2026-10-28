@@ -91,8 +91,9 @@ The listen address may also come from **`MQLITE_ADDR`** (precedence: `--addr` >
 `--insecure-allow-remote` is passed, and **`MQLITE_CORS` defaults to off**.
 
 Serves the RPC API, the open `/` + `/healthz`, and — unless `MQLITE_UI=off` —
-the embedded admin console at `/ui`. Enable Prometheus on the same API port with
-one flag:
+the embedded admin console at `/ui`. With the console enabled, opening `/` in an
+interactive browser redirects to `/ui/`; curl and JSON clients still receive the
+machine discovery card. Enable Prometheus on the same API port with one flag:
 
 ```bash
 MQLITE_DB=file:./mq.db MQLITE_TOKENS=mqk_dev mqlite serve \
