@@ -11,8 +11,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"mime"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -182,6 +185,16 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not_found", "no such path: "+r.URL.Path)
 		return
 	}
+	if s.UI {
+		// Keep the agent-facing JSON discovery contract as the default. An
+		// interactive browser explicitly prefers HTML, so give it the console
+		// without making curl, Go clients, or */* callers follow a redirect.
+		w.Header().Add("Vary", "Accept")
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && prefersHTML(r.Header.Get("Accept")) {
+			http.Redirect(w, r, "/ui/", http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	version := s.Version
 	if version == "" {
 		version = "dev"
@@ -207,6 +220,61 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		card.UI = "/ui"
 	}
 	writeJSON(w, card)
+}
+
+type acceptPreference struct {
+	quality     float64
+	specificity int
+}
+
+// prefersHTML reports whether Accept explicitly prefers exact text/html over
+// application/json. Missing Accept, */*, malformed values and exact ties all
+// stay on JSON to preserve the root discovery contract for existing clients.
+func prefersHTML(accept string) bool {
+	html := preferenceFor(accept, "text", "html")
+	if html.specificity != 2 || html.quality <= 0 {
+		return false
+	}
+	json := preferenceFor(accept, "application", "json")
+	if html.quality != json.quality {
+		return html.quality > json.quality
+	}
+	return html.specificity > json.specificity
+}
+
+func preferenceFor(accept, mediaType, mediaSubtype string) acceptPreference {
+	best := acceptPreference{specificity: -1}
+	for _, part := range strings.Split(accept, ",") {
+		parsed, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil {
+			continue
+		}
+		quality := 1.0
+		if raw, ok := params["q"]; ok {
+			quality, err = strconv.ParseFloat(raw, 64)
+			if err != nil || math.IsNaN(quality) || quality < 0 || quality > 1 {
+				continue
+			}
+		}
+
+		pieces := strings.SplitN(parsed, "/", 2)
+		if len(pieces) != 2 {
+			continue
+		}
+		specificity := -1
+		switch {
+		case pieces[0] == mediaType && pieces[1] == mediaSubtype:
+			specificity = 2
+		case pieces[0] == mediaType && pieces[1] == "*":
+			specificity = 1
+		case pieces[0] == "*" && pieces[1] == "*":
+			specificity = 0
+		}
+		if specificity > best.specificity || (specificity == best.specificity && quality > best.quality) {
+			best = acceptPreference{quality: quality, specificity: specificity}
+		}
+	}
+	return best
 }
 
 func (s *Server) postOnly(fn http.HandlerFunc) http.HandlerFunc {

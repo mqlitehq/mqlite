@@ -12,6 +12,17 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Send interactive browser visits to the console (MQLITE-169)
+
+- Redirect `GET` or `HEAD /` to `/ui/` only when the embedded console is enabled
+  and the request explicitly prefers HTML over JSON. Direct browser navigation no
+  longer renders the machine discovery card's complete RPC catalog.
+- Preserve the exact JSON discovery contract for requests with no `Accept` header,
+  `*/*`, or `application/json`, including the complete `endpoints` list used by
+  agents and release verification. Headless brokers continue to return JSON.
+- Add `Vary: Accept`, keep unknown paths as JSON 404s, and cover content quality,
+  CORS, HEAD and the packaged console in unit and release-image tests.
+
 ### Let listeners provision subscriptions (MQLITE-166)
 
 - Allow broker-wide `listen` keys to call `Subscribe` and `TestFilter`. Subscribe

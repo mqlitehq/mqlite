@@ -54,13 +54,15 @@ def smoke(args):
             raise RuntimeError(f"docker {command[0]} failed: {result.stderr.strip()}")
         return result
 
-    def request(path, body=None, auth=None, timeout=5):
+    def request(path, body=None, auth=None, timeout=5, headers=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(endpoint + path, data=data)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         if auth is not None:
             req.add_header("Authorization", "Bearer " + auth)
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
         try:
             with http.open(req, timeout=timeout) as response:
                 return response.status, response.read()
@@ -139,6 +141,11 @@ def smoke(args):
 
         paths = card.get("endpoints", [])
         check(isinstance(paths, list) and paths, "discovery has no RPC endpoints")
+        status, page = request(
+            "/", headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+        )
+        check(status == 200 and b"<title>mqlite console</title>" in page,
+              f"browser root did not reach the embedded console: HTTP {status}")
         # Every advertised RPC must reject absent and wrong credentials on the public API.
         for path in paths:
             for auth in (None, "invalid-" + token):

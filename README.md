@@ -184,6 +184,7 @@ mqlite serve --addr :6754
 TOKEN=mqk_dev
 # discovery: hit the root with no auth — a JSON card (name, version, status, endpoints)
 curl http://127.0.0.1:6754/
+# opening the same URL in a browser enters /ui/ when the console is enabled
 
 # create the queue first — sending to a queue that doesn't exist is a 404
 curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \

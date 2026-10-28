@@ -93,6 +93,8 @@ docker run -d --name mqlite -p 6754:6754 \
   disabled by default. For a private broker or an ingress that blocks public
   `/metrics`, add `-e MQLITE_METRICS=on` and give the collector a monitor token.
   Scraping uses the same API port; enabled discovery includes `"metrics":"/metrics"`.
+  With the console enabled, opening the root URL in a browser redirects to `/ui/`;
+  curl and JSON clients continue to receive the discovery card.
 
 ## Fly.io (minimal cost)
 
