@@ -286,14 +286,23 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   decisions when the response is first written. The additive header is valid on
   both success and error responses; a client MUST NOT use a proxy-generated
   failure or redirect as evidence of broker time. A remote lease scheduler MUST
-  apply transport and timestamp-precision uncertainty conservatively and MUST NOT
-  extend a lease merely because its local wall clock falls inside that interval.
+  apply transport and timestamp-precision uncertainty conservatively, reserve
+  observed round-trip headroom for the next renewal, and MUST NOT extend a lease
+  merely because its local wall clock falls inside that interval. A confirmed
+  exact lease shorter than the managed Receiver's safe renewal interval MUST fail
+  closed rather than enter an unbounded renewal loop.
   CORS-enabled responses MUST list the header in `Access-Control-Expose-Headers`.
   *(server/errors_test.go: TestJSONResponsesCarryServerTime;
   receiver_internal_test.go: TestClientMapsBrokerDeadlineOntoLocalMonotonicClock,
   TestClientLongPollNeverExtendsLeaseFromLocalWallClock,
   TestClientLongPollObservationDoesNotContaminateShortRenewal,
-  TestClientPreservesLegitimateShortLeaseFromServerTime)*
+  TestClientRejectsPathologicallyShortConfirmedLease)*
+- **9.8** A managed Receiver that receives HTTP 499 while its own controlling
+  context is still live MUST treat it as transient. A Receive replay MUST retain
+  the same attempt ID. If the caller context is already canceled, it MUST stop
+  without another request. *(receiver_internal_test.go:
+  TestReceiverRetriesBrokerCanceledReceiveWithSameAttemptID,
+  TestReceiverDoesNotRetryBrokerCanceledResponseAfterCallerCancel)*
 
 ## 10 · Storage & schema invariants
 

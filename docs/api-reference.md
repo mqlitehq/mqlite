@@ -39,10 +39,12 @@ values replace earlier ones, while repeated object and map values may merge.
   client trusts it only on successful broker responses and maps absolute lease
   deadlines onto its local monotonic clock with a conservative transport budget.
   Older clients ignore the additive header. With an older broker, the client can
-  use HTTP `Date` at its one-second precision. Without either header it retains
-  absolute-deadline behavior and uses bounded untrusted-clock pacing only when
-  that deadline is locally unusable; raw HTTP callers should map broker time or
-  synchronize clocks.
+  use HTTP `Date` at its one-second precision; a short lower bound dominated by
+  that precision uses bounded degraded-clock pacing. Without either header the
+  public absolute deadline is retained, but the managed Receiver reports one
+  diagnostic, confirms the lease before dispatch, and keeps a bounded
+  untrusted-clock cadence instead of using that foreign timestamp as a local
+  schedule; raw HTTP callers should map broker time or synchronize clocks.
   CORS-enabled brokers expose this header to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
@@ -481,10 +483,12 @@ lease it can lapse on the way. Current brokers return `X-Mqlite-Server-Time-Ms` 
 as the lease; the managed Receiver combines that observation with local monotonic time and a
 conservative transport budget instead of directly comparing two hosts' wall clocks. It performs a
 bounded synchronous Renew before dispatch when a deadline is unusable, separates renewal cadence
-from the request watchdog, and never extends a lease merely because the local wall clock falls in a
-wide uncertainty interval. Older brokers use HTTP `Date` when available; without either time header
-they retain absolute-deadline behavior and use conservative pacing only when that value is locally
-unusable.
+from the request watchdog, reserves two observed round trips for the next request, and never extends
+a lease merely because the local wall clock falls in a wide uncertainty interval. A confirmed exact
+lease below the 50 ms minimum cadence fails closed instead of entering a renewal hot loop. Older
+brokers use HTTP `Date` when available; without either time header they retain the public absolute
+deadline but never use it as a managed local schedule. The Receiver emits one diagnostic, confirms
+ownership before dispatch, and keeps a conservative bounded cadence.
 Raw `RenewBatch` callers should map the broker clock likewise (or keep clocks synchronized) and
 must not turn clock offset alone into `ErrLockLost`. (If the write itself outlived the lock, you get
 `ok=false` rather than a lock you never really held.) Like single-message Renew, the batch
@@ -967,7 +971,7 @@ status. A `not_found` response may add an optional `resource` discriminator
 | 409 | `subscription_not_empty` | subscription deletion found retained messages in at least one state |
 | 429 | `resource_exhausted` | the active plus deleting subscription capacity is full (`mqlite.ErrSubscriptionLimit`) |
 | 413 | `message_too_large` | a message body over `MaxMessageBytes` (default 1 MiB), or request decoding that exceeds `server.MaxBodyBytes` (default 32 MiB) |
-| 499 | `canceled` | the client canceled the request |
+| 499 | `canceled` | the request context was canceled. A managed Receiver whose own context is still live treats a received 499 as transient and retries the same Receive attempt; caller cancellation still stops immediately. |
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
 

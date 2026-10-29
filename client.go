@@ -76,6 +76,8 @@ type Client struct {
 type serverTimeObservation struct {
 	localAt     time.Time
 	serverUpper time.Time
+	responseRTT time.Duration
+	coarseClock bool
 }
 
 var _ deadlineRenewer = (*Client)(nil)
@@ -184,6 +186,7 @@ func observeServerTime(header http.Header, started, received time.Time) serverTi
 		roundTrip = 0
 	}
 	var serverLower, serverUpper time.Time
+	coarseClock := false
 	if raw := header.Get(wire.ServerTimeHeader); raw != "" {
 		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
 			serverLower = time.UnixMilli(ms)
@@ -194,12 +197,15 @@ func observeServerTime(header http.Header, started, received time.Time) serverTi
 		if parsed, err := http.ParseTime(header.Get("Date")); err == nil {
 			serverLower = parsed
 			serverUpper = parsed.Add(time.Second + roundTrip)
+			coarseClock = true
 		}
 	}
 	if serverLower.IsZero() {
-		return serverTimeObservation{}
+		return serverTimeObservation{localAt: received, responseRTT: roundTrip}
 	}
-	return serverTimeObservation{localAt: received, serverUpper: serverUpper}
+	return serverTimeObservation{
+		localAt: received, serverUpper: serverUpper, responseRTT: roundTrip, coarseClock: coarseClock,
+	}
 }
 
 // localLeaseDeadline maps a broker-wall deadline onto the local monotonic
@@ -209,7 +215,7 @@ func observeServerTime(header http.Header, started, received time.Time) serverTi
 // clock merely because it falls inside the uncertainty interval. In particular,
 // doing that after a long poll could extend a lease when the client clock is slow.
 func (o serverTimeObservation) localLeaseDeadline(deadline time.Time) (time.Time, bool) {
-	if deadline.IsZero() || o.localAt.IsZero() {
+	if deadline.IsZero() || o.localAt.IsZero() || o.serverUpper.IsZero() {
 		return time.Time{}, false
 	}
 	now := time.Now()
@@ -426,22 +432,25 @@ func (c *Client) wireToMessage(queue string, wm wire.Message, observation server
 	lockedUntil := msToTime(wm.LockedUntilMs)
 	localLockedUntil, _ := observation.localLeaseDeadline(lockedUntil)
 	return &Message{
-		SequenceNumber:   wm.SeqNumber,
-		Body:             wm.Body,
-		MessageID:        wm.MessageID,
-		GroupID:          wm.GroupID,
-		CorrelationID:    wm.CorrelationID,
-		ReplyTo:          wm.ReplyTo,
-		Subject:          wm.Subject,
-		ContentType:      wm.ContentType,
-		Properties:       wm.Properties,
-		DeliveryCount:    wm.DeliveryCount,
-		EnqueuedAt:       msToTime(wm.EnqueuedAtMs),
-		LockedUntil:      lockedUntil,
-		localLockedUntil: localLockedUntil,
-		queue:            queue,
-		lockToken:        wm.LockToken,
-		s:                c,
+		SequenceNumber:             wm.SeqNumber,
+		Body:                       wm.Body,
+		MessageID:                  wm.MessageID,
+		GroupID:                    wm.GroupID,
+		CorrelationID:              wm.CorrelationID,
+		ReplyTo:                    wm.ReplyTo,
+		Subject:                    wm.Subject,
+		ContentType:                wm.ContentType,
+		Properties:                 wm.Properties,
+		DeliveryCount:              wm.DeliveryCount,
+		EnqueuedAt:                 msToTime(wm.EnqueuedAtMs),
+		LockedUntil:                lockedUntil,
+		localLockedUntil:           localLockedUntil,
+		localLeaseResponseRTT:      observation.responseRTT,
+		localLeaseCoarseClock:      observation.coarseClock,
+		localLeaseClockUnavailable: observation.serverUpper.IsZero(),
+		queue:                      queue,
+		lockToken:                  wm.LockToken,
+		s:                          c,
 	}
 }
 
@@ -1024,18 +1033,22 @@ func (c *Client) renew(ctx context.Context, q string, seq int64, tok string) err
 	return c.settle(ctx, wire.PathRenew, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok})
 }
 
-func (c *Client) renewDeadline(ctx context.Context, q string, seq int64, tok string) (time.Time, error) {
+func (c *Client) renewDeadline(ctx context.Context, q string, seq int64, tok string) (renewalLease, error) {
 	results, observation, err := c.renewBatchObserved(ctx, q, c.Message(q, seq, tok))
 	if err != nil {
-		return time.Time{}, err
+		return renewalLease{}, err
 	}
 	if len(results) != 1 || !results[0].Ok {
-		return time.Time{}, ErrLockLost
+		return renewalLease{}, ErrLockLost
+	}
+	lease := renewalLease{
+		deadline: results[0].LockedUntil, responseRTT: observation.responseRTT, coarseClock: observation.coarseClock,
+		clockUnavailable: observation.serverUpper.IsZero(),
 	}
 	if local, ok := observation.localLeaseDeadline(results[0].LockedUntil); ok {
-		return local, nil
+		lease.deadline = local
 	}
-	return results[0].LockedUntil, nil
+	return lease, nil
 }
 
 // PeekedMessage is a read-only browse result.

@@ -30,6 +30,8 @@ const (
 	renewFallbackLease = 20 * time.Second
 	replayLeaseSafety  = 10 * time.Millisecond
 	renewMinimumDelay  = 50 * time.Millisecond
+	renewRTTMargin     = 10 * time.Millisecond
+	degradedClockError = "mqlite: broker time headers unavailable; lease scheduling is using degraded clock mode"
 	// Without broker time or a relative lease duration, a successful renewal
 	// whose absolute deadline is unusable locally cannot reveal its true
 	// remaining lifetime. Probe at a conservative bounded cadence, but give the
@@ -46,8 +48,15 @@ const (
 // fresh lease state without racing a write to Message.LockedUntil. Sources that
 // only implement the legacy settler continue to work with a conservative local
 // lease estimate.
+type renewalLease struct {
+	deadline         time.Time
+	responseRTT      time.Duration
+	coarseClock      bool
+	clockUnavailable bool
+}
+
 type deadlineRenewer interface {
-	renewDeadline(context.Context, string, int64, string) (time.Time, error)
+	renewDeadline(context.Context, string, int64, string) (renewalLease, error)
 }
 
 func exponentialBackoff(base, max time.Duration, step int) time.Duration {
@@ -110,9 +119,11 @@ type ReceiverOption func(*receiverConfig)
 // WithAutoRenew keeps locks alive with a background heartbeat for long handlers.
 // Transient renewal failures are retried while the known lease remains usable. If
 // client and broker clocks disagree, a successful broker acknowledgement gates
-// dispatch and renewals use a conservative local cadence. If the lock is lost or
-// renewal cannot be confirmed by its request watchdog, the per-message handler
-// context is canceled and that delivery is not settled.
+// dispatch and renewals use a conservative local cadence. Scheduling reserves
+// observed network headroom; an exact lease shorter than the minimum safe cadence
+// fails closed instead of hot-looping. If the lock is lost or renewal cannot be
+// confirmed by its request watchdog, the per-message handler context is canceled
+// and that delivery is not settled.
 func WithAutoRenew() ReceiverOption { return func(c *receiverConfig) { c.autoRenew = true } }
 
 // WithConcurrency sets the maximum number of handlers executing in parallel.
@@ -129,8 +140,9 @@ func WithConcurrency(n int) ReceiverOption { return func(c *receiverConfig) { c.
 func WithPrefetch(n int) ReceiverOption { return func(c *receiverConfig) { c.prefetch = n } }
 
 // WithErrorHandler registers a callback for errors the receive loop would otherwise swallow:
-// a transient receive error being retried, or a per-message settle/renew failure (e.g. a lost
-// lock). It is advisory — for logging or metrics — is called serially (the Receiver guards
+// a transient receive error being retried, a one-time degraded-clock diagnostic, or a
+// per-message settle/renew failure (e.g. a lost lock). It is advisory — for logging or
+// metrics — is called serially (the Receiver guards
 // it, so a plain slice-append or counter is safe), and must not block. A permanent error
 // (bad token, denied permission, missing queue) is passed here first and then also
 // returned from Run (MQLITE-77).
@@ -151,6 +163,7 @@ type Receiver struct {
 	// this capability bit; never hold the mutex across a network request.
 	renewCapabilityMu        sync.Mutex
 	deadlineRenewUnsupported bool
+	clockWarningOnce         sync.Once
 }
 
 func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiver {
@@ -171,6 +184,13 @@ func (r *Receiver) notify(err error) {
 	r.errMu.Lock()
 	defer r.errMu.Unlock()
 	r.cfg.onError(err)
+}
+
+func (r *Receiver) notifyDegradedClock(ctx context.Context, unavailable bool) bool {
+	if unavailable {
+		r.clockWarningOnce.Do(func() { r.notify(errors.New(degradedClockError)) })
+	}
+	return ctx.Err() == nil
 }
 
 // isPermanent reports whether an error will not be fixed by retrying and means the consumer
@@ -402,9 +422,15 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		if invalid > 0 {
 			r.notify(fmt.Errorf("%w: discarded %d invalid peek-lock message(s) without a lease deadline", ErrLockLost, invalid))
 		}
+		for _, m := range msgs {
+			if m.localLeaseClockUnavailable {
+				r.notifyDegradedClock(rctx, true)
+				break
+			}
+		}
 		// The observer runs synchronously and may cancel Run in response to a
-		// filtered delivery. Re-check after the final callback so no surviving
-		// message is dispatched with an already-canceled handler context.
+		// filtered delivery or degraded-clock diagnostic. Re-check after the final
+		// callback so no message is dispatched with an already-canceled context.
 		if rctx.Err() != nil {
 			releasePaired(handlerSlots, totalSlots, n)
 			return done()
@@ -442,8 +468,8 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 		if !m.localLockedUntil.IsZero() {
 			leaseDeadline = m.localLockedUntil
 		}
-		state := newRenewalState(leaseDeadline)
-		if forceInitialRenewal || needsInitialRenewalGate(leaseDeadline) {
+		state := newRenewalState(leaseDeadline, m.localLeaseResponseRTT, m.localLeaseCoarseClock, m.localLeaseClockUnavailable)
+		if forceInitialRenewal || needsInitialRenewalGate(state) {
 			attemptState := state
 			if forceInitialRenewal {
 				// A replay always needs a fresh broker fence. A mapped monotonic
@@ -529,8 +555,7 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 }
 
 func retryableManagedError(err error) bool {
-	if err == nil ||
-		errors.Is(err, context.Canceled) {
+	if err == nil {
 		return false
 	}
 	var httpErr *HTTPError
@@ -539,7 +564,13 @@ func retryableManagedError(err error) bool {
 			return false
 		}
 		status := httpErr.StatusCode
-		return status == 408 || status == 429 || status >= 500
+		// HTTP 499 is an actual broker/intermediary response, not proof that the
+		// caller canceled its controlling context. Managed operations are fenced or
+		// idempotent, and every retry loop separately stops when that context is done.
+		return status == 408 || status == 429 || status == 499 || status >= 500
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
 	}
 	if errors.Is(err, ErrLockLost) ||
 		errors.Is(err, ErrInvalidArgument) ||
@@ -593,12 +624,31 @@ type renewalState struct {
 	deadline          time.Time
 	leaseEstimate     time.Duration
 	deadlineUntrusted bool
+	responseRTT       time.Duration
+	coarseClock       bool
+	clockUnavailable  bool
+	leaseTooShort     bool
 }
 
-func newRenewalState(deadline time.Time) renewalState {
+func newRenewalState(deadline time.Time, responseRTT time.Duration, coarseClock, clockUnavailable bool) renewalState {
 	now := time.Now()
 	leaseEstimate := deadline.Sub(now)
-	deadlineUntrusted := deadline.IsZero() || !deadline.After(now.Add(replayLeaseSafety))
+	exactTooShort := !deadline.IsZero() && !coarseClock && !clockUnavailable && leaseEstimate <= renewMinimumDelay+replayLeaseSafety
+	// Without a broker-time observation, the wire deadline is in another
+	// machine's wall-clock domain. It may look far in the future when the broker
+	// clock is ahead even though the real lease is short, so it must never drive a
+	// local wait or request watchdog.
+	deadlineUntrusted := clockUnavailable || deadline.IsZero() || !deadline.After(now.Add(replayLeaseSafety))
+	if responseRTT < 0 {
+		responseRTT = 0
+	}
+	if coarseClock && leaseEstimate <= time.Second+2*responseRTT+replayLeaseSafety+renewRTTMargin {
+		// Date is only precise to one second. A short lower bound is useful as a
+		// dispatch fence, but not as an RPC watchdog: it can expire inside an
+		// otherwise ordinary cross-zone round trip. Use the bounded legacy cadence
+		// until an exact broker-time response is available.
+		deadlineUntrusted = true
+	}
 	if deadline.IsZero() {
 		leaseEstimate = renewFallbackLease
 		deadline = now.Add(leaseEstimate)
@@ -612,33 +662,81 @@ func newRenewalState(deadline time.Time) renewalState {
 		// later wall-clock correction cannot move an already accepted schedule.
 		deadline = now.Add(leaseEstimate)
 	}
-	return renewalState{deadline: deadline, leaseEstimate: leaseEstimate, deadlineUntrusted: deadlineUntrusted}
+	return renewalState{
+		deadline: deadline, leaseEstimate: leaseEstimate, deadlineUntrusted: deadlineUntrusted,
+		responseRTT: responseRTT, coarseClock: coarseClock, clockUnavailable: clockUnavailable,
+		leaseTooShort: exactTooShort,
+	}
 }
 
 // acceptRenewal records an authoritative successful broker renewal. The
 // absolute deadline is usable for local scheduling only when it is ahead of the
 // local safety window. Otherwise, clock offset and lease duration are
 // indistinguishable, so retain ownership but enter the conservative local mode.
-func (s renewalState) acceptRenewal(newDeadline, now time.Time) renewalState {
-	if newDeadline.IsZero() {
+func (s renewalState) acceptRenewal(lease renewalLease, now time.Time) renewalState {
+	// A positive, exact short horizon is genuine evidence that the legacy queue
+	// lock duration cannot support our minimum cadence. Preserve that evidence if
+	// an older broker can acknowledge Renew but cannot return its new deadline.
+	// An already expired/untrusted horizon is different: a legacy Renew may have
+	// installed a normal fresh lease, so keep the compatibility fallback there.
+	preserveLegacyShort := s.leaseTooShort && !s.deadlineUntrusted
+	if lease.responseRTT < 0 {
+		lease.responseRTT = 0
+	}
+	s.responseRTT = lease.responseRTT
+	s.coarseClock = lease.coarseClock
+	s.clockUnavailable = lease.clockUnavailable
+	if lease.clockUnavailable {
+		// A successful Renew proves ownership at this instant, but without either
+		// server-time header its absolute deadline still cannot be compared with the
+		// local clock. Keep using the bounded degraded cadence.
+		s.deadline = time.Time{}
+		s.deadlineUntrusted = true
+		s.leaseTooShort = preserveLegacyShort
+		return s
+	}
+	if lease.deadline.IsZero() {
 		if !s.deadlineUntrusted {
 			s.deadline = now.Add(s.leaseEstimate)
 		}
+		s.leaseTooShort = preserveLegacyShort
 		return s
 	}
-	if !newDeadline.After(now.Add(replayLeaseSafety)) {
+	s.leaseTooShort = false
+	remaining := lease.deadline.Sub(now)
+	if lease.coarseClock && remaining <= time.Second+2*lease.responseRTT+replayLeaseSafety+renewRTTMargin {
 		s.deadline = time.Time{}
 		s.deadlineUntrusted = true
 		return s
 	}
-	s.leaseEstimate = newDeadline.Sub(now)
+	if !lease.coarseClock && !lease.clockUnavailable && remaining <= renewMinimumDelay+replayLeaseSafety {
+		// An exact broker-time mapping (or the embedded clock) can distinguish a
+		// genuinely unusable short lease from clock skew. Preserve that fact even
+		// after it has entered or passed the ordinary safety window: one successful
+		// confirmation may lengthen it, but another short result must fail closed.
+		s.leaseEstimate = remaining
+		s.deadline = lease.deadline
+		s.deadlineUntrusted = !lease.deadline.After(now.Add(replayLeaseSafety))
+		s.leaseTooShort = true
+		return s
+	}
+	if !lease.deadline.After(now.Add(replayLeaseSafety)) {
+		s.deadline = time.Time{}
+		s.deadlineUntrusted = true
+		return s
+	}
+	s.leaseEstimate = remaining
 	s.deadline = now.Add(s.leaseEstimate)
 	s.deadlineUntrusted = false
 	return s
 }
 
-func needsInitialRenewalGate(deadline time.Time) bool {
-	return deadline.IsZero() || !deadline.After(time.Now().Add(replayLeaseSafety))
+func needsInitialRenewalGate(state renewalState) bool {
+	if state.deadlineUntrusted || state.leaseTooShort || state.deadline.IsZero() {
+		return true
+	}
+	horizon := time.Until(state.deadline) - replayLeaseSafety
+	return horizon <= 2*state.responseRTT+renewRTTMargin
 }
 
 func (r *Receiver) loseRenewal(cancelHandler context.CancelFunc, cause error) renewalOutcome {
@@ -670,7 +768,7 @@ func (r *Receiver) stopRenewal(cancelHandler context.CancelFunc, err error, canc
 // win the race, perform side effects, and cancel the renewal before it was sent.
 func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state, attemptState renewalState, cancelHandler context.CancelFunc, cancelled func() bool, fail func(error, bool)) (renewalState, bool) {
 	attemptCtx, cancelAttempt := initialRenewalAttemptContext(ctx, attemptState)
-	newDeadline, err := r.renewMessage(attemptCtx, m)
+	lease, err := r.renewMessage(attemptCtx, m)
 	attemptErr := attemptCtx.Err()
 	cancelAttempt()
 	if ctx.Err() != nil {
@@ -698,7 +796,15 @@ func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state,
 
 	// The successful broker acknowledgement is the dispatch fence. Do not
 	// overturn it solely with a comparison against the client's wall clock.
-	return state.acceptRenewal(newDeadline, time.Now()), true
+	state = state.acceptRenewal(lease, time.Now())
+	if !r.notifyDegradedClock(ctx, state.clockUnavailable) {
+		return state, false
+	}
+	if state.leaseTooShort {
+		r.loseRenewal(cancelHandler, fmt.Errorf("%w: renewed lease is shorter than the minimum safe renewal interval", ErrLockLost))
+		return state, false
+	}
+	return state, true
 }
 
 func initialRenewalAttemptContext(ctx context.Context, state renewalState) (context.Context, context.CancelFunc) {
@@ -734,14 +840,14 @@ func autoRenewDelay(deadline time.Time) time.Duration {
 	return delay
 }
 
-func (r *Receiver) renewMessage(ctx context.Context, m *Message) (time.Time, error) {
+func (r *Receiver) renewMessage(ctx context.Context, m *Message) (renewalLease, error) {
 	r.renewCapabilityMu.Lock()
 	unsupported := r.deadlineRenewUnsupported
 	r.renewCapabilityMu.Unlock()
 	if source, ok := r.src.(deadlineRenewer); ok && !unsupported {
-		deadline, err := source.renewDeadline(ctx, m.queue, m.SequenceNumber, m.lockToken)
+		lease, err := source.renewDeadline(ctx, m.queue, m.SequenceNumber, m.lockToken)
 		if !errors.Is(err, ErrUnsupported) {
-			return deadline, err
+			return lease, err
 		}
 		// An older broker may not implement the deadline-bearing route. Fall back
 		// to stable single-message Renew from now on, not once per heartbeat.
@@ -749,7 +855,7 @@ func (r *Receiver) renewMessage(ctx context.Context, m *Message) (time.Time, err
 		r.deadlineRenewUnsupported = true
 		r.renewCapabilityMu.Unlock()
 	}
-	return time.Time{}, m.Renew(ctx)
+	return renewalLease{}, m.Renew(ctx)
 }
 
 func renewalAttemptContext(ctx context.Context, state renewalState) (context.Context, context.CancelFunc) {
@@ -763,21 +869,39 @@ func renewalDelay(state renewalState) time.Duration {
 	if state.deadlineUntrusted {
 		return renewUntrustedDelay
 	}
+	if state.leaseTooShort {
+		return 0
+	}
 	// Schedule inside the same safety-adjusted horizon used by the RPC
 	// watchdog. Basing the wait on the full lease would make a 20ms lease wait
 	// 10ms and start its request exactly when the 10ms safety deadline fires.
-	return autoRenewDelay(state.deadline.Add(-replayLeaseSafety))
+	horizon := time.Until(state.deadline) - replayLeaseSafety
+	if horizon <= 0 {
+		return 0
+	}
+	delay := autoRenewDelay(state.deadline.Add(-replayLeaseSafety))
+	latest := horizon - 2*state.responseRTT - renewRTTMargin
+	if latest <= 0 {
+		return 0
+	}
+	if delay > latest {
+		return latest
+	}
+	return delay
 }
 
 func (r *Receiver) renewLoop(ctx context.Context, m *Message, state renewalState, cancelHandler context.CancelFunc, cancelled func() bool, fail func(error, bool)) renewalOutcome {
 	for {
+		if state.leaseTooShort {
+			return r.loseRenewal(cancelHandler, fmt.Errorf("%w: renewed lease is shorter than the minimum safe renewal interval", ErrLockLost))
+		}
 		delay := renewalDelay(state)
 		if !waitContext(ctx, delay) {
 			return renewalOutcome{}
 		}
 		for retry := 0; ; retry++ {
 			attemptCtx, cancelAttempt := renewalAttemptContext(ctx, state)
-			newDeadline, err := r.renewMessage(attemptCtx, m)
+			lease, err := r.renewMessage(attemptCtx, m)
 			attemptErr := attemptCtx.Err()
 			cancelAttempt()
 			if ctx.Err() != nil {
@@ -790,7 +914,10 @@ func (r *Receiver) renewLoop(ctx context.Context, m *Message, state renewalState
 				return r.loseRenewal(cancelHandler, attemptErr)
 			}
 			if err == nil {
-				state = state.acceptRenewal(newDeadline, time.Now())
+				state = state.acceptRenewal(lease, time.Now())
+				if !r.notifyDegradedClock(ctx, state.clockUnavailable) {
+					return renewalOutcome{}
+				}
 				break
 			}
 			if !retryableManagedError(err) {

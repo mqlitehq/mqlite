@@ -33,10 +33,21 @@ upgrade notes before replacing a broker.
 - Separate the untrusted-clock renewal cadence from its request watchdog and
   bound the initial renewal request. Cross-zone latency no longer trips a hard
   100 ms timeout, while response-bound server time keeps an ordinary long lease
-  from looking like a millisecond lease solely because clocks differ. Genuine
-  short leases retain the faster cadence required to stay live. A replayed
-  Receive is fenced by one broker Renew before dispatch even when continuous
-  auto-renew is disabled.
+  from looking like a millisecond lease solely because clocks differ. Renewal
+  scheduling now reserves two observed round trips before the conservative local
+  deadline, so a one-second lease on a 400 ms path renews immediately instead of
+  starting a request that its own watchdog must cancel. Coarse HTTP `Date`
+  observations use the bounded degraded mode when their one-second uncertainty
+  dominates a short lease; a confirmed exact lease below the 50 ms minimum
+  cadence fails closed instead of hot-looping. A replayed Receive is fenced by
+  one broker Renew before dispatch even when continuous auto-renew is disabled.
+- Treat a received HTTP 499 as a transient managed-operation response while the
+  Receiver's own context remains live. Receive retries keep the same attempt ID,
+  so a cancellation response from an older broker or intermediary cannot
+  permanently stop consumers; caller cancellation still stops immediately. The
+  Receiver also reports one advisory `onError` diagnostic when neither
+  broker-time header survives an intermediary, then uses degraded clock
+  scheduling.
 - Preserve applications that wrap `http.DefaultTransport`; the wrapper remains
   caller-owned and is not closed. Because an opaque `RoundTripper` cannot be
   cloned or tuned, those applications remain responsible for its connection-pool

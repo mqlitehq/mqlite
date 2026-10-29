@@ -609,25 +609,25 @@ func (e *Embedded) renew(ctx context.Context, q string, seq int64, tok string) e
 // renewDeadline is the managed Receiver's deadline-bearing renewal path. Keep
 // Message.Renew's public error-only signature stable while pacing later
 // heartbeats from the deadline the engine actually committed.
-func (e *Embedded) renewDeadline(ctx context.Context, q string, seq int64, tok string) (time.Time, error) {
+func (e *Embedded) renewDeadline(ctx context.Context, q string, seq int64, tok string) (renewalLease, error) {
 	results, err := e.eng.RenewBatch(ctx, q, []engine.SettleItem{{SeqNumber: seq, LockToken: tok}})
 	if err != nil {
-		return time.Time{}, err
+		return renewalLease{}, err
 	}
 	if len(results) != 1 || results[0].SeqNumber != seq {
-		return time.Time{}, fmt.Errorf("mqlite: invalid embedded RenewBatch result")
+		return renewalLease{}, fmt.Errorf("mqlite: invalid embedded RenewBatch result")
 	}
 	result := results[0]
 	if !result.Ok {
 		if result.LockedUntilMs != 0 {
-			return time.Time{}, fmt.Errorf("mqlite: invalid embedded RenewBatch lost-lock deadline")
+			return renewalLease{}, fmt.Errorf("mqlite: invalid embedded RenewBatch lost-lock deadline")
 		}
-		return time.Time{}, ErrLockLost
+		return renewalLease{}, ErrLockLost
 	}
 	if result.LockedUntilMs <= 0 {
-		return time.Time{}, fmt.Errorf("mqlite: invalid embedded RenewBatch deadline")
+		return renewalLease{}, fmt.Errorf("mqlite: invalid embedded RenewBatch deadline")
 	}
-	return msFromEpoch(result.LockedUntilMs), nil
+	return renewalLease{deadline: msFromEpoch(result.LockedUntilMs)}, nil
 }
 
 // newHTTPServer builds the broker's http.Server with hardening defaults (review F9,

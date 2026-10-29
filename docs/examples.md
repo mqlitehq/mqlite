@@ -178,12 +178,19 @@ deadline and the broker's fresh `now + lock_duration` candidate (capped at a fix
 subscription expiry), rather than adding a duration to the old deadline. It must
 arrive before the current lease expires and it cannot extend message TTL or a fixed
 subscription lifetime. The Receiver retries transient renewal failures while the
-known lease still leaves time. If renewal is rejected or cannot be confirmed before
-that deadline, it cancels the individual handler context and skips Complete/Abandon
-for that stale delivery. The handler must honor `ctx.Done()` and remain idempotent:
+known lease still leaves time. It starts earlier when the previous response measured
+a material round trip, leaving transport headroom before the conservative local
+deadline. If an exact confirmed lease is shorter than the minimum safe cadence, or
+renewal is rejected or cannot be confirmed before that deadline, it cancels the
+individual handler context and skips Complete/Abandon for that stale delivery. The
+handler must honor `ctx.Done()` and remain idempotent:
 another consumer may receive the message after the lease is lost. Exact Complete and
 Abandon requests are also replayed within a five-second settlement window when an
 acknowledgement is lost; the broker's settlement receipt makes that replay safe.
+If a broker or intermediary returns HTTP 499, it is retried while the Receiver's
+own context remains live, using the same Receive attempt ID. If a proxy removes
+both broker-time headers, `WithErrorHandler` receives one degraded-clock
+diagnostic.
 
 ## 4. Topic subscription lifecycle
 
