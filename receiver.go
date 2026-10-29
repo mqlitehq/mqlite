@@ -732,14 +732,19 @@ func renewalAttemptContext(ctx context.Context, state renewalState) (context.Con
 	return context.WithDeadline(ctx, state.deadline.Add(-replayLeaseSafety))
 }
 
+func renewalDelay(state renewalState) time.Duration {
+	if state.deadlineUntrusted {
+		return renewUntrustedDelay
+	}
+	// Schedule inside the same safety-adjusted horizon used by the RPC
+	// watchdog. Basing the wait on the full lease would make a 20ms lease wait
+	// 10ms and start its request exactly when the 10ms safety deadline fires.
+	return autoRenewDelay(state.deadline.Add(-replayLeaseSafety))
+}
+
 func (r *Receiver) renewLoop(ctx context.Context, m *Message, state renewalState, cancelHandler context.CancelFunc, cancelled func() bool, fail func(error, bool)) renewalOutcome {
 	for {
-		var delay time.Duration
-		if state.deadlineUntrusted {
-			delay = renewUntrustedDelay
-		} else {
-			delay = autoRenewDelay(state.deadline.Add(-replayLeaseSafety))
-		}
+		delay := renewalDelay(state)
 		if !waitContext(ctx, delay) {
 			return renewalOutcome{}
 		}

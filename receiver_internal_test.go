@@ -667,16 +667,32 @@ func TestAutoRenewDelayUsesOneThirdAndStaysInsideShortLease(t *testing.T) {
 	}
 }
 
-func TestReceiverShortLeaseStartsRenewBeforeWatchdog(t *testing.T) {
+func TestRenewalDelayLeavesWatchdogHeadroom(t *testing.T) {
+	state := renewalState{deadline: time.Now().Add(20 * time.Millisecond)}
+	horizon := time.Until(state.deadline.Add(-replayLeaseSafety))
+	delay := renewalDelay(state)
+	if delay <= 0 || delay >= horizon {
+		t.Fatalf("20ms lease renewal delay = %s with watchdog horizon %s, want positive headroom", delay, horizon)
+	}
+	state.deadlineUntrusted = true
+	if delay := renewalDelay(state); delay != renewUntrustedDelay {
+		t.Fatalf("untrusted renewal delay = %s, want %s", delay, renewUntrustedDelay)
+	}
+}
+
+func TestReceiverRenewStartsBeforeWatchdog(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	f := &fakeSource{}
-	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(20 * time.Millisecond), queue: "q", s: f}}
+	// Keep the behavioral test comfortably above coarse Windows race-detector
+	// scheduling granularity. TestRenewalDelayLeavesWatchdogHeadroom pins the
+	// exact 20ms arithmetic without relying on sub-10ms goroutine scheduling.
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(200 * time.Millisecond), queue: "q", s: f}}
 	renewed := make(chan struct{})
 	var once sync.Once
 	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
 		once.Do(func() { close(renewed) })
-		return time.Now().Add(20 * time.Millisecond), nil
+		return time.Now().Add(200 * time.Millisecond), nil
 	}
 	f.abandonFn = func(context.Context) error {
 		cancel()
