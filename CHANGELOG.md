@@ -10,6 +10,39 @@ refuse old DB files (`ErrSchemaVersionMismatch` — recreate, don't migrate).
 Compatible additions can preserve the existing schema token; read each release's
 upgrade notes before replacing a broker.
 
+## Unreleased
+
+> The canonical schema token remains **7** and no database rebuild is required.
+> The broker adds only an optional response header; older clients ignore it, and
+> current clients retain a conservative fallback for older brokers.
+
+### Harden remote delivery recovery and lease renewal (MQLITE-125)
+
+- Make managed Peek-Lock delivery replay transient Receive calls with one stable
+  attempt ID and replay the exact Complete or Abandon request when its response is
+  lost. Commit-like operations now reject malformed successful acknowledgements
+  as `ErrOutcomeUnknown`, all RPCs refuse redirects, and client-owned transports
+  reuse a bounded connection pool instead of creating a connection per request.
+- Stamp broker responses with `X-Mqlite-Server-Time-Ms`, using the same injectable
+  clock as lease decisions. The remote client maps absolute lease deadlines onto
+  its local monotonic clock with a conservative transport budget, so a fast client
+  clock no longer prevents handler dispatch or drives messages into the DLQ. Older
+  brokers use HTTP `Date` when available; without either time header they retain
+  absolute-deadline behavior and use bounded untrusted-clock pacing only when that
+  deadline is locally unusable.
+- Separate the untrusted-clock renewal cadence from its request watchdog and
+  bound the initial renewal request. Cross-zone latency no longer trips a hard
+  100 ms timeout, while response-bound server time keeps an ordinary long lease
+  from looking like a millisecond lease solely because clocks differ. Genuine
+  short leases retain the faster cadence required to stay live. A replayed
+  Receive is fenced by one broker Renew before dispatch even when continuous
+  auto-renew is disabled.
+- Preserve applications that wrap `http.DefaultTransport`; the wrapper remains
+  caller-owned and is not closed. Because an opaque `RoundTripper` cannot be
+  cloned or tuned, those applications remain responsible for its connection-pool
+  sizing. Missing remote queues now match both `ErrQueueNotFound` and the broader
+  `ErrNotFound`, and `HTTPError` preserves non-2xx status codes for inspection.
+
 ## v0.4.2 — 2026-10-28
 
 > **Patch upgrade from v0.4.1:** the canonical schema token remains **7** and no

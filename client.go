@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +71,11 @@ type Client struct {
 	token     string
 	http      *http.Client
 	ownedHTTP bool
+}
+
+type serverTimeObservation struct {
+	localAt     time.Time
+	serverUpper time.Time
 }
 
 var _ deadlineRenewer = (*Client)(nil)
@@ -172,44 +178,105 @@ func readClientResponse(r io.Reader, contentLength, limit int64) ([]byte, error)
 	return data, nil
 }
 
+func observeServerTime(header http.Header, started, received time.Time) serverTimeObservation {
+	roundTrip := received.Sub(started)
+	if roundTrip < 0 {
+		roundTrip = 0
+	}
+	var serverLower, serverUpper time.Time
+	if raw := header.Get(wire.ServerTimeHeader); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
+			serverLower = time.UnixMilli(ms)
+			serverUpper = serverLower.Add(time.Millisecond + roundTrip)
+		}
+	}
+	if serverLower.IsZero() {
+		if parsed, err := http.ParseTime(header.Get("Date")); err == nil {
+			serverLower = parsed
+			serverUpper = parsed.Add(time.Second + roundTrip)
+		}
+	}
+	if serverLower.IsZero() {
+		return serverTimeObservation{}
+	}
+	return serverTimeObservation{localAt: received, serverUpper: serverUpper}
+}
+
+// localLeaseDeadline maps a broker-wall deadline onto the local monotonic
+// timeline. The upper bound deliberately charges the complete observed RTT, not
+// an assumed symmetric half: a slow response may have spent almost all its time
+// after the broker committed the lease. It never substitutes the local wall
+// clock merely because it falls inside the uncertainty interval. In particular,
+// doing that after a long poll could extend a lease when the client clock is slow.
+func (o serverTimeObservation) localLeaseDeadline(deadline time.Time) (time.Time, bool) {
+	if deadline.IsZero() || o.localAt.IsZero() {
+		return time.Time{}, false
+	}
+	now := time.Now()
+	elapsed := now.Sub(o.localAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	serverUpper := o.serverUpper.Add(elapsed)
+	return now.Add(deadline.Sub(serverUpper)), true
+}
+
 func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) error {
+	_, err := c.postObserved(ctx, path, reqBody, respOut)
+	return err
+}
+
+// postObserved returns the clock observation from this exact successful response.
+// Lease-bearing data must use its own response rather than a process-wide sample:
+// a long-poll RTT is a safe budget for that batch, but must not shorten unrelated
+// leases returned by later requests.
+func (c *Client) postObserved(ctx context.Context, path string, reqBody, respOut any) (serverTimeObservation, error) {
 	b, err := json.Marshal(reqBody)
 	if err != nil {
-		return err
+		return serverTimeObservation{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+path, bytes.NewReader(b))
 	if err != nil {
-		return err
+		return serverTimeObservation{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	started := time.Now()
 	resp, err := c.http.Do(req)
+	received := time.Now()
 	if err != nil {
 		if isLifecycleDeletePath(path) {
 			// Once RoundTrip starts, a transport error cannot prove whether the
 			// broker committed the name-addressed deletion. Do not invite an
 			// automatic replay that could hit a later same-name resource.
-			return fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %s", ErrOutcomeUnknown, lifecycleReconcileHint(path), err.Error())
+			return serverTimeObservation{}, fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %s", ErrOutcomeUnknown, lifecycleReconcileHint(path), err.Error())
 		}
-		return err
+		return serverTimeObservation{}, err
 	}
 	defer resp.Body.Close()
+	// A proxy or gateway may synthesize redirects and failures with its own Date
+	// header. Only a successful broker response is evidence about the clock that
+	// issued the lease carried by that response.
+	var observation serverTimeObservation
+	if resp.StatusCode/100 == 2 {
+		observation = observeServerTime(resp.Header, started, received)
+	}
 	if resp.StatusCode/100 == 3 {
 		if isLifecycleDeletePath(path) {
-			return fmt.Errorf("%w: deletion received HTTP redirect %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
+			return serverTimeObservation{}, fmt.Errorf("%w: deletion received HTTP redirect %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
 		}
 		// Location is controlled by an intermediary and may contain credentials.
 		// Report only the status; RPC redirects are never part of the protocol.
-		return &HTTPError{StatusCode: resp.StatusCode, cause: errors.New("mqlite: unexpected HTTP redirect")}
+		return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: errors.New("mqlite: unexpected HTTP redirect")}
 	}
 	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 5 {
 		// An intermediary can synthesize a gateway error after the broker has
 		// accepted the request but before its acknowledgement reaches us. The
 		// status and body therefore cannot safely authorize a name-only replay.
-		return fmt.Errorf("%w: deletion received HTTP %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
+		return serverTimeObservation{}, fmt.Errorf("%w: deletion received HTTP %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
 	}
 	keyResponse := path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey
 	if resp.StatusCode/100 != 2 {
@@ -232,7 +299,7 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 		// 404 from something in front of the broker.
 		if resp.StatusCode == http.StatusNotFound &&
 			(eb.Code == "" || strings.HasPrefix(eb.Message, "no such path")) {
-			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrUnsupported, path)}
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrUnsupported, path)}
 		}
 		if keyResponse {
 			// Intermediary error bodies are untrusted too. Keep recognized codes
@@ -253,18 +320,18 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 			eb.Code = "permission_denied"
 		}
 		if path == wire.PathDeleteSubscription && eb.Code == "not_found" {
-			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message)}
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message)}
 		}
 		if path == wire.PathSubscribe && eb.Code == "resource_exhausted" {
-			return &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionLimit, eb.Message)}
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionLimit, eb.Message)}
 		}
 		if eb.Code == "" {
-			return &HTTPError{StatusCode: resp.StatusCode}
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode}
 		}
-		return &HTTPError{StatusCode: resp.StatusCode, cause: mapErr(eb)}
+		return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: mapErr(eb)}
 	}
 	if respOut == nil {
-		return nil
+		return observation, nil
 	}
 
 	var data []byte
@@ -283,21 +350,21 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 	if err != nil {
 		switch {
 		case isLifecycleDeletePath(path):
-			return fmt.Errorf("%w: invalid deletion acknowledgement; inspect %s to reconcile", ErrOutcomeUnknown, lifecycleReconcileHint(path))
+			return observation, fmt.Errorf("%w: invalid deletion acknowledgement; inspect %s to reconcile", ErrOutcomeUnknown, lifecycleReconcileHint(path))
 		case keyResponse && (path == wire.PathCreateKey || path == wire.PathRevokeKey):
-			return fmt.Errorf("%w: incomplete or oversized access key response", ErrOutcomeUnknown)
+			return observation, fmt.Errorf("%w: incomplete or oversized access key response", ErrOutcomeUnknown)
 		default:
-			return &invalidSuccessResponseError{cause: err}
+			return observation, &invalidSuccessResponseError{cause: err}
 		}
 	}
 	if raw, ok := respOut.(*json.RawMessage); ok {
 		*raw = data
-		return nil
+		return observation, nil
 	}
 	if err := json.Unmarshal(data, respOut); err != nil {
-		return &invalidSuccessResponseError{cause: err}
+		return observation, &invalidSuccessResponseError{cause: err}
 	}
-	return nil
+	return observation, nil
 }
 
 func mapErr(eb wire.ErrorBody) error {
@@ -355,23 +422,26 @@ func outToWire(m OutMessage) wire.Message {
 	}
 }
 
-func (c *Client) wireToMessage(queue string, wm wire.Message) *Message {
+func (c *Client) wireToMessage(queue string, wm wire.Message, observation serverTimeObservation) *Message {
+	lockedUntil := msToTime(wm.LockedUntilMs)
+	localLockedUntil, _ := observation.localLeaseDeadline(lockedUntil)
 	return &Message{
-		SequenceNumber: wm.SeqNumber,
-		Body:           wm.Body,
-		MessageID:      wm.MessageID,
-		GroupID:        wm.GroupID,
-		CorrelationID:  wm.CorrelationID,
-		ReplyTo:        wm.ReplyTo,
-		Subject:        wm.Subject,
-		ContentType:    wm.ContentType,
-		Properties:     wm.Properties,
-		DeliveryCount:  wm.DeliveryCount,
-		EnqueuedAt:     msToTime(wm.EnqueuedAtMs),
-		LockedUntil:    msToTime(wm.LockedUntilMs),
-		queue:          queue,
-		lockToken:      wm.LockToken,
-		s:              c,
+		SequenceNumber:   wm.SeqNumber,
+		Body:             wm.Body,
+		MessageID:        wm.MessageID,
+		GroupID:          wm.GroupID,
+		CorrelationID:    wm.CorrelationID,
+		ReplyTo:          wm.ReplyTo,
+		Subject:          wm.Subject,
+		ContentType:      wm.ContentType,
+		Properties:       wm.Properties,
+		DeliveryCount:    wm.DeliveryCount,
+		EnqueuedAt:       msToTime(wm.EnqueuedAtMs),
+		LockedUntil:      lockedUntil,
+		localLockedUntil: localLockedUntil,
+		queue:            queue,
+		lockToken:        wm.LockToken,
+		s:                c,
 	}
 }
 
@@ -593,29 +663,36 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Messa
 //
 // SettleResult.LockedUntil is the absolute broker deadline that was committed. Ok says the lease
 // was live when the broker's STATEMENT finished; the response still has to travel back to you, so
-// on a very short lease it can lapse on the way. Comparing LockedUntil with a client clock assumes
-// those clocks are synchronized. The managed Receiver uses successful renewal as a dispatch fence
-// and falls back to conservative local pacing when that absolute comparison is unusable.
+// on a very short lease it can lapse on the way. Raw callers comparing LockedUntil with a client
+// wall clock still require synchronized clocks. The managed Receiver binds the broker-time header
+// from this exact response to that deadline, maps it onto local monotonic time, and uses successful
+// renewal as a dispatch fence when no usable clock observation is available.
 func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
+	results, _, err := c.renewBatchObserved(ctx, queue, msgs...)
+	return results, err
+}
+
+func (c *Client) renewBatchObserved(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, serverTimeObservation, error) {
 	if len(msgs) > MaxRenewBatch {
-		return nil, fmt.Errorf("%w: renew batch exceeds %d messages", ErrInvalidArgument, MaxRenewBatch)
+		return nil, serverTimeObservation{}, fmt.Errorf("%w: renew batch exceeds %d messages", ErrInvalidArgument, MaxRenewBatch)
 	}
 	items, err := settleItems(msgs)
 	if err != nil {
-		return nil, err
+		return nil, serverTimeObservation{}, err
 	}
 	var resp wire.RenewBatchResponse
-	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
+	observation, err := c.postObserved(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp)
+	if err != nil {
 		var invalid *invalidSuccessResponseError
 		if errors.As(err, &invalid) {
-			return nil, &ambiguousAcknowledgementError{operation: "RenewBatch", cause: err}
+			return nil, serverTimeObservation{}, &ambiguousAcknowledgementError{operation: "RenewBatch", cause: err}
 		}
-		return nil, err
+		return nil, serverTimeObservation{}, err
 	}
 	if err := validateBatchResults(msgs, resp.Results, true); err != nil {
-		return nil, &ambiguousAcknowledgementError{operation: "RenewBatch", cause: err}
+		return nil, serverTimeObservation{}, &ambiguousAcknowledgementError{operation: "RenewBatch", cause: err}
 	}
-	return toSettleResults(resp.Results), nil
+	return toSettleResults(resp.Results), observation, nil
 }
 
 // ── receive ─────────────────────────────────────────────────────────────────
@@ -625,16 +702,21 @@ func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message)
 func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([]*Message, error) {
 	o := firstOpt(opts)
 	var resp wire.ReceiveResponse
+	var observation serverTimeObservation
 	if len(o.Pick) > 0 {
-		if err := c.post(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, SeqNumbers: o.Pick}, &resp); err != nil {
+		var err error
+		observation, err = c.postObserved(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, SeqNumbers: o.Pick}, &resp)
+		if err != nil {
 			return nil, err
 		}
 	} else {
 		eo := o.toEngine()
-		if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+		var err error
+		observation, err = c.postObserved(ctx, wire.PathReceive, wire.ReceiveRequest{
 			Queue: queue, MaxMessages: eo.MaxMessages, WaitTimeMs: eo.WaitMs,
 			ReceiveMode: int(eo.Mode), AttemptID: eo.AttemptID, // idempotent receive
-		}, &resp); err != nil {
+		}, &resp)
+		if err != nil {
 			var invalid *invalidSuccessResponseError
 			if eo.Mode == engine.ReceiveAndDelete && errors.As(err, &invalid) {
 				return nil, &ambiguousAcknowledgementError{operation: "AtMostOnce Receive", cause: err}
@@ -644,21 +726,22 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
-		out[i] = c.wireToMessage(queue, wm)
+		out[i] = c.wireToMessage(queue, wm, observation)
 	}
 	return out, nil
 }
 
 func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
 	var resp wire.ReceiveResponse
-	if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+	observation, err := c.postObserved(ctx, wire.PathReceive, wire.ReceiveRequest{
 		Queue: queue, MaxMessages: max, WaitTimeMs: waitMs, ReceiveMode: int(mode), AttemptID: attemptID,
-	}, &resp); err != nil {
+	}, &resp)
+	if err != nil {
 		return nil, err
 	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
-		out[i] = c.wireToMessage(queue, wm)
+		out[i] = c.wireToMessage(queue, wm, observation)
 	}
 	return out, nil
 }
@@ -942,12 +1025,15 @@ func (c *Client) renew(ctx context.Context, q string, seq int64, tok string) err
 }
 
 func (c *Client) renewDeadline(ctx context.Context, q string, seq int64, tok string) (time.Time, error) {
-	results, err := c.RenewBatch(ctx, q, c.Message(q, seq, tok))
+	results, observation, err := c.renewBatchObserved(ctx, q, c.Message(q, seq, tok))
 	if err != nil {
 		return time.Time{}, err
 	}
 	if len(results) != 1 || !results[0].Ok {
 		return time.Time{}, ErrLockLost
+	}
+	if local, ok := observation.localLeaseDeadline(results[0].LockedUntil); ok {
+		return local, nil
 	}
 	return results[0].LockedUntil, nil
 }

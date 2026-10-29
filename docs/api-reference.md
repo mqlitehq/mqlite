@@ -33,6 +33,17 @@ values replace earlier ones, while repeated object and map values may merge.
 - **`body`** is **base64** in JSON (Go marshals `[]byte` as base64).
 - **Timestamps** are **epoch milliseconds** (UTC) integers. Message durations use
   `*_ms`; observability durations explicitly named `*_seconds` retain fractional seconds.
+- **Broker time header:** every broker response includes
+  `X-Mqlite-Server-Time-Ms`, the UTC epoch-millisecond value from the same clock
+  used for lease, TTL, scheduling, and settlement decisions. The managed Go
+  client trusts it only on successful broker responses and maps absolute lease
+  deadlines onto its local monotonic clock with a conservative transport budget.
+  Older clients ignore the additive header. With an older broker, the client can
+  use HTTP `Date` at its one-second precision. Without either header it retains
+  absolute-deadline behavior and uses bounded untrusted-clock pacing only when
+  that deadline is locally unusable; raw HTTP callers should map broker time or
+  synchronize clocks.
+  CORS-enabled brokers expose this header to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
@@ -466,11 +477,16 @@ against a 2 s lock, and most of the locks expire mid-pass.
 `locked_until_ms` is the absolute broker deadline that was actually committed — renew again before
 it. And `ok=true` means the lease was live **when the broker's statement finished** — not when the
 answer reaches you. The result still has to be mapped, encoded and travel back, so on a very short
-lease it can lapse on the way. Comparing the absolute timestamp with a client clock assumes those
-clocks are synchronized. The managed Receiver treats a successful renewal as the dispatch fence
-when that comparison is unusable, then uses a conservative local cadence and fails closed on the
-first unconfirmed heartbeat. Raw `RenewBatch` callers should keep clocks synchronized and must not
-turn clock offset alone into `ErrLockLost`. (If the write itself outlived the lock, you get
+lease it can lapse on the way. Current brokers return `X-Mqlite-Server-Time-Ms` from the same clock
+as the lease; the managed Receiver combines that observation with local monotonic time and a
+conservative transport budget instead of directly comparing two hosts' wall clocks. It performs a
+bounded synchronous Renew before dispatch when a deadline is unusable, separates renewal cadence
+from the request watchdog, and never extends a lease merely because the local wall clock falls in a
+wide uncertainty interval. Older brokers use HTTP `Date` when available; without either time header
+they retain absolute-deadline behavior and use conservative pacing only when that value is locally
+unusable.
+Raw `RenewBatch` callers should map the broker clock likewise (or keep clocks synchronized) and
+must not turn clock offset alone into `ErrLockLost`. (If the write itself outlived the lock, you get
 `ok=false` rather than a lock you never really held.) Like single-message Renew, the batch
 operation leaves token, state, and
 `delivery_count` unchanged and commits the later of the existing deadline and the

@@ -145,57 +145,82 @@ func newBroker(t *testing.T, token string) (*mqlite.Client, *mqlite.Embedded) {
 // Exercise the N1 clock-skew regression through the real engine, HTTP handler,
 // wire decoder, managed Receiver, and terminal settlement path.
 func TestRemoteReceiverAutoRenewToleratesBrokerClockBehindClient(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-	eng, err := mqlite.OpenEmbedded(
-		context.Background(),
-		":memory:",
-		mqlite.WithClock(func() int64 { return time.Now().Add(-2 * time.Second).UnixMilli() }),
-		mqlite.WithoutBackground(),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer eng.Close()
-	if err := eng.CreateQueue(context.Background(), "q", mqlite.QueueConfig{LockDuration: time.Second, MaxDeliveryCount: 3}); err != nil {
-		t.Fatal(err)
-	}
-	ts := httptest.NewServer(server.New(eng.Engine(), []string{"clock-test"}).Handler())
-	defer ts.Close()
-	client, err := mqlite.Open(context.Background(), ts.URL, mqlite.WithToken("clock-test"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	if _, err := client.SendOne(context.Background(), "q", mqlite.OutMessage{Body: []byte("clock skew")}); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct {
+		name         string
+		rtt          time.Duration
+		receiveDelay time.Duration
+		handlerFor   time.Duration
+	}{
+		{name: "local", handlerFor: 50 * time.Millisecond},
+		{name: "150ms RTT", rtt: 150 * time.Millisecond, handlerFor: 500 * time.Millisecond},
+		{name: "long receive then fast renew", receiveDelay: 1200 * time.Millisecond, handlerFor: 500 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			eng, err := mqlite.OpenEmbedded(
+				context.Background(),
+				":memory:",
+				mqlite.WithClock(func() int64 { return time.Now().Add(-2 * time.Second).UnixMilli() }),
+				mqlite.WithoutBackground(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eng.Close()
+			if err := eng.CreateQueue(context.Background(), "q", mqlite.QueueConfig{LockDuration: time.Second, MaxDeliveryCount: 3}); err != nil {
+				t.Fatal(err)
+			}
+			broker := server.New(eng.Engine(), []string{"clock-test"}).Handler()
+			if tc.rtt > 0 || tc.receiveDelay > 0 {
+				next := broker
+				broker = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					delay := tc.rtt
+					if r.URL.Path == wire.PathReceive && tc.receiveDelay > 0 {
+						delay = tc.receiveDelay
+					}
+					time.Sleep(delay)
+					next.ServeHTTP(w, r)
+				})
+			}
+			ts := httptest.NewServer(broker)
+			defer ts.Close()
+			client, err := mqlite.Open(context.Background(), ts.URL, mqlite.WithToken("clock-test"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if _, err := client.SendOne(context.Background(), "q", mqlite.OutMessage{Body: []byte("clock skew")}); err != nil {
+				t.Fatal(err)
+			}
 
-	handlerCalls := 0
-	var observed []error
-	err = client.Receiver("q", mqlite.WithAutoRenew(), mqlite.WithErrorHandler(func(err error) {
-		observed = append(observed, err)
-	})).Run(ctx, func(context.Context, *mqlite.Message) error {
-		handlerCalls++
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-		return nil
-	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run = %v, want context.Canceled after handler", err)
-	}
-	if handlerCalls != 1 {
-		t.Fatalf("handler calls = %d, want one", handlerCalls)
-	}
-	if len(observed) != 0 {
-		t.Fatalf("receiver errors = %v, want none", observed)
-	}
-	metrics, err := eng.Stats(context.Background(), "q")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if metrics.Total != 0 || metrics.DeadLettered != 0 {
-		t.Fatalf("queue after completion: total=%d dead_lettered=%d, want 0/0", metrics.Total, metrics.DeadLettered)
+			handlerCalls := 0
+			var observed []error
+			err = client.Receiver("q", mqlite.WithAutoRenew(), mqlite.WithErrorHandler(func(err error) {
+				observed = append(observed, err)
+			})).Run(ctx, func(context.Context, *mqlite.Message) error {
+				handlerCalls++
+				time.Sleep(tc.handlerFor)
+				cancel()
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run = %v, want context.Canceled after handler", err)
+			}
+			if handlerCalls != 1 {
+				t.Fatalf("handler calls = %d, want one", handlerCalls)
+			}
+			if len(observed) != 0 {
+				t.Fatalf("receiver errors = %v, want none", observed)
+			}
+			metrics, err := eng.Stats(context.Background(), "q")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if metrics.Total != 0 || metrics.DeadLettered != 0 {
+				t.Fatalf("queue after completion: total=%d dead_lettered=%d, want 0/0", metrics.Total, metrics.DeadLettered)
+			}
+		})
 	}
 }
 

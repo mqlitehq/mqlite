@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,50 @@ import (
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
+
+func TestJSONResponsesCarryServerTime(t *testing.T) {
+	const brokerNow = int64(1_800_000_000_123)
+	eng, err := engine.Open(context.Background(), engine.Options{
+		DB:                ":memory:",
+		DisableBackground: true,
+		Now:               func() int64 { return brokerNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	h := server.New(eng, nil).Handler()
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "success", method: http.MethodGet, path: "/"},
+		{name: "error", method: http.MethodPost, path: wire.PathSend, body: "{"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)))
+			raw := rec.Header().Get(wire.ServerTimeHeader)
+			got, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				t.Fatalf("%s = %q: %v", wire.ServerTimeHeader, raw, err)
+			}
+			if got != brokerNow {
+				t.Fatalf("server time = %d, want injected broker clock %d", got, brokerNow)
+			}
+		})
+	}
+
+	misconfigured := server.New(eng, nil)
+	misconfigured.MonitorTokens = []string{"monitor"}
+	rec := httptest.NewRecorder()
+	misconfigured.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := rec.Header().Get(wire.ServerTimeHeader); got != strconv.FormatInt(brokerNow, 10) {
+		t.Fatalf("misconfiguration response %s = %q, want injected broker clock", wire.ServerTimeHeader, got)
+	}
+}
 
 // TestServerAuthAndErrors locks the broker's auth + error-envelope contract: the
 // status codes and {code,message} bodies clients branch on. The happy-path broker

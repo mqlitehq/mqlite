@@ -32,9 +32,13 @@ const (
 	renewMinimumDelay  = 50 * time.Millisecond
 	// Without broker time or a relative lease duration, a successful renewal
 	// whose absolute deadline is unusable locally cannot reveal its true
-	// remaining lifetime. Probe at a conservative bounded cadence and fail
-	// closed on the first unconfirmed renewal until the wire carries that data.
-	renewUntrustedDelay = 100 * time.Millisecond
+	// remaining lifetime. Probe at a conservative bounded cadence, but give the
+	// request a separate cross-zone-safe watchdog instead of making cadence the
+	// network timeout. New brokers provide server time so this is only a legacy
+	// fallback.
+	renewUntrustedDelay           = 250 * time.Millisecond
+	renewDefaultAttemptTimeout    = time.Second
+	renewMaxInitialAttemptTimeout = 5 * time.Second
 )
 
 // deadlineRenewer is an optional managed-Receiver extension. A source that can
@@ -106,9 +110,8 @@ type ReceiverOption func(*receiverConfig)
 // WithAutoRenew keeps locks alive with a background heartbeat for long handlers.
 // Transient renewal failures are retried while the known lease remains usable. If
 // client and broker clocks disagree, a successful broker acknowledgement gates
-// dispatch and renewals use a conservative local cadence; an unconfirmed renewal
-// then fails closed because no trustworthy retry budget exists. If the lock is
-// lost or renewal cannot be confirmed before its deadline, the per-message handler
+// dispatch and renewals use a conservative local cadence. If the lock is lost or
+// renewal cannot be confirmed by its request watchdog, the per-message handler
 // context is canceled and that delivery is not settled.
 func WithAutoRenew() ReceiverOption { return func(c *receiverConfig) { c.autoRenew = true } }
 
@@ -382,21 +385,15 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			return done()
 		}
 		// A Peek-Lock response without a message or lease deadline is invalid on
-		// every receive, including the first successful response. The local-clock
-		// stale cutoff is intentionally narrower: only an attempt replay may have
-		// spent its original lease waiting for lost responses. Applying it to a
-		// first response would reject a legitimate near-expiry delivery.
-		cutoff := time.Now().Add(replayLeaseSafety)
+		// every receive, including the first successful response. A non-zero replay
+		// deadline is not filtered with the client wall clock: a fast clock can make
+		// a broker-valid lease look stale. Replays are fenced by one synchronous
+		// Renew before dispatch, even when continuous auto-renew is disabled.
 		live := msgs[:0]
 		invalid := 0
-		stale := 0
 		for _, m := range msgs {
 			if m == nil || m.LockedUntil.IsZero() {
 				invalid++
-				continue
-			}
-			if hadTransientFailure && !r.cfg.autoRenew && !m.LockedUntil.After(cutoff) {
-				stale++
 				continue
 			}
 			live = append(live, m)
@@ -404,9 +401,6 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 		msgs = live
 		if invalid > 0 {
 			r.notify(fmt.Errorf("%w: discarded %d invalid peek-lock message(s) without a lease deadline", ErrLockLost, invalid))
-		}
-		if stale > 0 {
-			r.notify(fmt.Errorf("%w: discarded %d stale message(s) from receive replay", ErrLockLost, stale))
 		}
 		// The observer runs synchronously and may cancel Run in response to a
 		// filtered delivery. Re-check after the final callback so no surviving
@@ -442,16 +436,24 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 	var cancelRenew context.CancelFunc
 	var renewWG sync.WaitGroup
 	var renewal renewalOutcome
-	if r.cfg.autoRenew {
+	if r.cfg.autoRenew || forceInitialRenewal {
 		renewCtx, cancel := context.WithCancel(ctx)
-		cancelRenew = cancel
-		state := newRenewalState(m.LockedUntil)
-		if forceInitialRenewal || needsInitialRenewalGate(m.LockedUntil) {
+		leaseDeadline := m.LockedUntil
+		if !m.localLockedUntil.IsZero() {
+			leaseDeadline = m.localLockedUntil
+		}
+		state := newRenewalState(leaseDeadline)
+		if forceInitialRenewal || needsInitialRenewalGate(leaseDeadline) {
+			attemptState := state
 			if forceInitialRenewal {
-				// A replayed absolute deadline is not a trustworthy local horizon:
-				// a slow client clock can make an already-stale lease look far in
-				// the future. A deadline-bearing renewal can restore trust; a
-				// legacy success without one must stay in conservative mode.
+				// A replay always needs a fresh broker fence. A mapped monotonic
+				// deadline may bound that one RPC, but do not reuse the old replay
+				// horizon as the cadence after renewal. RenewBatch will supply the
+				// new mapped deadline; a legacy success stays in conservative mode.
+				if m.localLockedUntil.IsZero() {
+					attemptState.deadline = time.Time{}
+					attemptState.deadlineUntrusted = true
+				}
 				state.deadline = time.Time{}
 				state.deadlineUntrusted = true
 			}
@@ -460,7 +462,7 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 				return
 			}
 			var confirmed bool
-			state, confirmed = r.confirmInitialRenewal(renewCtx, m, state, cancelHandler, cancelled, fail)
+			state, confirmed = r.confirmInitialRenewal(renewCtx, m, state, attemptState, cancelHandler, cancelled, fail)
 			if !confirmed {
 				cancel()
 				return
@@ -473,11 +475,18 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 				return
 			}
 		}
-		renewWG.Add(1)
-		go func() {
-			defer renewWG.Done()
-			renewal = r.renewLoop(renewCtx, m, state, cancelHandler, cancelled, fail)
-		}()
+		if r.cfg.autoRenew {
+			cancelRenew = cancel
+			renewWG.Add(1)
+			go func() {
+				defer renewWG.Done()
+				renewal = r.renewLoop(renewCtx, m, state, cancelHandler, cancelled, fail)
+			}()
+		} else {
+			// A replay without continuous auto-renew needs only the synchronous
+			// broker fence above. Do not retain its request context for the handler.
+			cancel()
+		}
 	}
 	var stopRenewOnce sync.Once
 	stopRenew := func() {
@@ -659,12 +668,19 @@ func (r *Receiver) stopRenewal(cancelHandler context.CancelFunc, err error, canc
 // Receive response is already inside the local safety window. Starting the
 // handler and an immediate renew goroutine concurrently would let a fast handler
 // win the race, perform side effects, and cancel the renewal before it was sent.
-func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state renewalState, cancelHandler context.CancelFunc, cancelled func() bool, fail func(error, bool)) (renewalState, bool) {
-	newDeadline, err := r.renewMessage(ctx, m)
+func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state, attemptState renewalState, cancelHandler context.CancelFunc, cancelled func() bool, fail func(error, bool)) (renewalState, bool) {
+	attemptCtx, cancelAttempt := initialRenewalAttemptContext(ctx, attemptState)
+	newDeadline, err := r.renewMessage(attemptCtx, m)
+	attemptErr := attemptCtx.Err()
+	cancelAttempt()
+	if ctx.Err() != nil {
+		return state, false
+	}
+	if attemptErr != nil {
+		r.loseRenewal(cancelHandler, attemptErr)
+		return state, false
+	}
 	if err != nil {
-		if ctx.Err() != nil {
-			return state, false
-		}
 		if !retryableManagedError(err) {
 			if errors.Is(err, ErrLockLost) {
 				r.loseRenewal(cancelHandler, err)
@@ -673,9 +689,9 @@ func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state 
 			}
 			return state, false
 		}
-		// There is no safe lease time left for backoff before dispatch. A retryable
-		// failure is therefore an unconfirmed lock, just as it is when the normal
-		// renewal loop exhausts its deadline.
+		// No trustworthy retry budget exists before the first confirmed renew.
+		// The request watchdog is deliberately independent from the probe cadence,
+		// so ordinary network latency is not misclassified as this failure.
 		r.loseRenewal(cancelHandler, err)
 		return state, false
 	}
@@ -683,6 +699,17 @@ func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state 
 	// The successful broker acknowledgement is the dispatch fence. Do not
 	// overturn it solely with a comparison against the client's wall clock.
 	return state.acceptRenewal(newDeadline, time.Now()), true
+}
+
+func initialRenewalAttemptContext(ctx context.Context, state renewalState) (context.Context, context.CancelFunc) {
+	if state.deadlineUntrusted {
+		return context.WithTimeout(ctx, renewDefaultAttemptTimeout)
+	}
+	deadline := state.deadline.Add(-replayLeaseSafety)
+	if max := time.Now().Add(renewMaxInitialAttemptTimeout); deadline.After(max) {
+		deadline = max
+	}
+	return context.WithDeadline(ctx, deadline)
 }
 
 func autoRenewDelay(deadline time.Time) time.Duration {
@@ -727,7 +754,7 @@ func (r *Receiver) renewMessage(ctx context.Context, m *Message) (time.Time, err
 
 func renewalAttemptContext(ctx context.Context, state renewalState) (context.Context, context.CancelFunc) {
 	if state.deadlineUntrusted {
-		return context.WithTimeout(ctx, renewUntrustedDelay)
+		return context.WithTimeout(ctx, renewDefaultAttemptTimeout)
 	}
 	return context.WithDeadline(ctx, state.deadline.Add(-replayLeaseSafety))
 }
@@ -773,9 +800,9 @@ func (r *Receiver) renewLoop(ctx context.Context, m *Message, state renewalState
 				return r.stopRenewal(cancelHandler, err, cancelled, fail)
 			}
 			if state.deadlineUntrusted {
-				// A clock-skewed absolute deadline gives no safe retry headroom.
-				// Cancel before another consumer can overlap this handler rather
-				// than converting an unknown lease into a guessed retry budget.
+				// Without a relative lease duration there is no safe retry horizon.
+				// Fail closed after a confirmed, cross-zone-tolerant request timeout
+				// or transport failure rather than guessing past lock ownership.
 				return r.loseRenewal(cancelHandler, err)
 			}
 

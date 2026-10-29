@@ -1,6 +1,10 @@
 package server
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/mqlitehq/mqlite/wire"
+)
 
 // cors optionally makes the broker reachable from a browser app served by a different
 // origin — the standalone admin console pointed at this broker. It is disabled when
@@ -20,7 +24,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", s.CORS)
-		h.Set("Access-Control-Expose-Headers", requestIDHeader)
+		h.Set("Access-Control-Expose-Headers", requestIDHeader+", "+wire.ServerTimeHeader)
 		if s.CORS != "*" {
 			h.Add("Vary", "Origin") // response varies by origin when not wildcard
 		}

@@ -21,6 +21,14 @@ type Status struct {
 	ServerTimeMs  int64 // the injectable engine clock after the runtime probe
 }
 
+// ServerTimeMs returns the same injectable epoch-millisecond clock used for
+// lease, scheduling, TTL, and settlement decisions. HTTP adapters expose this
+// value so remote clients can translate absolute broker deadlines onto a local
+// monotonic timeline without assuming synchronized wall clocks.
+func (e *Engine) ServerTimeMs() int64 {
+	return e.now()
+}
+
 // Status probes the engine's backend without exposing any secret. The ping is a real
 // wall-clock read round-trip (most meaningful for a remote DB), independent of the
 // injectable clock.

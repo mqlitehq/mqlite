@@ -14,6 +14,12 @@ import (
 	"github.com/mqlitehq/mqlite/engine"
 )
 
+// ServerTimeHeader carries the broker wall clock at response write time as UTC
+// epoch milliseconds. Clients combine it with their local monotonic clock and a
+// conservative transport budget instead of comparing lease timestamps against a
+// potentially skewed wall clock. Older clients safely ignore the additive header.
+const ServerTimeHeader = "X-Mqlite-Server-Time-Ms"
+
 // Route paths (Connect-style: /package.Service/Method).
 const (
 	PathSend            = "/mqlite.v1.QueueService/Send"

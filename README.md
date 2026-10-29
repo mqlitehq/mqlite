@@ -247,10 +247,14 @@ still has time. If the lock is lost or can no longer be confirmed, it cancels th
 message's handler context and skips terminal settlement; handlers must honor
 `ctx.Done()` and remain idempotent because delivery is still at-least-once. If a
 successful renewal carries an absolute deadline that is unusable against the
-client clock, the broker acknowledgement still fences handler dispatch; the
-Receiver switches to a conservative local renewal cadence and fails closed on
-the first unconfirmed heartbeat because no trustworthy retry window is known.
-Keep broker and client clocks synchronized even with this degraded fallback.
+client clock, current brokers' `X-Mqlite-Server-Time-Ms` response header lets the
+client translate that deadline onto its local monotonic clock. The translation
+uses a conservative transport budget and never extends a lease from the local
+wall clock. Older brokers fall back to HTTP `Date`; if neither clock observation
+is available, the Receiver retains absolute-deadline behavior and switches to a
+bounded conservative cadence only when that deadline is locally unusable. Keep
+host clocks synchronized for raw lease handling, header-stripping intermediaries,
+and older brokers that do not provide either time observation.
 
 The remote client requires a complete semantic acknowledgement even when HTTP
 returns 2xx. An invalid acknowledgement for Send, Complete/Abandon/Reject/Defer

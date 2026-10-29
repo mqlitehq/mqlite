@@ -48,8 +48,8 @@ func TestCORSPreflightBypassesAuth(t *testing.T) {
 	if got := res.Header.Get("Access-Control-Allow-Headers"); got == "" {
 		t.Errorf("Allow-Headers missing")
 	}
-	if got := res.Header.Get("Access-Control-Expose-Headers"); got != "X-Request-ID" {
-		t.Errorf("Expose-Headers = %q, want X-Request-ID", got)
+	if got := res.Header.Get("Access-Control-Expose-Headers"); got != "X-Request-ID, X-Mqlite-Server-Time-Ms" {
+		t.Errorf("Expose-Headers = %q, want request ID and server time", got)
 	}
 }
 
@@ -68,8 +68,8 @@ func TestCORSHeaderOnActualResponse(t *testing.T) {
 	if got := res.Header.Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Allow-Origin = %q, want *", got)
 	}
-	if got := res.Header.Get("Access-Control-Expose-Headers"); got != "X-Request-ID" {
-		t.Errorf("Expose-Headers = %q, want X-Request-ID", got)
+	if got := res.Header.Get("Access-Control-Expose-Headers"); got != "X-Request-ID, X-Mqlite-Server-Time-Ms" {
+		t.Errorf("Expose-Headers = %q, want request ID and server time", got)
 	}
 	if got := res.Header.Get("X-Request-ID"); !validLogRequestID(got) {
 		t.Errorf("X-Request-ID = %q, want broker-generated correlation ID", got)

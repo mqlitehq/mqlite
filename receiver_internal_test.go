@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // A positive age bound must NEVER convert to 0 ms (which the engine reads as unbounded) —
@@ -680,6 +683,132 @@ func TestRenewalDelayLeavesWatchdogHeadroom(t *testing.T) {
 	}
 }
 
+func TestInitialRenewalAttemptContextCapsTrustedLease(t *testing.T) {
+	ctx, cancel := initialRenewalAttemptContext(context.Background(), renewalState{
+		deadline: time.Now().Add(time.Hour),
+	})
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("initial renewal context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining < renewMaxInitialAttemptTimeout-100*time.Millisecond || remaining > renewMaxInitialAttemptTimeout+100*time.Millisecond {
+		t.Fatalf("initial renewal watchdog = %s, want cap %s", remaining, renewMaxInitialAttemptTimeout)
+	}
+}
+
+func TestClientMapsBrokerDeadlineOntoLocalMonotonicClock(t *testing.T) {
+	now := time.Now()
+	serverNow := now.Add(-2 * time.Second)
+	header := make(http.Header)
+	header.Set(wire.ServerTimeHeader, strconv.FormatInt(serverNow.UnixMilli(), 10))
+	observation := observeServerTime(header, now.Add(-150*time.Millisecond), now)
+	deadline, ok := observation.localLeaseDeadline(serverNow.Add(time.Second))
+	if !ok {
+		t.Fatal("server-time observation was not retained")
+	}
+	remaining := time.Until(deadline)
+	if remaining < 800*time.Millisecond || remaining > 900*time.Millisecond {
+		t.Fatalf("mapped remaining lease = %s, want conservative ~849ms", remaining)
+	}
+}
+
+func TestClientPreservesLegitimateShortLeaseFromServerTime(t *testing.T) {
+	now := time.Now()
+	serverNow := now.Add(-2 * time.Second)
+	header := make(http.Header)
+	header.Set(wire.ServerTimeHeader, strconv.FormatInt(serverNow.UnixMilli(), 10))
+	observation := observeServerTime(header, now.Add(-2*time.Millisecond), now)
+	deadline, ok := observation.localLeaseDeadline(serverNow.Add(40 * time.Millisecond))
+	if !ok {
+		t.Fatal("server-time observation was not retained")
+	}
+	remaining := time.Until(deadline)
+	if remaining < 30*time.Millisecond || remaining > 40*time.Millisecond {
+		t.Fatalf("mapped short lease = %s, want about 37ms", remaining)
+	}
+	state := renewalState{deadlineUntrusted: true}.acceptRenewal(deadline, time.Now())
+	if state.deadlineUntrusted {
+		t.Fatal("valid short broker lease was degraded to the 250ms untrusted cadence")
+	}
+	if delay := renewalDelay(state); delay <= 0 || delay >= remaining {
+		t.Fatalf("short-lease renewal delay = %s, want inside %s lease", delay, remaining)
+	}
+}
+
+func TestClientClockSkewDoesNotManufactureTinyLease(t *testing.T) {
+	now := time.Now()
+	serverNow := now.Add(-35 * time.Second)
+	for _, tc := range []struct {
+		name   string
+		header http.Header
+	}{
+		{name: "exact", header: http.Header{wire.ServerTimeHeader: []string{strconv.FormatInt(serverNow.UnixMilli(), 10)}}},
+		{name: "date fallback", header: http.Header{"Date": []string{serverNow.UTC().Format(http.TimeFormat)}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := observeServerTime(tc.header, now.Add(-20*time.Millisecond), now)
+			deadline, ok := observation.localLeaseDeadline(serverNow.Add(30 * time.Second))
+			if !ok {
+				t.Fatal("server-time observation was not retained")
+			}
+			remaining := time.Until(deadline)
+			if remaining < 28*time.Second || remaining > 30*time.Second {
+				t.Fatalf("mapped 30s lease = %s, want a normal lease despite 35s clock skew", remaining)
+			}
+			state := newRenewalState(deadline)
+			if state.deadlineUntrusted || renewalDelay(state) < 9*time.Second {
+				t.Fatalf("mapped state = %+v delay=%s, want trusted non-spinning cadence", state, renewalDelay(state))
+			}
+		})
+	}
+}
+
+func TestClientLongPollNeverExtendsLeaseFromLocalWallClock(t *testing.T) {
+	// Date is only precise to a second. With a long request RTT, the local clock
+	// can fall inside that large uncertainty interval even when it is behind the
+	// broker. Treating local wall time as authoritative would then manufacture a
+	// longer lease. The conservative server-time upper bound must instead make
+	// this deliberately ambiguous lease unusable and force a broker Renew fence.
+	now := time.Now()
+	serverFloor := now.Truncate(time.Second)
+	header := make(http.Header)
+	header.Set("Date", serverFloor.UTC().Format(http.TimeFormat))
+	observation := observeServerTime(header, now.Add(-10*time.Second), now)
+	deadline, ok := observation.localLeaseDeadline(serverFloor.Add(2 * time.Second))
+	if !ok {
+		t.Fatal("Date observation was not retained")
+	}
+	if deadline.After(time.Now()) {
+		t.Fatalf("ambiguous long-poll deadline = %s, must not be extended past now", deadline)
+	}
+}
+
+func TestClientLongPollObservationDoesNotContaminateShortRenewal(t *testing.T) {
+	now := time.Now()
+	serverNow := now.Add(-2 * time.Second)
+	header := make(http.Header)
+	header.Set(wire.ServerTimeHeader, strconv.FormatInt(serverNow.UnixMilli(), 10))
+
+	longPoll := observeServerTime(header, now.Add(-10*time.Second), now)
+	if deadline, ok := longPoll.localLeaseDeadline(serverNow.Add(time.Second)); !ok || deadline.After(now) {
+		t.Fatalf("long-poll deadline = %s, %v; want unusable", deadline, ok)
+	}
+
+	// A Renew response carries its own short-RTT sample. It must recover a normal
+	// lease immediately rather than inherit the long poll's transport padding.
+	shortRenew := observeServerTime(header, now.Add(-20*time.Millisecond), now)
+	deadline, ok := shortRenew.localLeaseDeadline(serverNow.Add(time.Second))
+	if !ok {
+		t.Fatal("short-renew observation was not retained")
+	}
+	remaining := time.Until(deadline)
+	if remaining < 900*time.Millisecond || remaining > time.Second {
+		t.Fatalf("short-renew remaining lease = %s, want about 979ms", remaining)
+	}
+}
+
 func TestReceiverRenewStartsBeforeWatchdog(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1034,6 +1163,58 @@ func TestReceiverDispatchesAfterSuccessfulRenewalAcrossClockSkew(t *testing.T) {
 	}
 }
 
+func TestReceiverClockSkewRenewalAllowsCrossZoneRTT(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Second), queue: "q", s: f}}
+	f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
+		timer := time.NewTimer(150 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return time.Now().Add(-2 * time.Second), nil
+		case <-renewCtx.Done():
+			return time.Time{}, renewCtx.Err()
+		}
+	}
+	f.completeFn = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	var observed []error
+	handlerCompleted := false
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			handlerCompleted = true
+			return nil
+		case <-hctx.Done():
+			return hctx.Err()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after settlement", err)
+	}
+	if !handlerCompleted {
+		t.Fatal("150ms renewal RTT canceled the handler")
+	}
+	if len(observed) != 0 {
+		t.Fatalf("observed errors = %v, want none", observed)
+	}
+	f.mu.Lock()
+	renews, completeCalls := f.renewCalls, f.completeCalls
+	f.mu.Unlock()
+	if renews < 2 || completeCalls != 1 {
+		t.Fatalf("renew/complete calls = %d/%d, want >=2/1", renews, completeCalls)
+	}
+}
+
 func TestReceiverContinuesRenewingAcrossClockSkew(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1212,8 +1393,8 @@ func TestReceiverUntrustedRenewWatchdogCancelsHungHandler(t *testing.T) {
 		t.Fatalf("Run = %v, want context.Canceled after skew-mode watchdog", err)
 	}
 	elapsed := time.Since(started)
-	if elapsed < 150*time.Millisecond || elapsed > 2*time.Second {
-		t.Fatalf("untrusted renewal watchdog fired after %s, want two bounded 100ms windows", elapsed)
+	if elapsed < time.Second || elapsed > 2*time.Second {
+		t.Fatalf("untrusted renewal watchdog fired after %s, want a 250ms probe plus bounded 1s request", elapsed)
 	}
 	select {
 	case <-handlerCanceled:
@@ -1229,6 +1410,95 @@ func TestReceiverUntrustedRenewWatchdogCancelsHungHandler(t *testing.T) {
 	f.mu.Unlock()
 	if renews != 2 || completeCalls != 0 || abandonCalls != 0 {
 		t.Fatalf("renew/complete/abandon calls = %d/%d/%d, want 2/0/0", renews, completeCalls, abandonCalls)
+	}
+}
+
+func TestReceiverInitialRenewalHasWatchdog(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Second), queue: "q", s: f}}
+	f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
+		<-renewCtx.Done()
+		return time.Time{}, renewCtx.Err()
+	}
+	handlerCalls := 0
+	var observed []error
+	started := time.Now()
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})}).Run(ctx, func(context.Context, *Message) error {
+		handlerCalls++
+		return nil
+	})
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after watchdog", err)
+	}
+	if elapsed < 900*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("initial renewal watchdog fired after %s, want about 1s", elapsed)
+	}
+	if handlerCalls != 0 || len(observed) != 1 || !errors.Is(observed[0], ErrLockLost) {
+		t.Fatalf("handler calls=%d observed=%v, want 0 and one ErrLockLost", handlerCalls, observed)
+	}
+}
+
+func TestReceiverReplayInitialRenewalUsesMappedLeaseWatchdog(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		switch call {
+		case 1:
+			return nil, errors.New("lost receive response")
+		case 2:
+			return []*Message{{
+				SequenceNumber:   1,
+				LockedUntil:      time.Now().Add(-time.Second),
+				localLockedUntil: time.Now().Add(10 * time.Second),
+				queue:            "q",
+				s:                f,
+			}}, nil
+		default:
+			<-callCtx.Done()
+			return nil, callCtx.Err()
+		}
+	}
+	f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
+		timer := time.NewTimer(1100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return time.Now().Add(10 * time.Second), nil
+		case <-renewCtx.Done():
+			return time.Time{}, renewCtx.Err()
+		}
+	}
+	f.completeFn = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	var observed []error
+	handlers := 0
+	err := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})}).Run(ctx, func(context.Context, *Message) error {
+		handlers++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if handlers != 1 || len(observed) != 0 {
+		t.Fatalf("handler calls=%d observed=%v, want 1 and none", handlers, observed)
+	}
+	f.mu.Lock()
+	renews, completeCalls := f.renewCalls, f.completeCalls
+	f.mu.Unlock()
+	if renews != 1 || completeCalls != 1 {
+		t.Fatalf("renew/complete calls = %d/%d, want 1/1", renews, completeCalls)
 	}
 }
 
@@ -1439,6 +1709,53 @@ func TestReceiverAutoRenewFencesAttemptReplayRegardlessOfLocalDeadline(t *testin
 				t.Fatalf("observed errors = %v, want one ErrLockLost", observed)
 			}
 		})
+	}
+}
+
+func TestReceiverReplayWithoutAutoRenewUsesBrokerFenceAcrossClockSkew(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		switch call {
+		case 1:
+			return nil, errors.New("lost receive response")
+		case 2:
+			// A fast client clock makes a live replay look expired locally. The
+			// broker renewal fence, not that wall-clock comparison, decides.
+			return []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Second), queue: "q", s: f}}, nil
+		default:
+			<-callCtx.Done()
+			return nil, callCtx.Err()
+		}
+	}
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+		return time.Now().Add(-time.Second), nil
+	}
+	f.completeFn = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	handlers := 0
+	var observed []error
+	err := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})}).Run(ctx, func(context.Context, *Message) error {
+		handlers++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if handlers != 1 || len(observed) != 0 {
+		t.Fatalf("handler calls=%d observed=%v, want 1 and none", handlers, observed)
+	}
+	f.mu.Lock()
+	renews, completeCalls := f.renewCalls, f.completeCalls
+	f.mu.Unlock()
+	if renews != 1 || completeCalls != 1 {
+		t.Fatalf("renew/complete calls = %d/%d, want 1/1", renews, completeCalls)
 	}
 }
 
@@ -1776,6 +2093,11 @@ func testReceiverDropsStaleAttemptReplay(t *testing.T, staleDeadline time.Time) 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	f := &fakeSource{}
+	if !staleDeadline.IsZero() {
+		f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+			return time.Time{}, ErrLockLost
+		}
+	}
 	f.receiveFn = func(ctx context.Context, call int, _ string) ([]*Message, error) {
 		switch call {
 		case 1, 2:

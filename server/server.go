@@ -77,23 +77,66 @@ func (s *Server) Handler() http.Handler {
 		admins = append(admins, token)
 	}
 	if err := ValidateMonitorTokens(admins, s.MonitorTokens); err != nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		return s.withServerTime(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "internal", "invalid monitoring credential configuration")
-		})
+		}))
 	}
 	if s.Metrics && len(s.tokens) == 0 {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		return s.withServerTime(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "internal", "metrics require administrator authentication")
-		})
+		}))
 	}
 	handler := s.cors(s.observeRequests(s.logging(s.auth(s.observe(s.mux)))))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.withServerTime(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" && !s.Metrics {
 			http.NotFound(w, r)
 			return
 		}
 		handler.ServeHTTP(w, r)
+	}))
+}
+
+func (s *Server) withServerTime(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&serverTimeResponseWriter{ResponseWriter: w, now: s.serverTimeMs}, r)
 	})
+}
+
+type serverTimeResponseWriter struct {
+	http.ResponseWriter
+	now     func() int64
+	written bool
+}
+
+// Unwrap lets http.ResponseController reach optional capabilities implemented
+// by the underlying server writer (Flush, Hijack, full duplex, and deadlines).
+func (w *serverTimeResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *serverTimeResponseWriter) stamp() {
+	if w.written {
+		return
+	}
+	w.written = true
+	w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(w.now(), 10))
+}
+
+func (w *serverTimeResponseWriter) WriteHeader(status int) {
+	w.stamp()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *serverTimeResponseWriter) Write(p []byte) (int, error) {
+	w.stamp()
+	return w.ResponseWriter.Write(p)
+}
+
+func (s *Server) serverTimeMs() int64 {
+	if s.eng == nil {
+		return time.Now().UnixMilli()
+	}
+	return s.eng.ServerTimeMs()
 }
 
 // ValidateMonitorTokens rejects ambiguous or ineffective monitoring credentials.
