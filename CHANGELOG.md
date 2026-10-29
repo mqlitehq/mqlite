@@ -79,6 +79,20 @@ upgrade notes before replacing a broker.
   Once a Receive response is observed, callers must not reuse its AttemptID for
   another Receive or after partially settling that response.
 
+### Make broker signal shutdown escalation explicit (MQLITE-134)
+
+- Treat the first SIGINT or SIGTERM as graceful shutdown: restore the operating
+  system's normal signal behavior before canceling the server context, then allow
+  the existing HTTP drain and fenced engine close to run. A second signal now
+  terminates the process instead of being swallowed by an already-canceled signal
+  context.
+- Surface broker-engine and diagnostic-log close failures from `mqlite serve`,
+  joining them with an earlier Serve failure when both occur.
+- Add real-process regressions for a clean single-signal exit, persistence of an
+  acknowledged `FULL`-sync message across that exit, and forced second-signal
+  termination while an HTTP handler deliberately remains active. This does not
+  change whether a Receive admitted before shutdown may claim during the drain.
+
 ## v0.4.2 — 2026-10-28
 
 > **Patch upgrade from v0.4.1:** the canonical schema token remains **7** and no

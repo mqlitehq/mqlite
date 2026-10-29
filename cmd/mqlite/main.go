@@ -464,7 +464,7 @@ func stripEndpointCredentials(ep string) string {
 	return u.String()
 }
 
-func cmdServe(ctx context.Context, args []string) error {
+func cmdServe(ctx context.Context, args []string) (retErr error) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "", "listen address (default "+defaults.BrokerListenAddr+"; or set MQLITE_ADDR)")
 	diagnosticPath := fs.String("diagnostic-log", os.Getenv("MQLITE_DIAGNOSTIC_LOG"), "private rotating JSONL failure/recovery log (or MQLITE_DIAGNOSTIC_LOG; disabled by default)")
@@ -514,6 +514,12 @@ func cmdServe(ctx context.Context, args []string) error {
 			"bind loopback (e.g. 127.0.0.1:%s), set MQLITE_TOKENS, or pass --insecure-allow-remote",
 			listenAddr, defaults.BrokerPort)
 	}
+	// Install signal handling after pure configuration validation but before opening
+	// any persistent resource. A first signal during diagnostic-log or DB startup is
+	// therefore converted to cancellation; once cancellation becomes observable,
+	// signal behavior has already been restored for an immediate second-signal exit.
+	sctx, stop := serveSignalContext(ctx)
+	defer stop()
 
 	lg := serveLogger()
 	slogger := slog.New(lg)
@@ -522,7 +528,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		defer handler.Close()
+		defer mergeCleanupError(&retErr, "close diagnostic log", handler.Close)
 		slogger = slog.New(handler)
 	}
 
@@ -533,11 +539,11 @@ func cmdServe(ctx context.Context, args []string) error {
 	// serve is the only path that applies broker DLQ retention (serveRetentionOpts).
 	serveOpts := append(embeddedOpts(), serveRetentionOpts()...)
 	serveOpts = append(serveOpts, mqlite.WithLogger(slogger))
-	eng, err := mqlite.OpenEmbedded(ctx, db, serveOpts...)
+	eng, err := mqlite.OpenEmbedded(sctx, db, serveOpts...)
 	if err != nil {
 		return err
 	}
-	defer eng.Close()
+	defer mergeCleanupError(&retErr, "close broker", eng.Close)
 
 	corsOrigin, _ := resolveCORS(os.Getenv("MQLITE_CORS"), tokens == "")
 	ui := resolveUI(os.Getenv("MQLITE_UI"))
@@ -572,8 +578,6 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	lg.Info("cors", "allow-origin", corsPolicy)
 
-	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	// "ready" fires from WithReady, i.e. only after the listener actually binds — so a
 	// bind failure surfaces as an error instead of a misleading "ready" line (MQLITE-88).
 	return eng.Serve(sctx, listenAddr,
@@ -581,6 +585,59 @@ func cmdServe(ctx context.Context, args []string) error {
 		mqlite.WithMetrics(metricsEnabled),
 		mqlite.WithCORS(corsOrigin), mqlite.WithRequestLog(slogger), mqlite.WithUI(ui),
 		mqlite.WithReady(func() { lg.Info("ready — Ctrl-C to stop") }))
+}
+
+// serveSignalContext converts the first SIGINT/SIGTERM into graceful shutdown. The
+// signal registration is removed before the returned context is canceled, so once
+// Serve can observe shutdown, a second signal has its normal process-termination
+// behavior instead of disappearing into an already-canceled NotifyContext.
+func serveSignalContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go relayServeShutdown(parent.Done(), signals, stop, func() { signal.Stop(signals) }, cancel, done)
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+			cancel()
+		})
+	}
+	return ctx, cleanup
+}
+
+// relayServeShutdown is separate from signal registration so ordering can be tested
+// without delivering a process-global signal to the test runner. restore must finish
+// before cancel: ctx.Done is the barrier after which another signal must terminate.
+func relayServeShutdown(
+	parentDone <-chan struct{},
+	signals <-chan os.Signal,
+	stop <-chan struct{},
+	restore func(),
+	cancel context.CancelFunc,
+	done chan<- struct{},
+) {
+	defer close(done)
+	select {
+	case <-parentDone:
+		restore()
+		cancel()
+	case <-signals:
+		restore()
+		cancel()
+	case <-stop:
+		restore()
+	}
+}
+
+func mergeCleanupError(result *error, operation string, cleanup func() error) {
+	if err := cleanup(); err != nil {
+		*result = errors.Join(*result, fmt.Errorf("%s: %w", operation, err))
+	}
 }
 
 // resolveMetrics keeps scraping opt-in; an explicit flag overrides the environment.
