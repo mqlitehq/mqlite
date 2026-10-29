@@ -375,6 +375,13 @@ Every newly granted `Receive` claim increments `delivery_count`. A Peek-Lock
 every saved token still owns a live lease. After restart, settlement, or lease
 expiry invalidates any token, the broker discards that stale response and the retry
 performs a safe new claim; it never returns ownership the caller no longer has.
+Use an attempt ID only to retry the exact Receive whose response was not observed.
+Once the response arrives, do not reuse that ID for another Receive or after
+settling part of its batch. Invalidating a partially stale cached response does
+not revoke the other live leases from the original response: their original
+tokens remain valid until settlement or lease expiry, preventing concurrent
+delivery while the original caller may still be processing them. A replacement
+claim may therefore return fewer messages or different currently eligible work.
 Receive-and-Delete keeps replaying its tokenless saved response for the attempt lifetime.
 A live non-empty saved response also binds that attempt ID to its original
 `receive_mode`; reusing it with the other mode is `400 invalid_argument`. Empty

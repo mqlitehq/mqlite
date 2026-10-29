@@ -119,7 +119,12 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   same batch and tokens only while every cached token still owns the corresponding
   live, unexpired lock. If any token is stale, the broker MUST invalidate the whole
   cached batch and safely perform a new claim in the same transaction; it MUST NOT
-  return a stale or partially owned batch. A tokenless Receive-and-Delete response
+  return a stale or partially owned batch. This invalidation MUST NOT revoke any
+  other token from that response that still owns a live lease; the caller that
+  observed the original response may still be processing it. AttemptID is therefore
+  only an exact retry key for a Receive whose response was not observed, and MUST
+  NOT be reused for a new Receive after the response arrives or after partial
+  settlement. A tokenless Receive-and-Delete response
   remains replayable for the attempt lifetime. A live non-empty saved response is
   bound to its original receive mode; an empty result creates no record, and an
   expired record no longer binds the ID. Unknown modes MUST be rejected. Record and

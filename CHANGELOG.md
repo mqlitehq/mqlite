@@ -63,7 +63,9 @@ upgrade notes before replacing a broker.
 - Validate every cached Peek-Lock token against the current locked rows before an
   AttemptID replay reaches a caller. Startup recovery, lease expiry, settlement,
   and partial-batch settlement can no longer replay ownership that has already
-  been invalidated.
+  been invalidated. AttemptID is an exact retry key for a Receive whose response
+  was not observed; invalidating its cached batch never revokes another token in
+  that batch that still owns a live lease.
 - Invalidate a stale Peek-Lock batch and make the replacement claim in the same
   transaction. Preserve tokenless ReceiveAndDelete response replay across broker
   restarts, bind each live non-empty saved response to its original receive mode,
@@ -71,6 +73,8 @@ upgrade notes before replacing a broker.
   round trip per message.
 - Keep the wire format and schema unchanged. Add restart, final-delivery DLQ,
   lease-expiry, partial-batch, receive-mode, and ReceiveAndDelete regressions.
+  Once a Receive response is observed, callers must not reuse its AttemptID for
+  another Receive or after partially settling that response.
 
 ## v0.4.2 — 2026-10-28
 

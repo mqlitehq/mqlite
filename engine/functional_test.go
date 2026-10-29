@@ -1965,6 +1965,8 @@ func TestReceiveAttemptInvalidatesWholePartiallySettledBatch(t *testing.T) {
 	if err != nil || len(replay) != 0 {
 		t.Fatalf("partially settled attempt replayed a mixed-ownership batch: %+v, %v", replay, err)
 	}
+	// Invalidating the replay cache must not revoke a lease from the response the
+	// caller already observed: that handler may still be processing this message.
 	if err := e.Complete(ctx, "q", seqs[0], first[0].LockToken); err != nil {
 		t.Fatalf("invalidating the attempt released its remaining valid lock: %v", err)
 	}

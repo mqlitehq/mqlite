@@ -45,9 +45,14 @@ Still quiesce clients and avoid overlapping brokers during the binary replacemen
   timeout as proof that a write failed. A Peek-Lock AttemptID replays only while
   its entire saved batch still owns live leases; after restart or lease loss the
   broker invalidates that stale response and safely re-evaluates eligible work in
-  a fresh claim instead of returning an obsolete lock token. For a planned broker
-  replacement, quiesce new receives and let client handlers settle before stopping the old broker. Startup
-  recovery invalidates every remaining lock immediately; an old remote handler
+  a fresh claim instead of returning an obsolete lock token. Reuse that AttemptID
+  only when the original Receive response was not observed. Once a response is
+  available, retain its tokens and use a new AttemptID for later Receive calls;
+  invalidating a partially stale cached batch deliberately leaves its other live
+  leases with the original caller rather than creating concurrent delivery. For
+  a planned broker replacement, quiesce new receives and let client handlers
+  settle before stopping the old broker. Startup recovery invalidates every
+  remaining lock immediately; an old remote handler
   can still finish its external side effect, but can no longer settle that token,
   so the work may be processed again.
 
