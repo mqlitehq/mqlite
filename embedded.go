@@ -581,6 +581,16 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.UI = sc.ui
 	srv.Metrics = sc.metrics
 	hs := newHTTPServer(addr, srv.Handler())
+	// Every request context descends from the Serve lifetime. http.Server.Shutdown
+	// stops new connections but deliberately does not cancel active handlers; without
+	// this parent a parked 20-second Receive keeps graceful shutdown open for its full
+	// wait and may begin another claim round after shutdown has started (MQLITE-134).
+	// Canceling the parent wakes long polls through Engine.Receive's ctx arm and fences
+	// further work in every already-admitted handler. A request that has already begun
+	// a database operation remains ordinary in-flight work and is allowed to finish.
+	requestCtx, cancelRequests := context.WithCancel(ctx)
+	defer cancelRequests()
+	hs.BaseContext = func(net.Listener) context.Context { return requestCtx }
 
 	// Bind synchronously so a bind failure (port in use, bad addr) surfaces here —
 	// before any "ready" is announced — instead of after the caller already logged it.
@@ -603,6 +613,9 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 			return err
 		}
 	}
+	// The outer context already canceled requestCtx on the normal shutdown path.
+	// Cancel explicitly as well for a server-side exit, before waiting on handlers.
+	cancelRequests()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	return hs.Shutdown(shutCtx)

@@ -250,6 +250,68 @@ func TestBrokerSingleSignalDrainsAndPreservesAcknowledgedMessage(t *testing.T) {
 	}
 }
 
+func TestBrokerSingleSignalCancelsParkedLongPoll(t *testing.T) {
+	p := startSignalBroker(t)
+	remoteEnv := append(os.Environ(),
+		"MQLITE_ENDPOINT=http://"+p.addr,
+		"MQLITE_TOKEN=",
+	)
+	create := exec.Command(mqliteBin, "create-queue", "shutdown-long-poll")
+	create.Env = remoteEnv
+	if output, err := create.CombinedOutput(); err != nil {
+		t.Fatalf("create queue before long poll: %v: %s", err, output)
+	}
+
+	receive := exec.Command(mqliteBin, "receive", "shutdown-long-poll", "--wait", "20s", "--no-ack")
+	receive.Env = remoteEnv
+	receive.Stdout = io.Discard
+	receive.Stderr = io.Discard
+	if err := receive.Start(); err != nil {
+		t.Fatal(err)
+	}
+	receiveDone := make(chan error, 1)
+	go func() { receiveDone <- receive.Wait() }()
+	receiveReaped := false
+	t.Cleanup(func() {
+		if receiveReaped {
+			return
+		}
+		select {
+		case <-receiveDone:
+		default:
+			_ = receive.Process.Kill()
+			<-receiveDone
+		}
+	})
+
+	// Let the receive complete its empty claim round and park. It must still be
+	// running before the broker begins graceful shutdown.
+	time.Sleep(250 * time.Millisecond)
+	select {
+	case err := <-receiveDone:
+		receiveReaped = true
+		t.Fatalf("long-poll client exited before shutdown: %v", err)
+	default:
+	}
+
+	started := time.Now()
+	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.wait(t, 5*time.Second); err != nil {
+		t.Fatalf("graceful broker exit with parked long poll: %v\n%s", err, p.logs())
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("broker shutdown with parked long poll took %s, want <= 2s", elapsed)
+	}
+	select {
+	case <-receiveDone:
+		receiveReaped = true
+	case <-time.After(5 * time.Second):
+		t.Fatal("long-poll client remained blocked after broker shutdown")
+	}
+}
+
 func TestBrokerSecondSignalForcesBlockedShutdown(t *testing.T) {
 	p := startSignalBroker(t)
 	conn := holdActiveRequest(t, p.addr)

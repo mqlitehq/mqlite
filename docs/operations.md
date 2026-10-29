@@ -106,8 +106,13 @@ restore test.
 ## Graceful broker shutdown
 
 `mqlite serve` treats the first SIGINT or SIGTERM as a graceful-shutdown request.
-It stops accepting new HTTP connections, gives admitted handlers up to 25 seconds
-to finish, then closes the engine's operation admission, joins admitted database
+It stops accepting new HTTP connections and cancels every admitted HTTP request's
+context. A parked Receive long poll returns immediately instead of waiting out its
+20-second window, and cannot begin another claim round after observing shutdown.
+A claim or other database operation that already began remains in-flight work and
+may finish. Handlers that do not react to cancellation (for example, a client
+stalled while uploading a request body) still receive up to 25 seconds to finish.
+The broker then closes the engine's operation admission, joins admitted database
 work and background maintenance, closes the database, and releases the local file
 lock. Engine and diagnostic-log close failures make the command exit non-zero.
 
@@ -121,10 +126,11 @@ eligible for redelivery, but application side effects may already have happened
 and must remain idempotent. Ctrl-D is terminal input EOF, not a shutdown signal;
 the broker does not read stdin.
 
-An HTTP Receive long poll admitted before the first signal is an admitted handler.
-It may still claim and return work during the HTTP drain; this signal change does
-not establish a no-new-claim barrier. Quiesce consumers before a planned broker
-replacement when that distinction matters.
+Shutdown cancellation is the no-new-claim barrier for a Receive parked between
+claim rounds. It does not roll back a claim transaction that had already started;
+that request may return work committed before it observed cancellation. Quiesce
+consumers before a planned broker replacement when even that in-flight boundary
+matters.
 
 Set the platform's outer termination grace longer than:
 
@@ -134,8 +140,14 @@ Set the platform's outer termination grace longer than:
 
 `Engine.Close` deliberately waits for admitted work and has no unsafe timeout that
 releases ownership while a write may still be running. The outer platform deadline
-is therefore the final hard bound. Keep Turso/libSQL replacement single-active and
-stop-then-start; this shutdown behavior does not make overlapping brokers safe.
+is therefore the final hard bound. The repository's `docker-compose.yml` sets
+`stop_grace_period: 40s`; plain Docker otherwise defaults to only 10 seconds and
+can send SIGKILL while a deliberately stalled handler is still inside the 25-second
+HTTP drain. Kubernetes commonly defaults to a 30-second termination grace, leaving
+only about 5 seconds after the worst-case HTTP drain for engine close and process
+exit; configure at least 40 seconds, and more when measured remote-store close time
+requires it. Keep Turso/libSQL replacement single-active and stop-then-start; this
+shutdown behavior does not make overlapping brokers safe.
 
 ## Startup and routine checks
 

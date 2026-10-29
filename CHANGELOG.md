@@ -88,10 +88,17 @@ upgrade notes before replacing a broker.
   context.
 - Surface broker-engine and diagnostic-log close failures from `mqlite serve`,
   joining them with an earlier Serve failure when both occur.
+- Cancel admitted HTTP request contexts when graceful shutdown starts. Empty
+  Receive long polls now wake promptly and cannot begin another claim round;
+  database work already in flight may still finish. Keep the 25-second drain for
+  handlers that do not react to cancellation.
+- Give the bundled Docker Compose service a 40-second stop grace and document the
+  shorter Docker and Kubernetes defaults, so normal orchestration does not turn a
+  graceful stop into SIGKILL before engine close and log flush.
 - Add real-process regressions for a clean single-signal exit, persistence of an
-  acknowledged `FULL`-sync message across that exit, and forced second-signal
-  termination while an HTTP handler deliberately remains active. This does not
-  change whether a Receive admitted before shutdown may claim during the drain.
+  acknowledged `FULL`-sync message across that exit, prompt cancellation of a
+  parked long poll, and forced second-signal termination while an HTTP handler
+  deliberately remains active.
 
 ## v0.4.2 — 2026-10-28
 
