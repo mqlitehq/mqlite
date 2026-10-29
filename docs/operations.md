@@ -106,15 +106,17 @@ restore test.
 ## Graceful broker shutdown
 
 `mqlite serve` treats the first SIGINT or SIGTERM as a graceful-shutdown request.
-It stops accepting new HTTP connections and cancels every admitted HTTP request's
-context. A parked Receive long poll returns immediately instead of waiting out its
-20-second window, and cannot begin another claim round after observing shutdown.
-A claim or other database operation that already began remains in-flight work and
-may finish. Handlers that do not react to cancellation (for example, a client
-stalled while uploading a request body) still receive up to 25 seconds to finish.
-The broker then closes the engine's operation admission, joins admitted database
-work and background maintenance, closes the database, and releases the local file
-lock. Engine and diagnostic-log close failures make the command exit non-zero.
+It stops accepting new HTTP connections and cancels admitted Receive contexts only.
+A parked Receive long poll returns immediately instead of waiting out its 20-second
+window, and cannot begin another claim round after observing shutdown. An already
+started claim may finish before cancellation is observed or roll back at its normal
+context boundary. Other admitted requests retain their contexts and receive up to
+25 seconds to drain; the broker does not abort an in-flight Send or settlement just
+to wake a long poll. A handler that does not finish (for example, a client stalled
+while uploading a request body) consumes that drain budget. The broker then closes
+the engine's operation admission, joins admitted database work and background
+maintenance, closes the database, and releases the local file lock. Engine and
+diagnostic-log close failures make the command exit non-zero.
 
 After the first signal has been observed, normal operating-system signal behavior
 is restored before graceful shutdown starts. A second SIGINT or SIGTERM therefore

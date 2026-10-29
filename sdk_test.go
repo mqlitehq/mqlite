@@ -934,7 +934,7 @@ func TestServeReadyAfterBind(t *testing.T) {
 }
 
 // TestServeShutdownCancelsLongPoll verifies that graceful shutdown does not wait
-// out an already-admitted Receive long poll. The server owns the request lifetime:
+// out an already-admitted Receive long poll. The broker owns that long-poll lifetime:
 // once shutdown begins, a parked Receive must observe cancellation before it can
 // start another claim round, and Serve must be free to close the engine promptly.
 func TestServeShutdownCancelsLongPoll(t *testing.T) {
