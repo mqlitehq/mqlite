@@ -305,8 +305,11 @@ func TestBrokerSingleSignalCancelsParkedLongPoll(t *testing.T) {
 		t.Fatalf("broker shutdown with parked long poll took %s, want <= 2s", elapsed)
 	}
 	select {
-	case <-receiveDone:
+	case err := <-receiveDone:
 		receiveReaped = true
+		if err != nil {
+			t.Fatalf("long-poll client exited with an error during graceful shutdown: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("long-poll client remained blocked after broker shutdown")
 	}

@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mqlitehq/mqlite/internal/receivegate"
 )
 
 func TestQueueNotFoundIsGeneralNotFound(t *testing.T) {
@@ -2593,6 +2595,171 @@ func TestDeleteQueueWakesLongPoll(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("deleted queue left receiver waiting")
+	}
+}
+
+func TestReceiveDrainGateWakesParkedPollWithoutClaiming(t *testing.T) {
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	gate := receivegate.New()
+	ctx, cancel := context.WithTimeout(receivegate.WithContext(context.Background(), gate), 3*time.Second)
+	defer cancel()
+	type result struct {
+		msgs []*Message
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		msgs, err := e.Receive(ctx, "q", ReceiveOptions{
+			WaitMs: 20_000, Mode: ReceiveAndDelete, AttemptID: "drain-wait",
+		})
+		done <- result{msgs: msgs, err: err}
+	}()
+	select {
+	case <-gate.FirstParked():
+	case <-ctx.Done():
+		t.Fatal("Receive did not reach its parked long-poll boundary")
+	}
+
+	gate.Stop()
+	if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after-drain")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || len(got.msgs) != 0 {
+			t.Fatalf("drained long poll = %+v, %v; want empty success", got.msgs, got.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("drain gate did not wake parked Receive")
+	}
+	msgs, err := e.Receive(context.Background(), "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(msgs) != 1 || string(msgs[0].Body) != "after-drain" {
+		t.Fatalf("message sent after drain was claimed: %+v, %v", msgs, err)
+	}
+}
+
+func TestReceiveDrainGateLetsAdmittedClaimReturn(t *testing.T) {
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("admitted")}); err != nil {
+		t.Fatal(err)
+	}
+	gate := receivegate.New()
+	ctx := receivegate.WithContext(context.Background(), gate)
+	type result struct {
+		msgs []*Message
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		msgs, err := e.Receive(ctx, "q", ReceiveOptions{WaitMs: 20_000, AttemptID: "admitted-claim"})
+		done <- result{msgs: msgs, err: err}
+	}()
+	select {
+	case <-gate.FirstClaimEntered():
+	case <-time.After(3 * time.Second):
+		t.Fatal("claim did not reach the drain admission boundary")
+	}
+	// TryEnterClaim is the atomic admission boundary. Stop may win before the SQL
+	// call itself starts, but the already-admitted claim must still return its real
+	// result rather than being rewritten as an empty shutdown response.
+	gate.Stop()
+	select {
+	case got := <-done:
+		if got.err != nil || len(got.msgs) != 1 || string(got.msgs[0].Body) != "admitted" {
+			t.Fatalf("admitted claim = %+v, %v", got.msgs, got.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("admitted claim did not finish after drain")
+	}
+}
+
+func TestReceiveDrainGatePreservesCallerCancellation(t *testing.T) {
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	gate := receivegate.New()
+	request, cancel := context.WithCancel(context.Background())
+	ctx := receivegate.WithContext(request, gate)
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.Receive(ctx, "q", ReceiveOptions{WaitMs: 20_000})
+		done <- err
+	}()
+	select {
+	case <-gate.FirstParked():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Receive did not park before caller cancellation")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("caller cancellation = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("caller cancellation did not wake Receive")
+	}
+}
+
+func TestReceiveDrainGatePreservesAttemptReplay(t *testing.T) {
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	firstSeq, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := e.Receive(context.Background(), "q", ReceiveOptions{
+		MaxMessages: 1, AttemptID: "lost-response",
+	})
+	if err != nil || len(first) != 1 || first[0].SeqNumber != firstSeq {
+		t.Fatalf("initial attempt = %+v, %v", first, err)
+	}
+
+	// Simulate a committed claim whose HTTP response was lost. A retry arriving
+	// after the new broker's drain barrier must receive retryable ErrDraining,
+	// never an empty success that causes the client to discard this AttemptID.
+	draining := receivegate.New()
+	draining.Stop()
+	drainingCtx := receivegate.WithContext(context.Background(), draining)
+	retry, err := e.Receive(drainingCtx, "q", ReceiveOptions{
+		MaxMessages: 1, WaitMs: 20_000, AttemptID: "lost-response",
+	})
+	if !errors.Is(err, receivegate.ErrDraining) || len(retry) != 0 {
+		t.Fatalf("retry during drain = %+v, %v; want ErrDraining", retry, err)
+	}
+	select {
+	case <-draining.FirstClaimEntered():
+		t.Fatal("draining retry entered a database claim round")
+	default:
+	}
+
+	// After restart, the same AttemptID replays the exact committed token.
+	restarted := receivegate.New()
+	replayed, err := e.Receive(receivegate.WithContext(context.Background(), restarted), "q", ReceiveOptions{
+		MaxMessages: 1, AttemptID: "lost-response",
+	})
+	if err != nil || len(replayed) != 1 || replayed[0].SeqNumber != first[0].SeqNumber ||
+		replayed[0].LockToken != first[0].LockToken || replayed[0].DeliveryCount != first[0].DeliveryCount {
+		t.Fatalf("attempt replay = %+v, %v; want original %+v", replayed, err, first)
+	}
+
+	// A brand-new attempt fenced before its first round likewise returns draining
+	// without touching an active message.
+	secondSeq, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := receivegate.New()
+	blocked.Stop()
+	if msgs, err := e.Receive(receivegate.WithContext(context.Background(), blocked), "q", ReceiveOptions{
+		MaxMessages: 1, AttemptID: "brand-new",
+	}); !errors.Is(err, receivegate.ErrDraining) || len(msgs) != 0 {
+		t.Fatalf("new attempt during drain = %+v, %v", msgs, err)
+	}
+	available, err := e.Receive(context.Background(), "q", ReceiveOptions{MaxMessages: 1})
+	if err != nil || len(available) != 1 || available[0].SeqNumber != secondSeq || available[0].DeliveryCount != 1 {
+		t.Fatalf("new attempt touched active message: %+v, %v", available, err)
 	}
 }
 

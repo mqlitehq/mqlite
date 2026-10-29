@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/receivegate"
 	"github.com/mqlitehq/mqlite/internal/version"
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
@@ -482,6 +483,9 @@ type serveConfig struct {
 	reqLogger     *slog.Logger
 	ui            bool
 	ready         func()
+	// receiveGate is injected only by white-box shutdown tests. Production Serve
+	// creates a fresh gate for each invocation.
+	receiveGate *receivegate.Gate
 }
 
 // ServeOption configures Serve.
@@ -580,13 +584,15 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.Logger = sc.reqLogger
 	srv.UI = sc.ui
 	srv.Metrics = sc.metrics
-	// http.Server.Shutdown waits for active handlers but deliberately does not cancel
-	// them. Give only Receive a server-owned cancellation source: that wakes parked
-	// long polls and fences their next claim round without aborting an admitted Send,
-	// settlement, or management request that graceful shutdown is meant to drain.
-	receiveCtx, cancelReceives := context.WithCancel(context.Background())
-	defer cancelReceives()
-	hs := newHTTPServer(addr, cancelReceivesOnShutdown(srv.Handler(), receiveCtx))
+	// http.Server.Shutdown waits for active handlers but deliberately does not wake
+	// long polls. The gate interrupts only the wait between claim rounds. Stop and
+	// TryEnterClaim share an atomic boundary, so a claim admitted before shutdown
+	// may return its real result while no claim can start after the barrier.
+	receiveGate := sc.receiveGate
+	if receiveGate == nil {
+		receiveGate = receivegate.New()
+	}
+	hs := newHTTPServer(addr, receiveDrainHandler(srv.Handler(), receiveGate))
 
 	// Bind synchronously so a bind failure (port in use, bad addr) surfaces here —
 	// before any "ready" is announced — instead of after the caller already logged it.
@@ -610,36 +616,23 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 		}
 	}
 	// Wake parked Receive handlers before waiting for the remaining admitted HTTP
-	// work. A receive claim already inside a database operation may finish or roll
-	// back at its normal context boundary; unrelated handlers retain their contexts.
-	cancelReceives()
+	// work. An atomically admitted claim keeps the caller's request context and may
+	// finish; unrelated handlers retain their contexts.
+	receiveGate.Stop()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	return hs.Shutdown(shutCtx)
 }
 
-// cancelReceivesOnShutdown merges the broker drain lifetime into Receive request
-// contexts only. Using http.Server.BaseContext for this would also cancel admitted
-// Send and settlement requests, turning a graceful drain into broad request aborts.
-// ReceiveDeferred never long-polls and therefore drains like every other unary RPC.
-func cancelReceivesOnShutdown(next http.Handler, shutdown context.Context) http.Handler {
+// receiveDrainHandler attaches the internal claim gate only to Receive. It never
+// cancels the HTTP request context, so an active claim/commit keeps its real
+// outcome and every non-Receive RPC is untouched.
+func receiveDrainHandler(next http.Handler, gate *receivegate.Gate) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != wire.PathReceive {
-			next.ServeHTTP(w, r)
-			return
+		if r.URL.Path == wire.PathReceive {
+			r = r.WithContext(receivegate.WithContext(r.Context(), gate))
 		}
-		ctx, cancel := context.WithCancel(r.Context())
-		stop := context.AfterFunc(shutdown, cancel)
-		// Make an already-canceled shutdown deterministic before entering the
-		// handler; AfterFunc itself is scheduled asynchronously in that case.
-		if shutdown.Err() != nil {
-			cancel()
-		}
-		defer func() {
-			stop()
-			cancel()
-		}()
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r)
 	})
 }
 

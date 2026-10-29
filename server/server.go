@@ -21,6 +21,7 @@ import (
 
 	"github.com/mqlitehq/mqlite/engine"
 	"github.com/mqlitehq/mqlite/internal/authkey"
+	"github.com/mqlitehq/mqlite/internal/receivegate"
 	"github.com/mqlitehq/mqlite/wire"
 )
 
@@ -565,6 +566,12 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		// reconciles by message_id/dedup instead of blindly retrying a 500 into a
 		// double-apply (MQLITE-59). 503: the durability is uncertain, not a bad request.
 		writeErr(w, http.StatusServiceUnavailable, "outcome_unknown", err.Error())
+	case errors.Is(err, receivegate.ErrDraining):
+		// A first claim round was fenced by graceful shutdown. It may be a retry
+		// of a claim that committed before its response was lost, so never answer
+		// with an empty success that would make the client discard its AttemptID.
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "unavailable", err.Error())
 	case errors.Is(err, context.Canceled):
 		writeErr(w, 499, "canceled", err.Error())
 	default:

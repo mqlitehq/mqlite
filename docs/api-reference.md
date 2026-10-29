@@ -993,6 +993,7 @@ status. A `not_found` response may add an optional `resource` discriminator
 | 429 | `resource_exhausted` | the active plus deleting subscription capacity is full (`mqlite.ErrSubscriptionLimit`) |
 | 413 | `message_too_large` | a message body over `MaxMessageBytes` (default 1 MiB), or request decoding that exceeds `server.MaxBodyBytes` (default 32 MiB) |
 | 499 | `canceled` | the request context was canceled. A managed Receiver whose own context is still live treats a received 499 as transient and retries the same Receive attempt; caller cancellation still stops immediately. |
+| 503 | `unavailable` | graceful broker drain fenced a `Receive` before its first claim round. The response includes `Retry-After: 1`; retry with the **same** `receive_attempt_id`, because this request may itself be replaying a claim whose earlier response was lost. A long poll that had already completed a confirmed empty round instead wakes with `200` and an empty `messages` list. |
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
 

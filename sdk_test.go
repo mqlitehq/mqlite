@@ -1024,6 +1024,9 @@ func TestServeShutdownCancelsLongPoll(t *testing.T) {
 	}
 	select {
 	case result := <-receiveDone:
+		if result.err != nil {
+			t.Fatalf("long poll returned an error during graceful shutdown: %v", result.err)
+		}
 		if len(result.messages) != 0 {
 			t.Fatalf("long poll claimed %d message(s) after shutdown began", len(result.messages))
 		}

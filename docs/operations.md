@@ -106,11 +106,16 @@ restore test.
 ## Graceful broker shutdown
 
 `mqlite serve` treats the first SIGINT or SIGTERM as a graceful-shutdown request.
-It stops accepting new HTTP connections and cancels admitted Receive contexts only.
-A parked Receive long poll returns immediately instead of waiting out its 20-second
-window, and cannot begin another claim round after observing shutdown. An already
-started claim may finish before cancellation is observed or roll back at its normal
-context boundary. Other admitted requests retain their contexts and receive up to
+It stops accepting new HTTP connections and closes an internal no-new-claim gate for
+Receive. A call parked between claim rounds wakes with `200` and an empty message list;
+managed Receivers can therefore reconnect after the broker restarts. Caller-initiated
+cancellation remains `499`. Stop and claim admission share one atomic boundary: a round
+admitted before shutdown retains the caller's context and returns its real message or
+error, while no database operation starts for a later round. Only a call that already
+completed a confirmed empty round receives the `200` wake-up. A Receive fenced before
+its first round gets `503 unavailable` with `Retry-After`, preserving its AttemptID in
+case it is replaying a committed claim whose earlier response was lost. Other admitted
+requests retain their contexts and receive up to
 25 seconds to drain; the broker does not abort an in-flight Send or settlement just
 to wake a long poll. A handler that does not finish (for example, a client stalled
 while uploading a request body) consumes that drain budget. The broker then closes
@@ -128,9 +133,9 @@ eligible for redelivery, but application side effects may already have happened
 and must remain idempotent. Ctrl-D is terminal input EOF, not a shutdown signal;
 the broker does not read stdin.
 
-Shutdown cancellation is the no-new-claim barrier for a Receive parked between
-claim rounds. It does not roll back a claim transaction that had already started;
-that request may return work committed before it observed cancellation. Quiesce
+The Receive gate is the no-new-claim barrier for a call parked between claim rounds.
+An already-admitted claim transaction keeps the caller's request context and may return
+work committed before shutdown began. Quiesce
 consumers before a planned broker replacement when even that in-flight boundary
 matters.
 
