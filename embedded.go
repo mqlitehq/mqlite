@@ -222,11 +222,11 @@ func (e *Embedded) CompleteBatch(ctx context.Context, queue string, msgs ...*Mes
 // RenewBatch extends the lock lease of many messages in ONE STATEMENT — deliberately not a
 // transaction (the embedded twin of Client.RenewBatch), returning a per-message result.
 //
-// SettleResult.LockedUntil is the deadline actually committed, and it — not Ok — is the fact to
-// pace yourself by. Ok says the lease was live when the STATEMENT finished, which is already in the
-// past by the time you read it: nothing is encoded or sent in embedded mode, but your own handling
-// still takes time and a very short lease can lapse inside it. Compare LockedUntil against your own
-// clock rather than trusting Ok to still hold.
+// SettleResult.LockedUntil is the absolute deadline actually committed. Ok says the lease was live
+// when the STATEMENT finished, which is already in the past by the time you read it: nothing is
+// encoded or sent in embedded mode, but your own handling still takes time and a very short lease
+// can lapse inside it. Comparing LockedUntil with another clock assumes those clocks are
+// synchronized; the managed Receiver has a conservative fallback for an unusable comparison.
 func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]engine.SettleItem, len(msgs))
 	for i, m := range msgs {

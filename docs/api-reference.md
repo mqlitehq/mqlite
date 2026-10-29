@@ -25,7 +25,11 @@ values replace earlier ones, while repeated object and map values may merge.
   `WithHTTPClient` remains caller-owned; MQLite preserves its transport and timeout
   but still disables redirects for RPCs. Size a custom transport's
   `MaxIdleConnsPerHost` to at least Receiver concurrency plus effective prefetch
-  (the managed pipeline's maximum network work in flight).
+  (the managed pipeline's maximum network work in flight). If an application has
+  replaced the process-wide `http.DefaultTransport` with an opaque wrapper,
+  MQLite preserves that wrapper for instrumentation/mock compatibility and does
+  not close it; its underlying connection-pool sizing remains the application's
+  responsibility because a generic `http.RoundTripper` cannot be cloned or tuned.
 - **`body`** is **base64** in JSON (Go marshals `[]byte` as base64).
 - **Timestamps** are **epoch milliseconds** (UTC) integers. Message durations use
   `*_ms`; observability durations explicitly named `*_seconds` retain fractional seconds.
@@ -459,12 +463,16 @@ against a 2 s lock, and most of the locks expire mid-pass.
   `ok=false` for a stale/expired lock on that item (not fatal to the batch); each item is fenced
   on its own `lock_token`, exactly like `Renew`.
 
-`locked_until_ms` is the deadline the broker actually committed — renew again before it. And
-`ok=true` means the lease was live **when the broker's statement finished** — not when the answer
-reaches you. The result still has to be mapped, encoded and travel back, so on a very short lease
-it can lapse on the way. **`locked_until_ms` is the authoritative fact: compare it against your own
-clock.** (If the write itself outlived the lock, you get `ok=false` rather than a lock you never
-really held.) Like single-message Renew, the batch operation leaves token, state, and
+`locked_until_ms` is the absolute broker deadline that was actually committed — renew again before
+it. And `ok=true` means the lease was live **when the broker's statement finished** — not when the
+answer reaches you. The result still has to be mapped, encoded and travel back, so on a very short
+lease it can lapse on the way. Comparing the absolute timestamp with a client clock assumes those
+clocks are synchronized. The managed Receiver treats a successful renewal as the dispatch fence
+when that comparison is unusable, then uses a conservative local cadence and fails closed on the
+first unconfirmed heartbeat. Raw `RenewBatch` callers should keep clocks synchronized and must not
+turn clock offset alone into `ErrLockLost`. (If the write itself outlived the lock, you get
+`ok=false` rather than a lock you never really held.) Like single-message Renew, the batch
+operation leaves token, state, and
 `delivery_count` unchanged and commits the later of the existing deadline and the
 broker's fresh `now + lock_duration` candidate (capped by a fixed subscription
 lifetime).

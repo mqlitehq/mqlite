@@ -245,7 +245,12 @@ settlement can overlap later handlers, but the Receiver bounds all claimed work 
 With auto-renew enabled, it retries a transient heartbeat while the known lease
 still has time. If the lock is lost or can no longer be confirmed, it cancels that
 message's handler context and skips terminal settlement; handlers must honor
-`ctx.Done()` and remain idempotent because delivery is still at-least-once.
+`ctx.Done()` and remain idempotent because delivery is still at-least-once. If a
+successful renewal carries an absolute deadline that is unusable against the
+client clock, the broker acknowledgement still fences handler dispatch; the
+Receiver switches to a conservative local renewal cadence and fails closed on
+the first unconfirmed heartbeat because no trustworthy retry window is known.
+Keep broker and client clocks synchronized even with this degraded fallback.
 
 The remote client requires a complete semantic acknowledgement even when HTTP
 returns 2xx. An invalid acknowledgement for Send, Complete/Abandon/Reject/Defer

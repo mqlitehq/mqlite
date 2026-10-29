@@ -92,7 +92,11 @@ func WithToken(tok string) Option { return func(c *config) { c.token = tok } }
 // plus effective prefetch so overlapped settlement does not churn connections.
 func WithHTTPClient(h *http.Client) Option { return func(c *config) { c.httpClient = h } }
 
-// Open builds a client from a connection string: mqlite://<token>@host:port?tls=true
+// Open builds a client from a connection string: mqlite://<token>@host:port?tls=true.
+// When http.DefaultTransport is a custom RoundTripper, Open preserves it for
+// compatibility with process-wide instrumentation and mocks. That transport
+// and its connection pool remain caller-owned; use WithHTTPClient when explicit
+// per-client transport ownership or pool sizing is required.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 	endpoint, token, err := parseDSN(dsn)
 	if err != nil {
@@ -106,19 +110,24 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 		token = cfg.token
 	}
 	base := cfg.httpClient
-	ownedHTTP := base == nil
-	if ownedHTTP {
+	ownedHTTP := false
+	if base == nil {
 		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			return nil, fmt.Errorf("mqlite: default HTTP transport unavailable; use WithHTTPClient")
+		if ok {
+			transport := defaultTransport.Clone()
+			transport.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
+			if transport.MaxIdleConns < defaultMaxIdleConnsPerHost {
+				transport.MaxIdleConns = defaultMaxIdleConnsPerHost
+			}
+			// No global timeout: long-poll Receive relies on the request context.
+			base = &http.Client{Transport: transport}
+			ownedHTTP = true
+		} else {
+			// Preserve the pre-existing net/http behavior for applications that
+			// replace the global transport (for example, telemetry or HTTP mocks).
+			// A generic RoundTripper cannot be cloned or have its pool tuned safely.
+			base = &http.Client{Transport: http.DefaultTransport}
 		}
-		transport := defaultTransport.Clone()
-		transport.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
-		if transport.MaxIdleConns < defaultMaxIdleConnsPerHost {
-			transport.MaxIdleConns = defaultMaxIdleConnsPerHost
-		}
-		// No global timeout: long-poll Receive relies on the request context.
-		base = &http.Client{Transport: transport}
 	}
 	// Do not mutate a caller-owned client. The shallow copy preserves its
 	// transport, timeout and jar while enforcing the SDK's redirect boundary.
@@ -582,10 +591,11 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Messa
 // that outlasts the very lease it is trying to save (a 64-message batch on a 50ms link needs
 // 3.2s of renewals against a 2s lease), so the locks expire mid-renewal.
 //
-// SettleResult.LockedUntil is the deadline the broker committed, and it — not Ok — is the fact to
-// pace yourself by. Ok says the lease was live when the broker's STATEMENT finished; the response
-// still has to travel back to you, so on a very short lease it can lapse on the way. Compare
-// LockedUntil against your own clock.
+// SettleResult.LockedUntil is the absolute broker deadline that was committed. Ok says the lease
+// was live when the broker's STATEMENT finished; the response still has to travel back to you, so
+// on a very short lease it can lapse on the way. Comparing LockedUntil with a client clock assumes
+// those clocks are synchronized. The managed Receiver uses successful renewal as a dispatch fence
+// and falls back to conservative local pacing when that absolute comparison is unusable.
 func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	if len(msgs) > MaxRenewBatch {
 		return nil, fmt.Errorf("%w: renew batch exceeds %d messages", ErrInvalidArgument, MaxRenewBatch)

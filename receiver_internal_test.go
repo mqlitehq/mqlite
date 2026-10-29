@@ -647,14 +647,15 @@ func TestReceiverBackoffGrowsCapsAndJitters(t *testing.T) {
 	}
 }
 
-func TestAutoRenewDelayUsesHalfOfShortLease(t *testing.T) {
+func TestAutoRenewDelayUsesOneThirdAndStaysInsideShortLease(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		remaining time.Duration
 		want      time.Duration
 		tolerance time.Duration
 	}{
-		{name: "just over one second", remaining: 1010 * time.Millisecond, want: 505 * time.Millisecond, tolerance: 30 * time.Millisecond},
+		{name: "just over one second", remaining: 1010 * time.Millisecond, want: 337 * time.Millisecond, tolerance: 30 * time.Millisecond},
+		{name: "minimum cadence", remaining: 120 * time.Millisecond, want: 50 * time.Millisecond, tolerance: 5 * time.Millisecond},
 		{name: "near boundary", remaining: 40 * time.Millisecond, want: 20 * time.Millisecond, tolerance: 10 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -663,6 +664,48 @@ func TestAutoRenewDelayUsesHalfOfShortLease(t *testing.T) {
 				t.Fatalf("autoRenewDelay(%s) = %s, want %s ± %s", tc.remaining, got, tc.want, tc.tolerance)
 			}
 		})
+	}
+}
+
+func TestReceiverShortLeaseStartsRenewBeforeWatchdog(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(20 * time.Millisecond), queue: "q", s: f}}
+	renewed := make(chan struct{})
+	var once sync.Once
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+		once.Do(func() { close(renewed) })
+		return time.Now().Add(20 * time.Millisecond), nil
+	}
+	f.abandonFn = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	var observed []error
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		select {
+		case <-renewed:
+			return errors.New("handler failed after renewal")
+		case <-hctx.Done():
+			return hctx.Err()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after Abandon", err)
+	}
+	if len(observed) != 0 {
+		t.Fatalf("observed errors = %v, want none", observed)
+	}
+	f.mu.Lock()
+	renews := f.renewCalls
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if renews != 1 || completeCalls != 0 || abandonCalls != 1 {
+		t.Fatalf("renew/complete/abandon calls = %d/%d/%d, want 1/0/1", renews, completeCalls, abandonCalls)
 	}
 }
 
@@ -932,44 +975,244 @@ func TestReceiverRenewExhaustionCancelsOnlyMessage(t *testing.T) {
 	}
 }
 
-// A deadline-bearing renew response is authoritative. If it is already expired
-// when received, do not invent a fresh local lease from the previous duration.
-func TestReceiverRejectsExpiredCommittedRenewDeadline(t *testing.T) {
+// A successful renewal is authoritative proof that the broker still owned the
+// token when it committed the renewal. An absolute deadline that looks expired
+// locally can instead mean the client clock is ahead of the broker; rejecting
+// that acknowledgement would consume every delivery without invoking user code.
+func TestReceiverDispatchesAfterSuccessfulRenewalAcrossClockSkew(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	f := &fakeSource{renewDeadlineFn: func(context.Context) (time.Time, error) {
-		return time.Now().Add(-time.Second), nil
+		return time.Now().Add(-2 * time.Second), nil
 	}}
-	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(200 * time.Millisecond), queue: "q", s: f}}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Second), queue: "q", s: f}}
+	f.completeFn = func(context.Context) error {
+		cancel()
+		return nil
+	}
 	var observed []error
 	r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})})
+	handlerCalls := 0
+	err := r.Run(ctx, func(context.Context, *Message) error {
+		handlerCalls++
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after settlement", err)
+	}
+	if handlerCalls != 1 {
+		t.Fatalf("handler calls = %d, want one", handlerCalls)
+	}
+	if len(observed) != 0 {
+		t.Fatalf("observed errors = %v, want none", observed)
+	}
+	f.mu.Lock()
+	renews, completeCalls, abandonCalls := f.renewCalls, f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if renews < 1 || completeCalls != 1 || abandonCalls != 0 {
+		t.Fatalf("calls renew/complete/abandon = %d/%d/%d, want >=1/1/0", renews, completeCalls, abandonCalls)
+	}
+}
+
+func TestReceiverContinuesRenewingAcrossClockSkew(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Second), queue: "q", s: f}}
+	var timesMu sync.Mutex
+	var renewTimes []time.Time
+	thirdRenew := make(chan struct{})
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+		timesMu.Lock()
+		renewTimes = append(renewTimes, time.Now())
+		if len(renewTimes) == 3 {
+			close(thirdRenew)
+		}
+		timesMu.Unlock()
+		return time.Now().Add(-2 * time.Second), nil
+	}
+	f.completeFn = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	var observed []error
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		select {
+		case <-thirdRenew:
+			return nil
+		case <-hctx.Done():
+			return hctx.Err()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after settlement", err)
+	}
+	if len(observed) != 0 {
+		t.Fatalf("observed errors = %v, want none", observed)
+	}
+	timesMu.Lock()
+	times := append([]time.Time(nil), renewTimes...)
+	timesMu.Unlock()
+	if len(times) != 3 {
+		t.Fatalf("renew calls = %d, want three", len(times))
+	}
+	if elapsed := times[2].Sub(times[0]); elapsed < 150*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("three skew-mode renewals took %s, want bounded non-spinning cadence", elapsed)
+	}
+	f.mu.Lock()
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if completeCalls != 1 || abandonCalls != 0 {
+		t.Fatalf("complete/abandon calls = %d/%d, want 1/0", completeCalls, abandonCalls)
+	}
+}
+
+func TestReceiverClockSkewModeFailsClosedOnTransientRenewalFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Second), queue: "q", s: f}}
+	call := 0
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+		call++
+		if call == 1 {
+			return time.Now().Add(-2 * time.Second), nil
+		}
+		return time.Time{}, errors.New("renew transport unavailable")
+	}
+	handlerCanceled := make(chan struct{})
+	var observed []error
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
 		observed = append(observed, err)
 		if errors.Is(err, ErrLockLost) {
 			cancel()
 		}
-	})})
-	handlerCanceled := make(chan struct{})
-	err := r.Run(ctx, func(hctx context.Context, _ *Message) error {
+	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
 		<-hctx.Done()
 		close(handlerCanceled)
 		return hctx.Err()
 	})
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run = %v, want cancellation after unusable committed deadline", err)
+		t.Fatalf("Run = %v, want context.Canceled after lock loss", err)
 	}
 	select {
 	case <-handlerCanceled:
 	default:
-		t.Fatal("unusable committed deadline did not cancel the handler")
+		t.Fatal("untrusted renewal failure did not cancel the handler")
 	}
 	if len(observed) != 1 || !errors.Is(observed[0], ErrLockLost) {
 		t.Fatalf("observed errors = %v, want one ErrLockLost", observed)
 	}
 	f.mu.Lock()
-	renews, completeCalls, abandonCalls := f.renewCalls, f.completeCalls, f.abandonCalls
+	renews := f.renewCalls
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if renews != 2 || completeCalls != 0 || abandonCalls != 0 {
+		t.Fatalf("renew/complete/abandon calls = %d/%d/%d, want 2/0/0", renews, completeCalls, abandonCalls)
+	}
+}
+
+func TestReceiverTrustedRenewWatchdogCancelsHungHandler(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(300 * time.Millisecond), queue: "q", s: f}}
+	f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
+		<-renewCtx.Done()
+		return time.Time{}, renewCtx.Err()
+	}
+	handlerCanceled := make(chan struct{})
+	started := time.Now()
+	var observed []error
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		if errors.Is(err, ErrLockLost) {
+			cancel()
+		}
+	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		<-hctx.Done()
+		close(handlerCanceled)
+		return hctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after renewal watchdog", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 240*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("trusted renewal watchdog fired after %s, want near the 300ms lease horizon", elapsed)
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("trusted renewal watchdog did not cancel the handler")
+	}
+	if len(observed) != 1 || !errors.Is(observed[0], ErrLockLost) {
+		t.Fatalf("observed errors = %v, want one ErrLockLost", observed)
+	}
+	f.mu.Lock()
+	renews := f.renewCalls
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
 	f.mu.Unlock()
 	if renews != 1 || completeCalls != 0 || abandonCalls != 0 {
-		t.Fatalf("calls renew/complete/abandon = %d/%d/%d, want 1/0/0", renews, completeCalls, abandonCalls)
+		t.Fatalf("renew/complete/abandon calls = %d/%d/%d, want 1/0/0", renews, completeCalls, abandonCalls)
+	}
+}
+
+func TestReceiverUntrustedRenewWatchdogCancelsHungHandler(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(-time.Second), queue: "q", s: f}}
+	call := 0
+	f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
+		call++
+		if call == 1 {
+			return time.Now().Add(-2 * time.Second), nil
+		}
+		<-renewCtx.Done()
+		return time.Time{}, renewCtx.Err()
+	}
+	handlerCanceled := make(chan struct{})
+	started := time.Now()
+	var observed []error
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		if errors.Is(err, ErrLockLost) {
+			cancel()
+		}
+	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		<-hctx.Done()
+		close(handlerCanceled)
+		return hctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after skew-mode watchdog", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 150*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("untrusted renewal watchdog fired after %s, want two bounded 100ms windows", elapsed)
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("untrusted renewal watchdog did not cancel the handler")
+	}
+	if len(observed) != 1 || !errors.Is(observed[0], ErrLockLost) {
+		t.Fatalf("observed errors = %v, want one ErrLockLost", observed)
+	}
+	f.mu.Lock()
+	renews := f.renewCalls
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if renews != 2 || completeCalls != 0 || abandonCalls != 0 {
+		t.Fatalf("renew/complete/abandon calls = %d/%d/%d, want 2/0/0", renews, completeCalls, abandonCalls)
 	}
 }
 
@@ -1103,6 +1346,156 @@ func TestReceiverDropsExpiredAttemptReplay(t *testing.T) {
 
 func TestReceiverDropsZeroDeadlineAttemptReplay(t *testing.T) {
 	testReceiverDropsStaleAttemptReplay(t, time.Time{})
+}
+
+// A non-zero replay deadline cannot prove freshness against a client wall clock:
+// a fast clock makes a live token look expired, while a slow clock makes a stale
+// token look live. Let the broker's fenced Renew decide in auto-renew mode.
+func TestReceiverAutoRenewFencesAttemptReplayRegardlessOfLocalDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		renewErr     error
+		wantHandlers int
+		wantComplete int
+	}{
+		{name: "broker confirms token", wantHandlers: 1, wantComplete: 1},
+		{name: "broker rejects token", renewErr: ErrLockLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+				switch call {
+				case 1:
+					return nil, errors.New("lost receive response")
+				case 2:
+					// A slow client clock can make an actually stale replay look
+					// comfortably live. Replay status, not this timestamp, must force
+					// the broker-side renewal fence.
+					return []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(time.Hour), queue: "q", s: f}}, nil
+				default:
+					<-callCtx.Done()
+					return nil, callCtx.Err()
+				}
+			}
+			f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+				if tc.renewErr != nil {
+					return time.Time{}, tc.renewErr
+				}
+				return time.Now().Add(time.Hour), nil
+			}
+			f.completeFn = func(context.Context) error {
+				cancel()
+				return nil
+			}
+			handlers := 0
+			var observed []error
+			err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+				observed = append(observed, err)
+				if errors.Is(err, ErrLockLost) {
+					cancel()
+				}
+			})}).Run(ctx, func(context.Context, *Message) error {
+				handlers++
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run = %v, want context.Canceled", err)
+			}
+			if handlers != tc.wantHandlers {
+				t.Fatalf("handler calls = %d, want %d", handlers, tc.wantHandlers)
+			}
+			f.mu.Lock()
+			completeCalls := f.completeCalls
+			attempts := append([]string(nil), f.attempts...)
+			f.mu.Unlock()
+			if completeCalls != tc.wantComplete {
+				t.Fatalf("complete calls = %d, want %d", completeCalls, tc.wantComplete)
+			}
+			if len(attempts) < 2 || attempts[0] != attempts[1] {
+				t.Fatalf("attempt sequence = %q, want exact replay before renewal fence", attempts)
+			}
+			if tc.renewErr == nil && len(observed) != 0 {
+				t.Fatalf("observed errors = %v, want none", observed)
+			}
+			if tc.renewErr != nil && (len(observed) != 1 || !errors.Is(observed[0], ErrLockLost)) {
+				t.Fatalf("observed errors = %v, want one ErrLockLost", observed)
+			}
+		})
+	}
+}
+
+func TestReceiverReplayLegacyRenewalKeepsUntrustedCadence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f := &fakeSource{}
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		switch call {
+		case 1:
+			return nil, errors.New("lost receive response")
+		case 2:
+			// Simulate a slow client clock: this stale replay appears to have a
+			// huge local horizon, which cannot be reused after a legacy Renew.
+			return []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(time.Hour), queue: "q", s: f}}, nil
+		default:
+			<-callCtx.Done()
+			return nil, callCtx.Err()
+		}
+	}
+	f.renewDeadlineFn = func(context.Context) (time.Time, error) {
+		return time.Time{}, ErrUnsupported
+	}
+	var timesMu sync.Mutex
+	var legacyRenewTimes []time.Time
+	thirdLegacyRenew := make(chan struct{})
+	f.renewFn = func(context.Context) error {
+		timesMu.Lock()
+		legacyRenewTimes = append(legacyRenewTimes, time.Now())
+		if len(legacyRenewTimes) == 3 {
+			close(thirdLegacyRenew)
+		}
+		timesMu.Unlock()
+		return nil
+	}
+	f.completeFn = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	var observed []error
+	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+		cancel()
+	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
+		select {
+		case <-thirdLegacyRenew:
+			return nil
+		case <-hctx.Done():
+			return hctx.Err()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled after settlement", err)
+	}
+	if len(observed) != 0 {
+		t.Fatalf("observed errors = %v, want none", observed)
+	}
+	timesMu.Lock()
+	times := append([]time.Time(nil), legacyRenewTimes...)
+	timesMu.Unlock()
+	if len(times) != 3 {
+		t.Fatalf("legacy Renew calls = %d, want three", len(times))
+	}
+	if elapsed := times[2].Sub(times[0]); elapsed < 150*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("three legacy skew-mode renewals took %s, want bounded non-spinning cadence", elapsed)
+	}
+	f.mu.Lock()
+	deadlineCalls := f.deadlineRenewCalls
+	completeCalls, abandonCalls := f.completeCalls, f.abandonCalls
+	f.mu.Unlock()
+	if deadlineCalls != 1 || completeCalls != 1 || abandonCalls != 0 {
+		t.Fatalf("deadline-renew/complete/abandon calls = %d/%d/%d, want 1/1/0", deadlineCalls, completeCalls, abandonCalls)
+	}
 }
 
 func TestReceiverDropsZeroDeadlineOnFirstSuccess(t *testing.T) {
