@@ -330,7 +330,7 @@ class WorkflowContractTests(unittest.TestCase):
         expected = {
             "ci.yml": "fe31dd70fbc5c0b3bb0bd8b2e708113434c1da258eadf15e03a9108123a2de14",
             "release.yml": "badec32ab2c9e80b37e732ae0e4418ceebabb3de80b4a396d87dd0c799ab4ed4",
-            "release-image.yml": "00ce4b311619e3f573537516713741efc523d0fb2b1692cacb81d8e5e5219643",
+            "release-image.yml": "932ebb5179c71ef36a2fbd5747437b9b2d333a3891f67dbaa1df3ef0b439eaeb",
         }
         self.assertEqual({p.name for p in (ROOT / ".github/workflows").iterdir()},
                          {"ci.yml", "release.yml", "release-image.yml", "turso-nightly.yml",
