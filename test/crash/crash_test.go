@@ -56,6 +56,7 @@ const (
 	// never wrote. This is what makes liveness/attribution race-free — a sampled beat could not (a
 	// worker that died with output buffered might still deliver a stale beat after the check; codex).
 	pongPrefix = "CRASH-WORKER-PONG"
+	attemptID  = "crash-recovery-attempt"
 )
 
 // respond echoes every challenge the harness sends on stdin, so the harness can prove — from a reply
@@ -118,6 +119,13 @@ func TestCrashWorkerEntrypoint(t *testing.T) {
 		runProducer(ctx, e)
 	case "locker":
 		runLocker(ctx, e)
+	case "attempt-locker":
+		messages, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 1, Attempt: attemptID})
+		if err != nil || len(messages) != 1 || messages[0].DeliveryCount != 1 {
+			fail("receive-attempt lock fixture", fmt.Errorf("messages=%+v err=%v", messages, err))
+		}
+		ready()
+		select {}
 	case "delivery-limit":
 		runDeliveryLimitLocker(ctx, e)
 	case "queue-delete":
@@ -506,6 +514,38 @@ func TestCrashRecoveryResetsOrphanedLocks(t *testing.T) {
 			"  duplicated bodies: %v\n"+
 			"  nothing was ever completed, so every seed id 0..%d must come back exactly once.",
 			total, m.Total, seeded, trim(missing), trim(duped), seeded-1)
+	}
+}
+
+// TestCrashRecoveryInvalidatesReceiveAttemptLease proves the AttemptID cache cannot resurrect the
+// fencing token that startup recovery just invalidated. The child is killed with a live, persisted
+// attempt and lock; retrying that exact ID after restart must obtain a new usable lease rather than
+// replaying stale ownership.
+func TestCrashRecoveryInvalidatesReceiveAttemptLease(t *testing.T) {
+	ctx := context.Background()
+	db := dbPath(t)
+	func() {
+		e := openWithRetry(ctx, db)
+		defer e.Close()
+		ensureQueue(ctx, e, "q")
+		if _, err := e.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("attempt-recovery")}); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	_, _ = killLoop(t, db, "attempt-locker", readyMarker, true, 1)
+	e := openWithRetry(ctx, db)
+	defer e.Close()
+	recovered, err := e.Receive(ctx, "q", mqlite.RecvOpts{Max: 1, Attempt: attemptID})
+	if err != nil || len(recovered) != 1 || string(recovered[0].Body) != "attempt-recovery" || recovered[0].DeliveryCount != 2 {
+		t.Fatalf("attempt retry after crash=%+v, %v; want one fresh second delivery", recovered, err)
+	}
+	if err := recovered[0].Complete(ctx); err != nil {
+		t.Fatalf("attempt retry returned an unusable stale token: %v", err)
+	}
+	stats, err := e.Stats(ctx, "q")
+	if err != nil || stats.Total != 0 {
+		t.Fatalf("queue after completing recovered attempt: %+v, %v", stats, err)
 	}
 }
 

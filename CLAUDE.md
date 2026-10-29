@@ -234,7 +234,10 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   the reaper runs too; only a live exact-request receipt can replay a prior effect
   after its original lease expires. Renew and RenewBatch never revive expired leases.
 - **`receive_attempts`** table makes Receive idempotent when the client passes an
-  `AttemptID` (a retry replays the same batch / same lock tokens; `engine/recv_attempt.go`).
+  `AttemptID`. A Peek-Lock retry replays the same batch only while every cached token
+  still owns a live lease; otherwise the stale response is invalidated and the same
+  transaction safely performs a new claim. Tokenless ReceiveAndDelete responses remain
+  replayable after their rows are removed (`engine/recv_attempt.go`).
 
 ### Other engine subsystems
 

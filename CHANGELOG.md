@@ -58,6 +58,20 @@ upgrade notes before replacing a broker.
   sizing. Missing remote queues now match both `ErrQueueNotFound` and the broader
   `ErrNotFound`, and `HTTPError` preserves non-2xx status codes for inspection.
 
+### Reject stale receive-attempt ownership (MQLITE-133)
+
+- Validate every cached Peek-Lock token against the current locked rows before an
+  AttemptID replay reaches a caller. Startup recovery, lease expiry, settlement,
+  and partial-batch settlement can no longer replay ownership that has already
+  been invalidated.
+- Invalidate a stale Peek-Lock batch and make the replacement claim in the same
+  transaction. Preserve tokenless ReceiveAndDelete response replay across broker
+  restarts, bind each live non-empty saved response to its original receive mode,
+  reject unknown modes, and validate a batch with one set query rather than one
+  round trip per message.
+- Keep the wire format and schema unchanged. Add restart, final-delivery DLQ,
+  lease-expiry, partial-batch, receive-mode, and ReceiveAndDelete regressions.
+
 ## v0.4.2 — 2026-10-28
 
 > **Patch upgrade from v0.4.1:** the canonical schema token remains **7** and no

@@ -370,13 +370,22 @@ Peek-Lock (default) or Receive-and-Delete; long-polls up to `wait_time_ms`.
 Receive-and-Delete removes the row before returning it and grants no lease:
 `lock_token` is empty and `locked_until_ms` is zero (omitted when empty), including
 replays with the same receive attempt ID. The SDK exposes a zero `LockedUntil` time.
-Every newly granted `Receive` claim increments `delivery_count`; replaying a live
-`receive_attempt_id` returns the saved claim and does not increment it again.
+Every newly granted `Receive` claim increments `delivery_count`. A Peek-Lock
+`receive_attempt_id` returns its saved claim without another increment only while
+every saved token still owns a live lease. After restart, settlement, or lease
+expiry invalidates any token, the broker discards that stale response and the retry
+performs a safe new claim; it never returns ownership the caller no longer has.
+Receive-and-Delete keeps replaying its tokenless saved response for the attempt lifetime.
+A live non-empty saved response also binds that attempt ID to its original
+`receive_mode`; reusing it with the other mode is `400 invalid_argument`. Empty
+results are not saved, and an expired record no longer binds the ID.
 
 - **Request** `ReceiveRequest`: `queue`, `max_messages` (int, default 1, max 256),
   `wait_time_ms` (int, long-poll; max 20000), `receive_mode` (int: `0` peek-lock,
-  `1` receive-and-delete), `receive_attempt_id` (string, optional idempotency key —
-  a retry replays the same batch / same lock tokens).
+  `1` receive-and-delete; any other value is `400 invalid_argument`),
+  `receive_attempt_id` (string, optional idempotency key —
+  a Peek-Lock retry replays the same batch while all saved leases remain valid;
+  Receive-and-Delete replays its tokenless saved response).
 - **Response** `ReceiveResponse`: `messages` ([Message]) — each carries a
   `lock_token` to settle with (peek-lock mode).
 

@@ -17,7 +17,8 @@ resource deletion, and fixed subscription expiry. (§1.7, §3, §8, §14)
 - **1.1** `Receive` claims an `active` message, moving it to `locked` for the queue's
   lock duration, and returns a `lock_token`. *(engine/functional_test.go)*
 - **1.2** A `locked` message MUST be invisible to other `Receive` calls until it is
-  settled or its lock expires — no message is delivered to two consumers at once.
+  settled, its lock expires, or single-broker startup recovery invalidates the
+  orphaned lock. Within one running broker, no live lease is granted twice.
   *(engine/functional_test.go `TestCompetingConsumersNoDouble`)*
 - **1.3** Each newly granted `Receive` or `ReceiveDeferred` claim increments
   `delivery_count` exactly once. Renewal, settlement, lock reaping, scheduled
@@ -114,10 +115,26 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestReceiptsAreBoundToTheirArguments, TestSettlementReceiptsAreVerbSpecific,
   TestSettlementReceiptIdentityMatrix;
   engine/model_test.go: TestEngineMatchesTheModel, TestModelRejectReceiptArguments)*
-- **3.3** A `Receive` retried with the same `AttemptID` MUST replay the same batch /
-  same lock tokens while its attempt record is live. Record expiry MUST be checked against
-  fresh time after writer admission; a record that expires during the wait MUST NOT replay.
-  *(engine/ga_fixes_test.go; engine/functional_test.go: TestReceiveAttemptExpiryAfterWriterWait)*
+- **3.3** A Peek-Lock `Receive` retried with the same `AttemptID` MUST replay the
+  same batch and tokens only while every cached token still owns the corresponding
+  live, unexpired lock. If any token is stale, the broker MUST invalidate the whole
+  cached batch and safely perform a new claim in the same transaction; it MUST NOT
+  return a stale or partially owned batch. A tokenless Receive-and-Delete response
+  remains replayable for the attempt lifetime. A live non-empty saved response is
+  bound to its original receive mode; an empty result creates no record, and an
+  expired record no longer binds the ID. Unknown modes MUST be rejected. Record and
+  lease expiry MUST be checked against fresh time after writer admission.
+  *(engine/ga_fixes_test.go; engine/functional_test.go:
+  TestReceiveAttemptExpiryAfterWriterWait,
+  TestReceiveAttemptDoesNotReplayStaleLeaseAfterRestart,
+  TestReceiveAttemptDoesNotReplayDeadLetteredLeaseAfterRestart,
+  TestReceiveAndDeleteAttemptStillReplaysAfterRestart,
+  TestReceiveAttemptDoesNotReplayExpiredLease,
+  TestReceiveAttemptRejectsModeMismatchWithoutDestroyingReplay,
+  TestReceiveRejectsUnknownModeWithoutMutation,
+  TestEmptyReceiveAttemptDoesNotBindMode,
+  TestExpiredReceiveAttemptDoesNotBindMode,
+  TestReceiveAttemptInvalidatesWholePartiallySettledBatch)*
 - **3.4** No message loss + no content corruption: a contiguous `1..N` sequence with
   random bodies (hashed into a property), consumed concurrently with redelivery, is
   delivered completely (every value once) and intact (each body matches its hash).
@@ -544,9 +561,14 @@ recovery, not filesystem durability.
   every orphaned lock — to `active`, or to `dead_lettered` with `MaxDeliveryCountExceeded` if the
   message was already on its last permitted delivery (the same rule the reaper applies, §3.1). Either
   way nothing is stranded `locked`. The last-delivery case preserves the message body and delivery
-  count, clears the lock, and excludes it from normal receive.
+  count, clears the lock, and excludes it from normal receive. A cached Peek-Lock
+  attempt MUST NOT replay a token invalidated by this recovery; its retry either
+  obtains a currently valid new lease or observes no available message.
   *(test/crash/crash_test.go: TestCrashRecoveryResetsOrphanedLocks,
-  TestCrashRecoveryDeadLettersLastDelivery)*
+  TestCrashRecoveryDeadLettersLastDelivery,
+  TestCrashRecoveryInvalidatesReceiveAttemptLease; engine/functional_test.go:
+  TestReceiveAttemptDoesNotReplayStaleLeaseAfterRestart,
+  TestReceiveAttemptDoesNotReplayDeadLetteredLeaseAfterRestart)*
 - **15.3 Acknowledged commits survive recovery.** Every producer commit acknowledged to and
   observed by the harness before a kill MUST still be present after recovery. The harness checks
   those acknowledged transaction identities against both recovered business rows and messages.

@@ -189,8 +189,11 @@ type ReceiveOptions struct {
 	WaitMs      int64 // long-poll up to 20000
 	Mode        ReceiveMode
 	// AttemptID, when set, makes Receive idempotent under client retries: a retry
-	// with the same id replays the same batch (same lock tokens) instead of
-	// claiming new messages / burning delivery_count (SQS ReceiveRequestAttemptId).
+	// with the same id replays the same batch while every Peek-Lock lease remains
+	// valid. If any lease is no longer owned, the stale response is invalidated and
+	// the retry safely performs a new claim. ReceiveAndDelete responses remain
+	// replayable for the attempt lifetime. While a non-empty saved response is
+	// live, every use of its ID must keep the original Mode (SQS ReceiveRequestAttemptId).
 	AttemptID string
 }
 

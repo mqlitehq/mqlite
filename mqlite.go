@@ -242,7 +242,7 @@ type RecvOpts struct {
 	Max        int           // most messages to claim (0 -> 1)
 	Wait       time.Duration // long-poll wait (0 -> don't wait); capped at 20s
 	AtMostOnce bool          // receive-and-delete (no lock, no settle)
-	Attempt    string        // idempotent-receive key; a retry replays the same batch
+	Attempt    string        // idempotency key; a live non-empty saved response also binds the AtMostOnce value
 	Pick       []int64       // fetch these deferred seqs by seq instead of claiming
 }
 

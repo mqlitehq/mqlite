@@ -1055,6 +1055,13 @@ type busyState struct {
 	insertIDs       bool
 	inserted        int64
 	insertQueues    []string
+	attemptResponse string
+	attemptLeases   [][]driver.Value
+	replacementRow  []driver.Value
+	attemptChecks   int
+	attemptDeletes  int
+	attemptStores   int
+	replacementRuns int
 }
 
 func (c *busyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("prepare unused") }
@@ -1115,6 +1122,21 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 	if !c.record(query, args) {
 		return nil, errors.New("database is locked") // isBusyErr => retryable
 	}
+	if strings.Contains(normalized, "SELECT response FROM receive_attempts") {
+		if c.st.attemptResponse == "" {
+			return emptyRows{}, nil
+		}
+		return &oneQueueRow{values: []driver.Value{c.st.attemptResponse}}, nil
+	}
+	if strings.Contains(normalized, "SELECT id,lock_token,locked_until FROM messages") {
+		c.st.attemptChecks++
+		return &valueRows{values: c.st.attemptLeases}, nil
+	}
+	if c.st.replacementRow != nil && strings.HasPrefix(normalized, "UPDATE messages SET") &&
+		!strings.Contains(normalized, "receive_attempts") {
+		c.st.replacementRuns++
+		return &oneQueueRow{values: c.st.replacementRow}, nil
+	}
 	if c.st.rosterRows > 0 && strings.Contains(query, "FROM subscriptions s JOIN queues q") {
 		c.st.rosterRead++
 		values := make([][]driver.Value, c.st.rosterRows)
@@ -1150,6 +1172,13 @@ func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.Na
 	}
 	if c.st.execErr != nil {
 		return nil, c.st.execErr
+	}
+	normalized := strings.Join(strings.Fields(query), " ")
+	if strings.HasPrefix(normalized, "DELETE FROM receive_attempts WHERE queue=? AND attempt_id=?") {
+		c.st.attemptDeletes++
+	}
+	if strings.HasPrefix(normalized, "INSERT OR REPLACE INTO receive_attempts") {
+		c.st.attemptStores++
 	}
 	if c.st.noEffect {
 		return driver.RowsAffected(0), nil
@@ -1394,6 +1423,83 @@ func TestAttemptReceiveReadsLifecycleMetadataOnce(t *testing.T) {
 	}
 	if state.queueReads != 1 {
 		t.Fatalf("attempt receive metadata reads=%d, want 1", state.queueReads)
+	}
+}
+
+func TestReceiveAttemptReplayValidationUsesOneSetQuery(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1000, maxDeliveryCount: 10, ordering: OrderStandard}
+	want := []*Message{
+		{SeqNumber: 10, Body: []byte("a"), DeliveryCount: 1, LockedUntilMs: 2000, LockToken: "token-a"},
+		{SeqNumber: 11, Body: []byte("b"), DeliveryCount: 1, LockedUntilMs: 2000, LockToken: "token-b"},
+	}
+	blob, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.attemptResponse = string(blob)
+	state.attemptLeases = [][]driver.Value{
+		{int64(10), "token-a", int64(2000)},
+		{int64(11), "token-b", int64(2000)},
+	}
+
+	got, err := e.claimRound(context.Background(), q, 2, PeekLock, "attempt")
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("replay=%+v, %v; want %+v", got, err, want)
+	}
+	if state.attemptChecks != 1 {
+		t.Fatalf("batch lease validation queries=%d, want one set query", state.attemptChecks)
+	}
+	found := false
+	for i, query := range state.queries {
+		if !strings.Contains(strings.Join(strings.Fields(query), " "), "SELECT id,lock_token,locked_until FROM messages") {
+			continue
+		}
+		found = true
+		args := state.args[i]
+		if len(args) != 3 || args[0].Value != "q" || args[1].Value != int64(10) || args[2].Value != int64(11) {
+			t.Fatalf("set validation args=%v, want queue and every cached sequence", args)
+		}
+	}
+	if !found {
+		t.Fatal("missing set-based lease validation query")
+	}
+}
+
+func TestStaleReceiveAttemptReplacementRebuildsOnRemoteTransactionRetry(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	q := queueRow{name: "q", lifecycleState: "active", lockDurationMs: 1000, maxDeliveryCount: 10, ordering: OrderStandard}
+	stale, err := json.Marshal([]*Message{{
+		SeqNumber: 7, Body: []byte("stale"), DeliveryCount: 1,
+		LockedUntilMs: 2000, LockToken: "old-token",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.attemptResponse = string(stale)
+	state.replacementRow = []driver.Value{
+		int64(9), []byte("replacement"), int64(2), nil, nil, nil,
+		nil, nil, nil, nil, int64(900), int64(2000),
+	}
+	commits := 0
+	state.onCommit = func() {
+		commits++
+		if commits == 1 {
+			state.failsLeft = 1 // definite non-commit; rerun the whole callback
+		}
+	}
+
+	got, err := e.claimRound(context.Background(), q, 1, PeekLock, "attempt")
+	if err != nil || len(got) != 1 || got[0].SeqNumber != 9 || got[0].DeliveryCount != 2 ||
+		string(got[0].Body) != "replacement" || got[0].LockToken == "" || got[0].LockToken == "old-token" {
+		t.Fatalf("replacement=%+v, %v", got, err)
+	}
+	if commits != 2 || state.attemptChecks != 2 || state.attemptDeletes != 2 ||
+		state.replacementRuns != 2 || state.attemptStores != 2 {
+		t.Fatalf("commits=%d checks=%d deletes=%d replacement-claims=%d stores=%d; want every callback step twice",
+			commits, state.attemptChecks, state.attemptDeletes, state.replacementRuns, state.attemptStores)
 	}
 }
 

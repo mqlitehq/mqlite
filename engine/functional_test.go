@@ -1704,6 +1704,300 @@ func TestReceiveAttemptUsesOneExpiryInstantForGuardAndReplay(t *testing.T) {
 	}
 }
 
+func TestReceiveAttemptDoesNotReplayStaleLeaseAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "restart-attempt.db")
+	e1, _ := testEngineAt(t, path)
+	mustQueue(t, e1, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+	seq, err := e1.SendOne(ctx, "q", OutMessage{Body: []byte("survives")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "before-restart"
+	first, err := e1.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(first) != 1 || first[0].SeqNumber != seq {
+		t.Fatalf("initial receive=%+v, %v", first, err)
+	}
+	oldToken := first[0].LockToken
+	if err := e1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, _ := testEngineAt(t, path)
+	recovered, err := e2.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(recovered) != 1 || recovered[0].SeqNumber != seq {
+		t.Fatalf("receive after restart=%+v, %v", recovered, err)
+	}
+	if recovered[0].LockToken == "" || recovered[0].LockToken == oldToken || recovered[0].DeliveryCount != 2 {
+		t.Fatalf("restart replayed stale lease instead of reclaiming: before=%+v after=%+v", first[0], recovered[0])
+	}
+	if err := e2.Complete(ctx, "q", seq, recovered[0].LockToken); err != nil {
+		t.Fatalf("recovered lease cannot settle: %v", err)
+	}
+}
+
+func TestReceiveAttemptBatchDoesNotReplayStaleLeasesAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "restart-attempt-batch.db")
+	e1, _ := testEngineAt(t, path)
+	mustQueue(t, e1, "q", QueueConfig{MaxDeliveryCount: 10})
+	seqs, err := e1.Send(ctx, "q",
+		OutMessage{Body: []byte("a")},
+		OutMessage{Body: []byte("b")},
+		OutMessage{Body: []byte("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "before-restart-batch"
+	first, err := e1.Receive(ctx, "q", ReceiveOptions{MaxMessages: 3, AttemptID: attemptID})
+	if err != nil || len(first) != 3 {
+		t.Fatalf("initial receive=%+v, %v", first, err)
+	}
+	oldTokens := make(map[int64]string, len(first))
+	for _, msg := range first {
+		oldTokens[msg.SeqNumber] = msg.LockToken
+	}
+	if err := e1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, _ := testEngineAt(t, path)
+	recovered, err := e2.Receive(ctx, "q", ReceiveOptions{MaxMessages: 3, AttemptID: attemptID})
+	if err != nil || len(recovered) != 3 {
+		t.Fatalf("receive after restart=%+v, %v", recovered, err)
+	}
+	for i, msg := range recovered {
+		if msg.SeqNumber != seqs[i] || msg.LockToken == "" || msg.LockToken == oldTokens[msg.SeqNumber] || msg.DeliveryCount != 2 {
+			t.Fatalf("message %d did not get a valid recovered lease: %+v", i, msg)
+		}
+		if err := e2.Complete(ctx, "q", msg.SeqNumber, msg.LockToken); err != nil {
+			t.Fatalf("complete recovered message %d: %v", i, err)
+		}
+	}
+}
+
+func TestReceiveAttemptDoesNotReplayDeadLetteredLeaseAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "restart-final-attempt.db")
+	e1, _ := testEngineAt(t, path)
+	mustQueue(t, e1, "q", QueueConfig{MaxDeliveryCount: 1})
+	if _, err := e1.SendOne(ctx, "q", OutMessage{Body: []byte("final")}); err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "final-attempt"
+	first, err := e1.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(first) != 1 || first[0].DeliveryCount != 1 {
+		t.Fatalf("initial receive=%+v, %v", first, err)
+	}
+	if err := e1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, _ := testEngineAt(t, path)
+	replay, err := e2.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay) != 0 {
+		t.Fatalf("restart replayed a delivery already moved to the DLQ: %+v", replay)
+	}
+	dead, err := e2.Peek(ctx, "q", PeekOptions{State: StateDeadLettered})
+	if err != nil || len(dead) != 1 || string(dead[0].Body) != "final" {
+		t.Fatalf("dead-letter recovery=%+v, %v", dead, err)
+	}
+}
+
+func TestReceiveAndDeleteAttemptStillReplaysAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "restart-delete-attempt.db")
+	e1, _ := testEngineAt(t, path)
+	mustQueue(t, e1, "q", QueueConfig{})
+	seq, err := e1.SendOne(ctx, "q", OutMessage{Body: []byte("deleted-but-replayable")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "delete-attempt"
+	first, err := e1.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveAndDelete, AttemptID: attemptID})
+	if err != nil || len(first) != 1 || first[0].SeqNumber != seq || first[0].LockToken != "" {
+		t.Fatalf("initial receive-and-delete=%+v, %v", first, err)
+	}
+	if err := e1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, _ := testEngineAt(t, path)
+	replay, err := e2.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveAndDelete, AttemptID: attemptID})
+	if err != nil || len(replay) != 1 || replay[0].SeqNumber != seq || replay[0].LockToken != "" ||
+		string(replay[0].Body) != "deleted-but-replayable" {
+		t.Fatalf("receive-and-delete attempt was not replayed after restart: %+v, %v", replay, err)
+	}
+}
+
+func TestReceiveAttemptDoesNotReplayExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 10})
+	seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("expired")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "expired-attempt"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("initial receive=%+v, %v", first, err)
+	}
+	advance(clock, 2*time.Second)
+	e.RunMaintenanceOnce(ctx)
+
+	reclaimed, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].SeqNumber != seq {
+		t.Fatalf("receive after lease expiry=%+v, %v", reclaimed, err)
+	}
+	if reclaimed[0].LockToken == first[0].LockToken || reclaimed[0].DeliveryCount != 2 {
+		t.Fatalf("expired attempt replayed stale lease: before=%+v after=%+v", first[0], reclaimed[0])
+	}
+}
+
+func TestReceiveAttemptRejectsModeMismatchWithoutDestroyingReplay(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name      string
+		stored    ReceiveMode
+		mismatch  ReceiveMode
+		wantToken bool
+	}{
+		{name: "peek-lock then receive-and-delete", stored: PeekLock, mismatch: ReceiveAndDelete, wantToken: true},
+		{name: "receive-and-delete then peek-lock", stored: ReceiveAndDelete, mismatch: PeekLock},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			e, _ := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{})
+			seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte(test.name)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			const attemptID = "mode-bound"
+			first, err := e.Receive(ctx, "q", ReceiveOptions{Mode: test.stored, AttemptID: attemptID})
+			if err != nil || len(first) != 1 || first[0].SeqNumber != seq || (first[0].LockToken != "") != test.wantToken {
+				t.Fatalf("initial receive=%+v, %v", first, err)
+			}
+			if _, err := e.Receive(ctx, "q", ReceiveOptions{Mode: test.mismatch, AttemptID: attemptID}); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("mode mismatch error=%v, want ErrInvalidArgument", err)
+			}
+			replay, err := e.Receive(ctx, "q", ReceiveOptions{Mode: test.stored, AttemptID: attemptID})
+			if err != nil || len(replay) != 1 || replay[0].SeqNumber != seq ||
+				replay[0].LockToken != first[0].LockToken || string(replay[0].Body) != test.name {
+				t.Fatalf("original replay was changed by mode mismatch: first=%+v replay=%+v err=%v", first, replay, err)
+			}
+		})
+	}
+}
+
+func TestReceiveRejectsUnknownModeWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("untouched")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, attemptID := range []string{"", "unknown-mode"} {
+		if _, err := e.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveMode(2), AttemptID: attemptID}); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("unknown receive mode with attempt %q error=%v, want ErrInvalidArgument", attemptID, err)
+		}
+	}
+	stats, err := e.Stats(ctx, "q")
+	if err != nil || stats.Active != 1 || stats.Locked != 0 || stats.Total != 1 {
+		t.Fatalf("unknown mode mutated the queue: %+v, %v", stats, err)
+	}
+}
+
+func TestEmptyReceiveAttemptDoesNotBindMode(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	const attemptID = "empty-attempt"
+	if msgs, err := e.Receive(ctx, "q", ReceiveOptions{Mode: PeekLock, AttemptID: attemptID}); err != nil || len(msgs) != 0 {
+		t.Fatalf("empty peek-lock receive=%+v, %v", msgs, err)
+	}
+	if msgs, err := e.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveAndDelete, AttemptID: attemptID}); err != nil || len(msgs) != 0 {
+		t.Fatalf("empty receive-and-delete after mode switch=%+v, %v", msgs, err)
+	}
+}
+
+func TestExpiredReceiveAttemptDoesNotBindMode(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("deleted")}); err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "expired-mode-binding"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveAndDelete, AttemptID: attemptID})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("initial receive-and-delete=%+v, %v", first, err)
+	}
+	advance(clock, 5*time.Minute)
+	if msgs, err := e.Receive(ctx, "q", ReceiveOptions{Mode: PeekLock, AttemptID: attemptID}); err != nil || len(msgs) != 0 {
+		t.Fatalf("expired attempt still bound its old mode: %+v, %v", msgs, err)
+	}
+}
+
+func TestReceiveAttemptInvalidatesWholePartiallySettledBatch(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	seqs, err := e.Send(ctx, "q", OutMessage{Body: []byte("done")}, OutMessage{Body: []byte("still-owned")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "partial-batch"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 2, AttemptID: attemptID})
+	if err != nil || len(first) != 2 {
+		t.Fatalf("initial batch=%+v, %v", first, err)
+	}
+	// Keep the first cached lease valid and invalidate only the later item. This
+	// catches an implementation that checks just the first row instead of the whole batch.
+	if err := e.Complete(ctx, "q", first[1].SeqNumber, first[1].LockToken); err != nil {
+		t.Fatal(err)
+	}
+
+	replay, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 2, AttemptID: attemptID})
+	if err != nil || len(replay) != 0 {
+		t.Fatalf("partially settled attempt replayed a mixed-ownership batch: %+v, %v", replay, err)
+	}
+	if err := e.Complete(ctx, "q", seqs[0], first[0].LockToken); err != nil {
+		t.Fatalf("invalidating the attempt released its remaining valid lock: %v", err)
+	}
+}
+
+func TestReceiveAttemptReplaysMaximumBatch(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	input := make([]OutMessage, 256)
+	for i := range input {
+		input[i] = OutMessage{Body: []byte(fmt.Sprintf("message-%03d", i))}
+	}
+	if _, err := e.Send(ctx, "q", input...); err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "maximum-batch"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 256, AttemptID: attemptID})
+	if err != nil || len(first) != 256 {
+		t.Fatalf("initial maximum batch=%d, %v", len(first), err)
+	}
+	replay, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 256, AttemptID: attemptID})
+	if err != nil || len(replay) != len(first) {
+		t.Fatalf("maximum replay batch=%d, %v", len(replay), err)
+	}
+	for i := range first {
+		if replay[i].SeqNumber != first[i].SeqNumber || replay[i].LockToken != first[i].LockToken ||
+			replay[i].DeliveryCount != first[i].DeliveryCount {
+			t.Fatalf("maximum replay item %d changed ownership: first=%+v replay=%+v", i, first[i], replay[i])
+		}
+	}
+}
+
 func TestClaimRefreshesStaleCachedConfiguration(t *testing.T) {
 	t.Run("lease", func(t *testing.T) {
 		ctx := context.Background()

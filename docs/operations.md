@@ -42,7 +42,14 @@ Still quiesce clients and avoid overlapping brokers during the binary replacemen
   snapshot can repeat work whose external side effects already happened. Reuse
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
   when retrying within their documented retention windows; do not treat an HTTP
-  timeout as proof that a write failed.
+  timeout as proof that a write failed. A Peek-Lock AttemptID replays only while
+  its entire saved batch still owns live leases; after restart or lease loss the
+  broker invalidates that stale response and safely re-evaluates eligible work in
+  a fresh claim instead of returning an obsolete lock token. For a planned broker
+  replacement, quiesce new receives and let client handlers settle before stopping the old broker. Startup
+  recovery invalidates every remaining lock immediately; an old remote handler
+  can still finish its external side effect, but can no longer settle that token,
+  so the work may be processed again.
 
 The next three boundaries apply to v0.4.0 and later. v0.3.2 has
 the complete active-only `ListSubscriptions` operation, but it does not provide

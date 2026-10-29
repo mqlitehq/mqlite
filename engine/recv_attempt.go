@@ -5,6 +5,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
+)
+
+type attemptLookupState uint8
+
+const (
+	attemptMissing attemptLookupState = iota
+	attemptReplayable
+	attemptInvalidated
 )
 
 // recvAttemptTTLFloorMs is the minimum lifetime of a receive-attempt record. The
@@ -13,9 +23,9 @@ import (
 const recvAttemptTTLFloorMs = 5 * 60 * 1000 // 5 min
 
 // claimRound performs one transactional claim attempt. With an attempt id the whole round —
-// replay-check, claim, and record — runs in one transaction so a client retrying
-// a Receive whose response was lost replays the SAME batch instead of claiming
-// new messages and burning delivery_count.
+// replay-check, lease validation, claim, and record — runs in one transaction so
+// a client retrying a Receive whose response was lost replays the same still-owned
+// batch, and can never receive a stale lock after recovery or lease expiry.
 func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode ReceiveMode, attemptID string) ([]*Message, error) {
 	if attemptID == "" {
 		return e.claimUpTo(ctx, q, max, mode)
@@ -50,13 +60,18 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 			// Use the same instant as the UPDATE guard. If a live attempt caused
 			// that statement to return zero, advancing the clock here must not
 			// turn the same transaction into an empty response.
-			if replay, ok, lookupErr := lookupAttempt(ctx, tx, q.name, attemptID, claimNow); lookupErr != nil {
+			replay, state, lookupErr := lookupAttempt(ctx, tx, q.name, attemptID, mode, claimNow)
+			if lookupErr != nil {
 				return lookupErr
-			} else if ok {
+			}
+			if state == attemptReplayable {
 				out = replay
 				return nil
 			}
-			if claimConfigEqual(q, current) {
+			// A stale lease-bearing attempt is removed in this transaction. Claim
+			// immediately with the same attempt ID instead of returning an empty
+			// response that could be mistaken for a definite replay result.
+			if state == attemptMissing && claimConfigEqual(q, current) {
 				return nil
 			}
 			msgs, err = e.claimUpToLiveTx(ctx, tx, current, max, mode)
@@ -97,22 +112,115 @@ func claimConfigEqual(cached, current queueRow) bool {
 		cached.expiresAtMs == current.expiresAtMs
 }
 
-func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, now int64) ([]*Message, bool, error) {
+func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode ReceiveMode, now int64) ([]*Message, attemptLookupState, error) {
 	var blob string
 	err := tx.QueryRowContext(ctx,
 		`SELECT response FROM receive_attempts WHERE queue=? AND attempt_id=? AND expires_at>?`,
 		queue, attemptID, now).Scan(&blob)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
+		return nil, attemptMissing, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, attemptMissing, err
 	}
 	var msgs []*Message
 	if err := json.Unmarshal([]byte(blob), &msgs); err != nil {
-		return nil, false, err
+		return nil, attemptMissing, err
 	}
-	return msgs, true, nil
+	if len(msgs) == 0 {
+		return nil, attemptMissing, errors.New("mqlite: stored receive attempt has an empty response")
+	}
+
+	// ReceiveAndDelete removes the rows in the same transaction that stores this
+	// tokenless response. Its cached body is therefore the only safe replay after
+	// a lost acknowledgement, including across a broker restart. Peek-Lock is the
+	// opposite: every cached token must still fence a live, unexpired lock before
+	// user code may see it. Startup recovery, the reaper, settlement, or a prior
+	// replay can all invalidate that lease while the attempt record is still live.
+	tokenless, tokenBearing := true, true
+	for _, msg := range msgs {
+		if msg == nil {
+			return nil, attemptMissing, errors.New("mqlite: stored receive attempt contains a null message")
+		}
+		if msg.LockToken == "" {
+			tokenBearing = false
+		} else {
+			tokenless = false
+		}
+	}
+	if !tokenless && !tokenBearing {
+		return nil, attemptMissing, errors.New("mqlite: stored receive attempt mixes leased and deleted messages")
+	}
+	if mode == ReceiveAndDelete {
+		if !tokenless {
+			return nil, attemptMissing, fmt.Errorf("%w: receive attempt was created for peek-lock mode", ErrInvalidArgument)
+		}
+		for _, msg := range msgs {
+			if msg.LockedUntilMs != 0 {
+				return nil, attemptMissing, errors.New("mqlite: stored receive-and-delete attempt contains a lease deadline")
+			}
+		}
+		return msgs, attemptReplayable, nil
+	}
+	if !tokenBearing {
+		return nil, attemptMissing, fmt.Errorf("%w: receive attempt was created for receive-and-delete mode", ErrInvalidArgument)
+	}
+
+	type lease struct {
+		token       string
+		lockedUntil int64
+	}
+	expected := make(map[int64]string, len(msgs))
+	placeholders := make([]string, len(msgs))
+	args := make([]any, 0, len(msgs)+1)
+	args = append(args, queue)
+	for i, msg := range msgs {
+		if _, duplicate := expected[msg.SeqNumber]; duplicate {
+			return nil, attemptMissing, errors.New("mqlite: stored receive attempt contains a duplicate message")
+		}
+		expected[msg.SeqNumber] = msg.LockToken
+		placeholders[i] = "?"
+		args = append(args, msg.SeqNumber)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id,lock_token,locked_until FROM messages
+		WHERE queue=? AND state='locked' AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, attemptMissing, err
+	}
+	actual := make(map[int64]lease, len(msgs))
+	for rows.Next() {
+		var seq int64
+		var current lease
+		if err := rows.Scan(&seq, &current.token, &current.lockedUntil); err != nil {
+			_ = rows.Close()
+			return nil, attemptMissing, err
+		}
+		actual[seq] = current
+	}
+	if err := rows.Close(); err != nil {
+		return nil, attemptMissing, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, attemptMissing, err
+	}
+	valid := len(actual) == len(expected)
+	if valid {
+		for seq, token := range expected {
+			current, ok := actual[seq]
+			if !ok || current.token != token || current.lockedUntil <= now {
+				valid = false
+				break
+			}
+		}
+	}
+	if valid {
+		return msgs, attemptReplayable, nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM receive_attempts WHERE queue=? AND attempt_id=?`, queue, attemptID); err != nil {
+		return nil, attemptMissing, err
+	}
+	return nil, attemptInvalidated, nil
 }
 
 func storeAttempt(ctx context.Context, tx *txn, queue, attemptID string, msgs []*Message, now, expires int64) error {
