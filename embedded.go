@@ -139,23 +139,35 @@ func (e *Embedded) Close() error { return e.eng.Close() }
 // full=true (rewrites the file, global lock — maintenance only). Local-only.
 func (e *Embedded) Compact(ctx context.Context, full bool) error { return e.eng.Compact(ctx, full) }
 
-func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
+func embeddedLeaseDeadline(deadlineMs, serverNowMs int64) time.Time {
+	if deadlineMs <= 0 {
+		return time.Time{}
+	}
+	// Engine deadlines live in the injectable engine clock domain. Translate the
+	// remaining duration onto time.Now so Receiver scheduling keeps a monotonic
+	// horizon even when WithClock uses a test epoch far from the host wall clock.
+	remaining := time.UnixMilli(deadlineMs).Sub(time.UnixMilli(serverNowMs))
+	return time.Now().Add(remaining)
+}
+
+func (e *Embedded) engineToMessage(queue string, m *engine.Message, serverNowMs int64) *Message {
 	return &Message{
-		SequenceNumber: m.SeqNumber,
-		Body:           m.Body,
-		MessageID:      m.MessageID,
-		GroupID:        m.GroupID,
-		CorrelationID:  m.CorrelationID,
-		ReplyTo:        m.ReplyTo,
-		Subject:        m.Subject,
-		ContentType:    m.ContentType,
-		Properties:     m.Properties,
-		DeliveryCount:  m.DeliveryCount,
-		EnqueuedAt:     msToTime(m.EnqueuedAtMs),
-		LockedUntil:    msToTime(m.LockedUntilMs),
-		queue:          queue,
-		lockToken:      m.LockToken,
-		s:              e,
+		SequenceNumber:   m.SeqNumber,
+		Body:             m.Body,
+		MessageID:        m.MessageID,
+		GroupID:          m.GroupID,
+		CorrelationID:    m.CorrelationID,
+		ReplyTo:          m.ReplyTo,
+		Subject:          m.Subject,
+		ContentType:      m.ContentType,
+		Properties:       m.Properties,
+		DeliveryCount:    m.DeliveryCount,
+		EnqueuedAt:       msToTime(m.EnqueuedAtMs),
+		LockedUntil:      msToTime(m.LockedUntilMs),
+		localLockedUntil: embeddedLeaseDeadline(m.LockedUntilMs, serverNowMs),
+		queue:            queue,
+		lockToken:        m.LockToken,
+		s:                e,
 	}
 }
 
@@ -282,8 +294,12 @@ func (e *Embedded) Receive(ctx context.Context, queue string, opts ...RecvOpts) 
 		return nil, err
 	}
 	out := make([]*Message, len(ms))
+	if len(ms) == 0 {
+		return out, nil
+	}
+	serverNowMs := e.eng.ServerTimeMs()
 	for i, m := range ms {
-		out[i] = e.engineToMessage(queue, m)
+		out[i] = e.engineToMessage(queue, m, serverNowMs)
 	}
 	return out, nil
 }
@@ -294,8 +310,12 @@ func (e *Embedded) receiveOne(ctx context.Context, queue string, max int, waitMs
 		return nil, err
 	}
 	out := make([]*Message, len(ms))
+	if len(ms) == 0 {
+		return out, nil
+	}
+	serverNowMs := e.eng.ServerTimeMs()
 	for i, m := range ms {
-		out[i] = e.engineToMessage(queue, m)
+		out[i] = e.engineToMessage(queue, m, serverNowMs)
 	}
 	return out, nil
 }
@@ -627,7 +647,7 @@ func (e *Embedded) renewDeadline(ctx context.Context, q string, seq int64, tok s
 	if result.LockedUntilMs <= 0 {
 		return renewalLease{}, fmt.Errorf("mqlite: invalid embedded RenewBatch deadline")
 	}
-	return renewalLease{deadline: msFromEpoch(result.LockedUntilMs)}, nil
+	return renewalLease{deadline: embeddedLeaseDeadline(result.LockedUntilMs, e.eng.ServerTimeMs())}, nil
 }
 
 // newHTTPServer builds the broker's http.Server with hardening defaults (review F9,

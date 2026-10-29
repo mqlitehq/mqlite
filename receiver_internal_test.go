@@ -1514,6 +1514,52 @@ func TestReceiverCachesUnsupportedDeadlineRenewal(t *testing.T) {
 	}
 }
 
+func TestEmbeddedReceiverMapsInjectedClockLeaseToLocalTimeline(t *testing.T) {
+	const brokerNow = int64(1_600_000_000_000)
+	ctx := context.Background()
+	embedded, err := OpenEmbedded(ctx, ":memory:", WithClock(func() int64 { return brokerNow }), WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	if err := embedded.CreateQueue(ctx, "q", QueueConfig{LockDuration: 2 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := embedded.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := embedded.Receive(ctx, "q")
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("Receive = %d messages, %v", len(messages), err)
+	}
+	message := messages[0]
+	if want := time.UnixMilli(brokerNow + 2_000); !message.LockedUntil.Equal(want) {
+		t.Errorf("public LockedUntil = %v, want broker epoch %v", message.LockedUntil, want)
+	}
+	remaining := time.Until(message.localLockedUntil)
+	if remaining < 1500*time.Millisecond || remaining > 2100*time.Millisecond {
+		t.Errorf("local lease horizon = %s, want about 2s", remaining)
+	}
+
+	var observed []error
+	handlerCalls := 0
+	receiver := embedded.Receiver("q", WithAutoRenew(), WithErrorHandler(func(err error) {
+		observed = append(observed, err)
+	}))
+	receiver.process(ctx, message, func(context.Context, *Message) error {
+		handlerCalls++
+		return nil
+	}, func() {}, func() bool { return false }, func(err error, _ bool) {
+		t.Errorf("Receiver stopped: %v", err)
+	}, false)
+	if handlerCalls != 1 {
+		t.Errorf("handler calls = %d, want one", handlerCalls)
+	}
+	if len(observed) != 0 {
+		t.Errorf("Receiver diagnostics = %v, want none", observed)
+	}
+}
+
 func TestEmbeddedReceiverUsesCommittedRenewDeadline(t *testing.T) {
 	now := int64(1_800_000_000_000)
 	ctx := context.Background()
@@ -1539,9 +1585,12 @@ func TestEmbeddedReceiverUsesCommittedRenewDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := time.UnixMilli(now + 2000)
-	if !lease.deadline.Equal(want) || !lease.deadline.After(original) {
-		t.Fatalf("committed deadline = %v, want %v after original %v", lease.deadline, want, original)
+	remaining := time.Until(lease.deadline)
+	if remaining < 1500*time.Millisecond || remaining > 2100*time.Millisecond {
+		t.Fatalf("committed local deadline = %v (%s remaining), want about 2s", lease.deadline, remaining)
+	}
+	if !messages[0].LockedUntil.Equal(original) {
+		t.Fatalf("renewal mutated public LockedUntil = %v, want original broker epoch %v", messages[0].LockedUntil, original)
 	}
 	if err := messages[0].Complete(ctx); err != nil {
 		t.Fatal(err)

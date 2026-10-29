@@ -41,6 +41,10 @@ upgrade notes before replacing a broker.
   dominates a short lease; a confirmed exact lease below the 50 ms minimum
   cadence fails closed instead of hot-looping. A replayed Receive is fenced by
   one broker Renew before dispatch even when continuous auto-renew is disabled.
+- Map embedded-engine lease deadlines from the injectable engine clock onto a
+  local monotonic horizon for Receiver scheduling. `WithClock` test epochs no
+  longer make a valid embedded renewal look expired, while public `LockedUntil`
+  retains the engine's absolute epoch value.
 - Treat a received HTTP 499 as a transient managed-operation response while the
   Receiver's own context remains live. Receive retries keep the same attempt ID,
   so a cancellation response from an older broker or intermediary cannot

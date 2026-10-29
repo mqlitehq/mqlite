@@ -44,7 +44,10 @@ values replace earlier ones, while repeated object and map values may merge.
   public absolute deadline is retained, but the managed Receiver reports one
   diagnostic, confirms the lease before dispatch, and keeps a bounded
   untrusted-clock cadence instead of using that foreign timestamp as a local
-  schedule; raw HTTP callers should map broker time or synchronize clocks.
+  schedule. This no-header fallback cannot prove a lease shorter than its 250ms
+  cadence plus network latency; preserve one time header, or use a lock duration
+  well above that bound (1s or more is recommended). Raw HTTP callers should map
+  broker time or synchronize clocks.
   CORS-enabled brokers expose this header to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
@@ -488,7 +491,9 @@ a lease merely because the local wall clock falls in a wide uncertainty interval
 lease below the 50 ms minimum cadence fails closed instead of entering a renewal hot loop. Older
 brokers use HTTP `Date` when available; without either time header they retain the public absolute
 deadline but never use it as a managed local schedule. The Receiver emits one diagnostic, confirms
-ownership before dispatch, and keeps a conservative bounded cadence.
+ownership before dispatch, and keeps a conservative 250ms cadence. Because no relative lease
+duration is available in that fallback, preserve one time header or configure the lock well above
+250ms plus network latency (1s or more is recommended).
 Raw `RenewBatch` callers should map the broker clock likewise (or keep clocks synchronized) and
 must not turn clock offset alone into `ErrLockLost`. (If the write itself outlived the lock, you get
 `ok=false` rather than a lock you never really held.) Like single-message Renew, the batch
