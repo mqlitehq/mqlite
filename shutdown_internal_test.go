@@ -36,7 +36,9 @@ func TestReceiveDrainWireContract(t *testing.T) {
 	}
 
 	doReceive := func(gate *receivegate.Gate, requestCtx context.Context) *httptest.ResponseRecorder {
-		h := receiveDrainHandler(server.New(eng.eng, nil).Handler(), gate)
+		srv := server.New(eng.eng, nil)
+		srv.CORS = "*"
+		h := receiveDrainHandler(srv.Handler(), gate)
 		req := httptest.NewRequest(http.MethodPost, wire.PathReceive,
 			strings.NewReader(`{"queue":"q","wait_time_ms":20000,"receive_attempt_id":"attempt"}`)).WithContext(requestCtx)
 		rec := httptest.NewRecorder()
@@ -52,6 +54,9 @@ func TestReceiveDrainWireContract(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
 		t.Fatalf("first-round drain = %d Retry-After=%q; want 503/1; body=%s",
 			rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
+	}
+	if exposed := rec.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(exposed, "Retry-After") {
+		t.Fatalf("drain CORS expose headers = %q, want Retry-After", exposed)
 	}
 	var body wire.ErrorBody
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {

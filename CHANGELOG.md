@@ -93,7 +93,8 @@ upgrade notes before replacing a broker.
   after restart. A claim round admitted before the gate retains the caller's
   context and returns its real result or error; caller cancellation remains `499`.
   A call fenced before its first round returns retryable `503 unavailable` rather
-  than an empty success, preserving Receive AttemptID replay after a lost response.
+  than an empty success, preserving Receive AttemptID replay after a lost response;
+  CORS-enabled brokers expose its `Retry-After` hint to browser clients.
   Unrelated admitted Send, settlement, and management requests retain their contexts
   and the 25-second drain budget.
 - Give the bundled Docker Compose service a 40-second stop grace and document the

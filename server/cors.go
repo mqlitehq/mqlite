@@ -24,7 +24,10 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", s.CORS)
-		h.Set("Access-Control-Expose-Headers", requestIDHeader+", "+wire.ServerTimeHeader)
+		// Retry-After is not CORS-safelisted. Expose the graceful-drain hint so a
+		// browser client can honor the same retry contract as the official SDKs;
+		// the custom broker-time observation likewise needs explicit exposure.
+		h.Set("Access-Control-Expose-Headers", requestIDHeader+", "+wire.ServerTimeHeader+", Retry-After")
 		if s.CORS != "*" {
 			h.Add("Vary", "Origin") // response varies by origin when not wildcard
 		}

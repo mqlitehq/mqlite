@@ -2763,6 +2763,55 @@ func TestReceiveDrainGatePreservesAttemptReplay(t *testing.T) {
 	}
 }
 
+func TestReceiveDrainGatePreservesReceiveAndDeleteAttemptAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "drain-delete-attempt.db")
+	e1, _ := testEngineAt(t, path)
+	mustQueue(t, e1, "q", QueueConfig{})
+	seq, err := e1.SendOne(ctx, "q", OutMessage{Body: []byte("deleted-but-replayable")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const attemptID = "lost-delete-response"
+	first, err := e1.Receive(ctx, "q", ReceiveOptions{
+		Mode: ReceiveAndDelete, AttemptID: attemptID,
+	})
+	if err != nil || len(first) != 1 || first[0].SeqNumber != seq || first[0].LockToken != "" {
+		t.Fatalf("initial receive-and-delete = %+v, %v", first, err)
+	}
+
+	// A response-lost retry must retain its AttemptID while the old broker is
+	// draining. The gate rejects it before any attempt lookup or new claim, so a
+	// subsequent broker process can still replay the persisted tokenless result.
+	draining := receivegate.New()
+	draining.Stop()
+	retry, err := e1.Receive(receivegate.WithContext(ctx, draining), "q", ReceiveOptions{
+		Mode: ReceiveAndDelete, AttemptID: attemptID,
+	})
+	if !errors.Is(err, receivegate.ErrDraining) || len(retry) != 0 {
+		t.Fatalf("receive-and-delete retry during drain = %+v, %v; want ErrDraining", retry, err)
+	}
+	select {
+	case <-draining.FirstClaimEntered():
+		t.Fatal("draining receive-and-delete retry entered a database claim round")
+	default:
+	}
+	if err := e1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, _ := testEngineAt(t, path)
+	replayed, err := e2.Receive(ctx, "q", ReceiveOptions{
+		Mode: ReceiveAndDelete, AttemptID: attemptID,
+	})
+	if err != nil || len(replayed) != 1 || replayed[0].SeqNumber != first[0].SeqNumber ||
+		replayed[0].LockToken != "" || replayed[0].DeliveryCount != first[0].DeliveryCount ||
+		string(replayed[0].Body) != "deleted-but-replayable" {
+		t.Fatalf("receive-and-delete replay after drain/restart = %+v, %v; want original %+v", replayed, err, first)
+	}
+}
+
 func TestDeleteQueueConcurrentSendNeverLosesAcknowledgedMessage(t *testing.T) {
 	e, _ := testEngine(t)
 	ctx := context.Background()

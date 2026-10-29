@@ -113,8 +113,9 @@ cancellation remains `499`. Stop and claim admission share one atomic boundary: 
 admitted before shutdown retains the caller's context and returns its real message or
 error, while no database operation starts for a later round. Only a call that already
 completed a confirmed empty round receives the `200` wake-up. A Receive fenced before
-its first round gets `503 unavailable` with `Retry-After`, preserving its AttemptID in
-case it is replaying a committed claim whose earlier response was lost. Other admitted
+its first round gets `503 unavailable` with `Retry-After` (CORS-exposed when enabled),
+preserving its AttemptID in case it is replaying a committed claim whose earlier
+response was lost. Other admitted
 requests retain their contexts and receive up to
 25 seconds to drain; the broker does not abort an in-flight Send or settlement just
 to wake a long poll. A handler that does not finish (for example, a client stalled
