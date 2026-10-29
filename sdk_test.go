@@ -976,6 +976,7 @@ func TestServeShutdownCancelsLongPoll(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cli.Close() })
 	receiveCtx, cancelReceive := context.WithCancel(ctx)
+	defer cancelReceive()
 	type receiveResult struct {
 		messages []*mqlite.Message
 		err      error
