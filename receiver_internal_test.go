@@ -2,9 +2,11 @@ package mqlite
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strconv"
 	"strings"
@@ -157,8 +159,8 @@ func TestReceiverRetriesWithSameAttemptID(t *testing.T) {
 	f := &fakeSource{failN: 1}
 	f.batch = []*Message{{SequenceNumber: 1, Body: []byte("x"), LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
 
-	// Generous deadline: the receiver only needs one 500ms retry backoff, but a
-	// loaded CI runner under -race can starve the goroutine well past a few seconds.
+	// Generous deadline: the first lost-response replay is immediate, but a loaded
+	// CI runner under -race can still starve the goroutine for several seconds.
 	// A correct receiver still fires in <1s locally; this only absorbs CI jitter.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -841,17 +843,103 @@ func TestNewAttemptIDUnique(t *testing.T) {
 }
 
 func TestReceiverBackoffGrowsCapsAndJitters(t *testing.T) {
-	want := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second}
+	want := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 3 * time.Second, 3 * time.Second}
 	for step, expected := range want {
 		if got := exponentialBackoff(receiveBackoffBase, receiveBackoffMax, step); got != expected {
-			t.Fatalf("backoff step %d = %s, want %s", step, got, expected)
+			t.Fatalf("receive backoff step %d = %s, want %s", step, got, expected)
 		}
 	}
 	for i := 0; i < 32; i++ {
+		got := equalJitterDuration(3 * time.Second)
+		if got < 1500*time.Millisecond || got > 3*time.Second {
+			t.Fatalf("receive equal jitter = %s, want within 1.5s..3s", got)
+		}
+	}
+	// Renew and settlement retain their established symmetric jitter policy.
+	for i := 0; i < 32; i++ {
 		got := jitterDuration(time.Second)
 		if got < 800*time.Millisecond || got > 1200*time.Millisecond {
-			t.Fatalf("jitter = %s, want within 800ms..1.2s", got)
+			t.Fatalf("managed-operation jitter = %s, want within 800ms..1.2s", got)
 		}
+	}
+}
+
+func TestReceiverRetryScheduleKeepsAttemptAndResetsAfterSuccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := &fakeSource{}
+	f.receiveFn = func(callCtx context.Context, call int, _ string) ([]*Message, error) {
+		switch {
+		case call <= 6:
+			return nil, errors.New("simulated transient receive error")
+		case call == 7:
+			return nil, nil // a successful empty response ends this receive round
+		case call == 8:
+			cancel()
+			return nil, callCtx.Err()
+		default:
+			t.Fatalf("unexpected receive call %d", call)
+			return nil, errors.New("unexpected receive call")
+		}
+	}
+	r := newReceiver(f, "q", nil)
+	r.receiveJitter = func(d time.Duration) time.Duration { return d }
+	var waits []time.Duration
+	r.receiveWait = func(ctx context.Context, d time.Duration) bool {
+		waits = append(waits, d)
+		return ctx.Err() == nil
+	}
+	if err := r.Run(ctx, func(context.Context, *Message) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	wantWaits := []time.Duration{0, 500 * time.Millisecond, time.Second, 2 * time.Second, 3 * time.Second, 3 * time.Second}
+	if fmt.Sprint(waits) != fmt.Sprint(wantWaits) {
+		t.Fatalf("receive waits = %v, want %v", waits, wantWaits)
+	}
+	f.mu.Lock()
+	attempts := append([]string(nil), f.attempts...)
+	f.mu.Unlock()
+	if len(attempts) != 8 || attempts[0] == "" {
+		t.Fatalf("receive attempts = %q, want eight calls with a non-empty id", attempts)
+	}
+	for i := 1; i < 7; i++ {
+		if attempts[i] != attempts[0] {
+			t.Fatalf("attempt changed within retry round at call %d: %q != %q", i+1, attempts[i], attempts[0])
+		}
+	}
+	if attempts[7] == attempts[0] || attempts[7] == "" {
+		t.Fatalf("attempt after successful round = %q, want fresh non-empty id distinct from %q", attempts[7], attempts[0])
+	}
+}
+
+func TestReceiverRetryAfterIsManagedReceiveLowerBound(t *testing.T) {
+	r := newReceiver(nil, "q", nil)
+	r.receiveJitter = func(d time.Duration) time.Duration { return d }
+	for _, tc := range []struct {
+		name     string
+		failures int
+		err      error
+		want     time.Duration
+	}{
+		{name: "first transport replay", failures: 1, err: errors.New("connection reset"), want: 0},
+		{name: "first 503 hint", failures: 1, err: &HTTPError{StatusCode: 503, retryAfter: time.Second, retryAfterOK: true}, want: time.Second},
+		{name: "429 hint raises generated delay", failures: 2, err: &HTTPError{StatusCode: 429, retryAfter: 2 * time.Second, retryAfterOK: true}, want: 2 * time.Second},
+		{name: "zero hint does not erase backoff", failures: 2, err: &HTTPError{StatusCode: 503, retryAfterOK: true}, want: 500 * time.Millisecond},
+		{name: "server hint may exceed cap", failures: 5, err: &HTTPError{StatusCode: 503, retryAfter: 8 * time.Second, retryAfterOK: true}, want: 8 * time.Second},
+		{name: "500 ignores hint", failures: 2, err: &HTTPError{StatusCode: 500, retryAfter: 8 * time.Second, retryAfterOK: true}, want: 500 * time.Millisecond},
+		{name: "missing hint uses generated delay", failures: 3, err: &HTTPError{StatusCode: 503}, want: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := r.receiveRetryDelay(tc.failures, tc.err); got != tc.want {
+				t.Fatalf("receiveRetryDelay(%d, %v) = %s, want %s", tc.failures, tc.err, got, tc.want)
+			}
+		})
+	}
+
+	// A faulty injected jitter cannot violate the generated three-second cap.
+	r.receiveJitter = func(time.Duration) time.Duration { return 30 * time.Second }
+	if got := r.receiveRetryDelay(10, errors.New("connection reset")); got != 3*time.Second {
+		t.Fatalf("generated receive delay = %s, want 3s cap", got)
 	}
 }
 
@@ -1418,6 +1506,199 @@ func TestReceiverMissingRenewalClockDoesNotEraseExactShortFence(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	responseDate := time.Date(2026, time.October, 30, 9, 0, 0, 0, time.UTC)
+	received := responseDate.Add(250 * time.Millisecond)
+	for _, tc := range []struct {
+		name         string
+		raw          string
+		date         string
+		receivedAt   time.Time
+		want         time.Duration
+		wantAccepted bool
+	}{
+		{name: "delta zero", raw: "0", receivedAt: received, wantAccepted: true},
+		{name: "delta seconds", raw: " 3 ", receivedAt: received, want: 3 * time.Second, wantAccepted: true},
+		{
+			name:         "HTTP date uses response Date",
+			raw:          responseDate.Add(5 * time.Second).Format(http.TimeFormat),
+			date:         responseDate.Format(http.TimeFormat),
+			receivedAt:   responseDate.Add(24 * time.Hour),
+			want:         5 * time.Second,
+			wantAccepted: true,
+		},
+		{
+			name:         "HTTP date falls back to local receipt",
+			raw:          responseDate.Add(2 * time.Second).Format(http.TimeFormat),
+			receivedAt:   received,
+			want:         1750 * time.Millisecond,
+			wantAccepted: true,
+		},
+		{
+			name:         "malformed Date falls back to local receipt",
+			raw:          responseDate.Add(2 * time.Second).Format(http.TimeFormat),
+			date:         "not-a-date",
+			receivedAt:   received,
+			want:         1750 * time.Millisecond,
+			wantAccepted: true,
+		},
+		{name: "HTTP date equal to response Date", raw: responseDate.Format(http.TimeFormat), date: responseDate.Format(http.TimeFormat), receivedAt: received, wantAccepted: true},
+		{name: "negative delta", raw: "-1", receivedAt: received},
+		{name: "explicit plus is malformed", raw: "+1", receivedAt: received},
+		{name: "fraction is malformed", raw: "1.5", receivedAt: received},
+		{name: "text is malformed", raw: "later", receivedAt: received},
+		{name: "delta duration overflow", raw: "9223372037", receivedAt: received},
+		{
+			name:       "HTTP date duration overflow",
+			raw:        time.Date(2500, time.January, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat),
+			date:       time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat),
+			receivedAt: received,
+		},
+		{
+			name:       "past HTTP date",
+			raw:        responseDate.Add(-time.Second).Format(http.TimeFormat),
+			date:       responseDate.Format(http.TimeFormat),
+			receivedAt: received,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			header := make(http.Header)
+			header.Set("Retry-After", tc.raw)
+			if tc.date != "" {
+				header.Set("Date", tc.date)
+			}
+			got, ok := parseRetryAfter(header, tc.receivedAt)
+			if ok != tc.wantAccepted || got != tc.want {
+				t.Fatalf("parseRetryAfter(%q, Date=%q) = %s, %v; want %s, %v", tc.raw, tc.date, got, ok, tc.want, tc.wantAccepted)
+			}
+		})
+	}
+}
+
+func TestManagedReceiveRetryAfterStaysStatusScoped(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   bool
+	}{
+		{status: 429, want: true},
+		{status: 503, want: true},
+		{status: 408},
+		{status: 500},
+	} {
+		resp := &http.Response{StatusCode: tc.status, Header: make(http.Header)}
+		resp.Header.Set("Retry-After", "4")
+		err := httpErrorFromResponse(resp, time.Now(), nil)
+		got, ok := managedReceiveRetryAfter(err)
+		if ok != tc.want {
+			t.Fatalf("HTTP %d Retry-After accepted = %v, want %v", tc.status, ok, tc.want)
+		}
+		if ok && got != 4*time.Second {
+			t.Fatalf("HTTP %d Retry-After = %s, want 4s", tc.status, got)
+		}
+	}
+}
+
+func TestManagedReceiverHonorsHTTPRetryAfterAndKeepsAttemptID(t *testing.T) {
+	responseDate := time.Date(2026, time.October, 30, 9, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name       string
+		status     int
+		retryAfter string
+		date       string
+		wantWait   time.Duration
+	}{
+		{name: "429 delta seconds", status: http.StatusTooManyRequests, retryAfter: "2", wantWait: 2 * time.Second},
+		{
+			name:       "503 absolute date",
+			status:     http.StatusServiceUnavailable,
+			retryAfter: responseDate.Add(4 * time.Second).Format(http.TimeFormat),
+			date:       responseDate.Format(http.TimeFormat),
+			wantWait:   4 * time.Second,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requestMu sync.Mutex
+			var attempts []string
+			calls := 0
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != wire.PathReceive {
+					t.Errorf("path = %q, want %q", request.URL.Path, wire.PathReceive)
+					http.Error(w, "unexpected route", http.StatusNotFound)
+					return
+				}
+				var receiveRequest wire.ReceiveRequest
+				if err := json.NewDecoder(request.Body).Decode(&receiveRequest); err != nil {
+					t.Errorf("decode Receive request: %v", err)
+					http.Error(w, "bad request", http.StatusBadRequest)
+					return
+				}
+				requestMu.Lock()
+				calls++
+				call := calls
+				attempts = append(attempts, receiveRequest.AttemptID)
+				requestMu.Unlock()
+				switch call {
+				case 1:
+					w.Header().Set("Retry-After", tc.retryAfter)
+					if tc.date != "" {
+						w.Header().Set("Date", tc.date)
+					}
+					w.WriteHeader(tc.status)
+					_, _ = fmt.Fprint(w, `{}`)
+				case 2:
+					_, _ = fmt.Fprint(w, `{"messages":[]}`)
+				case 3:
+					// A successful empty response ended the prior replay round. Use an
+					// out-of-range status to terminate the next round deterministically.
+					w.WriteHeader(600)
+					_, _ = fmt.Fprint(w, `{}`)
+				default:
+					t.Errorf("unexpected Receive call %d", call)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer stub.Close()
+
+			client, err := Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			receiver := newReceiver(client, "jobs", nil)
+			receiver.receiveJitter = func(d time.Duration) time.Duration { return d }
+			var waits []time.Duration
+			receiver.receiveWait = func(ctx context.Context, d time.Duration) bool {
+				waits = append(waits, d)
+				return ctx.Err() == nil
+			}
+			handlerCalls := 0
+			err = receiver.Run(context.Background(), func(context.Context, *Message) error {
+				handlerCalls++
+				return nil
+			})
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != 600 {
+				t.Fatalf("Run = %v, want terminal HTTP 600", err)
+			}
+			if len(waits) != 1 || waits[0] != tc.wantWait {
+				t.Fatalf("managed Receive waits = %v, want [%s]", waits, tc.wantWait)
+			}
+			if handlerCalls != 0 {
+				t.Fatalf("handler calls = %d, want zero for empty Receive response", handlerCalls)
+			}
+			requestMu.Lock()
+			gotAttempts := append([]string(nil), attempts...)
+			requestMu.Unlock()
+			if len(gotAttempts) != 3 || gotAttempts[0] == "" || gotAttempts[0] != gotAttempts[1] {
+				t.Fatalf("Receive attempt IDs = %q, want first retry to reuse one non-empty ID", gotAttempts)
+			}
+			if gotAttempts[2] == "" || gotAttempts[2] == gotAttempts[0] {
+				t.Fatalf("Receive attempt after empty success = %q, want fresh ID distinct from %q", gotAttempts[2], gotAttempts[0])
+			}
+		})
+	}
+}
+
 func TestManagedRetryClassifiesHTTPStatus(t *testing.T) {
 	for _, tc := range []struct {
 		status int
@@ -1430,6 +1711,8 @@ func TestManagedRetryClassifiesHTTPStatus(t *testing.T) {
 		{499, true},
 		{500, true},
 		{503, true},
+		{599, true},
+		{600, true}, // preserve the established renewal/settlement classification
 	} {
 		err := &HTTPError{StatusCode: tc.status}
 		if got := retryableManagedError(err); got != tc.want {
@@ -1456,6 +1739,23 @@ func TestManagedRetryClassifiesHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestManagedReceiveUsesStrict5xxBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   bool
+	}{
+		{499, true},
+		{500, true},
+		{599, true},
+		{600, false},
+	} {
+		err := &HTTPError{StatusCode: tc.status}
+		if got := retryableManagedReceiveError(err); got != tc.want {
+			t.Errorf("HTTP %d Receive retryable = %v, want %v", tc.status, got, tc.want)
+		}
+	}
+}
+
 func TestSettlementExhaustionPreservesHTTPStatusClassification(t *testing.T) {
 	r := newReceiver(nil, "q", nil)
 	for _, tc := range []struct {
@@ -1478,19 +1778,91 @@ func TestSettlementExhaustionPreservesHTTPStatusClassification(t *testing.T) {
 }
 
 func TestReceiverReturnsNonRetryableHTTPError(t *testing.T) {
-	httpErr := &HTTPError{StatusCode: 307}
+	for _, status := range []int{http.StatusTemporaryRedirect, 600} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			httpErr := &HTTPError{StatusCode: status}
+			f := &fakeSource{recvErr: httpErr}
+			var observed error
+			err := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(err error) { observed = err })}).
+				Run(context.Background(), func(context.Context, *Message) error { return nil })
+			if !errors.Is(err, httpErr) || !errors.Is(observed, httpErr) {
+				t.Fatalf("Run/observed = %v/%v, want terminal HTTP %d error", err, observed, status)
+			}
+			f.mu.Lock()
+			calls := f.calls
+			f.mu.Unlock()
+			if calls != 1 {
+				t.Fatalf("non-retryable HTTP %d receive calls = %d, want one", status, calls)
+			}
+		})
+	}
+}
+
+func TestReceiverDoesNotRetryPermanent403OrHonorItsHint(t *testing.T) {
+	httpErr := &HTTPError{
+		StatusCode:   http.StatusForbidden,
+		cause:        ErrPermissionDenied,
+		retryAfter:   time.Hour,
+		retryAfterOK: true,
+	}
 	f := &fakeSource{recvErr: httpErr}
-	var observed error
-	err := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(err error) { observed = err })}).
-		Run(context.Background(), func(context.Context, *Message) error { return nil })
-	if !errors.Is(err, httpErr) || !errors.Is(observed, httpErr) {
-		t.Fatalf("Run/observed = %v/%v, want HTTP redirect error", err, observed)
+	r := newReceiver(f, "q", nil)
+	waits := 0
+	r.receiveWait = func(context.Context, time.Duration) bool {
+		waits++
+		return true
+	}
+	err := r.Run(context.Background(), func(context.Context, *Message) error { return nil })
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("Run = %v, want ErrPermissionDenied", err)
+	}
+	f.mu.Lock()
+	calls := f.calls
+	f.mu.Unlock()
+	if calls != 1 || waits != 0 {
+		t.Fatalf("403 receive calls/waits = %d/%d, want 1/0", calls, waits)
+	}
+}
+
+func TestReceiverCancellationInterruptsRetryAfterWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeSource{recvErr: &HTTPError{
+		StatusCode:   http.StatusServiceUnavailable,
+		retryAfter:   time.Hour,
+		retryAfterOK: true,
+	}}
+	r := newReceiver(f, "q", nil)
+	waiting := make(chan time.Duration, 1)
+	r.receiveWait = func(ctx context.Context, d time.Duration) bool {
+		waiting <- d
+		return waitContext(ctx, d)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Run(ctx, func(context.Context, *Message) error { return nil })
+	}()
+	select {
+	case got := <-waiting:
+		if got != time.Hour {
+			t.Fatalf("Retry-After wait = %s, want 1h", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Receiver did not enter Retry-After wait")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Receiver did not stop after cancellation interrupted Retry-After")
 	}
 	f.mu.Lock()
 	calls := f.calls
 	f.mu.Unlock()
 	if calls != 1 {
-		t.Fatalf("non-retryable HTTP receive calls = %d, want one", calls)
+		t.Fatalf("receive calls = %d, want one before canceled wait", calls)
 	}
 }
 
@@ -2224,7 +2596,9 @@ func TestReceiverKeepsAttemptIDAcrossBackoff(t *testing.T) {
 	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(30 * time.Second), queue: "q", s: f}}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	err := newReceiver(f, "q", nil).Run(ctx, func(context.Context, *Message) error {
+	r := newReceiver(f, "q", nil)
+	r.receiveWait = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
+	err := r.Run(ctx, func(context.Context, *Message) error {
 		cancel()
 		return nil
 	})

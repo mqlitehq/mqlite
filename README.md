@@ -257,6 +257,14 @@ cli.Receiver("orders", mqlite.WithAutoRenew(), mqlite.WithConcurrency(4)).
 
 The managed Receiver replays transient Receive calls with the same attempt ID and
 replays the exact Complete or Abandon request when its acknowledgement is lost.
+The first transient Receive replay adds no client-generated delay unless a valid
+HTTP 429/503 `Retry-After` requires one; continued failures use equal-jitter
+exponential backoff capped at three seconds. `Retry-After` is a lower bound and
+may ask for a longer wait, while cancellation interrupts the wait. An absolute
+retry date is measured from the same response's parseable `Date`, or from the
+local response receipt time when that header is not usable. A successful Receive
+starts the next round with a fresh attempt ID. Renewal and settlement use their
+own retry policies.
 `WithConcurrency(C)` limits concurrently executing handlers. Renewal shutdown and
 settlement can overlap later handlers, but the Receiver bounds all claimed work to
 `C + effective prefetch` deliveries (at most `2C`, and `2C` by default).

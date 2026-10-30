@@ -343,6 +343,25 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   without another request. *(receiver_internal_test.go:
   TestReceiverRetriesBrokerCanceledReceiveWithSameAttemptID,
   TestReceiverDoesNotRetryBrokerCanceledResponseAfterCallerCancel)*
+- **9.9** A managed Receiver MUST retain one non-empty AttemptID across every
+  transient retry of one Receive round. Its first transient failure MUST add no
+  client-generated delay unless a valid HTTP 429/503 `Retry-After` provides a
+  positive lower bound. Later failures use equal-jitter exponential backoff with
+  a 500 ms base, doubling nominal windows and a three-second generated-delay cap;
+  a valid server lower bound MAY exceed that cap, while `Retry-After: 0` MUST NOT
+  erase later generated backoff. Delta-seconds and HTTP-date forms are accepted.
+  An absolute date uses the same response's parseable `Date`, otherwise the local
+  response receipt time; malformed, negative, or overflowing values are ignored.
+  Every wait MUST be interruptible by the controlling context. An HTTP status is
+  transient under the 5xx rule only when `status / 100 == 5`; status 600 is not a
+  5xx and MUST be terminal. Any successful Receive, including an empty response,
+  ends the round, resets its failure count, and gives the next round a fresh
+  AttemptID. Renew and settlement retry policies MUST remain independent.
+  *(receiver_internal_test.go: TestReceiverRetryScheduleKeepsAttemptAndResetsAfterSuccess,
+  TestReceiverRetryAfterIsManagedReceiveLowerBound, TestParseRetryAfter,
+  TestManagedReceiverHonorsHTTPRetryAfterAndKeepsAttemptID,
+  TestReceiverCancellationInterruptsRetryAfterWait,
+  TestReceiverReturnsNonRetryableHTTPError)*
 
 ## 10 · Storage & schema invariants
 

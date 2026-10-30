@@ -46,8 +46,10 @@ func (e *ambiguousAcknowledgementError) Is(target error) bool { return target ==
 // HTTPError reports the HTTP status returned by a broker or intermediary.
 // Structured broker errors remain available through errors.Is on the same value.
 type HTTPError struct {
-	StatusCode int
-	cause      error
+	StatusCode   int
+	cause        error
+	retryAfter   time.Duration
+	retryAfterOK bool
 }
 
 func (e *HTTPError) Error() string {
@@ -64,6 +66,71 @@ func (e *HTTPError) Unwrap() error { return e.cause }
 
 // HTTPStatus returns the response status code.
 func (e *HTTPError) HTTPStatus() int { return e.StatusCode }
+
+func httpErrorFromResponse(resp *http.Response, receivedAt time.Time, cause error) *HTTPError {
+	retryAfter, ok := parseRetryAfter(resp.Header, receivedAt)
+	return &HTTPError{
+		StatusCode:   resp.StatusCode,
+		cause:        cause,
+		retryAfter:   retryAfter,
+		retryAfterOK: ok,
+	}
+}
+
+// parseRetryAfter accepts the two forms defined by HTTP: non-negative delta
+// seconds and an HTTP date. A date is evaluated against the Date header from
+// the same response, falling back to the local response receipt time only when
+// that header is absent or malformed. Invalid, negative, and values that cannot
+// fit in time.Duration are ignored.
+func parseRetryAfter(header http.Header, receivedAt time.Time) (time.Duration, bool) {
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return 0, false
+	}
+	digits := true
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			digits = false
+			break
+		}
+	}
+	if digits {
+		seconds, err := strconv.ParseUint(raw, 10, 64)
+		const maxDuration = time.Duration(1<<63 - 1)
+		if err != nil || seconds > uint64(maxDuration/time.Second) {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+
+	retryAt, err := http.ParseTime(raw)
+	if err != nil {
+		return 0, false
+	}
+	base := receivedAt
+	if responseDate, err := http.ParseTime(header.Get("Date")); err == nil {
+		base = responseDate
+	}
+	if retryAt.Before(base) {
+		return 0, false
+	}
+	seconds := retryAt.Unix() - base.Unix()
+	nanos := int64(retryAt.Nanosecond() - base.Nanosecond())
+	if nanos < 0 {
+		seconds--
+		nanos += int64(time.Second)
+	}
+	if seconds < 0 {
+		return 0, false
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	maxSeconds := int64(maxDuration / time.Second)
+	maxNanos := int64(maxDuration % time.Second)
+	if seconds > maxSeconds || (seconds == maxSeconds && nanos > maxNanos) {
+		return 0, false
+	}
+	return time.Duration(seconds)*time.Second + time.Duration(nanos), true
+}
 
 // Client is a remote mqlite client (Connect-style JSON over HTTP).
 type Client struct {
@@ -276,7 +343,7 @@ func (c *Client) postObserved(ctx context.Context, path string, reqBody, respOut
 		}
 		// Location is controlled by an intermediary and may contain credentials.
 		// Report only the status; RPC redirects are never part of the protocol.
-		return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: errors.New("mqlite: unexpected HTTP redirect")}
+		return serverTimeObservation{}, httpErrorFromResponse(resp, received, errors.New("mqlite: unexpected HTTP redirect"))
 	}
 	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 5 {
 		// An intermediary can synthesize a gateway error after the broker has
@@ -305,7 +372,7 @@ func (c *Client) postObserved(ctx context.Context, path string, reqBody, respOut
 		// 404 from something in front of the broker.
 		if resp.StatusCode == http.StatusNotFound &&
 			(eb.Code == "" || strings.HasPrefix(eb.Message, "no such path")) {
-			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrUnsupported, path)}
+			return serverTimeObservation{}, httpErrorFromResponse(resp, received, fmt.Errorf("%w: %s", ErrUnsupported, path))
 		}
 		if keyResponse {
 			// Intermediary error bodies are untrusted too. Keep recognized codes
@@ -326,15 +393,15 @@ func (c *Client) postObserved(ctx context.Context, path string, reqBody, respOut
 			eb.Code = "permission_denied"
 		}
 		if path == wire.PathDeleteSubscription && eb.Code == "not_found" {
-			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message)}
+			return serverTimeObservation{}, httpErrorFromResponse(resp, received, fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message))
 		}
 		if path == wire.PathSubscribe && eb.Code == "resource_exhausted" {
-			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionLimit, eb.Message)}
+			return serverTimeObservation{}, httpErrorFromResponse(resp, received, fmt.Errorf("%w: %s", ErrSubscriptionLimit, eb.Message))
 		}
 		if eb.Code == "" {
-			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode}
+			return serverTimeObservation{}, httpErrorFromResponse(resp, received, nil)
 		}
-		return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: mapErr(eb)}
+		return serverTimeObservation{}, httpErrorFromResponse(resp, received, mapErr(eb))
 	}
 	if respOut == nil {
 		return observation, nil
