@@ -276,6 +276,10 @@ additional remote database query. `metadata.json`, `windows.jsonl`,
 `summary.json`, `summary.md` and the test log are retained for 14 days. Errors,
 body mismatches, accounting failures, final backlog or exact cleanup failures
 fail the run, while the evidence written before a failure remains uploadable.
+Foreground failures and per-window storage errors include the safe generated
+category, HTTP/SQLite status where available, and a one-way error fingerprint.
+Provider text, URLs, credentials and message bodies are never copied into this
+evidence; the fingerprint is only a correlation key for private logs.
 
 A single non-final `Stats` or settlement-receipt-count sample that fails with the
 `connection` category is recorded as a gap and may recover at the next scheduled

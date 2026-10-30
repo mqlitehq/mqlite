@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 const tursoSoakVerificationHost = "mqlite-verify-jiba.aws-ap-northeast-1.turso.io"
@@ -26,11 +27,28 @@ func TestMain(m *testing.M) {
 			os.Exit(2)
 		}
 		if err := resetRemoteTestDB(dsn, os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN")); err != nil {
-			fmt.Fprintln(os.Stderr, "remote Turso test reset failed:", err)
+			fmt.Fprintln(os.Stderr, safeRemoteTestResetFailure(err))
 			os.Exit(2)
 		}
 	}
 	os.Exit(m.Run())
+}
+
+// safeRemoteTestResetFailure is written to both the Actions log and the retained
+// soak test.log. Keep provider text out of both: the libSQL HTTP driver includes
+// response bodies in errors, and GitHub's console masking does not rewrite files
+// captured by tee. The fingerprint correlates this evidence with private logs.
+func safeRemoteTestResetFailure(err error) string {
+	detail := describeError(err, time.Now().UnixMilli())
+	var b strings.Builder
+	fmt.Fprintf(&b, "remote Turso test reset failed: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+	if detail.HTTPStatus != 0 {
+		fmt.Fprintf(&b, " http_status=%d", detail.HTTPStatus)
+	}
+	if detail.SQLiteCode != 0 {
+		fmt.Fprintf(&b, " sqlite_code=%d", detail.SQLiteCode)
+	}
+	return b.String()
 }
 
 func validateRemoteTestReset(dsn, confirmation, soakDuration string) error {
@@ -67,6 +85,28 @@ func TestRemoteTestResetGate(t *testing.T) {
 				t.Fatalf("validateRemoteTestReset() error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestRemoteTestResetFailureEvidenceIsSafeAndActionable(t *testing.T) {
+	raw := fmt.Errorf("error code 503: provider detail https://db.invalid/path token=top-secret bearer eyJhbGciOiJub25lIn0.eyJzZWNyZXQiOiJ2YWx1ZSJ9.signature SQL=SELECT-card_number message_body=customer-message-body")
+	got := safeRemoteTestResetFailure(raw)
+	detail := describeError(raw, 0)
+	for _, secret := range []string{
+		"provider detail", "db.invalid", "top-secret", "eyJhbGciOiJub25lIn0",
+		"SELECT-card_number", "customer-message-body",
+	} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("reset failure evidence leaked %q: %s", secret, got)
+		}
+	}
+	for _, useful := range []string{
+		"remote Turso test reset failed", "category=provider_unavailable",
+		"http_status=503", "fingerprint=" + detail.Fingerprint,
+	} {
+		if !strings.Contains(got, useful) {
+			t.Fatalf("reset failure evidence omitted %q: %s", useful, got)
+		}
 	}
 }
 
