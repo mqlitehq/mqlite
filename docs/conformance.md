@@ -44,6 +44,15 @@ resource deletion, and fixed subscription expiry. (§1.7, §3, §8, §14)
   lock token is empty and deadline is zero, including a cached attempt replay.
   Peek-lock retains its token and lease deadline. *(sdk_test.go: TestSDKReceiveDeleteLeaseShape)*
 
+- **1.8 Queue lock configuration.** A new or explicitly reconfigured queue MUST
+  use `0` (the 30-second default) or a lock duration of at least 1 second.
+  Negative and subsecond nonzero values fail with `ErrInvalidArgument` before any
+  mutation. Existing databases with a legacy subsecond value remain readable;
+  an update that does not overwrite the backing queue configuration may preserve
+  that value. *(engine/engine_test.go: TestQueueLockDurationValidation,
+  TestLegacySubsecondQueueRemainsReadable; sdk_test.go:
+  TestQueueLockDurationValidationBeforeTransport)*
+
 ## 2 · Settlement (fenced on `lock_token`)
 
 Exactly one verb per outcome; new effects require the `lock_token` from `Receive`

@@ -167,6 +167,15 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("unknown ordering_mode", http.MethodPost, wire.PathCreateQueue, "secret",
 		jsonOf(wire.CreateQueueRequest{Name: "vq", Config: wire.QueueConfigJSON{OrderingMode: "fifo"}}),
 		http.StatusBadRequest, "invalid_argument")
+	check("negative lock duration", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "negative-lock", Config: wire.QueueConfigJSON{LockDurationMs: -1}}),
+		http.StatusBadRequest, "invalid_argument")
+	check("subsecond lock duration", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "short-lock", Config: wire.QueueConfigJSON{LockDurationMs: 999}}),
+		http.StatusBadRequest, "invalid_argument")
+	check("minimum lock duration", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "minimum-lock", Config: wire.QueueConfigJSON{LockDurationMs: 1000}}),
+		http.StatusOK, "")
 	check("valid create queue", http.MethodPost, wire.PathCreateQueue, "secret",
 		jsonOf(wire.CreateQueueRequest{Name: "vq", Config: wire.QueueConfigJSON{OrderingMode: "group_fifo"}}),
 		http.StatusOK, "")

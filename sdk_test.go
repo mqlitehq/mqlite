@@ -883,6 +883,69 @@ func TestRemoteInvalidArgumentPropagates(t *testing.T) {
 	}
 }
 
+func TestQueueLockDurationValidationBeforeTransport(t *testing.T) {
+	ctx := context.Background()
+	var calls atomic.Int32
+	var encoded []int64
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		var body wire.CreateQueueRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			return nil, err
+		}
+		encoded = append(encoded, body.Config.LockDurationMs)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Request:    req,
+		}, nil
+	})}
+	client, err := mqlite.Open(ctx, "http://broker.invalid", mqlite.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	invalid := []time.Duration{-time.Nanosecond, time.Nanosecond, time.Millisecond, time.Second - time.Nanosecond}
+	for i, lock := range invalid {
+		err := client.CreateQueue(ctx, fmt.Sprintf("remote-invalid-%d", i), mqlite.QueueConfig{LockDuration: lock})
+		if !errors.Is(err, mqlite.ErrInvalidArgument) {
+			t.Errorf("remote lock duration %s: error = %v, want ErrInvalidArgument", lock, err)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("invalid remote configurations made %d requests, want zero", calls.Load())
+	}
+	if err := client.CreateQueue(ctx, "remote-default", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CreateQueue(ctx, "remote-minimum", mqlite.QueueConfig{LockDuration: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, []int64{0, 1_000}) {
+		t.Fatalf("encoded lock durations = %v, want [0 1000]", encoded)
+	}
+
+	embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	for i, lock := range invalid {
+		err := embedded.CreateQueue(ctx, fmt.Sprintf("embedded-invalid-%d", i), mqlite.QueueConfig{LockDuration: lock})
+		if !errors.Is(err, mqlite.ErrInvalidArgument) {
+			t.Errorf("embedded lock duration %s: error = %v, want ErrInvalidArgument", lock, err)
+		}
+	}
+	if err := embedded.CreateQueue(ctx, "embedded-default", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.CreateQueue(ctx, "embedded-minimum", mqlite.QueueConfig{LockDuration: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestServeReadyAfterBind checks the broker announces readiness only after the listener
 // actually binds: WithReady fires on a good bind (and cancelling ctx shuts down cleanly),
 // but a bind failure returns an error WITHOUT firing ready — so automation waiting for

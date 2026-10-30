@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"slices"
@@ -50,6 +51,99 @@ func recvOne(t *testing.T, e *Engine, q string) *Message {
 		return nil
 	}
 	return ms[0]
+}
+
+func TestQueueLockDurationValidation(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+
+	for _, lock := range []int64{-1, 1, 999} {
+		name := fmt.Sprintf("invalid-%d", lock)
+		err := e.CreateQueue(ctx, name, QueueConfig{LockDurationMs: lock})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("lock duration %d: error = %v, want ErrInvalidArgument", lock, err)
+		}
+	}
+	queues, err := e.ListQueues(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queues) != 0 {
+		t.Fatalf("invalid configurations created queues: %+v", queues)
+	}
+
+	mustQueue(t, e, "default", QueueConfig{})
+	mustQueue(t, e, "minimum", QueueConfig{LockDurationMs: 1_000})
+	if err := e.CreateQueue(ctx, "default", QueueConfig{LockDurationMs: 999}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("invalid reconfiguration = %v, want ErrInvalidArgument", err)
+	}
+	queues, err = e.ListQueues(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]int64, len(queues))
+	for _, q := range queues {
+		got[q.Name] = q.LockDurationMs
+	}
+	if got["default"] != 30_000 || got["minimum"] != 1_000 {
+		t.Fatalf("stored lock durations = %v, want default=30000 minimum=1000", got)
+	}
+}
+
+func TestLegacySubsecondQueueRemainsReadable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy-short-lock.db")
+	e, err := Open(ctx, Options{DB: "file:" + path, DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "legacy", QueueConfig{})
+	if err := e.Subscribe(ctx, "events", "legacy-sub", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `UPDATE queues SET lock_duration_ms=50 WHERE name IN ('legacy','legacy-sub')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(ctx, Options{DB: "file:" + path, DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	defer reopened.Close()
+	if err := reopened.Subscribe(ctx, "events", "legacy-sub", nil); err != nil {
+		t.Fatalf("update legacy subscription without reconfiguring its queue: %v", err)
+	}
+	assertLegacyLocks := func() {
+		t.Helper()
+		queues, err := reopened.ListQueues(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make(map[string]int64)
+		for _, q := range queues {
+			if q.Name == "legacy" || q.Name == "legacy-sub" {
+				got[q.Name] = q.LockDurationMs
+			}
+		}
+		if len(got) != 2 || got["legacy"] != 50 || got["legacy-sub"] != 50 {
+			t.Fatalf("legacy lock durations = %v, want both queues at 50ms", got)
+		}
+	}
+	assertLegacyLocks()
+	if _, err := reopened.SendOne(ctx, "legacy", OutMessage{Body: []byte("still usable")}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := reopened.Receive(ctx, "legacy", ReceiveOptions{Mode: ReceiveAndDelete})
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("use legacy queue: messages=%d error=%v", len(msgs), err)
+	}
+	if err := reopened.CreateQueue(ctx, "legacy", QueueConfig{LockDurationMs: 50}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("legacy short-lock reconfiguration = %v, want ErrInvalidArgument", err)
+	}
+	assertLegacyLocks()
 }
 
 // I-core: send -> receive (Peek-Lock) -> complete; metrics reflect each step.

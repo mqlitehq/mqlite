@@ -2410,14 +2410,14 @@ func TestObservabilityMessageLifecycleInventory(t *testing.T) {
 	})
 	t.Run("lease expiry and max-delivery abandon", func(t *testing.T) {
 		e, clock := testEngine(t)
-		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1, MaxDeliveryCount: 2})
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 2})
 		if _, err := e.SendOne(ctx, "q", OutMessage{}); err != nil {
 			t.Fatal(err)
 		}
 		if recvOne(t, e, "q") == nil {
 			t.Fatal("claim")
 		}
-		advance(clock, time.Millisecond)
+		advance(clock, time.Second)
 		e.RunMaintenanceOnce(ctx)
 		m := recvOne(t, e, "q")
 		if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 0); err != nil {

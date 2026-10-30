@@ -775,7 +775,10 @@ func (c *Client) Peek(ctx context.Context, queue string, opts ...PeekOpts) ([]*P
 
 // CreateQueue creates or updates a queue.
 func (c *Client) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {
-	ec := cfg.toEngine()
+	ec, err := cfg.toEngine()
+	if err != nil {
+		return err
+	}
 	return c.post(ctx, wire.PathCreateQueue, wire.CreateQueueRequest{
 		Name: name, Config: wire.QueueConfigJSON{
 			LockDurationMs: ec.LockDurationMs, MaxDeliveryCount: ec.MaxDeliveryCount,

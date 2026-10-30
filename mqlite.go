@@ -112,7 +112,7 @@ func (m OutMessage) toEngine() engine.OutMessage {
 
 // QueueConfig configures a queue (durations as time.Duration).
 type QueueConfig struct {
-	LockDuration       time.Duration
+	LockDuration       time.Duration // 0 -> 30s default; otherwise at least 1s
 	MaxDeliveryCount   int           // ordinary claim budget; the final claim remains usable
 	DefaultTTL         time.Duration // default and ceiling for message TTL; 0 -> unlimited
 	DeadLetterOnExpire *bool
@@ -126,7 +126,13 @@ type QueueConfig struct {
 	DLQMaxBytes int64
 }
 
-func (c QueueConfig) toEngine() engine.QueueConfig {
+func (c QueueConfig) toEngine() (engine.QueueConfig, error) {
+	if c.LockDuration < 0 || c.LockDuration > 0 && c.LockDuration < time.Second {
+		return engine.QueueConfig{}, fmt.Errorf(
+			"%w: queue lock duration must be zero (30s default) or at least 1s",
+			ErrInvalidArgument,
+		)
+	}
 	return engine.QueueConfig{
 		LockDurationMs:     c.LockDuration.Milliseconds(),
 		MaxDeliveryCount:   c.MaxDeliveryCount,
@@ -137,7 +143,7 @@ func (c QueueConfig) toEngine() engine.QueueConfig {
 		DLQMaxAgeMs:        c.DLQMaxAge.Milliseconds(),
 		DLQMaxCount:        c.DLQMaxCount,
 		DLQMaxBytes:        c.DLQMaxBytes,
-	}
+	}, nil
 }
 
 // Metrics mirrors engine.Metrics with the same fields.

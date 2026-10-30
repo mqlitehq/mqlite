@@ -149,9 +149,13 @@ func TestConcurrentConsumersNeverShareAMessage(t *testing.T) {
 		}
 		defer e.Close()
 
-		// A short lease with the reaper live: expiry genuinely races the handler. This is the
-		// setting under which a queue either holds its exclusivity guarantee or does not.
-		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 300, MaxDeliveryCount: 100})
+		// A legacy short lease with the reaper live: expiry genuinely races the handler. New
+		// configurations reject this value, but existing databases retain it across upgrades,
+		// so their exclusivity guarantee remains part of the compatibility surface.
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 100})
+		if _, err := e.db.exec(ctx, `UPDATE queues SET lock_duration_ms=300 WHERE name='q'`); err != nil {
+			t.Fatal(err)
+		}
 
 		for i := 0; i < messages; i++ {
 			if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte(fmt.Sprintf("m%d", i))}); err != nil {
@@ -289,7 +293,7 @@ func TestConcurrentSettlementPicksExactlyOneWinner(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer e.Close()
-		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 50, MaxDeliveryCount: 100})
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 100})
 
 		const rounds = 60
 		for r := 0; r < rounds; r++ {

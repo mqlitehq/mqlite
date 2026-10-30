@@ -271,10 +271,11 @@ uses a conservative transport budget and never extends a lease from the local
 wall clock. Older brokers fall back to HTTP `Date`; if neither clock observation
 is available, the Receiver confirms ownership before dispatch and uses a bounded
 250ms conservative cadence instead of scheduling from the foreign absolute
-deadline. That degraded mode cannot prove a lease shorter than its cadence plus
-network latency: preserve at least one time header, or use a lock duration well
-above that bound (1s or more is the operational recommendation). Keep host clocks
-synchronized for raw lease handling and older clients.
+deadline. New and reconfigured queues therefore accept either `0` (the 30-second
+default) or a lock duration of at least 1 second. Legacy databases containing a
+subsecond queue remain readable, but a managed Receiver may fail closed when it
+cannot safely renew that lease. Preserve at least one time header and keep host
+clocks synchronized for raw lease handling and older clients.
 
 The remote client requires a complete semantic acknowledgement even when HTTP
 returns 2xx. An invalid acknowledgement for Send, Complete/Abandon/Reject/Defer

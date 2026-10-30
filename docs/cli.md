@@ -172,7 +172,7 @@ mqlite create-queue orders --lock 30s --max-delivery 5 --dedup 10m --ordering st
 ```
 | Flag | Default | |
 |---|---|---|
-| `--lock` | 0 → 30s | Peek-Lock duration (`0` inherits the engine default, 30s) |
+| `--lock` | 0 → 30s | Peek-Lock duration (`0` inherits the 30s engine default; an explicit value must be at least 1s) |
 | `--max-delivery` | 0 → 10 | ordinary Peek-Lock claim budget: the Nth claim is a usable final attempt; only failure of that locked attempt sends it to the DLQ (`0` inherits 10) |
 | `--ttl` | 0 (unlimited) | default **and ceiling** for message TTL; a shorter Send TTL is honored, a longer one is capped |
 | `--dedup` | 0 (off) | dedup window |

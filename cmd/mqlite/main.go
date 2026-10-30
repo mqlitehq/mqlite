@@ -1461,8 +1461,8 @@ func (r *renewer) Stop() {
 // second, so a queue whose lock duration was one second or less had its first renewal scheduled
 // at or after its own expiry — the lease could not be held at all (review round-3).
 //
-// It may legitimately return LESS than minRenewInterval: CreateQueue accepts any positive lock
-// duration, and a slow Receive can leave even a normal lease nearly spent. The caller treats that
+// It may legitimately return LESS than minRenewInterval: even a valid one-second queue lock can
+// be nearly spent after a slow Receive. The caller treats that
 // as "renew immediately" rather than clamping the first tick past locked_until — which would hand
 // the batch to the reaper before we ever asked. minRenewInterval is only the steady-state cadence
 // floor, a spin guard, not a delay before the first renewal.

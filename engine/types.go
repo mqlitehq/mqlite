@@ -82,7 +82,7 @@ var (
 // Zero values mean "use the documented default".
 type QueueConfig struct {
 	Kind               string       // "queue" (default) or "subscription"
-	LockDurationMs     int64        // Peek-Lock default lock duration; 0 -> 30000
+	LockDurationMs     int64        // Peek-Lock duration; 0 -> 30000, otherwise >=1000
 	MaxDeliveryCount   int          // ordinary claim budget; 0 -> 10, and the final claim remains usable
 	DefaultTTLMs       int64        // default and ceiling for message TTL; 0 -> unlimited
 	DeadLetterOnExpire *bool        // nil -> true
