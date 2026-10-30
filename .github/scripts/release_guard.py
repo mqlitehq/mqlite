@@ -15,7 +15,7 @@ CI_PATH = ".github/workflows/ci.yml"
 EXPECTED_JOBS = frozenset({
     "test (ubuntu-latest · go 1.21.x)",
     "test (ubuntu-latest · go stable)",
-    "test (macos-14 · go 1.21.x)",
+    "test (macos-latest · go 1.21.x)",
     "test (macos-latest · go stable)",
     "test (windows-latest · go 1.21.x)",
     "test (windows-latest · go stable)",
