@@ -204,12 +204,18 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 		return cancel, done
 	}
 	waitBroker := func(done <-chan error) {
+		// net/http deliberately keeps a freshly accepted StateNew connection alive
+		// for five seconds before Shutdown may classify it as idle. Its polling and
+		// second-granularity timestamp can push that boundary past a five-second
+		// test deadline under race-enabled CI load. Ten seconds leaves that bounded
+		// allowance while remaining well below the 20-second Receive long poll; the
+		// dedicated drain-barrier test above enforces its prompt wake-up separately.
 		select {
 		case err := <-done:
 			if err != nil {
 				t.Fatalf("broker shutdown returned %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("broker did not shut down promptly")
 		}
 	}
