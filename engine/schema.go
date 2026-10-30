@@ -199,8 +199,9 @@ var schemaStmts = []string{
 	`CREATE INDEX IF NOT EXISTS idx_settlement_expire ON settlement_receipts(expires_at)`,
 
 	// receive attempts make Receive idempotent under client RPC retries: a dropped
-	// Receive response replays the same batch (same lock tokens) instead of burning
-	// delivery_count / leaving in-flight black holes. Opt-in via a client attempt id.
+	// Receive response replays the same batch while every saved Peek-Lock lease is
+	// still valid. Stale leases are invalidated before a safe new claim. Tokenless
+	// ReceiveAndDelete responses remain replayable. Opt-in via a client attempt id.
 	`CREATE TABLE IF NOT EXISTS receive_attempts (
 	    queue       TEXT NOT NULL,
 	    attempt_id  TEXT NOT NULL,

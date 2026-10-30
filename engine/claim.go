@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 )
@@ -168,6 +169,9 @@ const firstClaimStrictAttemptSQL = claimUpdatePrefix + claimFencedCandidate + cl
 // Receive claims up to opts.MaxMessages messages (Peek-Lock by default), with
 // long-poll up to opts.WaitMs (clamped to 20s, §11.3).
 func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions) ([]*Message, error) {
+	if opts.Mode != PeekLock && opts.Mode != ReceiveAndDelete {
+		return nil, fmt.Errorf("%w: unknown receive mode %d", ErrInvalidArgument, opts.Mode)
+	}
 	max := opts.MaxMessages
 	if max <= 0 {
 		max = 1

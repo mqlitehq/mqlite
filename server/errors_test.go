@@ -125,6 +125,12 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("healthz open", http.MethodGet, "/healthz", "", nil, http.StatusOK, "")
 	// A valid token passes through to a successful send.
 	check("authed send", http.MethodPost, wire.PathSend, "secret", send("q"), http.StatusOK, "")
+	check("unknown receive mode", http.MethodPost, wire.PathReceive, "secret",
+		jsonOf(wire.ReceiveRequest{Queue: "q", ReceiveMode: 2, AttemptID: "unknown-mode"}),
+		http.StatusBadRequest, "invalid_argument")
+	if stats, err := eng.Stats(ctx, "q"); err != nil || stats.Active != 1 || stats.Locked != 0 {
+		t.Fatalf("unknown receive mode mutated queue: %+v, %v", stats, err)
+	}
 
 	// Subscription filter contract: a malformed expr is rejected at Subscribe with
 	// 400 invalid_argument (never stored); a valid one succeeds.

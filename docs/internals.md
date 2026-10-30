@@ -349,8 +349,12 @@ to make the *window* small and the *retries* safe:
   grant a new effect or renew that expired lease.
 - **`receive_attempts`** — a client may tag `Receive` with an `attempt_id`. The
   claimed batch is recorded under that id (same transaction again); a retry of
-  the same attempt **replays the exact same messages and lock tokens** instead of
-  claiming fresh ones and burning delivery counts.
+  the same Peek-Lock attempt replays the exact same messages and lock tokens only
+  while every token still owns a live lease. Replay validates the whole batch in
+  one query. If startup recovery, lease expiry, or settlement invalidated any
+  token, the same transaction removes the stale response and makes a safe new
+  claim; a stale or partially owned batch never reaches the caller. Tokenless
+  ReceiveAndDelete responses remain replayable after their message rows are gone.
 - **`dedup`** — on the producer side, a `message_id` within the queue's dedup
   window collapses resends into the original row (no id? the body's SHA-256 is
   used as a content-addressed key). Same id with a *different* body is a loud
