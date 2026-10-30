@@ -984,8 +984,9 @@ func openWithRetry(ctx context.Context, db string) *mqlite.Embedded {
 	for i := 0; i < 50; i++ {
 		// WithoutBackground: the reaper (1s tick) must NOT run. With short leases it could clear an
 		// orphaned lock before the kill or before the oracle reads it, letting the recovery test pass
-		// even if Open's crash recovery is broken — so only Open may reset a lock here (codex).
-		e, err := mqlite.OpenEmbedded(ctx, "file:"+db, mqlite.WithoutBackground())
+		// even if explicit startup recovery is broken — so only Open may reset a lock here (codex).
+		e, err := mqlite.OpenEmbedded(ctx, "file:"+db, mqlite.WithoutBackground(),
+			mqlite.WithReclaimUnexpiredLeases())
 		if err == nil {
 			return e
 		}

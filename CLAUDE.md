@@ -219,11 +219,13 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
 
 mqlite is honestly **at-least-once** — handlers must be idempotent. Three mechanisms:
 
-- **Startup recovery** (`engine.Open`): embedded mode reclaims every old `locked`
-  row because its in-process handlers died with the engine. Broker mode preserves
-  unexpired leases on active resources because remote handlers can outlive the
-  broker process, and reclaims only `locked_until <= now`; resource lifecycle and
-  message TTL remain authoritative. Reclaimed rows return to `active` below the
+- **Startup recovery** (`engine.Open`): every open preserves unexpired leases on
+  active resources by default because a new process cannot prove that no remote
+  or out-of-process handler still owns the persisted token. It reclaims only
+  `locked_until <= now`; resource lifecycle and message TTL remain authoritative.
+  A single-process embedded owner may explicitly opt into immediate orphan
+  recovery with `ReclaimUnexpiredLeases` / `WithReclaimUnexpiredLeases` once it
+  knows every prior handler is gone. Reclaimed rows return to `active` below the
   delivery limit or enter the DLQ at the limit; their old token is invalidated
   and the delivery count already bumped at claim is preserved.
 - **`settlement_receipts`** table makes Complete/Abandon/Reject/Defer idempotent:

@@ -964,6 +964,20 @@ func TestServeRequiresBrokerMode(t *testing.T) {
 	}
 }
 
+func TestBrokerModeRejectsDestructiveLeaseRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "must-not-open.db")
+	eng, err := mqlite.OpenEmbedded(context.Background(), "file:"+path,
+		mqlite.WithBrokerMode(), mqlite.WithReclaimUnexpiredLeases())
+	if eng != nil || !errors.Is(err, mqlite.ErrInvalidArgument) {
+		t.Fatalf("broker mode with live-lease recovery = eng %v, err %v; want ErrInvalidArgument", eng, err)
+	}
+	for _, name := range []string{path, path + ".lock"} {
+		if _, statErr := os.Stat(name); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("conflicting recovery options touched %s: %v", name, statErr)
+		}
+	}
+}
+
 func TestServeReadyAfterBind(t *testing.T) {
 	ctx := context.Background()
 	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"), mqlite.WithBrokerMode())
@@ -1671,8 +1685,8 @@ func TestReleaseDocsPinLatestDatedRelease(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "5a314857812b2153bce0cec3ee9060af50c4c3c399d0443a2e405129e5461922",
-		"concepts.html": "bb448de15db060614c791e59d9d346c94fb27c3987e233b7e87373f71a2f3af3",
+		"concepts.md":   "324ab7f748180ee53f4385c1c87a6ca7e7acdaa7901c09172414b79ffec575cd",
+		"concepts.html": "abaa7f2ea6c4bef8cd833ca52d9bf3ccb9cbaca29a6d8a8626e1581e4fac5d13",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {

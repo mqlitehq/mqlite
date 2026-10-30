@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,6 +36,10 @@ type signalBrokerProcess struct {
 }
 
 func startSignalBroker(t *testing.T) *signalBrokerProcess {
+	return startSignalBrokerAt(t, "")
+}
+
+func startSignalBrokerAt(t *testing.T, dbPath string) *signalBrokerProcess {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -44,7 +50,9 @@ func startSignalBroker(t *testing.T) *signalBrokerProcess {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(t.TempDir(), "broker.db")
+	if dbPath == "" {
+		dbPath = filepath.Join(t.TempDir(), "broker.db")
+	}
 	cmd := exec.Command(mqliteBin, "serve", "--addr", addr)
 	cmd.Env = append(os.Environ(),
 		"MQLITE_DB=file:"+dbPath,
@@ -99,6 +107,74 @@ func startSignalBroker(t *testing.T) *signalBrokerProcess {
 	})
 	p.waitReady(t)
 	return p
+}
+
+func TestBrokerVacuumBetweenRestartsPreservesLiveToken(t *testing.T) {
+	first := startSignalBroker(t)
+	remoteEnv := append(os.Environ(),
+		"MQLITE_ENDPOINT=http://"+first.addr,
+		"MQLITE_TOKEN=",
+	)
+	runRemote := func(name string, args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(mqliteBin, args...)
+		cmd.Env = remoteEnv
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v: %s", name, err, output)
+		}
+		return output
+	}
+
+	runRemote("create queue", "create-queue", "restart-vacuum", "--lock", "1m", "--max-delivery", "1")
+	runRemote("send", "send", "restart-vacuum", "in-flight")
+	output := runRemote("receive no-ack", "receive", "restart-vacuum", "--no-ack", "--output", "json")
+	var claimed []wire.Message
+	if err := json.Unmarshal(output, &claimed); err != nil || len(claimed) != 1 || claimed[0].LockToken == "" {
+		t.Fatalf("claimed delivery = %q, %v", output, err)
+	}
+	seq, token := claimed[0].SeqNumber, claimed[0].LockToken
+
+	if err := first.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.wait(t, 10*time.Second); err != nil {
+		t.Fatalf("first graceful broker exit: %v\n%s", err, first.logs())
+	}
+
+	// Exercise the real local maintenance command, including a full file rewrite,
+	// while the broker is stopped. Opening the DB must not revoke the live token.
+	vacuum := exec.Command(mqliteBin, "vacuum", "--full")
+	vacuum.Env = append(os.Environ(),
+		"MQLITE_DB=file:"+first.dbPath,
+		"MQLITE_ENDPOINT=",
+		"MQLITE_TOKEN=",
+	)
+	if output, err := vacuum.CombinedOutput(); err != nil {
+		t.Fatalf("local vacuum: %v: %s", err, output)
+	}
+
+	second := startSignalBrokerAt(t, first.dbPath)
+	remoteEnv = append(os.Environ(),
+		"MQLITE_ENDPOINT=http://"+second.addr,
+		"MQLITE_TOKEN=",
+	)
+	runRemote("complete old token", "complete", "restart-vacuum", strconv.FormatInt(seq, 10), token)
+	metricsOutput := runRemote("metrics", "metrics", "restart-vacuum", "--output", "json")
+	var metrics engine.Metrics
+	if err := json.Unmarshal(metricsOutput, &metrics); err != nil {
+		t.Fatalf("decode metrics %q: %v", metricsOutput, err)
+	}
+	if metrics.Total != 0 || metrics.Active != 0 || metrics.Locked != 0 || metrics.DeadLettered != 0 {
+		t.Fatalf("metrics after completing preserved token = %+v", metrics)
+	}
+
+	if err := second.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.wait(t, 10*time.Second); err != nil {
+		t.Fatalf("second graceful broker exit: %v\n%s", err, second.logs())
+	}
 }
 
 func (p *signalBrokerProcess) logs() string {

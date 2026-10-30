@@ -15,7 +15,26 @@ upgrade notes before replacing a broker.
 > The canonical schema token remains **7** and no database rebuild is required.
 > This release adds an optional response header plus a Go broker-mode option;
 > older remote clients ignore the header, while programmatic brokers must add
-> `WithBrokerMode` before calling `Serve` so startup can preserve live leases.
+> `WithBrokerMode` before calling `Serve` to select the server lifecycle contract.
+> An older binary does not know the new safe-open default and may still reclaim
+> live tokens when it opens the same database. Before downgrading, drain consumers
+> and settle all deliveries, or wait for every lease to expire and verify
+> `locked=0`; do not run an old local CLI against a stopped broker DB with live work.
+
+### Make preserving live leases the safe startup default (MQLITE-137 follow-up)
+
+- Preserve every unexpired Peek-Lock lease on an active resource across any
+  ordinary Engine, Embedded or local CLI open. Inspection and maintenance of a
+  stopped broker database, including `vacuum`, no longer invalidate remote tokens
+  or dead-letter a healthy final delivery attempt.
+- Add the explicit `ReclaimUnexpiredLeases` engine option and
+  `WithReclaimUnexpiredLeases` embedded option for an exclusive in-process owner
+  that knows every prior handler is gone. This destructive takeover invalidates
+  live tokens and applies the ordinary redelivery/final-attempt DLQ rule; it is
+  rejected in broker mode.
+- Local `receive --no-ack` tokens can now be settled by a later CLI invocation
+  while their lease remains live. Existing embedded applications that require
+  immediate crash-orphan recovery must opt into it explicitly.
 
 ### Bound managed Receiver reconnect pacing (MQLITE-139)
 
@@ -47,14 +66,14 @@ upgrade notes before replacing a broker.
 ### Preserve live broker leases across restart (MQLITE-137)
 
 - Add an explicit `WithBrokerMode` open option and require it for `Embedded.Serve`.
-  The `mqlite serve` command enables it automatically. Broker startup now retains
-  unexpired Peek-Lock rows on active resources, their fencing tokens and delivery
-  counts, so a remote handler can finish the same delivery after a short graceful
-  restart or broker crash. Resource lifecycle and message TTL remain authoritative.
+  The `mqlite serve` command enables it automatically. Startup retains unexpired
+  Peek-Lock rows on active resources, their fencing tokens and delivery counts, so
+  a remote handler can finish the same delivery after a short graceful restart,
+  broker crash or safe local maintenance open. Resource lifecycle and message TTL
+  remain authoritative.
 - Continue to reclaim leases at `locked_until <= now`, returning them to active or
-  dead-lettering the final permitted delivery exactly as the reaper does. Plain
-  embedded mode keeps its existing immediate orphan recovery because its handlers
-  cannot outlive the engine process.
+  dead-lettering the final permitted delivery exactly as the reaper does. Immediate
+  recovery of a still-live embedded orphan is now an explicit opt-in.
 - Cover valid AttemptID replay, RenewBatch and Complete after reopen, exact-expiry
   recovery, and an in-flight managed handler completing once across a real Serve
   stop/restart at `MaxDeliveryCount=1`.
@@ -802,8 +821,8 @@ upgrade notes before replacing a broker.
   env) and `--output text|json` for scripting (bodies base64, keys snake_case); and
   `receive --no-ack` now prints each `lock-token`. New SDK surface backs it —
   `Message.LockToken()`, `Client/Embedded.Message(queue, seq, token)`, `Status()`,
-  `ListSubscriptions()`, `TestFilter()`. (Settling across separate invocations needs a running
-  broker; embedded mode reclaims orphaned locks each open.)
+  `ListSubscriptions()`, `TestFilter()`. (The current safe startup default also
+  preserves a local embedded token until its lease expires.)
 - **CLI safety hardening** (MQLITE-93, follow-up review): `receive` now renders output
   **before** settling and settles the whole batch with a single `CompleteBatch` — a closed
   stdout / broken pipe exits non-zero and leaves the messages locked for redelivery instead

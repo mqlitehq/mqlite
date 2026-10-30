@@ -133,12 +133,14 @@ the ordinary expiry rule: the message returns to active below the delivery limit
 or enters the DLQ on its final attempt. Size lock durations and deployment grace
 periods so planned restarts normally finish inside the remaining lease.
 
-Do not open a stopped broker's database through plain `OpenEmbedded` or a local
-embedded CLI command for inspection: embedded ownership deliberately reclaims all
-old locks because it assumes their in-process handlers are gone. Use the broker's
-authenticated HTTP status/peek operations, or open programmatic servers with
-`WithBrokerMode`. Low-level `server.New` users must open the Engine with
-`engine.Options.PreserveUnexpiredLeases` before constructing the HTTP server.
+A stopped broker's database may be opened by a local CLI inspection or maintenance
+command without revoking an unexpired delivery: every Open preserves live leases by
+default. The local file still has a single owner, so stop the broker first and never
+open the same DB concurrently. Programmatic servers must use `WithBrokerMode` before
+`Serve` to select its shutdown and lifecycle contract. A single-process embedded
+owner may use `WithReclaimUnexpiredLeases` only when it knows every previous handler
+is gone; that explicit takeover invalidates live tokens and may send final attempts
+to the DLQ.
 
 After the first signal has been observed, normal operating-system signal behavior
 is restored before graceful shutdown starts. A second SIGINT or SIGTERM therefore
@@ -329,8 +331,8 @@ is still writing needs its own documented consistency guarantees.
 
 The repeatable [restore drill](../test/production/restore/README.md) verifies all
 schema tables and columns, complete payloads, auxiliary records, outbox data and
-the embedded-mode recovery transformations. Broker-mode preservation of live
-leases is covered separately by the engine and real Serve restart tests; the
+the explicitly requested embedded recovery transformations. Default preservation
+of live leases is covered separately by the engine and real Serve restart tests; the
 restore drill does not replace those checks. Run it for a candidate and rehearse
 the same procedure on representative operational data before relying on a backup.
 
@@ -345,6 +347,14 @@ establish database compatibility, and MQLite does not run schema migrations.
 | Different schema token | Keep the old database with its old binary. Account for all retained work, then create a new database using the candidate. Do not edit the schema token or point the candidate at the old file as a migration. |
 | Rollback before candidate accepts business writes | Stop the candidate and restore the matched old binary plus old snapshot/configuration; verify before resuming clients. |
 | Rollback after candidate accepts business writes | First preserve candidate data and reconcile new messages and external effects. Blindly restoring the old snapshot would discard those new writes. |
+
+Lease recovery behavior is implemented by the binary, not recorded in the schema
+token. A build from before the safe-open default may reclaim every live lock when
+it opens the database, even when the file itself is schema-compatible. Before such
+a downgrade, stop new claims, drain and settle in-flight work (or wait for every
+lease to expire), and verify every queue reports `locked=0`. Do not use an older
+local CLI for inspection or vacuum during a maintenance window that still has live
+tokens.
 
 For a cutover from **v0.3.0, v0.3.1, v0.3.2 or withdrawn v0.3.3 to v0.4.0**,
 the schema changes

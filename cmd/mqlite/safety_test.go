@@ -35,6 +35,71 @@ func resetGlobals(t *testing.T) {
 	})
 }
 
+// A stopped broker's database may be opened by local inspection or maintenance
+// commands. Those commands must not revoke a still-live remote delivery merely
+// because they are the next process to open the file.
+func TestLocalCommandsPreserveLiveBrokerLease(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{name: "status", run: func(ctx context.Context) error { return cmdStatus(ctx, nil) }},
+		{name: "list", run: func(ctx context.Context) error { return cmdList(ctx, nil) }},
+		{name: "peek", run: func(ctx context.Context) error { return cmdPeek(ctx, []string{"q"}) }},
+		{name: "metrics", run: func(ctx context.Context) error { return cmdMetrics(ctx, []string{"q"}) }},
+		{name: "key-list", run: func(ctx context.Context) error { return cmdKey(ctx, []string{"list"}) }},
+		{name: "vacuum", run: func(ctx context.Context) error { return cmdVacuum(ctx, nil) }},
+	}
+
+	for _, tc := range commands {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGlobals(t)
+			ctx := context.Background()
+			dsn := "file:" + filepath.Join(t.TempDir(), "broker.db")
+			t.Setenv("MQLITE_DB", dsn)
+			t.Setenv("MQLITE_ENDPOINT", "")
+
+			broker, err := mqlite.OpenEmbedded(ctx, dsn, mqlite.WithBrokerMode(), mqlite.WithoutBackground())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := broker.CreateQueue(ctx, "q", mqlite.QueueConfig{
+				LockDuration: time.Minute, MaxDeliveryCount: 1,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := broker.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("in-flight")}); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := broker.Receive(ctx, "q")
+			if err != nil || len(claimed) != 1 {
+				t.Fatalf("claim = %+v, %v", claimed, err)
+			}
+			seq, token := claimed[0].SequenceNumber, claimed[0].LockToken()
+			if err := broker.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := tc.run(ctx); err != nil {
+				t.Fatalf("local command: %v", err)
+			}
+
+			reopened, err := mqlite.OpenEmbedded(ctx, dsn, mqlite.WithBrokerMode(), mqlite.WithoutBackground())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if err := reopened.Message("q", seq, token).Complete(ctx); err != nil {
+				t.Fatalf("complete preserved delivery: %v", err)
+			}
+			stats, err := reopened.Stats(ctx, "q")
+			if err != nil || stats.Total != 0 || stats.DeadLettered != 0 {
+				t.Fatalf("stats after complete = %+v, %v", stats, err)
+			}
+		})
+	}
+}
+
 // P1-4: after a `--` terminator every remaining token is a literal positional, so a message
 // body keeps its flag-looking words and --output is not hijacked.
 func TestParseInterspersedDashDash(t *testing.T) {

@@ -167,12 +167,12 @@ eng.Tx(ctx, func(tx *engine.EngineTx) error {
 
 > Outgrow a single process? Open the *same* engine with
 > `mqlite.WithBrokerMode()`, then call `eng.Serve(ctx, ":6754")`; remote clients
-> speak the same semantics over HTTP (§2–§4). Broker mode is selected at open
-> time so a restart preserves unexpired leases on active resources while they are
-> still owned by remote consumers; resource lifecycle and message TTL still apply.
-> Plain embedded mode instead reclaims every old lock immediately because its
-> in-process handlers cannot survive the engine. Embedded and broker are not two
-> products; they are two ownership modes of one engine.
+> speak the same semantics over HTTP (§2–§4). Every open preserves unexpired
+> leases on active resources by default; resource lifecycle and message TTL still
+> apply. `WithBrokerMode` additionally enables the lifecycle and shutdown contract
+> required by `Serve`. A single-process embedded owner that knows all prior
+> handlers are gone may explicitly request immediate recovery with
+> `mqlite.WithReclaimUnexpiredLeases()`.
 
 ### 2. Serve a broker
 
@@ -192,9 +192,9 @@ defer broker.Close()
 if err := broker.Serve(ctx, ":6754"); err != nil { log.Fatal(err) }
 ```
 
-`Serve` rejects an engine opened without `WithBrokerMode`; startup recovery has
-already run by then, so switching modes later could not restore a token that an
-embedded open had correctly treated as orphaned.
+`Serve` rejects an engine opened without `WithBrokerMode`; the option must be
+selected at open time so the server's lifecycle and shutdown invariants are in
+place before it accepts traffic.
 
 ### 3. Talk to it with curl
 
@@ -306,9 +306,9 @@ transactional outbox, canonical `Observe`, or managed access-key administration.
 scheduler do not. With `max_delivery_count=10`, the tenth ordinary Peek-Lock `Receive` is a
 full final attempt — it may be renewed repeatedly and completed successfully. It
 does not dead-letter merely because the claim reached 10; max-delivery handling
-runs if that attempt is abandoned, its lease expires, or embedded startup recovery
-finds it orphaned. Broker startup preserves the attempt while its lease remains
-live and applies the same max-delivery rule only after expiry. `ReceiveDeferred` is an explicit-retrieval exception:
+runs if that attempt is abandoned, its lease expires, or an embedded owner explicitly
+reclaims live leases. Startup preserves the attempt by default while its lease
+remains live and applies the same max-delivery rule only after expiry. `ReceiveDeferred` is an explicit-retrieval exception:
 it increments the count but does not currently reject a claim merely because the
 count is already at the configured maximum. See [Core concepts](docs/concepts.md#queue).
 
@@ -435,9 +435,10 @@ For a local SQLite file, mqlite uses **WAL** journaling. Successfully committed
 state survives a normal process crash when the filesystem provides SQLite's
 required locking and flush semantics. Broker restart preserves an unexpired
 in-flight (`locked`) delivery so its remote holder can continue; an expired lease
-is reclaimed under the ordinary redelivery/DLQ rule. Plain embedded startup
-immediately reclaims old locks because its handlers died with the process. Settled
-work stays settled in either mode.
+is reclaimed under the ordinary redelivery/DLQ rule. Embedded startup uses the
+same safe default. If an exclusive embedded owner knows every prior in-process
+handler died, `WithReclaimUnexpiredLeases` can reclaim those live locks
+immediately. Settled work stays settled in either mode.
 
 The one knob is SQLite's `synchronous` level (database-wide — SQLite has no
 per-queue setting):

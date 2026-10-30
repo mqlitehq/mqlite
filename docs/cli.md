@@ -65,12 +65,11 @@ Two things are the CLI's own, and are *not* claims about the HTTP response:
 The CLI also doesn't expose *every* HTTP operation (batch send, attempt ids). For the complete
 contract — all routes, all fields — see [api-reference.md](api-reference.md).
 
-> **Settling across invocations needs a broker.** `receive --no-ack` locks a message and
-> prints its `lock-token`; you settle it later with `complete/abandon/reject/defer/renew
-> <queue> <seq> <token>`. This works against a running broker (client mode), which holds
-> the lock between calls. In **embedded** mode each invocation opens the DB fresh and
-> reclaims orphaned locks, so a `--no-ack` lock does not survive to the next command — use
-> a broker (`mqlite serve` + `--endpoint`) when you need manual settle-later.
+> **Settling across invocations.** `receive --no-ack` locks a message and prints its
+> `lock-token`; settle it later with `complete/abandon/reject/defer/renew <queue> <seq>
+> <token>`. Both broker and local embedded CLI invocations preserve that token until
+> its deadline. Prefer a broker for multi-process consumers: the local DB still permits
+> only one owning process at a time, and an expired token cannot be revived.
 
 ## Commands
 
@@ -341,7 +340,8 @@ reject it otherwise). New local DBs use `auto_vacuum=INCREMENTAL`, so the defaul
 checkpoints and exhausts the current incremental freelist; `--full` runs a full
 `VACUUM` (rewrites the file, global lock). The running broker also performs a
 bounded pass every 60 seconds once at least 256 pages are free. Not applicable to
-a remote Turso/libSQL store.
+a remote Turso/libSQL store. Opening the stopped broker DB for vacuum preserves
+every unexpired delivery and its fencing token.
 ```bash
 MQLITE_DB=file:/data/mq.db mqlite vacuum          # incremental
 MQLITE_DB=file:/data/mq.db mqlite vacuum --full   # full rewrite
@@ -349,8 +349,9 @@ MQLITE_DB=file:/data/mq.db mqlite vacuum --full   # full rewrite
 
 ### `complete` / `abandon` / `reject` / `defer` / `renew` — settle a message
 Settle a message received earlier with `receive --no-ack` (which printed its
-`lock-token`). Positional args are always `<queue> <seq> <lock-token>`. Client mode only
-in practice (a broker holds the lock between calls — see the note under Global flags).
+`lock-token`). Positional args are always `<queue> <seq> <lock-token>`. A broker is
+recommended for concurrent consumers; local embedded invocations can also settle
+a token while its lease remains live (see the note under Global flags).
 ```bash
 mqlite complete orders 42 lt_9f3a…                 # done
 mqlite abandon  orders 42 lt_9f3a… --delay 60s     # retry after backoff, or DLQ at the limit

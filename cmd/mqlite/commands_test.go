@@ -351,9 +351,8 @@ func deadLetterOne(t *testing.T, ctx context.Context, queue string) {
 
 // TestParityCommands exercises the API-parity commands added in MQLITE-92 (schedule,
 // cancel, receive-deferred, status, list-subscriptions, test-filter, --output json) on the
-// embedded path. Settlement across separate invocations is intentionally NOT covered here
-// — embedded Open reclaims orphaned locks each time, so settle-later is a broker-only
-// contract, tested against a live broker in TestRemoteSettleByToken.
+// embedded path. Settle-later is covered separately by the local-command live-lease test
+// and against a real broker in TestRemoteSettleByToken.
 func TestParityCommands(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("MQLITE_ENDPOINT", "")
@@ -409,7 +408,7 @@ func TestParityCommands(t *testing.T) {
 		t.Error("invalid --output should be a usage error")
 	}
 
-	// settlement wrapper: a bogus token fails (embedded reclaims the lock) but exercises
+	// settlement wrapper: a bogus token cannot own the preserved lock, but exercises
 	// cmdSettle end to end; usage errors must not panic.
 	if err := cmdSettle(ctx, "complete", []string{"orders", "1", "no-such-token"}); err == nil {
 		t.Error("complete with a bogus token should error")

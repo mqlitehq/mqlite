@@ -38,6 +38,7 @@ type embeddedConfig struct {
 	dlqMaxBytes       int64
 	maxSubscriptions  int
 	brokerMode        bool
+	reclaimLiveLeases bool
 }
 
 // EmbeddedOption configures OpenEmbedded.
@@ -70,15 +71,21 @@ func WithMaxSubscriptions(n int) EmbeddedOption {
 	return func(c *embeddedConfig) { c.maxSubscriptions = n }
 }
 
-// WithBrokerMode configures OpenEmbedded for a network broker whose remote
-// consumers can outlive this process. On reopen, unexpired Peek-Lock leases on
-// active resources and their fencing tokens remain valid; only expired locks are
-// recovered. Resource lifecycle and message TTL still apply. Pass this option
-// whenever the returned engine will be served with Serve. Plain embedded mode
-// intentionally keeps immediate orphan recovery because its handlers die with
-// the engine.
+// WithBrokerMode configures OpenEmbedded for use as a network broker. Live
+// Peek-Lock leases are preserved by default in every mode; broker mode also
+// enables the lifecycle and shutdown contract required by Serve.
 func WithBrokerMode() EmbeddedOption {
 	return func(c *embeddedConfig) { c.brokerMode = true }
+}
+
+// WithReclaimUnexpiredLeases opts into destructive embedded startup recovery.
+// Open invalidates every existing Peek-Lock token immediately, even if its lease
+// is still live, and applies the ordinary redelivery or final-attempt DLQ rule.
+// Use it only when this process exclusively owns the database and every prior
+// in-process handler is known to be gone. It cannot be combined with
+// WithBrokerMode.
+func WithReclaimUnexpiredLeases() EmbeddedOption {
+	return func(c *embeddedConfig) { c.reclaimLiveLeases = true }
 }
 
 // WithLogger routes background-loop failures to lg (nil -> slog.Default()).
@@ -117,19 +124,22 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if cfg.brokerMode && cfg.reclaimLiveLeases {
+		return nil, fmt.Errorf("%w: WithBrokerMode cannot reclaim unexpired leases", ErrInvalidArgument)
+	}
 	eng, err := engine.Open(ctx, engine.Options{
-		DB:                      dbDSN,
-		AuthToken:               cfg.authToken,
-		Now:                     cfg.now,
-		DisableBackground:       cfg.disableBackground,
-		PreserveUnexpiredLeases: cfg.brokerMode,
-		MaxMessageBytes:         cfg.maxMessageBytes,
-		MaxSubscriptions:        cfg.maxSubscriptions,
-		Logger:                  cfg.logger,
-		Synchronous:             cfg.synchronous,
-		DLQMaxAgeMs:             cfg.dlqMaxAgeMs,
-		DLQMaxCount:             cfg.dlqMaxCount,
-		DLQMaxBytes:             cfg.dlqMaxBytes,
+		DB:                     dbDSN,
+		AuthToken:              cfg.authToken,
+		Now:                    cfg.now,
+		DisableBackground:      cfg.disableBackground,
+		ReclaimUnexpiredLeases: cfg.reclaimLiveLeases,
+		MaxMessageBytes:        cfg.maxMessageBytes,
+		MaxSubscriptions:       cfg.maxSubscriptions,
+		Logger:                 cfg.logger,
+		Synchronous:            cfg.synchronous,
+		DLQMaxAgeMs:            cfg.dlqMaxAgeMs,
+		DLQMaxCount:            cfg.dlqMaxCount,
+		DLQMaxBytes:            cfg.dlqMaxBytes,
 	})
 	if err != nil {
 		return nil, err
