@@ -2901,6 +2901,33 @@ func TestErrorHandlerCancelDoesNotRewriteOrdering(t *testing.T) {
 // goroutine and both handler outcomes, without a same-attempt transient retry.
 // A Complete/Abandon failure can race one already-pipelined fresh Receive after
 // its handler slot is released; cancellation must stop that long-poll.
+func TestPermanentRenewalStopsRunBeforeHandlerCancellation(t *testing.T) {
+	var order []string
+	r := newReceiver(&fakeSource{}, "q", []ReceiverOption{WithErrorHandler(func(error) {
+		order = append(order, "notify")
+	})})
+	outcome := r.stopRenewal(
+		func() { order = append(order, "cancel-handler") },
+		ErrPermissionDenied,
+		func() bool {
+			order = append(order, "sample-caller")
+			return false
+		},
+		func(err error, afterCancel bool) {
+			if !errors.Is(err, ErrPermissionDenied) || afterCancel {
+				t.Fatalf("fail = (%v, %v), want permission denied before caller cancellation", err, afterCancel)
+			}
+			order = append(order, "fail-run")
+		},
+	)
+	if !outcome.skipSettlement {
+		t.Fatal("permanent renewal failure must skip settlement")
+	}
+	if got, want := strings.Join(order, ","), "sample-caller,fail-run,cancel-handler,notify"; got != want {
+		t.Fatalf("permanent renewal shutdown order = %q, want %q", got, want)
+	}
+}
+
 func TestReceiverPermissionDeniedStopsEveryPath(t *testing.T) {
 	for _, operation := range []string{"receive", "complete", "abandon", "renew"} {
 		t.Run(operation, func(t *testing.T) {
