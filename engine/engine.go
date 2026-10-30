@@ -57,9 +57,15 @@ type Options struct {
 	AuthToken         string       // injected from env; never compiled in
 	Now               func() int64 // test clock (epoch ms)
 	DisableBackground bool         // skip reaper/scheduler loops (tests)
-	Synchronous       string       // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
-	MaxMessageBytes   int64        // reject bodies larger than this; 0 -> 1 MiB (§11.4)
-	MaxSubscriptions  int          // retained active + deleting subscriptions; 0 -> 10,000
+	// PreserveUnexpiredLeases keeps live Peek-Lock deliveries on active resources
+	// across Open. Network broker clients can outlive a broker process and still
+	// own their persisted token, so broker mode enables this. Embedded mode leaves
+	// it false: an in-process handler cannot survive its engine and its locks are
+	// orphans. Resource lifecycle and message TTL remain authoritative.
+	PreserveUnexpiredLeases bool
+	Synchronous             string // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
+	MaxMessageBytes         int64  // reject bodies larger than this; 0 -> 1 MiB (§11.4)
+	MaxSubscriptions        int    // retained active + deleting subscriptions; 0 -> 10,000
 	// DLQ retention bounds (MQLITE-21): a background pass drops dead letters
 	// oldest-first past these. ONLY state='dead_lettered' is touched; 0 = that
 	// dimension unbounded. Defaults are applied by the broker, not the engine.
@@ -99,8 +105,8 @@ type queueRow struct {
 	dlqMaxBytes int64
 }
 
-// Open opens the store (initializing the schema), performs single-broker crash
-// recovery, and starts background maintenance loops.
+// Open opens the store (initializing the schema), performs startup lease
+// recovery according to Options, and starts background maintenance loops.
 func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if opts.MaxSubscriptions < 0 {
 		return nil, fmt.Errorf("%w: max subscriptions must not be negative", ErrInvalidArgument)
@@ -163,12 +169,16 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	// unfinished/error work for the event-driven worker started below.
 	lifecyclePending := e.maintainLifecyclePass(ctx)
 
-	// Single-broker crash recovery (§4.4): any 'locked' row is an orphan from a
-	// previous process — reclaim it immediately (delivery_count was already
-	// incremented at claim time, so this counts as one redelivery). Same rule as
-	// the reaper (MQLITE-58): a message that died on its LAST allowed attempt is
-	// dead-lettered here, not redelivered an (max+1)th time — max_delivery_count
-	// is a bound on deliveries, not on deliveries-without-a-crash.
+	// Embedded crash recovery (§4.4) treats every locked row as an orphan because
+	// its in-process handler died with the engine. A network broker is different:
+	// remote handlers can survive the broker process and still own a persisted,
+	// unexpired token. Broker mode therefore reclaims only leases whose deadline
+	// has passed. In both modes delivery_count was already incremented at claim,
+	// and the existing max-delivery transition remains the boundary.
+	recoveryLeaseFilter := ""
+	if opts.PreserveUnexpiredLeases {
+		recoveryLeaseFilter = " AND locked_until<=?"
+	}
 	if err := e.mutateMessagesFresh(ctx, "recovered", `
 		UPDATE messages SET
 		    state = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
@@ -176,10 +186,16 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		    locked_until = 0, lock_token = NULL,
 		    dead_letter_reason = CASE WHEN delivery_count >= (SELECT max_delivery_count FROM queues WHERE name=messages.queue)
 		                              THEN 'MaxDeliveryCountExceeded' ELSE dead_letter_reason END
-		 WHERE state='locked'
+		 WHERE state='locked'`+recoveryLeaseFilter+`
 		   AND queue IN (SELECT name FROM queues
 		                 WHERE lifecycle_state='active' AND (expires_at=0 OR expires_at>?))`,
-		func() []any { return []any{e.now()} }); err != nil {
+		func() []any {
+			now := e.now()
+			if opts.PreserveUnexpiredLeases {
+				return []any{now, now}
+			}
+			return []any{now}
+		}); err != nil {
 		_ = d.close()
 		return nil, fmt.Errorf("crash recovery: %w", err)
 	}

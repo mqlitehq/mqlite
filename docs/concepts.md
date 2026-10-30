@@ -104,11 +104,13 @@ Every transition, with its trigger and the condition under which it fires:
   `Abandon`, lock expiry, and the scheduler do not. With `max=10`, the ordinary
   Peek-Lock `Receive` that returns `count=10` is a complete final attempt: it may renew
   its live lease repeatedly and still `Complete`. Reaching 10 does not itself move
-  the row. If that attempt is abandoned, its lease expires, or startup recovery
-  finds it locked, the row goes to the DLQ instead of receiving ordinary Peek-Lock
-  attempt number 11. Explicit `ReceiveDeferred` currently differs: it increments `count` but does
-  not currently refuse the claim based on `max`, so do not treat the configured
-  maximum as an admission limit for that by-sequence recovery path.
+  the row. If that attempt is abandoned, its lease expires, or embedded startup
+  recovery finds it orphaned, the row goes to the DLQ instead of receiving ordinary
+  Peek-Lock attempt number 11. Broker startup preserves it while the lease remains
+  live; expiry still applies the same boundary. Explicit `ReceiveDeferred`
+  currently differs: it increments `count` but does not currently refuse the claim
+  based on `max`, so do not treat the configured maximum as an admission limit for
+  that by-sequence recovery path.
 - **The DLQ is not a separate queue.** It is messages in the same queue with
   `state='dead_lettered'`. A message lands there when a failed locked attempt is
   abandoned, reaped, or recovered with `delivery_count >= max_delivery_count`, on

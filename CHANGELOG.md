@@ -13,8 +13,24 @@ upgrade notes before replacing a broker.
 ## Unreleased
 
 > The canonical schema token remains **7** and no database rebuild is required.
-> The broker adds only an optional response header; older clients ignore it, and
-> current clients retain a conservative fallback for older brokers.
+> This release adds an optional response header plus a Go broker-mode option;
+> older remote clients ignore the header, while programmatic brokers must add
+> `WithBrokerMode` before calling `Serve` so startup can preserve live leases.
+
+### Preserve live broker leases across restart (MQLITE-137)
+
+- Add an explicit `WithBrokerMode` open option and require it for `Embedded.Serve`.
+  The `mqlite serve` command enables it automatically. Broker startup now retains
+  unexpired Peek-Lock rows on active resources, their fencing tokens and delivery
+  counts, so a remote handler can finish the same delivery after a short graceful
+  restart or broker crash. Resource lifecycle and message TTL remain authoritative.
+- Continue to reclaim leases at `locked_until <= now`, returning them to active or
+  dead-lettering the final permitted delivery exactly as the reaper does. Plain
+  embedded mode keeps its existing immediate orphan recovery because its handlers
+  cannot outlive the engine process.
+- Cover valid AttemptID replay, RenewBatch and Complete after reopen, exact-expiry
+  recovery, and an in-flight managed handler completing once across a real Serve
+  stop/restart at `MaxDeliveryCount=1`.
 
 ### Harden remote delivery recovery and lease renewal (MQLITE-125)
 

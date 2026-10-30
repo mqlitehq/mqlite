@@ -538,7 +538,7 @@ func cmdServe(ctx context.Context, args []string) (retErr error) {
 	}
 	// serve is the only path that applies broker DLQ retention (serveRetentionOpts).
 	serveOpts := append(embeddedOpts(), serveRetentionOpts()...)
-	serveOpts = append(serveOpts, mqlite.WithLogger(slogger))
+	serveOpts = append(serveOpts, mqlite.WithLogger(slogger), mqlite.WithBrokerMode())
 	eng, err := mqlite.OpenEmbedded(sctx, db, serveOpts...)
 	if err != nil {
 		return err

@@ -30,6 +30,14 @@ def check(condition, message):
         raise RuntimeError(message)
 
 
+def log_fields(line, service, **fields):
+    """Match structured access-log fields without depending on field order."""
+    if service not in line:
+        return False
+    return all(re.search(r"(?:^|\s)" + re.escape(name) + "=" + re.escape(str(value)) + r"(?:\s|$)", line)
+               for name, value in fields.items())
+
+
 def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -125,13 +133,14 @@ class Drill:
         (self.out / "broker.log").write_text(text, encoding="utf-8")
         errors = [line for line in delta.splitlines()
                   if re.search(r"\b(WARN|ERRO|ERROR|FATAL|PANIC)\b|panic:|status=[45]\d\d", line, re.I)
-                  and not (phase == "before-full" and "AdminService/Status status=401 code=unauthenticated" in line)]
+                  and not (phase == "before-full" and log_fields(
+                      line, "AdminService/Status", status=401, code="unauthenticated"))]
         self.record("log-checks.jsonl", {"phase": phase, "errors": errors, "allow_full": allow_full})
         # Request access logs intentionally omit the error message. Correlate
         # exactly two failed Send logs with the two independently checked
         # HTTP/CLI disk-full responses, rather than accepting arbitrary 500s.
-        denied_sends = [line for line in errors if re.search(
-            r"QueueService/Send status=500 queue=" + re.escape(self.queue) + r" code=internal dur=\S+$", line)]
+        denied_sends = [line for line in errors if log_fields(
+            line, "QueueService/Send", status=500, queue=self.queue, code="internal")]
         if allow_full:
             check(len(denied_sends) == 2, "expected exactly two disk-full Send access logs")
         check(all(allow_full and (FULL.search(line) or line in denied_sends) for line in errors),
@@ -360,16 +369,17 @@ class Drill:
         self.start_broker()
         self.send(self.message("after-process-restart"))
         self.logs("after-process-restart")
-        observed = set()
-        for _ in range(len(self.acks)):
+        complete = self.rpc("Queue", "Complete", {"queue": self.queue, "seq_number": locked["seq_number"],
+                                                   "lock_token": locked["lock_token"]})
+        check(complete.get("ok") is True, "preserved pre-crash lease did not accept its original token")
+        observed = {locked["message_id"]}
+        for _ in range(len(self.acks) - 1):
             messages = self.rpc("Queue", "Receive", {"queue": self.queue, "max_messages": 1}).get("messages", [])
             check(len(messages) == 1, "missing message while draining")
             message = messages[0]
             identity = message.get("message_id")
             check(identity not in observed, "unexpected duplicate delivery")
-            self.verify_wire(message, 2 if identity == locked["message_id"] else 1)
-            if identity == locked["message_id"]:
-                check(message["lock_token"] != locked["lock_token"], "restart reused a stale lock token")
+            self.verify_wire(message, 1)
             complete = self.rpc("Queue", "Complete", {"queue": self.queue, "seq_number": message["seq_number"],
                                                        "lock_token": message["lock_token"]})
             check(complete.get("ok") is True, "completion was not acknowledged")

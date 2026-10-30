@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,7 +79,7 @@ func TestReceiveDrainWireContract(t *testing.T) {
 
 func TestServeDrainBarrierKeepsPostStopMessageActive(t *testing.T) {
 	ctx := context.Background()
-	eng, err := OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "drain.db"))
+	eng, err := OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "drain.db"), WithBrokerMode())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 		}
 	}
 
-	first, err := OpenEmbedded(ctx, "file:"+dbPath)
+	first, err := OpenEmbedded(ctx, "file:"+dbPath, WithBrokerMode())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,11 +224,10 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 			_ = first.Close()
 		}
 	}()
-	if err := first.CreateQueue(ctx, "restart-jobs", QueueConfig{}); err != nil {
+	if err := first.CreateQueue(ctx, "restart-jobs", QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1}); err != nil {
 		t.Fatal(err)
 	}
-	firstGate := receivegate.New()
-	cancelFirst, firstDone := startBroker(first, withReceiveGateForTest(firstGate))
+	cancelFirst, firstDone := startBroker(first)
 	firstRunning := true
 	defer func() {
 		if firstRunning {
@@ -243,7 +243,10 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 	defer cli.Close()
 	receiverCtx, cancelReceiver := context.WithCancel(ctx)
 	defer cancelReceiver()
-	handled := make(chan string, 1)
+	handled := make(chan string, 2)
+	handlerStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	var inFlightCalls atomic.Int32
 	observed := make(chan error, 32)
 	runDone := make(chan error, 1)
 	go func() {
@@ -252,20 +255,36 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 			case observed <- err:
 			default:
 			}
-		})).Run(receiverCtx, func(_ context.Context, msg *Message) error {
-			handled <- string(msg.Body)
+		})).Run(receiverCtx, func(handlerCtx context.Context, msg *Message) error {
+			body := string(msg.Body)
+			if body == "in-flight" {
+				inFlightCalls.Add(1)
+				select {
+				case handlerStarted <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseHandler:
+				case <-handlerCtx.Done():
+					return handlerCtx.Err()
+				}
+			}
+			handled <- body
 			return nil
 		})
 	}()
 
-	// Synchronize on the real engine wait boundary: the first empty claim round
-	// completed, the notifier is registered, and this Receive is now parked.
+	if _, err := cli.SendOne(ctx, "restart-jobs", OutMessage{Body: []byte("in-flight")}); err != nil {
+		t.Fatal(err)
+	}
+	// Stop the broker only after the delivery is inside user code. The handler is
+	// not an HTTP request; graceful HTTP drain alone cannot account for its lease.
 	select {
-	case <-firstGate.FirstParked():
+	case <-handlerStarted:
 	case err := <-runDone:
-		t.Fatalf("Receiver exited before parking: %v", err)
+		t.Fatalf("Receiver exited before handler started: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("Receiver did not reach the broker long-poll wait")
+		t.Fatal("Receiver did not start the in-flight handler")
 	}
 	cancelFirst()
 	waitBroker(firstDone)
@@ -280,11 +299,18 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 	}
 	firstClosed = true
 
-	second, err := OpenEmbedded(ctx, "file:"+dbPath)
+	second, err := OpenEmbedded(ctx, "file:"+dbPath, WithBrokerMode())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Close()
+	metrics, err := second.Stats(ctx, "restart-jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.Locked != 1 || metrics.Active != 0 || metrics.DeadLettered != 0 {
+		t.Fatalf("broker restart revoked the in-flight lease: %+v", metrics)
+	}
 	cancelSecond, secondDone := startBroker(second)
 	secondRunning := true
 	defer func() {
@@ -293,6 +319,34 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 			waitBroker(secondDone)
 		}
 	}()
+	close(releaseHandler)
+	select {
+	case body := <-handled:
+		if body != "in-flight" {
+			t.Fatalf("first handled body = %q, want in-flight", body)
+		}
+	case err := <-runDone:
+		t.Fatalf("Receiver exited before completing the preserved lease: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight handler did not return after broker restart")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		metrics, err = second.Stats(ctx, "restart-jobs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if metrics.Total == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("preserved delivery was not completed: %+v", metrics)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := inFlightCalls.Load(); got != 1 {
+		t.Fatalf("in-flight handler calls = %d, want exactly one", got)
+	}
 
 	if _, err := cli.SendOne(ctx, "restart-jobs", OutMessage{Body: []byte("after-restart")}); err != nil {
 		t.Fatal(err)
@@ -309,13 +363,13 @@ func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 	}
 
 	// Connection-refused during the short restart is transient and allowed. The
-	// broker drain itself must not surface as the fatal H1 cancellation.
+	// broker drain itself must not surface as cancellation or revoke the lease.
 	for {
 		select {
 		case err := <-observed:
-			if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "HTTP 499") ||
+			if errors.Is(err, ErrLockLost) || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "HTTP 499") ||
 				strings.Contains(err.Error(), "mqlite: canceled") {
-				t.Fatalf("broker shutdown surfaced as cancellation: %v", err)
+				t.Fatalf("broker restart invalidated Receiver state: %v", err)
 			}
 		default:
 			goto observedDrained

@@ -35,7 +35,7 @@ MQLite engine opens the live source.
 | Live backup | Source process remains open at a quiescent barrier; committed business data exists in WAL and is absent from an isolated main-file-only negative control; read-only `VACUUM INTO` preserves the complete logical snapshot |
 | Cold backup | Worker closes successfully; entire source directory is copied and every file hash matches |
 | Restore before opening | Fresh directory; `integrity_check=ok`, no foreign-key errors; every schema object, table, column, typed value and row matches the source, including business data and auxiliary tables |
-| Startup recovery | Only orphan locks change: below-limit rows become active; final-attempt rows become DLQ with `MaxDeliveryCountExceeded`; both clear token/deadline and retain all other fields |
+| Embedded fixture startup recovery | Only orphan locks change: below-limit rows become active; final-attempt rows become DLQ with `MaxDeliveryCountExceeded`; both clear token/deadline and retain all other fields |
 | Restored operations | Full identity/body/metadata checks through fresh Receive, deferred Pick, scheduled activation, DLQ redrive, dedup replay/conflict, receipt replay, attempt replay and stale-token fencing; subscription filter includes and excludes the intended messages |
 | Restored credentials | Active key retains exact metadata and authenticates; expired/revoked keys are rejected; all three digest-only records stay unchanged |
 | Convergence | Every queue's Stats and all-state Peek are empty; the entire messages table is empty; committed business data remains exact; backup copies remain unchanged |

@@ -39,10 +39,11 @@ image has its full RC OCI version and the binary's base source version.
    and SHM files. Read-only SQLite integrity/foreign-key checks and complete
    identity, sequence, state, count, body, and metadata reconciliation must pass.
 5. Restart the broker **inside the same running container**, prove the tmpfs
-   identity and holder process survived, and acknowledge a fresh message. Receive
-   every acknowledged message, compare the full body and metadata, prove orphaned
-   lock recovery increments the count only on the new claim and changes its
-   token, then Complete it. No purge is used to hide unknown rows.
+   identity and holder process survived, and acknowledge a fresh message. Prove
+   the unexpired pre-crash lease retains its token and `delivery_count=1`, then
+   Complete it with that original token. Receive every other acknowledged message
+   once, compare the full body and metadata, and Complete it. No purge is used to
+   hide unknown rows.
 6. Require no extra delivery, empty Peeks for all five retained states, and zero
    Stats. Stop the broker cleanly, copy the complete DB directory again, and
    require a read-only integrity/foreign-key check with zero message rows.
