@@ -81,6 +81,7 @@ func run() (err error) {
 	ctx := context.Background()
 	e, err := mq.OpenEmbedded(ctx, "file:"+os.Args[2], mq.WithoutBackground(),
 		mq.WithClock(func() int64 { return now }), mq.WithSynchronous("FULL"),
+		mq.WithReclaimUnexpiredLeases(),
 		mq.WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
 	if err != nil {
 		return err

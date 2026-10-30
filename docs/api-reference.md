@@ -373,10 +373,11 @@ Receive-and-Delete removes the row before returning it and grants no lease:
 replays with the same receive attempt ID. The SDK exposes a zero `LockedUntil` time.
 Every newly granted `Receive` claim increments `delivery_count`. A Peek-Lock
 `receive_attempt_id` returns its saved claim without another increment only while
-every saved token still owns a live lease. If embedded startup recovery, broker
-recovery of an expired lease, settlement, or ordinary lease expiry invalidates any
-token, the broker discards that stale response and the retry performs a safe new
-claim; it never returns ownership the caller no longer has.
+every saved token still owns a live lease. If explicit embedded live-lease
+recovery, startup recovery of an expired lease, settlement, or ordinary lease
+expiry invalidates any token, the broker discards that stale response and the
+retry performs a safe new claim; it never returns ownership the caller no longer
+has.
 Use an attempt ID only to retry the exact Receive whose response was not observed.
 Once the response arrives, do not reuse that ID for another Receive or after
 settling part of its batch. Invalidating a partially stale cached response does
@@ -455,9 +456,9 @@ current deadline; once the lease is expired, Renew fails with `409 lock_lost`.
 ordinary Peek-Lock claim is granted. For example, with a maximum of 10, an ordinary Peek-Lock `Receive`
 may return `delivery_count=10`; that consumer can renew the lease repeatedly and
 Complete successfully. If it instead Abandons, lets the lease expire, or leaves the
-lock for embedded startup recovery, the message goes to the DLQ and is not ordinarily
-claimed an eleventh time. Broker startup preserves that final attempt while its lease
-is unexpired; expiry still applies the same DLQ boundary. `ReceiveDeferred` currently
+lock for explicit embedded live-lease recovery, the message goes to the DLQ and is
+not ordinarily claimed an eleventh time. Startup preserves that final attempt by
+default while its lease is unexpired; expiry still applies the same DLQ boundary. `ReceiveDeferred` currently
 differs, as described below.
 
 > **Defer + ordering.** A deferred message keeps its head-of-line position: in a

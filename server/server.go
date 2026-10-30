@@ -1,10 +1,9 @@
 // Package server exposes an mqlite Engine as a Connect-style JSON-over-HTTP
 // broker (design §7). Every unary RPC is a plain HTTP POST to
 // /mqlite.v1.<Service>/<Method> with a JSON body — curl-able by construction.
-// A durable broker Engine must be opened with
-// engine.Options.PreserveUnexpiredLeases so remote consumers retain live tokens
-// across broker restarts. The higher-level Embedded.Serve path enforces the
-// equivalent mqlite.WithBrokerMode option.
+// A durable broker Engine preserves live tokens under engine.Open's safe default.
+// The higher-level Embedded.Serve path additionally enforces WithBrokerMode so
+// its shutdown and lifecycle contract is selected before serving traffic.
 package server
 
 import (
@@ -61,9 +60,9 @@ type Server struct {
 }
 
 // New builds a Server. tokens is the set of accepted Bearer tokens; pass nil/empty
-// to disable auth (documented as a localhost/LAN downgrade, §7.5). For a durable
-// broker, eng must have been opened with engine.Options.PreserveUnexpiredLeases;
-// otherwise a reopen uses embedded ownership semantics and revokes old locks.
+// to disable auth (documented as a localhost/LAN downgrade, §7.5). Open preserves
+// unexpired leases by default; do not pass ReclaimUnexpiredLeases for an Engine
+// that will be used by a network broker.
 func New(eng *engine.Engine, tokens []string) *Server {
 	s := &Server{eng: eng, tokens: map[string]bool{}, mux: http.NewServeMux(), rpcLat: newRPCLatency(), started: time.Now(),
 		MaxBodyBytes: 32 << 20}

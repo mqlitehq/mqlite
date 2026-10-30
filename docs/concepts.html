@@ -234,9 +234,9 @@
             a deferred row. Renewal, Abandon and scheduled activation do not. With a
             maximum of 10, ordinary Peek-Lock <code>Receive</code> 10 is a full final attempt:
             it may renew repeatedly and Complete. If it is Abandoned, its lease expires, or
-            embedded startup finds it orphaned, it moves to <b>DLQ</b> instead of ordinary
-            Peek-Lock <code>Receive</code> number 11. Broker startup preserves the final attempt
-            while its lease is live; expiry applies the same DLQ boundary. Explicit
+            an embedded owner explicitly reclaims live leases, it moves to <b>DLQ</b> instead of
+            ordinary Peek-Lock <code>Receive</code> number 11. Startup preserves the final attempt
+            by default while its lease is live; expiry applies the same DLQ boundary. Explicit
             <code>ReceiveDeferred</code> currently
             differs: it increments the count but has no maximum admission
             check.</p>

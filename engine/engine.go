@@ -57,15 +57,20 @@ type Options struct {
 	AuthToken         string       // injected from env; never compiled in
 	Now               func() int64 // test clock (epoch ms)
 	DisableBackground bool         // skip reaper/scheduler loops (tests)
-	// PreserveUnexpiredLeases keeps live Peek-Lock deliveries on active resources
-	// across Open. Network broker clients can outlive a broker process and still
-	// own their persisted token, so broker mode enables this. Embedded mode leaves
-	// it false: an in-process handler cannot survive its engine and its locks are
-	// orphans. Resource lifecycle and message TTL remain authoritative.
+	// PreserveUnexpiredLeases is retained for source compatibility. Open now
+	// preserves live Peek-Lock deliveries by default, so setting this field is no
+	// longer necessary. Resource lifecycle and message TTL remain authoritative.
+	//
+	// Deprecated: live leases are preserved unless ReclaimUnexpiredLeases is set.
 	PreserveUnexpiredLeases bool
-	Synchronous             string // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
-	MaxMessageBytes         int64  // reject bodies larger than this; 0 -> 1 MiB (§11.4)
-	MaxSubscriptions        int    // retained active + deleting subscriptions; 0 -> 10,000
+	// ReclaimUnexpiredLeases explicitly treats every live Peek-Lock delivery as an
+	// orphan during Open. Use this only for an embedded owner that knows all of its
+	// in-process handlers are gone. It invalidates their fencing tokens and can
+	// dead-letter a message on its final delivery attempt.
+	ReclaimUnexpiredLeases bool
+	Synchronous            string // local SQLite PRAGMA synchronous: NORMAL(default)|FULL|OFF
+	MaxMessageBytes        int64  // reject bodies larger than this; 0 -> 1 MiB (§11.4)
+	MaxSubscriptions       int    // retained active + deleting subscriptions; 0 -> 10,000
 	// DLQ retention bounds (MQLITE-21): a background pass drops dead letters
 	// oldest-first past these. ONLY state='dead_lettered' is touched; 0 = that
 	// dimension unbounded. Defaults are applied by the broker, not the engine.
@@ -110,6 +115,9 @@ type queueRow struct {
 func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if opts.MaxSubscriptions < 0 {
 		return nil, fmt.Errorf("%w: max subscriptions must not be negative", ErrInvalidArgument)
+	}
+	if opts.PreserveUnexpiredLeases && opts.ReclaimUnexpiredLeases {
+		return nil, fmt.Errorf("%w: preserve and reclaim unexpired leases are mutually exclusive", ErrInvalidArgument)
 	}
 	d, err := openDB(ctx, opts.DB, opts.AuthToken, opts.Synchronous)
 	if err != nil {
@@ -169,15 +177,15 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	// unfinished/error work for the event-driven worker started below.
 	lifecyclePending := e.maintainLifecyclePass(ctx)
 
-	// Embedded crash recovery (§4.4) treats every locked row as an orphan because
-	// its in-process handler died with the engine. A network broker is different:
-	// remote handlers can survive the broker process and still own a persisted,
-	// unexpired token. Broker mode therefore reclaims only leases whose deadline
-	// has passed. In both modes delivery_count was already incremented at claim,
-	// and the existing max-delivery transition remains the boundary.
-	recoveryLeaseFilter := ""
-	if opts.PreserveUnexpiredLeases {
-		recoveryLeaseFilter = " AND locked_until<=?"
+	// Safe startup recovery preserves every unexpired fencing token by default.
+	// The process opening this database cannot prove that another process did not
+	// hand the token to a still-running remote or out-of-process handler. Embedded
+	// owners that can prove all handlers died may explicitly reclaim live leases.
+	// In either mode delivery_count was already incremented at claim, and the
+	// existing max-delivery transition remains the boundary.
+	recoveryLeaseFilter := " AND locked_until<=?"
+	if opts.ReclaimUnexpiredLeases {
+		recoveryLeaseFilter = ""
 	}
 	if err := e.mutateMessagesFresh(ctx, "recovered", `
 		UPDATE messages SET
@@ -191,10 +199,10 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		                 WHERE lifecycle_state='active' AND (expires_at=0 OR expires_at>?))`,
 		func() []any {
 			now := e.now()
-			if opts.PreserveUnexpiredLeases {
-				return []any{now, now}
+			if opts.ReclaimUnexpiredLeases {
+				return []any{now}
 			}
-			return []any{now}
+			return []any{now, now}
 		}); err != nil {
 		_ = d.close()
 		return nil, fmt.Errorf("crash recovery: %w", err)

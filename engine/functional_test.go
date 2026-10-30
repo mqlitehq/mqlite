@@ -2454,7 +2454,10 @@ func TestObservabilityMessageLifecycleInventory(t *testing.T) {
 		if err := e.Close(); err != nil {
 			t.Fatal(err)
 		}
-		reopened, err := Open(ctx, Options{DB: "file:" + path, Now: func() int64 { return *clock }, DisableBackground: true})
+		reopened, err := Open(ctx, Options{
+			DB: "file:" + path, Now: func() int64 { return *clock }, DisableBackground: true,
+			ReclaimUnexpiredLeases: true,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}

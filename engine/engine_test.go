@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync/atomic"
@@ -21,9 +22,10 @@ func testEngineAt(t *testing.T, path string) (*Engine, *int64) {
 	t.Helper()
 	var ms int64 = 1_700_000_000_000
 	e, err := Open(context.Background(), Options{
-		DB:                "file:" + path,
-		Now:               func() int64 { return atomic.LoadInt64(&ms) },
-		DisableBackground: true,
+		DB:                     "file:" + path,
+		Now:                    func() int64 { return atomic.LoadInt64(&ms) },
+		DisableBackground:      true,
+		ReclaimUnexpiredLeases: true,
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -417,8 +419,8 @@ func TestRedrive(t *testing.T) {
 	}
 }
 
-// I-crash: after a restart, orphaned locks are reclaimed (single-broker, §4.4).
-func TestCrashRecovery(t *testing.T) {
+// An exclusive embedded owner may explicitly reclaim live orphaned locks after a restart.
+func TestExplicitCrashRecovery(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mq.db")
@@ -443,7 +445,7 @@ func TestCrashRecovery(t *testing.T) {
 // with MaxDeliveryCountExceeded instead of being redelivered an (max+1)th time —
 // max_delivery_count bounds deliveries, not deliveries-without-a-crash. A message
 // still under the bound is redelivered as before.
-func TestCrashRecoveryRespectsMaxDelivery(t *testing.T) {
+func TestExplicitCrashRecoveryRespectsMaxDelivery(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "mq.db")
 
@@ -475,10 +477,9 @@ func TestCrashRecoveryRespectsMaxDelivery(t *testing.T) {
 	}
 }
 
-// A broker's remote consumer can outlive the broker process. Reopening in
-// broker mode must therefore retain an unexpired token so the same delivery can
+// Safe startup recovery retains an unexpired token by default so a delivery can
 // be replayed, renewed and completed instead of being duplicated or dead-lettered.
-func TestBrokerRecoveryPreservesUnexpiredLease(t *testing.T) {
+func TestOpenPreservesUnexpiredLeaseByDefault(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "mq.db")
 
@@ -497,10 +498,9 @@ func TestBrokerRecoveryPreservesUnexpiredLease(t *testing.T) {
 	}
 
 	e2, err := Open(ctx, Options{
-		DB:                      "file:" + path,
-		Now:                     func() int64 { return atomic.LoadInt64(clock) },
-		DisableBackground:       true,
-		PreserveUnexpiredLeases: true,
+		DB:                "file:" + path,
+		Now:               func() int64 { return atomic.LoadInt64(clock) },
+		DisableBackground: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -533,10 +533,10 @@ func TestBrokerRecoveryPreservesUnexpiredLease(t *testing.T) {
 	}
 }
 
-// Broker mode preserves only a live lease. The exact expiry boundary retains
+// Default startup recovery preserves only a live lease. The exact expiry boundary retains
 // the existing recovery rule: below the delivery limit it returns to active,
 // while the final allowed delivery moves to the DLQ.
-func TestBrokerRecoveryReclaimsExpiredLeases(t *testing.T) {
+func TestOpenReclaimsExpiredLeasesByDefault(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "mq.db")
 
@@ -558,10 +558,9 @@ func TestBrokerRecoveryReclaimsExpiredLeases(t *testing.T) {
 	advance(clock, time.Second) // locked_until == now is expired.
 
 	e2, err := Open(ctx, Options{
-		DB:                      "file:" + path,
-		Now:                     func() int64 { return atomic.LoadInt64(clock) },
-		DisableBackground:       true,
-		PreserveUnexpiredLeases: true,
+		DB:                "file:" + path,
+		Now:               func() int64 { return atomic.LoadInt64(clock) },
+		DisableBackground: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -577,6 +576,24 @@ func TestBrokerRecoveryReclaimsExpiredLeases(t *testing.T) {
 	}
 	if got := recvOne(t, e2, "spare"); got == nil || got.DeliveryCount != 2 {
 		t.Fatalf("recovered delivery = %+v, want delivery count 2", got)
+	}
+}
+
+func TestOpenRejectsConflictingLeaseRecoveryOptions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "must-not-open.db")
+	e, err := Open(context.Background(), Options{
+		DB:                      "file:" + path,
+		DisableBackground:       true,
+		PreserveUnexpiredLeases: true, //nolint:staticcheck // compatibility test intentionally exercises the deprecated field
+		ReclaimUnexpiredLeases:  true,
+	})
+	if e != nil || !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("conflicting recovery options = engine %v, error %v; want ErrInvalidArgument", e, err)
+	}
+	for _, name := range []string{path, path + ".lock"} {
+		if _, statErr := os.Stat(name); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("conflicting recovery options touched %s: %v", name, statErr)
+		}
 	}
 }
 
