@@ -318,17 +318,22 @@ class WorkflowContractTests(unittest.TestCase):
         names = set(re.findall(r"^    name: (.+)$", ci, re.MULTILINE))
         names.remove("test (${{ matrix.os }} · go ${{ matrix.go }})")
         names.update("test (" + os + " · go " + go + ")" for os, go in (
-            ("ubuntu-latest", "1.21.x"), ("ubuntu-latest", "stable"), ("macos-14", "1.21.x"),
+            ("ubuntu-latest", "1.21.x"), ("ubuntu-latest", "stable"), ("macos-latest", "1.21.x"),
             ("macos-latest", "stable"), ("windows-latest", "1.21.x"), ("windows-latest", "stable")))
         self.assertEqual(names, guard.EXPECTED_JOBS)
         self.assertEqual(len(names), 13)
+        self.assertNotRegex(ci, r"(?m)^\s+- os: macos-14$")
+        self.assertIn("          - os: macos-latest\n"
+                      "            go: '1.21.x'\n"
+                      "            go_flags: '-ldflags=-linkmode=external'", ci)
+        self.assertIn("      GOFLAGS: ${{ matrix.go_flags }}", ci)
 
     def test_workflow_surface_requires_deliberate_review(self):
         # Hash the complete workflows, not selected "good" lines: an added if,
         # continue-on-error, alternate publish step, matrix entry, or checkout is
         # security-relevant. Review any change before updating these goldens.
         expected = {
-            "ci.yml": "a383ac555b6bde2123a772518a8f1009a0542ad393a8590ea3622552050f7d1e",
+            "ci.yml": "f0f87dc063b3bab4d50d9494eb621d9bed7a737acf282323e35304e2a09b2bd5",
             "release.yml": "badec32ab2c9e80b37e732ae0e4418ceebabb3de80b4a396d87dd0c799ab4ed4",
             "release-image.yml": "932ebb5179c71ef36a2fbd5747437b9b2d333a3891f67dbaa1df3ef0b439eaeb",
         }

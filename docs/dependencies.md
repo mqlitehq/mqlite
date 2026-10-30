@@ -48,6 +48,12 @@ local/remote parity, live lifecycle, sustained-load or six-target release gates.
 None currently satisfies the complete Go 1.21, CGO-free, six-target and
 storage-semantics contract.
 
+CI keeps that source-floor contract on supported macOS runners by externally
+linking the Go 1.21 test binaries. Go 1.21's internal Darwin linker does not emit
+the `LC_UUID` required by current macOS releases; the external Apple linker does.
+This exception applies only to the compatibility gate. Release binaries use the
+current supported Go toolchain and its normal linker selection.
+
 MQLite contains the known HTTP logical-stream lifecycle defect behind a narrow
 single-lease adapter: a `libsql://` driver connection is discarded when its
 `database/sql` lease ends, while Go's shared HTTP transport continues to reuse

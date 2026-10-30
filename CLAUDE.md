@@ -76,6 +76,10 @@ producer-acknowledged commits, and orphaned locks returning to active or reachin
 the delivery limit. This is process-death recovery; it does not test power-loss durability.
 
 Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/windows.
+The Go 1.21 macOS leg uses the supported `macos-latest` runner with external linking:
+Go 1.21's internal Darwin linker does not emit the `LC_UUID` required by current
+macOS releases. This is a source-floor compatibility gate; supported Go release
+builds continue to use their default linker.
 
 ## Releasing, versioning & dependencies
 
