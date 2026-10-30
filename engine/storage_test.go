@@ -1128,7 +1128,8 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		}
 		return &oneQueueRow{values: []driver.Value{c.st.attemptResponse}}, nil
 	}
-	if strings.Contains(normalized, "SELECT id,lock_token,locked_until FROM messages") {
+	if strings.Contains(normalized, "SELECT id,body,delivery_count,group_id,message_id") &&
+		strings.Contains(normalized, "FROM messages") {
 		c.st.attemptChecks++
 		return &valueRows{values: c.st.attemptLeases}, nil
 	}
@@ -1440,8 +1441,8 @@ func TestReceiveAttemptReplayValidationUsesOneSetQuery(t *testing.T) {
 	}
 	state.attemptResponse = string(blob)
 	state.attemptLeases = [][]driver.Value{
-		{int64(10), "token-a", int64(2000)},
-		{int64(11), "token-b", int64(2000)},
+		{int64(10), []byte("a"), int64(1), nil, nil, nil, nil, nil, nil, nil, int64(0), int64(2000), "token-a"},
+		{int64(11), []byte("b"), int64(1), nil, nil, nil, nil, nil, nil, nil, int64(0), int64(2000), "token-b"},
 	}
 
 	got, err := e.claimRound(context.Background(), q, 2, PeekLock, "attempt")
@@ -1453,7 +1454,7 @@ func TestReceiveAttemptReplayValidationUsesOneSetQuery(t *testing.T) {
 	}
 	found := false
 	for i, query := range state.queries {
-		if !strings.Contains(strings.Join(strings.Fields(query), " "), "SELECT id,lock_token,locked_until FROM messages") {
+		if !strings.Contains(strings.Join(strings.Fields(query), " "), "SELECT id,body,delivery_count,group_id,message_id") {
 			continue
 		}
 		found = true

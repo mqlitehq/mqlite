@@ -355,14 +355,20 @@ to make the *window* small and the *retries* safe:
   receipt can replay the original effect after the original lease expires, but cannot
   grant a new effect or renew that expired lease.
 - **`receive_attempts`** — a client may tag `Receive` with an `attempt_id`. The
-  claimed batch is recorded under that id (same transaction again); a retry of
-  the same Peek-Lock attempt replays the exact same messages and lock tokens only
-  while every token still owns a live lease. Replay validates the whole batch in
-  one query. If explicit embedded live-lease recovery, startup recovery of an
-  expired lease, ordinary lease expiry, or settlement invalidated any token, the same
-  transaction removes the stale response and makes a safe new claim; a stale or
+  claimed batch is recorded under that id (same transaction again); Peek-Lock
+  stores only the ordered sequence/token/deadline roster, then reconstructs the
+  immutable message fields from the locked rows while validating the whole batch
+  in one query. This avoids duplicating every live message body in the replay
+  table. A retry replays the exact same messages and lock tokens only while every
+  token still owns a live lease. If explicit embedded live-lease recovery,
+  startup recovery of an expired lease, ordinary lease expiry, or settlement
+  invalidated any token, the same transaction removes the stale response and
+  makes a safe new claim; a stale or
   partially owned batch never reaches the caller. Tokenless ReceiveAndDelete
-  responses remain replayable after their message rows are gone.
+  retains the full response because its message rows are gone. Its replay lifetime
+  remains the greater of five minutes and the queue lock duration, matching the
+  existing contract. Managed local and remote receivers both retain AttemptID replay:
+  even an in-process database commit can return an uncertain outcome.
 - **`dedup`** — on the producer side, a `message_id` within the queue's dedup
   window collapses resends into the original row (no id? the body's SHA-256 is
   used as a content-addressed key). Same id with a *different* body is a loud

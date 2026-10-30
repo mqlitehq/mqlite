@@ -22,6 +22,25 @@ const (
 // long as the lock the client is holding.
 const recvAttemptTTLFloorMs = 5 * 60 * 1000 // 5 min
 
+// receiveAttemptFormatVersion identifies the compact envelope stored in the
+// existing receive_attempts.response column. Versioned JSON lets upgraded
+// brokers replay pre-upgrade full-message arrays until they expire without a
+// schema migration.
+const receiveAttemptFormatVersion = 1
+
+type storedReceiveAttempt struct {
+	Version  int                  `json:"version"`
+	Mode     ReceiveMode          `json:"mode"`
+	Leases   []storedReceiveLease `json:"leases,omitempty"`
+	Messages []*Message           `json:"messages,omitempty"`
+}
+
+type storedReceiveLease struct {
+	SeqNumber     int64  `json:"seq_number"`
+	LockToken     string `json:"lock_token"`
+	LockedUntilMs int64  `json:"locked_until_ms"`
+}
+
 // claimRound performs one transactional claim attempt. With an attempt id the whole round —
 // replay-check, lease validation, claim, and record — runs in one transaction so
 // a client retrying a Receive whose response was lost replays the same still-owned
@@ -80,6 +99,9 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 			return err
 		}
 		if len(msgs) > 0 {
+			// Preserve the existing attempt lifetime for both modes. Peek-Lock
+			// needs it to cover the lease; ReceiveAndDelete has historically used
+			// the same queue-scoped replay window even though it grants no lease.
 			ttl := current.lockDurationMs
 			if ttl < recvAttemptTTLFloorMs {
 				ttl = recvAttemptTTLFloorMs
@@ -89,7 +111,7 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 				return err
 			}
 			expires := boundedDeadlineMs(now, ttl, current.expiresAtMs)
-			if err := storeAttempt(ctx, tx, current.name, attemptID, msgs, now, expires); err != nil {
+			if err := storeAttempt(ctx, tx, current.name, attemptID, mode, msgs, now, expires); err != nil {
 				return err
 			}
 		}
@@ -123,79 +145,61 @@ func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode R
 	if err != nil {
 		return nil, attemptMissing, err
 	}
-	var msgs []*Message
-	if err := json.Unmarshal([]byte(blob), &msgs); err != nil {
+	stored, err := decodeStoredReceiveAttempt(blob)
+	if err != nil {
 		return nil, attemptMissing, err
 	}
-	if len(msgs) == 0 {
-		return nil, attemptMissing, errors.New("mqlite: stored receive attempt has an empty response")
-	}
-
-	// ReceiveAndDelete removes the rows in the same transaction that stores this
-	// tokenless response. Its cached body is therefore the only safe replay after
-	// a lost acknowledgement, including across a broker restart. Peek-Lock is the
-	// opposite: every cached token must still fence a live, unexpired lock before
-	// user code may see it. Startup recovery, the reaper, settlement, or a prior
-	// replay can all invalidate that lease while the attempt record is still live.
-	tokenless, tokenBearing := true, true
-	for _, msg := range msgs {
-		if msg == nil {
-			return nil, attemptMissing, errors.New("mqlite: stored receive attempt contains a null message")
-		}
-		if msg.LockToken == "" {
-			tokenBearing = false
-		} else {
-			tokenless = false
-		}
-	}
-	if !tokenless && !tokenBearing {
-		return nil, attemptMissing, errors.New("mqlite: stored receive attempt mixes leased and deleted messages")
-	}
-	if mode == ReceiveAndDelete {
-		if !tokenless {
+	if stored.Mode != mode {
+		if stored.Mode == PeekLock {
 			return nil, attemptMissing, fmt.Errorf("%w: receive attempt was created for peek-lock mode", ErrInvalidArgument)
 		}
-		for _, msg := range msgs {
-			if msg.LockedUntilMs != 0 {
-				return nil, attemptMissing, errors.New("mqlite: stored receive-and-delete attempt contains a lease deadline")
-			}
-		}
-		return msgs, attemptReplayable, nil
-	}
-	if !tokenBearing {
 		return nil, attemptMissing, fmt.Errorf("%w: receive attempt was created for receive-and-delete mode", ErrInvalidArgument)
 	}
-
-	type lease struct {
-		token       string
-		lockedUntil int64
+	if mode == ReceiveAndDelete {
+		return stored.Messages, attemptReplayable, nil
 	}
-	expected := make(map[int64]string, len(msgs))
-	placeholders := make([]string, len(msgs))
-	args := make([]any, 0, len(msgs)+1)
+
+	// Peek-Lock stores only ownership coordinates. The message rows are immutable
+	// while locked, so one set query both validates every token and reconstructs
+	// the original response without duplicating bodies in receive_attempts.
+	expected := make(map[int64]storedReceiveLease, len(stored.Leases))
+	placeholders := make([]string, len(stored.Leases))
+	args := make([]any, 0, len(stored.Leases)+1)
 	args = append(args, queue)
-	for i, msg := range msgs {
-		if _, duplicate := expected[msg.SeqNumber]; duplicate {
+	for i, lease := range stored.Leases {
+		if lease.SeqNumber <= 0 || lease.LockToken == "" || lease.LockedUntilMs <= 0 {
+			return nil, attemptMissing, errors.New("mqlite: stored receive attempt contains an invalid lease")
+		}
+		if _, duplicate := expected[lease.SeqNumber]; duplicate {
 			return nil, attemptMissing, errors.New("mqlite: stored receive attempt contains a duplicate message")
 		}
-		expected[msg.SeqNumber] = msg.LockToken
+		expected[lease.SeqNumber] = lease
 		placeholders[i] = "?"
-		args = append(args, msg.SeqNumber)
+		args = append(args, lease.SeqNumber)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,lock_token,locked_until FROM messages
+	rows, err := tx.QueryContext(ctx, `SELECT id,body,delivery_count,group_id,message_id,
+		correlation_id,reply_to,subject,content_type,properties,enqueued_at,locked_until,lock_token FROM messages
 		WHERE queue=? AND state='locked' AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return nil, attemptMissing, err
 	}
-	actual := make(map[int64]lease, len(msgs))
+	actual := make(map[int64]*Message, len(stored.Leases))
 	for rows.Next() {
-		var seq int64
-		var current lease
-		if err := rows.Scan(&seq, &current.token, &current.lockedUntil); err != nil {
+		var msg Message
+		var groupID, messageID, correlationID, replyTo, subject, ctype, props sql.NullString
+		if err := rows.Scan(&msg.SeqNumber, &msg.Body, &msg.DeliveryCount, &groupID, &messageID,
+			&correlationID, &replyTo, &subject, &ctype, &props, &msg.EnqueuedAtMs, &msg.LockedUntilMs, &msg.LockToken); err != nil {
 			_ = rows.Close()
 			return nil, attemptMissing, err
 		}
-		actual[seq] = current
+		msg.GroupID = groupID.String
+		msg.MessageID = messageID.String
+		msg.CorrelationID = correlationID.String
+		msg.ReplyTo = replyTo.String
+		msg.Subject = subject.String
+		msg.ContentType = ctype.String
+		msg.Properties = parseProps(props)
+		actual[msg.SeqNumber] = &msg
 	}
 	if err := rows.Close(); err != nil {
 		return nil, attemptMissing, err
@@ -205,15 +209,23 @@ func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode R
 	}
 	valid := len(actual) == len(expected)
 	if valid {
-		for seq, token := range expected {
+		for seq, lease := range expected {
 			current, ok := actual[seq]
-			if !ok || current.token != token || current.lockedUntil <= now {
+			if !ok || current.LockToken != lease.LockToken || current.LockedUntilMs <= now {
 				valid = false
 				break
 			}
 		}
 	}
 	if valid {
+		msgs := make([]*Message, len(stored.Leases))
+		for i, lease := range stored.Leases {
+			msg := actual[lease.SeqNumber]
+			// Preserve the deadline observed in the original response. A Renew may
+			// have extended the row since then, but replay remains the same response.
+			msg.LockedUntilMs = lease.LockedUntilMs
+			msgs[i] = msg
+		}
 		return msgs, attemptReplayable, nil
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -223,8 +235,92 @@ func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode R
 	return nil, attemptInvalidated, nil
 }
 
-func storeAttempt(ctx context.Context, tx *txn, queue, attemptID string, msgs []*Message, now, expires int64) error {
-	blob, err := json.Marshal(msgs)
+func decodeStoredReceiveAttempt(blob string) (storedReceiveAttempt, error) {
+	trimmed := strings.TrimSpace(blob)
+	if trimmed == "" {
+		return storedReceiveAttempt{}, errors.New("mqlite: stored receive attempt has an empty response")
+	}
+	if trimmed[0] == '[' {
+		// Before compact envelopes, both modes stored the complete []*Message.
+		// Convert that representation in memory so live attempts survive upgrade.
+		var msgs []*Message
+		if err := json.Unmarshal([]byte(trimmed), &msgs); err != nil {
+			return storedReceiveAttempt{}, err
+		}
+		if len(msgs) == 0 {
+			return storedReceiveAttempt{}, errors.New("mqlite: stored receive attempt has an empty response")
+		}
+		tokenless, tokenBearing := true, true
+		for _, msg := range msgs {
+			if msg == nil {
+				return storedReceiveAttempt{}, errors.New("mqlite: stored receive attempt contains a null message")
+			}
+			if msg.LockToken == "" {
+				tokenBearing = false
+			} else {
+				tokenless = false
+			}
+		}
+		if !tokenless && !tokenBearing {
+			return storedReceiveAttempt{}, errors.New("mqlite: stored receive attempt mixes leased and deleted messages")
+		}
+		if tokenless {
+			for _, msg := range msgs {
+				if msg.LockedUntilMs != 0 {
+					return storedReceiveAttempt{}, errors.New("mqlite: stored receive-and-delete attempt contains a lease deadline")
+				}
+			}
+			return storedReceiveAttempt{Version: receiveAttemptFormatVersion, Mode: ReceiveAndDelete, Messages: msgs}, nil
+		}
+		leases := make([]storedReceiveLease, len(msgs))
+		for i, msg := range msgs {
+			leases[i] = storedReceiveLease{SeqNumber: msg.SeqNumber, LockToken: msg.LockToken, LockedUntilMs: msg.LockedUntilMs}
+		}
+		return storedReceiveAttempt{Version: receiveAttemptFormatVersion, Mode: PeekLock, Leases: leases}, nil
+	}
+	if trimmed[0] != '{' {
+		return storedReceiveAttempt{}, errors.New("mqlite: stored receive attempt has an unknown format")
+	}
+	var stored storedReceiveAttempt
+	if err := json.Unmarshal([]byte(trimmed), &stored); err != nil {
+		return storedReceiveAttempt{}, err
+	}
+	if stored.Version != receiveAttemptFormatVersion {
+		return storedReceiveAttempt{}, fmt.Errorf("mqlite: unsupported stored receive attempt version %d", stored.Version)
+	}
+	switch stored.Mode {
+	case PeekLock:
+		if len(stored.Leases) == 0 || len(stored.Messages) != 0 {
+			return storedReceiveAttempt{}, errors.New("mqlite: stored peek-lock attempt has an invalid response")
+		}
+	case ReceiveAndDelete:
+		if len(stored.Messages) == 0 || len(stored.Leases) != 0 {
+			return storedReceiveAttempt{}, errors.New("mqlite: stored receive-and-delete attempt has an invalid response")
+		}
+		for _, msg := range stored.Messages {
+			if msg == nil || msg.LockToken != "" || msg.LockedUntilMs != 0 {
+				return storedReceiveAttempt{}, errors.New("mqlite: stored receive-and-delete attempt contains a lease")
+			}
+		}
+	default:
+		return storedReceiveAttempt{}, fmt.Errorf("mqlite: stored receive attempt has unknown mode %d", stored.Mode)
+	}
+	return stored, nil
+}
+
+func storeAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode ReceiveMode, msgs []*Message, now, expires int64) error {
+	stored := storedReceiveAttempt{Version: receiveAttemptFormatVersion, Mode: mode}
+	if mode == ReceiveAndDelete {
+		stored.Messages = msgs
+	} else {
+		stored.Leases = make([]storedReceiveLease, len(msgs))
+		for i, msg := range msgs {
+			stored.Leases[i] = storedReceiveLease{
+				SeqNumber: msg.SeqNumber, LockToken: msg.LockToken, LockedUntilMs: msg.LockedUntilMs,
+			}
+		}
+	}
+	blob, err := json.Marshal(stored)
 	if err != nil {
 		return err
 	}
