@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"runtime"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/wire"
 )
 
 // A positive age bound must NEVER convert to 0 ms (which the engine reads as unbounded) —
