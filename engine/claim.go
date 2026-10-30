@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/mqlitehq/mqlite/internal/receivegate"
 )
 
 func randToken() string {
@@ -187,8 +189,37 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 		wait = 20000
 	}
 	deadline := boundedDeadlineMs(e.now(), wait, 0)
+	gate := receivegate.FromContext(ctx)
+	var drain <-chan struct{}
+	if gate != nil {
+		drain = gate.Done()
+	}
+	confirmedEmpty := false
 
 	for {
+		// TryEnterClaim and Gate.Stop share one mutex. A true result is the
+		// linearization point at which this metadata-read + claim round becomes
+		// admitted and may finish; false means broker drain won and no database
+		// operation may start. Never cancel ctx here: a remote commit whose
+		// acknowledgement races shutdown must return its real result/error, not be
+		// disguised as an empty long poll.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if gate != nil && !gate.TryEnterClaim() {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			select {
+			case <-e.closed:
+				return nil, ErrClosed
+			default:
+			}
+			if confirmedEmpty {
+				return nil, nil
+			}
+			return nil, receivegate.ErrDraining
+		}
 		q, err := e.loadQueue(ctx, queue)
 		if err != nil {
 			return nil, err
@@ -220,11 +251,29 @@ func (e *Engine) Receive(ctx context.Context, queue string, opts ReceiveOptions)
 			}
 			return nil, nil
 		}
+		confirmedEmpty = true
 		timer := time.NewTimer(time.Duration(remaining) * time.Millisecond)
+		if gate != nil {
+			gate.MarkParked()
+		}
 		select {
 		case <-ch:
 			timer.Stop()
 		case <-timer.C:
+		case <-drain:
+			timer.Stop()
+			release()
+			// Preserve an already-observable caller cancellation or engine close.
+			// Only the broker-owned gate itself is the successful empty result.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			select {
+			case <-e.closed:
+				return nil, ErrClosed
+			default:
+			}
+			return nil, nil
 		case <-ctx.Done():
 			timer.Stop()
 			release()

@@ -79,6 +79,32 @@ upgrade notes before replacing a broker.
   Once a Receive response is observed, callers must not reuse its AttemptID for
   another Receive or after partially settling that response.
 
+### Make broker signal shutdown escalation explicit (MQLITE-134)
+
+- Treat the first SIGINT or SIGTERM as graceful shutdown: restore the operating
+  system's normal signal behavior before canceling the server context, then allow
+  the existing HTTP drain and fenced engine close to run. A second signal now
+  terminates the process instead of being swallowed by an already-canceled signal
+  context.
+- Surface broker-engine and diagnostic-log close failures from `mqlite serve`,
+  joining them with an earlier Serve failure when both occur.
+- Close an atomic no-new-claim gate when graceful shutdown starts. Parked Receive
+  calls wake with a normal `200` empty response, so managed Receivers reconnect
+  after restart. A claim round admitted before the gate retains the caller's
+  context and returns its real result or error; caller cancellation remains `499`.
+  A call fenced before its first round returns retryable `503 unavailable` rather
+  than an empty success, preserving Receive AttemptID replay after a lost response;
+  CORS-enabled brokers expose its `Retry-After` hint to browser clients.
+  Unrelated admitted Send, settlement, and management requests retain their contexts
+  and the 25-second drain budget.
+- Give the bundled Docker Compose service a 40-second stop grace and document the
+  shorter Docker and Kubernetes defaults, so normal orchestration does not turn a
+  graceful stop into SIGKILL before engine close and log flush.
+- Add real-process regressions for a clean single-signal exit, persistence of an
+  acknowledged `FULL`-sync message across that exit, prompt cancellation of a
+  parked long poll, and forced second-signal termination while an HTTP handler
+  deliberately remains active.
+
 ## v0.4.2 — 2026-10-28
 
 > **Patch upgrade from v0.4.1:** the canonical schema token remains **7** and no

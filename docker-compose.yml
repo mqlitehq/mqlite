@@ -11,6 +11,10 @@ services:
     build:
       context: .
     image: mqlite:dev
+    # Leave headroom beyond the broker's 25s HTTP drain for the fenced engine
+    # close, diagnostic-log flush and process exit. Docker's 10s default is too
+    # short for a deliberately stalled handler.
+    stop_grace_period: 40s
     ports:
       - "127.0.0.1:6754:6754"   # loopback only — not exposed on the LAN
     environment:

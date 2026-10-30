@@ -933,6 +933,117 @@ func TestServeReadyAfterBind(t *testing.T) {
 	}
 }
 
+// TestServeShutdownCancelsLongPoll verifies that graceful shutdown does not wait
+// out an already-admitted Receive long poll. The broker owns that long-poll lifetime:
+// once shutdown begins, a parked Receive must observe cancellation before it can
+// start another claim round, and Serve must be free to close the engine promptly.
+func TestServeShutdownCancelsLongPoll(t *testing.T) {
+	ctx := context.Background()
+	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	if err := eng.CreateQueue(ctx, "shutdown-long-poll", mqlite.QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	ready := make(chan struct{})
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- eng.Serve(serveCtx, addr, mqlite.WithReady(func() { close(ready) }))
+	}()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker did not become ready")
+	}
+
+	cli, err := mqlite.Open(ctx, "http://"+addr)
+	if err != nil {
+		cancelServe()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	receiveCtx, cancelReceive := context.WithCancel(ctx)
+	defer cancelReceive()
+	type receiveResult struct {
+		messages []*mqlite.Message
+		err      error
+	}
+	receiveDone := make(chan receiveResult, 1)
+	go func() {
+		messages, err := cli.Receive(receiveCtx, "shutdown-long-poll", mqlite.RecvOpts{Wait: 20 * time.Second})
+		receiveDone <- receiveResult{messages: messages, err: err}
+	}()
+
+	// Let the request complete its empty claim round and park in the long poll.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case result := <-receiveDone:
+		cancelServe()
+		t.Fatalf("long poll returned before shutdown: %v", result.err)
+	default:
+	}
+
+	start := time.Now()
+	cancelServe()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("clean shutdown returned %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("shutdown took %s with a parked long poll, want <= 2s", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		// Release the request so a failure does not leave this test waiting for the
+		// full 20-second poll before cleanup can finish.
+		cancelReceive()
+		select {
+		case <-serveDone:
+		case <-time.After(5 * time.Second):
+		}
+		t.Fatal("Serve remained blocked by a parked long poll after shutdown")
+	}
+	select {
+	case result := <-receiveDone:
+		if result.err != nil {
+			t.Fatalf("long poll returned an error during graceful shutdown: %v", result.err)
+		}
+		if len(result.messages) != 0 {
+			t.Fatalf("long poll claimed %d message(s) after shutdown began", len(result.messages))
+		}
+	case <-time.After(2 * time.Second):
+		cancelReceive()
+		t.Fatal("long poll client remained blocked after Serve returned")
+	}
+	// cancelServe requests shutdown, but Gate.Stop is the actual no-new-claim
+	// linearization boundary and runs in the Serve goroutine. Waiting for Serve
+	// above avoids treating scheduler order as part of the public contract. The
+	// atomic Stop-vs-claim ordering itself has deterministic engine gate tests.
+	if _, err := eng.SendOne(ctx, "shutdown-long-poll", mqlite.OutMessage{Body: []byte("after-shutdown")}); err != nil {
+		t.Fatal(err)
+	}
+	peeked, err := eng.Peek(ctx, "shutdown-long-poll", mqlite.PeekOpts{Max: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peeked) != 1 || string(peeked[0].Body) != "after-shutdown" {
+		t.Fatalf("post-shutdown message was claimed instead of remaining active: %+v", peeked)
+	}
+}
+
 // TestServeMetricsToggle verifies the public SDK's opt-in on the API listener,
 // including discovery, authentication and graceful shutdown in both modes.
 func TestServeMetricsToggle(t *testing.T) {

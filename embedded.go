@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/receivegate"
 	"github.com/mqlitehq/mqlite/internal/version"
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
@@ -482,6 +483,9 @@ type serveConfig struct {
 	reqLogger     *slog.Logger
 	ui            bool
 	ready         func()
+	// receiveGate is injected only by white-box shutdown tests. Production Serve
+	// creates a fresh gate for each invocation.
+	receiveGate *receivegate.Gate
 }
 
 // ServeOption configures Serve.
@@ -580,7 +584,15 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 	srv.Logger = sc.reqLogger
 	srv.UI = sc.ui
 	srv.Metrics = sc.metrics
-	hs := newHTTPServer(addr, srv.Handler())
+	// http.Server.Shutdown waits for active handlers but deliberately does not wake
+	// long polls. The gate interrupts only the wait between claim rounds. Stop and
+	// TryEnterClaim share an atomic boundary, so a claim admitted before shutdown
+	// may return its real result while no claim can start after the barrier.
+	receiveGate := sc.receiveGate
+	if receiveGate == nil {
+		receiveGate = receivegate.New()
+	}
+	hs := newHTTPServer(addr, receiveDrainHandler(srv.Handler(), receiveGate))
 
 	// Bind synchronously so a bind failure (port in use, bad addr) surfaces here —
 	// before any "ready" is announced — instead of after the caller already logged it.
@@ -603,9 +615,25 @@ func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) 
 			return err
 		}
 	}
+	// Wake parked Receive handlers before waiting for the remaining admitted HTTP
+	// work. An atomically admitted claim keeps the caller's request context and may
+	// finish; unrelated handlers retain their contexts.
+	receiveGate.Stop()
 	shutCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	return hs.Shutdown(shutCtx)
+}
+
+// receiveDrainHandler attaches the internal claim gate only to Receive. It never
+// cancels the HTTP request context, so an active claim/commit keeps its real
+// outcome and every non-Receive RPC is untouched.
+func receiveDrainHandler(next http.Handler, gate *receivegate.Gate) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wire.PathReceive {
+			r = r.WithContext(receivegate.WithContext(r.Context(), gate))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ── settler ─────────────────────────────────────────────────────────────────

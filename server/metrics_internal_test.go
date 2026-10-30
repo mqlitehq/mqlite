@@ -76,7 +76,7 @@ func TestObservabilityFullContract(t *testing.T) {
 }
 
 func TestRequestOutcomeVocabulary(t *testing.T) {
-	want := []string{"ok", "unauthenticated", "permission_denied", "key_conflict", "not_found", "already_exists", "name_conflict", "group_required", "invalid_argument", "message_too_large", "outcome_unknown", "canceled", "internal", "lock_lost", "unimplemented", "queue_not_empty", "subscription_not_empty", "resource_exhausted"}
+	want := []string{"ok", "unauthenticated", "permission_denied", "key_conflict", "not_found", "already_exists", "name_conflict", "group_required", "invalid_argument", "message_too_large", "outcome_unknown", "canceled", "internal", "lock_lost", "unimplemented", "queue_not_empty", "subscription_not_empty", "resource_exhausted", "unavailable"}
 	if !reflect.DeepEqual(requestCodes[:], want) {
 		t.Fatal("complete RPC outcome vocabulary drift")
 	}

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/internal/receivegate"
 	"github.com/mqlitehq/mqlite/wire"
 )
 
@@ -33,5 +34,24 @@ func TestFailOutcomeUnknown(t *testing.T) {
 	}
 	if e.Code != "outcome_unknown" {
 		t.Errorf("code = %q, want outcome_unknown", e.Code)
+	}
+}
+
+func TestFailReceiveDrainingIsRetryable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	(&Server{}).fail(rec, receivegate.ErrDraining)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want 1", got)
+	}
+	var e wire.ErrorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("decode body %q: %v", rec.Body.String(), err)
+	}
+	if e.Code != "unavailable" {
+		t.Errorf("code = %q, want unavailable", e.Code)
 	}
 }

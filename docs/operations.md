@@ -103,6 +103,60 @@ snapshot age (RPO), recovery time (RTO), backlog age, and capacity limits. Measu
 restore time with representative data. A successful backup command alone is not a
 restore test.
 
+## Graceful broker shutdown
+
+`mqlite serve` treats the first SIGINT or SIGTERM as a graceful-shutdown request.
+It stops accepting new HTTP connections and closes an internal no-new-claim gate for
+Receive. A call parked between claim rounds wakes with `200` and an empty message list;
+managed Receivers can therefore reconnect after the broker restarts. Caller-initiated
+cancellation remains `499`. Stop and claim admission share one atomic boundary: a round
+admitted before shutdown retains the caller's context and returns its real message or
+error, while no database operation starts for a later round. Only a call that already
+completed a confirmed empty round receives the `200` wake-up. A Receive fenced before
+its first round gets `503 unavailable` with `Retry-After` (CORS-exposed when enabled),
+preserving its AttemptID in case it is replaying a committed claim whose earlier
+response was lost. Other admitted
+requests retain their contexts and receive up to
+25 seconds to drain; the broker does not abort an in-flight Send or settlement just
+to wake a long poll. A handler that does not finish (for example, a client stalled
+while uploading a request body) consumes that drain budget. The broker then closes
+the engine's operation admission, joins admitted database work and background
+maintenance, closes the database, and releases the local file lock. Engine and
+diagnostic-log close failures make the command exit non-zero.
+
+After the first signal has been observed, normal operating-system signal behavior
+is restored before graceful shutdown starts. A second SIGINT or SIGTERM therefore
+forces process termination immediately. Use that escalation only when abandoning
+the remaining HTTP handlers and cleanup is preferable to waiting: the process
+cannot run additional settlement or close code after the second signal. SQLite
+transactions still recover atomically, and unsettled Peek-Lock deliveries are
+eligible for redelivery, but application side effects may already have happened
+and must remain idempotent. Ctrl-D is terminal input EOF, not a shutdown signal;
+the broker does not read stdin.
+
+The Receive gate is the no-new-claim barrier for a call parked between claim rounds.
+An already-admitted claim transaction keeps the caller's request context and may return
+work committed before shutdown began. Quiesce
+consumers before a planned broker replacement when even that in-flight boundary
+matters.
+
+Set the platform's outer termination grace longer than:
+
+```text
+25s HTTP drain + Engine.Close duration + log and process-exit margin
+```
+
+`Engine.Close` deliberately waits for admitted work and has no unsafe timeout that
+releases ownership while a write may still be running. The outer platform deadline
+is therefore the final hard bound. The repository's `docker-compose.yml` sets
+`stop_grace_period: 40s`; plain Docker otherwise defaults to only 10 seconds and
+can send SIGKILL while a deliberately stalled handler is still inside the 25-second
+HTTP drain. Kubernetes commonly defaults to a 30-second termination grace, leaving
+only about 5 seconds after the worst-case HTTP drain for engine close and process
+exit; configure at least 40 seconds, and more when measured remote-store close time
+requires it. Keep Turso/libSQL replacement single-active and stop-then-start; this
+shutdown behavior does not make overlapping brokers safe.
+
 ## Startup and routine checks
 
 Pin the binary checksum or image digest and record its source commit, Go version,

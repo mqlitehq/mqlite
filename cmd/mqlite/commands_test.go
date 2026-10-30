@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,6 +13,84 @@ import (
 	"github.com/mqlitehq/mqlite"
 	"github.com/mqlitehq/mqlite/internal/defaults"
 )
+
+func TestRelayServeShutdownRestoresSignalsBeforeCancel(t *testing.T) {
+	for _, trigger := range []string{"signal", "parent"} {
+		t.Run(trigger, func(t *testing.T) {
+			parentDone := make(chan struct{})
+			signals := make(chan os.Signal, 1)
+			stop := make(chan struct{})
+			restored := make(chan struct{})
+			canceled := make(chan struct{})
+			orderViolation := make(chan struct{}, 1)
+			done := make(chan struct{})
+
+			go relayServeShutdown(parentDone, signals, stop, func() {
+				close(restored)
+			}, func() {
+				select {
+				case <-restored:
+				default:
+					orderViolation <- struct{}{}
+				}
+				close(canceled)
+			}, done)
+
+			if trigger == "signal" {
+				signals <- os.Interrupt
+			} else {
+				close(parentDone)
+			}
+			select {
+			case <-canceled:
+			case <-time.After(time.Second):
+				t.Fatal("shutdown relay did not cancel")
+			}
+			<-done
+			select {
+			case <-orderViolation:
+				t.Fatal("serve context canceled before signal behavior was restored")
+			default:
+			}
+		})
+	}
+}
+
+func TestMergeCleanupError(t *testing.T) {
+	serveErr := errors.New("serve failed")
+	closeErr := errors.New("close failed")
+	tests := []struct {
+		name       string
+		initial    error
+		cleanupErr error
+		wantServe  bool
+		wantClose  bool
+	}{
+		{name: "success"},
+		{name: "serve only", initial: serveErr, wantServe: true},
+		{name: "close only", cleanupErr: closeErr, wantClose: true},
+		{name: "both", initial: serveErr, cleanupErr: closeErr, wantServe: true, wantClose: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.initial
+			calls := 0
+			mergeCleanupError(&got, "close broker", func() error {
+				calls++
+				return tc.cleanupErr
+			})
+			if calls != 1 {
+				t.Fatalf("cleanup calls = %d, want 1", calls)
+			}
+			if errors.Is(got, serveErr) != tc.wantServe || errors.Is(got, closeErr) != tc.wantClose {
+				t.Fatalf("merged error = %v; serve=%v close=%v", got, errors.Is(got, serveErr), errors.Is(got, closeErr))
+			}
+			if tc.cleanupErr != nil && !strings.Contains(got.Error(), "close broker") {
+				t.Fatalf("cleanup error lacks operation context: %v", got)
+			}
+		})
+	}
+}
 
 // TestResolveBrokerTokens covers the broker's secure-by-default token policy.
 func TestResolveBrokerTokens(t *testing.T) {
