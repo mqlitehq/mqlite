@@ -36,6 +36,24 @@ upgrade notes before replacing a broker.
   while their lease remains live. Existing embedded applications that require
   immediate crash-orphan recovery must opt into it explicitly.
 
+### Reduce idempotent Receive storage amplification (MQLITE-141)
+
+- Store only the ordered sequence number, lock token, and original deadline for
+  Peek-Lock receive attempts. Replay validates and reconstructs the batch from
+  the still-locked message rows in one query, so message bodies are no longer
+  duplicated as base64 JSON for the replay lifetime. Existing full-response
+  attempt records remain readable until they expire; no schema rebuild is needed.
+- Keep the full response for ReceiveAndDelete because its message rows no longer
+  exist. Its existing replay lifetime (the greater of five minutes and the queue
+  lock duration) is unchanged. Managed local and remote receivers both retain
+  AttemptID replay because a database commit can have an uncertain outcome even
+  when there is no HTTP response to lose.
+- Before downgrading to a broker that predates this compact format, stop new
+  Receive calls and wait for live receive attempts to expire. Older binaries do
+  not understand the versioned object; they fail closed instead of replaying an
+  incomplete body. The maximum wait is the greater of five minutes and the
+  queue's lock duration.
+
 ### Bound managed Receiver reconnect pacing (MQLITE-139)
 
 - Keep the first transient Receive replay on the same AttemptID without adding a

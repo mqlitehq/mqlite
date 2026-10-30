@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -1999,6 +2000,208 @@ func TestReceiveAttemptReplaysMaximumBatch(t *testing.T) {
 			replay[i].DeliveryCount != first[i].DeliveryCount {
 			t.Fatalf("maximum replay item %d changed ownership: first=%+v replay=%+v", i, first[i], replay[i])
 		}
+	}
+}
+
+func TestPeekLockAttemptStoresCompactRoster(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	body := []byte(strings.Repeat("payload-", 512))
+	if _, err := e.SendOne(ctx, "q", OutMessage{
+		Body: body, MessageID: "message-id", GroupID: "group-id",
+		CorrelationID: "correlation-id", ReplyTo: "reply-address",
+		Subject: "subject", ContentType: "application/octet-stream",
+		Properties: map[string]string{"tenant": "acme", "trace": "trace-id"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "compact-peek-lock"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("initial receive=%+v, %v", first, err)
+	}
+	var blob string
+	if err := e.db.queryRowScan(ctx, []any{&blob},
+		`SELECT response FROM receive_attempts WHERE queue=? AND attempt_id=?`, "q", attemptID); err != nil {
+		t.Fatal(err)
+	}
+	if len(blob) >= len(body)/4 {
+		t.Fatalf("compact attempt bytes=%d for %d-byte body; response still appears to contain the body", len(blob), len(body))
+	}
+	var stored storedReceiveAttempt
+	if err := json.Unmarshal([]byte(blob), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Version != receiveAttemptFormatVersion || stored.Mode != PeekLock || len(stored.Leases) != 1 || len(stored.Messages) != 0 {
+		t.Fatalf("stored attempt=%+v", stored)
+	}
+	if lease := stored.Leases[0]; lease.SeqNumber != first[0].SeqNumber || lease.LockToken != first[0].LockToken ||
+		lease.LockedUntilMs != first[0].LockedUntilMs {
+		t.Fatalf("stored lease=%+v, want message=%+v", lease, first[0])
+	}
+	replay, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || !reflect.DeepEqual(replay, first) {
+		t.Fatalf("compact replay=%+v, %v; want %+v", replay, err, first)
+	}
+}
+
+func TestPeekLockAttemptReplayKeepsOriginalDeadlineAfterRenew(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 30_000})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("renewed")}); err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "renewed-compact-replay"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("initial receive=%+v, %v", first, err)
+	}
+	originalDeadline := first[0].LockedUntilMs
+	advance(clock, time.Second)
+	if err := e.Renew(ctx, "q", first[0].SeqNumber, first[0].LockToken); err != nil {
+		t.Fatal(err)
+	}
+	var currentDeadline int64
+	if err := e.db.queryRowScan(ctx, []any{&currentDeadline},
+		`SELECT locked_until FROM messages WHERE queue=? AND id=?`, "q", first[0].SeqNumber); err != nil {
+		t.Fatal(err)
+	}
+	if currentDeadline <= originalDeadline {
+		t.Fatalf("renewed deadline=%d, want later than original %d", currentDeadline, originalDeadline)
+	}
+	replay, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: attemptID})
+	if err != nil || len(replay) != 1 {
+		t.Fatalf("replay=%+v, %v", replay, err)
+	}
+	if replay[0].LockedUntilMs != originalDeadline {
+		t.Fatalf("replay deadline=%d, want original response deadline %d", replay[0].LockedUntilMs, originalDeadline)
+	}
+}
+
+func TestReceiveAndDeleteAttemptKeepsBodyAndExistingReplayWindow(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60 * 60 * 1000})
+	body := []byte("deleted response must remain replayable")
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "delete-snapshot"
+	first, err := e.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveAndDelete, AttemptID: attemptID})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("initial receive-and-delete=%+v, %v", first, err)
+	}
+	var blob string
+	var created, expires int64
+	if err := e.db.queryRowScan(ctx, []any{&blob, &created, &expires},
+		`SELECT response,created_at,expires_at FROM receive_attempts WHERE queue=? AND attempt_id=?`, "q", attemptID); err != nil {
+		t.Fatal(err)
+	}
+	var stored storedReceiveAttempt
+	if err := json.Unmarshal([]byte(blob), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Mode != ReceiveAndDelete || len(stored.Messages) != 1 || len(stored.Leases) != 0 ||
+		!reflect.DeepEqual(stored.Messages, first) {
+		t.Fatalf("stored receive-and-delete attempt=%+v, want %+v", stored, first)
+	}
+	if got, want := expires-created, int64(60*time.Minute/time.Millisecond); got != want {
+		t.Fatalf("receive-and-delete attempt TTL=%dms, want existing %dms queue-scoped window", got, want)
+	}
+}
+
+func TestReceiveAttemptReadsLegacyFullResponseFormat(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	legacy := []*Message{{SeqNumber: 41, Body: []byte("pre-upgrade deleted response"), DeliveryCount: 1}}
+	blob, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := e.now()
+	if _, err := e.db.exec(ctx, `INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at)
+		VALUES(?,?,?,?,?)`, "q", "legacy-delete", string(blob), now, now+recvAttemptTTLFloorMs); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := e.Receive(ctx, "q", ReceiveOptions{Mode: ReceiveAndDelete, AttemptID: "legacy-delete"})
+	if err != nil || !reflect.DeepEqual(replay, legacy) {
+		t.Fatalf("legacy replay=%+v, %v; want %+v", replay, err, legacy)
+	}
+}
+
+func TestPeekLockAttemptReadsLegacyFullResponseFormat(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{
+		Body:       []byte("pre-upgrade leased response"),
+		Properties: map[string]string{"source": "legacy"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := e.Receive(ctx, "q", ReceiveOptions{})
+	if err != nil || len(legacy) != 1 {
+		t.Fatalf("initial receive=%+v, %v", legacy, err)
+	}
+	blob, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := e.now()
+	if _, err := e.db.exec(ctx, `INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at)
+		VALUES(?,?,?,?,?)`, "q", "legacy-peek-lock", string(blob), now, now+recvAttemptTTLFloorMs); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: "legacy-peek-lock"})
+	if err != nil || !reflect.DeepEqual(replay, legacy) {
+		t.Fatalf("legacy replay=%+v, %v; want %+v", replay, err, legacy)
+	}
+}
+
+func TestReceiveAttemptRejectsUnknownCompactVersionWithoutClaiming(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("must remain active")}); err != nil {
+		t.Fatal(err)
+	}
+	stored := storedReceiveAttempt{
+		Version: receiveAttemptFormatVersion + 1,
+		Mode:    PeekLock,
+		Leases: []storedReceiveLease{{
+			SeqNumber: 1, LockToken: "future-token", LockedUntilMs: e.now() + 30_000,
+		}},
+	}
+	blob, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := e.now()
+	if _, err := e.db.exec(ctx, `INSERT INTO receive_attempts(queue,attempt_id,response,created_at,expires_at)
+		VALUES(?,?,?,?,?)`, "q", "future-version", string(blob), now, now+recvAttemptTTLFloorMs); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := e.Receive(ctx, "q", ReceiveOptions{AttemptID: "future-version"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported stored receive attempt version") {
+		t.Fatalf("Receive messages=%+v error=%v, want unsupported-version failure", msgs, err)
+	}
+	stats, err := e.Stats(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Active != 1 || stats.Locked != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("unknown attempt version changed queue state: %+v", stats)
+	}
+	var attempts int
+	if err := e.db.queryRowScan(ctx, []any{&attempts},
+		`SELECT COUNT(*) FROM receive_attempts WHERE queue=? AND attempt_id=?`, "q", "future-version"); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("unknown-version attempt rows=%d, want record retained for safe expiry", attempts)
 	}
 }
 
