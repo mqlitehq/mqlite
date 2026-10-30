@@ -389,6 +389,18 @@ A live non-empty saved response also binds that attempt ID to its original
 `receive_mode`; reusing it with the other mode is `400 invalid_argument`. Empty
 results are not saved, and an expired record no longer binds the ID.
 
+The managed Go Receiver keeps that attempt ID across all transient retries in one
+Receive round. Its first transient failure adds no client-generated delay unless
+HTTP 429/503 supplies a valid `Retry-After` lower bound. Continued failures use
+equal-jitter exponential backoff with a 500 ms base and a three-second generated
+cap; a valid server hint may exceed the cap, and `Retry-After: 0` cannot remove
+later backoff. It accepts delta-seconds and HTTP-date forms. An absolute date uses
+the same response's parseable `Date`, otherwise the local response receipt time;
+malformed, negative, and overflowing values are ignored. Cancellation interrupts
+the wait. A successful response, including an empty batch, starts a fresh round
+with a new attempt ID. HTTP 500–599 are transient under the 5xx rule; status 600
+is terminal. Renew and settlement use separate retry policies.
+
 - **Request** `ReceiveRequest`: `queue`, `max_messages` (int, default 1, max 256),
   `wait_time_ms` (int, long-poll; max 20000), `receive_mode` (int: `0` peek-lock,
   `1` receive-and-delete; any other value is `400 invalid_argument`),

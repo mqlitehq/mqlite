@@ -21,7 +21,7 @@ func newAttemptID() string {
 
 const (
 	receiveBackoffBase = 500 * time.Millisecond
-	receiveBackoffMax  = 10 * time.Second
+	receiveBackoffMax  = 3 * time.Second
 	renewRetryBase     = 50 * time.Millisecond
 	renewRetryMax      = 500 * time.Millisecond
 	settleRetryBase    = 50 * time.Millisecond
@@ -85,6 +85,23 @@ func jitterDuration(d time.Duration) time.Duration {
 	}
 	percent := int64(80) + int64(b[0])*40/255
 	return time.Duration(int64(d) * percent / 100)
+}
+
+// equalJitterDuration spreads a managed Receive retry across the upper half of
+// its exponential window. Unlike the older symmetric jitter used by renew and
+// settlement, it can never extend the generated delay beyond the configured
+// cap. A broker Retry-After hint is applied separately and may be longer.
+func equalJitterDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	half := d / 2
+	span := d - half
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return d
+	}
+	return half + time.Duration(int64(span)*int64(b[0])/255)
 }
 
 func waitContext(ctx context.Context, d time.Duration) bool {
@@ -158,7 +175,11 @@ type Receiver struct {
 	src   receiveSource
 	queue string
 	cfg   receiverConfig
-	errMu sync.Mutex // serializes onError across the loop, worker, and renew goroutines
+	// receiveJitter and receiveWait are private timing seams for deterministic
+	// retry tests. Renew and settlement deliberately keep their own policies.
+	receiveJitter func(time.Duration) time.Duration
+	receiveWait   func(context.Context, time.Duration) bool
+	errMu         sync.Mutex // serializes onError across the loop, worker, and renew goroutines
 	// deadlineRenewUnsupported is learned once from an older broker. Protect only
 	// this capability bit; never hold the mutex across a network request.
 	renewCapabilityMu        sync.Mutex
@@ -174,7 +195,36 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 	if cfg.concurrency < 1 {
 		cfg.concurrency = 1
 	}
-	return &Receiver{src: src, queue: queue, cfg: cfg}
+	return &Receiver{
+		src:           src,
+		queue:         queue,
+		cfg:           cfg,
+		receiveJitter: equalJitterDuration,
+		receiveWait:   waitContext,
+	}
+}
+
+// receiveRetryDelay returns the wait before replaying the current Receive
+// attempt. The first transient failure is replayed immediately to recover a
+// response that may have been lost after the broker committed the claim. Later
+// generated delays use equal-jitter exponential backoff capped at three seconds.
+// A valid Retry-After from HTTP 429/503 is a lower bound, not part of that cap.
+func (r *Receiver) receiveRetryDelay(failures int, err error) time.Duration {
+	var delay time.Duration
+	if failures > 1 {
+		nominal := exponentialBackoff(receiveBackoffBase, receiveBackoffMax, failures-2)
+		delay = r.receiveJitter(nominal)
+		if delay < 0 {
+			delay = 0
+		}
+		if delay > receiveBackoffMax {
+			delay = receiveBackoffMax
+		}
+	}
+	if hint, ok := managedReceiveRetryAfter(err); ok && hint > delay {
+		return hint
+	}
+	return delay
 }
 
 func (r *Receiver) notify(err error) {
@@ -355,18 +405,16 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			// Sample the shutdown ordering the moment the error is observed — before a retry or
 			// notify callback can span a caller cancellation (codex).
 			errAfterCancel = err != nil && cancelled()
-			if err == nil || !retryableManagedError(err) || rctx.Err() != nil {
+			if err == nil || !retryableManagedReceiveError(err) || rctx.Err() != nil {
 				break
 			}
 			hadTransientFailure = true
 			transientFailures++
-			if transientFailures == 1 {
-				// Preserve the established fast replay for a single lost response.
-				continue
+			if transientFailures > 1 {
+				r.notify(err)
 			}
-			r.notify(err)
-			delay := jitterDuration(exponentialBackoff(receiveBackoffBase, receiveBackoffMax, transientFailures-2))
-			if !waitContext(rctx, delay) {
+			delay := r.receiveRetryDelay(transientFailures, err)
+			if !r.receiveWait(rctx, delay) {
 				err = rctx.Err()
 				errAfterCancel = cancelled()
 				break
@@ -380,7 +428,7 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			if rctx.Err() != nil && !isPermanent(err) {
 				return done()
 			}
-			if !retryableManagedError(err) {
+			if !retryableManagedReceiveError(err) {
 				r.notify(err)
 				fail(err, errAfterCancel)
 				return done()
@@ -582,6 +630,31 @@ func retryableManagedError(err error) bool {
 	// from a custom http.Client.Timeout while the operation's own context is still
 	// live; each retry loop separately checks that controlling context.
 	return true
+}
+
+// retryableManagedReceiveError narrows nonstandard HTTP status handling for the
+// Receive loop without changing the established renewal and settlement policy.
+// Only actual 5xx responses are server failures; 600 and above are terminal.
+func retryableManagedReceiveError(err error) bool {
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr != nil && httpErr.StatusCode >= 500 {
+		return httpErr.StatusCode/100 == 5
+	}
+	return retryableManagedError(err)
+}
+
+// managedReceiveRetryAfter returns a private server pacing hint only for the
+// statuses whose HTTP semantics permit it here. Renew and settlement retry
+// paths intentionally do not consult this metadata.
+func managedReceiveRetryAfter(err error) (time.Duration, bool) {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr == nil || !httpErr.retryAfterOK {
+		return 0, false
+	}
+	if httpErr.StatusCode != 429 && httpErr.StatusCode != 503 {
+		return 0, false
+	}
+	return httpErr.retryAfter, true
 }
 
 func (r *Receiver) retrySettlement(ctx context.Context, settle func(context.Context) error) error {

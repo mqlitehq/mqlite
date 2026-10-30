@@ -17,6 +17,21 @@ upgrade notes before replacing a broker.
 > older remote clients ignore the header, while programmatic brokers must add
 > `WithBrokerMode` before calling `Serve` so startup can preserve live leases.
 
+### Bound managed Receiver reconnect pacing (MQLITE-139)
+
+- Keep the first transient Receive replay on the same AttemptID without adding a
+  client-generated delay, unless a valid HTTP 429/503 `Retry-After` requires one.
+  Continued failures use equal-jitter exponential backoff with a generated-delay
+  cap of three seconds. A successful response ends that replay round; the next
+  Receive gets a fresh AttemptID and starts from the no-client-delay step again.
+- Honor valid `Retry-After` delta-seconds and HTTP-date values on HTTP 429/503 as
+  a managed Receive lower bound. Absolute retry dates use the same response's
+  parseable `Date` as their clock reference, otherwise the local response receipt
+  time. Server hints may exceed the local three-second cap, `Retry-After: 0`
+  cannot erase later backoff, malformed or overflowing hints are ignored, and
+  caller cancellation interrupts every wait. Renew and settlement retry behavior
+  is unchanged.
+
 ### Reject unsafe queue lock durations (MQLITE-138)
 
 - Reject negative and subsecond nonzero Peek-Lock durations when a queue or
