@@ -753,12 +753,15 @@ func (r *Receiver) loseRenewal(cancelHandler context.CancelFunc, cause error) re
 }
 
 func (r *Receiver) stopRenewal(cancelHandler context.CancelFunc, err error, cancelled func() bool, fail func(error, bool)) renewalOutcome {
-	cancelHandler()
-	afterCancel := cancelled()
-	r.notify(err)
 	if isPermanent(err) {
+		// Stop the receive loop before releasing handler capacity. Otherwise the
+		// handler can return and make a slot available while notify is still
+		// running, allowing one fresh Receive to race a revoked credential.
+		afterCancel := cancelled()
 		fail(err, afterCancel)
 	}
+	cancelHandler()
+	r.notify(err)
 	return renewalOutcome{skipSettlement: true}
 }
 

@@ -52,6 +52,9 @@ upgrade notes before replacing a broker.
   Receiver also reports one advisory `onError` diagnostic when neither
   broker-time header survives an intermediary, then uses degraded clock
   scheduling.
+- Stop the managed receive loop before releasing handler capacity when renewal
+  reports a permanent authentication or permission failure. Credential revocation
+  can no longer race one fresh Receive while the error callback is still running.
 - Preserve applications that wrap `http.DefaultTransport`; the wrapper remains
   caller-owned and is not closed. Because an opaque `RoundTripper` cannot be
   cloned or tuned, those applications remain responsible for its connection-pool
