@@ -13,6 +13,95 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
+func TestErrorBodyResourceIsAdditive(t *testing.T) {
+	data, err := json.Marshal(wire.ErrorBody{Code: "not_found", Message: "missing", Resource: "queue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(`"resource":"queue"`)) {
+		t.Fatalf("error body = %s, want resource discriminator", data)
+	}
+	var legacy struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil || legacy.Code != "not_found" {
+		t.Fatalf("legacy decode = %+v, %v", legacy, err)
+	}
+}
+
+func TestSemanticAcknowledgementsRequireExplicitFields(t *testing.T) {
+	t.Run("single settlement", func(t *testing.T) {
+		for _, body := range []string{
+			`{}`,
+			`null`,
+			`{"ok":null}`,
+			`{"ok":"true"}`,
+		} {
+			var response wire.SettleResponse
+			if err := json.Unmarshal([]byte(body), &response); err == nil {
+				t.Fatalf("invalid settlement response accepted: %s", body)
+			}
+		}
+		for _, body := range []string{
+			`{"ok":true}`,
+			`{"ok":false}`,
+			`{"ok":true,"future":"compatible"}`,
+		} {
+			var response wire.SettleResponse
+			if err := json.Unmarshal([]byte(body), &response); err != nil {
+				t.Fatalf("valid settlement response %s: %v", body, err)
+			}
+		}
+	})
+
+	t.Run("batch item", func(t *testing.T) {
+		for _, body := range []string{
+			`{"results":[{"seq_number":7}]}`,
+			`{"results":[{"seq_number":7,"ok":null}]}`,
+			`{"results":[{"seq_number":7,"ok":"false"}]}`,
+		} {
+			var response wire.CompleteBatchResponse
+			if err := json.Unmarshal([]byte(body), &response); err == nil {
+				t.Fatalf("invalid batch response accepted: %s", body)
+			}
+		}
+		for _, body := range []string{
+			`{"results":[{"seq_number":7,"ok":true}]}`,
+			`{"results":[{"seq_number":7,"ok":false}]}`,
+			`{"results":[{"seq_number":7,"ok":false,"future":1}]}`,
+		} {
+			var response wire.CompleteBatchResponse
+			if err := json.Unmarshal([]byte(body), &response); err != nil {
+				t.Fatalf("valid batch response %s: %v", body, err)
+			}
+		}
+	})
+
+	t.Run("receive", func(t *testing.T) {
+		for _, body := range []string{
+			`{}`,
+			`null`,
+			`{"messages":null}`,
+		} {
+			var response wire.ReceiveResponse
+			if err := json.Unmarshal([]byte(body), &response); err == nil {
+				t.Fatalf("invalid receive response accepted: %s", body)
+			}
+		}
+		for _, body := range []string{
+			`{"messages":[]}`,
+			`{"messages":[],"future":"compatible"}`,
+			`{"messages":[{"seq_number":7}]}`,
+		} {
+			var response wire.ReceiveResponse
+			if err := json.Unmarshal([]byte(body), &response); err != nil {
+				t.Fatalf("valid receive response %s: %v", body, err)
+			}
+		}
+	})
+}
+
 // Keep the released legacy wire type's exact field order, tags and arity. This
 // preserves external unkeyed SubscriptionJSON literals at compile time.
 var _ struct {

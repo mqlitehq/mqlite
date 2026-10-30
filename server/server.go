@@ -77,23 +77,66 @@ func (s *Server) Handler() http.Handler {
 		admins = append(admins, token)
 	}
 	if err := ValidateMonitorTokens(admins, s.MonitorTokens); err != nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		return s.withServerTime(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "internal", "invalid monitoring credential configuration")
-		})
+		}))
 	}
 	if s.Metrics && len(s.tokens) == 0 {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		return s.withServerTime(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "internal", "metrics require administrator authentication")
-		})
+		}))
 	}
 	handler := s.cors(s.observeRequests(s.logging(s.auth(s.observe(s.mux)))))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.withServerTime(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" && !s.Metrics {
 			http.NotFound(w, r)
 			return
 		}
 		handler.ServeHTTP(w, r)
+	}))
+}
+
+func (s *Server) withServerTime(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&serverTimeResponseWriter{ResponseWriter: w, now: s.serverTimeMs}, r)
 	})
+}
+
+type serverTimeResponseWriter struct {
+	http.ResponseWriter
+	now     func() int64
+	written bool
+}
+
+// Unwrap lets http.ResponseController reach optional capabilities implemented
+// by the underlying server writer (Flush, Hijack, full duplex, and deadlines).
+func (w *serverTimeResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *serverTimeResponseWriter) stamp() {
+	if w.written {
+		return
+	}
+	w.written = true
+	w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(w.now(), 10))
+}
+
+func (w *serverTimeResponseWriter) WriteHeader(status int) {
+	w.stamp()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *serverTimeResponseWriter) Write(p []byte) (int, error) {
+	w.stamp()
+	return w.ResponseWriter.Write(p)
+}
+
+func (s *Server) serverTimeMs() int64 {
+	if s.eng == nil {
+		return time.Now().UnixMilli()
+	}
+	return s.eng.ServerTimeMs()
 }
 
 // ValidateMonitorTokens rejects ambiguous or ineffective monitoring credentials.
@@ -472,13 +515,17 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	writeResourceErr(w, status, code, msg, "")
+}
+
+func writeResourceErr(w http.ResponseWriter, status int, code, msg, resource string) {
 	if rec, ok := w.(*statusRecorder); ok {
 		rec.code = code
 	}
 	logf(w, "code", code)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: code, Message: msg})
+	_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: code, Message: msg, Resource: resource})
 }
 
 // mapErr translates engine errors to a Connect-style (status, code) error.
@@ -490,7 +537,11 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusForbidden, "permission_denied", "access key lacks the required permission")
 	case errors.Is(err, engine.ErrKeyConflict):
 		writeErr(w, http.StatusConflict, "key_conflict", err.Error())
-	case errors.Is(err, engine.ErrSubscriptionNotFound), errors.Is(err, engine.ErrQueueNotFound), errors.Is(err, engine.ErrNotFound):
+	case errors.Is(err, engine.ErrSubscriptionNotFound):
+		writeResourceErr(w, http.StatusNotFound, "not_found", err.Error(), "subscription")
+	case errors.Is(err, engine.ErrQueueNotFound):
+		writeResourceErr(w, http.StatusNotFound, "not_found", err.Error(), "queue")
+	case errors.Is(err, engine.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, engine.ErrDedupConflict):
 		writeErr(w, http.StatusConflict, "already_exists", err.Error())

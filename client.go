@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,12 +16,71 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
+const (
+	defaultMaxIdleConnsPerHost = 64
+	maxClientResponseBytes     = 64 << 20
+	maxClientErrorBytes        = 64 << 10
+)
+
+type invalidSuccessResponseError struct{ cause error }
+
+func (e *invalidSuccessResponseError) Error() string {
+	return "mqlite: invalid successful response: " + e.cause.Error()
+}
+
+func (e *invalidSuccessResponseError) Unwrap() error { return e.cause }
+
+type ambiguousAcknowledgementError struct {
+	operation string
+	cause     error
+}
+
+func (e *ambiguousAcknowledgementError) Error() string {
+	return fmt.Sprintf("%s: invalid %s acknowledgement: %v", ErrOutcomeUnknown, e.operation, e.cause)
+}
+
+func (e *ambiguousAcknowledgementError) Unwrap() error { return e.cause }
+
+func (e *ambiguousAcknowledgementError) Is(target error) bool { return target == ErrOutcomeUnknown }
+
+// HTTPError reports the HTTP status returned by a broker or intermediary.
+// Structured broker errors remain available through errors.Is on the same value.
+type HTTPError struct {
+	StatusCode int
+	cause      error
+}
+
+func (e *HTTPError) Error() string {
+	if e == nil {
+		return "mqlite: HTTP request failed"
+	}
+	if e.cause != nil {
+		return fmt.Sprintf("%v (HTTP %d)", e.cause, e.StatusCode)
+	}
+	return fmt.Sprintf("mqlite: request failed: HTTP %d", e.StatusCode)
+}
+
+func (e *HTTPError) Unwrap() error { return e.cause }
+
+// HTTPStatus returns the response status code.
+func (e *HTTPError) HTTPStatus() int { return e.StatusCode }
+
 // Client is a remote mqlite client (Connect-style JSON over HTTP).
 type Client struct {
-	endpoint string
-	token    string
-	http     *http.Client
+	endpoint  string
+	token     string
+	http      *http.Client
+	ownedHTTP bool
 }
+
+type serverTimeObservation struct {
+	localAt     time.Time
+	serverUpper time.Time
+	responseRTT time.Duration
+	coarseClock bool
+}
+
+var _ deadlineRenewer = (*Client)(nil)
 
 type config struct {
 	token      string
@@ -31,10 +93,18 @@ type Option func(*config)
 // WithToken overrides the token from the connection string.
 func WithToken(tok string) Option { return func(c *config) { c.token = tok } }
 
-// WithHTTPClient supplies a custom *http.Client (e.g. for TLS config).
+// WithHTTPClient supplies a caller-owned *http.Client (e.g. for TLS config).
+// MQLite preserves its transport, timeout, and jar but disables redirects for
+// every RPC. Client.Close does not close a caller-owned client's idle connections.
+// Size a custom Transport's MaxIdleConnsPerHost to at least Receiver concurrency
+// plus effective prefetch so overlapped settlement does not churn connections.
 func WithHTTPClient(h *http.Client) Option { return func(c *config) { c.httpClient = h } }
 
-// Open builds a client from a connection string: mqlite://<token>@host:port?tls=true
+// Open builds a client from a connection string: mqlite://<token>@host:port?tls=true.
+// When http.DefaultTransport is a custom RoundTripper, Open preserves it for
+// compatibility with process-wide instrumentation and mocks. That transport
+// and its connection pool remain caller-owned; use WithHTTPClient when explicit
+// per-client transport ownership or pool sizing is required.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 	endpoint, token, err := parseDSN(dsn)
 	if err != nil {
@@ -47,16 +117,43 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Client, error) {
 	if cfg.token != "" {
 		token = cfg.token
 	}
-	hc := cfg.httpClient
-	if hc == nil {
-		// No global timeout: long-poll Receive relies on the request context.
-		hc = &http.Client{}
+	base := cfg.httpClient
+	ownedHTTP := false
+	if base == nil {
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if ok {
+			transport := defaultTransport.Clone()
+			transport.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
+			if transport.MaxIdleConns < defaultMaxIdleConnsPerHost {
+				transport.MaxIdleConns = defaultMaxIdleConnsPerHost
+			}
+			// No global timeout: long-poll Receive relies on the request context.
+			base = &http.Client{Transport: transport}
+			ownedHTTP = true
+		} else {
+			// Preserve the pre-existing net/http behavior for applications that
+			// replace the global transport (for example, telemetry or HTTP mocks).
+			// A generic RoundTripper cannot be cloned or have its pool tuned safely.
+			base = &http.Client{Transport: http.DefaultTransport}
+		}
 	}
-	return &Client{endpoint: endpoint, token: token, http: hc}, nil
+	// Do not mutate a caller-owned client. The shallow copy preserves its
+	// transport, timeout and jar while enforcing the SDK's redirect boundary.
+	hc := *base
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &Client{endpoint: endpoint, token: token, http: &hc, ownedHTTP: ownedHTTP}, nil
 }
 
-// Close releases client resources (no-op for HTTP).
-func (c *Client) Close() error { return nil }
+// Close releases idle connections owned by this client. A client supplied with
+// WithHTTPClient remains caller-owned and is not closed.
+func (c *Client) Close() error {
+	if c != nil && c.ownedHTTP && c.http != nil {
+		c.http.CloseIdleConnections()
+	}
+	return nil
+}
 
 func isLifecycleDeletePath(path string) bool {
 	return path == wire.PathDeleteQueue || path == wire.PathDeleteSubscription
@@ -69,67 +166,132 @@ func lifecycleReconcileHint(path string) string {
 	return "ListQueues"
 }
 
+func readClientResponse(r io.Reader, contentLength, limit int64) ([]byte, error) {
+	if contentLength > limit {
+		return nil, fmt.Errorf("mqlite: response exceeds %d bytes", limit)
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("mqlite: response exceeds %d bytes", limit)
+	}
+	return data, nil
+}
+
+func observeServerTime(header http.Header, started, received time.Time) serverTimeObservation {
+	roundTrip := received.Sub(started)
+	if roundTrip < 0 {
+		roundTrip = 0
+	}
+	var serverLower, serverUpper time.Time
+	coarseClock := false
+	if raw := header.Get(wire.ServerTimeHeader); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
+			serverLower = time.UnixMilli(ms)
+			serverUpper = serverLower.Add(time.Millisecond + roundTrip)
+		}
+	}
+	if serverLower.IsZero() {
+		if parsed, err := http.ParseTime(header.Get("Date")); err == nil {
+			serverLower = parsed
+			serverUpper = parsed.Add(time.Second + roundTrip)
+			coarseClock = true
+		}
+	}
+	if serverLower.IsZero() {
+		return serverTimeObservation{localAt: received, responseRTT: roundTrip}
+	}
+	return serverTimeObservation{
+		localAt: received, serverUpper: serverUpper, responseRTT: roundTrip, coarseClock: coarseClock,
+	}
+}
+
+// localLeaseDeadline maps a broker-wall deadline onto the local monotonic
+// timeline. The upper bound deliberately charges the complete observed RTT, not
+// an assumed symmetric half: a slow response may have spent almost all its time
+// after the broker committed the lease. It never substitutes the local wall
+// clock merely because it falls inside the uncertainty interval. In particular,
+// doing that after a long poll could extend a lease when the client clock is slow.
+func (o serverTimeObservation) localLeaseDeadline(deadline time.Time) (time.Time, bool) {
+	if deadline.IsZero() || o.localAt.IsZero() || o.serverUpper.IsZero() {
+		return time.Time{}, false
+	}
+	now := time.Now()
+	elapsed := now.Sub(o.localAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	serverUpper := o.serverUpper.Add(elapsed)
+	return now.Add(deadline.Sub(serverUpper)), true
+}
+
 func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) error {
+	_, err := c.postObserved(ctx, path, reqBody, respOut)
+	return err
+}
+
+// postObserved returns the clock observation from this exact successful response.
+// Lease-bearing data must use its own response rather than a process-wide sample:
+// a long-poll RTT is a safe budget for that batch, but must not shorten unrelated
+// leases returned by later requests.
+func (c *Client) postObserved(ctx context.Context, path string, reqBody, respOut any) (serverTimeObservation, error) {
 	b, err := json.Marshal(reqBody)
 	if err != nil {
-		return err
+		return serverTimeObservation{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+path, bytes.NewReader(b))
 	if err != nil {
-		return err
+		return serverTimeObservation{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-	httpClient := c.http
-	if isLifecycleDeletePath(path) {
-		// net/http follows 307/308 with the original POST when GetBody is set.
-		// A destructive, name-addressed write must be sent at most once by this
-		// client; a redirect is an unknown outcome for the caller to reconcile.
-		clone := *c.http
-		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-		httpClient = &clone
-	}
-	resp, err := httpClient.Do(req)
+	started := time.Now()
+	resp, err := c.http.Do(req)
+	received := time.Now()
 	if err != nil {
 		if isLifecycleDeletePath(path) {
 			// Once RoundTrip starts, a transport error cannot prove whether the
 			// broker committed the name-addressed deletion. Do not invite an
 			// automatic replay that could hit a later same-name resource.
-			return fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %s", ErrOutcomeUnknown, lifecycleReconcileHint(path), err.Error())
+			return serverTimeObservation{}, fmt.Errorf("%w: deletion response unavailable; inspect %s to reconcile: %s", ErrOutcomeUnknown, lifecycleReconcileHint(path), err.Error())
 		}
-		return err
+		return serverTimeObservation{}, err
 	}
 	defer resp.Body.Close()
-	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 3 {
-		return fmt.Errorf("%w: deletion received HTTP redirect %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
+	// A proxy or gateway may synthesize redirects and failures with its own Date
+	// header. Only a successful broker response is evidence about the clock that
+	// issued the lease carried by that response.
+	var observation serverTimeObservation
+	if resp.StatusCode/100 == 2 {
+		observation = observeServerTime(resp.Header, started, received)
+	}
+	if resp.StatusCode/100 == 3 {
+		if isLifecycleDeletePath(path) {
+			return serverTimeObservation{}, fmt.Errorf("%w: deletion received HTTP redirect %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
+		}
+		// Location is controlled by an intermediary and may contain credentials.
+		// Report only the status; RPC redirects are never part of the protocol.
+		return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: errors.New("mqlite: unexpected HTTP redirect")}
 	}
 	if isLifecycleDeletePath(path) && resp.StatusCode/100 == 5 {
 		// An intermediary can synthesize a gateway error after the broker has
 		// accepted the request but before its acknowledgement reaches us. The
 		// status and body therefore cannot safely authorize a name-only replay.
-		return fmt.Errorf("%w: deletion received HTTP %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
+		return serverTimeObservation{}, fmt.Errorf("%w: deletion received HTTP %d; inspect %s to reconcile", ErrOutcomeUnknown, resp.StatusCode, lifecycleReconcileHint(path))
 	}
 	keyResponse := path == wire.PathCreateKey || path == wire.PathListKeys || path == wire.PathRevokeKey
-	var keyData []byte
-	if keyResponse {
-		keyData, err = wire.ReadKeyResponse(resp.Body)
-		if err != nil {
-			if path == wire.PathCreateKey || path == wire.PathRevokeKey {
-				return fmt.Errorf("%w: incomplete or oversized access key response", ErrOutcomeUnknown)
-			}
-			return err
-		}
-	}
 	if resp.StatusCode/100 != 2 {
 		var eb wire.ErrorBody
-		if keyResponse {
-			_ = json.Unmarshal(keyData, &eb)
-		} else {
-			_ = json.NewDecoder(resp.Body).Decode(&eb)
+		data, readErr := readClientResponse(resp.Body, resp.ContentLength, maxClientErrorBytes)
+		if readErr == nil {
+			if err := json.Unmarshal(data, &eb); err != nil {
+				eb = wire.ErrorBody{}
+			}
 		}
 		// Did the broker say "I have no such ROUTE" — i.e. it is too old to serve this operation —
 		// rather than "that queue/message does not exist"? Both are 404s, and the difference
@@ -143,7 +305,7 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 		// 404 from something in front of the broker.
 		if resp.StatusCode == http.StatusNotFound &&
 			(eb.Code == "" || strings.HasPrefix(eb.Message, "no such path")) {
-			return fmt.Errorf("%w: %s", ErrUnsupported, path)
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrUnsupported, path)}
 		}
 		if keyResponse {
 			// Intermediary error bodies are untrusted too. Keep recognized codes
@@ -164,52 +326,62 @@ func (c *Client) post(ctx context.Context, path string, reqBody, respOut any) er
 			eb.Code = "permission_denied"
 		}
 		if path == wire.PathDeleteSubscription && eb.Code == "not_found" {
-			return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message)
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message)}
 		}
 		if path == wire.PathSubscribe && eb.Code == "resource_exhausted" {
-			return fmt.Errorf("%w: %s", ErrSubscriptionLimit, eb.Message)
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: fmt.Errorf("%w: %s", ErrSubscriptionLimit, eb.Message)}
 		}
-		return mapErr(eb)
+		if eb.Code == "" {
+			return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode}
+		}
+		return serverTimeObservation{}, &HTTPError{StatusCode: resp.StatusCode, cause: mapErr(eb)}
 	}
-	if respOut != nil {
-		if raw, ok := respOut.(*json.RawMessage); ok && keyResponse {
-			// Key management validates a COMPLETE response, including trailing data,
-			// before returning a secret or acknowledging a security-sensitive write.
-			*raw = keyData
-			return nil
-		}
-		if raw, ok := respOut.(*json.RawMessage); ok && path == wire.PathObserve {
-			data, err := wire.ReadObserveResponse(resp.Body)
-			if err != nil {
-				return err
-			}
-			*raw = data
-			return nil
-		}
-		if raw, ok := respOut.(*json.RawMessage); ok && path == wire.PathListSubscriptionsPage {
-			data, err := wire.ReadListSubscriptionsPageResponse(resp.Body)
-			if err != nil {
-				return err
-			}
-			*raw = data
-			return nil
-		}
-		if raw, ok := respOut.(*json.RawMessage); ok && isLifecycleDeletePath(path) {
-			data, err := wire.ReadDeleteResponse(resp.Body)
-			if err != nil {
-				return fmt.Errorf("%w: invalid deletion acknowledgement; inspect %s to reconcile", ErrOutcomeUnknown, lifecycleReconcileHint(path))
-			}
-			*raw = data
-			return nil
-		}
-		return json.NewDecoder(resp.Body).Decode(respOut)
+	if respOut == nil {
+		return observation, nil
 	}
-	return nil
+
+	var data []byte
+	switch {
+	case keyResponse:
+		data, err = wire.ReadKeyResponse(resp.Body)
+	case path == wire.PathObserve:
+		data, err = wire.ReadObserveResponse(resp.Body)
+	case path == wire.PathListSubscriptionsPage:
+		data, err = wire.ReadListSubscriptionsPageResponse(resp.Body)
+	case isLifecycleDeletePath(path):
+		data, err = wire.ReadDeleteResponse(resp.Body)
+	default:
+		data, err = readClientResponse(resp.Body, resp.ContentLength, maxClientResponseBytes)
+	}
+	if err != nil {
+		switch {
+		case isLifecycleDeletePath(path):
+			return observation, fmt.Errorf("%w: invalid deletion acknowledgement; inspect %s to reconcile", ErrOutcomeUnknown, lifecycleReconcileHint(path))
+		case keyResponse && (path == wire.PathCreateKey || path == wire.PathRevokeKey):
+			return observation, fmt.Errorf("%w: incomplete or oversized access key response", ErrOutcomeUnknown)
+		default:
+			return observation, &invalidSuccessResponseError{cause: err}
+		}
+	}
+	if raw, ok := respOut.(*json.RawMessage); ok {
+		*raw = data
+		return observation, nil
+	}
+	if err := json.Unmarshal(data, respOut); err != nil {
+		return observation, &invalidSuccessResponseError{cause: err}
+	}
+	return observation, nil
 }
 
 func mapErr(eb wire.ErrorBody) error {
 	switch eb.Code {
 	case "not_found":
+		if eb.Resource == "queue" {
+			return fmt.Errorf("%w: %s", ErrQueueNotFound, eb.Message)
+		}
+		if eb.Resource == "subscription" {
+			return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, eb.Message)
+		}
 		return fmt.Errorf("%w: %s", ErrNotFound, eb.Message)
 	case "already_exists":
 		return fmt.Errorf("%w: %s", ErrDedupConflict, eb.Message)
@@ -256,23 +428,29 @@ func outToWire(m OutMessage) wire.Message {
 	}
 }
 
-func (c *Client) wireToMessage(queue string, wm wire.Message) *Message {
+func (c *Client) wireToMessage(queue string, wm wire.Message, observation serverTimeObservation) *Message {
+	lockedUntil := msToTime(wm.LockedUntilMs)
+	localLockedUntil, _ := observation.localLeaseDeadline(lockedUntil)
 	return &Message{
-		SequenceNumber: wm.SeqNumber,
-		Body:           wm.Body,
-		MessageID:      wm.MessageID,
-		GroupID:        wm.GroupID,
-		CorrelationID:  wm.CorrelationID,
-		ReplyTo:        wm.ReplyTo,
-		Subject:        wm.Subject,
-		ContentType:    wm.ContentType,
-		Properties:     wm.Properties,
-		DeliveryCount:  wm.DeliveryCount,
-		EnqueuedAt:     msToTime(wm.EnqueuedAtMs),
-		LockedUntil:    msToTime(wm.LockedUntilMs),
-		queue:          queue,
-		lockToken:      wm.LockToken,
-		s:              c,
+		SequenceNumber:             wm.SeqNumber,
+		Body:                       wm.Body,
+		MessageID:                  wm.MessageID,
+		GroupID:                    wm.GroupID,
+		CorrelationID:              wm.CorrelationID,
+		ReplyTo:                    wm.ReplyTo,
+		Subject:                    wm.Subject,
+		ContentType:                wm.ContentType,
+		Properties:                 wm.Properties,
+		DeliveryCount:              wm.DeliveryCount,
+		EnqueuedAt:                 msToTime(wm.EnqueuedAtMs),
+		LockedUntil:                lockedUntil,
+		localLockedUntil:           localLockedUntil,
+		localLeaseResponseRTT:      observation.responseRTT,
+		localLeaseCoarseClock:      observation.coarseClock,
+		localLeaseClockUnavailable: observation.serverUpper.IsZero(),
+		queue:                      queue,
+		lockToken:                  wm.LockToken,
+		s:                          c,
 	}
 }
 
@@ -287,6 +465,8 @@ func msToTime(ms int64) time.Time {
 
 // SendOne enqueues one message and returns its seq. A dedup conflict (same id,
 // different body) surfaces as ErrDedupConflict. SendOpts.At schedules delayed delivery.
+// An invalid successful acknowledgement returns ErrOutcomeUnknown because the
+// message may already have committed; reconcile before retrying.
 func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts ...SendOpts) (int64, error) {
 	if err := validateOutMessageTTL(m); err != nil {
 		return 0, err
@@ -300,10 +480,17 @@ func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts .
 	}
 	var resp wire.SendResponse
 	if err := c.post(ctx, path, req, &resp); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return 0, &ambiguousAcknowledgementError{operation: "Send", cause: err}
+		}
 		return 0, err
 	}
-	if len(resp.SeqNumbers) == 0 {
-		return 0, fmt.Errorf("mqlite: malformed Send response (no seq_numbers)")
+	if len(resp.SeqNumbers) != 1 {
+		return 0, &ambiguousAcknowledgementError{
+			operation: "Send",
+			cause:     fmt.Errorf("received %d sequence numbers for 1 message", len(resp.SeqNumbers)),
+		}
 	}
 	// seq 0 on a 200 response is a topic publish that matched no subscription — a valid no-op
 	// returning (0, nil), matching the embedded SDK. A real single-message dedup conflict
@@ -316,6 +503,8 @@ func (c *Client) SendOne(ctx context.Context, queue string, m OutMessage, opts .
 // for a single seq return or At() scheduling). Batches whose messages use
 // different TTL values require a broker that supports per-message ttl_ms;
 // older strict brokers reject that additive field rather than applying it wrongly.
+// An invalid successful acknowledgement returns ErrOutcomeUnknown because the
+// batch may already have committed; reconcile before retrying.
 func (c *Client) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]int64, error) {
 	if len(msgs) == 0 {
 		return nil, nil
@@ -353,7 +542,17 @@ func (c *Client) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]
 	}
 	var resp wire.SendResponse
 	if err := c.post(ctx, wire.PathSend, request, &resp); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return nil, &ambiguousAcknowledgementError{operation: "Send", cause: err}
+		}
 		return nil, err
+	}
+	if len(resp.SeqNumbers) != len(msgs) {
+		return nil, &ambiguousAcknowledgementError{
+			operation: "Send",
+			cause:     fmt.Errorf("received %d sequence numbers for %d messages", len(resp.SeqNumbers), len(msgs)),
+		}
 	}
 	return resp.SeqNumbers, nil
 }
@@ -361,7 +560,21 @@ func (c *Client) Send(ctx context.Context, queue string, msgs ...OutMessage) ([]
 // Cancel deletes a never-delivered scheduled Send. It cannot cancel a retry
 // parked in scheduled by delayed Abandon.
 func (c *Client) Cancel(ctx context.Context, queue string, seq int64) error {
-	return c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: seq}, &wire.SettleResponse{})
+	var response wire.SettleResponse
+	if err := c.post(ctx, wire.PathCancel, wire.CancelRequest{Queue: queue, SeqNumber: seq}, &response); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return &ambiguousAcknowledgementError{operation: "Cancel", cause: err}
+		}
+		return err
+	}
+	if !response.Ok {
+		return &ambiguousAcknowledgementError{
+			operation: "Cancel",
+			cause:     errors.New("successful response contained ok=false"),
+		}
+	}
+	return nil
 }
 
 // SettleResult is the per-message outcome of a batch settle (Ok=false = the lock was
@@ -387,6 +600,31 @@ func toSettleResults(rs []wire.SettleItemResult) []SettleResult {
 	return out
 }
 
+func settleItems(msgs []*Message) ([]wire.SettleItem, error) {
+	items := make([]wire.SettleItem, len(msgs))
+	for i, m := range msgs {
+		if m == nil {
+			return nil, fmt.Errorf("%w: message %d is nil", ErrInvalidArgument, i)
+		}
+		items[i] = wire.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	}
+	return items, nil
+}
+
+func validateBatchResults(msgs []*Message, results []wire.SettleItemResult, renew bool) error {
+	if len(results) != len(msgs) {
+		return fmt.Errorf("mqlite: batch response has %d results for %d messages", len(results), len(msgs))
+	}
+	for i, result := range results {
+		if result.SeqNumber != msgs[i].SequenceNumber || result.LockedUntilMs < 0 ||
+			(!renew && result.LockedUntilMs != 0) ||
+			(renew && ((result.Ok && result.LockedUntilMs == 0) || (!result.Ok && result.LockedUntilMs != 0))) {
+			return fmt.Errorf("mqlite: invalid batch result at index %d", i)
+		}
+	}
+	return nil
+}
+
 // msFromEpoch turns an epoch-ms deadline into a time, keeping the zero time for "not set".
 func msFromEpoch(ms int64) time.Time {
 	if ms == 0 {
@@ -409,13 +647,20 @@ func (c *Client) Message(queue string, seq int64, lockToken string) *Message {
 // CompleteBatch completes many messages in one request (one settlement RPC instead of N),
 // returning a per-message result so a caller can see which sequence numbers settled.
 func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
-	items := make([]wire.SettleItem, len(msgs))
-	for i, m := range msgs {
-		items[i] = wire.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	items, err := settleItems(msgs)
+	if err != nil {
+		return nil, err
 	}
 	var resp wire.CompleteBatchResponse
 	if err := c.post(ctx, wire.PathCompleteBatch, wire.CompleteBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return nil, &ambiguousAcknowledgementError{operation: "CompleteBatch", cause: err}
+		}
 		return nil, err
+	}
+	if err := validateBatchResults(msgs, resp.Results, false); err != nil {
+		return nil, &ambiguousAcknowledgementError{operation: "CompleteBatch", cause: err}
 	}
 	return toSettleResults(resp.Results), nil
 }
@@ -425,20 +670,38 @@ func (c *Client) CompleteBatch(ctx context.Context, queue string, msgs ...*Messa
 // that outlasts the very lease it is trying to save (a 64-message batch on a 50ms link needs
 // 3.2s of renewals against a 2s lease), so the locks expire mid-renewal.
 //
-// SettleResult.LockedUntil is the deadline the broker committed, and it — not Ok — is the fact to
-// pace yourself by. Ok says the lease was live when the broker's STATEMENT finished; the response
-// still has to travel back to you, so on a very short lease it can lapse on the way. Compare
-// LockedUntil against your own clock.
+// SettleResult.LockedUntil is the absolute broker deadline that was committed. Ok says the lease
+// was live when the broker's STATEMENT finished; the response still has to travel back to you, so
+// on a very short lease it can lapse on the way. Raw callers comparing LockedUntil with a client
+// wall clock still require synchronized clocks. The managed Receiver binds the broker-time header
+// from this exact response to that deadline, maps it onto local monotonic time, and uses successful
+// renewal as a dispatch fence when no usable clock observation is available.
 func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
-	items := make([]wire.SettleItem, len(msgs))
-	for i, m := range msgs {
-		items[i] = wire.SettleItem{SeqNumber: m.SequenceNumber, LockToken: m.lockToken}
+	results, _, err := c.renewBatchObserved(ctx, queue, msgs...)
+	return results, err
+}
+
+func (c *Client) renewBatchObserved(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, serverTimeObservation, error) {
+	if len(msgs) > MaxRenewBatch {
+		return nil, serverTimeObservation{}, fmt.Errorf("%w: renew batch exceeds %d messages", ErrInvalidArgument, MaxRenewBatch)
+	}
+	items, err := settleItems(msgs)
+	if err != nil {
+		return nil, serverTimeObservation{}, err
 	}
 	var resp wire.RenewBatchResponse
-	if err := c.post(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp); err != nil {
-		return nil, err
+	observation, err := c.postObserved(ctx, wire.PathRenewBatch, wire.RenewBatchRequest{Queue: queue, Messages: items}, &resp)
+	if err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			return nil, serverTimeObservation{}, &ambiguousAcknowledgementError{operation: "RenewBatch", cause: err}
+		}
+		return nil, serverTimeObservation{}, err
 	}
-	return toSettleResults(resp.Results), nil
+	if err := validateBatchResults(msgs, resp.Results, true); err != nil {
+		return nil, serverTimeObservation{}, &ambiguousAcknowledgementError{operation: "RenewBatch", cause: err}
+	}
+	return toSettleResults(resp.Results), observation, nil
 }
 
 // ── receive ─────────────────────────────────────────────────────────────────
@@ -448,36 +711,46 @@ func (c *Client) RenewBatch(ctx context.Context, queue string, msgs ...*Message)
 func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([]*Message, error) {
 	o := firstOpt(opts)
 	var resp wire.ReceiveResponse
+	var observation serverTimeObservation
 	if len(o.Pick) > 0 {
-		if err := c.post(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, SeqNumbers: o.Pick}, &resp); err != nil {
+		var err error
+		observation, err = c.postObserved(ctx, wire.PathReceiveDeferred, wire.ReceiveDeferredRequest{Queue: queue, SeqNumbers: o.Pick}, &resp)
+		if err != nil {
 			return nil, err
 		}
 	} else {
 		eo := o.toEngine()
-		if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+		var err error
+		observation, err = c.postObserved(ctx, wire.PathReceive, wire.ReceiveRequest{
 			Queue: queue, MaxMessages: eo.MaxMessages, WaitTimeMs: eo.WaitMs,
 			ReceiveMode: int(eo.Mode), AttemptID: eo.AttemptID, // idempotent receive
-		}, &resp); err != nil {
+		}, &resp)
+		if err != nil {
+			var invalid *invalidSuccessResponseError
+			if eo.Mode == engine.ReceiveAndDelete && errors.As(err, &invalid) {
+				return nil, &ambiguousAcknowledgementError{operation: "AtMostOnce Receive", cause: err}
+			}
 			return nil, err
 		}
 	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
-		out[i] = c.wireToMessage(queue, wm)
+		out[i] = c.wireToMessage(queue, wm, observation)
 	}
 	return out, nil
 }
 
 func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs int64, mode engine.ReceiveMode, attemptID string) ([]*Message, error) {
 	var resp wire.ReceiveResponse
-	if err := c.post(ctx, wire.PathReceive, wire.ReceiveRequest{
+	observation, err := c.postObserved(ctx, wire.PathReceive, wire.ReceiveRequest{
 		Queue: queue, MaxMessages: max, WaitTimeMs: waitMs, ReceiveMode: int(mode), AttemptID: attemptID,
-	}, &resp); err != nil {
+	}, &resp)
+	if err != nil {
 		return nil, err
 	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
-		out[i] = c.wireToMessage(queue, wm)
+		out[i] = c.wireToMessage(queue, wm, observation)
 	}
 	return out, nil
 }
@@ -728,6 +1001,14 @@ func (c *Client) Receiver(queue string, opts ...ReceiverOption) *Receiver {
 func (c *Client) settle(ctx context.Context, path string, req wire.SettleRequest) error {
 	var r wire.SettleResponse
 	if err := c.post(ctx, path, req, &r); err != nil {
+		var invalid *invalidSuccessResponseError
+		if errors.As(err, &invalid) {
+			operation := path
+			if slash := strings.LastIndexByte(operation, '/'); slash >= 0 {
+				operation = operation[slash+1:]
+			}
+			return &ambiguousAcknowledgementError{operation: operation, cause: err}
+		}
 		return err
 	}
 	if !r.Ok {
@@ -750,6 +1031,24 @@ func (c *Client) deferMsg(ctx context.Context, q string, seq int64, tok string) 
 }
 func (c *Client) renew(ctx context.Context, q string, seq int64, tok string) error {
 	return c.settle(ctx, wire.PathRenew, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok})
+}
+
+func (c *Client) renewDeadline(ctx context.Context, q string, seq int64, tok string) (renewalLease, error) {
+	results, observation, err := c.renewBatchObserved(ctx, q, c.Message(q, seq, tok))
+	if err != nil {
+		return renewalLease{}, err
+	}
+	if len(results) != 1 || !results[0].Ok {
+		return renewalLease{}, ErrLockLost
+	}
+	lease := renewalLease{
+		deadline: results[0].LockedUntil, responseRTT: observation.responseRTT, coarseClock: observation.coarseClock,
+		clockUnavailable: observation.serverUpper.IsZero(),
+	}
+	if local, ok := observation.localLeaseDeadline(results[0].LockedUntil); ok {
+		lease.deadline = local
+	}
+	return lease, nil
 }
 
 // PeekedMessage is a read-only browse result.

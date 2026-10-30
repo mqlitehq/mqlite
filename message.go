@@ -25,6 +25,13 @@ type Message struct {
 	queue     string
 	lockToken string
 	s         settler
+	// localLockedUntil is the broker deadline mapped onto this process's
+	// monotonic clock from an HTTP server-time observation. It remains private:
+	// callers still receive the protocol's absolute LockedUntil value.
+	localLockedUntil           time.Time
+	localLeaseResponseRTT      time.Duration
+	localLeaseCoarseClock      bool
+	localLeaseClockUnavailable bool
 }
 
 // LockToken returns the Peek-Lock fencing token for this message. Normal SDK use never

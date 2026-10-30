@@ -90,7 +90,7 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **2.8 RenewBatch** extends a whole batch's leases in ONE statement, fenced per item on its own
   `lock_token`, and reports the deadline it committed. `ok=true` means the lease was live when the
   broker's STATEMENT finished — the answer still has to travel, so `locked_until_ms` is the
-  authoritative fact and the caller compares it against its own clock. A renewal whose write
+  authoritative fact and remote callers map it from broker time onto a local monotonic clock. A renewal whose write
   outlived the lock reports `ok=false` rather than handing back a lock the caller never held, and a
   renewal never *shortens* a lease. Each successful item uses the same deadline rule
   as §2.5 and preserves state, token, and `delivery_count`. Capped at 512 messages —
@@ -223,7 +223,9 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   the static admin console under `/ui` (when enabled — its own API calls still carry a
   token); a missing/invalid/expired/revoked token → 401 `unauthenticated`.
   *(server/errors_test.go, server/index_test.go, server/console_test.go)*
-- **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status:
+- **9.2** Errors use a JSON envelope `{code,message}` with the documented HTTP status;
+  `not_found` may add the backward-compatible `resource` discriminator `queue` or
+  `subscription`:
   400 `invalid_argument`/`group_required` · 401 `unauthenticated` · 403
   `permission_denied` · 404 `not_found` · 409
   `already_exists`/`lock_lost`/`name_conflict`/`key_conflict`/
@@ -279,6 +281,28 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestAccessKeySortValidationAndIndex; server/errors_test.go:
   TestAccessKeyCreationOrderHTTP; wire/wire_test.go:
   TestAccessKeyCreationOrderResponseValidation; test/api_tests.py)*
+- **9.7** Every HTTP response MUST carry `X-Mqlite-Server-Time-Ms`, sampled from
+  the same injectable epoch-millisecond broker clock used for lease and TTL
+  decisions when the response is first written. The additive header is valid on
+  both success and error responses; a client MUST NOT use a proxy-generated
+  failure or redirect as evidence of broker time. A remote lease scheduler MUST
+  apply transport and timestamp-precision uncertainty conservatively, reserve
+  observed round-trip headroom for the next renewal, and MUST NOT extend a lease
+  merely because its local wall clock falls inside that interval. A confirmed
+  exact lease shorter than the managed Receiver's safe renewal interval MUST fail
+  closed rather than enter an unbounded renewal loop.
+  CORS-enabled responses MUST list the header in `Access-Control-Expose-Headers`.
+  *(server/errors_test.go: TestJSONResponsesCarryServerTime;
+  receiver_internal_test.go: TestClientMapsBrokerDeadlineOntoLocalMonotonicClock,
+  TestClientLongPollNeverExtendsLeaseFromLocalWallClock,
+  TestClientLongPollObservationDoesNotContaminateShortRenewal,
+  TestClientRejectsPathologicallyShortConfirmedLease)*
+- **9.8** A managed Receiver that receives HTTP 499 while its own controlling
+  context is still live MUST treat it as transient. A Receive replay MUST retain
+  the same attempt ID. If the caller context is already canceled, it MUST stop
+  without another request. *(receiver_internal_test.go:
+  TestReceiverRetriesBrokerCanceledReceiveWithSameAttemptID,
+  TestReceiverDoesNotRetryBrokerCanceledResponseAfterCallerCancel)*
 
 ## 10 · Storage & schema invariants
 

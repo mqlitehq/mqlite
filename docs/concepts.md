@@ -215,7 +215,9 @@ publish.
 - Name resolution at publish/send is unambiguous in the supported namespace: an
   active plain-queue or backing-queue name addresses that queue; an implicit topic
   name addresses its active subscription rows; any other name returns
-  `ErrQueueNotFound`. A valid name can never be both a queue and a topic, so a
+  `ErrQueueNotFound`. That sentinel also matches the broader `ErrNotFound` via
+  `errors.Is`, consistently in embedded mode and with a resource-aware remote
+  broker. A valid name can never be both a queue and a topic, so a
   `Send` is never silently rerouted.
 
 ```

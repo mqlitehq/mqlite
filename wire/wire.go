@@ -7,7 +7,18 @@
 // integers. Unary RPC = HTTP POST to /mqlite.v1.<Service>/<Method>.
 package wire
 
-import "github.com/mqlitehq/mqlite/engine"
+import (
+	"encoding/json"
+	"errors"
+
+	"github.com/mqlitehq/mqlite/engine"
+)
+
+// ServerTimeHeader carries the broker wall clock at response write time as UTC
+// epoch milliseconds. Clients combine it with their local monotonic clock and a
+// conservative transport budget instead of comparing lease timestamps against a
+// potentially skewed wall clock. Older clients safely ignore the additive header.
+const ServerTimeHeader = "X-Mqlite-Server-Time-Ms"
 
 // Route paths (Connect-style: /package.Service/Method).
 const (
@@ -120,6 +131,24 @@ type ReceiveResponse struct {
 	Messages []Message `json:"messages"`
 }
 
+// UnmarshalJSON rejects a successful response that does not explicitly carry
+// the claimed batch. A proxy-generated {} or {"messages":null} cannot be
+// treated as an empty Receive: the broker may already have claimed messages for
+// the attempt ID whose acknowledgement was damaged in transit.
+func (r *ReceiveResponse) UnmarshalJSON(data []byte) error {
+	var response struct {
+		Messages *[]Message `json:"messages"`
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return err
+	}
+	if response.Messages == nil {
+		return errors.New("mqlite: receive response is missing required messages")
+	}
+	r.Messages = *response.Messages
+	return nil
+}
+
 type ReceiveDeferredRequest struct {
 	Queue      string  `json:"queue"`
 	SeqNumbers []int64 `json:"seq_numbers"`
@@ -135,6 +164,22 @@ type SettleRequest struct {
 }
 type SettleResponse struct {
 	Ok bool `json:"ok"`
+}
+
+// UnmarshalJSON preserves the distinction between an explicit negative
+// acknowledgement and a malformed successful response that omitted ok.
+func (r *SettleResponse) UnmarshalJSON(data []byte) error {
+	var response struct {
+		Ok *bool `json:"ok"`
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return err
+	}
+	if response.Ok == nil {
+		return errors.New("mqlite: settlement response is missing required ok")
+	}
+	r.Ok = *response.Ok
+	return nil
 }
 
 // CompleteBatch settles many messages in one round-trip (fixes the drain N+1).
@@ -153,6 +198,28 @@ type SettleItemResult struct {
 	// A renewing client needs it to know when to renew next.
 	LockedUntilMs int64 `json:"locked_until_ms,omitempty"`
 }
+
+// UnmarshalJSON requires every positional batch result to say whether its
+// operation succeeded. Missing ok must not collapse into the bool zero value,
+// which would incorrectly look like an explicit lock-loss result.
+func (r *SettleItemResult) UnmarshalJSON(data []byte) error {
+	var result struct {
+		SeqNumber     int64 `json:"seq_number"`
+		Ok            *bool `json:"ok"`
+		LockedUntilMs int64 `json:"locked_until_ms,omitempty"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return err
+	}
+	if result.Ok == nil {
+		return errors.New("mqlite: batch settlement result is missing required ok")
+	}
+	r.SeqNumber = result.SeqNumber
+	r.Ok = *result.Ok
+	r.LockedUntilMs = result.LockedUntilMs
+	return nil
+}
+
 type CompleteBatchResponse struct {
 	Results []SettleItemResult `json:"results"`
 }
@@ -369,6 +436,10 @@ type Empty struct{}
 type ErrorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Resource refines a broad code without changing it. Older clients ignore
+	// this additive field; newer clients use "queue" to restore the SDK's
+	// ErrQueueNotFound/ErrNotFound hierarchy across HTTP.
+	Resource string `json:"resource,omitempty"`
 }
 
 // ── conversions between wire and engine ─────────────────────────────────────

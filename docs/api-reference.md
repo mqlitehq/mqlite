@@ -19,9 +19,36 @@ values replace earlier ones, while repeated object and map values may merge.
 
 - **Transport:** HTTP `POST`, `Content-Type: application/json`. Discovery and
   health use open `GET` endpoints; opt-in metrics uses authenticated `GET` on the same port.
+- **Go SDK transport:** RPC clients never follow HTTP redirects. The default
+  client keeps up to 64 idle connections per broker for concurrent receivers and
+  releases its own idle connections on `Client.Close`. A client passed through
+  `WithHTTPClient` remains caller-owned; MQLite preserves its transport and timeout
+  but still disables redirects for RPCs. Size a custom transport's
+  `MaxIdleConnsPerHost` to at least Receiver concurrency plus effective prefetch
+  (the managed pipeline's maximum network work in flight). If an application has
+  replaced the process-wide `http.DefaultTransport` with an opaque wrapper,
+  MQLite preserves that wrapper for instrumentation/mock compatibility and does
+  not close it; its underlying connection-pool sizing remains the application's
+  responsibility because a generic `http.RoundTripper` cannot be cloned or tuned.
 - **`body`** is **base64** in JSON (Go marshals `[]byte` as base64).
 - **Timestamps** are **epoch milliseconds** (UTC) integers. Message durations use
   `*_ms`; observability durations explicitly named `*_seconds` retain fractional seconds.
+- **Broker time header:** every broker response includes
+  `X-Mqlite-Server-Time-Ms`, the UTC epoch-millisecond value from the same clock
+  used for lease, TTL, scheduling, and settlement decisions. The managed Go
+  client trusts it only on successful broker responses and maps absolute lease
+  deadlines onto its local monotonic clock with a conservative transport budget.
+  Older clients ignore the additive header. With an older broker, the client can
+  use HTTP `Date` at its one-second precision; a short lower bound dominated by
+  that precision uses bounded degraded-clock pacing. Without either header the
+  public absolute deadline is retained, but the managed Receiver reports one
+  diagnostic, confirms the lease before dispatch, and keeps a bounded
+  untrusted-clock cadence instead of using that foreign timestamp as a local
+  schedule. This no-header fallback cannot prove a lease shorter than its 250ms
+  cadence plus network latency; preserve one time header, or use a lock duration
+  well above that bound (1s or more is recommended). Raw HTTP callers should map
+  broker time or synchronize clocks.
+  CORS-enabled brokers expose this header to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
@@ -433,6 +460,11 @@ a Complete-per-message N+1 (the cheap path for draining).
   for a stale/expired lock on that item (not fatal to the batch). Each item is fenced +
   idempotent exactly like `Complete`.
 
+The Go SDK requires exactly one result per requested message in the same order,
+with no renewal deadline on a completion result. A malformed successful
+acknowledgement returns `ErrOutcomeUnknown`, because some completions may already
+have committed.
+
 ### RenewBatch
 
 Extend the lock lease of a whole received batch in **one round-trip**.
@@ -447,15 +479,32 @@ against a 2 s lock, and most of the locks expire mid-pass.
   `ok=false` for a stale/expired lock on that item (not fatal to the batch); each item is fenced
   on its own `lock_token`, exactly like `Renew`.
 
-`locked_until_ms` is the deadline the broker actually committed — renew again before it. And
-`ok=true` means the lease was live **when the broker's statement finished** — not when the answer
-reaches you. The result still has to be mapped, encoded and travel back, so on a very short lease
-it can lapse on the way. **`locked_until_ms` is the authoritative fact: compare it against your own
-clock.** (If the write itself outlived the lock, you get `ok=false` rather than a lock you never
-really held.) Like single-message Renew, the batch operation leaves token, state, and
+`locked_until_ms` is the absolute broker deadline that was actually committed — renew again before
+it. And `ok=true` means the lease was live **when the broker's statement finished** — not when the
+answer reaches you. The result still has to be mapped, encoded and travel back, so on a very short
+lease it can lapse on the way. Current brokers return `X-Mqlite-Server-Time-Ms` from the same clock
+as the lease; the managed Receiver combines that observation with local monotonic time and a
+conservative transport budget instead of directly comparing two hosts' wall clocks. It performs a
+bounded synchronous Renew before dispatch when a deadline is unusable, separates renewal cadence
+from the request watchdog, reserves two observed round trips for the next request, and never extends
+a lease merely because the local wall clock falls in a wide uncertainty interval. A confirmed exact
+lease below the 50 ms minimum cadence fails closed instead of entering a renewal hot loop. Older
+brokers use HTTP `Date` when available; without either time header they retain the public absolute
+deadline but never use it as a managed local schedule. The Receiver emits one diagnostic, confirms
+ownership before dispatch, and keeps a conservative 250ms cadence. Because no relative lease
+duration is available in that fallback, preserve one time header or configure the lock well above
+250ms plus network latency (1s or more is recommended).
+Raw `RenewBatch` callers should map the broker clock likewise (or keep clocks synchronized) and
+must not turn clock offset alone into `ErrLockLost`. (If the write itself outlived the lock, you get
+`ok=false` rather than a lock you never really held.) Like single-message Renew, the batch
+operation leaves token, state, and
 `delivery_count` unchanged and commits the later of the existing deadline and the
 broker's fresh `now + lock_duration` candidate (capped by a fixed subscription
 lifetime).
+
+The Go SDK requires exactly one ordered result per request item. A successful
+renewal must have a positive `locked_until_ms`; a failed renewal must not claim a
+deadline. Malformed renewal results are rejected rather than treated as renewed.
 
 > **Why 512?** Renewal is a claim about the *future* ("this lease is live"), and that claim is
 > only keepable within a single statement: across several, the first batch's lease can expire —
@@ -908,7 +957,9 @@ collision?**
 
 ## Errors
 
-Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP status:
+Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP
+status. A `not_found` response may add an optional `resource` discriminator
+(`"queue"` or `"subscription"`); older clients safely ignore this additive field:
 
 | HTTP | `code` | When |
 |---|---|---|
@@ -916,7 +967,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 400 | `group_required` | a `group_fifo` send with no `group_id` |
 | 401 | `unauthenticated` | missing/invalid Bearer token (auth is on by default; only `MQLITE_TOKENS=off` disables it) |
 | 403 | `permission_denied` | a valid key lacks permission, or key management was attempted with auth disabled (`mqlite.ErrPermissionDenied`) |
-| 404 | `not_found` | the queue, exact topic/subscription pair, or message doesn't exist; or an unknown path |
+| 404 | `not_found` | the queue, exact topic/subscription pair, or message doesn't exist; or an unknown path. Missing queues and subscriptions include the corresponding `resource` when the broker can identify it. |
 | 409 | `already_exists` | single-message dedup conflict (same id, different body) |
 | 409 | `name_conflict` | a queue/subscription/topic name collision at creation time, including a name reserved by a deleting queue — the namespace is one and disjoint (`Subscribe`/`CreateQueue`) |
 | 409 | `key_conflict` | a managed key ID or token digest is already registered (`mqlite.ErrKeyConflict`); no existing secret is returned |
@@ -925,7 +976,7 @@ Errors are a JSON envelope `{"code": "...", "message": "..."}` with an HTTP stat
 | 409 | `subscription_not_empty` | subscription deletion found retained messages in at least one state |
 | 429 | `resource_exhausted` | the active plus deleting subscription capacity is full (`mqlite.ErrSubscriptionLimit`) |
 | 413 | `message_too_large` | a message body over `MaxMessageBytes` (default 1 MiB), or request decoding that exceeds `server.MaxBodyBytes` (default 32 MiB) |
-| 499 | `canceled` | the client canceled the request |
+| 499 | `canceled` | the request context was canceled. A managed Receiver whose own context is still live treats a received 499 as transient and retries the same Receive attempt; caller cancellation still stops immediately. |
 | 503 | `outcome_unknown` | a remote (Turso/libSQL) write lost its commit acknowledgement — it **may or may not** have applied. **Do not blindly retry**; reconcile messages by `message_id`/dedup, or key operations by their retained public key ID (`mqlite.ErrOutcomeUnknown`). Only occurs against a remote store, never a local file/`:memory:`. |
 | 500 | `internal` | unexpected server error |
 
@@ -939,3 +990,15 @@ The Go SDK re-exports sentinel errors such as `mqlite.ErrLockLost`,
 works in both embedded and client mode. An accepted queue or subscription
 deletion is a successful operation even when its typed HTTP result is
 `state:"deleting"`.
+
+With a resource-aware broker, a missing queue matches both
+`mqlite.ErrQueueNotFound` and the broader `mqlite.ErrNotFound`; this is the same
+hierarchy as embedded mode. A new client connected to an older broker receives
+the legacy envelope without `resource` and can only match `ErrNotFound`.
+
+The Go SDK bounds ordinary successful response bodies at 64 MiB and error bodies
+at 64 KiB. Outside lifecycle deletion's explicit `ErrOutcomeUnknown` cases, a
+non-2xx response is available through `errors.As` as `*mqlite.HTTPError`; its
+`StatusCode` and `HTTPStatus()` retain the HTTP status even when an intermediary
+returned no JSON error code. Redirect errors report only the status and never copy
+the untrusted `Location` value into the error.

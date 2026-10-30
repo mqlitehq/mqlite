@@ -139,23 +139,35 @@ func (e *Embedded) Close() error { return e.eng.Close() }
 // full=true (rewrites the file, global lock — maintenance only). Local-only.
 func (e *Embedded) Compact(ctx context.Context, full bool) error { return e.eng.Compact(ctx, full) }
 
-func (e *Embedded) engineToMessage(queue string, m *engine.Message) *Message {
+func embeddedLeaseDeadline(deadlineMs, serverNowMs int64) time.Time {
+	if deadlineMs <= 0 {
+		return time.Time{}
+	}
+	// Engine deadlines live in the injectable engine clock domain. Translate the
+	// remaining duration onto time.Now so Receiver scheduling keeps a monotonic
+	// horizon even when WithClock uses a test epoch far from the host wall clock.
+	remaining := time.UnixMilli(deadlineMs).Sub(time.UnixMilli(serverNowMs))
+	return time.Now().Add(remaining)
+}
+
+func (e *Embedded) engineToMessage(queue string, m *engine.Message, serverNowMs int64) *Message {
 	return &Message{
-		SequenceNumber: m.SeqNumber,
-		Body:           m.Body,
-		MessageID:      m.MessageID,
-		GroupID:        m.GroupID,
-		CorrelationID:  m.CorrelationID,
-		ReplyTo:        m.ReplyTo,
-		Subject:        m.Subject,
-		ContentType:    m.ContentType,
-		Properties:     m.Properties,
-		DeliveryCount:  m.DeliveryCount,
-		EnqueuedAt:     msToTime(m.EnqueuedAtMs),
-		LockedUntil:    msToTime(m.LockedUntilMs),
-		queue:          queue,
-		lockToken:      m.LockToken,
-		s:              e,
+		SequenceNumber:   m.SeqNumber,
+		Body:             m.Body,
+		MessageID:        m.MessageID,
+		GroupID:          m.GroupID,
+		CorrelationID:    m.CorrelationID,
+		ReplyTo:          m.ReplyTo,
+		Subject:          m.Subject,
+		ContentType:      m.ContentType,
+		Properties:       m.Properties,
+		DeliveryCount:    m.DeliveryCount,
+		EnqueuedAt:       msToTime(m.EnqueuedAtMs),
+		LockedUntil:      msToTime(m.LockedUntilMs),
+		localLockedUntil: embeddedLeaseDeadline(m.LockedUntilMs, serverNowMs),
+		queue:            queue,
+		lockToken:        m.LockToken,
+		s:                e,
 	}
 }
 
@@ -222,11 +234,11 @@ func (e *Embedded) CompleteBatch(ctx context.Context, queue string, msgs ...*Mes
 // RenewBatch extends the lock lease of many messages in ONE STATEMENT — deliberately not a
 // transaction (the embedded twin of Client.RenewBatch), returning a per-message result.
 //
-// SettleResult.LockedUntil is the deadline actually committed, and it — not Ok — is the fact to
-// pace yourself by. Ok says the lease was live when the STATEMENT finished, which is already in the
-// past by the time you read it: nothing is encoded or sent in embedded mode, but your own handling
-// still takes time and a very short lease can lapse inside it. Compare LockedUntil against your own
-// clock rather than trusting Ok to still hold.
+// SettleResult.LockedUntil is the absolute deadline actually committed. Ok says the lease was live
+// when the STATEMENT finished, which is already in the past by the time you read it: nothing is
+// encoded or sent in embedded mode, but your own handling still takes time and a very short lease
+// can lapse inside it. Comparing LockedUntil with another clock assumes those clocks are
+// synchronized; the managed Receiver has a conservative fallback for an unusable comparison.
 func (e *Embedded) RenewBatch(ctx context.Context, queue string, msgs ...*Message) ([]SettleResult, error) {
 	items := make([]engine.SettleItem, len(msgs))
 	for i, m := range msgs {
@@ -282,8 +294,12 @@ func (e *Embedded) Receive(ctx context.Context, queue string, opts ...RecvOpts) 
 		return nil, err
 	}
 	out := make([]*Message, len(ms))
+	if len(ms) == 0 {
+		return out, nil
+	}
+	serverNowMs := e.eng.ServerTimeMs()
 	for i, m := range ms {
-		out[i] = e.engineToMessage(queue, m)
+		out[i] = e.engineToMessage(queue, m, serverNowMs)
 	}
 	return out, nil
 }
@@ -294,8 +310,12 @@ func (e *Embedded) receiveOne(ctx context.Context, queue string, max int, waitMs
 		return nil, err
 	}
 	out := make([]*Message, len(ms))
+	if len(ms) == 0 {
+		return out, nil
+	}
+	serverNowMs := e.eng.ServerTimeMs()
 	for i, m := range ms {
-		out[i] = e.engineToMessage(queue, m)
+		out[i] = e.engineToMessage(queue, m, serverNowMs)
 	}
 	return out, nil
 }
@@ -604,6 +624,30 @@ func (e *Embedded) deferMsg(ctx context.Context, q string, seq int64, tok string
 }
 func (e *Embedded) renew(ctx context.Context, q string, seq int64, tok string) error {
 	return e.eng.Renew(ctx, q, seq, tok)
+}
+
+// renewDeadline is the managed Receiver's deadline-bearing renewal path. Keep
+// Message.Renew's public error-only signature stable while pacing later
+// heartbeats from the deadline the engine actually committed.
+func (e *Embedded) renewDeadline(ctx context.Context, q string, seq int64, tok string) (renewalLease, error) {
+	results, err := e.eng.RenewBatch(ctx, q, []engine.SettleItem{{SeqNumber: seq, LockToken: tok}})
+	if err != nil {
+		return renewalLease{}, err
+	}
+	if len(results) != 1 || results[0].SeqNumber != seq {
+		return renewalLease{}, fmt.Errorf("mqlite: invalid embedded RenewBatch result")
+	}
+	result := results[0]
+	if !result.Ok {
+		if result.LockedUntilMs != 0 {
+			return renewalLease{}, fmt.Errorf("mqlite: invalid embedded RenewBatch lost-lock deadline")
+		}
+		return renewalLease{}, ErrLockLost
+	}
+	if result.LockedUntilMs <= 0 {
+		return renewalLease{}, fmt.Errorf("mqlite: invalid embedded RenewBatch deadline")
+	}
+	return renewalLease{deadline: embeddedLeaseDeadline(result.LockedUntilMs, e.eng.ServerTimeMs())}, nil
 }
 
 // newHTTPServer builds the broker's http.Server with hardening defaults (review F9,
