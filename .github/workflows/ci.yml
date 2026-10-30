@@ -57,7 +57,9 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
       - name: test (race)
-        run: go test -race -count=1 ./...
+        # Windows race builds regularly spend 8–9 minutes in the engine package;
+        # keep a real hang bounded without relying on Go's tight 10m default (MQLITE-140).
+        run: go test -race -count=1 -timeout=15m ./...
       # Turso integration is gated by env (MQLITE_TEST_DB) and runs in the
       # nightly workflow, not here — keeps PRs hermetic and off the remote quota.
       # Coverage is measured once in the dedicated `coverage` job below.
