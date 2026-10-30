@@ -998,12 +998,6 @@ func TestServeShutdownCancelsLongPoll(t *testing.T) {
 
 	start := time.Now()
 	cancelServe()
-	// A message becoming available after the cancellation barrier must remain
-	// active; the admitted long poll may not start a post-shutdown claim round.
-	if _, err := eng.SendOne(ctx, "shutdown-long-poll", mqlite.OutMessage{Body: []byte("after-shutdown")}); err != nil {
-		cancelReceive()
-		t.Fatal(err)
-	}
 	select {
 	case err := <-serveDone:
 		if err != nil {
@@ -1033,6 +1027,13 @@ func TestServeShutdownCancelsLongPoll(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		cancelReceive()
 		t.Fatal("long poll client remained blocked after Serve returned")
+	}
+	// cancelServe requests shutdown, but Gate.Stop is the actual no-new-claim
+	// linearization boundary and runs in the Serve goroutine. Waiting for Serve
+	// above avoids treating scheduler order as part of the public contract. The
+	// atomic Stop-vs-claim ordering itself has deterministic engine gate tests.
+	if _, err := eng.SendOne(ctx, "shutdown-long-poll", mqlite.OutMessage{Body: []byte("after-shutdown")}); err != nil {
+		t.Fatal(err)
 	}
 	peeked, err := eng.Peek(ctx, "shutdown-long-poll", mqlite.PeekOpts{Max: 10})
 	if err != nil {

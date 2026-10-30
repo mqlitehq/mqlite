@@ -76,6 +76,103 @@ func TestReceiveDrainWireContract(t *testing.T) {
 	}
 }
 
+func TestServeDrainBarrierKeepsPostStopMessageActive(t *testing.T) {
+	ctx := context.Background()
+	eng, err := OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "drain.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := receivegate.New()
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+	ready := make(chan struct{})
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- eng.Serve(serveCtx, addr,
+			withReceiveGateForTest(gate),
+			WithReady(func() { close(ready) }),
+		)
+	}()
+	select {
+	case <-ready:
+	case err := <-serveDone:
+		t.Fatalf("broker exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker did not become ready")
+	}
+
+	client, err := Open(ctx, "http://"+addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	receiveCtx, cancelReceive := context.WithCancel(ctx)
+	defer cancelReceive()
+	type receiveResult struct {
+		messages []*Message
+		err      error
+	}
+	receiveDone := make(chan receiveResult, 1)
+	go func() {
+		messages, err := client.Receive(receiveCtx, "q", RecvOpts{Wait: 20 * time.Second})
+		receiveDone <- receiveResult{messages: messages, err: err}
+	}()
+	select {
+	case <-gate.FirstParked():
+	case result := <-receiveDone:
+		t.Fatalf("long poll returned before parking: %v", result.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("long poll did not reach the broker wait boundary")
+	}
+
+	cancelServe()
+	select {
+	case <-gate.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not establish the receive drain barrier")
+	}
+	if _, err := eng.SendOne(ctx, "q", OutMessage{Body: []byte("after-barrier")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-receiveDone:
+		if result.err != nil || len(result.messages) != 0 {
+			t.Fatalf("drained long poll = %+v, %v; want empty success", result.messages, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("long poll did not wake after the drain barrier")
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("clean shutdown returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after draining the parked receive")
+	}
+	peeked, err := eng.Peek(ctx, "q", PeekOpts{Max: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peeked) != 1 || string(peeked[0].Body) != "after-barrier" {
+		t.Fatalf("message sent after the drain barrier was claimed: %+v", peeked)
+	}
+}
+
 func TestReceiverSurvivesBrokerRestart(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "restart.db")
