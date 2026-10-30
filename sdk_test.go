@@ -907,7 +907,14 @@ func TestQueueLockDurationValidationBeforeTransport(t *testing.T) {
 	}
 	defer client.Close()
 
-	invalid := []time.Duration{-time.Nanosecond, time.Nanosecond, time.Millisecond, time.Second - time.Nanosecond}
+	invalid := []time.Duration{
+		-time.Nanosecond,
+		time.Nanosecond,
+		time.Millisecond,
+		time.Second - time.Nanosecond,
+		time.Hour + time.Nanosecond,
+		time.Duration(1<<63 - 1),
+	}
 	for i, lock := range invalid {
 		err := client.CreateQueue(ctx, fmt.Sprintf("remote-invalid-%d", i), mqlite.QueueConfig{LockDuration: lock})
 		if !errors.Is(err, mqlite.ErrInvalidArgument) {
@@ -923,8 +930,11 @@ func TestQueueLockDurationValidationBeforeTransport(t *testing.T) {
 	if err := client.CreateQueue(ctx, "remote-minimum", mqlite.QueueConfig{LockDuration: time.Second}); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(encoded, []int64{0, 1_000}) {
-		t.Fatalf("encoded lock durations = %v, want [0 1000]", encoded)
+	if err := client.CreateQueue(ctx, "remote-maximum", mqlite.QueueConfig{LockDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, []int64{0, 1_000, 3_600_000}) {
+		t.Fatalf("encoded lock durations = %v, want [0 1000 3600000]", encoded)
 	}
 
 	embedded, err := mqlite.OpenEmbedded(ctx, ":memory:", mqlite.WithoutBackground())
@@ -942,6 +952,9 @@ func TestQueueLockDurationValidationBeforeTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := embedded.CreateQueue(ctx, "embedded-minimum", mqlite.QueueConfig{LockDuration: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if err := embedded.CreateQueue(ctx, "embedded-maximum", mqlite.QueueConfig{LockDuration: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 }

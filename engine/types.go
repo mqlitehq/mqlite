@@ -78,11 +78,17 @@ var (
 	ErrInvalidArgument = errors.New("mqlite: invalid argument")
 )
 
+const (
+	defaultQueueLockDurationMs int64 = 30_000
+	minQueueLockDurationMs     int64 = 1_000
+	maxQueueLockDurationMs     int64 = 60 * 60 * 1_000
+)
+
 // QueueConfig configures a queue or subscription (entity-level defaults).
 // Zero values mean "use the documented default".
 type QueueConfig struct {
 	Kind               string       // "queue" (default) or "subscription"
-	LockDurationMs     int64        // Peek-Lock duration; 0 -> 30000, otherwise >=1000
+	LockDurationMs     int64        // Peek-Lock duration; 0 -> 30000, otherwise 1000..3600000
 	MaxDeliveryCount   int          // ordinary claim budget; 0 -> 10, and the final claim remains usable
 	DefaultTTLMs       int64        // default and ceiling for message TTL; 0 -> unlimited
 	DeadLetterOnExpire *bool        // nil -> true

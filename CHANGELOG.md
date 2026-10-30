@@ -51,17 +51,20 @@ upgrade notes before replacing a broker.
   caller cancellation interrupts every wait. Renew and settlement retry behavior
   is unchanged.
 
-### Reject unsafe queue lock durations (MQLITE-138)
+### Bound queue lock durations (MQLITE-138)
 
-- Reject negative and subsecond nonzero Peek-Lock durations when a queue or
-  subscription backing queue is created or explicitly reconfigured. Zero still
-  selects the 30-second default; 1 second is the minimum explicit duration.
+- Reject negative, subsecond, and over-one-hour Peek-Lock durations when a queue
+  or subscription backing queue is created or explicitly reconfigured. Zero
+  still selects the 30-second default; explicit durations must be from 1 second
+  through 1 hour, inclusive.
 - Validate the public Go SDK's `time.Duration` before converting it to
-  milliseconds, so values such as `1ns` cannot be truncated to zero and silently
-  become the default. Remote validation happens before any HTTP request.
-- Keep existing databases compatible: a legacy subsecond queue remains readable
-  and usable after upgrade, but its next explicit configuration update must select
-  zero or at least 1 second.
+  milliseconds, so values such as `1ns` cannot be truncated to zero and values
+  above 1 hour cannot create effectively stranded deliveries. Remote validation
+  happens before any HTTP request.
+- Keep existing databases compatible: a legacy queue outside the new range
+  remains readable and usable after upgrade, but its next explicit configuration
+  update must select zero or a duration from 1 second through 1 hour. Upgrading or
+  reconfiguring a queue never shortens a `locked_until` deadline already granted.
 
 ### Preserve live broker leases across restart (MQLITE-137)
 

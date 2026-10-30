@@ -100,6 +100,45 @@ func TestLocalCommandsPreserveLiveBrokerLease(t *testing.T) {
 	}
 }
 
+func TestCreateQueueRejectsInvalidLockBeforeDial(t *testing.T) {
+	t.Run("local database", func(t *testing.T) {
+		resetGlobals(t)
+		dbPath := filepath.Join(t.TempDir(), "must-not-exist.db")
+		t.Setenv("MQLITE_ENDPOINT", "")
+		t.Setenv("MQLITE_DB", "file:"+dbPath)
+
+		for _, value := range []string{"-1s", "500ms", "2h"} {
+			err := cmdCreateQueue(context.Background(), []string{"q", "--lock", value})
+			if !errors.Is(err, mqlite.ErrInvalidArgument) || !strings.Contains(err.Error(), "between 1s and 1h") {
+				t.Errorf("--lock %s error = %v, want clear ErrInvalidArgument", value, err)
+			}
+		}
+		for _, path := range []string{dbPath, dbPath + ".lock", dbPath + "-wal", dbPath + "-shm"} {
+			if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("invalid --lock touched %s: %v", path, statErr)
+			}
+		}
+	})
+
+	t.Run("remote broker", func(t *testing.T) {
+		resetGlobals(t)
+		var calls atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			calls.Add(1)
+		}))
+		defer ts.Close()
+		t.Setenv("MQLITE_ENDPOINT", ts.URL)
+
+		err := cmdCreateQueue(context.Background(), []string{"q", "--lock", "2h"})
+		if !errors.Is(err, mqlite.ErrInvalidArgument) {
+			t.Fatalf("invalid remote --lock error = %v, want ErrInvalidArgument", err)
+		}
+		if got := calls.Load(); got != 0 {
+			t.Fatalf("invalid --lock made %d remote requests, want none", got)
+		}
+	})
+}
+
 // P1-4: after a `--` terminator every remaining token is a literal positional, so a message
 // body keeps its flag-looking words and --output is not hijacked.
 func TestParseInterspersedDashDash(t *testing.T) {

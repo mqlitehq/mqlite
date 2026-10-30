@@ -176,6 +176,15 @@ func TestServerAuthAndErrors(t *testing.T) {
 	check("minimum lock duration", http.MethodPost, wire.PathCreateQueue, "secret",
 		jsonOf(wire.CreateQueueRequest{Name: "minimum-lock", Config: wire.QueueConfigJSON{LockDurationMs: 1000}}),
 		http.StatusOK, "")
+	check("maximum lock duration", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "maximum-lock", Config: wire.QueueConfigJSON{LockDurationMs: 3_600_000}}),
+		http.StatusOK, "")
+	check("overlong lock duration", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "overlong-lock", Config: wire.QueueConfigJSON{LockDurationMs: 3_600_001}}),
+		http.StatusBadRequest, "invalid_argument")
+	check("maximum integer lock duration", http.MethodPost, wire.PathCreateQueue, "secret",
+		jsonOf(wire.CreateQueueRequest{Name: "integer-max-lock", Config: wire.QueueConfigJSON{LockDurationMs: 9_223_372_036_854_775_807}}),
+		http.StatusBadRequest, "invalid_argument")
 	check("valid create queue", http.MethodPost, wire.PathCreateQueue, "secret",
 		jsonOf(wire.CreateQueueRequest{Name: "vq", Config: wire.QueueConfigJSON{OrderingMode: "group_fifo"}}),
 		http.StatusOK, "")

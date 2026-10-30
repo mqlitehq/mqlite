@@ -262,8 +262,8 @@ func validateQueueConfig(name string, cfg QueueConfig) error {
 	if err := validateAddressName("queue", name); err != nil {
 		return err
 	}
-	if cfg.LockDurationMs < 0 || cfg.LockDurationMs > 0 && cfg.LockDurationMs < 1000 {
-		return fmt.Errorf("%w: queue lock duration must be zero (30000ms default) or at least 1000ms", ErrInvalidArgument)
+	if cfg.LockDurationMs < 0 || cfg.LockDurationMs > 0 && (cfg.LockDurationMs < minQueueLockDurationMs || cfg.LockDurationMs > maxQueueLockDurationMs) {
+		return fmt.Errorf("%w: queue lock duration must be zero (30s default) or between 1s and 1h", ErrInvalidArgument)
 	}
 	switch cfg.Kind {
 	case "", "queue", "subscription":
@@ -387,7 +387,7 @@ func (e *Engine) createQueueTx(ctx context.Context, tx *txn, name string, cfg Qu
 	}
 	lock := cfg.LockDurationMs
 	if lock == 0 {
-		lock = 30000
+		lock = defaultQueueLockDurationMs
 	}
 	maxdc := cfg.MaxDeliveryCount
 	if maxdc <= 0 {
