@@ -259,8 +259,9 @@ The managed Receiver replays transient Receive calls with the same attempt ID an
 replays the exact Complete or Abandon request when its acknowledgement is lost.
 The first transient Receive replay adds no client-generated delay unless a valid
 HTTP 429/503 `Retry-After` requires one; continued failures use equal-jitter
-exponential backoff capped at three seconds. `Retry-After` is a lower bound and
-may ask for a longer wait, while cancellation interrupts the wait. An absolute
+exponential backoff capped at three seconds. `Retry-After` may raise an individual
+wait up to 60 seconds; when it does, the error handler is called before waiting,
+including on the first failure. Cancellation interrupts the wait. An absolute
 retry date is measured from the same response's parseable `Date`, or from the
 local response receipt time when that header is not usable. A successful Receive
 starts the next round with a fresh attempt ID. Renewal and settlement use their
