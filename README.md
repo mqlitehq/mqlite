@@ -280,10 +280,11 @@ wall clock. Older brokers fall back to HTTP `Date`; if neither clock observation
 is available, the Receiver confirms ownership before dispatch and uses a bounded
 250ms conservative cadence instead of scheduling from the foreign absolute
 deadline. New and reconfigured queues therefore accept either `0` (the 30-second
-default) or a lock duration of at least 1 second. Legacy databases containing a
-subsecond queue remain readable, but a managed Receiver may fail closed when it
-cannot safely renew that lease. Preserve at least one time header and keep host
-clocks synchronized for raw lease handling and older clients.
+default) or a lock duration from 1 second through 1 hour. Legacy databases
+containing a duration outside that range remain readable, but a managed Receiver
+may fail closed when it cannot safely renew a very short lease. Preserve at least
+one time header and keep host clocks synchronized for raw lease handling and older
+clients.
 
 The remote client requires a complete semantic acknowledgement even when HTTP
 returns 2xx. An invalid acknowledgement for Send, Complete/Abandon/Reject/Defer

@@ -59,7 +59,7 @@ func TestQueueLockDurationValidation(t *testing.T) {
 	ctx := context.Background()
 	e, _ := testEngine(t)
 
-	for _, lock := range []int64{-1, 1, 999} {
+	for _, lock := range []int64{-1, 1, 999, 3_600_001, 9_223_372_036_854_775_807} {
 		name := fmt.Sprintf("invalid-%d", lock)
 		err := e.CreateQueue(ctx, name, QueueConfig{LockDurationMs: lock})
 		if !errors.Is(err, ErrInvalidArgument) {
@@ -76,8 +76,11 @@ func TestQueueLockDurationValidation(t *testing.T) {
 
 	mustQueue(t, e, "default", QueueConfig{})
 	mustQueue(t, e, "minimum", QueueConfig{LockDurationMs: 1_000})
-	if err := e.CreateQueue(ctx, "default", QueueConfig{LockDurationMs: 999}); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("invalid reconfiguration = %v, want ErrInvalidArgument", err)
+	mustQueue(t, e, "maximum", QueueConfig{LockDurationMs: 3_600_000})
+	for _, lock := range []int64{999, 3_600_001, 9_223_372_036_854_775_807} {
+		if err := e.CreateQueue(ctx, "default", QueueConfig{LockDurationMs: lock}); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("invalid reconfiguration %d = %v, want ErrInvalidArgument", lock, err)
+		}
 	}
 	queues, err = e.ListQueues(ctx)
 	if err != nil {
@@ -87,23 +90,27 @@ func TestQueueLockDurationValidation(t *testing.T) {
 	for _, q := range queues {
 		got[q.Name] = q.LockDurationMs
 	}
-	if got["default"] != 30_000 || got["minimum"] != 1_000 {
-		t.Fatalf("stored lock durations = %v, want default=30000 minimum=1000", got)
+	if got["default"] != 30_000 || got["minimum"] != 1_000 || got["maximum"] != 3_600_000 {
+		t.Fatalf("stored lock durations = %v, want default=30000 minimum=1000 maximum=3600000", got)
 	}
 }
 
-func TestLegacySubsecondQueueRemainsReadable(t *testing.T) {
+func TestLegacyOutOfRangeQueuesRemainReadable(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "legacy-short-lock.db")
+	path := filepath.Join(t.TempDir(), "legacy-lock-range.db")
 	e, err := Open(ctx, Options{DB: "file:" + path, DisableBackground: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	mustQueue(t, e, "legacy", QueueConfig{})
+	mustQueue(t, e, "legacy-long", QueueConfig{})
 	if err := e.Subscribe(ctx, "events", "legacy-sub", nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.db.exec(ctx, `UPDATE queues SET lock_duration_ms=50 WHERE name IN ('legacy','legacy-sub')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `UPDATE queues SET lock_duration_ms=7200000 WHERE name='legacy-long'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.Close(); err != nil {
@@ -126,12 +133,12 @@ func TestLegacySubsecondQueueRemainsReadable(t *testing.T) {
 		}
 		got := make(map[string]int64)
 		for _, q := range queues {
-			if q.Name == "legacy" || q.Name == "legacy-sub" {
+			if q.Name == "legacy" || q.Name == "legacy-sub" || q.Name == "legacy-long" {
 				got[q.Name] = q.LockDurationMs
 			}
 		}
-		if len(got) != 2 || got["legacy"] != 50 || got["legacy-sub"] != 50 {
-			t.Fatalf("legacy lock durations = %v, want both queues at 50ms", got)
+		if len(got) != 3 || got["legacy"] != 50 || got["legacy-sub"] != 50 || got["legacy-long"] != 7_200_000 {
+			t.Fatalf("legacy lock durations = %v, want short queues at 50ms and long queue at 7200000ms", got)
 		}
 	}
 	assertLegacyLocks()
@@ -144,6 +151,9 @@ func TestLegacySubsecondQueueRemainsReadable(t *testing.T) {
 	}
 	if err := reopened.CreateQueue(ctx, "legacy", QueueConfig{LockDurationMs: 50}); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("legacy short-lock reconfiguration = %v, want ErrInvalidArgument", err)
+	}
+	if err := reopened.CreateQueue(ctx, "legacy-long", QueueConfig{LockDurationMs: 7_200_000}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("legacy long-lock reconfiguration = %v, want ErrInvalidArgument", err)
 	}
 	assertLegacyLocks()
 }

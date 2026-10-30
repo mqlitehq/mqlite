@@ -794,6 +794,11 @@ func cmdCreateQueue(ctx context.Context, args []string) error {
 	if len(pos) != 1 { // exact arity — a surplus positional is a typo, not something to ignore
 		return fmt.Errorf("usage: create-queue <name> [--lock 30s --max-delivery 10 --ttl 1h --dedup 5m --ordering standard --dlq-max-age 336h --dlq-max-count 1000 --dlq-max-bytes 10485760]")
 	}
+	// Validate before dial: an invalid local command must not create a database or
+	// lock sidecar merely to discover that its queue configuration is unusable.
+	if *lock < 0 || *lock > 0 && (*lock < time.Second || *lock > time.Hour) {
+		return fmt.Errorf("%w: --lock must be zero (30s default) or between 1s and 1h (got %s)", mqlite.ErrInvalidArgument, *lock)
+	}
 	c, err := dial(ctx)
 	if err != nil {
 		return err
