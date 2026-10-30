@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1323,11 +1324,12 @@ type tursoSoakLaneWindow struct {
 }
 
 type tursoSoakStorageOperation struct {
-	Operation string `json:"operation"`
-	Outcome   string `json:"outcome"`
-	ErrorCode string `json:"error_code"`
-	Count     uint64 `json:"count"`
-	Retries   uint64 `json:"retries"`
+	Operation string       `json:"operation"`
+	Outcome   string       `json:"outcome"`
+	ErrorCode string       `json:"error_code"`
+	Count     uint64       `json:"count"`
+	Retries   uint64       `json:"retries"`
+	LastError *ErrorDetail `json:"last_error,omitempty"`
 }
 
 type tursoSoakStorageWindow struct {
@@ -1363,6 +1365,7 @@ func tursoSoakStorageDelta(before, after StorageObservation) tursoSoakStorageWin
 		}
 		out.Operations = append(out.Operations, tursoSoakStorageOperation{
 			Operation: op.Operation, Outcome: op.Outcome, ErrorCode: op.ErrorCode, Count: count, Retries: retries,
+			LastError: cloneTursoSoakErrorDetail(op.LastError),
 		})
 	}
 	return out
@@ -1463,9 +1466,10 @@ func tursoSoakWindowPartial(final bool) bool {
 }
 
 type tursoSoakFailure struct {
-	Lane      string `json:"lane,omitempty"`
-	Operation string `json:"operation"`
-	Code      string `json:"code"`
+	Lane      string       `json:"lane,omitempty"`
+	Operation string       `json:"operation"`
+	Code      string       `json:"code"`
+	Detail    *ErrorDetail `json:"error,omitempty"`
 }
 
 func (f tursoSoakFailure) Error() string {
@@ -1475,8 +1479,30 @@ func (f tursoSoakFailure) Error() string {
 	return fmt.Sprintf("lane %s %s failed (%s)", f.Lane, f.Operation, f.Code)
 }
 
+func (f tursoSoakFailure) Is(target error) bool {
+	other, ok := target.(tursoSoakFailure)
+	if !ok {
+		return false
+	}
+	// Detail is diagnostic evidence, not part of the stable failure identity.
+	return f.Lane == other.Lane && f.Operation == other.Operation && f.Code == other.Code
+}
+
 func safeTursoSoakFailure(lane, operation string, err error) error {
-	return tursoSoakFailure{Lane: lane, Operation: operation, Code: storageErrorCode(err)}
+	return newTursoSoakFailure(lane, operation, err)
+}
+
+func newTursoSoakFailure(lane, operation string, err error) tursoSoakFailure {
+	detail := describeError(err, time.Now().UnixMilli())
+	return tursoSoakFailure{Lane: lane, Operation: operation, Code: storageErrorCode(err), Detail: &detail}
+}
+
+func cloneTursoSoakErrorDetail(detail *ErrorDetail) *ErrorDetail {
+	if detail == nil {
+		return nil
+	}
+	clone := *detail
+	return &clone
 }
 
 type tursoSoakLogHandler struct {
@@ -1612,6 +1638,7 @@ func tursoSoakMaintenanceFailure(m MaintenanceObservation) tursoSoakFailure {
 	if recent.Error.Category != "" {
 		failure.Code = recent.Error.Category
 	}
+	failure.Detail = cloneTursoSoakErrorDetail(&recent.Error)
 	return failure
 }
 
@@ -1825,6 +1852,16 @@ func (s tursoSoakSummary) markdown() []byte {
 	}
 	if s.Failure != nil {
 		fmt.Fprintf(&b, "\nFailure: %s\n", s.Failure.Error())
+		if detail := s.Failure.Detail; detail != nil {
+			fmt.Fprintf(&b, "Failure evidence: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+			if detail.HTTPStatus != 0 {
+				fmt.Fprintf(&b, " http_status=%d", detail.HTTPStatus)
+			}
+			if detail.SQLiteCode != 0 {
+				fmt.Fprintf(&b, " sqlite_code=%d", detail.SQLiteCode)
+			}
+			fmt.Fprintln(&b)
+		}
 	}
 	fmt.Fprintln(&b, "\nRemote physical database and WAL sizes are unavailable; null values are intentional.")
 	return []byte(b.String())
@@ -2433,7 +2470,7 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	})
 	cancelOpen()
 	if err != nil {
-		failure := tursoSoakFailure{Operation: "open", Code: storageErrorCode(err)}
+		failure := newTursoSoakFailure("", "open", err)
 		summary := tursoSoakSummary{
 			Status: "FAIL", RequestedDurationSeconds: cfg.Duration.Seconds(), ElapsedSeconds: time.Since(started).Seconds(),
 			WindowSeconds: cfg.Window.Seconds(), Failure: &failure,
@@ -2491,7 +2528,7 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	runner.lastMaintenance = terminalMaintenance
 	maintenanceErr := tursoSoakTerminalMaintenanceHealth(terminalMaintenance)
 	if closeErr != nil {
-		closeErr = tursoSoakFailure{Operation: "close", Code: storageErrorCode(closeErr)}
+		closeErr = newTursoSoakFailure("", "close", closeErr)
 	}
 	evidenceCloseErr := evidence.close()
 	backgroundErr := runner.failure()
@@ -2578,6 +2615,65 @@ func TestTursoSoakConfigurationGate(t *testing.T) {
 	t.Setenv(tursoSoakWindowEnv, "1ms")
 	if _, enabled, err := readTursoSoakConfig(); !enabled || err == nil {
 		t.Fatalf("short window: enabled=%v err=%v", enabled, err)
+	}
+}
+
+func TestTursoSoakFailureEvidenceIsSafeAndActionable(t *testing.T) {
+	raw := errors.New("request failed: error code 503: provider detail https://db.invalid/path token=top-secret bearer eyJhbGciOiJub25lIn0.eyJzZWNyZXQiOiJ2YWx1ZSJ9.signature SQL=SELECT-card_number message_body=customer-message-body")
+	err := safeTursoSoakFailure("group_fifo", "receive", raw)
+	var failure tursoSoakFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("failure type = %T, want tursoSoakFailure", err)
+	}
+	if failure.Code != "other" || failure.Detail == nil || failure.Detail.Category != "provider_unavailable" ||
+		failure.Detail.HTTPStatus != http.StatusServiceUnavailable || failure.Detail.Fingerprint == "" {
+		t.Fatalf("failure evidence = %+v", failure)
+	}
+	encoded, err := json.Marshal(failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"provider detail", "db.invalid", "top-secret", "eyJhbGciOiJub25lIn0",
+		"SELECT-card_number", "customer-message-body",
+	} {
+		if bytes.Contains(encoded, []byte(secret)) {
+			t.Fatalf("failure evidence leaked %q: %s", secret, encoded)
+		}
+	}
+	for _, useful := range []string{"provider_unavailable", `"http_status":503`, failure.Detail.Fingerprint} {
+		if !bytes.Contains(encoded, []byte(useful)) {
+			t.Fatalf("failure evidence omitted %q: %s", useful, encoded)
+		}
+	}
+	markdown := (tursoSoakSummary{Status: "FAIL", Failure: &failure}).markdown()
+	for _, useful := range []string{"category=provider_unavailable", "http_status=503", failure.Detail.Fingerprint} {
+		if !bytes.Contains(markdown, []byte(useful)) {
+			t.Fatalf("failure markdown omitted %q: %s", useful, markdown)
+		}
+	}
+	if bytes.Contains(markdown, []byte("top-secret")) {
+		t.Fatalf("failure markdown leaked provider text: %s", markdown)
+	}
+}
+
+func TestTursoSoakStorageDeltaKeepsSafeLastError(t *testing.T) {
+	detail := &ErrorDetail{AtMs: 123, Category: "connection", Message: "Database connection or transport failed.", Fingerprint: "abcdef"}
+	before := StorageObservation{Operations: []StorageOperation{{
+		Operation: "transaction", Outcome: "error", ErrorCode: "connection", Duration: DurationHistogram{},
+	}}}
+	after := StorageObservation{Operations: []StorageOperation{{
+		Operation: "transaction", Outcome: "error", ErrorCode: "connection",
+		Duration: DurationHistogram{Count: 1}, Retries: 2, LastError: detail,
+	}}}
+	delta := tursoSoakStorageDelta(before, after)
+	if len(delta.Operations) != 1 || delta.Operations[0].Count != 1 || delta.Operations[0].Retries != 2 ||
+		delta.Operations[0].LastError == nil || delta.Operations[0].LastError.Fingerprint != detail.Fingerprint {
+		t.Fatalf("storage delta = %+v", delta)
+	}
+	delta.Operations[0].LastError.Fingerprint = "changed"
+	if detail.Fingerprint != "abcdef" {
+		t.Fatal("storage delta aliases the source error detail")
 	}
 }
 
