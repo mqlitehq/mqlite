@@ -22,16 +22,21 @@ func newAttemptID() string {
 const (
 	receiveBackoffBase = 500 * time.Millisecond
 	receiveBackoffMax  = 3 * time.Second
-	renewRetryBase     = 50 * time.Millisecond
-	renewRetryMax      = 500 * time.Millisecond
-	settleRetryBase    = 50 * time.Millisecond
-	settleRetryMax     = 500 * time.Millisecond
-	settleTimeout      = 5 * time.Second
-	renewFallbackLease = 20 * time.Second
-	replayLeaseSafety  = 10 * time.Millisecond
-	renewMinimumDelay  = 50 * time.Millisecond
-	renewRTTMargin     = 10 * time.Millisecond
-	degradedClockError = "mqlite: broker time headers unavailable; lease scheduling is using degraded clock mode"
+	// A server or intermediary may advertise a much longer Retry-After than a
+	// long-lived consumer can safely honor without another liveness probe. Keep
+	// server pacing distinct from the generated reconnect cap, but bound one
+	// managed Receive wait so a stale or hostile hint cannot park the Receiver.
+	receiveRetryAfterMax = 60 * time.Second
+	renewRetryBase       = 50 * time.Millisecond
+	renewRetryMax        = 500 * time.Millisecond
+	settleRetryBase      = 50 * time.Millisecond
+	settleRetryMax       = 500 * time.Millisecond
+	settleTimeout        = 5 * time.Second
+	renewFallbackLease   = 20 * time.Second
+	replayLeaseSafety    = 10 * time.Millisecond
+	renewMinimumDelay    = 50 * time.Millisecond
+	renewRTTMargin       = 10 * time.Millisecond
+	degradedClockError   = "mqlite: broker time headers unavailable; lease scheduling is using degraded clock mode"
 	// Without broker time or a relative lease duration, a successful renewal
 	// whose absolute deadline is unusable locally cannot reveal its true
 	// remaining lifetime. Probe at a conservative bounded cadence, but give the
@@ -90,7 +95,7 @@ func jitterDuration(d time.Duration) time.Duration {
 // equalJitterDuration spreads a managed Receive retry across the upper half of
 // its exponential window. Unlike the older symmetric jitter used by renew and
 // settlement, it can never extend the generated delay beyond the configured
-// cap. A broker Retry-After hint is applied separately and may be longer.
+// cap. A broker Retry-After hint is applied separately with its own cap.
 func equalJitterDuration(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
@@ -205,11 +210,13 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 }
 
 // receiveRetryDelay returns the wait before replaying the current Receive
-// attempt. The first transient failure is replayed immediately to recover a
-// response that may have been lost after the broker committed the claim. Later
-// generated delays use equal-jitter exponential backoff capped at three seconds.
-// A valid Retry-After from HTTP 429/503 is a lower bound, not part of that cap.
-func (r *Receiver) receiveRetryDelay(failures int, err error) time.Duration {
+// attempt. The first transient failure adds no client-generated delay so a
+// response lost after a committed claim is replayed promptly. Later generated
+// delays use equal-jitter exponential backoff capped at three seconds.
+// A valid Retry-After from HTTP 429/503 can raise that generated delay, up to
+// receiveRetryAfterMax. The boolean reports whether the server hint raised the
+// delay, so even a first failure is observable before the Receiver waits.
+func (r *Receiver) receiveRetryDelay(failures int, err error) (time.Duration, bool) {
 	var delay time.Duration
 	if failures > 1 {
 		nominal := exponentialBackoff(receiveBackoffBase, receiveBackoffMax, failures-2)
@@ -221,10 +228,15 @@ func (r *Receiver) receiveRetryDelay(failures int, err error) time.Duration {
 			delay = receiveBackoffMax
 		}
 	}
-	if hint, ok := managedReceiveRetryAfter(err); ok && hint > delay {
-		return hint
+	if hint, ok := managedReceiveRetryAfter(err); ok {
+		if hint > receiveRetryAfterMax {
+			hint = receiveRetryAfterMax
+		}
+		if hint > delay {
+			return hint, true
+		}
 	}
-	return delay
+	return delay, false
 }
 
 func (r *Receiver) notify(err error) {
@@ -410,10 +422,10 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			}
 			hadTransientFailure = true
 			transientFailures++
-			if transientFailures > 1 {
+			delay, serverPaced := r.receiveRetryDelay(transientFailures, err)
+			if transientFailures > 1 || serverPaced {
 				r.notify(err)
 			}
-			delay := r.receiveRetryDelay(transientFailures, err)
 			if !r.receiveWait(rctx, delay) {
 				err = rctx.Err()
 				errAfterCancel = cancelled()

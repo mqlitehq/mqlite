@@ -393,10 +393,12 @@ results are not saved, and an expired record no longer binds the ID.
 
 The managed Go Receiver keeps that attempt ID across all transient retries in one
 Receive round. Its first transient failure adds no client-generated delay unless
-HTTP 429/503 supplies a valid `Retry-After` lower bound. Continued failures use
+HTTP 429/503 may supply a valid `Retry-After` pacing hint. Continued failures use
 equal-jitter exponential backoff with a 500 ms base and a three-second generated
-cap; a valid server hint may exceed the cap, and `Retry-After: 0` cannot remove
-later backoff. It accepts delta-seconds and HTTP-date forms. An absolute date uses
+cap. A valid hint may raise one wait up to 60 seconds; when it raises the generated
+delay, the error handler is called before waiting, including on the first failure.
+`Retry-After: 0` cannot remove later backoff. The Receiver accepts delta-seconds
+and HTTP-date forms. An absolute date uses
 the same response's parseable `Date`, otherwise the local response receipt time;
 malformed, negative, and overflowing values are ignored. Cancellation interrupts
 the wait. A successful response, including an empty batch, starts a fresh round

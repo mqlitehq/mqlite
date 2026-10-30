@@ -346,10 +346,12 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 - **9.9** A managed Receiver MUST retain one non-empty AttemptID across every
   transient retry of one Receive round. Its first transient failure MUST add no
   client-generated delay unless a valid HTTP 429/503 `Retry-After` provides a
-  positive lower bound. Later failures use equal-jitter exponential backoff with
-  a 500 ms base, doubling nominal windows and a three-second generated-delay cap;
-  a valid server lower bound MAY exceed that cap, while `Retry-After: 0` MUST NOT
-  erase later generated backoff. Delta-seconds and HTTP-date forms are accepted.
+  positive pacing hint. Later failures use equal-jitter exponential backoff with
+  a 500 ms base, doubling nominal windows and a three-second generated-delay cap.
+  A valid hint MAY raise one wait above that cap but MUST be limited to 60 seconds;
+  when it raises the generated delay, the error handler MUST be called before the
+  wait, including on the first failure. `Retry-After: 0` MUST NOT erase later
+  generated backoff. Delta-seconds and HTTP-date forms are accepted.
   An absolute date uses the same response's parseable `Date`, otherwise the local
   response receipt time; malformed, negative, or overflowing values are ignored.
   Every wait MUST be interruptible by the controlling context. An HTTP status is
@@ -358,7 +360,7 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   ends the round, resets its failure count, and gives the next round a fresh
   AttemptID. Renew and settlement retry policies MUST remain independent.
   *(receiver_internal_test.go: TestReceiverRetryScheduleKeepsAttemptAndResetsAfterSuccess,
-  TestReceiverRetryAfterIsManagedReceiveLowerBound, TestParseRetryAfter,
+  TestReceiverRetryAfterIsBoundedManagedReceivePacing, TestParseRetryAfter,
   TestManagedReceiverHonorsHTTPRetryAfterAndKeepsAttemptID,
   TestReceiverCancellationInterruptsRetryAfterWait,
   TestReceiverReturnsNonRetryableHTTPError)*

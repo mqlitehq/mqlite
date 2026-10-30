@@ -44,12 +44,14 @@ upgrade notes before replacing a broker.
   cap of three seconds. A successful response ends that replay round; the next
   Receive gets a fresh AttemptID and starts from the no-client-delay step again.
 - Honor valid `Retry-After` delta-seconds and HTTP-date values on HTTP 429/503 as
-  a managed Receive lower bound. Absolute retry dates use the same response's
+  managed Receive pacing hints. Absolute retry dates use the same response's
   parseable `Date` as their clock reference, otherwise the local response receipt
-  time. Server hints may exceed the local three-second cap, `Retry-After: 0`
-  cannot erase later backoff, malformed or overflowing hints are ignored, and
-  caller cancellation interrupts every wait. Renew and settlement retry behavior
-  is unchanged.
+  time. A hint may exceed the local three-second generated cap, but one wait is
+  limited to 60 seconds so stale gateway metadata cannot silently park a Receiver.
+  A hint that raises the generated delay is reported before waiting, including on
+  the first failure. `Retry-After: 0` cannot erase later backoff, malformed or
+  overflowing hints are ignored, and caller cancellation interrupts every wait.
+  Renew and settlement retry behavior is unchanged.
 
 ### Bound queue lock durations (MQLITE-138)
 
