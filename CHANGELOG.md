@@ -17,6 +17,18 @@ upgrade notes before replacing a broker.
 > older remote clients ignore the header, while programmatic brokers must add
 > `WithBrokerMode` before calling `Serve` so startup can preserve live leases.
 
+### Reject unsafe queue lock durations (MQLITE-138)
+
+- Reject negative and subsecond nonzero Peek-Lock durations when a queue or
+  subscription backing queue is created or explicitly reconfigured. Zero still
+  selects the 30-second default; 1 second is the minimum explicit duration.
+- Validate the public Go SDK's `time.Duration` before converting it to
+  milliseconds, so values such as `1ns` cannot be truncated to zero and silently
+  become the default. Remote validation happens before any HTTP request.
+- Keep existing databases compatible: a legacy subsecond queue remains readable
+  and usable after upgrade, but its next explicit configuration update must select
+  zero or at least 1 second.
+
 ### Preserve live broker leases across restart (MQLITE-137)
 
 - Add an explicit `WithBrokerMode` open option and require it for `Embedded.Serve`.

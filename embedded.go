@@ -388,7 +388,11 @@ func (e *Embedded) DeleteSubscriptionWithOptions(ctx context.Context, topic, nam
 }
 
 func (e *Embedded) CreateQueue(ctx context.Context, name string, cfg QueueConfig) error {
-	return e.eng.CreateQueue(ctx, name, cfg.toEngine())
+	ec, err := cfg.toEngine()
+	if err != nil {
+		return err
+	}
+	return e.eng.CreateQueue(ctx, name, ec)
 }
 
 func (e *Embedded) Subscribe(ctx context.Context, topic, name string, f *Filter) error {

@@ -44,10 +44,11 @@ values replace earlier ones, while repeated object and map values may merge.
   public absolute deadline is retained, but the managed Receiver reports one
   diagnostic, confirms the lease before dispatch, and keeps a bounded
   untrusted-clock cadence instead of using that foreign timestamp as a local
-  schedule. This no-header fallback cannot prove a lease shorter than its 250ms
-  cadence plus network latency; preserve one time header, or use a lock duration
-  well above that bound (1s or more is recommended). Raw HTTP callers should map
-  broker time or synchronize clocks.
+  schedule. New and reconfigured queues accept either `0` (the 30-second default)
+  or a lock duration of at least 1 second. Legacy databases containing a
+  subsecond queue remain readable, but this no-header fallback may fail closed
+  when it cannot prove enough lease remains. Raw HTTP callers should preserve one
+  time header, map broker time, or synchronize clocks.
   CORS-enabled brokers expose this header to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
@@ -511,8 +512,10 @@ lease below the 50 ms minimum cadence fails closed instead of entering a renewal
 brokers use HTTP `Date` when available; without either time header they retain the public absolute
 deadline but never use it as a managed local schedule. The Receiver emits one diagnostic, confirms
 ownership before dispatch, and keeps a conservative 250ms cadence. Because no relative lease
-duration is available in that fallback, preserve one time header or configure the lock well above
-250ms plus network latency (1s or more is recommended).
+duration is available in that fallback, preserve one time header. New and
+reconfigured queues enforce a minimum explicit lock duration of 1 second; zero
+selects the 30-second default. Legacy subsecond configurations remain readable
+but can fail closed when safe renewal cannot be proven.
 Raw `RenewBatch` callers should map the broker clock likewise (or keep clocks synchronized) and
 must not turn clock offset alone into `ErrLockLost`. (If the write itself outlived the lock, you get
 `ok=false` rather than a lock you never really held.) Like single-message Renew, the batch
@@ -737,7 +740,7 @@ Config is **queue-level**: it's set here, not per `Send`/`Receive`.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `kind` | string | `queue` | `queue` (normal). `subscription` can reconfigure an existing legitimate backing queue through the advanced engine/wire surface, but cannot create a backing queue without a topic mapping; use `Subscribe` to create one. |
-| `lock_duration_ms` | int (ms) | `30000` (30s) | the **peek-lock window**. At `locked_until_ms`, new settlement and renewal fail immediately; the reaper later returns the row to `active` below the delivery limit or dead-letters it at the limit. `Renew` uses this duration to extend the same live attempt; the committed deadline is never earlier than the existing one. There is **no per-`Receive` override** — it's fixed by the queue. `0` → the 30s default. |
+| `lock_duration_ms` | int (ms) | `30000` (30s) | the **peek-lock window**. At `locked_until_ms`, new settlement and renewal fail immediately; the reaper later returns the row to `active` below the delivery limit or dead-letters it at the limit. `Renew` uses this duration to extend the same live attempt; the committed deadline is never earlier than the existing one. There is **no per-`Receive` override** — it's fixed by the queue. `0` selects the 30s default; an explicit value must be at least `1000`. Existing databases with an older subsecond value still open, but an explicit reconfiguration must satisfy this minimum. |
 | `max_delivery_count` | int | `10` | ordinary delivery-attempt budget. The Nth ordinary Peek-Lock `Receive` is a usable final attempt; it is dead-lettered with `reason=MaxDeliveryCountExceeded` only if that locked attempt is abandoned, its lease expires, or it is recovered on startup at `delivery_count >= N`. `ReceiveDeferred` increments the count but currently does not use N as an admission check. `0` → the default of 10. |
 | `default_ttl_ms` | int (ms) | `0` = unlimited | default **and ceiling** for message TTL. A shorter positive Send `ttl_ms` is honored; a longer one is capped. For a scheduled Send the effective TTL starts at scheduled visibility. On expiry normal delivery ends and the message goes to the DLQ or is discarded — see `dead_letter_on_expire`. |
 | `dead_letter_on_expire` | bool | `true` | on TTL expiry: `true` → move to the DLQ; `false` → discard silently. |
