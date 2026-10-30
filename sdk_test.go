@@ -887,9 +887,23 @@ func TestRemoteInvalidArgumentPropagates(t *testing.T) {
 // actually binds: WithReady fires on a good bind (and cancelling ctx shuts down cleanly),
 // but a bind failure returns an error WITHOUT firing ready — so automation waiting for
 // "ready" never connects to a broker that failed to come up (MQLITE-88).
+func TestServeRequiresBrokerMode(t *testing.T) {
+	eng, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = eng.Serve(ctx, "127.0.0.1:0")
+	if err == nil || !strings.Contains(err.Error(), "WithBrokerMode") {
+		t.Fatalf("Serve without broker mode = %v, want actionable configuration error", err)
+	}
+}
+
 func TestServeReadyAfterBind(t *testing.T) {
 	ctx := context.Background()
-	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"), mqlite.WithBrokerMode())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -939,7 +953,7 @@ func TestServeReadyAfterBind(t *testing.T) {
 // start another claim round, and Serve must be free to close the engine promptly.
 func TestServeShutdownCancelsLongPoll(t *testing.T) {
 	ctx := context.Background()
-	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"))
+	eng, err := mqlite.OpenEmbedded(ctx, "file:"+filepath.Join(t.TempDir(), "mq.db"), mqlite.WithBrokerMode())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1049,7 +1063,7 @@ func TestServeShutdownCancelsLongPoll(t *testing.T) {
 func TestServeMetricsToggle(t *testing.T) {
 	for _, mode := range []string{"default", "off", "on"} {
 		t.Run(mode, func(t *testing.T) {
-			embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
+			embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground(), mqlite.WithBrokerMode())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1129,7 +1143,7 @@ func TestServeMetricsToggle(t *testing.T) {
 	}
 	for _, tokens := range [][]string{nil, {" ", ""}} {
 		t.Run("requires-auth", func(t *testing.T) {
-			embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
+			embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground(), mqlite.WithBrokerMode())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1594,8 +1608,8 @@ func TestReleaseDocsPinLatestDatedRelease(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "125f4b5247864a6518d50a738da11ee5086fb8a4125169cd1eaea07ef543723a",
-		"concepts.html": "1aaab8fd4d8b845fb73376a6c7a36c8ef6b424da3f056fad58509a032acfb2ca",
+		"concepts.md":   "5a314857812b2153bce0cec3ee9060af50c4c3c399d0443a2e405129e5461922",
+		"concepts.html": "bb448de15db060614c791e59d9d346c94fb27c3987e233b7e87373f71a2f3af3",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {
@@ -3123,7 +3137,7 @@ func TestSDKObserveRejectsInvalidSuccessAndPreservesErrors(t *testing.T) {
 }
 
 func TestSDKMonitorTokenServeValidation(t *testing.T) {
-	embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground())
+	embedded, err := mqlite.OpenEmbedded(context.Background(), ":memory:", mqlite.WithoutBackground(), mqlite.WithBrokerMode())
 	if err != nil {
 		t.Fatal(err)
 	}

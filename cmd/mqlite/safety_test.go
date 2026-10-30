@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -298,17 +300,34 @@ func TestPurgeAllRejectsBounds(t *testing.T) {
 	}
 }
 
-// lock duration and require the settle to still succeed.
+// A slow settlement must not outlive its Peek-Lock lease. Synchronize the slow
+// CompleteBatch with the first successful renewal so this test exercises renewal
+// during settlement rather than racing the renew goroutine's first scheduling on
+// a loaded runner.
 func TestRenewalSpansSettlement(t *testing.T) {
 	resetGlobals(t)
 	ctx := context.Background()
+	const (
+		lockDuration = 5 * time.Second
+		settleDelay  = 6 * time.Second
+	)
+	// Production leases use epoch timestamps, but a host wall-clock correction is
+	// unrelated to this delayed-settlement contract. Keep an epoch value while the
+	// test advances from Go's monotonic clock, as the larger batch test below does.
+	clockOrigin := time.Now()
+	stableEpoch := func() int64 {
+		return clockOrigin.UnixMilli() + time.Since(clockOrigin).Milliseconds()
+	}
 	// Background loops ON: the reaper is what reclaims an expired lock.
-	eng, err := engine.Open(ctx, engine.Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db")})
+	eng, err := engine.Open(ctx, engine.Options{
+		DB:  "file:" + filepath.Join(t.TempDir(), "mq.db"),
+		Now: stableEpoch,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer eng.Close()
-	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: 2000}); err != nil {
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{LockDurationMs: lockDuration.Milliseconds()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := eng.SendOne(ctx, "q", engine.OutMessage{Body: []byte("slow-link")}); err != nil {
@@ -316,9 +335,40 @@ func TestRenewalSpansSettlement(t *testing.T) {
 	}
 
 	inner := server.New(eng, nil).Handler()
+	firstRenewed := make(chan struct{})
+	var firstRenewedOnce sync.Once
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == wire.PathCompleteBatch {
-			time.Sleep(3 * time.Second) // > the 2s lock: renewal must carry the lease across it
+		switch r.URL.Path {
+		case wire.PathRenewBatch:
+			// Observe a committed, successful renewal before allowing the delayed
+			// settlement to start its lease-spanning wait. Recording also lets the
+			// barrier distinguish HTTP success from a failed renewal request.
+			recorded := httptest.NewRecorder()
+			inner.ServeHTTP(recorded, r)
+			var response wire.RenewBatchResponse
+			if recorded.Code == http.StatusOK &&
+				json.Unmarshal(recorded.Body.Bytes(), &response) == nil &&
+				len(response.Results) == 1 && response.Results[0].Ok {
+				firstRenewedOnce.Do(func() { close(firstRenewed) })
+			}
+			for name, values := range recorded.Header() {
+				w.Header()[name] = append([]string(nil), values...)
+			}
+			w.WriteHeader(recorded.Code)
+			_, _ = w.Write(recorded.Body.Bytes())
+			return
+		case wire.PathCompleteBatch:
+			select {
+			case <-firstRenewed:
+			case <-r.Context().Done():
+				return
+			case <-time.After(15 * time.Second):
+				http.Error(w, "timed out waiting for the first successful lease renewal", http.StatusGatewayTimeout)
+				return
+			}
+			// The first renewal alone expires before this wait ends. Complete can
+			// succeed only if renewal continues while its RPC remains in flight.
+			time.Sleep(settleDelay)
 		}
 		inner.ServeHTTP(w, r)
 	}))

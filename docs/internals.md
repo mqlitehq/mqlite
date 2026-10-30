@@ -305,18 +305,25 @@ allowance. Those two rows per subscription still consume the shared 4,096-row
 budget. Exact affected-row checks keep this safe even when foreign keys are off.
 Subscriptions with any retained state remain on the ordinary fair row/byte path.
 
-**Crash recovery is one statement.** On `Open`, every `locked` row is an orphan
-of a previous process (locks are rows, remember) and is reclaimed — back to
-`active`, or straight to the dead-letter state if it died on its final allowed
-attempt. Same rule as the reaper; a crash never buys an extra delivery.
+**Startup lease recovery is one statement.** Ownership mode decides which rows
+are orphans. Plain embedded mode reclaims every `locked` row because its handler
+lived in the engine process and cannot survive it. Broker mode preserves rows
+whose `locked_until` is still in the future because remote handlers and their
+persisted fencing tokens can outlive the broker process; it reclaims only expired
+rows on active resources. Resource lifecycle and message TTL remain authoritative.
+Every reclaimed row returns to `active`, or goes straight to the dead-letter state
+if it used its final allowed attempt. The rule is the same as the reaper, and
+preserving a live attempt does not increment `delivery_count`.
 
 **Ordinary retries are bounded by data.** `delivery_count` is incremented *at
 claim time* inside the claim UPDATE itself, so no failure mode can lose count.
 Reaching the maximum does not interrupt that claim: with `max_delivery_count=10`,
-ordinary Peek-Lock claim 10 is a full final attempt that can be renewed repeatedly and
-completed. If it is Abandoned, its lock expires, or startup recovery finds it
-still locked, that transition sees `delivery_count >= max_delivery_count` and
-moves it to `state='dead_lettered'` instead of allowing ordinary Peek-Lock claim 11.
+ordinary Peek-Lock claim 10 is a full final attempt that can be renewed repeatedly
+and completed. If it is Abandoned, its lock expires, or embedded startup recovery
+finds it orphaned, that transition sees `delivery_count >= max_delivery_count` and
+moves it to `state='dead_lettered'` instead of allowing ordinary Peek-Lock claim
+11. Broker startup preserves that final attempt until its deadline; expiry then
+applies the same transition.
 `ReceiveDeferred` is the explicit exception described in §4: it increments the
 count without a maximum admission check. The DLQ is not a separate queue, just a
 state you can `Peek`, `Redrive` (back to active, count reset) or `Purge`, with
@@ -351,10 +358,11 @@ to make the *window* small and the *retries* safe:
   claimed batch is recorded under that id (same transaction again); a retry of
   the same Peek-Lock attempt replays the exact same messages and lock tokens only
   while every token still owns a live lease. Replay validates the whole batch in
-  one query. If startup recovery, lease expiry, or settlement invalidated any
-  token, the same transaction removes the stale response and makes a safe new
-  claim; a stale or partially owned batch never reaches the caller. Tokenless
-  ReceiveAndDelete responses remain replayable after their message rows are gone.
+  one query. If embedded startup recovery, broker-mode recovery of an expired
+  lease, ordinary lease expiry, or settlement invalidated any token, the same
+  transaction removes the stale response and makes a safe new claim; a stale or
+  partially owned batch never reaches the caller. Tokenless ReceiveAndDelete
+  responses remain replayable after their message rows are gone.
 - **`dedup`** — on the producer side, a `message_id` within the queue's dedup
   window collapses resends into the original row (no id? the body's SHA-256 is
   used as a content-addressed key). Same id with a *different* body is a loud
@@ -419,8 +427,9 @@ Every claim in this document is enforced by something that fails loudly:
   exceeds its delivery bound.
 - **A crash-injection layer** — a real worker process, hard-killed (`SIGKILL`)
   mid-transaction and restarted, proving the outbox is atomic across the crash
-  and every producer commit acknowledged to the harness survives. `Open` reclaims orphaned locks
-  to active or DLQ at the delivery limit. It re-execs the test binary, so
+  and every producer commit acknowledged to the harness survives. The crash
+  worker uses embedded recovery, which reclaims its orphaned locks to active or
+  DLQ at the delivery limit. It re-execs the test binary, so
   it is gated behind the `crash_injection` build tag and run on Linux in its own
   CI job: `make crash`, with the race detector, separately from the default package
   matrix. This tests *process* death, not power loss.

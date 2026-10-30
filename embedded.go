@@ -18,10 +18,12 @@ import (
 )
 
 // Embedded runs the queue engine in-process (like goqite), exposing the same
-// method set as the remote Client plus same-DB transactional enqueue (Tx) and a
-// one-line upgrade to a network broker (Serve). See design §4.5.
+// method set as the remote Client plus same-DB transactional enqueue (Tx). When
+// opened with WithBrokerMode, it can expose the same engine as a network broker
+// through Serve. See design §4.5.
 type Embedded struct {
-	eng *engine.Engine
+	eng        *engine.Engine
+	brokerMode bool
 }
 
 type embeddedConfig struct {
@@ -35,6 +37,7 @@ type embeddedConfig struct {
 	dlqMaxCount       int
 	dlqMaxBytes       int64
 	maxSubscriptions  int
+	brokerMode        bool
 }
 
 // EmbeddedOption configures OpenEmbedded.
@@ -65,6 +68,17 @@ func WithMaxMessageBytes(n int64) EmbeddedOption {
 // Zero uses the engine default.
 func WithMaxSubscriptions(n int) EmbeddedOption {
 	return func(c *embeddedConfig) { c.maxSubscriptions = n }
+}
+
+// WithBrokerMode configures OpenEmbedded for a network broker whose remote
+// consumers can outlive this process. On reopen, unexpired Peek-Lock leases on
+// active resources and their fencing tokens remain valid; only expired locks are
+// recovered. Resource lifecycle and message TTL still apply. Pass this option
+// whenever the returned engine will be served with Serve. Plain embedded mode
+// intentionally keeps immediate orphan recovery because its handlers die with
+// the engine.
+func WithBrokerMode() EmbeddedOption {
+	return func(c *embeddedConfig) { c.brokerMode = true }
 }
 
 // WithLogger routes background-loop failures to lg (nil -> slog.Default()).
@@ -104,22 +118,23 @@ func OpenEmbedded(ctx context.Context, dbDSN string, opts ...EmbeddedOption) (*E
 		o(&cfg)
 	}
 	eng, err := engine.Open(ctx, engine.Options{
-		DB:                dbDSN,
-		AuthToken:         cfg.authToken,
-		Now:               cfg.now,
-		DisableBackground: cfg.disableBackground,
-		MaxMessageBytes:   cfg.maxMessageBytes,
-		MaxSubscriptions:  cfg.maxSubscriptions,
-		Logger:            cfg.logger,
-		Synchronous:       cfg.synchronous,
-		DLQMaxAgeMs:       cfg.dlqMaxAgeMs,
-		DLQMaxCount:       cfg.dlqMaxCount,
-		DLQMaxBytes:       cfg.dlqMaxBytes,
+		DB:                      dbDSN,
+		AuthToken:               cfg.authToken,
+		Now:                     cfg.now,
+		DisableBackground:       cfg.disableBackground,
+		PreserveUnexpiredLeases: cfg.brokerMode,
+		MaxMessageBytes:         cfg.maxMessageBytes,
+		MaxSubscriptions:        cfg.maxSubscriptions,
+		Logger:                  cfg.logger,
+		Synchronous:             cfg.synchronous,
+		DLQMaxAgeMs:             cfg.dlqMaxAgeMs,
+		DLQMaxCount:             cfg.dlqMaxCount,
+		DLQMaxBytes:             cfg.dlqMaxBytes,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Embedded{eng: eng}, nil
+	return &Embedded{eng: eng, brokerMode: cfg.brokerMode}, nil
 }
 
 // Engine exposes the underlying engine (advanced/embedded use).
@@ -558,8 +573,13 @@ func WithReady(fn func()) ServeOption {
 	return func(c *serveConfig) { c.ready = fn }
 }
 
-// Serve exposes this engine as an HTTP broker until ctx is canceled.
+// Serve exposes this engine as an HTTP broker until ctx is canceled. The engine
+// must have been opened with WithBrokerMode so a restart cannot revoke leases
+// still owned by remote consumers.
 func (e *Embedded) Serve(ctx context.Context, addr string, opts ...ServeOption) error {
+	if !e.brokerMode {
+		return errors.New("mqlite: Serve requires OpenEmbedded with WithBrokerMode")
+	}
 	var sc serveConfig
 	for _, o := range opts {
 		o(&sc)

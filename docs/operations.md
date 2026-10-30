@@ -43,18 +43,17 @@ Still quiesce clients and avoid overlapping brokers during the binary replacemen
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
   when retrying within their documented retention windows; do not treat an HTTP
   timeout as proof that a write failed. A Peek-Lock AttemptID replays only while
-  its entire saved batch still owns live leases; after restart or lease loss the
-  broker invalidates that stale response and safely re-evaluates eligible work in
-  a fresh claim instead of returning an obsolete lock token. Reuse that AttemptID
-  only when the original Receive response was not observed. Once a response is
-  available, retain its tokens and use a new AttemptID for later Receive calls;
-  invalidating a partially stale cached batch deliberately leaves its other live
-  leases with the original caller rather than creating concurrent delivery. For
-  a planned broker replacement, quiesce new receives and let client handlers
-  settle before stopping the old broker. Startup recovery invalidates every
-  remaining lock immediately; an old remote handler
-  can still finish its external side effect, but can no longer settle that token,
-  so the work may be processed again.
+  its entire saved batch still owns live leases. A broker restart preserves those
+  unexpired leases and tokens; after lease expiry or settlement, the broker
+  invalidates a stale response and safely re-evaluates eligible work in a fresh
+  claim instead of returning obsolete ownership. Reuse that AttemptID only when
+  the original Receive response was not observed. Once a response is available,
+  retain its tokens and use a new AttemptID for later Receive calls; invalidating
+  a partially stale cached batch deliberately leaves its other live leases with
+  the original caller rather than creating concurrent delivery. For a planned
+  broker replacement, keep the outage shorter than the remaining leases, or
+  quiesce new receives and let handlers settle first. A lease that expires during
+  the outage follows normal redelivery/final-attempt DLQ rules.
 
 The next three boundaries apply to v0.4.0 and later. v0.3.2 has
 the complete active-only `ListSubscriptions` operation, but it does not provide
@@ -124,13 +123,31 @@ the engine's operation admission, joins admitted database work and background
 maintenance, closes the database, and releases the local file lock. Engine and
 diagnostic-log close failures make the command exit non-zero.
 
+Broker startup preserves an unexpired Peek-Lock lease on an active resource, its
+fencing token and its delivery count. Resource lifecycle and message TTL remain
+authoritative. A remote handler that outlives a short broker restart can
+therefore renew or complete the same delivery after reconnecting; the restart
+does not by itself duplicate the message or consume another delivery attempt.
+If the downtime reaches `locked_until`, startup recovery (or the reaper) applies
+the ordinary expiry rule: the message returns to active below the delivery limit
+or enters the DLQ on its final attempt. Size lock durations and deployment grace
+periods so planned restarts normally finish inside the remaining lease.
+
+Do not open a stopped broker's database through plain `OpenEmbedded` or a local
+embedded CLI command for inspection: embedded ownership deliberately reclaims all
+old locks because it assumes their in-process handlers are gone. Use the broker's
+authenticated HTTP status/peek operations, or open programmatic servers with
+`WithBrokerMode`. Low-level `server.New` users must open the Engine with
+`engine.Options.PreserveUnexpiredLeases` before constructing the HTTP server.
+
 After the first signal has been observed, normal operating-system signal behavior
 is restored before graceful shutdown starts. A second SIGINT or SIGTERM therefore
 forces process termination immediately. Use that escalation only when abandoning
 the remaining HTTP handlers and cleanup is preferable to waiting: the process
 cannot run additional settlement or close code after the second signal. SQLite
-transactions still recover atomically, and unsettled Peek-Lock deliveries are
-eligible for redelivery, but application side effects may already have happened
+transactions still recover atomically. A committed, unexpired Peek-Lock lease is
+preserved on the next broker open; once its deadline passes it is eligible for
+redelivery or final-attempt DLQ. Application side effects may already have happened
 and must remain idempotent. Ctrl-D is terminal input EOF, not a shutdown signal;
 the broker does not read stdin.
 
@@ -292,13 +309,16 @@ is still writing needs its own documented consistency guarantees.
    binary against it on an isolated endpoint, with authentication and `FULL`, while
    business clients remain stopped. Do not attach the original database as well.
 4. Verify configuration, subscriptions, message identities and body hashes against
-   recorded expectations. On startup every orphaned lock is reclaimed: below the
-   queue's delivery limit it becomes active; at the limit it goes to DLQ with
-   `MaxDeliveryCountExceeded`. Delivery count and payload survive, and the old lock
-   token is invalid. A queue already marked `deleting` never participates in lock
-   recovery; startup first continues one bounded cleanup pass, then the background
-   loop resumes it. Old receive-attempt snapshots may replay old handles for active
-   queues; that does not give those handles ownership of a recovered message.
+   recorded expectations. Broker startup preserves a locked row whose lease is
+   still unexpired; it retains the original token and delivery count until the
+   holder settles it or the deadline passes. An already-expired lock is reclaimed:
+   below the queue's delivery limit it becomes active; at the limit it goes to DLQ
+   with `MaxDeliveryCountExceeded`, and its old token is invalid. A queue already
+   marked `deleting` never participates in lock recovery; startup first continues
+   one bounded cleanup pass, then the background loop resumes it. A saved
+   receive-attempt response may replay only while every token in its batch still
+   owns a preserved live lease. If expiry or recovery invalidates any token, the
+   stale response is removed and cannot recreate ownership.
 5. Check deferred/scheduled/DLQ work and topic filters, then run the authenticated
    canary. A restore replays the snapshot's state: later completions, sends, dedup
    records and external business effects require reconciliation against the
@@ -309,8 +329,10 @@ is still writing needs its own documented consistency guarantees.
 
 The repeatable [restore drill](../test/production/restore/README.md) verifies all
 schema tables and columns, complete payloads, auxiliary records, outbox data and
-the expected recovery transformations. Run it for a candidate and rehearse the
-same procedure on representative operational data before relying on a backup.
+the embedded-mode recovery transformations. Broker-mode preservation of live
+leases is covered separately by the engine and real Serve restart tests; the
+restore drill does not replace those checks. Run it for a candidate and rehearse
+the same procedure on representative operational data before relying on a backup.
 
 ## Upgrade and rollback
 

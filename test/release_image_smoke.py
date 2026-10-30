@@ -320,19 +320,21 @@ def smoke(args):
                   "active key metadata changed after replacement")
         check(rpc("Queue", "Stats", {"queue": queue}, listener)["total"] == 2,
               "listen key did not survive replacement")
-        recovered = receive(2)
-        for index, actual in enumerate(recovered):
-            verify_message(actual, pending[index], seqs[index], 2 if index == 0 else 1)
-            if index == 0:
-                check(actual["lock_token"] != locked["lock_token"], "restart reused the old lock token")
-                check(actual["enqueued_at_ms"] == locked["enqueued_at_ms"], "restart changed enqueue time")
-            complete(actual)
+        complete(locked)
+        after_preserved_complete = rpc("Queue", "Stats", {"queue": queue}, listener)
+        check(after_preserved_complete.get("locked") == 0
+              and after_preserved_complete.get("active") == 1
+              and after_preserved_complete.get("total") == 1,
+              f"unexpired restart lease did not complete with its original token: {after_preserved_complete!r}")
+        remaining = receive(1)[0]
+        verify_message(remaining, pending[1], seqs[1], 1)
+        complete(remaining)
         drained()
         for key in keys.values():
             check(rpc("Auth", "RevokeKey", {"id": key["key"]["id"]}).get("ok") is True,
                   "test key cleanup failed")
         print("PASS managed permissions and persistent credentials/revocation on container replacement", flush=True)
-        print("PASS same-volume container replacement: active and locked messages survive and settle", flush=True)
+        print("PASS same-volume container replacement: active message and original live lease settle once", flush=True)
     except BaseException:
         for container in sorted(live_containers):
             logs = docker("logs", "--tail", "100", container, required=False)

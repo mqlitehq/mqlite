@@ -17,8 +17,11 @@ resource deletion, and fixed subscription expiry. (§1.7, §3, §8, §14)
 - **1.1** `Receive` claims an `active` message, moving it to `locked` for the queue's
   lock duration, and returns a `lock_token`. *(engine/functional_test.go)*
 - **1.2** A `locked` message MUST be invisible to other `Receive` calls until it is
-  settled, its lock expires, or single-broker startup recovery invalidates the
-  orphaned lock. Within one running broker, no live lease is granted twice.
+  settled, its lock expires, or embedded-mode startup recovery invalidates the
+  orphaned lock. Broker-mode startup MUST preserve an unexpired lease on an active
+  resource because its remote holder can survive that restart; resource lifecycle
+  and message TTL still apply. Within one running broker, no live lease is granted
+  twice.
   *(engine/functional_test.go `TestCompetingConsumersNoDouble`)*
 - **1.3** Each newly granted `Receive` or `ReceiveDeferred` claim increments
   `delivery_count` exactly once. Renewal, settlement, lock reaping, scheduled
@@ -100,11 +103,17 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
 
 ## 3 · Idempotency & at-least-once
 
-- **3.1** On `Open`, every orphaned `locked` row (a crash leftover) MUST be
-  reclaimed under the same rule as the reaper: back to `active`, or to
-  `dead_lettered` (`MaxDeliveryCountExceeded`) once `delivery_count >=
-  max_delivery_count` — a crash never buys an extra delivery.
-  *(engine/engine_test.go: TestCrashRecoveryRespectsMaxDelivery)*
+- **3.1** On embedded-mode `Open`, every old `locked` row MUST be reclaimed because
+  its in-process handler cannot survive. Broker-mode `Open` MUST instead preserve
+  every unexpired lease on an active resource and reclaim only
+  `locked_until <= now`, because a remote holder may still renew or settle its
+  persisted token; resource lifecycle and message TTL remain authoritative.
+  Reclamation follows the reaper rule: back to `active`, or to `dead_lettered`
+  (`MaxDeliveryCountExceeded`) once `delivery_count >= max_delivery_count`.
+  Preserving a live lease MUST NOT increment `delivery_count`.
+  *(engine/engine_test.go: TestCrashRecoveryRespectsMaxDelivery,
+  TestBrokerRecoveryPreservesUnexpiredLease,
+  TestBrokerRecoveryReclaimsExpiredLeases)*
 - **3.2** While its exact-request receipt is live, a settle whose response was lost MUST
   replay as success, not `ErrLockLost` — and ONLY when it is the same request.
   A `settlement_receipt` identifies
@@ -562,18 +571,24 @@ recovery, not filesystem durability.
     two-*commit* gap is supplementary coverage, not a per-run guarantee.
 
   *(test/crash/crash_test.go: TestCrashOutboxAtomicity)*
-- **15.2 Orphaned locks reset on restart.** After a crash while messages are `locked`, `Open` reclaims
-  every orphaned lock — to `active`, or to `dead_lettered` with `MaxDeliveryCountExceeded` if the
-  message was already on its last permitted delivery (the same rule the reaper applies, §3.1). Either
-  way nothing is stranded `locked`. The last-delivery case preserves the message body and delivery
-  count, clears the lock, and excludes it from normal receive. A cached Peek-Lock
-  attempt MUST NOT replay a token invalidated by this recovery; its retry either
-  obtains a currently valid new lease or observes no available message.
+- **15.2 Startup recovery respects lease ownership.** Embedded-mode `Open` reclaims
+  every old lock. Broker-mode `Open` preserves an unexpired lock on an active
+  resource, its token and delivery count so its remote holder can continue across
+  a broker restart; a cached
+  Peek-Lock attempt may replay that same valid token. Once the lease is expired,
+  startup reclaims it to `active`, or to `dead_lettered` with
+  `MaxDeliveryCountExceeded` if it was the last permitted delivery (the same rule
+  the reaper applies, §3.1). A cached attempt MUST NOT replay a token invalidated by
+  that recovery; its retry either obtains a currently valid new lease or observes
+  no available message.
   *(test/crash/crash_test.go: TestCrashRecoveryResetsOrphanedLocks,
   TestCrashRecoveryDeadLettersLastDelivery,
   TestCrashRecoveryInvalidatesReceiveAttemptLease; engine/functional_test.go:
   TestReceiveAttemptDoesNotReplayStaleLeaseAfterRestart,
-  TestReceiveAttemptDoesNotReplayDeadLetteredLeaseAfterRestart)*
+  TestReceiveAttemptDoesNotReplayDeadLetteredLeaseAfterRestart;
+  engine/engine_test.go: TestBrokerRecoveryPreservesUnexpiredLease,
+  TestBrokerRecoveryReclaimsExpiredLeases; shutdown_internal_test.go:
+  TestReceiverSurvivesBrokerRestart)*
 - **15.3 Acknowledged commits survive recovery.** Every producer commit acknowledged to and
   observed by the harness before a kill MUST still be present after recovery. The harness checks
   those acknowledged transaction identities against both recovered business rows and messages.

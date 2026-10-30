@@ -381,6 +381,111 @@ func TestCrashRecoveryRespectsMaxDelivery(t *testing.T) {
 	}
 }
 
+// A broker's remote consumer can outlive the broker process. Reopening in
+// broker mode must therefore retain an unexpired token so the same delivery can
+// be replayed, renewed and completed instead of being duplicated or dead-lettered.
+func TestBrokerRecoveryPreservesUnexpiredLease(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "mq.db")
+
+	e1, clock := testEngineAt(t, path)
+	mustQueue(t, e1, "q", QueueConfig{MaxDeliveryCount: 1})
+	if _, err := e1.SendOne(ctx, "q", OutMessage{Body: []byte("in-flight")}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := e1.Receive(ctx, "q", ReceiveOptions{AttemptID: "restart-attempt"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: messages=%+v err=%v", claimed, err)
+	}
+	want := claimed[0]
+	if err := e1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	e2, err := Open(ctx, Options{
+		DB:                      "file:" + path,
+		Now:                     func() int64 { return atomic.LoadInt64(clock) },
+		DisableBackground:       true,
+		PreserveUnexpiredLeases: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e2.Close()
+	stats, err := e2.Stats(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Locked != 1 || stats.Active != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("preserved lease stats = %+v, want one locked message", stats)
+	}
+	replayed, err := e2.Receive(ctx, "q", ReceiveOptions{AttemptID: "restart-attempt"})
+	if err != nil || len(replayed) != 1 {
+		t.Fatalf("attempt replay: messages=%+v err=%v", replayed, err)
+	}
+	if got := replayed[0]; got.SeqNumber != want.SeqNumber || got.LockToken != want.LockToken || got.DeliveryCount != want.DeliveryCount {
+		t.Fatalf("replayed delivery = %+v, want seq=%d token=%q delivery=%d", got, want.SeqNumber, want.LockToken, want.DeliveryCount)
+	}
+	renewed, err := e2.RenewBatch(ctx, "q", []SettleItem{{SeqNumber: want.SeqNumber, LockToken: want.LockToken}})
+	if err != nil || len(renewed) != 1 || !renewed[0].Ok {
+		t.Fatalf("renew preserved lease = %+v, %v", renewed, err)
+	}
+	if err := e2.Complete(ctx, "q", want.SeqNumber, want.LockToken); err != nil {
+		t.Fatalf("complete preserved lease: %v", err)
+	}
+	stats, err = e2.Stats(ctx, "q")
+	if err != nil || stats.Total != 0 {
+		t.Fatalf("stats after complete = %+v, %v; want empty queue", stats, err)
+	}
+}
+
+// Broker mode preserves only a live lease. The exact expiry boundary retains
+// the existing recovery rule: below the delivery limit it returns to active,
+// while the final allowed delivery moves to the DLQ.
+func TestBrokerRecoveryReclaimsExpiredLeases(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "mq.db")
+
+	e1, clock := testEngineAt(t, path)
+	mustQueue(t, e1, "last", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 1})
+	mustQueue(t, e1, "spare", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 2})
+	if _, err := e1.SendOne(ctx, "last", OutMessage{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e1.SendOne(ctx, "spare", OutMessage{}); err != nil {
+		t.Fatal(err)
+	}
+	if recvOne(t, e1, "last") == nil || recvOne(t, e1, "spare") == nil {
+		t.Fatal("expected both messages to be locked")
+	}
+	if err := e1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	advance(clock, time.Second) // locked_until == now is expired.
+
+	e2, err := Open(ctx, Options{
+		DB:                      "file:" + path,
+		Now:                     func() int64 { return atomic.LoadInt64(clock) },
+		DisableBackground:       true,
+		PreserveUnexpiredLeases: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e2.Close()
+	last, err := e2.Stats(ctx, "last")
+	if err != nil || last.DeadLettered != 1 || last.Locked != 0 {
+		t.Fatalf("last-attempt recovery = %+v, %v", last, err)
+	}
+	spare, err := e2.Stats(ctx, "spare")
+	if err != nil || spare.Active != 1 || spare.Locked != 0 {
+		t.Fatalf("under-limit recovery = %+v, %v", spare, err)
+	}
+	if got := recvOne(t, e2, "spare"); got == nil || got.DeliveryCount != 2 {
+		t.Fatalf("recovered delivery = %+v, want delivery count 2", got)
+	}
+}
+
 // I-outbox: Tx commits business write + enqueue atomically; rollback enqueues nothing.
 func TestTxAtomicEnqueue(t *testing.T) {
 	ctx := context.Background()

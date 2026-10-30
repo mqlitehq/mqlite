@@ -245,7 +245,7 @@ const lockerReadyAt = 250
 // runLocker claims messages in big batches and HOLDS them — hundreds at once — so that when it is
 // killed there are far more orphaned locks than any plausible recovery cap. It never completes
 // anything: no message leaves the queue, so after a restart every message must still be there and
-// none may be stuck `locked` (Open reclaims orphaned locks).
+// none may be stuck `locked` (this embedded worker uses immediate orphan recovery).
 func runLocker(ctx context.Context, e *mqlite.Embedded) {
 	holding := 0
 	for {
