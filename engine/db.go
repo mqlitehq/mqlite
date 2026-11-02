@@ -462,6 +462,21 @@ func (d *db) backoff(ctx context.Context, attempt int) {
 	}
 }
 
+// beforeRemoteAttempt refuses work whose caller has already stopped, including
+// a retry whose context ended while the previous safe failure was backing off.
+// The second check is deliberately after backoff: no SQL has started yet, so
+// returning the caller's exact cancellation identity is both safe and more
+// precise than treating a deadline as an outcome-unknown network timeout.
+func (d *db) beforeRemoteAttempt(ctx context.Context, attempt int) error {
+	if err := checkCtx(ctx); err != nil {
+		return err
+	}
+	if attempt > 0 {
+		d.backoff(ctx, attempt)
+	}
+	return checkCtx(ctx)
+}
+
 // ─── cancellation on a LOCAL store ────────────────────────────────────────────
 //
 // Interrupting an in-flight statement on a local SQLite store LEAKS THE CONNECTION. The pool then
@@ -614,10 +629,31 @@ func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		if i > 0 {
-			d.backoff(ctx, i)
+		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
+			return res, err
 		}
-		res, err = d.sql.ExecContext(ctx, query, args...)
+		// Acquire the pool lease explicitly so a caller deadline while waiting
+		// for capacity cannot be confused with a timeout from an issued write.
+		// No SQL exists until Conn.ExecContext below.
+		var conn *sql.Conn
+		conn, err = d.sql.Conn(ctx)
+		if err != nil {
+			if ctxErr := checkCtx(ctx); ctxErr != nil {
+				return res, ctxErr
+			}
+			if d.retryable(err) && i+1 < d.attempts() {
+				continue
+			}
+			// Connection acquisition cannot have issued SQL. Even a broad EOF or
+			// timeout is a definite connection failure here, never outcome unknown.
+			return res, err
+		}
+		if ctxErr := checkCtx(ctx); ctxErr != nil {
+			_ = conn.Close()
+			return res, ctxErr
+		}
+		res, err = conn.ExecContext(ctx, query, args...)
+		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
 		}
@@ -675,18 +711,26 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		if i > 0 {
-			d.backoff(ctx, i)
+		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
+			return res, err
 		}
 		var conn *sql.Conn
 		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
 		if err != nil {
-			if d.retryableWrite(err) {
+			if ctxErr := checkCtx(ctx); ctxErr != nil {
+				return res, ctxErr // acquiring a pool lease cannot have issued SQL
+			}
+			if d.retryable(err) && i+1 < d.attempts() {
 				continue
 			}
-			break
+			return res, err
 		}
-		res, err = conn.ExecContext(ctx, query, buildArgs()...)
+		args := buildArgs()
+		if ctxErr := checkCtx(ctx); ctxErr != nil {
+			_ = conn.Close()
+			return res, ctxErr
+		}
+		res, err = conn.ExecContext(ctx, query, args...)
 		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
@@ -724,19 +768,27 @@ func (d *db) queryFreshUnobserved(ctx context.Context, query string, buildArgs f
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		if i > 0 {
-			d.backoff(ctx, i)
+		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
+			return err
 		}
 		var conn *sql.Conn
 		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
 		if err != nil {
+			if ctxErr := checkCtx(ctx); ctxErr != nil {
+				return ctxErr
+			}
 			if d.retryable(err) {
 				continue
 			}
 			return err
 		}
+		args := buildArgs()
+		if ctxErr := checkCtx(ctx); ctxErr != nil {
+			_ = conn.Close()
+			return ctxErr
+		}
 		var rows *sql.Rows
-		rows, err = conn.QueryContext(ctx, query, buildArgs()...)
+		rows, err = conn.QueryContext(ctx, query, args...)
 		if err != nil {
 			_ = conn.Close()
 			if d.retryable(err) {
@@ -809,8 +861,8 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 	// No admission gate here: query only ever runs inside queryRows's remote branch, which holds the
 	// admission across the scan (the rows outlive this call, so gating here would release too early).
 	for i := 0; i < d.attempts(); i++ {
-		if i > 0 {
-			d.backoff(ctx, i)
+		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
+			return rows, err
 		}
 		rows, err = d.sql.QueryContext(ctx, query, args...)
 		if err == nil || !d.retryable(err) {
@@ -846,8 +898,8 @@ func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query strin
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		if i > 0 {
-			d.backoff(ctx, i)
+		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
+			return err
 		}
 		var rows *sql.Rows
 		rows, err = d.sql.QueryContext(ctx, query, args...)
@@ -980,14 +1032,33 @@ func (t *txn) SQL() *sql.Tx { return t.tx }
 // commitAttempt keeps confirmed commits and their in-memory topology effects in
 // the same order. Remote transactions may overlap, so a delayed deletion reply
 // must publish retirement before a later creation publishes the reused name.
-func (e *Engine) commitAttempt(attempt *txn) error {
+func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
 	e.commitMu.Lock()
 	defer e.commitMu.Unlock()
+	// Waiting for the commit sequencer is not part of the database commit. If
+	// the caller stopped while queued here, no commit has started and the exact
+	// context error is the only truthful outcome.
+	if err := checkCtx(attempt.caller); err != nil {
+		return err, true
+	}
 	if err := attempt.tx.Commit(); err != nil {
-		return err
+		return err, false
 	}
 	e.observation.commit(attempt)
-	return nil
+	return nil, false
+}
+
+// normalizeCanceledRemoteCommitError preserves the caller's cancellation
+// identity when database/sql's asynchronous rollback wins a race with Commit.
+// A live caller's sql.ErrTxDone is a genuine transaction-state error and must
+// remain unchanged (MQLITE-147).
+func normalizeCanceledRemoteCommitError(ctx context.Context, err error) (error, bool) {
+	if errors.Is(err, sql.ErrTxDone) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr, true
+		}
+	}
+	return err, false
 }
 
 // inTx runs fn inside a transaction, retrying the whole transaction on a
@@ -1033,7 +1104,8 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr // the deferred rollback undoes it
 			}
-			return e.commitAttempt(attempt)
+			cerr, _ := e.commitAttempt(attempt)
+			return cerr
 		})
 	}
 	var err error
@@ -1043,8 +1115,8 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 	}
 	defer e.db.inFlight.Done()
 	for i := 0; i < e.db.attempts(); i++ {
-		if i > 0 {
-			e.db.backoff(ctx, i)
+		if err = e.db.beforeRemoteAttempt(ctx, i); err != nil {
+			return err
 		}
 		if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
 			a.callbackRejected.Store(false)
@@ -1058,6 +1130,13 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			}
 			return err
 		}
+		// BeginTx can finish at the same instant its context is canceled. Match
+		// the local contract: if the caller stopped before its callback begins,
+		// roll back the new transaction and never run application code.
+		if ctxErr := checkCtx(ctx); ctxErr != nil {
+			_ = tx.Rollback()
+			return ctxErr
+		}
 		// The rollback is deferred across BOTH the callback and the commit — scoped to the
 		// callback alone it would fire on the success path too, BEFORE Commit, silently rolling
 		// back every remote transaction (TestRemoteTxClosureCanBeReplayed caught exactly that).
@@ -1069,13 +1148,14 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
 		// replayable statement failures into ErrOutcomeUnknown.
 		var ferr, cerr error
+		var commitNotStarted bool
 		attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx), observationEpoch: observationEpoch}
 		func() {
 			defer func() { _ = tx.Rollback() }()
 			if ferr = fn(e.db.stmtCtx(ctx), attempt); ferr != nil {
 				return
 			}
-			cerr = e.commitAttempt(attempt)
+			cerr, commitNotStarted = e.commitAttempt(attempt)
 		}()
 		if ferr != nil {
 			err = ferr
@@ -1084,7 +1164,15 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			}
 			return err
 		}
-		if err = cerr; err != nil {
+		var canceledCommit bool
+		err, canceledCommit = normalizeCanceledRemoteCommitError(ctx, cerr)
+		if err != nil {
+			if commitNotStarted || canceledCommit {
+				// No driver Commit ran, and the transaction is rolled back before
+				// this attempt returns. Unlike a transport timeout, the outcome is
+				// known and must not be wrapped as ErrOutcomeUnknown.
+				return err
+			}
 			if e.db.retryableWrite(err) {
 				continue // ErrBadConn / busy: the commit provably didn't land, safe to replay
 			}

@@ -30,6 +30,123 @@ import (
 // pool (TestTursoConcurrent). The hermetic retry-classification tests live in
 // storage_test.go.
 
+// TestTursoCanceledCommitPreservesCallerCancellation pins the controlled
+// provider timing that exposed MQLITE-147: database/sql rolls back the remote
+// transaction while Commit waits behind MQLite's sequencer. The engine must
+// return the caller's cancellation instead of leaking sql.ErrTxDone.
+//
+// This focused live check is not complete Turso acceptance or a replacement for
+// the soak. Its own transaction is read-only and it emits only stable booleans,
+// a bounded category, and a fingerprint; no DSN, token, provider response, SQL
+// payload, or raw error text leaves the test process. TestMain still performs
+// the explicitly confirmed destructive reset documented for every live test.
+// CI separately restricts its secret to the project's verification database;
+// direct runs may use any disposable remote database they own.
+func TestTursoCanceledCommitPreservesCallerCancellation(t *testing.T) {
+	dsn := os.Getenv("MQLITE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set MQLITE_TEST_DB (and MQLITE_TEST_DB_AUTH_TOKEN) to run the Turso cancellation verification")
+	}
+	if os.Getenv(remoteTestResetConfirmEnv) != "1" {
+		t.Fatalf("%s=1 is required", remoteTestResetConfirmEnv)
+	}
+	token := os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN")
+	if token == "" {
+		t.Fatal("MQLITE_TEST_DB_AUTH_TOKEN is required")
+	}
+
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 30*time.Second)
+	e, err := Open(openCtx, Options{
+		DB: dsn, AuthToken: token, DisableBackground: true,
+		// The verification prints only the safe identity tuple below. Suppress the
+		// ordinary private operator log so raw errors never reach Actions output.
+		Logger: slog.New(tursoSoakLogHandler{report: func(error) {}}),
+	})
+	cancelOpen()
+	if err != nil {
+		detail := describeError(err, time.Now().UnixMilli())
+		t.Fatalf("open remote failed: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+	}
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			detail := describeError(err, time.Now().UnixMilli())
+			t.Errorf("close remote failed: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+		}
+	})
+	if !e.Remote() {
+		t.Fatal("dedicated verification database did not open as a remote store")
+	}
+
+	// Hold the MQLite commit sequencer after the callback has completed its real
+	// remote statement. Cancellation can then drive database/sql.awaitDone through
+	// Rollback before Commit is allowed to inspect the transaction state.
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	defer cancelCaller()
+	e.commitMu.Lock()
+	commitLocked := true
+	defer func() {
+		if commitLocked {
+			e.commitMu.Unlock()
+		}
+	}()
+
+	callbackDone := make(chan error, 1)
+	result := make(chan error, 1)
+	go func() {
+		result <- e.inTx(callerCtx, func(ctx context.Context, tx *txn) error {
+			var one int
+			err := tx.QueryRowContext(ctx, `SELECT 1`).Scan(&one)
+			if err == nil && one != 1 {
+				err = errors.New("verification SELECT returned an unexpected value")
+			}
+			callbackDone <- err
+			return err
+		})
+	}()
+
+	select {
+	case callbackErr := <-callbackDone:
+		if callbackErr != nil {
+			detail := describeError(callbackErr, time.Now().UnixMilli())
+			t.Fatalf("remote callback failed: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("remote callback did not finish within the diagnostic bound")
+	}
+	if inUse := e.db.sql.Stats().InUse; inUse != 1 {
+		t.Fatalf("remote transaction connection count before cancellation=%d, want 1", inUse)
+	}
+
+	cancelCaller()
+	deadline := time.Now().Add(30 * time.Second)
+	for e.db.sql.Stats().InUse != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if inUse := e.db.sql.Stats().InUse; inUse != 0 {
+		t.Fatalf("database/sql awaitDone did not release the canceled transaction: in_use=%d", inUse)
+	}
+
+	e.commitMu.Unlock()
+	commitLocked = false
+	select {
+	case err = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transaction did not return after the commit sequencer was released")
+	}
+	if err == nil {
+		t.Fatal("canceled transaction unexpectedly committed")
+	}
+	detail := describeError(err, time.Now().UnixMilli())
+	isTxDone := errors.Is(err, sql.ErrTxDone)
+	isCanceled := errors.Is(err, context.Canceled)
+	t.Logf("Turso cancellation verification: is_sql_err_tx_done=%t is_context_canceled=%t category=%s fingerprint=%s",
+		isTxDone, isCanceled, detail.Category, detail.Fingerprint)
+	if isTxDone || !isCanceled || detail.Category != "canceled" {
+		t.Fatalf("unexpected cancellation identity: is_sql_err_tx_done=%t is_context_canceled=%t category=%s fingerprint=%s",
+			isTxDone, isCanceled, detail.Category, detail.Fingerprint)
+	}
+}
+
 // Register after the engine's Close cleanup: testing runs cleanups last-in-first-out.
 // Only exact names owned by the test are removed, including auxiliary rows that
 // have no queue foreign key. Attempt every statement and fail visibly on errors.

@@ -1039,6 +1039,9 @@ type busyConn struct{ st *busyState }
 
 type busyState struct {
 	failsLeft       int
+	onFailure       func()
+	connectErr      error
+	connects        atomic.Int64
 	args            [][]driver.NamedValue // the args of every attempt, in order
 	queries         []string
 	statements      []string // every query/exec, including lifecycle reads excluded from queries
@@ -1091,6 +1094,9 @@ func (c *busyConn) record(query string, args []driver.NamedValue) bool {
 	c.st.queries = append(c.st.queries, query)
 	if c.st.failsLeft > 0 {
 		c.st.failsLeft--
+		if c.st.onFailure != nil {
+			c.st.onFailure()
+		}
 		return false
 	}
 	return true
@@ -1242,8 +1248,14 @@ func (r *valueRows) Next(dest []driver.Value) error {
 
 type busyConnector struct{ st *busyState }
 
-func (c busyConnector) Connect(context.Context) (driver.Conn, error) { return &busyConn{st: c.st}, nil }
-func (c busyConnector) Driver() driver.Driver                        { return nil }
+func (c busyConnector) Connect(context.Context) (driver.Conn, error) {
+	c.st.connects.Add(1)
+	if c.st.connectErr != nil {
+		return nil, c.st.connectErr
+	}
+	return &busyConn{st: c.st}, nil
+}
+func (c busyConnector) Driver() driver.Driver { return nil }
 
 // remoteDBFailingFirst builds a *db that looks remote (so the retry loop is armed) and whose
 // first n statements come back busy.
@@ -1768,6 +1780,371 @@ func TestMemoryDBSurvivesRepeatedFreshStatements(t *testing.T) {
 		t.Errorf("local pool changed by remote compatibility policy: max_open=%d max_lifetime_closed=%d, want 1/0",
 			pool.MaxOpenConnections, pool.MaxLifetimeClosed)
 	}
+}
+
+type remoteCanceledCommitState struct {
+	rollbackOnce sync.Once
+	rolledBack   chan struct{}
+	commitCalls  atomic.Int64
+	afterBegin   func()
+}
+
+type remoteCanceledCommitConnector struct{ state *remoteCanceledCommitState }
+
+func (c remoteCanceledCommitConnector) Connect(context.Context) (driver.Conn, error) {
+	return &remoteCanceledCommitConn{state: c.state}, nil
+}
+func (remoteCanceledCommitConnector) Driver() driver.Driver { return nil }
+
+type remoteCanceledCommitConn struct{ state *remoteCanceledCommitState }
+
+func (*remoteCanceledCommitConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("remote canceled-commit test does not prepare statements")
+}
+func (*remoteCanceledCommitConn) Close() error { return nil }
+func (c *remoteCanceledCommitConn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+func (c *remoteCanceledCommitConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	if c.state.afterBegin != nil {
+		c.state.afterBegin()
+	}
+	return &remoteCanceledCommitTx{state: c.state}, nil
+}
+
+type remoteCanceledCommitTx struct{ state *remoteCanceledCommitState }
+
+func (t *remoteCanceledCommitTx) Commit() error {
+	t.state.commitCalls.Add(1)
+	return nil
+}
+func (t *remoteCanceledCommitTx) Rollback() error {
+	t.state.rollbackOnce.Do(func() { close(t.state.rolledBack) })
+	return nil
+}
+
+func newRemoteCanceledCommitEngine(t *testing.T) (*Engine, *remoteCanceledCommitState) {
+	t.Helper()
+	state := &remoteCanceledCommitState{rolledBack: make(chan struct{})}
+	sdb := sql.OpenDB(remoteCanceledCommitConnector{state: state})
+	t.Cleanup(func() { _ = sdb.Close() })
+	return &Engine{
+		db:          &db{sql: sdb, remote: true},
+		now:         func() int64 { return 1_700_000_000_000 },
+		observation: observations{background: true},
+	}, state
+}
+
+func awaitRemoteCanceledCommitRollback(t *testing.T, state *remoteCanceledCommitState) {
+	t.Helper()
+	select {
+	case <-state.rolledBack:
+	case <-time.After(5 * time.Second):
+		t.Fatal("database/sql did not roll back the canceled remote transaction")
+	}
+}
+
+func onlyRemoteCanceledCommitStorageOperation(t *testing.T, e *Engine) StorageOperation {
+	t.Helper()
+	var found []StorageOperation
+	for _, op := range e.db.storage.snapshot(e.db.sql.Stats()).Operations {
+		if op.Duration.Count != 0 {
+			found = append(found, op)
+		}
+	}
+	if len(found) != 1 || found[0].Operation != "transaction" || found[0].Duration.Count != 1 {
+		t.Fatalf("unexpected storage observations: %+v", found)
+	}
+	return found[0]
+}
+
+func canceledRemoteCommit(t *testing.T, e *Engine, state *remoteCanceledCommitState, ctx context.Context, cancel context.CancelFunc) error {
+	t.Helper()
+	err := e.inTx(ctx, func(context.Context, *txn) error {
+		cancel()
+		awaitRemoteCanceledCommitRollback(t, state)
+		return nil
+	})
+	if got := state.commitCalls.Load(); got != 0 {
+		t.Fatalf("canceled transaction reached the remote Commit driver %d times", got)
+	}
+	return err
+}
+
+// MQLITE-147: database/sql may roll a remote transaction back after caller
+// cancellation and then surface sql.ErrTxDone from Commit. Preserve the exact
+// caller cancellation identity in storage and maintenance observability.
+func TestRemoteCanceledCommitPreservesCallerCancellation(t *testing.T) {
+	t.Run("storage", func(t *testing.T) {
+		e, state := newRemoteCanceledCommitEngine(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		err := canceledRemoteCommit(t, e, state, ctx, cancel)
+		if !errors.Is(err, context.Canceled) || errors.Is(err, sql.ErrTxDone) {
+			t.Fatalf("canceled commit error = %v, want context.Canceled only", err)
+		}
+		op := onlyRemoteCanceledCommitStorageOperation(t, e)
+		if op.Outcome != "error" || op.ErrorCode != "canceled" {
+			t.Fatalf("canceled commit storage observation = %+v", op)
+		}
+	})
+
+	t.Run("deadline", func(t *testing.T) {
+		e, state := newRemoteCanceledCommitEngine(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		err := e.inTx(ctx, func(context.Context, *txn) error {
+			<-ctx.Done()
+			awaitRemoteCanceledCommitRollback(t, state)
+			return nil
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, sql.ErrTxDone) {
+			t.Fatalf("expired commit error = %v, want context.DeadlineExceeded only", err)
+		}
+		op := onlyRemoteCanceledCommitStorageOperation(t, e)
+		if op.Outcome != "error" || op.ErrorCode != "canceled" {
+			t.Fatalf("expired commit storage observation = %+v", op)
+		}
+	})
+
+	t.Run("maintenance", func(t *testing.T) {
+		e, state := newRemoteCanceledCommitEngine(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		e.runMaintenance(ctx, "locks", func(maintenanceCtx context.Context) {
+			if err := canceledRemoteCommit(t, e, state, maintenanceCtx, cancel); err != nil {
+				e.maintenanceFailure(maintenanceCtx, "reclaim_locks", err)
+			}
+		})
+		m := e.observation.maintenance["locks"]
+		if m.Runs != 1 || m.Interrupted != 1 || m.Failures != 0 || m.Diagnostics == nil || m.Diagnostics.LastOutcome != "interrupted" {
+			t.Fatalf("canceled commit maintenance observation = %+v", m)
+		}
+		op := onlyRemoteCanceledCommitStorageOperation(t, e)
+		if op.Outcome != "error" || op.ErrorCode != "canceled" {
+			t.Fatalf("canceled maintenance storage observation = %+v", op)
+		}
+	})
+}
+
+// MQLITE-147: only the Commit race is normalized. An application callback owns
+// its error identity even if it returns sql.ErrTxDone after cancellation.
+func TestRemoteCanceledCallbackPreservesApplicationErrTxDone(t *testing.T) {
+	e, state := newRemoteCanceledCommitEngine(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	want := fmt.Errorf("application callback: %w", sql.ErrTxDone)
+	err := e.Tx(ctx, func(*EngineTx) error {
+		cancel()
+		awaitRemoteCanceledCommitRollback(t, state)
+		return want
+	})
+	if !errors.Is(err, sql.ErrTxDone) || errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled callback error = %v, want application sql.ErrTxDone only", err)
+	}
+	op := onlyRemoteCanceledCommitStorageOperation(t, e)
+	if op.Outcome != "rejected" || op.ErrorCode != "application" {
+		t.Fatalf("callback ErrTxDone storage observation = %+v", op)
+	}
+}
+
+// MQLITE-147: a live caller's Commit ErrTxDone remains a transaction-state
+// failure. Cancellation normalization must not hide application misuse.
+func TestRemoteLiveCommitPreservesErrTxDone(t *testing.T) {
+	e, _ := newRemoteCanceledCommitEngine(t)
+	err := e.inTx(context.Background(), func(_ context.Context, tx *txn) error {
+		if err := tx.tx.Rollback(); err != nil {
+			return err
+		}
+		return nil
+	})
+	if !errors.Is(err, sql.ErrTxDone) || errors.Is(err, context.Canceled) {
+		t.Fatalf("live commit error = %v, want sql.ErrTxDone only", err)
+	}
+	op := onlyRemoteCanceledCommitStorageOperation(t, e)
+	if op.Outcome != "error" || op.ErrorCode != "other" {
+		t.Fatalf("live ErrTxDone storage observation = %+v", op)
+	}
+}
+
+// MQLITE-147: if cancellation wins while BeginTx is returning, no remote
+// transaction callback may begin. Callback code is application code and can
+// have effects outside the transaction that a later rollback cannot undo.
+func TestRemoteCancellationAfterBeginSkipsCallback(t *testing.T) {
+	e, state := newRemoteCanceledCommitEngine(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	state.afterBegin = cancel
+	ran := false
+	err := e.inTx(ctx, func(context.Context, *txn) error {
+		ran = true
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || errors.Is(err, sql.ErrTxDone) {
+		t.Fatalf("post-BeginTx cancellation error = %v, want context.Canceled only", err)
+	}
+	if ran {
+		t.Fatal("remote transaction callback ran after its caller was canceled")
+	}
+	if got := state.commitCalls.Load(); got != 0 {
+		t.Fatalf("post-BeginTx cancellation reached Commit %d times", got)
+	}
+	awaitRemoteCanceledCommitRollback(t, state)
+}
+
+// MQLITE-147: deadline expiry is distinct from explicit cancellation, and an
+// unrelated commit error must never be rewritten merely because the caller ended.
+func TestNormalizeCanceledRemoteCommitErrorIsNarrow(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancel()
+	err, normalized := normalizeCanceledRemoteCommitError(ctx, fmt.Errorf("remote commit: %w", sql.ErrTxDone))
+	if !normalized || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, sql.ErrTxDone) {
+		t.Fatalf("expired commit error = %v normalized=%t, want context.DeadlineExceeded only", err, normalized)
+	}
+	want := errors.New("independent commit failure")
+	if got, changed := normalizeCanceledRemoteCommitError(ctx, want); got != want || changed {
+		t.Fatalf("unrelated canceled-context error = %v normalized=%t, want original %v", got, changed, want)
+	}
+}
+
+// MQLITE-147: a caller deadline observed before a remote write starts is not an
+// ambiguous transport timeout. This covers both write implementations and the
+// safe-retry window; an error from an already-issued write remains governed by
+// the existing ErrOutcomeUnknown contract.
+func TestRemoteWriteCancellationBeforeRequestPreservesIdentity(t *testing.T) {
+	for _, fresh := range []bool{false, true} {
+		name := "exec"
+		if fresh {
+			name = "exec-fresh"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, afterSafeFailure := range []bool{false, true} {
+				phase := "before-first-attempt"
+				if afterSafeFailure {
+					phase = "after-safe-failure"
+				}
+				t.Run(phase, func(t *testing.T) {
+					failures := 0
+					if afterSafeFailure {
+						failures = 1
+					}
+					d, state := remoteDBFailingFirst(t, failures)
+					var ctx context.Context
+					var cancel context.CancelFunc
+					if afterSafeFailure {
+						ctx, cancel = context.WithTimeout(context.Background(), 10*time.Millisecond)
+						state.onFailure = func() { <-ctx.Done() }
+					} else {
+						ctx, cancel = context.WithDeadline(context.Background(), time.Unix(0, 0))
+					}
+					defer cancel()
+
+					builds := 0
+					var err error
+					if fresh {
+						_, err = d.execFresh(ctx, `UPDATE messages SET state='active'`, func() []any {
+							builds++
+							return nil
+						})
+					} else {
+						_, err = d.exec(ctx, `UPDATE messages SET state='active'`)
+					}
+					if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) {
+						t.Fatalf("remote write error = %v, want context.DeadlineExceeded only", err)
+					}
+					wantAttempts := 0
+					if afterSafeFailure {
+						wantAttempts = 1
+					}
+					if got := len(state.args); got != wantAttempts {
+						t.Fatalf("remote driver attempts = %d, want %d", got, wantAttempts)
+					}
+					if fresh && builds != wantAttempts {
+						t.Fatalf("fresh argument builds = %d, want %d", builds, wantAttempts)
+					}
+					ops := nonzeroStorageOperations(d.storage.snapshot(d.sql.Stats()))
+					if len(ops) != 1 || ops[0].Outcome != "error" || ops[0].ErrorCode != "canceled" {
+						t.Fatalf("remote write storage observation = %+v", ops)
+					}
+				})
+			}
+
+			t.Run("while-waiting-for-pool", func(t *testing.T) {
+				d, state := remoteDBFailingFirst(t, 0)
+				d.sql.SetMaxOpenConns(1)
+				held, err := d.sql.Conn(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+				defer cancel()
+				builds := 0
+				if fresh {
+					_, err = d.execFresh(ctx, `UPDATE messages SET state='active'`, func() []any {
+						builds++
+						return nil
+					})
+				} else {
+					_, err = d.exec(ctx, `UPDATE messages SET state='active'`)
+				}
+				if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) {
+					t.Fatalf("pool-wait error = %v, want context.DeadlineExceeded only", err)
+				}
+				if len(state.args) != 0 || builds != 0 {
+					t.Fatalf("pool-wait issued SQL: attempts=%d builds=%d", len(state.args), builds)
+				}
+			})
+
+			t.Run("while-establishing-connection", func(t *testing.T) {
+				d, state := remoteDBFailingFirst(t, 0)
+				state.connectErr = io.EOF
+				builds := 0
+				var err error
+				if fresh {
+					_, err = d.execFresh(context.Background(), `UPDATE messages SET state='active'`, func() []any {
+						builds++
+						return nil
+					})
+				} else {
+					_, err = d.exec(context.Background(), `UPDATE messages SET state='active'`)
+				}
+				if !errors.Is(err, io.EOF) || errors.Is(err, ErrOutcomeUnknown) {
+					t.Fatalf("connection error = %v, want original io.EOF only", err)
+				}
+				if state.connects.Load() != maxConnAttempts || len(state.args) != 0 || builds != 0 {
+					t.Fatalf("connection attempts=%d SQL attempts=%d builds=%d", state.connects.Load(), len(state.args), builds)
+				}
+			})
+		})
+	}
+
+	t.Run("maintenance", func(t *testing.T) {
+		d, state := remoteDBFailingFirst(t, 0)
+		e := &Engine{db: d, now: func() int64 { return 1_700_000_000_000 }}
+		ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+		defer cancel()
+		e.runMaintenance(ctx, "locks", func(maintenanceCtx context.Context) {
+			if _, err := e.db.exec(maintenanceCtx, `UPDATE messages SET state='active'`); err != nil {
+				e.maintenanceFailure(maintenanceCtx, "reclaim_locks", err)
+			}
+		})
+		m := e.observation.maintenance["locks"]
+		if m.Runs != 1 || m.Interrupted != 1 || m.Failures != 0 || m.Diagnostics == nil || m.Diagnostics.LastOutcome != "interrupted" {
+			t.Fatalf("pre-expired maintenance observation = %+v", m)
+		}
+		if len(state.args) != 0 {
+			t.Fatalf("pre-expired maintenance issued %d remote writes", len(state.args))
+		}
+	})
+
+	t.Run("in-flight-timeout-remains-unknown", func(t *testing.T) {
+		d, state := remoteDBFailingFirst(t, 0)
+		state.execErr = context.DeadlineExceeded
+		_, err := d.exec(context.Background(), `UPDATE messages SET state='active'`)
+		if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("in-flight timeout error = %v, want ErrOutcomeUnknown only", err)
+		}
+		if len(state.args) != 1 {
+			t.Fatalf("in-flight timeout driver attempts = %d, want 1", len(state.args))
+		}
+	})
 }
 
 // On a remote store, a transaction that fails on a retryable connection/busy error is replayed
