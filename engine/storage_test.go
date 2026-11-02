@@ -1998,7 +1998,7 @@ func TestNormalizeCanceledRemoteCommitErrorIsNarrow(t *testing.T) {
 		t.Fatalf("expired commit error = %v normalized=%t, want context.DeadlineExceeded only", err, normalized)
 	}
 	want := errors.New("independent commit failure")
-	if got, changed := normalizeCanceledRemoteCommitError(ctx, want); got != want || changed {
+	if got, changed := normalizeCanceledRemoteCommitError(ctx, want); !errors.Is(got, want) || changed {
 		t.Fatalf("unrelated canceled-context error = %v normalized=%t, want original %v", got, changed, want)
 	}
 }
