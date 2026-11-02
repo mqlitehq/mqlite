@@ -21,6 +21,17 @@ upgrade notes before replacing a broker.
 > and settle all deliveries, or wait for every lease to expire and verify
 > `locked=0`; do not run an old local CLI against a stopped broker DB with live work.
 
+### Preserve remote cancellation identity (MQLITE-147)
+
+- Preserve a caller's cancellation identity when remote work has provably not
+  started: while waiting for a connection or the commit sequencer, after a safe
+  retry, and when `database/sql` has already rolled the transaction back. Remote
+  callbacks no longer start after cancellation wins the `BeginTx` race.
+- Keep ambiguous in-flight write and commit timeouts as `ErrOutcomeUnknown`, and
+  leave callback errors and live-caller transaction-state errors unchanged.
+  Shutdown maintenance is therefore interrupted rather than falsely failed
+  without weakening the existing unknown-outcome safety contract.
+
 ### Make preserving live leases the safe startup default (MQLITE-137 follow-up)
 
 - Preserve every unexpired Peek-Lock lease on an active resource across any
