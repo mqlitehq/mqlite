@@ -23,8 +23,12 @@ shared vector through both SDKs. Two handlers remain active while the real
 `Embedded.Serve` stops, the engine closes, and the same database reopens at the
 same HTTP address after an additional 500ms stopped wait. The actual unavailable
 interval also includes drain, engine close, reopen and listener readiness, and is
-logged separately. With a 30-second lease and a delivery limit of
-one, each handler must execute once and receive a successful Complete response;
+logged separately. SQLite uses a 30-second lease; the remote profile uses an
+explicit two-minute lease because an observed Turso reopen took 35.375 seconds.
+The earlier 30-second profile's lease-expiry/DLQ result remains a failed
+precondition observation, not evidence of wrongful revocation. The queue API's
+default is unchanged. With a delivery limit of one, each handler must execute
+once and receive a successful Complete response while its lease remains valid;
 the reopened database must preserve both live leases, then end empty with no
 dead letters. The remote test uses the same allowlist and only its own queues.
 
@@ -47,6 +51,8 @@ even when the earlier pipeline fails; that failure still fails the workflow.
 Manual `verification_scope=receivers` skips the destructive engine suite and the
 main SDK pipeline, while preserving the dedicated-database allowlist and shared
 concurrency lock. `full` remains the default and matches scheduled verification.
+The manual `restart` scope runs only the shared in-flight restart vector after
+the pinned SDK checkout; it also skips database reset and unrelated pipelines.
 
 Pipeline success is counted from the client transport reading and validating a
 complete `200` / `ok:true` response bound to an accepted queue and sequence.

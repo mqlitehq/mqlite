@@ -8,12 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       verification_scope:
-        description: 'Full suite, or receiver diagnostics without a database reset'
+        description: 'Full suite, receiver diagnostics, or the in-flight restart vector'
         type: choice
         default: full
         options:
           - full
           - receivers
+          - restart
 
 permissions:
   contents: read
@@ -33,7 +34,7 @@ jobs:
         with:
           go-version: stable
       - name: TestTurso* against dedicated verification database
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope != 'receivers' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope == 'full' }}
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
@@ -53,7 +54,7 @@ jobs:
           fi
           go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
       - name: HTTP broker and managed SDK against dedicated verification database
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope != 'receivers' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope == 'full' }}
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
@@ -77,6 +78,7 @@ jobs:
           path: .test-mqlite-go
           persist-credentials: false
       - name: Independent remote SDK through HTTP against dedicated verification database
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope != 'restart' }}
         working-directory: test/sdkcheck/remotesdk
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}

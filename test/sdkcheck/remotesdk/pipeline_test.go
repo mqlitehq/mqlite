@@ -24,7 +24,7 @@ import (
 )
 
 func TestSQLiteInFlightBrokerRestart(t *testing.T) {
-	exerciseInFlightRestart(t, "file:"+filepath.Join(t.TempDir(), "restart.db"), "")
+	exerciseInFlightRestart(t, "file:"+filepath.Join(t.TempDir(), "restart.db"), "", 30*time.Second)
 }
 
 func TestTursoInFlightBrokerRestart(t *testing.T) {
@@ -35,13 +35,16 @@ func TestTursoInFlightBrokerRestart(t *testing.T) {
 	if dsn != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" || os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN") == "" {
 		t.Fatal("restart test requires the dedicated verification database and token")
 	}
-	exerciseInFlightRestart(t, dsn, os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"))
+	// A measured remote reopen took 35.375s, exceeding the default 30s lease.
+	// Keep that expiry result as a separate boundary observation; this vector
+	// specifically tests preservation while a lease is still demonstrably live.
+	exerciseInFlightRestart(t, dsn, os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"), 2*time.Minute)
 }
 
 // Both adapters run the same lifecycle vector through the real Embedded.Serve
 // drain path. Closing/reopening the engine keeps the database and HTTP address;
 // the independent clients and their blocked handlers survive the whole restart.
-func exerciseInFlightRestart(t *testing.T, dsn, databaseToken string) {
+func exerciseInFlightRestart(t *testing.T, dsn, databaseToken string, lockDuration time.Duration) {
 	for _, sdkName := range []string{"main", "remote-only"} {
 		t.Run(sdkName, func(t *testing.T) {
 			started := time.Now()
@@ -136,7 +139,7 @@ func exerciseInFlightRestart(t *testing.T, dsn, databaseToken string) {
 				check("main client open", err)
 				closeClient = client.Close
 				create = func() error {
-					return client.CreateQueue(ctx, queue, broker.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1})
+					return client.CreateQueue(ctx, queue, broker.QueueConfig{LockDuration: lockDuration, MaxDeliveryCount: 1})
 				}
 				send = func(body string) (int64, error) {
 					return client.SendOne(ctx, queue, broker.OutMessage{Body: []byte(body)})
@@ -156,7 +159,7 @@ func exerciseInFlightRestart(t *testing.T, dsn, databaseToken string) {
 				check("remote-only client open", err)
 				closeClient = client.Close
 				create = func() error {
-					return client.CreateQueue(ctx, queue, sdk.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1})
+					return client.CreateQueue(ctx, queue, sdk.QueueConfig{LockDuration: lockDuration, MaxDeliveryCount: 1})
 				}
 				send = func(body string) (int64, error) {
 					return client.SendOne(ctx, queue, sdk.OutMessage{Body: []byte(body)})
@@ -278,8 +281,8 @@ func exerciseInFlightRestart(t *testing.T, dsn, databaseToken string) {
 			phase("restart_fixed_pause_done")
 			start()
 			actualDowntime := time.Since(restartBegan)
-			t.Logf("restart actual_downtime_ms=%d configured_pause_ms=500 configured_lock_ms=30000 elapsed_ms=%d",
-				actualDowntime.Milliseconds(), time.Since(started).Milliseconds())
+			t.Logf("restart actual_downtime_ms=%d configured_pause_ms=500 configured_lock_ms=%d elapsed_ms=%d",
+				actualDowntime.Milliseconds(), lockDuration.Milliseconds(), time.Since(started).Milliseconds())
 			liveAtReady := liveInitialLeases("restart_ready", current.Engine().ServerTimeMs())
 			stats, err := current.Stats(ctx, queue)
 			check("stats after reopen", err)
