@@ -34,6 +34,8 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > in-flight handler contexts. `Run` still waits for handlers and settlement to
 > return, but offers no grace period for handlers to finish before cancellation;
 > interrupted deliveries can consume delivery attempts.
+> See the [consumer stop and interruption boundaries](docs/operations.md#consumer-stops-and-host-interruptions)
+> before wiring process signals to `Run` cancellation.
 
 ## Goal
 

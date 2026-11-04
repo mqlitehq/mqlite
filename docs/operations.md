@@ -146,6 +146,12 @@ If the downtime reaches `locked_until`, startup recovery (or the reaper) applies
 the ordinary expiry rule: the message returns to active below the delivery limit
 or enters the DLQ on its final attempt. Size lock durations and deployment grace
 periods so planned restarts normally finish inside the remaining lease.
+The managed Go clients also have bounded renewal and settlement retry budgets:
+terminal Complete/Abandon cleanup gets up to five seconds. Returning before lease
+expiry is therefore necessary but not sufficient to preserve a particular
+handler's settlement; an exhausted retry budget does not resume automatically
+when the broker later returns. Retaining a valid token does not guarantee that an
+external side effect ran only once.
 
 A stopped broker's database may be opened by a local CLI inspection or maintenance
 command without revoking an unexpired delivery: every Open preserves live leases by
@@ -189,6 +195,40 @@ only about 5 seconds after the worst-case HTTP drain for engine close and proces
 exit; configure at least 40 seconds, and more when measured remote-store close time
 requires it. Keep Turso/libSQL replacement single-active and stop-then-start; this
 shutdown behavior does not make overlapping brokers safe.
+
+## Consumer stops and host interruptions
+
+These boundaries describe unreleased `main` and both Go clients' managed
+`Receiver.Run`. The SDK does not install process signal handlers. The host
+application decides how SIGINT/SIGTERM, stdin EOF, and platform grace periods
+affect its contexts; `Consumer.Shutdown` and a stop-admission-then-drain API are
+not implemented. Ctrl-D normally produces stdin EOF, not a process signal or
+automatic context cancellation; `mqlite serve` does not read stdin.
+
+| Event | Current behavior and required action |
+|---|---|
+| Broker stops and restarts within the remaining lease | A live Receiver retries and can reuse the persisted token. Renewal and settlement must also finish inside their retry budgets. Keep a single active broker and leave the Receiver's controlling context live. |
+| Broker outage reaches lease expiry | The original token cannot renew or create a new settlement effect. The delivery returns to active below `MaxDeliveryCount`, or enters the DLQ at the limit. A retained exact-request receipt can still confirm an earlier committed settlement. |
+| Application cancels `Run` | Receive retries stop and handler/renewal contexts are canceled immediately. `Run` still waits for workers and cleanup. A returning handler's `nil` result requests Complete; a non-nil result requests Abandon on a fresh context with up to five seconds, unless terminal renewal failure already made settlement unsafe. Cancellation offers no handler grace period. |
+| Handler, error callback, or custom transport ignores cancellation | Shutdown can remain blocked while joining that work. Context cancellation is cooperative; it is not a goroutine kill or a hard return deadline. |
+| Application calls a Close method | `Receiver.Close` is a no-op; `Client.Close` releases only SDK-owned idle HTTP connections. Neither cancels an active Run. `Embedded.Close` joins admitted database work, not application handlers. Cancel and join the Receiver before closing its client or engine. |
+| Consumer is killed, SIGSTOPped, or container-paused while the broker stays available | A killed process cannot settle; a paused process cannot renew. Expired leases follow the ordinary redelivery/DLQ rule. A resumed handler may already have made an external change even though its old token is fenced. |
+| Broker is killed | There is no HTTP drain or cleanup guarantee. Local transactions recover atomically; default startup preserves still-valid leases. If the response is lost around a commit, the caller must reconcile the result (for example through the exact-request receipt); process death alone does not prove rollback. `:memory:` loses all state when its process exits. |
+| Screen turns off or locks; machine sleeps, freezes, or loses power | Turning off or locking the screen alone does not signal a process or cancel its contexts; the OS may separately suspend the host. During host sleep or failure, do not assume continued serving, renewal, or cleanup; broker-clock deadlines may be past on resumption. SIGSTOP, container pause/restart, and SIGKILL are process fault models, not proofs of host-sleep or power-loss behavior. |
+
+For a planned consumer stop, arrange application-level admission control and let
+work settle before canceling it, or use an explicit Receive loop whose lifecycle
+the application owns. An interrupted final delivery can reach the DLQ without a
+business-handler failure. Do not repeatedly restart or redrive a non-idempotent
+handler without reconciling its external side effects.
+
+A successful Send acknowledgement means the transaction committed under the
+configured storage contract. It does not acknowledge completion of a consumer's
+external work. Local `NORMAL` protects against process crashes; power-loss
+durability requires `FULL` and a storage stack that honors flushes. Turso/libSQL
+durability is the remote service's contract, not a setting proved by a local
+container test. Recovery tests must state which of these failure models they
+actually exercise.
 
 ## Startup and routine checks
 
