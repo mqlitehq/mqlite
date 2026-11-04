@@ -32,6 +32,13 @@ upgrade notes before replacing a broker.
   Shutdown maintenance is therefore interrupted rather than falsely failed
   without weakening the existing unknown-outcome safety contract.
 
+### Distinguish main documentation from v0.4.2 (MQLITE-149)
+
+- Mark the README, HTTP reference, and operations runbook as following `main`,
+  with unreleased lease, shutdown, and managed Receiver behavior. Link the
+  v0.4.2 documentation for operators using the published binary, and clarify
+  that broker shutdown does not implement application consumer draining.
+
 ### Make preserving live leases the safe startup default (MQLITE-137 follow-up)
 
 - Preserve every unexpired Peek-Lock lease on an active resource across any
