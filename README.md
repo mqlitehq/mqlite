@@ -31,8 +31,9 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > behavior described below are not included in v0.4.2. For an installed v0.4.2
 > binary, use the [documentation at its tag](https://github.com/mqlitehq/mqlite/tree/v0.4.2/docs).
 > Consumer draining is still separate work: canceling `Receiver.Run` cancels
-> in-flight handler contexts; it does not wait for successful handler completion
-> and settlement, and interrupted deliveries can consume delivery attempts.
+> in-flight handler contexts. `Run` still waits for handlers and settlement to
+> return, but offers no grace period for handlers to finish before cancellation;
+> interrupted deliveries can consume delivery attempts.
 
 ## Goal
 

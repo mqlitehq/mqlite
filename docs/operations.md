@@ -112,10 +112,11 @@ restore test.
 The coordinated shutdown and lease-preserving restart contract below requires
 unreleased `main`; an installed v0.4.2 broker does not provide these guarantees.
 It also does not drain application consumers. Canceling `Receiver.Run` cancels
-its in-flight handler contexts; it does not wait for successful completion and
-settlement, and interrupted deliveries can consume delivery attempts or reach
-the DLQ at the configured limit. Quiesce and drain consumers at the application
-layer before canceling them when a planned consumer stop must finish its work.
+its in-flight handler contexts. `Run` still waits for handlers and settlement to
+return, but offers no grace period for handlers to finish before cancellation.
+Interrupted deliveries can consume delivery attempts or reach the DLQ at the
+configured limit. Quiesce and drain consumers at the application layer before
+canceling them when a planned consumer stop must finish its work.
 
 `mqlite serve` treats the first SIGINT or SIGTERM as a graceful-shutdown request.
 It stops accepting new HTTP connections and closes an internal no-new-claim gate for
