@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -160,9 +161,31 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 // head keeps blocking its group and successors cannot overtake it (MQLITE-66);
 // the scheduler re-activates it at visible_at. delayMs=0 redelivers immediately.
 func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
+	if delayMs < 0 {
+		return fmt.Errorf("%w: abandon delay cannot be negative", ErrInvalidArgument)
+	}
 	// The delay is part of the request's identity: replaying Abandon with a DIFFERENT delay is a
 	// different request, not a lost-response retry, and must not inherit the first one's success.
 	err := e.settleOp(ctx, queue, seq, token, "abandoned", settleArgs(strconv.FormatInt(delayMs, 10)), func(ctx context.Context, tx *txn, now int64) (int64, error) {
+		if now > math.MaxInt64-delayMs {
+			// Reject an overflowing new effect without altering its live token.
+			// An already-settled token must instead reach settleOp's receipt
+			// lookup: the same delay may have fitted when it originally committed
+			// before the clock advanced (MQLITE-154). Ordinary delays add no query.
+			var owns bool
+			err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+				SELECT 1 FROM messages
+				 WHERE id=? AND queue=? AND lock_token=? AND state='locked'
+				   AND locked_until>? AND `+liveMessageQueueSQL+`)`,
+				seq, queue, token, now, now).Scan(&owns)
+			if err != nil {
+				return 0, err
+			}
+			if owns {
+				return 0, fmt.Errorf("%w: abandon delay exceeds the timestamp range", ErrInvalidArgument)
+			}
+			return 0, nil
+		}
 		var state string
 		err := tx.QueryRowContext(ctx, `
 			UPDATE messages SET
