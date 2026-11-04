@@ -6,9 +6,14 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
-This reference describes v0.4.2, the latest supported release. v0.3.3 is
-withdrawn and unsupported; use the documentation in the v0.3.2 tag when working
-with its smaller management surface.
+This reference follows `main`, including unreleased changes. The latest supported
+release is v0.4.2; use the [v0.4.2 reference](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/api-reference.md)
+for that installed broker. The broker time header, revised Go managed Receiver
+retry and renewal behavior, 1-second through 1-hour queue lock-duration bounds,
+lease-preserving startup, and coordinated shutdown responses documented here
+are unreleased; see [CHANGELOG.md](../CHANGELOG.md#unreleased). v0.3.3 is withdrawn
+and unsupported; use the documentation in the v0.3.2 tag when working with its
+smaller management surface.
 
 Every RPC body must be exactly one non-null JSON object, including operations
 whose request is otherwise empty (`{}`). Unknown fields and data after that object

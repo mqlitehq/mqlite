@@ -24,6 +24,16 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > public assets remain available only for forensic or compatibility inspection
 > and must not be deployed. v0.4.0 and later carry its retraction directive.
 
+> **Documentation scope:** this README follows `main`, including unreleased
+> changes listed in [CHANGELOG.md](CHANGELOG.md#unreleased). Lease-preserving
+> startup, cross-invocation local CLI settlement, coordinated broker shutdown,
+> the broker time header, and the revised managed Receiver retry and renewal
+> behavior described below are not included in v0.4.2. For an installed v0.4.2
+> binary, use the [documentation at its tag](https://github.com/mqlitehq/mqlite/tree/v0.4.2/docs).
+> Consumer draining is still separate work: canceling `Receiver.Run` cancels
+> in-flight handler contexts; it does not wait for successful handler completion
+> and settlement, and interrupted deliveries can consume delivery attempts.
+
 ## Goal
 
 mqlite aims to be the **smallest reliable queue you can drop into a system** — and
