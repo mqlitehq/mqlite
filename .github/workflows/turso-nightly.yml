@@ -43,3 +43,18 @@ jobs:
             exit 1
           fi
           go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
+      - name: HTTP broker and managed SDK against dedicated verification database
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+        run: |
+          if [ -z "$MQLITE_TEST_DB" ] || [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
+            echo "The dedicated verification database and token are required."
+            exit 1
+          fi
+          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
+            echo "MQLITE_TEST_DB is not the dedicated verification database."
+            exit 1
+          fi
+          # Root package only: this case never invokes engine.TestMain's table reset.
+          go test . -run '^TestTursoHTTPBrokerDelivery$' -count=1 -v -timeout 180s
