@@ -40,6 +40,20 @@ func TestMain(m *testing.M) {
 	if err := build.Run(); err != nil {
 		panic("build test binary: " + err.Error())
 	}
+	if runtime.GOOS == "darwin" && strings.HasPrefix(runtime.Version(), "go1.21.") {
+		// Go 1.21's externally linked CLI can retain an invalid ad-hoc signature
+		// on current macOS. Sign only our freshly built temporary test binary.
+		for _, args := range [][]string{
+			{"--force", "--sign", "-", mqliteBin},
+			{"--verify", "--strict", mqliteBin},
+		} {
+			if output, err := exec.Command("/usr/bin/codesign", args...).CombinedOutput(); err != nil {
+				_ = os.RemoveAll(dir)
+				panic(fmt.Sprintf("macOS Go 1.21 test CLI codesign %v failed: %v\n%s", args[:len(args)-1], err, output))
+			}
+		}
+		fmt.Fprintln(os.Stderr, "macOS Go 1.21 test CLI: ad-hoc signature strictly verified")
+	}
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
