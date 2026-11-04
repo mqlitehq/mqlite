@@ -41,7 +41,9 @@ import (
 )
 
 func TestRemoteMalformedMessageResponses(t *testing.T) {
-	for _, body := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`, `{"messages":[{"seq_number":7},null]}`} {
+	for _, body := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`, `{"messages":[{"seq_number":7},null]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"token"},{"seq_number":7,"lock_token":"token"}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"first"},{"seq_number":7,"lock_token":"second"}]}`} {
 		for _, atMostOnce := range []bool{false, true} {
 			t.Run(fmt.Sprintf("receive delete=%v %s", atMostOnce, body), func(t *testing.T) {
 				var calls int32
@@ -168,7 +170,66 @@ func TestRemoteCorruptedReceiveKeepsCommittedOutcomeExplicit(t *testing.T) {
 	}
 }
 
+func TestRemoteReceiveRequiresPeekLockOwnership(t *testing.T) {
+	for _, body := range []string{
+		`{"messages":[{"seq_number":7}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":null}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"first"},{"seq_number":8}]}`,
+	} {
+		for _, deferred := range []bool{false, true} {
+			t.Run(fmt.Sprintf("deferred=%v %s", deferred, body), func(t *testing.T) {
+				stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+				defer stub.Close()
+				client, err := mqlite.Open(context.Background(), stub.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				opts := mqlite.RecvOpts{Max: 2}
+				if deferred {
+					opts.Pick = []int64{7, 8}
+					opts.AtMostOnce = true
+				}
+				messages, err := client.Receive(context.Background(), "q", opts)
+				if err == nil || len(messages) != 0 || errors.Is(err, mqlite.ErrOutcomeUnknown) {
+					t.Fatalf("unowned Peek-Lock batch exposed: n=%d err=%v", len(messages), err)
+				}
+			})
+		}
+	}
+	for _, body := range []string{`{"messages":[{"seq_number":7}]}`, `{"messages":[{"seq_number":7,"lock_token":"same arbitrary token"},{"seq_number":8,"lock_token":"same arbitrary token"}]}`} {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+		client, err := mqlite.Open(context.Background(), stub.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages, err := client.Receive(context.Background(), "q", mqlite.RecvOpts{AtMostOnce: true})
+		if err != nil || len(messages) == 0 {
+			t.Fatalf("valid ReceiveAndDelete rejected: n=%d err=%v", len(messages), err)
+		}
+		peeked, err := client.Peek(context.Background(), "q")
+		if err != nil || len(peeked) == 0 {
+			t.Fatalf("tokenless Peek rejected: n=%d err=%v", len(peeked), err)
+		}
+		if strings.Contains(body, "same arbitrary token") {
+			messages, err = client.Receive(context.Background(), "q")
+			if err != nil || len(messages) != 2 {
+				t.Fatalf("independent sequences sharing an opaque token rejected: n=%d err=%v", len(messages), err)
+			}
+		}
+		_ = client.Close()
+		stub.Close()
+	}
+}
+
 func TestManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T) {
+	for _, corrupt := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":7}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"token"},{"seq_number":7,"lock_token":"token"}]}`} {
+		t.Run(corrupt, func(t *testing.T) { testManagedReceiveReplaysMalformedItemWithSameAttempt(t, corrupt) })
+	}
+}
+
+func testManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T, corrupt string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var receives, handlers, completes int32
@@ -190,8 +251,11 @@ func TestManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T) {
 			mu.Unlock()
 			switch atomic.AddInt32(&receives, 1) {
 			case 1:
-				_, _ = io.WriteString(w, `{"messages":[null]}`)
+				_, _ = io.WriteString(w, corrupt)
 			case 2:
+				if atomic.LoadInt32(&handlers) != 0 || atomic.LoadInt32(&completes) != 0 {
+					t.Error("malformed batch reached handler or settlement before replay")
+				}
 				_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":7,"body":"","lock_token":"token","delivery_count":1,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
 			default:
 				<-r.Context().Done()
@@ -212,7 +276,7 @@ func TestManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	err = client.Receiver("q").Run(ctx, func(_ context.Context, message *mqlite.Message) error {
+	err = client.Receiver("q", mqlite.WithConcurrency(2)).Run(ctx, func(_ context.Context, message *mqlite.Message) error {
 		atomic.AddInt32(&handlers, 1)
 		if message.SequenceNumber != 7 || len(message.Body) != 0 {
 			t.Errorf("invalid dispatch: %+v", message)

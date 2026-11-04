@@ -33,10 +33,15 @@ upgrade notes before replacing a broker.
 
 ### Reject impossible message acknowledgements (MQLITE-152)
 
-- Reject null Receive items and nonpositive delivery sequence numbers before
+- Reject null Receive items, nonpositive or duplicate delivery sequences, and
+  Peek-Lock deliveries without a fencing token before exposing any batch prefix.
+  Receive-and-delete does not require tokens, and read-only Peek stays tokenless.
+  The token remains opaque; no global token-uniqueness or format rule is added.
+- Validate the whole delivery list before
   exposing any part of the returned batch. A damaged receive-and-delete response
-  reports `ErrOutcomeUnknown`; a Peek-Lock response remains replayable with the
-  same attempt ID, including through the managed Receiver.
+  reports `ErrOutcomeUnknown`; ordinary Peek-Lock Receive remains replayable with
+  the same attempt ID, including through the managed Receiver. ReceiveDeferred
+  gains validation, not an attempt-ID replay contract.
 - Reject null or negative Send/Schedule acknowledgement sequences while preserving
   legitimate zero results for topic no-match and skipped batch dedup slots.
   Valid empty message bodies and empty Receive lists remain supported.
