@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -1582,11 +1584,253 @@ func tursoSoakWindowPartial(final bool) bool {
 	return final
 }
 
+// MQLITE-155 diagnostic-branch-only observations. Never persist error text,
+// SQL, request/response payloads, headers, hostnames or credentials.
+type tursoTraceKey struct{}
+
+type tursoSafeTraceSnapshot struct {
+	Stage           string          `json:"stage"`
+	Statement       int             `json:"statement_calls"`
+	Attempts        int             `json:"attempts"`
+	Context         string          `json:"context"`
+	ErrorTypes      []string        `json:"error_types"`
+	StageErrorTypes []string        `json:"stage_error_types,omitempty"`
+	Known           map[string]bool `json:"known"`
+}
+
+type tursoSafeTrace struct {
+	mu                  sync.Mutex
+	stage               string
+	statement, attempts int
+	stageTypes          []string
+}
+
+func tursoErrorTypes(err error) []string {
+	var types []string
+	for i := 0; err != nil && i < 8; i++ {
+		types = append(types, fmt.Sprintf("%T", err))
+		err = errors.Unwrap(err)
+	}
+	return types
+}
+
+func (t *tursoSafeTrace) observe(stage string, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.stage = stage
+	if stage == "begin" {
+		t.attempts++
+		t.statement = 0
+	}
+	if stage == "statement" {
+		t.statement++
+	}
+	if err != nil {
+		t.stageTypes = tursoErrorTypes(err)
+	}
+}
+
+func (t *tursoSafeTrace) current() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stage
+}
+
+func (t *tursoSafeTrace) snapshot(ctx context.Context, err error) tursoSafeTraceSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state := "active"
+	if errors.Is(ctx.Err(), context.Canceled) {
+		state = "canceled"
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		state = "deadline"
+	}
+	return tursoSafeTraceSnapshot{
+		Stage: t.stage, Statement: t.statement, Attempts: t.attempts, Context: state,
+		ErrorTypes: tursoErrorTypes(err), StageErrorTypes: append([]string(nil), t.stageTypes...),
+		Known: map[string]bool{
+			"canceled": errors.Is(err, context.Canceled), "deadline": errors.Is(err, context.DeadlineExceeded),
+			"tx_done": errors.Is(err, sql.ErrTxDone), "conn_done": errors.Is(err, sql.ErrConnDone),
+			"bad_conn": errors.Is(err, driver.ErrBadConn), "lock_lost": errors.Is(err, ErrLockLost),
+			"outcome_unknown": errors.Is(err, ErrOutcomeUnknown),
+		},
+	}
+}
+
+type tursoTracedError struct {
+	cause error
+	trace tursoSafeTraceSnapshot
+}
+
+func (e *tursoTracedError) Error() string { return e.cause.Error() }
+func (e *tursoTracedError) Unwrap() error { return e.cause }
+
+type tursoProviderEvent struct {
+	AtMs       int64  `json:"at_ms"`
+	HTTPStatus int    `json:"http_status"`
+	Stage      string `json:"stage"`
+	Code       string `json:"code"`
+}
+
+type tursoProviderRecorder struct {
+	mu     sync.Mutex
+	events []tursoProviderEvent
+}
+
+func (r *tursoProviderRecorder) add(event tursoProviderEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.events) == 8 {
+		copy(r.events, r.events[1:])
+		r.events = r.events[:7]
+	}
+	r.events = append(r.events, event)
+}
+
+func (r *tursoProviderRecorder) write(dir string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	data, err := json.Marshal(struct {
+		Scope  string               `json:"scope"`
+		Events []tursoProviderEvent `json:"events"`
+	}{"process observations; unattributed events are not assigned to a foreground call", r.events})
+	if err != nil {
+		return err
+	}
+	return tursoSoakAtomicWrite(filepath.Join(dir, "safe-provider-trace.json"), data)
+}
+
+// Only these reviewed, fixed enums may cross the diagnostic output boundary.
+func tursoSafeProviderCode(code string) string {
+	switch code {
+	case "STREAM_EXPIRED", "STREAM_NOT_FOUND", "TRANSACTION_TIMEOUT", "TXN_TIMEOUT",
+		"SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT", "SQLITE_LOCKED", "SQLITE_CONSTRAINT",
+		"SQLITE_READONLY", "SQLITE_FULL", "SQLITE_IOERR", "SQLITE_CORRUPT", "SQLITE_SCHEMA",
+		"AUTH_REQUIRED", "AUTH_EXPIRED", "FORBIDDEN", "RATE_LIMITED", "INTERNAL":
+		return code
+	default:
+		return "unknown"
+	}
+}
+
+type tursoTraceTransport struct {
+	base     http.RoundTripper
+	recorder *tursoProviderRecorder
+}
+
+func (t tursoTraceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(req)
+	if err != nil || response == nil || response.Body == nil {
+		return response, err
+	}
+	stage := "unattributed"
+	if trace, ok := req.Context().Value(tursoTraceKey{}).(*tursoSafeTrace); ok {
+		stage = trace.current()
+	}
+	response.Body = &tursoTraceBody{ReadCloser: response.Body, recorder: t.recorder, status: response.StatusCode, stage: stage}
+	return response, nil
+}
+
+// Read never reads ahead: the driver receives the original bytes and errors.
+// Only the first 4 KiB is copied, and only a complete small JSON error envelope
+// is inspected. Close forwards once even after partial reads or read failures.
+type tursoTraceBody struct {
+	io.ReadCloser
+	recorder              *tursoProviderRecorder
+	status                int
+	stage                 string
+	prefix                []byte
+	truncated             bool
+	mu                    sync.Mutex
+	finished              bool
+	finishOnce, closeOnce sync.Once
+	closeErr              error
+}
+
+func (b *tursoTraceBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.mu.Lock()
+	if !b.finished {
+		take := n
+		if remaining := 4096 - len(b.prefix); take > remaining {
+			take = remaining
+			b.truncated = true
+		}
+		b.prefix = append(b.prefix, p[:take]...)
+	}
+	b.mu.Unlock()
+	if err != nil {
+		b.finish(err == io.EOF)
+	}
+	return n, err
+}
+
+func (b *tursoTraceBody) Close() error {
+	b.closeOnce.Do(func() { b.closeErr = b.ReadCloser.Close(); b.finish(false) })
+	return b.closeErr
+}
+
+func (b *tursoTraceBody) finish(complete bool) {
+	b.finishOnce.Do(func() {
+		b.mu.Lock()
+		prefix, truncated := b.prefix, b.truncated
+		b.prefix, b.finished = nil, true
+		b.mu.Unlock()
+		type providerError struct {
+			Code string `json:"code"`
+		}
+		var envelope struct {
+			Code    string          `json:"code"`
+			Error   json.RawMessage `json:"error"`
+			Results []struct {
+				Error    *providerError `json:"error"`
+				Response struct {
+					Result struct {
+						StepErrors []*providerError `json:"step_errors"`
+					} `json:"result"`
+				} `json:"response"`
+			} `json:"results"`
+		}
+		var codes []string
+		if complete && !truncated && json.Unmarshal(prefix, &envelope) == nil {
+			if envelope.Code != "" {
+				codes = append(codes, envelope.Code)
+			}
+			if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+				var e providerError
+				_ = json.Unmarshal(envelope.Error, &e)
+				codes = append(codes, e.Code)
+			}
+			for _, result := range envelope.Results {
+				if result.Error != nil {
+					codes = append(codes, result.Error.Code)
+				}
+				for _, e := range result.Response.Result.StepErrors {
+					if e != nil {
+						codes = append(codes, e.Code)
+					}
+				}
+			}
+		}
+		if len(codes) == 0 && b.status != http.StatusOK {
+			codes = append(codes, "")
+		}
+		for i, code := range codes {
+			if i == 8 {
+				break
+			}
+			b.recorder.add(tursoProviderEvent{time.Now().UnixMilli(), b.status, b.stage, tursoSafeProviderCode(code)})
+		}
+	})
+}
+
 type tursoSoakFailure struct {
-	Lane      string       `json:"lane,omitempty"`
-	Operation string       `json:"operation"`
-	Code      string       `json:"code"`
-	Detail    *ErrorDetail `json:"error,omitempty"`
+	Lane      string                  `json:"lane,omitempty"`
+	Operation string                  `json:"operation"`
+	Code      string                  `json:"code"`
+	Detail    *ErrorDetail            `json:"error,omitempty"`
+	Trace     *tursoSafeTraceSnapshot `json:"safe_trace,omitempty"`
 }
 
 func (f tursoSoakFailure) Error() string {
@@ -1611,7 +1855,12 @@ func safeTursoSoakFailure(lane, operation string, err error) error {
 
 func newTursoSoakFailure(lane, operation string, err error) tursoSoakFailure {
 	detail := describeError(err, time.Now().UnixMilli())
-	return tursoSoakFailure{Lane: lane, Operation: operation, Code: storageErrorCode(err), Detail: &detail}
+	failure := tursoSoakFailure{Lane: lane, Operation: operation, Code: storageErrorCode(err), Detail: &detail}
+	var traced *tursoTracedError
+	if errors.As(err, &traced) {
+		failure.Trace = &traced.trace
+	}
+	return failure
 }
 
 func cloneTursoSoakErrorDetail(detail *ErrorDetail) *ErrorDetail {
@@ -2048,7 +2297,13 @@ func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
 		return err
 	}
 	defer r.admission.release()
-	return fn(ctx)
+	trace := &tursoSafeTrace{}
+	ctx = context.WithValue(ctx, remoteDiagnosticKey{}, trace.observe)
+	ctx = context.WithValue(ctx, tursoTraceKey{}, trace)
+	if err := fn(ctx); err != nil {
+		return &tursoTracedError{cause: err, trace: trace.snapshot(ctx, err)}
+	}
+	return nil
 }
 
 // tursoSoakAdmission bounds every harness-originated database call. Limiting the
@@ -2559,6 +2814,7 @@ func runTursoPerformanceSoak(cfg tursoSoakConfig) (resultErr error) {
 	}()
 	started := time.Now()
 	metadata := map[string]any{
+		"diagnostic_only": true, "diagnostic_ticket": "MQLITE-155",
 		"schema_version": 1, "started_at": started.UTC(), "duration_seconds": cfg.Duration.Seconds(),
 		"window_seconds": cfg.Window.Seconds(), "call_timeout_seconds": cfg.CallTimeout.Seconds(),
 		"backend": "remote Turso/libSQL", "engine_count": 1, "message_body_bytes": tursoSoakBodyBytes,
@@ -2694,8 +2950,149 @@ func TestTursoPerformanceSoak(t *testing.T) {
 	if token == "" {
 		t.Fatal("MQLITE_TEST_DB_AUTH_TOKEN is required")
 	}
+	// Diagnostic branch only: do not change retries, requests, response bytes or
+	// the shared verification database workflow's locking/reset contract.
+	recorder := &tursoProviderRecorder{}
+	previous := http.DefaultTransport
+	http.DefaultTransport = tursoTraceTransport{base: previous, recorder: recorder}
+	defer func() { http.DefaultTransport = previous }()
 	if err := runTursoPerformanceSoak(cfg); err != nil {
+		if writeErr := recorder.write(cfg.OutputDir); writeErr != nil {
+			t.Error("safe provider diagnostic evidence could not be written")
+		}
 		t.Fatalf("Turso performance soak failed: %v", err)
+	}
+}
+
+type tursoTraceRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f tursoTraceRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type tursoTraceTestBody struct {
+	io.Reader
+	closed   int
+	closeErr error
+}
+
+type tursoTraceReadFailure struct{ err error }
+
+func (r tursoTraceReadFailure) Read(p []byte) (int, error) { return copy(p, "prefix"), r.err }
+
+func (b *tursoTraceTestBody) Close() error { b.closed++; return b.closeErr }
+
+func TestTursoSafeTracePreservesFailureAndClassifiesStage(t *testing.T) {
+	e, _ := newRemoteCanceledCommitEngine(t)
+	runner := &tursoSoakRunner{cfg: tursoSoakConfig{CallTimeout: time.Second}, admission: newTursoSoakAdmission(1)}
+	err := runner.call(func(ctx context.Context) error {
+		return e.inTx(ctx, func(_ context.Context, tx *txn) error { return tx.tx.Rollback() })
+	})
+	if !errors.Is(err, sql.ErrTxDone) {
+		t.Fatal("diagnostic changed the original transaction error")
+	}
+	failure := newTursoSoakFailure("standard_a", "complete", err)
+	if failure.Trace == nil || failure.Trace.Stage != "commit_error" || failure.Trace.Attempts != 1 ||
+		failure.Trace.Context != "active" || !failure.Trace.Known["tx_done"] {
+		t.Fatalf("unexpected safe stage evidence: %+v", failure.Trace)
+	}
+	secret := errors.New("provider message https://private.invalid SQL=secret token=hidden body=customer")
+	trace := &tursoSafeTrace{}
+	trace.observe("statement_error", secret)
+	wrapped := &tursoTracedError{cause: secret, trace: trace.snapshot(context.Background(), secret)}
+	if !errors.Is(wrapped, secret) || wrapped.Error() != secret.Error() {
+		t.Fatal("error identity changed")
+	}
+	data, marshalErr := json.Marshal(newTursoSoakFailure("lane", "complete", wrapped))
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	for _, forbidden := range []string{"provider message", "private.invalid", "SQL=secret", "token=hidden", "body=customer"} {
+		if bytes.Contains(data, []byte(forbidden)) {
+			t.Fatal("safe error evidence leaked private content")
+		}
+	}
+}
+
+func TestTursoSafeProviderTraceIsBoundedPrivateAndTransparent(t *testing.T) {
+	const private = "https://private.invalid token=hidden SQL=private body=customer"
+	for _, tc := range []struct {
+		name, payload, want string
+		status, count       int
+	}{
+		{"success", `{"baton":"private","results":[{"response":{"type":"execute","result":{"rows":[]}}}]}`, "", 200, 0},
+		{"provider code", `{"results":[{"error":{"code":"TRANSACTION_TIMEOUT","message":"` + private + `"}}]}`, "TRANSACTION_TIMEOUT", 200, 1},
+		{"unreviewed code", `{"results":[{"error":{"code":"token=hidden","message":"` + private + `"}}]}`, "unknown", 200, 1},
+		{"batch code", `{"results":[{"response":{"result":{"step_errors":[{"code":"SQLITE_BUSY","message":"` + private + `"}]}}}]}`, "SQLITE_BUSY", 200, 1},
+		{"http error", `{"error":"` + private + `"}`, "unknown", 503, 1},
+		{"malformed", private, "unknown", 503, 1},
+		{"oversize", `{"code":"STREAM_EXPIRED","message":"` + strings.Repeat(private, 100) + `"}`, "unknown", 503, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &tursoProviderRecorder{}
+			body := &tursoTraceTestBody{Reader: strings.NewReader(tc.payload)}
+			calls := 0
+			transport := tursoTraceTransport{recorder: recorder, base: tursoTraceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: tc.status, Body: body, Header: http.Header{"Test": []string{"retained"}}}, nil
+			})}
+			req, _ := http.NewRequest("POST", "https://synthetic.invalid/", nil)
+			response, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatal("synthetic transport failed")
+			}
+			data, err := io.ReadAll(response.Body)
+			if err != nil || string(data) != tc.payload || response.StatusCode != tc.status || response.Header.Get("Test") != "retained" {
+				t.Fatal("diagnostic changed response bytes, status or headers")
+			}
+			_ = response.Body.Close()
+			_ = response.Body.Close()
+			if calls != 1 || body.closed != 1 || len(recorder.events) != tc.count {
+				t.Fatal("request, close or observation count changed")
+			}
+			if tc.count > 0 && (recorder.events[0].Code != tc.want || recorder.events[0].Stage != "unattributed") {
+				t.Fatal("unsafe or incorrect provider enum")
+			}
+			if err := recorder.write(t.TempDir()); err != nil {
+				t.Fatal("safe evidence write failed")
+			}
+			encoded, _ := json.Marshal(recorder.events)
+			for _, forbidden := range []string{"private.invalid", "token=hidden", "SQL=private", "body=customer", "baton"} {
+				if bytes.Contains(encoded, []byte(forbidden)) {
+					t.Fatal("provider diagnostic leaked private content")
+				}
+			}
+		})
+	}
+	// An early close never parses a partial envelope, and still closes the
+	// original body exactly once. Transport errors are returned by identity.
+	recorder := &tursoProviderRecorder{}
+	original := &tursoTraceTestBody{Reader: strings.NewReader(`{"error":{"code":"SQLITE_BUSY"}}`)}
+	wrapped := &tursoTraceBody{ReadCloser: original, recorder: recorder, status: 200, stage: "statement"}
+	var one [1]byte
+	_, _ = wrapped.Read(one[:])
+	_ = wrapped.Close()
+	_ = wrapped.Close()
+	if original.closed != 1 || len(recorder.events) != 0 {
+		t.Fatal("partial body was parsed or closed incorrectly")
+	}
+	readErr, closeErr := errors.New("private read failure"), errors.New("private close failure")
+	faulty := &tursoTraceTestBody{Reader: tursoTraceReadFailure{readErr}, closeErr: closeErr}
+	faultTrace := &tursoTraceBody{ReadCloser: faulty, recorder: recorder, status: 200, stage: "statement"}
+	data, gotErr := io.ReadAll(faultTrace)
+	if string(data) != "prefix" || !errors.Is(gotErr, readErr) || !errors.Is(faultTrace.Close(), closeErr) ||
+		!errors.Is(faultTrace.Close(), closeErr) || faulty.closed != 1 || len(recorder.events) != 0 {
+		t.Fatal("read/close failures or partial bytes changed")
+	}
+	wantErr := errors.New(private)
+	transport := tursoTraceTransport{recorder: recorder, base: tursoTraceRoundTripFunc(func(*http.Request) (*http.Response, error) { return nil, wantErr })}
+	req, _ := http.NewRequest("POST", "https://synthetic.invalid/", nil)
+	if _, gotErr := transport.RoundTrip(req); !errors.Is(gotErr, wantErr) {
+		t.Fatal("transport error identity changed")
+	}
+	for i := 0; i < 20; i++ {
+		recorder.add(tursoProviderEvent{Code: "unknown"})
+	}
+	if len(recorder.events) != 8 {
+		t.Fatal("provider evidence is not bounded")
 	}
 }
 

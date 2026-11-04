@@ -986,6 +986,16 @@ type txn struct {
 	statementError   error
 }
 
+// MQLITE-155: diagnostic-branch-only, context-local observation seam. No
+// observer is installed in normal operation; it cannot alter errors or retry.
+type remoteDiagnosticKey struct{}
+
+func remoteDiagnosticStage(ctx context.Context, stage string, err error) {
+	if observe, ok := ctx.Value(remoteDiagnosticKey{}).(func(string, error)); ok {
+		observe(stage, err)
+	}
+}
+
 func (t *txn) ctx() context.Context {
 	if t.caller.Err() != nil {
 		return t.caller // cancelled: database/sql refuses it before the driver ever sees it
@@ -994,15 +1004,19 @@ func (t *txn) ctx() context.Context {
 }
 
 func (t *txn) ExecContext(_ context.Context, q string, args ...any) (sql.Result, error) {
+	remoteDiagnosticStage(t.caller, "statement", nil)
 	res, err := t.tx.ExecContext(t.ctx(), q, args...)
 	if err != nil {
+		remoteDiagnosticStage(t.caller, "statement_error", err)
 		t.statementError = err
 	}
 	return res, err
 }
 func (t *txn) QueryContext(_ context.Context, q string, args ...any) (*sql.Rows, error) {
+	remoteDiagnosticStage(t.caller, "query", nil)
 	rows, err := t.tx.QueryContext(t.ctx(), q, args...)
 	if err != nil {
+		remoteDiagnosticStage(t.caller, "query_error", err)
 		t.statementError = err
 	}
 	return rows, err
@@ -1014,8 +1028,10 @@ type transactionRow struct {
 }
 
 func (r transactionRow) Scan(dest ...any) error {
+	remoteDiagnosticStage(r.owner.caller, "scan", nil)
 	err := r.row.Scan(dest...)
 	if err != nil {
+		remoteDiagnosticStage(r.owner.caller, "scan_error", err)
 		r.owner.statementError = err
 	}
 	return err
@@ -1033,15 +1049,19 @@ func (t *txn) SQL() *sql.Tx { return t.tx }
 // the same order. Remote transactions may overlap, so a delayed deletion reply
 // must publish retirement before a later creation publishes the reused name.
 func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
+	remoteDiagnosticStage(attempt.caller, "commit_wait", nil)
 	e.commitMu.Lock()
 	defer e.commitMu.Unlock()
 	// Waiting for the commit sequencer is not part of the database commit. If
 	// the caller stopped while queued here, no commit has started and the exact
 	// context error is the only truthful outcome.
 	if err := checkCtx(attempt.caller); err != nil {
+		remoteDiagnosticStage(attempt.caller, "commit_not_started", err)
 		return err, true
 	}
+	remoteDiagnosticStage(attempt.caller, "commit", nil)
 	if err := attempt.tx.Commit(); err != nil {
+		remoteDiagnosticStage(attempt.caller, "commit_error", err)
 		return err, false
 	}
 	e.observation.commit(attempt)
@@ -1123,8 +1143,10 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		}
 		var tx *sql.Tx
 		observationEpoch := e.observationEpoch()
+		remoteDiagnosticStage(ctx, "begin", nil)
 		tx, err = e.db.sql.BeginTx(ctx, nil)
 		if err != nil {
+			remoteDiagnosticStage(ctx, "begin_error", err)
 			if e.db.retryable(err) {
 				continue
 			}
