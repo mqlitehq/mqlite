@@ -1,10 +1,8 @@
-name: Turso nightly
+name: Turso network diagnostic
 
-# Real-remote integration against a Turso/libSQL DB. Gated by repo secrets so it
-# never runs on forks or PRs (avoids burning the remote quota); nightly + manual.
+# Test-only candidate: profile the existing product without resetting the DB.
+# Shares the production-test lock with nightly/soak; never deploys a public app.
 on:
-  schedule:
-    - cron: '0 8 * * *' # 08:00 UTC daily
   workflow_dispatch:
 
 permissions:
@@ -16,19 +14,22 @@ concurrency:
 
 jobs:
   turso:
-    name: real Turso integration
+    name: bounded dedicated-Turso network profile
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: ${{ github.repository == 'mqlitehq/mqlite' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: stable
-      - name: TestTurso* against dedicated verification database
+      - name: Verify diagnostic privacy and observation controls
+        run: go test -race -count=1 -timeout 90s ./test/networkprobe
+      - name: Profile dedicated verification database without reset
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
-          MQLITE_TEST_DB_RESET_CONFIRM: '1'
+          MQLITE_NETWORK_PROBE_OUTPUT: ${{ runner.temp }}/network-probe/result.json
         run: |
           if [ -z "$MQLITE_TEST_DB" ]; then
             echo "MQLITE_TEST_DB is required for the dedicated nightly integration suite."
@@ -42,4 +43,12 @@ jobs:
             echo "MQLITE_TEST_DB is not the dedicated verification database."
             exit 1
           fi
-          go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
+          timeout 360s go run ./test/networkprobe --opens=2 --call-timeout=90s
+      - name: Retain bounded privacy-safe measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: turso-network-profile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/network-probe/result.json
+          if-no-files-found: error
+          retention-days: 14
