@@ -418,8 +418,14 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 		if err != nil {
 			// Provider error strings can contain endpoints and credentials. Only
 			// stable, non-secret categories may enter Actions logs.
-			t.Fatalf("HTTP pipeline stage=%s failed canceled=%t deadline=%t outcome_unknown=%t", stage,
-				errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, mqlite.ErrOutcomeUnknown))
+			status := 0
+			var responseError *mqlite.HTTPError
+			if errors.As(err, &responseError) && responseError != nil {
+				status = responseError.StatusCode
+			}
+			t.Fatalf("HTTP pipeline stage=%s failed type=%T canceled=%t deadline=%t outcome_unknown=%t lock_lost=%t permission_denied=%t not_found=%t http_status=%d", stage, err,
+				errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, mqlite.ErrOutcomeUnknown),
+				errors.Is(err, mqlite.ErrLockLost), errors.Is(err, mqlite.ErrPermissionDenied), errors.Is(err, mqlite.ErrNotFound), status)
 		}
 	}
 	eng, err := mqlite.OpenEmbedded(ctx, dsn,
