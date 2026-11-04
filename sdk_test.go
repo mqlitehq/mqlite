@@ -359,7 +359,7 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 		}
 	}
 	eng, err := mqlite.OpenEmbedded(ctx, dsn,
-		mqlite.WithDBAuthToken(databaseToken), mqlite.WithBrokerMode(), mqlite.WithoutBackground(),
+		mqlite.WithDBAuthToken(databaseToken), mqlite.WithBrokerMode(),
 		mqlite.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	fail("open", err)
 	defer func() {
@@ -506,7 +506,11 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 		t.Fatal("HTTP pipeline deadline reached before all completions")
 	}
 	stopReceiver()
-	err = <-runDone
+	select {
+	case err = <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("HTTP pipeline Receiver exceeded its shutdown budget")
+	}
 	joined = true
 	if !errors.Is(err, context.Canceled) {
 		fail("Receiver terminal result", err)
