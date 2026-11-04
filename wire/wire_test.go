@@ -18,6 +18,7 @@ func TestMessageResponseSequenceValidation(t *testing.T) {
 		`{"messages":[null]}`, `{"messages":[{}]}`,
 		`{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`,
 		`{"messages":[{"seq_number":7},null]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"first"},{"seq_number":7,"lock_token":"second"}]}`,
 	} {
 		t.Run("receive "+body, func(t *testing.T) {
 			var response wire.ReceiveResponse
@@ -26,7 +27,8 @@ func TestMessageResponseSequenceValidation(t *testing.T) {
 			}
 		})
 	}
-	for _, body := range []string{`{"messages":[]}`, `{"messages":[{"seq_number":7}]}`, `{"messages":[{"seq_number":7,"body":""}],"future":true}`} {
+	for _, body := range []string{`{"messages":[]}`, `{"messages":[{"seq_number":7}]}`, `{"messages":[{"seq_number":7,"body":""}],"future":true}`,
+		`{"messages":[{"seq_number":7,"lock_token":"same"},{"seq_number":8,"lock_token":"same"}]}`} {
 		var response wire.ReceiveResponse
 		if err := json.Unmarshal([]byte(body), &response); err != nil {
 			t.Fatalf("valid empty body/list rejected: %s: %v", body, err)
