@@ -21,7 +21,9 @@ under the existing shared Turso concurrency lock.
 `TestSQLiteInFlightBrokerRestart` and `TestTursoInFlightBrokerRestart` run one
 shared vector through both SDKs. Two handlers remain active while the real
 `Embedded.Serve` stops, the engine closes, and the same database reopens at the
-same HTTP address after 500ms. With a 30-second lease and a delivery limit of
+same HTTP address after an additional 500ms stopped wait. The actual unavailable
+interval also includes drain, engine close, reopen and listener readiness, and is
+logged separately. With a 30-second lease and a delivery limit of
 one, each handler must execute once and receive a successful Complete response;
 the reopened database must preserve both live leases, then end empty with no
 dead letters. The remote test uses the same allowlist and only its own queues.
@@ -45,3 +47,16 @@ even when the earlier pipeline fails; that failure still fails the workflow.
 Manual `verification_scope=receivers` skips the destructive engine suite and the
 main SDK pipeline, while preserving the dedicated-database allowlist and shared
 concurrency lock. `full` remains the default and matches scheduled verification.
+
+Pipeline success is counted from the client transport reading and validating a
+complete `200` / `ok:true` response bound to an accepted queue and sequence.
+Server-buffered responses remain a separate observation. Local controls cover
+lost and truncated responses, malformed acknowledgements and mismatched request
+identities. The 120-second pipeline budget includes database open, queue setup
+and serial sends; phase timestamps distinguish those costs from Receiver time
+and show when a test deadline itself caused cancellation or Abandon.
+Restart logs also bind each handler to its initial lease deadline and server
+time. If that known live-lease bound has expired by readiness or the post-open
+probe, the test reports an expired precondition, rather than calling it wrongful
+revocation of a live token. A later successful renewal can extend that bound;
+these initial-deadline logs alone do not prove that an actual token has expired.
