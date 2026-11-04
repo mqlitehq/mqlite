@@ -12,6 +12,7 @@ package mqlite_test
 // White-box internals live in receiver_internal_test.go (package mqlite).
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -39,6 +41,212 @@ import (
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
+
+func TestTursoHTTPBrokerDelivery(t *testing.T) {
+	dsn := os.Getenv("MQLITE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set MQLITE_TEST_DB for the dedicated remote HTTP pipeline test")
+	}
+	// Match the nightly workflow's exact test-only database whitelist. This
+	// external-package test never invokes engine.TestMain or resets the schema.
+	if dsn != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" {
+		t.Fatal("remote HTTP pipeline refused: not the dedicated verification database")
+	}
+	token := os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN")
+	if token == "" {
+		t.Fatal("remote HTTP pipeline requires the dedicated database token")
+	}
+	exerciseHTTPBrokerDelivery(t, "turso", dsn, token)
+}
+
+func TestSQLiteHTTPBrokerDelivery(t *testing.T) {
+	exerciseHTTPBrokerDelivery(t, "sqlite", ":memory:", "")
+}
+
+func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	fail := func(stage string, err error) {
+		t.Helper()
+		if err != nil {
+			// Provider error strings can contain endpoints and credentials. Only
+			// stable, non-secret categories may enter Actions logs.
+			t.Fatalf("HTTP pipeline stage=%s failed canceled=%t deadline=%t outcome_unknown=%t", stage,
+				errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, mqlite.ErrOutcomeUnknown))
+		}
+	}
+	eng, err := mqlite.OpenEmbedded(ctx, dsn,
+		mqlite.WithDBAuthToken(databaseToken), mqlite.WithBrokerMode(), mqlite.WithoutBackground(),
+		mqlite.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	fail("open", err)
+	defer func() {
+		if err := eng.Close(); err != nil {
+			t.Error("HTTP pipeline engine close failed")
+		}
+	}()
+	const total = 24
+	const brokerToken = "http-pipeline-local-test-token"
+	queue := fmt.Sprintf("http-pipeline-%d-%d", os.Getpid(), time.Now().UnixNano())
+	var mu sync.Mutex
+	completed := make(map[int64]bool, total)
+	var renewals, notifications int
+	allCompleted := make(chan struct{})
+	base := server.New(eng.Engine(), []string{brokerToken}).Handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Queue string `json:"queue"`
+			Seq   int64  `json:"seq_number"`
+		}
+		if r.URL.Path == wire.PathComplete {
+			data, readErr := io.ReadAll(r.Body)
+			_ = r.Body.Close()
+			if readErr != nil || json.Unmarshal(data, &request) != nil {
+				http.Error(w, "invalid test completion request", http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(data))
+		}
+		recorder := httptest.NewRecorder()
+		base.ServeHTTP(recorder, r)
+		for name, values := range recorder.Header() {
+			w.Header()[name] = values
+		}
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+		if recorder.Code != http.StatusOK {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case wire.PathComplete:
+			var response struct {
+				OK bool `json:"ok"`
+			}
+			if json.Unmarshal(recorder.Body.Bytes(), &response) == nil && response.OK && request.Queue == queue {
+				if !completed[request.Seq] {
+					completed[request.Seq] = true
+					if len(completed) == total {
+						close(allCompleted)
+					}
+				}
+			}
+		case wire.PathRenewBatch:
+			var response wire.RenewBatchResponse
+			if json.Unmarshal(recorder.Body.Bytes(), &response) == nil {
+				for _, result := range response.Results {
+					if result.Ok && result.LockedUntilMs > 0 {
+						renewals++
+					}
+				}
+			}
+		}
+	}))
+	defer ts.Close()
+	client, err := mqlite.Open(ctx, ts.URL, mqlite.WithToken(brokerToken))
+	fail("client open", err)
+	defer client.Close()
+	fail("create own queue", client.CreateQueue(ctx, queue, mqlite.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1}))
+	defer func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 20*time.Second)
+		defer stop()
+		_, err := client.DeleteQueueWithOptions(cleanup, queue, mqlite.DeleteQueueOpts{Force: true})
+		if err != nil {
+			t.Error("HTTP pipeline own-queue cleanup failed")
+		}
+	}()
+	type expected struct {
+		seq  int64
+		body []byte
+	}
+	sent := make(map[string]expected, total)
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("binary-%02d", i)
+		body := []byte{byte(i), 0, 255, 128, byte(i ^ 127)}
+		seq, err := client.SendOne(ctx, queue, mqlite.OutMessage{MessageID: id, Body: body})
+		fail("send", err)
+		if seq <= 0 {
+			t.Fatal("HTTP pipeline Send returned an invalid sequence")
+		}
+		sent[id] = expected{seq: seq, body: body}
+	}
+	runCtx, stopReceiver := context.WithCancel(ctx)
+	seen := make(map[string]int, total)
+	invalidDelivery := false
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- client.Receiver(queue, mqlite.WithConcurrency(4), mqlite.WithAutoRenew(),
+			mqlite.WithErrorHandler(func(error) { mu.Lock(); notifications++; mu.Unlock() })).
+			Run(runCtx, func(handlerCtx context.Context, message *mqlite.Message) error {
+				want, exists := sent[message.MessageID]
+				mu.Lock()
+				seen[message.MessageID]++
+				valid := exists && message.SequenceNumber == want.seq && bytes.Equal(message.Body, want.body) &&
+					message.DeliveryCount == 1 && seen[message.MessageID] == 1
+				invalidDelivery = invalidDelivery || !valid
+				mu.Unlock()
+				if !valid {
+					return errors.New("HTTP pipeline delivery validation failed")
+				}
+				if message.MessageID == "binary-00" {
+					// Cross the 30s lease's first renewal point, so AutoRenew is
+					// observed on the wire rather than merely enabled as an option.
+					timer := time.NewTimer(11 * time.Second)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+					case <-handlerCtx.Done():
+						return handlerCtx.Err()
+					}
+				}
+				return nil
+			})
+	}()
+	joined := false
+	defer func() {
+		stopReceiver()
+		if !joined {
+			select {
+			case <-runDone:
+			case <-time.After(10 * time.Second):
+				t.Error("HTTP pipeline Receiver did not stop within cleanup budget")
+			}
+		}
+	}()
+	select {
+	case <-allCompleted:
+	case err := <-runDone:
+		joined = true
+		fail("Receiver stopped before all completions", err)
+		t.Fatal("HTTP pipeline Receiver ended before all completions")
+	case <-ctx.Done():
+		t.Fatal("HTTP pipeline deadline reached before all completions")
+	}
+	stopReceiver()
+	err = <-runDone
+	joined = true
+	if !errors.Is(err, context.Canceled) {
+		fail("Receiver terminal result", err)
+		t.Fatal("HTTP pipeline Receiver did not report cancellation")
+	}
+	stats, err := client.Stats(ctx, queue)
+	fail("final stats", err)
+	mu.Lock()
+	defer mu.Unlock()
+	if invalidDelivery || len(seen) != total || len(completed) != total || renewals == 0 ||
+		stats.Total != 0 || stats.Active != 0 || stats.Locked != 0 || stats.DeadLettered != 0 {
+		t.Fatalf("HTTP pipeline accounting failed invalid=%t handled=%d complete=%d renewals=%d total=%d locked=%d dlq=%d",
+			invalidDelivery, len(seen), len(completed), renewals, stats.Total, stats.Locked, stats.DeadLettered)
+	}
+	for id, want := range sent {
+		if seen[id] != 1 || !completed[want.seq] {
+			t.Fatal("HTTP pipeline per-message handler/Complete accounting failed")
+		}
+	}
+	t.Logf("HTTP pipeline backend=%s sent=%d handled=%d confirmed_complete=%d confirmed_renewals=%d notifications=%d final_total=%d dlq=%d",
+		backend, len(sent), len(seen), len(completed), renewals, notifications, stats.Total, stats.DeadLettered)
+}
 
 // Keep the released public type's exact field order, tags and arity. This also
 // preserves external unkeyed SubscriptionInfo literals at compile time.
