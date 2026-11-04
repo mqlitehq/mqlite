@@ -35,3 +35,13 @@ valid. It does not test operating-system signals, suspended hosts, power loss,
 outages beyond the lease, or graceful draining of client handlers. Those cases
 have different recovery semantics; at-least-once delivery still requires
 idempotent handlers.
+
+On failure, the pipeline records handler/settlement counts and probes its own
+queue with a separate five-second context before cleanup. Error diagnostics
+contain only types, HTTP statuses and fixed sentinel flags; provider error text,
+SQL, credentials and endpoints are excluded and covered by a privacy control.
+The nightly workflow runs the restart vector independently after SDK checkout,
+even when the earlier pipeline fails; that failure still fails the workflow.
+Manual `verification_scope=receivers` skips the destructive engine suite and the
+main SDK pipeline, while preserving the dedicated-database allowlist and shared
+concurrency lock. `full` remains the default and matches scheduled verification.

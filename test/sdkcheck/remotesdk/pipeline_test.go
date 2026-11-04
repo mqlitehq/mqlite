@@ -339,26 +339,77 @@ func TestSQLiteHTTPBrokerDelivery(t *testing.T) {
 	exerciseHTTPBrokerDelivery(t, "sqlite", ":memory:", "")
 }
 
+// Only types, fixed categories and status codes cross this diagnostic boundary.
+// Provider Error() text can contain credentials, SQL or endpoint addresses.
+type pipelineErrorFields struct {
+	Type             string
+	UnwrapTypes      []string
+	HTTPStatus       int
+	Canceled         bool
+	Deadline         bool
+	OutcomeUnknown   bool
+	LockLost         bool
+	PermissionDenied bool
+	Unauthenticated  bool
+	NotFound         bool
+	InvalidArgument  bool
+}
+
+func pipelineErrorDiagnostic(err error) pipelineErrorFields {
+	fields := pipelineErrorFields{
+		Type: fmt.Sprintf("%T", err), Canceled: errors.Is(err, context.Canceled),
+		Deadline: errors.Is(err, context.DeadlineExceeded), OutcomeUnknown: errors.Is(err, sdk.ErrOutcomeUnknown),
+		LockLost: errors.Is(err, sdk.ErrLockLost), PermissionDenied: errors.Is(err, sdk.ErrPermissionDenied),
+		Unauthenticated: errors.Is(err, sdk.ErrUnauthenticated), NotFound: errors.Is(err, sdk.ErrNotFound),
+		InvalidArgument: errors.Is(err, sdk.ErrInvalidArgument),
+	}
+	var responseError *sdk.HTTPError
+	if errors.As(err, &responseError) && responseError != nil {
+		fields.HTTPStatus = responseError.StatusCode
+	}
+	for cause, depth := errors.Unwrap(err), 0; cause != nil && depth < 6; cause, depth = errors.Unwrap(cause), depth+1 {
+		fields.UnwrapTypes = append(fields.UnwrapTypes, fmt.Sprintf("%T", cause))
+	}
+	return fields
+}
+
+func TestPipelineErrorDiagnosticPrivacy(t *testing.T) {
+	const secret = "https://private.invalid/db?token=PRIVATE_TOKEN_SENTINEL SQL=SELECT_PRIVATE_SENTINEL"
+	err := fmt.Errorf("%s: %w", secret, errors.Join(&sdk.HTTPError{StatusCode: 503}, sdk.ErrLockLost,
+		sdk.ErrOutcomeUnknown, context.Canceled, context.DeadlineExceeded))
+	fields := pipelineErrorDiagnostic(err)
+	data, marshalErr := json.Marshal(fields)
+	data = append(data, []byte(fmt.Sprintf("%+v", fields))...)
+	if marshalErr != nil || bytes.Contains(data, []byte("private.invalid")) || bytes.Contains(data, []byte("PRIVATE_TOKEN_SENTINEL")) ||
+		bytes.Contains(data, []byte("SELECT_PRIVATE_SENTINEL")) || !fields.LockLost || !fields.OutcomeUnknown ||
+		!fields.Canceled || !fields.Deadline || fields.HTTPStatus != 503 {
+		t.Fatal("pipeline diagnostic privacy or category control failed")
+	}
+	plain := pipelineErrorDiagnostic(errors.New(secret))
+	data, marshalErr = json.Marshal(plain)
+	data = append(data, []byte(fmt.Sprintf("%+v", plain))...)
+	if marshalErr != nil || bytes.Contains(data, []byte("private.invalid")) || bytes.Contains(data, []byte("PRIVATE_TOKEN_SENTINEL")) ||
+		bytes.Contains(data, []byte("SELECT_PRIVATE_SENTINEL")) || plain.HTTPStatus != 0 || plain.LockLost || plain.Canceled {
+		t.Fatal("pipeline diagnostic negative control failed")
+	}
+}
+
 // This deliberately follows the main SDK's HTTP-pipeline ledger, while every
 // client operation and managed handler uses the independent remote-only SDK.
 func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+	var snapshot func(string)
 	fail := func(stage string, err error) {
 		t.Helper()
 		if err == nil {
 			return
 		}
-		// Never print provider errors: their text may contain secrets or URLs.
-		status := 0
-		var responseError *sdk.HTTPError
-		if errors.As(err, &responseError) && responseError != nil {
-			status = responseError.StatusCode
+		if snapshot != nil {
+			snapshot(stage)
 		}
-		t.Fatalf("remote SDK pipeline stage=%s failed type=%T canceled=%t deadline=%t outcome_unknown=%t lock_lost=%t permission_denied=%t not_found=%t http_status=%d", stage, err,
-			errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, sdk.ErrOutcomeUnknown),
-			errors.Is(err, sdk.ErrLockLost), errors.Is(err, sdk.ErrPermissionDenied), errors.Is(err, sdk.ErrNotFound), status)
+		t.Fatalf("remote SDK pipeline stage=%s diagnostic=%+v", stage, pipelineErrorDiagnostic(err))
 	}
 	eng, err := broker.OpenEmbedded(ctx, dsn, broker.WithDBAuthToken(databaseToken), broker.WithBrokerMode(),
 		broker.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
@@ -374,6 +425,7 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 	var mu sync.Mutex
 	completed := make(map[int64]bool, total)
 	var renewals, notifications int
+	completeFailures, renewFailures := make(map[int]int), make(map[int]int)
 	allCompleted := make(chan struct{})
 	base := server.New(eng.Engine(), []string{brokerToken}).Handler()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -398,6 +450,13 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 		w.WriteHeader(recorder.Code)
 		written, writeErr := w.Write(recorder.Body.Bytes())
 		if recorder.Code != http.StatusOK || writeErr != nil || written != recorder.Body.Len() {
+			mu.Lock()
+			if r.URL.Path == wire.PathComplete {
+				completeFailures[recorder.Code]++
+			} else if r.URL.Path == wire.PathRenewBatch {
+				renewFailures[recorder.Code]++
+			}
+			mu.Unlock()
 			return
 		}
 		mu.Lock()
@@ -452,10 +511,38 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 	runCtx, stopReceiver := context.WithCancel(ctx)
 	seen := make(map[string]int, total)
 	invalidDelivery := false
+	snapshot = func(stage string) {
+		mu.Lock()
+		calls := 0
+		for _, count := range seen {
+			calls += count
+		}
+		t.Logf("remote SDK pipeline snapshot stage=%s sent=%d seen_unique=%d handler_calls=%d confirmed_complete=%d renewals=%d notifications=%d invalid_delivery=%t unconfirmed=%d complete_http_failures=%v renew_http_failures=%v",
+			stage, len(sent), len(seen), calls, len(completed), renewals, notifications, invalidDelivery,
+			len(sent)-len(completed), completeFailures, renewFailures)
+		mu.Unlock()
+		// The Run context may already be expired. Probe with a fresh, independently
+		// bounded context before queue cleanup; DLQ/locked rows are not lost rows.
+		probe, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		stats, statsErr := client.Stats(probe, queue)
+		if statsErr != nil {
+			t.Logf("remote SDK pipeline snapshot_stats stage=%s diagnostic=%+v", stage, pipelineErrorDiagnostic(statsErr))
+			return
+		}
+		t.Logf("remote SDK pipeline snapshot_stats stage=%s active=%d locked=%d deferred=%d scheduled=%d dlq=%d total=%d",
+			stage, stats.Active, stats.Locked, stats.Deferred, stats.Scheduled, stats.DeadLettered, stats.Total)
+	}
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- client.Receiver(queue, sdk.WithConcurrency(4), sdk.WithAutoRenew(),
-			sdk.WithErrorHandler(func(error) { mu.Lock(); notifications++; mu.Unlock() })).
+			sdk.WithErrorHandler(func(err error) {
+				mu.Lock()
+				notifications++
+				count := notifications
+				mu.Unlock()
+				t.Logf("remote SDK pipeline notification number=%d diagnostic=%+v", count, pipelineErrorDiagnostic(err))
+			})).
 			Run(runCtx, func(handlerCtx context.Context, message *sdk.Message) error {
 				want, exists := sent[message.MessageID]
 				mu.Lock()
@@ -496,8 +583,10 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 	case err := <-runDone:
 		joined = true
 		fail("Receiver stopped before all completions", err)
+		snapshot("Receiver returned nil before all completions")
 		t.Fatal("remote SDK pipeline Receiver ended before all completions")
 	case <-ctx.Done():
+		snapshot("completion deadline")
 		t.Fatal("remote SDK pipeline deadline reached before all completions")
 	}
 	stopReceiver()

@@ -6,6 +6,14 @@ on:
   schedule:
     - cron: '0 8 * * *' # 08:00 UTC daily
   workflow_dispatch:
+    inputs:
+      verification_scope:
+        description: 'Full suite, or receiver diagnostics without a database reset'
+        type: choice
+        default: full
+        options:
+          - full
+          - receivers
 
 permissions:
   contents: read
@@ -25,6 +33,7 @@ jobs:
         with:
           go-version: stable
       - name: TestTurso* against dedicated verification database
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope != 'receivers' }}
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
@@ -44,6 +53,7 @@ jobs:
           fi
           go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
       - name: HTTP broker and managed SDK against dedicated verification database
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope != 'receivers' }}
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
@@ -59,6 +69,7 @@ jobs:
           # Root package only: this case never invokes engine.TestMain's table reset.
           go test . -run '^TestTursoHTTPBrokerDelivery$' -count=1 -v -timeout 180s
       - name: Check out the independent remote SDK candidate
+        id: remote-sdk-candidate
         uses: actions/checkout@v7
         with:
           repository: mqlitehq/mqlite-go
@@ -88,6 +99,7 @@ jobs:
           # Separate module: no main-module SDK dependency and no engine.TestMain reset.
           go test . -run '^TestTursoHTTPBrokerDelivery$' -count=1 -v -timeout 180s
       - name: In-flight handlers survive broker close and reopen with both SDKs
+        if: ${{ !cancelled() && steps.remote-sdk-candidate.outcome == 'success' }}
         working-directory: test/sdkcheck/remotesdk
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
@@ -95,5 +107,11 @@ jobs:
           GOWORK: 'off'
         run: |
           # Test repeats the exact allowlist check; same shared database lock.
-          # The previous step pinned the SDK replacement to the verified SHA.
+          # Run even if the earlier pipeline fails, preserving that failure.
+          # Recheck independently instead of assuming earlier setup succeeded.
+          if [ "$(git -C "$GITHUB_WORKSPACE/.test-mqlite-go" rev-parse HEAD)" != "4cb6c799a5c0099bb485921e489f7b55e7e7f3a9" ]; then
+            echo "The remote SDK checkout does not match the reviewed candidate."
+            exit 1
+          fi
+          go mod edit -replace=github.com/mqlitehq/mqlite-go="$GITHUB_WORKSPACE/.test-mqlite-go"
           go test -race . -run '^TestTursoInFlightBrokerRestart$' -count=1 -v -timeout 210s
