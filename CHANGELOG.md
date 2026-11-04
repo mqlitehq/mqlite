@@ -21,6 +21,16 @@ upgrade notes before replacing a broker.
 > and settle all deliveries, or wait for every lease to expire and verify
 > `locked=0`; do not run an old local CLI against a stopped broker DB with live work.
 
+### Reject impossible message acknowledgements (MQLITE-152)
+
+- Reject null Receive items and nonpositive delivery sequence numbers before
+  exposing any part of the returned batch. A damaged receive-and-delete response
+  reports `ErrOutcomeUnknown`; a Peek-Lock response remains replayable with the
+  same attempt ID, including through the managed Receiver.
+- Reject null or negative Send/Schedule acknowledgement sequences while preserving
+  legitimate zero results for topic no-match and skipped batch dedup slots.
+  Valid empty message bodies and empty Receive lists remain supported.
+
 ### Preserve remote cancellation identity (MQLITE-147)
 
 - Preserve a caller's cancellation identity when remote work has provably not
