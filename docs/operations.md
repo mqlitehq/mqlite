@@ -146,6 +146,10 @@ If the downtime reaches `locked_until`, startup recovery (or the reaper) applies
 the ordinary expiry rule: the message returns to active below the delivery limit
 or enters the DLQ on its final attempt. Size lock durations and deployment grace
 periods so planned restarts normally finish inside the remaining lease.
+Measure the full interval from stopping the old broker until the replacement
+listener is ready, including database open and schema checks. The default lease
+is 30 seconds; use a longer configured lease when measured remote-store restart
+time and renewal/settlement latency need more margin.
 The managed Go clients also have bounded renewal and settlement retry budgets:
 terminal Complete/Abandon cleanup gets up to five seconds. Returning before lease
 expiry is therefore necessary but not sufficient to preserve a particular
