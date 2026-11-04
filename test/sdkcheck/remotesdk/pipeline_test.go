@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +22,303 @@ import (
 	"github.com/mqlitehq/mqlite/server"
 	"github.com/mqlitehq/mqlite/wire"
 )
+
+func TestSQLiteInFlightBrokerRestart(t *testing.T) {
+	exerciseInFlightRestart(t, "file:"+filepath.Join(t.TempDir(), "restart.db"), "")
+}
+
+func TestTursoInFlightBrokerRestart(t *testing.T) {
+	dsn := os.Getenv("MQLITE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set MQLITE_TEST_DB for the dedicated restart test")
+	}
+	if dsn != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" || os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN") == "" {
+		t.Fatal("restart test requires the dedicated verification database and token")
+	}
+	exerciseInFlightRestart(t, dsn, os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"))
+}
+
+// Both adapters run the same lifecycle vector through the real Embedded.Serve
+// drain path. Closing/reopening the engine keeps the database and HTTP address;
+// the independent clients and their blocked handlers survive the whole restart.
+func exerciseInFlightRestart(t *testing.T, dsn, databaseToken string) {
+	for _, sdkName := range []string{"main", "remote-only"} {
+		t.Run(sdkName, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			check := func(stage string, err error) {
+				t.Helper()
+				if err != nil {
+					// Provider errors may contain endpoint/credential text. Log only
+					// type and stable categories, never raw errors or the DSN.
+					t.Fatalf("restart stage=%s type=%T canceled=%t deadline=%t", stage, err,
+						errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded))
+				}
+			}
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			check("reserve address", err)
+			addr := ln.Addr().String()
+			check("release address", ln.Close())
+			const token = "inflight-restart-local-test-token"
+			queue := fmt.Sprintf("inflight-restart-%d-%d", os.Getpid(), time.Now().UnixNano())
+			var current *broker.Embedded
+			var serveCancel context.CancelFunc
+			var serveDone chan error
+			start := func() {
+				var err error
+				current, err = broker.OpenEmbedded(ctx, dsn, broker.WithBrokerMode(), broker.WithDBAuthToken(databaseToken),
+					broker.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+				check("open broker", err)
+				serveCtx, stop := context.WithCancel(ctx)
+				serveCancel = stop
+				ready := make(chan struct{})
+				serveDone = make(chan error, 1)
+				instance, done := current, serveDone
+				go func() {
+					done <- instance.Serve(serveCtx, addr, broker.WithTokens(token), broker.WithReady(func() { close(ready) }))
+				}()
+				select {
+				case <-ready:
+				case err := <-serveDone:
+					serveDone = nil
+					check("serve before ready", err)
+					t.Fatal("Serve exited before ready")
+				case <-ctx.Done():
+					t.Fatal("restart broker readiness timed out")
+				}
+			}
+			stop := func() {
+				if serveDone != nil {
+					serveCancel()
+					select {
+					case err := <-serveDone:
+						serveDone = nil
+						check("serve shutdown", err)
+					case <-time.After(10 * time.Second):
+						t.Fatal("restart Serve shutdown exceeded test budget")
+					}
+				}
+				if current != nil {
+					check("engine close", current.Close())
+					current = nil
+				}
+			}
+			defer stop()
+			start()
+			ledger := &restartTransport{base: http.DefaultTransport.(*http.Transport).Clone(), queue: queue, completed: make(map[int64]bool)}
+			defer ledger.base.CloseIdleConnections()
+			httpClient := &http.Client{Transport: ledger}
+			var create func() error
+			var send func(string) (int64, error)
+			var run func(context.Context, func(context.Context, int64, int, []byte) error, func(error)) error
+			var cleanup func(context.Context) error
+			var closeClient func() error
+			if sdkName == "main" {
+				client, err := broker.Open(ctx, "http://"+addr, broker.WithToken(token), broker.WithHTTPClient(httpClient))
+				check("main client open", err)
+				closeClient = client.Close
+				create = func() error {
+					return client.CreateQueue(ctx, queue, broker.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1})
+				}
+				send = func(body string) (int64, error) {
+					return client.SendOne(ctx, queue, broker.OutMessage{Body: []byte(body)})
+				}
+				cleanup = func(c context.Context) error {
+					_, err := client.DeleteQueueWithOptions(c, queue, broker.DeleteQueueOpts{Force: true})
+					return err
+				}
+				run = func(c context.Context, handler func(context.Context, int64, int, []byte) error, notify func(error)) error {
+					return client.Receiver(queue, broker.WithAutoRenew(), broker.WithConcurrency(3), broker.WithErrorHandler(notify)).Run(c,
+						func(h context.Context, m *broker.Message) error {
+							return handler(h, m.SequenceNumber, m.DeliveryCount, m.Body)
+						})
+				}
+			} else {
+				client, err := sdk.Open(ctx, "http://"+addr, sdk.WithToken(token), sdk.WithHTTPClient(httpClient))
+				check("remote-only client open", err)
+				closeClient = client.Close
+				create = func() error {
+					return client.CreateQueue(ctx, queue, sdk.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1})
+				}
+				send = func(body string) (int64, error) {
+					return client.SendOne(ctx, queue, sdk.OutMessage{Body: []byte(body)})
+				}
+				cleanup = func(c context.Context) error {
+					_, err := client.DeleteQueueWithOptions(c, queue, sdk.DeleteQueueOpts{Force: true})
+					return err
+				}
+				run = func(c context.Context, handler func(context.Context, int64, int, []byte) error, notify func(error)) error {
+					return client.Receiver(queue, sdk.WithAutoRenew(), sdk.WithConcurrency(3), sdk.WithErrorHandler(notify)).Run(c,
+						func(h context.Context, m *sdk.Message) error {
+							return handler(h, m.SequenceNumber, m.DeliveryCount, m.Body)
+						})
+				}
+			}
+			defer func() { check("client close", closeClient()) }()
+			check("create queue", create())
+			defer func() {
+				c, done := context.WithTimeout(context.Background(), 15*time.Second)
+				defer done()
+				check("own queue cleanup", cleanup(c))
+			}()
+			sent := make(map[int64]string)
+			for _, body := range []string{"restart-work-0", "restart-work-1"} {
+				seq, err := send(body)
+				check("send", err)
+				if seq <= 0 || sent[seq] != "" {
+					t.Fatal("Send returned an invalid or duplicate sequence")
+				}
+				sent[seq] = body
+			}
+			var mu sync.Mutex
+			seen := make(map[int64]int)
+			invalid, lockLost, notifications := false, 0, 0
+			entered, release := make(chan struct{}, 2), make(chan struct{})
+			runCtx, cancelRun := context.WithCancel(ctx)
+			runDone := make(chan error, 1)
+			go func() {
+				runDone <- run(runCtx, func(h context.Context, seq int64, delivery int, body []byte) error {
+					mu.Lock()
+					seen[seq]++
+					want, exists := sent[seq]
+					invalid = invalid || !exists || delivery != 1 || seen[seq] != 1 || string(body) != want
+					mu.Unlock()
+					select {
+					case entered <- struct{}{}:
+					default:
+					}
+					select {
+					case <-release:
+						return nil
+					case <-h.Done():
+						return h.Err()
+					}
+				}, func(err error) {
+					mu.Lock()
+					defer mu.Unlock()
+					notifications++
+					if errors.Is(err, broker.ErrLockLost) || errors.Is(err, sdk.ErrLockLost) {
+						lockLost++
+					}
+				})
+			}()
+			joined := false
+			defer func() {
+				cancelRun()
+				if !joined {
+					select {
+					case <-runDone:
+					case <-time.After(10 * time.Second):
+						t.Error("restart receiver cleanup exceeded budget")
+					}
+				}
+			}()
+			for i := 0; i < 2; i++ {
+				select {
+				case <-entered:
+				case <-ctx.Done():
+					t.Fatal("handlers did not enter before restart")
+				}
+			}
+			stop()
+			// Deliberate, bounded broker unavailability; the client Run is unchanged.
+			timer := time.NewTimer(500 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				t.Fatal("restart deadline")
+			}
+			start()
+			stats, err := current.Stats(ctx, queue)
+			check("stats after reopen", err)
+			if stats.Locked != 2 || stats.DeadLettered != 0 {
+				t.Fatalf("reopen revoked live leases locked=%d dlq=%d", stats.Locked, stats.DeadLettered)
+			}
+			close(release)
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			for ledger.count() != 2 {
+				select {
+				case err := <-runDone:
+					joined = true
+					check("receiver exited during restart", err)
+					t.Fatal("Receiver returned before both confirmations")
+				case <-ctx.Done():
+					t.Fatal("restart settlements did not confirm")
+				case <-ticker.C:
+				}
+			}
+			cancelRun()
+			select {
+			case err := <-runDone:
+				joined = true
+				if !errors.Is(err, context.Canceled) {
+					check("receiver terminal result", err)
+					t.Fatal("Receiver did not return caller cancellation")
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("restart Receiver did not join")
+			}
+			stats, err = current.Stats(ctx, queue)
+			check("final stats", err)
+			mu.Lock()
+			defer mu.Unlock()
+			if invalid || len(seen) != 2 || lockLost != 0 || stats.Total != 0 || stats.DeadLettered != 0 {
+				t.Fatalf("restart ledger invalid=%t handled=%d complete=%d lock_lost=%d total=%d dlq=%d", invalid, len(seen), ledger.count(), lockLost, stats.Total, stats.DeadLettered)
+			}
+			for seq := range sent {
+				if seen[seq] != 1 || !ledger.confirmed(seq) {
+					t.Fatal("restart per-message confirmation mismatch")
+				}
+			}
+			t.Logf("restart sdk=%s sent=2 handlers=2 confirmed_complete=2 lock_lost=0 notifications=%d final_total=0 dlq=0", sdkName, notifications)
+		})
+	}
+}
+
+// Count successful Complete responses received by the actual SDK, independently
+// from handler returns and the final queue snapshot. No retries are added here.
+type restartTransport struct {
+	base      *http.Transport
+	queue     string
+	mu        sync.Mutex
+	completed map[int64]bool
+}
+
+func (r *restartTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := r.base.RoundTrip(request)
+	if err != nil || request.URL.Path != wire.PathComplete || response.StatusCode != http.StatusOK {
+		return response, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	_ = response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(data))
+	var input wire.SettleRequest
+	if request.GetBody == nil {
+		return response, nil
+	}
+	body, bodyErr := request.GetBody()
+	if bodyErr != nil {
+		return response, nil
+	}
+	decodeErr := json.NewDecoder(io.LimitReader(body, 4096)).Decode(&input)
+	_ = body.Close()
+	var result wire.SettleResponse
+	if readErr == nil && decodeErr == nil && input.Queue == r.queue && input.SeqNumber > 0 && json.Unmarshal(data, &result) == nil && result.Ok {
+		r.mu.Lock()
+		r.completed[input.SeqNumber] = true
+		r.mu.Unlock()
+	}
+	return response, nil
+}
+
+func (r *restartTransport) count() int { r.mu.Lock(); defer r.mu.Unlock(); return len(r.completed) }
+func (r *restartTransport) confirmed(seq int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.completed[seq]
+}
 
 func TestTursoHTTPBrokerDelivery(t *testing.T) {
 	dsn := os.Getenv("MQLITE_TEST_DB")

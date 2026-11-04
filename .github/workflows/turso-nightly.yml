@@ -87,3 +87,13 @@ jobs:
           go mod edit -replace=github.com/mqlitehq/mqlite-go="$GITHUB_WORKSPACE/.test-mqlite-go"
           # Separate module: no main-module SDK dependency and no engine.TestMain reset.
           go test . -run '^TestTursoHTTPBrokerDelivery$' -count=1 -v -timeout 180s
+      - name: In-flight handlers survive broker close and reopen with both SDKs
+        working-directory: test/sdkcheck/remotesdk
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+          GOWORK: 'off'
+        run: |
+          # Test repeats the exact allowlist check; same shared database lock.
+          # The previous step pinned the SDK replacement to the verified SHA.
+          go test -race . -run '^TestTursoInFlightBrokerRestart$' -count=1 -v -timeout 210s
