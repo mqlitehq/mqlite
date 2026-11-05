@@ -988,7 +988,7 @@ func TestHranaCommitAlreadyCanceledDoesNotSubmit(t *testing.T) {
 			defer cancel()
 			conn := &hranaCommitCountingConn{}
 			err := (&singleLeaseTx{conn: conn, ctx: ctx}).Commit()
-			if err != ctx.Err() || errors.Is(err, ErrOutcomeUnknown) || conn.calls != 0 {
+			if !errors.Is(err, ctx.Err()) || errors.Is(err, ErrOutcomeUnknown) || conn.calls != 0 {
 				t.Fatalf("already-canceled COMMIT err=%v calls=%d, want caller error and no submission", err, conn.calls)
 			}
 		})
