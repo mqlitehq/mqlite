@@ -32,6 +32,18 @@ upgrade notes before replacing a broker.
   Shutdown maintenance is therefore interrupted rather than falsely failed
   without weakening the existing unknown-outcome safety contract.
 
+### Honor remote transaction deadlines (MQLITE-163)
+
+- Keep Hrana HTTP COMMIT on the transaction's original context. A stalled
+  response no longer detaches the commit from the caller's cancellation or
+  deadline and indefinitely holds admitted work and engine shutdown open.
+- An interrupted COMMIT remains `ErrOutcomeUnknown`; the transaction callback
+  is not automatically replayed. ROLLBACK gets a separate, five-second cleanup
+  budget so an already-canceled caller does not prevent a cleanup attempt.
+- This does not bound the deprecated driver's separate asynchronous stream-close
+  requests. Those may outlive engine shutdown on a stalled network (MQLITE-164).
+  Local SQLite, the schema and SDK wire contracts are unchanged.
+
 ### Make preserving live leases the safe startup default (MQLITE-137 follow-up)
 
 - Preserve every unexpired Peek-Lock lease on an active resource across any
