@@ -650,17 +650,105 @@ func TestPipelineErrorDiagnosticPrivacy(t *testing.T) {
 	}
 }
 
-// This deliberately follows the main SDK's HTTP-pipeline ledger, while every
-// client operation and managed handler uses the independent remote-only SDK.
+// Both SDKs use the same workload, client-side ACK observer and failure ledger.
+// Only the public client/message types differ at this adapter boundary.
+type pipelineMessage struct {
+	SequenceNumber int64
+	MessageID      string
+	Body           []byte
+	DeliveryCount  int
+}
+
+type pipelineClient struct {
+	create  func(context.Context) error
+	send    func(context.Context, string, []byte) (int64, error)
+	stats   func(context.Context) (broker.Metrics, error)
+	cleanup func(context.Context) error
+	run     func(context.Context, func(context.Context, pipelineMessage) error, func(error)) error
+	close   func() error
+}
+
+func openPipelineClient(ctx context.Context, sdkName, endpoint, token, queue string, httpClient *http.Client) (pipelineClient, error) {
+	if sdkName == "main" {
+		client, err := broker.Open(ctx, endpoint, broker.WithToken(token), broker.WithHTTPClient(httpClient))
+		if err != nil {
+			return pipelineClient{}, err
+		}
+		return pipelineClient{
+			create: func(c context.Context) error {
+				return client.CreateQueue(c, queue, broker.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1})
+			},
+			send: func(c context.Context, id string, body []byte) (int64, error) {
+				return client.SendOne(c, queue, broker.OutMessage{MessageID: id, Body: body})
+			},
+			stats: func(c context.Context) (broker.Metrics, error) { return client.Stats(c, queue) },
+			cleanup: func(c context.Context) error {
+				result, err := client.DeleteQueueWithOptions(c, queue, broker.DeleteQueueOpts{Force: true})
+				if err == nil && (!result.Deleted || result.State != "deleted") {
+					return errors.New("main SDK pipeline queue deletion was not confirmed")
+				}
+				return err
+			},
+			run: func(c context.Context, handler func(context.Context, pipelineMessage) error, notify func(error)) error {
+				return client.Receiver(queue, broker.WithConcurrency(4), broker.WithAutoRenew(), broker.WithErrorHandler(notify)).Run(c,
+					func(h context.Context, m *broker.Message) error {
+						return handler(h, pipelineMessage{SequenceNumber: m.SequenceNumber, MessageID: m.MessageID, Body: m.Body, DeliveryCount: m.DeliveryCount})
+					})
+			},
+			close: client.Close,
+		}, nil
+	}
+	if sdkName != "remote-only" {
+		return pipelineClient{}, errors.New("unsupported pipeline test SDK")
+	}
+	client, err := sdk.Open(ctx, endpoint, sdk.WithToken(token), sdk.WithHTTPClient(httpClient))
+	if err != nil {
+		return pipelineClient{}, err
+	}
+	return pipelineClient{
+		create: func(c context.Context) error {
+			return client.CreateQueue(c, queue, sdk.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1})
+		},
+		send: func(c context.Context, id string, body []byte) (int64, error) {
+			return client.SendOne(c, queue, sdk.OutMessage{MessageID: id, Body: body})
+		},
+		stats: func(c context.Context) (broker.Metrics, error) {
+			m, err := client.Stats(c, queue)
+			return broker.Metrics{Active: m.Active, Locked: m.Locked, Deferred: m.Deferred, Scheduled: m.Scheduled, DeadLettered: m.DeadLettered, Total: m.Total}, err
+		},
+		cleanup: func(c context.Context) error {
+			result, err := client.DeleteQueueWithOptions(c, queue, sdk.DeleteQueueOpts{Force: true})
+			if err == nil && (!result.Deleted || result.State != "deleted") {
+				return errors.New("remote SDK pipeline queue deletion was not confirmed")
+			}
+			return err
+		},
+		run: func(c context.Context, handler func(context.Context, pipelineMessage) error, notify func(error)) error {
+			return client.Receiver(queue, sdk.WithConcurrency(4), sdk.WithAutoRenew(), sdk.WithErrorHandler(notify)).Run(c,
+				func(h context.Context, m *sdk.Message) error {
+					return handler(h, pipelineMessage{SequenceNumber: m.SequenceNumber, MessageID: m.MessageID, Body: m.Body, DeliveryCount: m.DeliveryCount})
+				})
+		},
+		close: client.Close,
+	}, nil
+}
+
 func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string) {
+	t.Helper()
+	for _, sdkName := range []string{"main", "remote-only"} {
+		t.Run(sdkName, func(t *testing.T) { exerciseHTTPBrokerDeliveryWithSDK(t, backend, dsn, databaseToken, sdkName) })
+	}
+}
+
+func exerciseHTTPBrokerDeliveryWithSDK(t *testing.T, backend, dsn, databaseToken, sdkName string) {
 	t.Helper()
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	mark := func(stage string, seq int64) {
 		deadline, _ := ctx.Deadline()
-		t.Logf("remote SDK pipeline phase=%s seq=%d elapsed_ms=%d remaining_budget_ms=%d context_expired=%t",
-			stage, seq, time.Since(started).Milliseconds(), time.Until(deadline).Milliseconds(), ctx.Err() != nil)
+		t.Logf("HTTP SDK pipeline sdk=%s phase=%s seq=%d elapsed_ms=%d remaining_budget_ms=%d context_expired=%t",
+			sdkName, stage, seq, time.Since(started).Milliseconds(), time.Until(deadline).Milliseconds(), ctx.Err() != nil)
 	}
 	var snapshot func(string)
 	fail := func(stage string, err error) {
@@ -671,7 +759,7 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 		if snapshot != nil {
 			snapshot(stage)
 		}
-		t.Fatalf("remote SDK pipeline stage=%s diagnostic=%+v", stage, pipelineErrorDiagnostic(err))
+		t.Fatalf("HTTP SDK pipeline stage=%s diagnostic=%+v", stage, pipelineErrorDiagnostic(err))
 	}
 	mark("broker_open_begin", 0)
 	eng, err := broker.OpenEmbedded(ctx, dsn, broker.WithDBAuthToken(databaseToken), broker.WithBrokerMode(),
@@ -680,7 +768,7 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 	mark("broker_open_done", 0)
 	defer func() {
 		if err := eng.Close(); err != nil {
-			t.Error("remote SDK pipeline engine close failed")
+			t.Error("HTTP SDK pipeline engine close failed")
 		}
 	}()
 	const total = 24
@@ -756,16 +844,18 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 	}
 	defer transport.CloseIdleConnections()
 	acks := &pipelineAckTransport{base: transport, queue: queue, expected: make(map[int64]bool, total), completed: make(map[int64]bool, total), done: make(chan struct{}), onAck: func(seq int64) { mark("client_complete_acknowledged", seq) }}
-	client, err := sdk.Open(ctx, ts.URL, sdk.WithToken(brokerToken), sdk.WithHTTPClient(&http.Client{Transport: acks}))
+	client, err := openPipelineClient(ctx, sdkName, ts.URL, brokerToken, queue, &http.Client{Transport: acks})
 	fail("client open", err)
-	defer client.Close()
-	fail("create own queue", client.CreateQueue(ctx, queue, sdk.QueueConfig{LockDuration: 30 * time.Second, MaxDeliveryCount: 1}))
+	defer func() { fail("client close", client.close()) }()
+	fail("create own queue", client.create(ctx))
 	mark("queue_created", 0)
 	defer func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 20*time.Second)
 		defer stop()
-		if _, err := client.DeleteQueueWithOptions(cleanup, queue, sdk.DeleteQueueOpts{Force: true}); err != nil {
-			t.Error("remote SDK pipeline own-queue cleanup failed")
+		if err := client.cleanup(cleanup); err != nil {
+			t.Error("HTTP SDK pipeline own-queue cleanup failed")
+		} else {
+			t.Logf("HTTP SDK pipeline sdk=%s own_queue_deleted=true", sdkName)
 		}
 	}()
 	type expected struct {
@@ -776,13 +866,17 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 	for i := 0; i < total; i++ {
 		id := fmt.Sprintf("binary-%02d", i)
 		body := []byte{byte(i), 0, 255, 128, byte(i ^ 127)}
-		seq, err := client.SendOne(ctx, queue, sdk.OutMessage{MessageID: id, Body: body})
+		seq, err := client.send(ctx, id, body)
 		fail("send", err)
 		if seq <= 0 {
-			t.Fatal("remote SDK pipeline Send returned an invalid sequence")
+			t.Fatal("HTTP SDK pipeline Send returned an invalid sequence")
 		}
 		sent[id] = expected{seq: seq, body: body}
 		acks.mu.Lock()
+		if acks.expected[seq] {
+			acks.mu.Unlock()
+			t.Fatal("HTTP SDK pipeline Send returned a duplicate sequence")
+		}
 		acks.expected[seq] = true
 		acks.mu.Unlock()
 	}
@@ -797,7 +891,7 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 			calls += count
 		}
 		clientCount := acks.count()
-		t.Logf("remote SDK pipeline snapshot stage=%s elapsed_ms=%d context_expired=%t cleanup_phase=before_own_queue_cleanup sent=%d seen_unique=%d handler_calls=%d client_confirmed_complete=%d server_buffered_complete=%d server_buffered_abandon=%d server_buffered_renewals=%d notifications=%d invalid_delivery=%t unconfirmed=%d complete_response_failures_by_status=%v renew_response_failures_by_status=%v",
+		t.Logf("HTTP SDK pipeline snapshot stage=%s elapsed_ms=%d context_expired=%t cleanup_phase=before_own_queue_cleanup sent=%d seen_unique=%d handler_calls=%d client_confirmed_complete=%d server_buffered_complete=%d server_buffered_abandon=%d server_buffered_renewals=%d notifications=%d invalid_delivery=%t unconfirmed=%d complete_response_failures_by_status=%v renew_response_failures_by_status=%v",
 			stage, time.Since(started).Milliseconds(), ctx.Err() != nil, len(sent), len(seen), calls, clientCount, len(serverCompleted), serverAbandons, renewals, notifications, invalidDelivery,
 			len(sent)-clientCount, completeFailures, renewFailures)
 		mu.Unlock()
@@ -805,53 +899,51 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 		// bounded context before queue cleanup; DLQ/locked rows are not lost rows.
 		probe, stop := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stop()
-		stats, statsErr := client.Stats(probe, queue)
+		stats, statsErr := client.stats(probe)
 		mark("failure_stats_before_own_queue_cleanup", 0)
 		if statsErr != nil {
-			t.Logf("remote SDK pipeline snapshot_stats stage=%s diagnostic=%+v", stage, pipelineErrorDiagnostic(statsErr))
+			t.Logf("HTTP SDK pipeline snapshot_stats stage=%s diagnostic=%+v", stage, pipelineErrorDiagnostic(statsErr))
 			return
 		}
-		t.Logf("remote SDK pipeline snapshot_stats stage=%s active=%d locked=%d deferred=%d scheduled=%d dlq=%d total=%d",
+		t.Logf("HTTP SDK pipeline snapshot_stats stage=%s active=%d locked=%d deferred=%d scheduled=%d dlq=%d total=%d",
 			stage, stats.Active, stats.Locked, stats.Deferred, stats.Scheduled, stats.DeadLettered, stats.Total)
 	}
 	runDone := make(chan error, 1)
 	go func() {
 		mark("receiver_begin", 0)
-		runDone <- client.Receiver(queue, sdk.WithConcurrency(4), sdk.WithAutoRenew(),
-			sdk.WithErrorHandler(func(err error) {
-				mu.Lock()
-				notifications++
-				count := notifications
-				mu.Unlock()
-				t.Logf("remote SDK pipeline notification number=%d diagnostic=%+v", count, pipelineErrorDiagnostic(err))
-			})).
-			Run(runCtx, func(handlerCtx context.Context, message *sdk.Message) error {
-				want, exists := sent[message.MessageID]
-				mu.Lock()
-				seen[message.MessageID]++
-				valid := exists && message.SequenceNumber == want.seq && bytes.Equal(message.Body, want.body) &&
-					message.DeliveryCount == 1 && seen[message.MessageID] == 1
-				invalidDelivery = invalidDelivery || !valid
-				mu.Unlock()
-				if !valid {
-					return errors.New("remote SDK pipeline delivery validation failed")
+		runDone <- client.run(runCtx, func(handlerCtx context.Context, message pipelineMessage) error {
+			want, exists := sent[message.MessageID]
+			mu.Lock()
+			seen[message.MessageID]++
+			valid := exists && message.SequenceNumber == want.seq && bytes.Equal(message.Body, want.body) &&
+				message.DeliveryCount == 1 && seen[message.MessageID] == 1
+			invalidDelivery = invalidDelivery || !valid
+			mu.Unlock()
+			if !valid {
+				return errors.New("HTTP SDK pipeline delivery validation failed")
+			}
+			if message.MessageID == "binary-00" {
+				mark("slow_handler_begin", message.SequenceNumber)
+				// Observe a real renewal at the 30s lease's first 10s point.
+				timer := time.NewTimer(11 * time.Second)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					mark("slow_handler_return_nil", message.SequenceNumber)
+				case <-handlerCtx.Done():
+					mark("slow_handler_return_context_error", message.SequenceNumber)
+					t.Logf("HTTP SDK pipeline slow_handler diagnostic=%+v", pipelineErrorDiagnostic(handlerCtx.Err()))
+					return handlerCtx.Err()
 				}
-				if message.MessageID == "binary-00" {
-					mark("slow_handler_begin", message.SequenceNumber)
-					// Observe a real renewal at the 30s lease's first 10s point.
-					timer := time.NewTimer(11 * time.Second)
-					defer timer.Stop()
-					select {
-					case <-timer.C:
-						mark("slow_handler_return_nil", message.SequenceNumber)
-					case <-handlerCtx.Done():
-						mark("slow_handler_return_context_error", message.SequenceNumber)
-						t.Logf("remote SDK pipeline slow_handler diagnostic=%+v", pipelineErrorDiagnostic(handlerCtx.Err()))
-						return handlerCtx.Err()
-					}
-				}
-				return nil
-			})
+			}
+			return nil
+		}, func(err error) {
+			mu.Lock()
+			notifications++
+			count := notifications
+			mu.Unlock()
+			t.Logf("HTTP SDK pipeline sdk=%s notification number=%d diagnostic=%+v", sdkName, count, pipelineErrorDiagnostic(err))
+		})
 	}()
 	joined := false
 	defer func() {
@@ -860,7 +952,7 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 			select {
 			case <-runDone:
 			case <-time.After(10 * time.Second):
-				t.Error("remote SDK pipeline Receiver did not stop within cleanup budget")
+				t.Error("HTTP SDK pipeline Receiver did not stop within cleanup budget")
 			}
 		}
 	}()
@@ -870,36 +962,36 @@ func exerciseHTTPBrokerDelivery(t *testing.T, backend, dsn, databaseToken string
 		joined = true
 		fail("Receiver stopped before all completions", err)
 		snapshot("Receiver returned nil before all completions")
-		t.Fatal("remote SDK pipeline Receiver ended before all completions")
+		t.Fatal("HTTP SDK pipeline Receiver ended before all completions")
 	case <-ctx.Done():
 		snapshot("completion deadline")
-		t.Fatal("remote SDK pipeline deadline reached before all completions")
+		t.Fatal("HTTP SDK pipeline deadline reached before all completions")
 	}
 	stopReceiver()
 	select {
 	case err = <-runDone:
 	case <-time.After(10 * time.Second):
-		t.Fatal("remote SDK pipeline Receiver exceeded its shutdown budget")
+		t.Fatal("HTTP SDK pipeline Receiver exceeded its shutdown budget")
 	}
 	joined = true
 	if !errors.Is(err, context.Canceled) {
 		fail("Receiver terminal result", err)
-		t.Fatal("remote SDK pipeline Receiver did not report cancellation")
+		t.Fatal("HTTP SDK pipeline Receiver did not report cancellation")
 	}
-	stats, err := client.Stats(ctx, queue)
+	stats, err := client.stats(ctx)
 	fail("final stats", err)
 	mu.Lock()
 	defer mu.Unlock()
 	if invalidDelivery || len(seen) != total || acks.count() != total || renewals == 0 ||
 		stats.Total != 0 || stats.Active != 0 || stats.Locked != 0 || stats.DeadLettered != 0 {
-		t.Fatalf("remote SDK pipeline accounting failed invalid=%t handled=%d complete=%d renewals=%d total=%d locked=%d dlq=%d",
+		t.Fatalf("HTTP SDK pipeline accounting failed invalid=%t handled=%d complete=%d renewals=%d total=%d locked=%d dlq=%d",
 			invalidDelivery, len(seen), acks.count(), renewals, stats.Total, stats.Locked, stats.DeadLettered)
 	}
 	for id, want := range sent {
 		if seen[id] != 1 || !acks.confirmed(want.seq) {
-			t.Fatal("remote SDK pipeline per-message handler/Complete accounting failed")
+			t.Fatal("HTTP SDK pipeline per-message handler/Complete accounting failed")
 		}
 	}
-	t.Logf("remote SDK pipeline backend=%s sent=%d handled=%d client_confirmed_complete=%d server_buffered_complete=%d server_buffered_abandon=%d server_buffered_renewals=%d notifications=%d final_total=%d dlq=%d",
-		backend, len(sent), len(seen), acks.count(), len(serverCompleted), serverAbandons, renewals, notifications, stats.Total, stats.DeadLettered)
+	t.Logf("HTTP SDK pipeline sdk=%s backend=%s sent=%d handled=%d client_confirmed_complete=%d server_buffered_complete=%d server_buffered_abandon=%d server_buffered_renewals=%d notifications=%d final_total=%d dlq=%d",
+		sdkName, backend, len(sent), len(seen), acks.count(), len(serverCompleted), serverAbandons, renewals, notifications, stats.Total, stats.DeadLettered)
 }

@@ -1,20 +1,8 @@
-name: Turso nightly
+name: Turso SDK recovery acceptance
 
-# Real-remote integration against a Turso/libSQL DB. Gated by repo secrets so it
-# never runs on forks or PRs (avoids burning the remote quota); nightly + manual.
+# Test-only, manual, non-resetting verification under the shared dedicated DB lock.
 on:
-  schedule:
-    - cron: '0 8 * * *' # 08:00 UTC daily
   workflow_dispatch:
-    inputs:
-      verification_scope:
-        description: 'Full suite, receiver diagnostics, or the in-flight restart vector'
-        type: choice
-        default: full
-        options:
-          - full
-          - receivers
-          - restart
 
 permissions:
   contents: read
@@ -25,95 +13,129 @@ concurrency:
 
 jobs:
   turso:
-    name: real Turso integration
+    name: both SDKs through HTTP with Turso
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: ${{ github.repository == 'mqlitehq/mqlite' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: stable
-      - name: TestTurso* against dedicated verification database
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope == 'full' }}
-        env:
-          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
-          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
-          MQLITE_TEST_DB_RESET_CONFIRM: '1'
-        run: |
-          if [ -z "$MQLITE_TEST_DB" ]; then
-            echo "MQLITE_TEST_DB is required for the dedicated nightly integration suite."
-            exit 1
-          fi
-          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
-            echo "MQLITE_TEST_DB_AUTH_TOKEN is required when MQLITE_TEST_DB is configured."
-            exit 1
-          fi
-          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
-            echo "MQLITE_TEST_DB is not the dedicated verification database."
-            exit 1
-          fi
-          go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
-      - name: HTTP broker and managed SDK against dedicated verification database
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope == 'full' }}
-        env:
-          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
-          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
-        run: |
-          if [ -z "$MQLITE_TEST_DB" ] || [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
-            echo "The dedicated verification database and token are required."
-            exit 1
-          fi
-          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
-            echo "MQLITE_TEST_DB is not the dedicated verification database."
-            exit 1
-          fi
-          # Root package only: this case never invokes engine.TestMain's table reset.
-          go test . -run '^TestTursoHTTPBrokerDelivery$' -count=1 -v -timeout 180s
-      - name: Check out the independent remote SDK candidate
-        id: remote-sdk-candidate
+      - name: Check out the reviewed independent SDK source
         uses: actions/checkout@v7
         with:
           repository: mqlitehq/mqlite-go
           ref: 4cb6c799a5c0099bb485921e489f7b55e7e7f3a9
           path: .test-mqlite-go
           persist-credentials: false
-      - name: Independent remote SDK through HTTP against dedicated verification database
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.verification_scope != 'restart' }}
+      - name: Verify source identities, diagnostic controls and local SQLite vectors
+        id: prepare
+        working-directory: test/sdkcheck/remotesdk
+        env:
+          GOWORK: 'off'
+        run: |
+          mkdir -p "$RUNNER_TEMP/turso-sdk-recovery"
+          if [ "$(git -C "$GITHUB_WORKSPACE/.test-mqlite-go" rev-parse HEAD)" != "4cb6c799a5c0099bb485921e489f7b55e7e7f3a9" ]; then
+            echo "Independent SDK source differs from the reviewed candidate."
+            exit 1
+          fi
+          go mod edit -replace=github.com/mqlitehq/mqlite-go="$GITHUB_WORKSPACE/.test-mqlite-go"
+          python3 - <<'PROVENANCE'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          runtime_sha=hashlib.sha256((root/'engine/libsql_conn.go').read_bytes()).hexdigest()
+          assert runtime_sha=='1eff2a878ecc0b81eea4e6fc6da6da3bf3b30c224a51d7b53518f1400949d193'
+          head=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()
+          assert head==os.environ['GITHUB_SHA']
+          proof={'candidate_sha':head,'sdk_sha':'4cb6c799a5c0099bb485921e489f7b55e7e7f3a9','runtime_sha256':runtime_sha,'go_version':subprocess.check_output(['go','version'],text=True).strip(),'reset':False,'pipeline_per_case_seconds':120,'restart_per_case_seconds':90}
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'turso-sdk-recovery/source.json').write_text(json.dumps(proof,indent=2)+'\n')
+          PROVENANCE
+          set -o pipefail
+          go test -json -race . -run '^(TestSQLiteHTTPBrokerDelivery|TestSQLiteInFlightBrokerRestart|TestPipelineClientAcknowledgementControls|TestPipelineErrorDiagnosticPrivacy|TestRestartAcknowledgementPreservesReadError)$' -count=1 -timeout 180s | tee "$RUNNER_TEMP/turso-sdk-recovery/local-controls.jsonl"
+      - name: main SDK pipeline
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         working-directory: test/sdkcheck/remotesdk
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
           GOWORK: 'off'
         run: |
-          if [ -z "$MQLITE_TEST_DB" ] || [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
-            echo "The dedicated verification database and token are required."
+          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ] || [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
+            echo "Dedicated verification database and token are required."
             exit 1
           fi
-          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
-            echo "MQLITE_TEST_DB is not the dedicated verification database."
-            exit 1
-          fi
-          if [ "$(git -C "$GITHUB_WORKSPACE/.test-mqlite-go" rev-parse HEAD)" != "4cb6c799a5c0099bb485921e489f7b55e7e7f3a9" ]; then
-            echo "The remote SDK checkout does not match the reviewed candidate."
-            exit 1
-          fi
-          go mod edit -replace=github.com/mqlitehq/mqlite-go="$GITHUB_WORKSPACE/.test-mqlite-go"
-          # Separate module: no main-module SDK dependency and no engine.TestMain reset.
-          go test . -run '^TestTursoHTTPBrokerDelivery$' -count=1 -v -timeout 180s
-      - name: In-flight handlers survive broker close and reopen with both SDKs
-        if: ${{ !cancelled() && steps.remote-sdk-candidate.outcome == 'success' }}
+          set -o pipefail
+          go test -json -race . -run '^TestTursoHTTPBrokerDelivery$/^main$' -count=1 -timeout 180s | tee "$RUNNER_TEMP/turso-sdk-recovery/main-pipeline.jsonl"
+      - name: remote-only SDK pipeline
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         working-directory: test/sdkcheck/remotesdk
         env:
           MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
           MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
           GOWORK: 'off'
         run: |
-          # Test repeats the exact allowlist check; same shared database lock.
-          # Run even if the earlier pipeline fails, preserving that failure.
-          # Recheck independently instead of assuming earlier setup succeeded.
-          if [ "$(git -C "$GITHUB_WORKSPACE/.test-mqlite-go" rev-parse HEAD)" != "4cb6c799a5c0099bb485921e489f7b55e7e7f3a9" ]; then
-            echo "The remote SDK checkout does not match the reviewed candidate."
+          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ] || [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
+            echo "Dedicated verification database and token are required."
             exit 1
           fi
-          go mod edit -replace=github.com/mqlitehq/mqlite-go="$GITHUB_WORKSPACE/.test-mqlite-go"
-          go test -race . -run '^TestTursoInFlightBrokerRestart$' -count=1 -v -timeout 210s
+          set -o pipefail
+          go test -json -race . -run '^TestTursoHTTPBrokerDelivery$/^remote-only$' -count=1 -timeout 180s | tee "$RUNNER_TEMP/turso-sdk-recovery/remote-pipeline.jsonl"
+      - name: main SDK in-flight broker restart
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        working-directory: test/sdkcheck/remotesdk
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+          GOWORK: 'off'
+        run: |
+          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ] || [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
+            echo "Dedicated verification database and token are required."
+            exit 1
+          fi
+          set -o pipefail
+          go test -json -race . -run '^TestTursoInFlightBrokerRestart$/^main$' -count=1 -timeout 180s | tee "$RUNNER_TEMP/turso-sdk-recovery/main-restart.jsonl"
+      - name: remote-only SDK in-flight broker restart
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        working-directory: test/sdkcheck/remotesdk
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+          GOWORK: 'off'
+        run: |
+          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ] || [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
+            echo "Dedicated verification database and token are required."
+            exit 1
+          fi
+          set -o pipefail
+          go test -json -race . -run '^TestTursoInFlightBrokerRestart$/^remote-only$' -count=1 -timeout 180s | tee "$RUNNER_TEMP/turso-sdk-recovery/remote-restart.jsonl"
+      - name: Require every selected case to execute and pass
+        if: always()
+        run: |
+          python3 - <<'VERIFY'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'turso-sdk-recovery'
+          expected={
+            'local-controls.jsonl':['TestSQLiteHTTPBrokerDelivery/main','TestSQLiteHTTPBrokerDelivery/remote-only','TestSQLiteInFlightBrokerRestart/main','TestSQLiteInFlightBrokerRestart/remote-only','TestPipelineClientAcknowledgementControls','TestPipelineErrorDiagnosticPrivacy','TestRestartAcknowledgementPreservesReadError'],
+            'main-pipeline.jsonl':['TestTursoHTTPBrokerDelivery/main'],
+            'remote-pipeline.jsonl':['TestTursoHTTPBrokerDelivery/remote-only'],
+            'main-restart.jsonl':['TestTursoInFlightBrokerRestart/main'],
+            'remote-restart.jsonl':['TestTursoInFlightBrokerRestart/remote-only'],
+          }
+          for filename,names in expected.items():
+            events=[json.loads(line) for line in (root/filename).read_text().splitlines() if line.strip()]
+            assert not any(e.get('Action') in ('fail','skip') for e in events), filename
+            for name in names:
+              actions=[e.get('Action') for e in events if e.get('Test')==name]
+              assert actions.count('run')==1 and actions.count('pass')==1,(filename,name)
+            assert any(e.get('Action')=='pass' and not e.get('Test') for e in events),filename
+          print('All selected local controls and four real-Turso SDK cases executed and passed.')
+          VERIFY
+      - name: Preserve source and all individual outcomes
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: turso-sdk-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/turso-sdk-recovery/
+          if-no-files-found: error
+          retention-days: 14

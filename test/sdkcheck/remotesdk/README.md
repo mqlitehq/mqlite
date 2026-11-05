@@ -1,18 +1,31 @@
-# Independent remote SDK HTTP pipeline
+# Shared Go SDK HTTP pipeline
 
-This separate test module runs the remote-only `mqlite-go` client against a real
-HTTP broker backed by SQLite or the dedicated Turso verification database. It
-keeps the main module's dependencies unchanged. Its Go 1.21 floor belongs to the
+This separate test module runs both the main Go SDK and the remote-only
+`mqlite-go` client against a real HTTP broker backed by SQLite or the dedicated
+Turso verification database. Both use the same workload, client ACK observer,
+failure ledger and configuration through small typed adapters. It keeps the
+main module's dependencies unchanged. Its Go 1.21 floor belongs to the
 broker harness; it does not change the remote SDK's Go 1.13 floor.
 
 Place the intended `mqlite-go` checkout beside the main repository, then run:
 
 ```sh
 cd test/sdkcheck/remotesdk
-go test -race -run '^TestSQLiteHTTPBrokerDelivery$' -count=1 -v -timeout 150s .
+go test -race -run '^TestSQLiteHTTPBrokerDelivery$' -count=1 -v -timeout 300s .
 ```
 
-The gated `TestTursoHTTPBrokerDelivery` requires both `MQLITE_TEST_DB` and
+`TestSQLiteHTTPBrokerDelivery` and the gated `TestTursoHTTPBrokerDelivery` each
+run sequential `main` and `remote-only` subcases: 24 binary messages, concurrency
+four, a 30-second lease and one 11-second handler that must renew. Every subcase
+has its original 120-second budget including Open, setup and serial sends; a
+command selecting both needs an outer timeout that covers both budgets and
+cleanup. Each Send must have a unique positive sequence, every handler must
+observe the expected identity/body and delivery count one, and every accepted
+sequence must have its own complete client acknowledgement. Queue cleanup is
+successful only when the delete result confirms `deleted`, not merely that a
+request was accepted.
+
+The gated live test requires both `MQLITE_TEST_DB` and
 `MQLITE_TEST_DB_AUTH_TOKEN`, accepts only the nightly verification database, and
 creates and deletes its own unique queue. It never resets tables. The nightly
 workflow pins the remote SDK checkout by full commit SHA and runs this module
@@ -33,7 +46,7 @@ the reopened database must preserve both live leases, then end empty with no
 dead letters. The remote test uses the same allowlist and only its own queues.
 
 ```sh
-go test -race -run '^TestSQLiteInFlightBrokerRestart$' -count=1 -v -timeout 120s .
+go test -race -run '^TestSQLiteInFlightBrokerRestart$' -count=1 -v -timeout 240s .
 ```
 
 This tests application-managed broker close/reopen while the lease remains
@@ -48,11 +61,11 @@ contain only types, HTTP statuses and fixed sentinel flags; provider error text,
 SQL, credentials and endpoints are excluded and covered by a privacy control.
 The nightly workflow runs the restart vector independently after SDK checkout,
 even when the earlier pipeline fails; that failure still fails the workflow.
-Manual `verification_scope=receivers` skips the destructive engine suite and the
-main SDK pipeline, while preserving the dedicated-database allowlist and shared
-concurrency lock. `full` remains the default and matches scheduled verification.
-The manual `restart` scope runs only the shared in-flight restart vector after
-the pinned SDK checkout; it also skips database reset and unrelated pipelines.
+The live pipeline and restart cases can run together from this nested module
+without invoking the engine test harness or resetting tables. Workflow selection
+must include both `main` and `remote-only` subcases; a no-credential SKIP is not
+an online pass. The test-only workflow preserves the exact dedicated-database
+allowlist, immutable SDK checkout and shared concurrency lock.
 
 Pipeline success is counted from the client transport reading and validating a
 complete `200` / `ok:true` response bound to an accepted queue and sequence.
