@@ -109,6 +109,20 @@ still bounded as follows:
   synthesize that response after the broker committed and its acknowledgement was
   lost. Local stores never retry at all (a single conn is the single writer).
 
+The HTTP compatibility adapter keeps COMMIT on the original transaction context.
+Use a deadline or cancellation on that context: interrupting an already-started
+COMMIT still means `ErrOutcomeUnknown`, not proof that the write was rolled back.
+The adapter waits for the context-aware HTTP call to return rather than leaving
+the commit running in a detached goroutine. ROLLBACK has a separate five-second
+cleanup deadline, so canceled work can still attempt cleanup and returning from
+an operation may include that cleanup interval (MQLITE-163).
+
+This is not a hard deadline for every driver resource. The pinned upstream
+driver's asynchronous stream-close request still uses a background context and
+can outlive `Engine.Close` on a stalled network (MQLITE-164). Bounding that work
+requires a separate driver compatibility change; do not treat a successful
+engine close as proof that all provider cleanup requests have finished.
+
 > **Transport caveat.** The outcome-unknown guarantee holds for the documented remote
 > transport `libsql://` (Hrana-over-HTTP). The `ws://`/`wss://` transports can wrap a
 > response-read failure as `ErrBadConn`, under which a lost commit ack *would* be
