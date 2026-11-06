@@ -1,7 +1,12 @@
 # Production operations
 
-This runbook describes v0.4.2, the latest supported release (port 6754, schema
-token 7). v0.3.3 is withdrawn and
+This runbook follows `main`, including unreleased changes. The latest supported
+release is v0.4.2 (port 6754, schema token 7); use the
+[v0.4.2 runbook](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/operations.md)
+when operating that binary. In particular, lease-preserving startup and local
+maintenance, coordinated broker shutdown, and the revised managed Receiver
+behavior below are unreleased; see [CHANGELOG.md](../CHANGELOG.md#unreleased).
+v0.3.3 is withdrawn and
 unsupported; its public assets and exact image remain available for forensic or
 compatibility inspection and must not be deployed. v0.4.2 retains v0.4.0's
 retraction of v0.3.3. Upgrading from v0.3.2 or another schema-5 release
@@ -103,6 +108,15 @@ restore time with representative data. A successful backup command alone is not 
 restore test.
 
 ## Graceful broker shutdown
+
+The coordinated shutdown and lease-preserving restart contract below requires
+unreleased `main`; an installed v0.4.2 broker does not provide these guarantees.
+It also does not drain application consumers. Canceling `Receiver.Run` cancels
+its in-flight handler contexts. `Run` still waits for handlers and settlement to
+return, but offers no grace period for handlers to finish before cancellation.
+Interrupted deliveries can consume delivery attempts or reach the DLQ at the
+configured limit. Quiesce and drain consumers at the application layer before
+canceling them when a planned consumer stop must finish its work.
 
 `mqlite serve` treats the first SIGINT or SIGTERM as a graceful-shutdown request.
 It stops accepting new HTTP connections and closes an internal no-new-claim gate for
