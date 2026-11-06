@@ -1,5 +1,9 @@
 # Conformance — correct mqlite behavior (TCK)
 
+This specification follows `main`, including unreleased changes. For an installed
+v0.4.2 release, use the [conformance specification at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/conformance.md);
+see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+
 This is the normative spec of how mqlite **must** behave — the invariants that define
 "correct," independent of any one implementation detail. Each is enforced by a
 hermetic test (cross-referenced); together these are mqlite's TCK. If a change would
@@ -125,6 +129,8 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestOpenReclaimsExpiredLeasesByDefault)*
 - **3.2** While its exact-request receipt is live, a settle whose response was lost MUST
   replay as success, not `ErrLockLost` — and ONLY when it is the same request.
+  The receipt expires 30 minutes after recording; replay MUST NOT refresh that
+  deadline. Resource deletion or fixed subscription expiry can end replay earlier.
   A `settlement_receipt` identifies
   `queue + seq_number + lock_token + operation + effect-bearing arguments`; a call that
   differs in ANY of them is not a replay and MUST return `ErrLockLost`, never a success
@@ -134,7 +140,7 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestSettlementReceiptIdentityMatrix;
   engine/model_test.go: TestEngineMatchesTheModel, TestModelRejectReceiptArguments)*
 - **3.3** A Peek-Lock `Receive` retried with the same `AttemptID` MUST replay the
-  same batch and tokens only while every cached token still owns the corresponding
+  same batch and tokens only while its record is live and every cached token still owns the corresponding
   live, unexpired lock. If any token is stale, the broker MUST invalidate the whole
   cached batch and safely perform a new claim in the same transaction; it MUST NOT
   return a stale or partially owned batch. This invalidation MUST NOT revoke any
@@ -143,7 +149,10 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   only an exact retry key for a Receive whose response was not observed, and MUST
   NOT be reused for a new Receive after the response arrives or after partial
   settlement. A tokenless Receive-and-Delete response
-  remains replayable for the attempt lifetime. A live non-empty saved response is
+  remains replayable for the attempt lifetime. For either mode, a record's
+  lifetime is the greater of five minutes and the queue lock duration when
+  recorded, capped by fixed subscription expiry. Replay and lease renewal MUST
+  NOT extend the record's deadline. A live non-empty saved response is
   bound to its original receive mode; an empty result creates no record, and an
   expired record no longer binds the ID. Unknown modes MUST be rejected. Record and
   lease expiry MUST be checked against fresh time after writer admission.
@@ -158,15 +167,22 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   TestEmptyReceiveAttemptDoesNotBindMode,
   TestExpiredReceiveAttemptDoesNotBindMode,
   TestReceiveAttemptInvalidatesWholePartiallySettledBatch)*
-- **3.4** No message loss + no content corruption: a contiguous `1..N` sequence with
-  random bodies (hashed into a property), consumed concurrently with redelivery, is
-  delivered completely (every value once) and intact (each body matches its hash).
+- **3.4** No message loss + no content corruption: the hermetic integrity workload
+  sends a contiguous `1..N` sequence with random bodies (hashed into a property),
+  then consumes concurrently with intentional redelivery and a sufficient delivery
+  budget. Every identity MUST be completed and each received body MUST match its
+  hash. Repeated receives are expected; this is not an exactly-once handler guarantee.
   *(engine/integrity_test.go `TestMessageIntegrity`)*
 
 ## 4 · Deduplication
 
 - **4.1** Within a queue's `dedup_window`, a repeat `message_id` (empty → body SHA-256)
-  MUST collapse to a single enqueue. *(engine/functional_test.go, engine/turso_test.go)*
+  with the same body MUST collapse to a single enqueue. Dedup is disabled when
+  the configured window is zero (the default). Its window starts at the last new
+  enqueue for the key; duplicates MUST NOT refresh it. Completion MUST NOT erase
+  the retained dedup identity. Only body bytes participate in the conflict check;
+  duplicate metadata, TTL and scheduled time MUST NOT update the original message.
+  *(engine/functional_test.go, engine/turso_test.go)*
 - **4.2** A *single* `Send` whose `message_id` conflicts with a different body MUST
   return `ErrDedupConflict` (HTTP 409). *(server/send_dedup_test.go)*
 - **4.3** In a *multi-message* `Send`, a conflicting slot comes back as seq `0`
@@ -270,7 +286,8 @@ and an unexpired lease, with the exact-request replay exception in §2.6.
   `permission_denied` · 404 `not_found` · 409
   `already_exists`/`lock_lost`/`name_conflict`/`key_conflict`/
   `queue_not_empty`/`subscription_not_empty` · 413 `message_too_large` ·
-  429 `resource_exhausted` · 500 `internal` · 503 `outcome_unknown`.
+  429 `resource_exhausted` · 499 `canceled` · 500 `internal` ·
+  503 `unavailable`/`outcome_unknown`.
   *(server/errors_test.go; see [api-reference.md](api-reference.md))*
 - **9.3** Every registered RPC MUST bind a permission in the route registration.
   Send/Schedule/Cancel require send; all other QueueService methods require listen;
@@ -564,7 +581,10 @@ engine to grade itself — an engine with a bug reports that everything is fine.
   *(engine/concurrency_test.go: TestConcurrentSettlementPicksExactlyOneWinner)*
 - **14.3 No zombie delivery.** A completed message MUST NOT be delivered again.
   *(engine/concurrency_test.go)*
-- **14.4 No loss.** Every message sent is eventually completed — not most of them.
+- **14.4 No loss in the concurrency workload.** With successful sends, live
+  consumers, a sufficient delivery budget and no configured discard or expiry,
+  every sent identity MUST be completed. This does not override final-attempt
+  DLQ, explicit deletion, retention, message TTL or fixed subscription expiry.
   *(engine/concurrency_test.go)*
 - **14.5 Shutdown fences the store.** `Close` closes admission before anything else: DB work
   that begins after shutdown starts MUST fail fast with `ErrClosed`; work already admitted —

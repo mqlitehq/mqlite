@@ -18,8 +18,8 @@ to stay friendly to both humans and AI agents. Priorities, in order:
    touching app code.
 2. **Reliable under concurrency.** At-least-once with fencing tokens, single-broker
    crash recovery, idempotent send/receive/settle, and O(log n) claims on a deep
-   backlog — built to take high enqueue/dequeue throughput without losing or
-   double-delivering messages.
+   backlog — built to take high enqueue/dequeue throughput without losing durably
+   committed work. Delivery can repeat, so handlers must be idempotent.
 3. **Simple, unambiguous interface.** Every operation is one HTTP POST with a JSON
    body — curl-able and easy for an LLM/agent to drive — with exactly one
    settlement verb per outcome and no aliased calls.

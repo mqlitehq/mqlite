@@ -34,6 +34,8 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > in-flight handler contexts. `Run` still waits for handlers and settlement to
 > return, but offers no grace period for handlers to finish before cancellation;
 > interrupted deliveries can consume delivery attempts.
+> See the [consumer stop and interruption boundaries](docs/operations.md#consumer-stops-and-host-interruptions)
+> before wiring process signals to `Run` cancellation.
 
 ## Goal
 
@@ -45,7 +47,8 @@ to stay friendly to both humans and AI agents:
   Embed it in your process or run it as a broker; move the storage from a
   `:memory:` test to a replicated Turso DB without changing a line of app code.
 - **Reliable under concurrency.** At-least-once delivery with fencing tokens,
-  single-broker crash recovery, idempotent send/receive/settle, and O(log n) claims
+  single-broker crash recovery, opt-in send deduplication, bounded Receive and
+  settlement replay, and O(log n) claims
   on a deep backlog — built to take high enqueue/dequeue throughput without losing
   durably committed work. Delivery can repeat, so handlers must be idempotent.
 - **Simple, unambiguous interface.** Every operation is one plain HTTP `POST` with
@@ -101,10 +104,11 @@ Full copy-runnable programs (embedded, transactional outbox, remote consumer, cu
 mqlite's primary form is a **library you embed directly in your Go process**, exactly
 like `goqite` or using `database/sql` against SQLite. `OpenEmbedded` gives you the
 full queue — Send/Receive/Peek-Lock/DLQ/scheduling/topics — calling the storage
-engine **in-process**. There is **no broker to run, no network hop, no JSON
-serialization, no extra daemon**: your app and the queue are one binary backed by
-one SQLite (or Turso) database. You only start an HTTP server if you *choose* to
-(see §2) — the embedded path never opens a socket.
+engine **in-process**, without a separate broker or broker HTTP/JSON hop. With a
+local SQLite database, queue operations need no network. Choosing a remote Turso
+database still sends storage requests over the network and depends on its
+availability. You only start a broker listener if you *choose* to (see §2);
+`OpenEmbedded` does not start one.
 
 > **Single process, single writer.** Embedded mode is one process owning one
 > database. `OpenEmbedded` takes an exclusive lock on the DB file, so a second

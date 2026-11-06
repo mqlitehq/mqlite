@@ -118,9 +118,12 @@
     <p class="sub">One SQLite file is the entire message broker. The model sits closest
     to Azure Service Bus, but is simplified from first principles. This page explains how
     it works, and how it compares to the equivalents on Azure / AWS / GCP.</p>
-    <p class="sub">This interactive overview describes <b>v0.4.2</b>.
-      The <a href="concepts.md">canonical concepts and lifecycle contract</a> and
-      <a href="operations.md">production runbook</a> contain the complete operational rules.</p>
+    <p class="sub">This interactive overview follows <b>main</b>, including
+      unreleased changes. For an installed v0.4.2 release, use the
+      <a href="https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/concepts.md">concepts at that tag</a>.
+      This illustration is a companion to the
+      <a href="concepts.md">canonical concepts and lifecycle contract</a> and
+      <a href="operations.md">production runbook</a>, which contain the complete operational rules.</p>
     <div class="adv">
       <span>One <b>SQLite file</b> · no cluster</span>
       <span><b>Embeddable</b> in-process · one owner</span>
@@ -256,7 +259,9 @@
             and a fixed subscription lifetime caps the candidate. A lost-response replay
             succeeds only for the exact queue, sequence, token, operation and
             effect-bearing arguments recorded in a live receipt, including after the
-            original lease expires.</p>
+            original lease expires. Receipts expire 30 minutes after recording;
+            replay does not extend that deadline, and resource deletion or fixed
+            subscription expiry can end replay earlier.</p>
           <p>The lease, message TTL and subscription lifetime are different clocks.
             A lease fences one attempt. Message TTL bounds normal delivery eligibility
             and may expire a message while locked; expiry dead-letters it by default,
@@ -747,8 +752,8 @@ body_text contains "urgent"</span>
 
 <footer><div class="wrap">
   MQLite · concepts &amp; subscription filters · reviewed companion to <a href="concepts.md">docs/concepts.md</a> ·
-  behavior per <span class="kbd">engine/engine.go</span>
-  <span class="kbd">sendTracked</span> / <span class="kbd">resolveTargets</span>.
+  behavior per <span class="kbd">engine/engine.go:sendTracked</span> /
+  <span class="kbd">engine/tx.go:resolveTargetsTx</span>.
 </div></footer>
 
 <script>
