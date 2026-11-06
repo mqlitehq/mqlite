@@ -3,7 +3,7 @@
 Measured, reproducible numbers for the mqlite engine across realistic workloads —
 **not** a single throughput figure — plus what they mean for **deployment sizing** and
 **tuning**. The suite exercises throughput, write amplification, **whole-process memory
-+ reclamation**, **DB-file bloat vs reclamation**, **KV-property (enriched) messages**, a
+and reclamation**, **DB-file bloat vs reclamation**, **KV-property (enriched) messages**, a
 **body-size sweep**, and **load ramp / consumer churn**. Run **locally** (a fast
 multi-core box) and on a deliberately tiny **cloud** box so the two tell different truths.
 
