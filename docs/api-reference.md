@@ -392,6 +392,12 @@ tokens remain valid until settlement or lease expiry, preventing concurrent
 delivery while the original caller may still be processing them. A replacement
 claim may therefore return fewer messages or different currently eligible work.
 Receive-and-Delete keeps replaying its tokenless saved response for the attempt lifetime.
+For either mode, the saved record expires after the greater of five minutes and
+the queue lock duration at the time it is recorded, capped by a fixed subscription
+expiry. Replaying or renewing a message does not extend that record's deadline.
+After record expiry the same ID can make a new claim, even if a previously renewed
+token is still live. An attempt ID is therefore a bounded recovery key, not a
+permanent delivery identity.
 A live non-empty saved response also binds that attempt ID to its original
 `receive_mode`; reusing it with the other mode is `400 invalid_argument`. Empty
 results are not saved, and an expired record no longer binds the ID.
@@ -443,6 +449,10 @@ already counts as expired, even if the background reaper has not run. The broker
 time after local writer admission and afresh for each statement and remote retry. A
 live exact-request receipt can replay a previously committed settlement after its
 original lease deadline; it cannot authorize a different request or revive a lease.
+The receipt expires 30 minutes after it is recorded. Replaying it does not refresh
+that deadline, and resource deletion or fixed subscription expiry can end replay
+earlier. After expiry, `lock_lost` does not prove the original settlement failed;
+retain application-side evidence when reconciliation must outlive this window.
 
 | Method | Extra fields | Effect |
 |---|---|---|
@@ -990,7 +1000,17 @@ collision?**
 | queue dedup | effect of `message_id` |
 |---|---|
 | **off** (`dedup_window_ms = 0`, the **default**) | purely informational metadata. **No uniqueness is enforced and a collision is impossible** — send the same `message_id` a thousand times and you get a thousand independent messages (each its own `seq_number`). Use it as an idempotency hint your *own* consumer checks. |
-| **on** (`dedup_window_ms > 0`) | within the sliding window, keyed by **`(queue, message_id)`**: <br>• same id **+ same body** → collapses to one enqueue (the duplicate is silently dropped; you get the original `seq_number` back). <br>• same id **+ different body** → a **conflict**: a single `Send` returns `409 already_exists` (`ErrDedupConflict`); in a multi-message `Send` that one slot comes back as `seq 0` (skipped) while the rest commit. <br>• empty id → the body's SHA-256 is the key (content-addressed dedup). |
+| **on** (`dedup_window_ms > 0`) | within the window, keyed by **`(queue, message_id)`**: <br>• same id **+ same body** → collapses to one enqueue (the duplicate is silently dropped; you get the original `seq_number` back). <br>• same id **+ different body** → a **conflict**: a single `Send` returns `409 already_exists` (`ErrDedupConflict`); in a multi-message `Send` that one slot comes back as `seq 0` (skipped) while the rest commit. <br>• empty id → the body's SHA-256 is the key (content-addressed dedup). |
+
+- **The window starts at the last new enqueue for that key.** Duplicate sends do
+  not slide or refresh it. At exact window expiry, the key can enqueue a new
+  message. Completing the original message does not end the dedup window: a
+  duplicate within it still returns the original sequence number, even though
+  that message may already be gone.
+- **The conflict check compares body bytes.** Subject, properties, routing metadata,
+  requested TTL and scheduled time are not part of that comparison. Sending the
+  same key and body with different metadata does not update the original message.
+  Keep the whole request stable when retrying an uncertain send.
 
 - **Dedup is per-queue.** The key is `(queue, message_id)`, so the same `message_id` in two
   different queues — or fanned out to two subscriptions' backing queues — never collides;

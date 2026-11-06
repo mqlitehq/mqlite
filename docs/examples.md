@@ -1,5 +1,9 @@
 # Examples
 
+These examples follow `main`, including unreleased behavior. For an installed
+v0.4.2 release, use the [examples at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/examples.md);
+see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+
 For authenticated producer/consumer credentials, Go SDK key management, console and
 MCP workflows, see [Access keys](access-keys.md) (v0.3.1 and later).
 
@@ -65,6 +69,10 @@ Commit a business write **and** the enqueue in **one** SQLite transaction — th
 message is enqueued if and only if the business change commits. No dual-write race,
 no separate outbox poller. Embedded-only (same DB).
 
+Run this demonstration once in a fresh directory: it creates `app.db` and inserts
+the fixed sample order ID `42`. A real application supplies its own order identity
+and retry/reconciliation policy.
+
 ```go
 package main
 
@@ -83,7 +91,19 @@ func main() {
 		log.Fatal(err)
 	}
 	defer mq.Close()
-	_ = mq.CreateQueue(ctx, "order-events", mqlite.QueueConfig{})
+	if err := mq.CreateQueue(ctx, "order-events", mqlite.QueueConfig{}); err != nil {
+		log.Fatal(err)
+	}
+
+	// Initialize this example's application-owned table. Real applications can
+	// create their business schema through their normal migration process.
+	if err := mq.Tx(ctx, func(tx *engine.EngineTx) error {
+		_, err := tx.SQL().ExecContext(tx.Context(),
+			`CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, total INTEGER NOT NULL)`)
+		return err
+	}); err != nil {
+		log.Fatal(err)
+	}
 
 	// Your app tables live in the same DB. Tx gives you that transaction.
 	err = mq.Tx(ctx, func(tx *engine.EngineTx) error {
@@ -185,8 +205,9 @@ renewal is rejected or cannot be confirmed before that deadline, it cancels the
 individual handler context and skips Complete/Abandon for that stale delivery. The
 handler must honor `ctx.Done()` and remain idempotent:
 another consumer may receive the message after the lease is lost. Exact Complete and
-Abandon requests are also replayed within a five-second settlement window when an
-acknowledgement is lost; the broker's settlement receipt makes that replay safe.
+Abandon requests share a five-second total settlement budget, including the first
+request and replays after a lost acknowledgement; the broker's settlement receipt
+makes that replay safe.
 If a broker or intermediary returns HTTP 499, it is retried while the Receiver's
 own context remains live, using the same Receive attempt ID. If a proxy removes
 both broker-time headers, `WithErrorHandler` receives one degraded-clock

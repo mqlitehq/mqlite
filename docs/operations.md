@@ -47,7 +47,14 @@ Still quiesce clients and avoid overlapping brokers during the binary replacemen
   snapshot can repeat work whose external side effects already happened. Reuse
   stable `MessageID`/body, receive `AttemptID`, and the exact settlement request
   when retrying within their documented retention windows; do not treat an HTTP
-  timeout as proof that a write failed. A Peek-Lock AttemptID replays only while
+  timeout as proof that a write failed. Send deduplication is off by default:
+  enable a positive queue dedup window that covers the retry period before
+  relying on `MessageID`, and keep metadata, TTL and scheduled time stable too.
+  Duplicate sends do not extend that window. Settlement receipts expire after
+  30 minutes without extension on replay; resource deletion or fixed subscription
+  expiry can end replay earlier. Keep an application-side ledger when reconciliation
+  must outlive those bounds. A Peek-Lock AttemptID replays only while its saved
+  record is unexpired and
   its entire saved batch still owns live leases. A broker restart preserves those
   unexpired leases and tokens; after lease expiry or settlement, the broker
   invalidates a stale response and safely re-evaluates eligible work in a fresh
@@ -151,7 +158,8 @@ listener is ready, including database open and schema checks. The default lease
 is 30 seconds; use a longer configured lease when measured remote-store restart
 time and renewal/settlement latency need more margin.
 The managed Go clients also have bounded renewal and settlement retry budgets:
-terminal Complete/Abandon cleanup gets up to five seconds. Returning before lease
+terminal Complete/Abandon cleanup gets up to five seconds in total, including the
+first request and all replays. Returning before lease
 expiry is therefore necessary but not sufficient to preserve a particular
 handler's settlement; an exhausted retry budget does not resume automatically
 when the broker later returns. Retaining a valid token does not guarantee that an

@@ -1,5 +1,9 @@
 # Turso / libSQL: concurrency & embedded replicas (MQLITE-4)
 
+This guide follows `main`, including unreleased driver hardening. For an installed
+v0.4.2 release, use the [Turso guide at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/turso.md);
+see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+
 MQLite runs the same engine on a local SQLite file or a remote
 [Turso](https://turso.tech)/libSQL database — set `MQLITE_DB=libsql://<db>.turso.io`
 (+ `MQLITE_DB_AUTH_TOKEN`). The remote path is **CGO-free**: it speaks Hrana over

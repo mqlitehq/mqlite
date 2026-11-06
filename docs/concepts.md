@@ -1,5 +1,9 @@
 # Core concepts & subscription filters
 
+This document follows `main`, including unreleased changes. For an installed
+v0.4.2 release, use the [concepts at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/concepts.md);
+see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+
 > Goal: explain MQLite's model once, clearly, and place it against the comparable
 > services from Azure Service Bus, AWS (SQS + SNS) and GCP Pub/Sub. MQLite is designed
 > from first principles (one SQLite file, embeddable, agent-friendly), but conceptually
@@ -131,7 +135,9 @@ Every transition, with its trigger and the condition under which it fires:
   and delivery attempt, and cannot revive an expired lease. A live receipt can
   replay an already committed settlement only for the same queue, sequence, token,
   operation and effect-bearing arguments, including after the original lease
-  expires.
+  expires. Receipts expire 30 minutes after recording; replay does not extend
+  that deadline, and resource deletion or fixed subscription expiry can end
+  replay earlier.
 - **Lease, message TTL, and subscription lifetime are different clocks.** The lease
   temporarily fences one delivery attempt. Message TTL bounds normal delivery
   eligibility and can expire a message while locked; expiry moves it to the DLQ by

@@ -1,5 +1,9 @@
 # How mqlite works — building a reliable queue on one SQLite file
 
+This document follows `main`, including unreleased changes. For an installed
+v0.4.2 release, use the [internals at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/internals.md);
+see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+
 > This is the teaching document: how mqlite is actually built, table by table and
 > decision by decision — and *why* this construction yields a queue you can trust.
 > Nothing here is required to use mqlite; all of it helps you predict what it will
@@ -339,7 +343,9 @@ to make the *window* small and the *retries* safe:
 
 - **`settlement_receipts`** — when a settle (Complete/Abandon/Reject/Defer)
   succeeds, a receipt for the *request* is written *in the same transaction*
-  (kept ~30 minutes). If the client's response got lost and it retries, the
+  (logically valid for 30 minutes from recording; replay does not extend it).
+  Resource deletion or fixed subscription expiry can end replay earlier. If the
+  client's response got lost and it retries within that window, the
   settle matches zero rows — but finds an unexpired receipt, and returns success instead
   of a spurious `lock_lost`. Acknowledgements are idempotent.
 
@@ -359,21 +365,28 @@ to make the *window* small and the *retries* safe:
   stores only the ordered sequence/token/deadline roster, then reconstructs the
   immutable message fields from the locked rows while validating the whole batch
   in one query. This avoids duplicating every live message body in the replay
-  table. A retry replays the exact same messages and lock tokens only while every
-  token still owns a live lease. If explicit embedded live-lease recovery,
+  table. A retry replays the exact same messages and lock tokens only while the
+  record is unexpired and every token still owns a live lease. If explicit embedded live-lease recovery,
   startup recovery of an expired lease, ordinary lease expiry, or settlement
   invalidated any token, the same transaction removes the stale response and
   makes a safe new claim; a stale or
   partially owned batch never reaches the caller. Tokenless ReceiveAndDelete
-  retains the full response because its message rows are gone. Its replay lifetime
-  remains the greater of five minutes and the queue lock duration, matching the
-  existing contract. Managed local and remote receivers both retain AttemptID replay:
+  retains the full response because its message rows are gone. Both modes retain
+  the record for the greater of five minutes and the queue lock duration when
+  recorded, capped by a fixed subscription expiry. Neither replay nor lease
+  renewal extends that record's deadline. After it expires, the same ID may claim
+  new work even while a renewed original token remains live.
+  Managed local and remote receivers both retain AttemptID replay:
   even an in-process database commit can return an uncertain outcome.
 - **`dedup`** — on the producer side, a `message_id` within the queue's dedup
   window collapses resends into the original row (no id? the body's SHA-256 is
   used as a content-addressed key). Same id with a *different* body is a loud
   conflict, never a silent overwrite — a single send gets `409`; in a batch the
-  offending slot is skipped (seq `0`) while the rest commit.
+  offending slot is skipped (seq `0`) while the rest commit. Dedup is off by
+  default. When enabled, its window starts at the last new enqueue for that key;
+  duplicate sends do not refresh it, and completion does not erase it. The
+  conflict check covers body bytes, not metadata, TTL or scheduled time, so a
+  duplicate does not update the original message.
 
 Notice the pattern: each idempotency mechanism is **a small table written in the
 same transaction as the operation it protects**. No timeouts-and-hope, no
@@ -458,7 +471,8 @@ hear it from us:
 
 If your problem fits inside those lines — one node, thousands-per-second, must
 never lie to you — then the whole stack under your queue is a ~30 MB process,
-one file on disk (copyable with `cp` when stopped; use `VACUUM INTO` for a hot backup —
+one SQLite database (copy the complete DB/WAL/SHM set while stopped; use
+read-only `VACUUM INTO` for a hot backup —
 see [operations runbook](operations.md#consistent-backups)), and a set of promises you can
 re-verify by running `go test`.
 
