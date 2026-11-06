@@ -766,7 +766,7 @@ rejected with `409 name_conflict` instead of silently taking over
 **Response** `{}` (Empty).
 
 **Request** `CreateQueueRequest`: `name` (valid UTF-8, 1–128 bytes) + `config`
-(`QueueConfigJSON`, all fields optional — omit one to take its default). Every duration is **epoch milliseconds**.
+(`QueueConfigJSON`, all fields optional — omit one to take its default). Every duration is in **milliseconds**.
 Config is **queue-level**: it's set here, not per `Send`/`Receive`.
 
 | Field | Type | Default | Meaning |
