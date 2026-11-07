@@ -436,6 +436,10 @@ Every claim in this document is enforced by something that fails loudly:
 - **A schema golden test** — the complete canonical DDL is pinned. A database
   with a different guard token is refused (`ErrSchemaVersionMismatch`); existing
   table layouts are never migrated. Incompatible changes require a token change.
+  A narrowly scoped compatibility repair atomically replaces the two recognized
+  legacy message-parent triggers with equivalent indexed predicates that also
+  compile on Rust-based Turso. Unknown trigger definitions refuse Open before
+  DDL; this repair changes neither message data nor the schema token.
   The independent `access_keys` addition originally preserved token 5 and remains
   part of the canonical schema, with a separate golden for its DDL. Durable
   resource lifecycle and fixed subscription expiry advance the current canonical

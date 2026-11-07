@@ -140,7 +140,7 @@ func TestSchemaVersionGuard(t *testing.T) {
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
 		wantVersion = "7"
-		wantHash    = "623db1d9c1f74775cced0fd73494dc8a04d4921de415d617139f0e84b75e0bc8"
+		wantHash    = "8ee9ca9f1f4d61a1bc9578f9324934b0adab8da1057ceae63516f9f1701c18c8"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -160,6 +160,13 @@ func schemaVersionSixFixture(t *testing.T) []string {
 	                              expires_at=0 OR (kind='subscription' AND expires_at>created_at)),`
 	var previous []string
 	for _, statement := range schemaStmts {
+		// Freeze actual version-6 trigger spelling, rather than retroactively
+		// applying the compatible version-7 Rust expression repair to the fixture.
+		for _, guard := range parentGuardSchemas {
+			if strings.Contains(statement, guard.name) {
+				statement = guard.legacy
+			}
+		}
 		if strings.Contains(statement, "idx_subscription_expiry") {
 			continue
 		}
@@ -3163,6 +3170,11 @@ func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
 	// Access-key objects remain independently additive inside schema 7.
 	var oldSchema []string
 	for _, stmt := range schemaStmts {
+		for _, guard := range parentGuardSchemas {
+			if strings.Contains(stmt, guard.name) {
+				stmt = guard.legacy
+			}
+		}
 		if stmt != accessKeySchema && stmt != accessKeyCreatedIndex {
 			oldSchema = append(oldSchema, stmt)
 		}

@@ -160,6 +160,12 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		dlqMaxCount:      opts.DLQMaxCount,
 		dlqMaxBytes:      opts.DLQMaxBytes,
 	}
+	if d.refreshParentGuards {
+		if err := e.refreshParentGuardSchema(ctx); err != nil {
+			_ = d.close()
+			return nil, err
+		}
+	}
 	if err := e.initializeObservations(ctx); err != nil {
 		_ = d.close()
 		return nil, err

@@ -12,6 +12,17 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Keep resource cleanup compatible with Rust Turso (MQLITE-172)
+
+- Use independent indexed existence probes instead of compound SELECT subqueries
+  for resource emptiness checks and parent guards. Rust-based Turso currently
+  rejects the compound form at execution time, even after accepting its trigger.
+- Refresh only exact recognized legacy parent-trigger definitions atomically on
+  Open. No table layout, message content, live token or schema token changes;
+  unknown application definitions are refused before schema DDL. Older binaries
+  can still use the equivalent guards. This is a compatibility repair rather
+  than a general migration mechanism.
+
 ### Protect database credentials in diagnostics (MQLITE-168)
 
 - Remove injected credentials from remote URL parse errors while preserving the

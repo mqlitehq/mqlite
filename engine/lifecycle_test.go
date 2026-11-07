@@ -1348,7 +1348,7 @@ func TestLifecycleCleanupQueriesUseQueuePrefixIndexes(t *testing.T) {
 			}
 		})
 	}
-	existencePlan := explainPlan(t, e, `SELECT EXISTS(`+messageExistenceUnion("?")+`)`, repeatedQueueArgs("q")...)
+	existencePlan := explainPlan(t, e, `SELECT NOT (`+messageAbsencePredicate("?")+`)`, repeatedQueueArgs("q")...)
 	for _, state := range lifecycleMessageStates {
 		if !strings.Contains(existencePlan, state.index) {
 			t.Fatalf("message existence check does not use %s:\n%s", state.index, existencePlan)
@@ -1595,7 +1595,7 @@ func TestMessageParentDeleteStaysIndexedBesideDeepUnrelatedBacklog(t *testing.T)
 	// This is the exact predicate embedded in both parent triggers. Pinning every
 	// branch to its queue-prefix partial index is deterministic evidence that an
 	// empty target does six bounded seeks instead of scanning the unrelated rows.
-	plan := explainPlan(t, e, `SELECT EXISTS(`+messageExistenceUnion("?")+`)`, repeatedQueueArgs("empty-target")...)
+	plan := explainPlan(t, e, `SELECT NOT (`+messageAbsencePredicate("?")+`)`, repeatedQueueArgs("empty-target")...)
 	for _, state := range lifecycleMessageStates {
 		if !strings.Contains(plan, state.index) {
 			t.Errorf("parent guard for %s does not use %s:\n%s", state.name, state.index, plan)

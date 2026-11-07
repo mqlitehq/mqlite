@@ -304,8 +304,12 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
 - **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do
   not keep version history or migrations. `schemaVersion` is just an opaque guard
-  token. `initSchema` is CREATE-IF-NOT-EXISTS only: it does not rewrite existing
+  token. `initSchema` uses CREATE-IF-NOT-EXISTS: it does not rewrite existing
   table layouts, but can add a proven-compatible table under the same token.
+  The one expression repair replaces only the two exact recognized legacy
+  message-parent triggers with equivalent indexed predicates in one transaction,
+  for Rust Turso compatibility; unknown definitions refuse Open before DDL.
+  This is not an arbitrary schema migration path.
   Additions require the complete schema golden, actual prior-version upgrade /
   downgrade checks, and backup/restore coverage. `Open` **refuses** a DB whose recorded token differs
   (`ErrSchemaVersionMismatch`). Change the token whenever the schema changes
