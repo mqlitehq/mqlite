@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -2017,6 +2018,384 @@ func TestEmbeddedReceiverUsesCommittedRenewDeadline(t *testing.T) {
 	}
 	if err := messages[0].Complete(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// settlementClock advances context deadlines and retry waits without depending
+// on scheduler timing or sleeping through multi-second remote confirmations.
+type settlementClock struct {
+	mu       sync.Mutex
+	now      time.Time
+	contexts []*settlementTestContext
+	timeouts []time.Duration
+}
+type settlementTestContext struct {
+	clock    *settlementClock
+	parent   context.Context
+	deadline time.Time
+	done     chan struct{}
+	err      error
+}
+
+func (c *settlementTestContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *settlementTestContext) Done() <-chan struct{}       { return c.done }
+func (c *settlementTestContext) Err() error {
+	c.clock.mu.Lock()
+	err := c.err
+	c.clock.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return c.parent.Err()
+}
+func (c *settlementTestContext) Value(key any) any { return c.parent.Value(key) }
+func (c *settlementClock) withTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	c.mu.Lock()
+	deadline := c.now.Add(d)
+	if limit, ok := parent.Deadline(); ok && limit.Before(deadline) {
+		deadline = limit
+	}
+	ctx := &settlementTestContext{clock: c, parent: parent, deadline: deadline, done: make(chan struct{})}
+	c.contexts = append(c.contexts, ctx)
+	c.timeouts = append(c.timeouts, d)
+	c.mu.Unlock()
+	return ctx, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if ctx.err == nil {
+			ctx.err = context.Canceled
+			close(ctx.done)
+		}
+	}
+}
+func (c *settlementClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+	for _, ctx := range c.contexts {
+		if ctx.err == nil && !ctx.deadline.After(c.now) {
+			ctx.err = context.DeadlineExceeded
+			close(ctx.done)
+		}
+	}
+}
+func (c *settlementClock) time() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *settlementClock) wait(ctx context.Context, d time.Duration) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := deadline.Sub(c.time()); remaining < d {
+			d = remaining
+		}
+	}
+	c.advance(d)
+	return ctx.Err() == nil
+}
+func useSettlementClock(r *Receiver) *settlementClock {
+	c := &settlementClock{now: time.Now()}
+	r.settlement.withTimeout = c.withTimeout
+	r.settlement.wait = c.wait
+	return c
+}
+
+type settlementIdentitySource struct {
+	*fakeSource
+	identities []string
+}
+
+func (s *settlementIdentitySource) complete(ctx context.Context, q string, seq int64, token string) error {
+	s.identities = append(s.identities, fmt.Sprintf("complete:%s:%d:%s", q, seq, token))
+	return s.fakeSource.complete(ctx, q, seq, token)
+}
+func (s *settlementIdentitySource) abandon(ctx context.Context, q string, seq int64, token string, delay int64) error {
+	s.identities = append(s.identities, fmt.Sprintf("abandon:%s:%d:%s:%d", q, seq, token, delay))
+	return s.fakeSource.abandon(ctx, q, seq, token, delay)
+}
+
+func TestReceiverSettlementSlowConfirmationBudget(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			source := &settlementIdentitySource{fakeSource: f}
+			f.batch = []*Message{{SequenceNumber: 42, LockedUntil: time.Now().Add(time.Minute), queue: "q", lockToken: "same-token", s: source}}
+			observed, handlers, attempts, effects := 0, 0, 0, 0
+			r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { observed++; cancel() })})
+			clock := useSettlementClock(r)
+			settle := func(callCtx context.Context) error {
+				attempts++
+				clock.advance(3 * time.Second)
+				if err := callCtx.Err(); err != nil {
+					return err
+				}
+				if attempts == 1 {
+					effects++
+					return io.EOF
+				} // committed; only the acknowledgement is lost
+				cancel()
+				return nil // exact receipt replay confirms the first effect
+			}
+			if operation == "complete" {
+				f.completeFn = settle
+			} else {
+				f.abandonFn = settle
+			}
+			err := r.Run(ctx, func(context.Context, *Message) error {
+				handlers++
+				if operation == "abandon" {
+					return errors.New("handler failure")
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || observed != 0 || handlers != 1 || attempts != 2 || effects != 1 {
+				t.Fatalf("Run=%v observed=%d handlers=%d attempts=%d effects=%d", err, observed, handlers, attempts, effects)
+			}
+			if len(source.identities) != 2 || source.identities[0] != source.identities[1] {
+				t.Fatalf("settlement identity changed: %v", source.identities)
+			}
+			if len(clock.timeouts) != 3 || clock.timeouts[0] != 30*time.Second || clock.timeouts[1] != 15*time.Second || clock.timeouts[2] != 15*time.Second {
+				t.Fatalf("total/attempt budgets=%v, want 30s/15s/15s", clock.timeouts)
+			}
+			for _, ctx := range clock.contexts {
+				if ctx.Err() == nil {
+					t.Error("confirmation context timer was not released")
+				}
+			}
+		})
+	}
+}
+
+// A committed operation can take longer than five seconds to return, and its
+// exact receipt replay can be slow too. Reserve half of the total window per
+// attempt rather than canceling every otherwise healthy slow request.
+func TestReceiverSettlementSlowAttemptHeadroom(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			source := &settlementIdentitySource{fakeSource: f}
+			f.batch = []*Message{{SequenceNumber: 42, LockedUntil: time.Now().Add(time.Minute), queue: "q", lockToken: "same-token", s: source}}
+			observed, handlers, attempts, effects := 0, 0, 0, 0
+			r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { observed++; cancel() })})
+			clock := useSettlementClock(r)
+			advanceRPC := func(callCtx context.Context, d time.Duration) bool {
+				if deadline, ok := callCtx.Deadline(); ok && deadline.Sub(clock.time()) < d {
+					d = deadline.Sub(clock.time())
+				}
+				clock.advance(d)
+				return callCtx.Err() == nil
+			}
+			settle := func(callCtx context.Context) error {
+				attempts++
+				if attempts == 1 {
+					if !advanceRPC(callCtx, time.Second) {
+						return callCtx.Err()
+					}
+					effects++ // provider committed; the response is delayed and then lost
+					if !advanceRPC(callCtx, 7*time.Second) {
+						return callCtx.Err()
+					}
+					return io.EOF
+				}
+				if !advanceRPC(callCtx, 8*time.Second) {
+					return callCtx.Err()
+				}
+				cancel()
+				return nil
+			}
+			if operation == "complete" {
+				f.completeFn = settle
+			} else {
+				f.abandonFn = settle
+			}
+			err := r.Run(ctx, func(context.Context, *Message) error {
+				handlers++
+				if operation == "abandon" {
+					return errors.New("handler failure")
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || observed != 0 || handlers != 1 || attempts != 2 || effects != 1 {
+				t.Fatalf("Run=%v observed=%d handlers=%d attempts=%d effects=%d", err, observed, handlers, attempts, effects)
+			}
+			if len(source.identities) != 2 || source.identities[0] != source.identities[1] {
+				t.Fatalf("request identity changed: %v", source.identities)
+			}
+		})
+	}
+}
+
+func TestReceiverSettlementBudgetDoesNotInventUncertainty(t *testing.T) {
+	r := newReceiver(nil, "q", nil)
+	clock := useSettlementClock(r)
+	ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancel()
+	err := r.retrySettlement(ctx, func(context.Context) error { clock.advance(30 * time.Second); return nil })
+	if err != nil {
+		t.Fatalf("confirmed acknowledgement replaced by deadline: %v", err)
+	}
+	ctx, cancel = clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancel()
+	clock.advance(30 * time.Second)
+	calls := 0
+	err = r.retrySettlement(ctx, func(context.Context) error { calls++; return nil })
+	if calls != 0 || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("pre-expired budget calls=%d err=%v", calls, err)
+	}
+}
+
+func TestReceiverSettlementExhaustionPreservesLastCause(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{"fast EOF", io.EOF}, {"HTTP 503 body is not permanent", &HTTPError{StatusCode: 503, cause: ErrPermissionDenied}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReceiver(nil, "q", nil)
+			clock := useSettlementClock(r)
+			start := clock.time()
+			ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+			defer cancel()
+			attempts := 0
+			err := r.retrySettlement(ctx, func(context.Context) error { attempts++; return tc.cause })
+			if !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, tc.cause) {
+				t.Fatalf("exhausted error=%v, want outcome unknown and original cause", err)
+			}
+			if attempts < 2 || clock.time().Sub(start) < 30*time.Second || clock.time().Sub(start) > 31*time.Second {
+				t.Fatalf("attempts=%d elapsed=%s", attempts, clock.time().Sub(start))
+			}
+			if tc.name != "fast EOF" {
+				var status *HTTPError
+				if !errors.As(err, &status) || status.StatusCode != 503 {
+					t.Fatal("HTTP error type lost")
+				}
+				fatal := false
+				r.settleErr(err, func() bool { return false }, func(error, bool) { fatal = true })
+				if fatal {
+					t.Fatal("transient status became permanent after wrapping")
+				}
+			}
+		})
+	}
+}
+
+func TestReceiverSettlementAttemptTimeoutAndPermanentBoundary(t *testing.T) {
+	r := newReceiver(nil, "q", nil)
+	clock := useSettlementClock(r)
+	var retryWait time.Duration
+	r.settlement.wait = func(ctx context.Context, d time.Duration) bool {
+		retryWait += d
+		return clock.wait(ctx, d)
+	}
+	start := clock.time()
+	ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+	defer cancel()
+	attempts := 0
+	var attemptBudgets []time.Duration
+	err := r.retrySettlement(ctx, func(callCtx context.Context) error {
+		attempts++
+		deadline, _ := callCtx.Deadline()
+		remaining := deadline.Sub(clock.time())
+		if remaining <= 0 || remaining > 15*time.Second {
+			t.Fatalf("attempt remaining=%s", remaining)
+		}
+		attemptBudgets = append(attemptBudgets, remaining)
+		clock.advance(remaining)
+		return callCtx.Err()
+	})
+	if attempts != 2 || clock.time().Sub(start) != 30*time.Second || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("attempts=%d elapsed=%s err=%v", attempts, clock.time().Sub(start), err)
+	}
+	if retryWait <= 0 || attemptBudgets[0] != 15*time.Second || attemptBudgets[1] != 15*time.Second-retryWait {
+		t.Fatalf("blackhole attempt budgets=%v, want first 15s and total-budget-clipped replay", attemptBudgets)
+	}
+	for _, terminal := range []error{ErrLockLost, ErrUnauthenticated, ErrInvalidArgument, &HTTPError{StatusCode: 403, cause: ErrPermissionDenied}} {
+		r := newReceiver(nil, "q", nil)
+		clock := useSettlementClock(r)
+		ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
+		got := r.retrySettlement(ctx, func(context.Context) error { clock.advance(30 * time.Second); return terminal })
+		cancel()
+		if !errors.Is(got, terminal) || errors.Is(got, ErrOutcomeUnknown) {
+			t.Fatalf("terminal identity lost or marked outcome unknown: %v", got)
+		}
+	}
+}
+
+func TestReceiverSettlementCancellationJoinsConfirmation(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f := &fakeSource{}
+			source := &settlementIdentitySource{fakeSource: f}
+			f.batch = []*Message{{SequenceNumber: 7, LockedUntil: time.Now().Add(time.Minute), queue: "q", lockToken: "same-token", s: source}}
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
+			observed, handlers, attempts := 0, 0, 0
+			r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { observed++ })})
+			clock := useSettlementClock(r)
+			settle := func(callCtx context.Context) error {
+				attempts++
+				if attempts == 1 {
+					if callCtx.Err() != nil {
+						t.Error("Run cancellation canceled fresh cleanup context")
+					}
+					close(entered)
+					<-release
+				}
+				clock.advance(3 * time.Second)
+				if err := callCtx.Err(); err != nil {
+					return err
+				}
+				if attempts == 1 {
+					return io.EOF
+				}
+				return nil
+			}
+			if operation == "complete" {
+				f.completeFn = settle
+			} else {
+				f.abandonFn = settle
+			}
+			done := make(chan error, 1)
+			go func() {
+				done <- r.Run(ctx, func(context.Context, *Message) error {
+					handlers++
+					cancel()
+					if operation == "abandon" {
+						return context.Canceled
+					}
+					return nil
+				})
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("cleanup did not start")
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("Run returned before cleanup was released: %v", err)
+			default:
+			}
+			releaseOnce.Do(func() { close(release) })
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not join cleanup")
+			}
+			if observed != 0 || handlers != 1 || attempts != 2 || len(source.identities) != 2 || source.identities[0] != source.identities[1] {
+				t.Fatalf("observed=%d handlers=%d attempts=%d identities=%v", observed, handlers, attempts, source.identities)
+			}
+		})
 	}
 }
 
