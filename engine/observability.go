@@ -740,6 +740,10 @@ func storageErrorCode(err error) string {
 		return "closed"
 	case isBusyErr(err):
 		return "busy"
+	case isExpiredRemoteTransactionErr(err):
+		// Keep the established counter/wire label matrix backward-compatible.
+		// ErrorDetail carries the more precise transaction_expired diagnostic.
+		return "connection"
 	case isConnErr(err):
 		return "connection"
 	}

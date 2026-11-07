@@ -60,6 +60,12 @@ func TestRustTursoBusyClassificationIsExactAndTransportSafe(t *testing.T) {
 // Its failed statement/COMMIT explicitly has no committed effect. Transport-loss
 // and post-commit ambiguity are separate negative controls below.
 type rustBusyProvider struct {
+	failureMessage                                                string
+	failureCode                                                   string
+	rollbackOnFailure                                             bool
+	skipAtStage                                                   int
+	expiredRollbacks                                              int
+	reads                                                         int
 	mu                                                            sync.Mutex
 	failStage                                                     string
 	remaining                                                     int
@@ -106,6 +112,9 @@ func (p *rustBusyProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "UPDATE validation_counter SET value=value+1":
 			p.writes++
 			stage = "statement"
+		case "SELECT value FROM validation_counter":
+			p.reads++
+			stage = "read"
 		case "COMMIT":
 			p.commits++
 			stage = "commit"
@@ -116,20 +125,46 @@ func (p *rustBusyProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unexpected test SQL", 400)
 			return
 		}
-		if stage == p.failStage && p.remaining > 0 {
+		shouldFail := stage == p.failStage && p.remaining > 0
+		if shouldFail && p.skipAtStage > 0 {
+			p.skipAtStage--
+			shouldFail = false
+		}
+		if shouldFail {
 			p.remaining--
 			p.failures++
-			result = map[string]any{"type": "error", "error": map[string]any{"code": "SQLITE_BUSY", "message": "Tursodb error: Database is busy"}}
+			message, code := p.failureMessage, p.failureCode
+			if message == "" {
+				message = "Tursodb error: Database is busy"
+			}
+			if code == "" {
+				code = "SQLITE_BUSY"
+			}
+			if p.rollbackOnFailure {
+				delete(p.pending, baton)
+				baton = ""
+				p.expiredRollbacks++
+			}
+			result = map[string]any{"type": "error", "error": map[string]any{"code": code, "message": message}}
 		} else {
 			if stage == "statement" {
-				p.pending[baton]++
+				if baton == "" {
+					p.applied++
+				} else {
+					p.pending[baton]++
+				}
 			}
 			if stage == "commit" {
 				p.applied += p.pending[baton]
 				delete(p.pending, baton)
 				baton = ""
 			}
-			result = map[string]any{"type": "ok", "response": map[string]any{"type": "execute", "result": map[string]any{"cols": []any{}, "rows": []any{}, "affected_row_count": 1, "last_insert_rowid": "1"}}}
+			cols, rows := []any{}, []any{}
+			if stage == "read" {
+				cols = []any{map[string]any{"name": "value", "decltype": "INTEGER"}}
+				rows = []any{[]any{map[string]any{"type": "integer", "value": strconv.Itoa(p.applied)}}}
+			}
+			result = map[string]any{"type": "ok", "response": map[string]any{"type": "execute", "result": map[string]any{"cols": cols, "rows": rows, "affected_row_count": 1, "last_insert_rowid": "1"}}}
 		}
 	}
 	var batonValue any

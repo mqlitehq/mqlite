@@ -561,6 +561,14 @@ func exactRemoteProviderError(err error, message string) bool {
 	return false
 }
 
+// isExpiredRemoteTransactionErr accepts a definite provider rollback receipt,
+// not a generic timeout or a missing COMMIT acknowledgement. The pinned driver
+// discards the protocol code, so every word of this explanation is significant.
+func isExpiredRemoteTransactionErr(err error) bool {
+	return exactRemoteProviderError(err, "SQLite error: interactive transaction was rolled back "+
+		"because the stream was idle for too long; retry the transaction")
+}
+
 // backoff pauses before a retry so a contended remote write doesn't immediately
 // re-collide; it escalates a little per attempt and honors ctx cancellation.
 func (d *db) backoff(ctx context.Context, attempt int) {
@@ -711,17 +719,18 @@ func (d *db) attempts() int {
 }
 
 func (d *db) retryable(err error) bool {
-	return d.remote && (isConnErr(err) || isBusyErr(err))
+	return d.remote && (isConnErr(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
 }
 
 // retryableWrite is retryable for a WRITE or COMMIT: safe to replay only when the error
 // guarantees the statement never applied — driver.ErrBadConn (database/sql's "retry on a
-// fresh connection" signal) or a busy error (the lock was never acquired). A broad transport
+// fresh connection" signal), a busy error (the lock was never acquired), or the
+// exact provider acknowledgement that the whole idle transaction was rolled back. A broad transport
 // error like "connection reset" on a write is outcome-unknown (the primary may have committed
 // before the ack was lost), so it is NOT replayed — the caller gets ErrOutcomeUnknown instead
 // of a silent double-apply (MQLITE-59).
 func (d *db) retryableWrite(err error) bool {
-	return d.remote && (errors.Is(err, driver.ErrBadConn) || isBusyErr(err))
+	return d.remote && (errors.Is(err, driver.ErrBadConn) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
 }
 
 func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql.Result, error) {
