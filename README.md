@@ -310,6 +310,11 @@ not retry blindly. Peek-Lock Receive is replayable instead—reuse the same
 `RecvOpts.Attempt` to recover the exact claimed batch; the managed Receiver does
 this automatically.
 
+Every Receive item must carry a positive sequence number; a null item invalidates
+the entire response. Empty message bodies and empty message lists remain valid.
+Send/Schedule acknowledgements reject null or negative sequence numbers, while zero still
+represents a legitimate topic no-match or skipped batch dedup slot.
+
 Remote-only applications that need a lower source floor can use the official
 [MQLite Remote Client for Go](https://github.com/mqlitehq/mqlite-go), whose
 module path remains `github.com/mqlitehq/mqlite-go`

@@ -425,6 +425,14 @@ is terminal. Renew and settlement use separate retry policies.
 - **Response** `ReceiveResponse`: `messages` ([Message]) — each carries a
   `lock_token` to settle with (peek-lock mode).
 
+Go clients validate the entire batch before returning handles: every delivery
+must have a positive, unique sequence number, and Peek-Lock (including
+ReceiveDeferred) requires a nonempty fencing token. Receive-and-Delete grants no
+token, and Peek remains a tokenless browse operation. Tokens stay opaque and need
+not be globally unique. A malformed Peek-Lock Receive success can be replayed
+with its original attempt ID; ReceiveDeferred has no attempt-ID replay contract.
+A malformed Receive-and-Delete success is outcome-unknown.
+
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   --data '{"queue":"orders","max_messages":1,"wait_time_ms":5000}' \
