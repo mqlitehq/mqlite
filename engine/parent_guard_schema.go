@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // validateParentGuardSchema refuses unknown application definitions before any
@@ -20,11 +21,10 @@ func (d *db) validateParentGuardSchema(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("check parent guard schema: %w", err)
 		}
-		current := normalizedSchemaSQL(ddl)
-		if kind != "trigger" || table != "queues" || (current != normalizedSchemaSQL(guard.current) && current != normalizedSchemaSQL(guard.legacy)) {
+		if kind != "trigger" || table != "queues" || (!matchesParentGuardDefinition(ddl, guard.current) && !matchesParentGuardDefinition(ddl, guard.legacy)) {
 			return false, parentGuardConflict(guard.name)
 		}
-		refresh = refresh || current == normalizedSchemaSQL(guard.legacy)
+		refresh = refresh || matchesParentGuardDefinition(ddl, guard.legacy)
 	}
 	return refresh, nil
 }
@@ -44,11 +44,10 @@ func (e *Engine) refreshParentGuardSchema(ctx context.Context) error {
 			if err := tx.QueryRowContext(ctx, `SELECT type,tbl_name,sql FROM sqlite_master WHERE name=? COLLATE NOCASE`, guard.name).Scan(&kind, &table, &ddl); err != nil {
 				return fmt.Errorf("refresh parent guard schema: %w", err)
 			}
-			definition := normalizedSchemaSQL(ddl)
-			if kind != "trigger" || table != "queues" || (definition != normalizedSchemaSQL(guard.current) && definition != normalizedSchemaSQL(guard.legacy)) {
+			if kind != "trigger" || table != "queues" || (!matchesParentGuardDefinition(ddl, guard.current) && !matchesParentGuardDefinition(ddl, guard.legacy)) {
 				return parentGuardConflict(guard.name)
 			}
-			if definition == normalizedSchemaSQL(guard.current) {
+			if matchesParentGuardDefinition(ddl, guard.current) {
 				continue
 			}
 			// The identifier is a package-owned constant, never a caller value.
@@ -61,4 +60,16 @@ func (e *Engine) refreshParentGuardSchema(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+// Rust writes this one canonical inequality as !=. Construct the allowed
+// alternative from package-owned SQL, never by normalizing arbitrary operators
+// or literals in a database definition.
+func matchesParentGuardDefinition(actual, canonical string) bool {
+	normalized := normalizedSchemaSQL(actual)
+	if normalized == normalizedSchemaSQL(canonical) {
+		return true
+	}
+	alternate := strings.Replace(canonical, "NEW.name<>OLD.name", "NEW.name!=OLD.name", 1)
+	return normalized == normalizedSchemaSQL(alternate)
 }
