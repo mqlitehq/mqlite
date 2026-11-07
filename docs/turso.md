@@ -124,6 +124,17 @@ still bounded as follows:
   wrapping. Arbitrary busy text, transport/cancellation wrappers, joined errors
   and post-commit checkpoint failures do not qualify. This does not add retries
   to local SQLite or make overlapping brokers safe.
+- **A confirmed idle-transaction rollback can be retried.** MQLite recognizes only
+  the exact provider explanation that an interactive transaction "was rolled back
+  because the stream was idle for too long; retry the transaction." This is a
+  rollback acknowledgement, rather than a lost COMMIT reply. The engine reopens
+  and retries the entire transaction under the same six-attempt budget, rebuilding
+  time-sensitive arguments as usual. Exhaustion keeps the existing `connection`
+  counter category and reports `transaction_expired` in optional error details;
+  it does not change the required observation counter matrix.
+  Generic "transaction timed out" or "rolled back" text, network/cancellation
+  wrappers, joined causes and checkpoint failures do not qualify. A lost COMMIT
+  reply remains outcome-unknown even if an outer diagnostic mentions expiry.
 - **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
   other transport drop on a write/commit — the primary may have durably committed before
   the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead

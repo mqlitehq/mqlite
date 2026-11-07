@@ -60,6 +60,13 @@ func describeError(err error, now int64) (d ErrorDetail) {
 	raw := err.Error()
 	hash := sha256.Sum256([]byte(raw))
 	d.Fingerprint = hex.EncodeToString(hash[:12])
+	if isExpiredRemoteTransactionErr(err) {
+		// Precision belongs in the optional detail, not a new required storage-counter
+		// tuple that would make current clients reject older broker observations.
+		d.Category = "transaction_expired"
+		d.Message = "Remote database rolled back an idle transaction; the permitted retries were exhausted."
+		return d
+	}
 	if match := providerHTTPCode.FindStringSubmatch(raw); len(match) == 2 {
 		d.HTTPStatus, _ = strconv.Atoi(match[1])
 		switch {
