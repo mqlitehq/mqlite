@@ -46,6 +46,11 @@ import (
 // so it exercises the errors.As(net.Error).Timeout() branch specifically (MQLITE-59).
 type netTimeout struct{}
 
+type sqliteBusyEvidence struct{}
+
+func (sqliteBusyEvidence) Error() string { return "database is locked" }
+func (sqliteBusyEvidence) Code() int     { return 5 }
+
 func (netTimeout) Error() string   { return "deadline exceeded" }
 func (netTimeout) Timeout() bool   { return true }
 func (netTimeout) Temporary() bool { return true }
@@ -817,7 +822,7 @@ func TestIsConnErr(t *testing.T) {
 		{"net.Error timeout (no substring)", netTimeout{}, true},
 		// A structured server *response* is a definite non-commit — must NOT be
 		// treated as outcome-unknown (else a rejected write reads as "maybe applied").
-		{"server 500 response", errors.New("error code 500: SQLITE_ERROR"), false},
+		{"server 500 response", errors.New("error code 500: SQLITE_ERROR"), true},
 		{"no such table", errors.New("no such table: messages"), false},
 		{"unique constraint", errors.New("UNIQUE constraint failed: dedup.message_id"), false},
 		{"context canceled", errors.New("context canceled"), false},
@@ -870,8 +875,11 @@ func TestRetryableWrite(t *testing.T) {
 	if !remote.retryableWrite(fmt.Errorf("exec: %w", driver.ErrBadConn)) {
 		t.Error("write on ErrBadConn must be retryable (the statement never ran)")
 	}
-	if !remote.retryableWrite(errors.New("database is locked")) {
-		t.Error("write on a busy error must be retryable (lock never acquired)")
+	if !remote.retryableWrite(sqliteBusyEvidence{}) {
+		t.Error("write on typed SQLITE_BUSY must be retryable")
+	}
+	if remote.retryableWrite(errors.New("database is locked")) {
+		t.Error("untyped busy text cannot prove an issued write did not commit")
 	}
 	// Every broad transport error — including the EOF/timeout/broken-pipe siblings
 	// isConnErr now spans — is outcome-unknown for a write: it may have applied before
@@ -1080,6 +1088,7 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 type busyConn struct{ st *busyState }
 
 type busyState struct {
+	queryRowsErr    error
 	failsLeft       int
 	onFailure       func()
 	connectErr      error
@@ -1125,7 +1134,7 @@ func (t *busyTx) Commit() error {
 	}
 	if t.st.failsLeft > 0 {
 		t.st.failsLeft--
-		return errors.New("database is locked") // busy: the commit provably did not land
+		return sqliteBusyEvidence{} // typed rejection: the commit provably did not land
 	}
 	return t.st.commitErr
 }
@@ -1168,7 +1177,10 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		return &oneQueueRow{values: []driver.Value{name, "queue", int64(1000), int64(10), int64(0), int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "active", c.st.queueExpiresAt}}, nil
 	}
 	if !c.record(query, args) {
-		return nil, errors.New("database is locked") // isBusyErr => retryable
+		return nil, sqliteBusyEvidence{}
+	}
+	if c.st.queryRowsErr != nil {
+		return &terminalErrorRows{err: c.st.queryRowsErr}, nil
 	}
 	if strings.Contains(normalized, "SELECT response FROM receive_attempts") {
 		if c.st.attemptResponse == "" {
@@ -1217,7 +1229,7 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.st.statements = append(c.st.statements, query)
 	if !c.record(query, args) {
-		return nil, errors.New("database is locked")
+		return nil, sqliteBusyEvidence{}
 	}
 	if c.st.execErr != nil {
 		return nil, c.st.execErr
@@ -1236,6 +1248,12 @@ func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.Na
 }
 
 type emptyRows struct{}
+
+type terminalErrorRows struct{ err error }
+
+func (*terminalErrorRows) Columns() []string           { return []string{"value"} }
+func (*terminalErrorRows) Close() error                { return nil }
+func (r *terminalErrorRows) Next([]driver.Value) error { return r.err }
 
 func (emptyRows) Columns() []string         { return []string{"id"} }
 func (emptyRows) Close() error              { return nil }
@@ -1675,8 +1693,8 @@ func TestFreshHelpersRebuildArgsPerAttempt(t *testing.T) {
 		name string
 		run  func(d *db, build func() []any) error
 	}{
-		{"queryFresh", func(d *db, build func() []any) error {
-			return d.queryFresh(ctx, "UPDATE t SET x=?", build, func(*sql.Rows) error { return nil })
+		{"queryFreshWrite", func(d *db, build func() []any) error {
+			return d.queryFreshWrite(ctx, "UPDATE t SET x=?", build, func(*sql.Rows) error { return nil })
 		}},
 		{"execFresh", func(d *db, build func() []any) error {
 			_, err := d.execFresh(ctx, "UPDATE t SET x=?", build)
@@ -1750,7 +1768,7 @@ func TestFreshHelpersBuildArgsAfterAcquiringAConn(t *testing.T) {
 	var built atomic.Bool
 	done := make(chan error, 1)
 	go func() {
-		done <- d.queryFresh(context.Background(), "UPDATE t SET x=?",
+		done <- d.queryFreshWrite(context.Background(), "UPDATE t SET x=?",
 			func() []any { built.Store(true); return []any{int64(1)} },
 			func(*sql.Rows) error { return nil })
 	}()
@@ -4203,7 +4221,7 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 		category string
 		status   int
 	}{
-		{errors.New("remote: error code 503: private provider message https://secret.example/?token=hidden"), "provider_unavailable", 503},
+		{fmt.Errorf("remote: %w", errors.New("error code 503: private provider message https://secret.example/?token=hidden")), "provider_unavailable", 503},
 		{errors.New("error code 401: token=hidden"), "provider_auth", 401},
 		{errors.New("error code 429: slow down"), "provider_rate_limit", 429},
 		{errors.New("error code 400: private SQL"), "provider_http", 400},
@@ -4218,7 +4236,8 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 		{errors.New("SQLITE_FULL"), "full", 0},
 		{errors.New("unknown private explanation mqk_hidden"), "unclassified", 0},
 		{errors.Join(ErrOutcomeUnknown, errors.New("error code 503: unknown commit")), "outcome_unknown", 0},
-		{fmt.Errorf("%w: error code 503: unknown commit", ErrOutcomeUnknown), "outcome_unknown", 503},
+		{fmt.Errorf("%w: error code 503: unknown commit", ErrOutcomeUnknown), "outcome_unknown", 0},
+		{unknownRemoteWrite(errors.New("error code 503: unknown commit")), "outcome_unknown", 503},
 	} {
 		t.Run(tc.category+fmt.Sprint(tc.status), func(t *testing.T) {
 			detail := describeError(tc.err, 123)
@@ -4248,6 +4267,337 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 	}
 	if !strings.Contains(private, "provider overloaded") || len(private) > 2060 || !utf8.ValidString(private) {
 		t.Fatalf("invalid bounded private log (%d bytes)", len(private))
+	}
+}
+
+// Provider HTTP failures use the pinned driver's real Hrana-over-HTTP path.
+// The model can commit before emitting an HTTP error: status alone is never
+// evidence that a WRITE or COMMIT had no durable effect (MQLITE-174).
+func TestProviderHTTPStatusRequiresOneExactLeaf(t *testing.T) {
+	leaf := errors.New("error code 502: upstream forward failed")
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"leaf", leaf, 502},
+		{"driver newline", fmt.Errorf("failed to execute SQL: UPDATE example\n%w", leaf), 502},
+		{"SQL text only", errors.New("failed to execute SQL: SELECT 'error code 503: private SQL'"), 0},
+		{"outer text only", fmt.Errorf("error code 503: %w", errors.New("logical SQL error")), 0},
+		{"non-three-digit", errors.New("error code 5020: unrelated"), 0},
+		{"joined", errors.Join(leaf, errors.New("another failure")), 0},
+		{"joined singleton", errors.Join(leaf), 0},
+		{"network wrapper", &net.OpError{Op: "read", Net: "tcp", Err: leaf}, 0},
+		{"URL wrapper", &url.Error{Op: "Post", Err: leaf}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := remoteProviderHTTPStatus(tc.err); got != tc.status {
+				t.Fatalf("status=%d, want %d", got, tc.status)
+			}
+			if (&db{remote: true}).retryableWrite(tc.err) {
+				t.Fatal("HTTP/ambiguous explanation became safe write replay")
+			}
+		})
+	}
+	for _, status := range []int{408, 429, 499, 500, 502, 503, 599} {
+		err := fmt.Errorf("failed to execute SQL:\n%w", fmt.Errorf("error code %d: SQLITE_BUSY no such table EOF", status))
+		if !(&db{remote: true}).retryable(err) || (&db{remote: true}).retryableWrite(err) || isBusyErr(err) || storageErrorCode(err) != "connection" {
+			t.Fatalf("HTTP %d body overrode retry boundaries", status)
+		}
+	}
+	for _, status := range []int{400, 401, 403, 404, 409, 422} {
+		err := fmt.Errorf("failed to execute SQL:\n%w", fmt.Errorf("error code %d: SQLITE_BUSY EOF", status))
+		if (&db{remote: true}).retryable(err) || (&db{remote: true}).retryableWrite(err) || isConnErr(err) || isBusyErr(err) {
+			t.Fatalf("nontransient HTTP %d was retried", status)
+		}
+	}
+	unknown := unknownRemoteWrite(leaf)
+	if !errors.Is(unknown, ErrOutcomeUnknown) || !errors.Is(unknown, leaf) || (&db{remote: true}).retryable(unknown) || (&db{remote: true}).retryableWrite(unknown) {
+		t.Fatal("unknown outcome lost its cause or became replayable")
+	}
+	var statusError interface{ HTTPStatus() int }
+	if !errors.As(unknown, &statusError) || statusError.HTTPStatus() != 502 {
+		t.Fatal("unknown outcome lost provider HTTP status")
+	}
+	detail := describeError(fmt.Errorf("failed to execute SQL:\n%w", leaf), 1)
+	if detail.HTTPStatus != 502 || detail.Category != "provider_unavailable" || strings.Contains(detail.Message, "upstream") {
+		t.Fatalf("provider failure diagnostics=%+v", detail)
+	}
+	detail = describeError(unknown, 1)
+	if detail.HTTPStatus != 502 || detail.Category != "outcome_unknown" {
+		t.Fatalf("unknown provider diagnostics=%+v", detail)
+	}
+}
+
+func TestProviderHTTPPrecommitRetriesOnlyOneCommittedEffect(t *testing.T) {
+	for _, stage := range []string{"begin", "statement"} {
+		t.Run(stage, func(t *testing.T) {
+			p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 502, httpApply: true}
+			e := newRustBusyEngine(t, p)
+			runs := 0
+			err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+				runs++
+				_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			wantRuns := 2
+			if stage == "begin" {
+				wantRuns = 1
+			}
+			if runs != wantRuns || p.starts != 2 || p.commits != 1 || p.applied != 1 || p.failures != 1 {
+				t.Fatalf("runs=%d starts=%d commits=%d effects=%d failures=%d", runs, p.starts, p.commits, p.applied, p.failures)
+			}
+		})
+	}
+}
+
+func TestProviderHTTPCommittedFailureIsUnknownAndNeverReplayed(t *testing.T) {
+	for _, operation := range []string{"commit", "exec", "exec-fresh"} {
+		t.Run(operation, func(t *testing.T) {
+			stage := "statement"
+			if operation == "commit" {
+				stage = "commit"
+			}
+			p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 502, httpApply: true}
+			e := newRustBusyEngine(t, p)
+			calls := 0
+			var err error
+			switch operation {
+			case "commit":
+				err = e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+					calls++
+					_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+					return err
+				})
+			case "exec":
+				calls++
+				_, err = e.db.execUnobserved(context.Background(), "UPDATE validation_counter SET value=value+1")
+			case "exec-fresh":
+				_, err = e.db.execFreshUnobserved(context.Background(), "UPDATE validation_counter SET value=value+1", func() []any { calls++; return nil })
+			}
+			if !errors.Is(err, ErrOutcomeUnknown) || remoteProviderHTTPStatus(err) != 502 {
+				t.Fatalf("write error=%v status=%d", err, remoteProviderHTTPStatus(err))
+			}
+			var unknown *providerWriteOutcomeUnknown
+			if !errors.As(err, &unknown) || unknown.cause == nil {
+				t.Fatal("provider cause lost")
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if calls != 1 || p.applied != 1 || p.writes != 1 || p.failures != 1 || operation == "commit" && p.commits != 1 {
+				t.Fatalf("calls=%d effects=%d writes=%d commits=%d failures=%d", calls, p.applied, p.writes, p.commits, p.failures)
+			}
+		})
+	}
+}
+
+func TestProviderHTTPReadRetryAndExhaustionAreBounded(t *testing.T) {
+	for _, failures := range []int{1, maxConnAttempts + 1} {
+		t.Run(fmt.Sprint(failures), func(t *testing.T) {
+			p := &rustBusyProvider{failStage: "read", remaining: failures, httpStatus: 502}
+			e := newRustBusyEngine(t, p)
+			var value int
+			err := e.db.queryRowScan(context.Background(), []any{&value}, "SELECT value FROM validation_counter")
+			wantReads := 2
+			if failures > 1 {
+				wantReads = maxConnAttempts
+				if err == nil || errors.Is(err, ErrOutcomeUnknown) || storageErrorCode(err) != "connection" || describeError(err, 1).HTTPStatus != 502 {
+					t.Fatalf("exhausted read=%v", err)
+				}
+			} else if err != nil || value != 0 {
+				t.Fatalf("read=%d err=%v", value, err)
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.reads != wantReads || p.applied != 0 {
+				t.Fatalf("reads=%d effects=%d", p.reads, p.applied)
+			}
+		})
+	}
+}
+
+func TestProviderHTTPBodyCannotAuthorizeWriteReplay(t *testing.T) {
+	for _, status := range []int{400, 401, 403, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			p := &rustBusyProvider{failStage: "commit", remaining: 1, httpStatus: status, httpBody: `{"error":"SQLITE_BUSY database is locked EOF"}`, httpApply: true}
+			e := newRustBusyEngine(t, p)
+			runs := 0
+			err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+				runs++
+				_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+				return err
+			})
+			if err == nil || errors.Is(err, ErrOutcomeUnknown) != (status == 503) {
+				t.Fatalf("status=%d err=%v", status, err)
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if runs != 1 || p.commits != 1 || p.applied != 1 {
+				t.Fatalf("runs=%d commits=%d effects=%d", runs, p.commits, p.applied)
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &rustBusyProvider{failStage: "begin", remaining: 2, httpStatus: 502, onFailure: cancel}
+	e := newRustBusyEngine(t, p)
+	defer cancel()
+	err := e.inTx(ctx, func(context.Context, *txn) error { t.Fatal("canceled BEGIN dispatched callback"); return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled retry=%v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.starts != 1 || p.writes != 0 || p.commits != 0 {
+		t.Fatalf("after cancellation starts=%d writes=%d commits=%d", p.starts, p.writes, p.commits)
+	}
+}
+
+func TestProviderHTTPDiscardedStatusCannotAuthorizeWriteReplay(t *testing.T) {
+	for _, code := range []string{"SQLITE_BUSY", "STREAM_EXPIRED"} {
+		t.Run(code, func(t *testing.T) {
+			for _, operation := range []string{"commit", "exec"} {
+				t.Run(operation, func(t *testing.T) {
+					// The non-string error property makes the driver's first decoder fail;
+					// its fallback keeps code/message but discards the actual HTTP status.
+					body := fmt.Sprintf(`{"error":{},"code":%q,"message":"database is locked"}`, code)
+					stage := "statement"
+					if operation == "commit" {
+						stage = "commit"
+					}
+					p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 503, httpBody: body, httpApply: true}
+					e := newRustBusyEngine(t, p)
+					runs := 0
+					var err error
+					if operation == "commit" {
+						err = e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+							runs++
+							_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+							return err
+						})
+					} else {
+						runs++
+						_, err = e.db.execUnobserved(context.Background(), "UPDATE validation_counter SET value=value+1")
+					}
+					p.mu.Lock()
+					defer p.mu.Unlock()
+					if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, driver.ErrBadConn) || remoteProviderHTTPStatus(err) != 0 {
+						t.Fatalf("discarded status error=%v invented status=%d writes=%d committed_effects=%d", err, remoteProviderHTTPStatus(err), p.writes, p.applied)
+					}
+					if runs != 1 || p.writes != 1 || operation == "commit" && p.commits != 1 || p.applied != 1 {
+						t.Fatalf("runs=%d commits=%d effects=%d", runs, p.commits, p.applied)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestProviderHTTPBodyOnlyBusyCannotAuthorizeCommittedReplay(t *testing.T) {
+	for _, message := range []string{"database is locked", "Tursodb error: Database is busy", expiredTransactionProviderFixture} {
+		t.Run(message, func(t *testing.T) {
+			for _, operation := range []string{"write", "public-tx-commit"} {
+				t.Run(operation, func(t *testing.T) {
+					body := fmt.Sprintf(`{"error":{},"message":%q}`, message)
+					stage := "statement"
+					if operation == "public-tx-commit" {
+						stage = "commit"
+					}
+					p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 503, httpBody: body, httpApply: true}
+					e := newRustBusyEngine(t, p)
+					callbacks := 0
+					var err error
+					if operation == "public-tx-commit" {
+						err = e.Tx(context.Background(), func(tx *EngineTx) error {
+							callbacks++
+							_, err := tx.SQL().ExecContext(tx.Context(), "UPDATE validation_counter SET value=value+1")
+							return err
+						})
+					} else {
+						callbacks++
+						_, err = e.db.exec(context.Background(), "UPDATE validation_counter SET value=value+1")
+					}
+					p.mu.Lock()
+					defer p.mu.Unlock()
+					if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, driver.ErrBadConn) || remoteProviderHTTPStatus(err) != 0 || callbacks != 1 || p.writes != 1 || p.applied != 1 || operation == "public-tx-commit" && p.commits != 1 {
+						t.Fatalf("err=%v callbacks=%d writes=%d commits=%d effects=%d invented_status=%d", err, callbacks, p.writes, p.commits, p.applied, remoteProviderHTTPStatus(err))
+					}
+					var unknown *providerWriteOutcomeUnknown
+					if !errors.As(err, &unknown) || unknown.cause == nil || !errors.Is(err, unknown.cause) {
+						t.Fatal("unknown lost its original provider cause")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestProviderHTTPRenewBatchReturningIsOneIssuedWrite(t *testing.T) {
+	p := &rustBusyProvider{failStage: "statement", remaining: 1, httpStatus: 502, httpApply: true}
+	e := newRustBusyEngine(t, p)
+	e.now = func() int64 { return 1000 }
+	e.qcache = map[string]queueRow{"q": {name: "q", kind: "queue", lockDurationMs: 60000, lifecycleState: "active"}}
+	result, err := e.RenewBatch(context.Background(), "q", []SettleItem{{SeqNumber: 1, LockToken: "token"}})
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !errors.Is(err, ErrOutcomeUnknown) || remoteProviderHTTPStatus(err) != 502 || result != nil || p.writes != 1 || p.applied != 1 {
+		t.Fatalf("RenewBatch=%+v err=%v status=%d writes=%d effects=%d", result, err, remoteProviderHTTPStatus(err), p.writes, p.applied)
+	}
+}
+
+func TestQueryFreshWriteScanAndWaitingBoundaries(t *testing.T) {
+	for _, stage := range []string{"write-scan", "write-rows", "read-scan"} {
+		t.Run(stage, func(t *testing.T) {
+			d, state := remoteDBFailingFirst(t, 0)
+			calls := 0
+			scan := func(*sql.Rows) error {
+				calls++
+				if calls == 1 {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
+			}
+			var err error
+			if stage == "read-scan" {
+				err = d.queryFresh(context.Background(), "SELECT value", func() []any { return nil }, scan)
+			} else {
+				if stage == "write-rows" {
+					state.queryRowsErr = io.ErrUnexpectedEOF
+					scan = func(rows *sql.Rows) error {
+						calls++
+						for rows.Next() {
+						}
+						return nil
+					}
+				}
+				err = d.queryFreshWrite(context.Background(), "UPDATE t SET x=? RETURNING x", func() []any { return []any{1} }, scan)
+			}
+			if stage == "read-scan" {
+				if err != nil || calls != 2 || len(state.args) != 2 {
+					t.Fatalf("read calls=%d queries=%d err=%v", calls, len(state.args), err)
+				}
+			} else if !errors.Is(err, ErrOutcomeUnknown) || calls != 1 || len(state.args) != 1 {
+				t.Fatalf("write calls=%d queries=%d err=%v", calls, len(state.args), err)
+			}
+		})
+	}
+	d, state := remoteDBFailingFirst(t, 0)
+	d.sql.SetMaxOpenConns(1)
+	held, err := d.sql.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	built := false
+	err = d.queryFreshWrite(ctx, "UPDATE t SET x=? RETURNING x", func() []any { built = true; return nil }, func(*sql.Rows) error { t.Fatal("scan ran while waiting for a pool lease"); return nil })
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) || built || len(state.args) != 0 {
+		t.Fatalf("pre-dispatch err=%v built=%t queries=%d", err, built, len(state.args))
 	}
 }
 
@@ -4309,7 +4659,7 @@ func TestStorageLastErrorKeepsCoarseCountersAndPrivateCause(t *testing.T) {
 	snapshot := e.db.storage.snapshot(e.db.sql.Stats())
 	var detail *ErrorDetail
 	for _, row := range snapshot.Operations {
-		if row.Operation == "read" && row.ErrorCode == "other" {
+		if row.Operation == "read" && row.ErrorCode == "connection" {
 			detail = row.LastError
 			if row.Duration.Count != 2 || detail == nil || detail.Category != "provider_unavailable" || detail.HTTPStatus != 503 {
 				t.Fatalf("error bucket=%+v", row)

@@ -22,6 +22,9 @@ type EngineTx struct {
 // in the same transaction as the enqueue. It is for caller-owned tables;
 // directly modifying mqlite's internal tables is unsupported and can bypass
 // engine invariants.
+// Engine owns the transaction boundary: do not call Commit or Rollback on this
+// handle or execute BEGIN, COMMIT, ROLLBACK, or other transaction-control SQL.
+// Early caller commits bypass Engine's rollback and safe-retry guarantees.
 //
 // These are YOUR statements: mqlite cannot see where one ends and the next begins, so it cannot
 // stop issuing them on your behalf the way it does for its own (see txn in db.go). Two things
@@ -108,6 +111,8 @@ func (t *EngineTx) SendOne(queue string, m OutMessage) (int64, error) {
 // twice. That is the contract, and it is not hypothetical: an HTTP call, a charge, a counter in
 // memory does not roll back with a SQL transaction (round-4 §5.2). Keep fn to transaction-bound
 // work.
+// Engine manages BEGIN, COMMIT, and ROLLBACK; fn must not take over those
+// boundaries through SQL() or SQL transaction-control statements.
 //
 // Local file and :memory: stores never retry, so there fn runs zero or one time — zero when the
 // caller was already cancelled before the transaction began.

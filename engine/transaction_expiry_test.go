@@ -36,8 +36,8 @@ func TestRemoteTransactionExpiryClassificationIsDefiniteAndExact(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			remote, local := &db{remote: true}, &db{}
-			if got := remote.retryableWrite(tc.err); got != tc.want {
-				t.Fatalf("write safe replay=%t want%t", got, tc.want)
+			if remote.retryableWrite(tc.err) {
+				t.Fatal("text-only rollback explanation authorized issued write replay")
 			}
 			if tc.want && !remote.retryable(tc.err) {
 				t.Fatal("definite expiry is not retried on read/statement path")
@@ -74,6 +74,17 @@ func TestRemoteTransactionExpiryReplaysWholeAbortedTransaction(t *testing.T) {
 				tx.record("q", "enqueued", 1)
 				return nil
 			})
+			if stage == "commit" {
+				if !errors.Is(err, ErrOutcomeUnknown) || runs != 1 {
+					t.Fatalf("untyped COMMIT outcome runs=%d err=%v", runs, err)
+				}
+				p.mu.Lock()
+				defer p.mu.Unlock()
+				if p.applied != 0 || p.expiredRollbacks != 1 {
+					t.Fatalf("effects=%d rollbacks=%d", p.applied, p.expiredRollbacks)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("explicit rollback receipt not replayed: %v", err)
 			}
@@ -100,19 +111,19 @@ func TestRemoteTransactionExpiryRetriesDirectReadAndWrite(t *testing.T) {
 				if err := e.db.queryRowScan(context.Background(), []any{&value}, "SELECT value FROM validation_counter"); err != nil || value != 7 {
 					t.Fatalf("read retry value=%d err=%v", value, err)
 				}
-			} else if _, err := e.db.exec(context.Background(), "UPDATE validation_counter SET value=value+1"); err != nil {
-				t.Fatal(err)
+			} else if _, err := e.db.exec(context.Background(), "UPDATE validation_counter SET value=value+1"); !errors.Is(err, ErrOutcomeUnknown) {
+				t.Fatalf("untyped write rollback text=%v, want unknown", err)
 			}
 			p.mu.Lock()
 			defer p.mu.Unlock()
-			if p.failures != 1 || (read && p.reads != 2) || (!read && (p.writes != 2 || p.applied != 1)) {
+			if p.failures != 1 || (read && p.reads != 2) || (!read && (p.writes != 1 || p.applied != 0)) {
 				t.Fatal("direct retry accounting/effect mismatch")
 			}
 		})
 	}
 }
 func TestRemoteTransactionExpiryExhaustionAndUnknownCommitStayDistinct(t *testing.T) {
-	p := newExpiredTransactionProvider("commit")
+	p := newExpiredTransactionProvider("statement")
 	p.remaining = maxConnAttempts + 1
 	e := newRustBusyEngine(t, p)
 	runs := 0
