@@ -113,31 +113,32 @@ still bounded as follows:
   connection is always safe. `isConnErr` spans the whole transport-failure family —
   `driver.ErrBadConn`, a closed Hrana stream, and their siblings `EOF` / `broken pipe` /
   `i/o timeout` (behind a proxy like Fly a dropped connection reads as `EOF`, not `RST`).
-- **Writes and COMMIT retry only after a definite non-commit** — `retryableWrite =
-  remote && (ErrBadConn || isBusyErr || isExpiredRemoteTransactionErr)`. A closed
-  stream before dispatch (`ErrBadConn`), contention, or the exact whole-transaction
-  rollback acknowledgement permits a fresh attempt without duplicating a committed
-  effect. `inTx` replays the entire transaction after discarding the failed attempt;
-  it does not replay COMMIT alone. The retry is bounded by `maxConnAttempts`; exhaustion is
-  returned to the caller. The `busy_timeout(5000)` DSN pragma belongs to local modernc
-  SQLite connections and does not apply to Turso/libSQL.
-  The Rust preview's exact provider rejection `Tursodb error: Database is busy`
-  follows the same bounded policy. Its protocol code is lost by the pinned HTTP
-  driver, so MQLite recognizes only the exact provider leaf through single-cause
-  wrapping. Arbitrary busy text, transport/cancellation wrappers, joined errors
-  and post-commit checkpoint failures do not qualify. This does not add retries
-  to local SQLite or make overlapping brokers safe.
-- **A confirmed idle-transaction rollback can be retried.** MQLite recognizes only
-  the exact provider explanation that an interactive transaction "was rolled back
-  because the stream was idle for too long; retry the transaction." This is a
-  rollback acknowledgement, rather than a lost COMMIT reply. The engine reopens
-  and retries the entire transaction under the same six-attempt budget, rebuilding
-  time-sensitive arguments as usual. Exhaustion keeps the existing `connection`
-  counter category and reports `transaction_expired` in optional error details;
-  it does not change the required observation counter matrix.
-  Generic "transaction timed out" or "rolled back" text, network/cancellation
-  wrappers, joined causes and checkpoint failures do not qualify. A lost COMMIT
-  reply remains outcome-unknown even if an outer diagnostic mentions expiry.
+  A single provider HTTP error leaf with status 408, 429, 499 or 5xx also follows
+  this policy. Before COMMIT is attempted, `inTx` discards the failed transaction
+  and may reopen the entire callback under the same six-attempt bound. A numeric
+  provider status takes precedence over SQLite words in its response body.
+- **Writes and COMMIT retry only after a proven rejection.** Only a genuine
+  before-dispatch `driver.ErrBadConn` or typed `SQLITE_BUSY` evidence permits
+  transparent replay. Plain text such as `database is locked`, the Rust preview's
+  exact `Tursodb error: Database is busy`, or an idle-transaction rollback message
+  does not prove that an issued write or COMMIT was rejected. The pinned driver
+  can discard a non-200 HTTP status and return exactly the same text as a normal
+  SQL rejection. Those issued-write outcomes are `ErrOutcomeUnknown`, preserving
+  the cause, instead of automatically repeating a possibly committed effect.
+  Before COMMIT starts, a callback error can still discard and retry the entire
+  transaction within the six-attempt budget. Local SQLite remains unchanged.
+  Supported callbacks use `EngineTx.SQL()` only for business statements; they
+  must not call its `Commit`/`Rollback` methods or issue transaction-control SQL.
+  Engine owns those boundaries. Early caller commits bypass this stage contract.
+- **Idle-transaction expiry is stage-sensitive.** The exact provider explanation
+  that an interactive transaction was rolled back because its stream was idle
+  identifies the known expiry condition for reads and pre-COMMIT callback retries.
+  These paths reopen the whole transaction, rebuilding time-sensitive arguments.
+  Exhaustion keeps the existing `connection` counter category and optional
+  `transaction_expired` detail. The same untyped text received after an issued
+  standalone write or COMMIT stays outcome-unknown; the driver no longer exposes
+  enough protocol information to prove its origin. Generic timeout/rollback text,
+  joined causes and checkpoint failures do not authorize extra retries.
 - **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
   other transport drop on a write/commit — the primary may have durably committed before
   the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead
@@ -145,6 +146,18 @@ still bounded as follows:
   `message_id`/dedup before retrying; transparent recovery would need durable per-op
   idempotency, which is deferred. **`errors.Is(err, mqlite.ErrOutcomeUnknown)` works in
   both embedded and client mode.**
+  Transient provider HTTP responses on an issued standalone write or COMMIT are
+  also outcome-unknown: a proxy 502 does not prove that the primary rejected the
+  effect. They are never automatically replayed; the error preserves its provider
+  cause and `HTTPStatus()` for reconciliation and diagnostics. HTTP authentication
+  and other nontransient responses are returned without blind retries. Provider
+  HTTP failures keep the existing `connection` storage-counter category; optional
+  details carry the safe status and `provider_unavailable` description, with
+  `outcome_unknown` remaining authoritative for ambiguous writes.
+  When fallback decoding discards the HTTP status, diagnostics do not invent it.
+  Coded fallback errors cannot promote a remote write into a safe `ErrBadConn`
+  retry. Supported remote mutations hold an explicit connection or transaction;
+  MQLite does not issue standalone writes through `sql.DB.ExecContext`.
 - **Never retry a logical storage error.** A constraint violation or `no such table`
   is final inside the engine. At the HTTP client boundary, lifecycle deletion is
   more conservative: every HTTP 5xx is `ErrOutcomeUnknown`, because a gateway can
