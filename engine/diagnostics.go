@@ -97,6 +97,10 @@ func describeError(err error, now int64) (d ErrorDetail) {
 	var coded interface{ Code() int }
 	if errors.As(err, &coded) {
 		d.SQLiteCode = coded.Code()
+	} else if isRustTursoBusyErr(err) {
+		// The pinned HTTP driver drops the Rust provider's numeric result code.
+		// Its exact Busy variant is SQLITE_BUSY, not an ambiguous transport error.
+		d.SQLiteCode = 5
 	}
 	upper := strings.ToUpper(raw)
 	switch {

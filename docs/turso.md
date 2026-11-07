@@ -118,6 +118,12 @@ still bounded as follows:
   commit cannot double-apply. The retry is bounded by `maxConnAttempts`; exhaustion is
   returned to the caller. The `busy_timeout(5000)` DSN pragma belongs to local modernc
   SQLite connections and does not apply to Turso/libSQL.
+  The Rust preview's exact provider rejection `Tursodb error: Database is busy`
+  follows the same bounded policy. Its protocol code is lost by the pinned HTTP
+  driver, so MQLite recognizes only the exact provider leaf through single-cause
+  wrapping. Arbitrary busy text, transport/cancellation wrappers, joined errors
+  and post-commit checkpoint failures do not qualify. This does not add retries
+  to local SQLite or make overlapping brokers safe.
 - **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
   other transport drop on a write/commit — the primary may have durably committed before
   the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead

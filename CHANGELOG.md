@@ -12,6 +12,15 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Retry definite Rust Turso contention (MQLITE-173)
+
+- Recognize the Rust provider's exact `Database is busy` rejection through the
+  pinned HTTP driver's error wrapping. These definite rejections now use the
+  existing bounded remote retry policy and report `busy` / SQLite code 5.
+- Keep transport loss, cancellation, joined causes and post-commit checkpoint
+  explanations outside this compatibility rule. They are not made safe to replay
+  by merely mentioning contention. Local SQLite retry behavior is unchanged.
+
 ### Keep resource cleanup compatible with Rust Turso (MQLITE-172)
 
 - Use independent indexed existence probes instead of compound SELECT subqueries
