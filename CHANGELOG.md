@@ -12,6 +12,16 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Validate Abandon delays before settlement (MQLITE-154)
+
+- Reject negative Abandon delays and Go durations below the wire's one-millisecond
+  precision instead of silently releasing or dead-lettering the delivery.
+- Reject a new delay whose absolute visibility deadline would overflow epoch
+  milliseconds without changing the live token or writing a receipt. Previously
+  committed exact requests retain receipt replay when the clock advances.
+- Keep zero-delay abandonment immediate and ordinary valid delays unchanged;
+  the timestamp-overflow check adds no SQL to the ordinary settlement path.
+
 > The canonical schema token remains **7** and no database rebuild is required.
 > This release adds an optional response header plus a Go broker-mode option;
 > older remote clients ignore the header, while programmatic brokers must add
