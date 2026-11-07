@@ -32,7 +32,7 @@ const (
 	settleRetryBase      = 50 * time.Millisecond
 	settleRetryMax       = 500 * time.Millisecond
 	settleTimeout        = 30 * time.Second
-	settleAttemptTimeout = 5 * time.Second
+	settleAttemptTimeout = settleTimeout / 2
 	renewFallbackLease   = 20 * time.Second
 	replayLeaseSafety    = 10 * time.Millisecond
 	renewMinimumDelay    = 50 * time.Millisecond
@@ -339,7 +339,7 @@ func releasePaired(handlers, total chan struct{}, n int) {
 // It returns ctx.Err() on cancellation, or the first permanent receive/settle/renew error.
 // Cancellation stops receiving and cancels handler/renewal contexts, then Run joins
 // the workers. When settlement is still safe, a returning handler gets a fresh
-// 30-second confirmation budget with at most five seconds per attempt. These
+// 30-second confirmation budget with at most fifteen seconds per attempt. These
 // cooperative contexts do not impose a hard return deadline on a handler or custom transport
 // that ignores cancellation.
 func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Message) error) error {

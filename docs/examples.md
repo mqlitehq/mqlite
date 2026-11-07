@@ -207,8 +207,10 @@ handler must honor `ctx.Done()` and remain idempotent:
 another consumer may receive the message after the lease is lost. Exact Complete and
 Abandon requests share a 30-second total confirmation budget, including the first
 request, replays after a lost acknowledgement and backoff. Each request gets at
-most five seconds, clamped by the remaining total budget; the broker's exact
-settlement receipt makes replay safe without calling the handler again.
+most fifteen seconds, clamped by the remaining total budget; the broker's exact
+settlement receipt makes replay safe without calling the handler again. A single
+blackholed request can use at most half of the initial total window; its retry is
+clamped by the remaining budget and is not guaranteed another full fifteen seconds.
 Exhausted transient confirmation reaches `WithErrorHandler` as
 `ErrOutcomeUnknown`, retaining the final cause for `errors.Is`/`errors.As`.
 The budget does not extend a lease, and canceling `Run` still waits for returning
