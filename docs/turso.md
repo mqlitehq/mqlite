@@ -107,15 +107,18 @@ HTTP/TLS reuse remains owned by Go's shared transport. Normal failure handling i
 still bounded as follows:
 
 - **Bounded retry on transient errors only** — `maxConnAttempts = 6`.
-- **Reads retry on any transport drop.** `retryable = remote && (isConnErr || isBusyErr)`
+- **Reads retry on transport drops and definite remote aborts.**
+  `retryable = remote && (isConnErr || isBusyErr || isExpiredRemoteTransactionErr)`
   gates `query`/`queryRowScan`: a read is idempotent, so replaying it on a fresh pooled
   connection is always safe. `isConnErr` spans the whole transport-failure family —
   `driver.ErrBadConn`, a closed Hrana stream, and their siblings `EOF` / `broken pipe` /
   `i/o timeout` (behind a proxy like Fly a dropped connection reads as `EOF`, not `RST`).
-- **Writes retry only when the statement provably never applied** — `retryableWrite =
-  remote && (ErrBadConn || isBusyErr)`. A closed stream (`ErrBadConn`) or a `SQLITE_BUSY`
-  (lock never acquired) guarantees the write never ran, so replaying `exec` / the `inTx`
-  commit cannot double-apply. The retry is bounded by `maxConnAttempts`; exhaustion is
+- **Writes and COMMIT retry only after a definite non-commit** — `retryableWrite =
+  remote && (ErrBadConn || isBusyErr || isExpiredRemoteTransactionErr)`. A closed
+  stream before dispatch (`ErrBadConn`), contention, or the exact whole-transaction
+  rollback acknowledgement permits a fresh attempt without duplicating a committed
+  effect. `inTx` replays the entire transaction after discarding the failed attempt;
+  it does not replay COMMIT alone. The retry is bounded by `maxConnAttempts`; exhaustion is
   returned to the caller. The `busy_timeout(5000)` DSN pragma belongs to local modernc
   SQLite connections and does not apply to Turso/libSQL.
   The Rust preview's exact provider rejection `Tursodb error: Database is busy`
