@@ -205,9 +205,14 @@ renewal is rejected or cannot be confirmed before that deadline, it cancels the
 individual handler context and skips Complete/Abandon for that stale delivery. The
 handler must honor `ctx.Done()` and remain idempotent:
 another consumer may receive the message after the lease is lost. Exact Complete and
-Abandon requests share a five-second total settlement budget, including the first
-request and replays after a lost acknowledgement; the broker's settlement receipt
-makes that replay safe.
+Abandon requests share a 30-second total confirmation budget, including the first
+request, replays after a lost acknowledgement and backoff. Each request gets at
+most five seconds, clamped by the remaining total budget; the broker's exact
+settlement receipt makes replay safe without calling the handler again.
+Exhausted transient confirmation reaches `WithErrorHandler` as
+`ErrOutcomeUnknown`, retaining the final cause for `errors.Is`/`errors.As`.
+The budget does not extend a lease, and canceling `Run` still waits for returning
+handlers' terminal confirmation to finish.
 If a broker or intermediary returns HTTP 499, it is retried while the Receiver's
 own context remains live, using the same Receive attempt ID. If a proxy removes
 both broker-time headers, `WithErrorHandler` receives one degraded-clock
