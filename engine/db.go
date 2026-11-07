@@ -723,7 +723,8 @@ func (d *db) retryable(err error) bool {
 }
 
 // retryableWrite is retryable for a WRITE or COMMIT: safe to replay only when the error
-// guarantees the statement never applied — driver.ErrBadConn (database/sql's "retry on a
+// guarantees the write effect or transaction did not commit — driver.ErrBadConn
+// (database/sql's "retry on a
 // fresh connection" signal), a busy error (the lock was never acquired), or the
 // exact provider acknowledgement that the whole idle transaction was rolled back. A broad transport
 // error like "connection reset" on a write is outcome-unknown (the primary may have committed
