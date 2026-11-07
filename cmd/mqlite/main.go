@@ -1555,8 +1555,28 @@ func formatMsg(m *mqlite.Message, withToken bool) string {
 	return b.String()
 }
 
-// redact hides any auth token embedded in a DSN before printing.
+// redact keeps only a remote DSN's scheme, host and path in diagnostics. Remote
+// drivers accept several credential query names, so no query field is logged.
 func redact(s string) string {
+	scheme, _, _ := strings.Cut(strings.TrimSpace(s), ":")
+	switch strings.ToLower(scheme) {
+	case "libsql", "turso", "ws", "wss":
+		const invalidRemote = "[redacted remote database]"
+		u, err := url.Parse(s)
+		if err != nil || u.Opaque != "" || u.Hostname() == "" {
+			return invalidRemote
+		}
+		// Parse also rejects malformed escapes in the otherwise opaque query.
+		if _, err := url.ParseQuery(u.RawQuery); err != nil {
+			return invalidRemote
+		}
+		u.User = nil
+		u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
+		u.ForceQuery = false
+		return u.String()
+	}
+	// Preserve existing local-file location diagnostics and their legacy token
+	// masking; this helper never changes the DSN used to connect.
 	if i := strings.Index(s, "authToken="); i >= 0 {
 		return s[:i] + "authToken=***"
 	}

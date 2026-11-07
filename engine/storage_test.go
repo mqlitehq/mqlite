@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -535,6 +536,40 @@ func newClosedStreamHranaPool(tb testing.TB, maxOpen, maxIdle int) (*sql.DB, *at
 	pool.SetMaxIdleConns(maxIdle)
 	tb.Cleanup(func() { _ = pool.Close() })
 	return pool, &calls
+}
+
+func TestHTTPHranaParseErrorDoesNotExposeAuthToken(t *testing.T) {
+	const token = "must-not-appear-in-errors+42"
+	for _, scheme := range []string{"libsql", "ws", "wss"} {
+		_, err := openDB(context.Background(), scheme+"://test.invalid/%zz", token, "")
+		if err == nil {
+			t.Fatal("malformed remote URL unexpectedly opened")
+		}
+		for _, sensitive := range []string{token, url.QueryEscape(token), "authToken="} {
+			if strings.Contains(err.Error(), sensitive) {
+				t.Fatal("remote parse error exposed an injected credential")
+			}
+		}
+		var parseError *url.Error
+		var escapeError url.EscapeError
+		if !errors.As(err, &parseError) || parseError.URL != "" || parseError.Op != "parse" || !errors.As(err, &escapeError) {
+			t.Fatal("safe parse error did not retain its operation and underlying error type")
+		}
+	}
+}
+
+func TestHTTPHranaRejectsURLFragmentsBeforeConnecting(t *testing.T) {
+	const token = "must-not-appear-in-errors+42"
+	for _, suffix := range []string{"#fragment", "#"} {
+		_, conn, _ := resolveDSN("libsql://test.invalid/"+suffix, token, "")
+		c, err := (libsqlDSNConnector{dsn: conn}).Connect(context.Background())
+		if c != nil {
+			_ = c.Close()
+		}
+		if err == nil || !strings.Contains(err.Error(), "fragment") || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), url.QueryEscape(token)) {
+			t.Fatal("fragment URL was not safely rejected before connecting")
+		}
+	}
 }
 
 // The HTTP Hrana server may return a successful result with no baton, which means

@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 
 	libsql "github.com/tursodatabase/libsql-client-go/libsql"
 )
@@ -45,7 +48,34 @@ func (c libsqlDSNConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return (libsql.Driver{}).Open(c.dsn)
+	if err := validateRemoteConnectionDSN(c.dsn); err != nil {
+		return nil, err
+	}
+	conn, err := (libsql.Driver{}).Open(c.dsn)
+	return conn, redactedRemoteURLError(err)
+}
+
+func validateRemoteConnectionDSN(dsn string) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return redactedRemoteURLError(err)
+	}
+	// A fragment is not transmitted to the server. It can also capture an auth
+	// token appended to a caller's DSN and appear in subsequent HTTP errors.
+	if u.Fragment != "" || strings.Contains(dsn, "#") {
+		return errors.New("remote database URL must not contain a fragment")
+	}
+	return nil
+}
+
+func redactedRemoteURLError(err error) error {
+	// net/url includes the full URL in parse errors. This connection string has
+	// an injected auth token, so preserve the cause and operation without its URL.
+	var parseError *url.Error
+	if errors.As(err, &parseError) {
+		err = &url.Error{Op: parseError.Op, Err: parseError.Err}
+	}
+	return err
 }
 
 func (libsqlDSNConnector) Driver() driver.Driver { return libsql.Driver{} }
