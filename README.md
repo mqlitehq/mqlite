@@ -284,6 +284,15 @@ own retry policies.
 `WithConcurrency(C)` limits concurrently executing handlers. Renewal shutdown and
 settlement can overlap later handlers, but the Receiver bounds all claimed work to
 `C + effective prefetch` deliveries (at most `2C`, and `2C` by default).
+After a handler returns, its exact Complete/Abandon request gets up to 30 seconds
+in total for confirmation, including the first request, retries and backoff;
+each request has at most five seconds. The confirmation loop reuses the original
+token and sequence without calling the handler again. If transient retries
+exhaust that budget, `WithErrorHandler` receives `ErrOutcomeUnknown` with the final
+cause preserved for `errors.Is`/`errors.As`; reconcile the original settlement.
+This does not extend the lease; retries do not resume after the confirmation
+budget expires. Canceling `Run` still joins handlers, renewal shutdown and their
+terminal confirmation, so allow for cleanup before closing the client or engine.
 With auto-renew enabled, it retries a transient heartbeat while the known lease
 still has time. If the lock is lost or can no longer be confirmed, it cancels that
 message's handler context and skips terminal settlement; handlers must honor

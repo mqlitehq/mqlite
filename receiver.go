@@ -31,7 +31,8 @@ const (
 	renewRetryMax        = 500 * time.Millisecond
 	settleRetryBase      = 50 * time.Millisecond
 	settleRetryMax       = 500 * time.Millisecond
-	settleTimeout        = 5 * time.Second
+	settleTimeout        = 30 * time.Second
+	settleAttemptTimeout = 5 * time.Second
 	renewFallbackLease   = 20 * time.Second
 	replayLeaseSafety    = 10 * time.Millisecond
 	renewMinimumDelay    = 50 * time.Millisecond
@@ -184,12 +185,22 @@ type Receiver struct {
 	// retry tests. Renew and settlement deliberately keep their own policies.
 	receiveJitter func(time.Duration) time.Duration
 	receiveWait   func(context.Context, time.Duration) bool
+	settlement    settlementTiming
 	errMu         sync.Mutex // serializes onError across the loop, worker, and renew goroutines
 	// deadlineRenewUnsupported is learned once from an older broker. Protect only
 	// this capability bit; never hold the mutex across a network request.
 	renewCapabilityMu        sync.Mutex
 	deadlineRenewUnsupported bool
 	clockWarningOnce         sync.Once
+}
+
+// settlementTiming keeps the confirmation policy private and lets tests advance
+// request and retry budgets without sleeping through remote round trips.
+type settlementTiming struct {
+	totalTimeout   time.Duration
+	attemptTimeout time.Duration
+	withTimeout    func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+	wait           func(context.Context, time.Duration) bool
 }
 
 func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiver {
@@ -206,6 +217,7 @@ func newReceiver(src receiveSource, queue string, opts []ReceiverOption) *Receiv
 		cfg:           cfg,
 		receiveJitter: equalJitterDuration,
 		receiveWait:   waitContext,
+		settlement:    settlementTiming{totalTimeout: settleTimeout, attemptTimeout: settleAttemptTimeout, withTimeout: context.WithTimeout, wait: waitContext},
 	}
 }
 
@@ -325,6 +337,11 @@ func releasePaired(handlers, total chan struct{}, n int) {
 
 // Run pulls and processes messages until ctx is canceled or a permanent error occurs.
 // It returns ctx.Err() on cancellation, or the first permanent receive/settle/renew error.
+// Cancellation stops receiving and cancels handler/renewal contexts, then Run joins
+// the workers. When settlement is still safe, a returning handler gets a fresh
+// 30-second confirmation budget with at most five seconds per attempt. These
+// cooperative contexts do not impose a hard return deadline on a handler or custom transport
+// that ignores cancellation.
 func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Message) error) error {
 	batch := r.cfg.prefetch
 	if batch <= 0 || batch > r.cfg.concurrency {
@@ -600,10 +617,10 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 		return
 	}
 
-	// Settle on a fresh short-lived context so cleanup still happens during shutdown.
+	// Confirm settlement on a fresh bounded context, including during shutdown.
 	// Exact request replays are safe: the broker's settlement receipt distinguishes
 	// Complete from Abandon and includes Abandon's delay in the request identity.
-	sctx, cancelSettle := context.WithTimeout(context.Background(), settleTimeout)
+	sctx, cancelSettle := r.settlement.withTimeout(context.Background(), r.settlement.totalTimeout)
 	defer cancelSettle()
 	if herr != nil {
 		err := r.retrySettlement(sctx, func(callCtx context.Context) error { return m.Abandon(callCtx) })
@@ -669,16 +686,40 @@ func managedReceiveRetryAfter(err error) (time.Duration, bool) {
 	return httpErr.retryAfter, true
 }
 
+// settlementConfirmationError marks an exhausted confirmation budget without
+// losing the last transport/HTTP cause. Its single-cause shape is also compatible
+// with the remote-only SDK's Go 1.13 errors.Is/errors.As contract.
+type settlementConfirmationError struct{ cause error }
+
+func (e *settlementConfirmationError) Error() string {
+	return fmt.Sprintf("mqlite: settlement outcome unknown after confirmation budget expired: %v", e.cause)
+}
+func (e *settlementConfirmationError) Unwrap() error        { return e.cause }
+func (e *settlementConfirmationError) Is(target error) bool { return target == ErrOutcomeUnknown }
+
 func (r *Receiver) retrySettlement(ctx context.Context, settle func(context.Context) error) error {
 	var lastErr error
 	for retry := 0; ; retry++ {
-		lastErr = settle(ctx)
-		if lastErr == nil || !retryableManagedError(lastErr) || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			if lastErr == nil {
+				return ctx.Err() // no request was attempted
+			}
+			return &settlementConfirmationError{cause: lastErr}
+		}
+		callCtx, cancel := r.settlement.withTimeout(ctx, r.settlement.attemptTimeout)
+		lastErr = settle(callCtx)
+		cancel()
+		// A confirmed acknowledgement wins even if its deadline raced the return.
+		// Definitive errors retain their identity, including at the budget boundary.
+		if lastErr == nil || !retryableManagedError(lastErr) {
 			return lastErr
 		}
+		if ctx.Err() != nil {
+			return &settlementConfirmationError{cause: lastErr}
+		}
 		delay := jitterDuration(exponentialBackoff(settleRetryBase, settleRetryMax, retry))
-		if !waitContext(ctx, delay) {
-			return lastErr
+		if !r.settlement.wait(ctx, delay) {
+			return &settlementConfirmationError{cause: lastErr}
 		}
 	}
 }
