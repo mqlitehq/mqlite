@@ -3,7 +3,7 @@
 //
 // Connection (read from env; the DB string is never compiled in):
 //
-//	MQLITE_DB=file:./mq.db | :memory: | libsql://<db>.turso.io   (embedded mode)
+//	MQLITE_DB=file:./mq.db | :memory: | libsql://<db>.turso.io | turso://<db>.turso.io
 //	MQLITE_DB_AUTH_TOKEN=<jwt>                                    (remote Turso/libSQL)
 //	MQLITE_ENDPOINT=http://host:port + MQLITE_TOKEN=<bearer>      (client mode; wins if set)
 //	MQLITE_ADDR=host:port       (listen address for `serve`; precedence: --addr >

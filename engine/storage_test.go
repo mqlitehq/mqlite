@@ -540,7 +540,7 @@ func newClosedStreamHranaPool(tb testing.TB, maxOpen, maxIdle int) (*sql.DB, *at
 
 func TestHTTPHranaParseErrorDoesNotExposeAuthToken(t *testing.T) {
 	const token = "must-not-appear-in-errors+42"
-	for _, scheme := range []string{"libsql", "ws", "wss"} {
+	for _, scheme := range []string{"libsql", "turso", "ws", "wss"} {
 		_, err := openDB(context.Background(), scheme+"://test.invalid/%zz", token, "")
 		if err == nil {
 			t.Fatal("malformed remote URL unexpectedly opened")
@@ -3014,6 +3014,79 @@ func TestAccessKeySortValidationAndIndex(t *testing.T) {
 	}
 }
 
+func TestAccessKeySchemaFormattingCompatibility(t *testing.T) {
+	// The Rust backend rewrites insignificant spaces around punctuation in its
+	// schema catalog. Opening the same valid schema again must still succeed.
+	compact := strings.ReplaceAll(strings.Join(strings.Fields(accessKeySchema), " "), ") ) STRICT", ")) STRICT")
+	for name, table := range map[string]string{
+		"compact parentheses": compact,
+		"lowercase keywords":  strings.ToLower(accessKeySchema),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "formatted.db")
+			d, err := openDB(context.Background(), path, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ddl := range []string{table, `CREATE INDEX idx_access_keys_created ON access_keys ( created_at DESC , id DESC )`} {
+				if _, err := d.exec(context.Background(), ddl); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := d.close(); err != nil {
+				t.Fatal(err)
+			}
+			e, err := Open(context.Background(), Options{DB: path, DisableBackground: true})
+			if err != nil {
+				t.Fatalf("valid reformatted schema refused: %v", err)
+			}
+			defer e.Close()
+			if _, _, err := e.CreateAccessKey(context.Background(), accessKeyOptions(1)); err != nil {
+				t.Fatalf("reformatted constraints are not usable: %v", err)
+			}
+		})
+	}
+}
+
+func TestTursoDSNUsesHTTPCompatibilityAdapter(t *testing.T) {
+	for _, scheme := range []string{"turso", "libsql"} {
+		driverName, conn, remote := resolveDSN(scheme+"://test.invalid?tls=1", "test+token", "")
+		if !remote || driverName != "libsql" || conn != "libsql://test.invalid?tls=1&authToken=test%2Btoken" {
+			t.Fatalf("%s DSN did not select authenticated remote HTTP transport", scheme)
+		}
+	}
+}
+
+func TestTursoURIKeepsTheHTTPConnectionValidityContract(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer regression-token" {
+			t.Error("Turso HTTP request lost its authorization")
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, closedStreamHranaResponse)
+	}))
+	defer server.Close()
+	d, err := openDB(context.Background(), "turso://"+strings.TrimPrefix(server.URL, "http://")+"?tls=0", "regression-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.close()
+	if !d.remote || d.lock != nil || d.reader != nil {
+		t.Fatal("Turso HTTP URL acquired local database resources")
+	}
+	for i := 0; i < 2; i++ {
+		var got int
+		if err := d.queryRowScan(context.Background(), []any{&got}, "SELECT 1"); err != nil || got != 1 {
+			t.Fatalf("Turso query after a closed logical stream: %d, %v", got, err)
+		}
+	}
+	if requests.Load() < 2 {
+		t.Fatal("Turso queries did not reach the HTTP adapter")
+	}
+}
+
 func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
 	ctx := context.Background()
 	t.Run("table-only upgrade", func(t *testing.T) {
@@ -3043,12 +3116,15 @@ func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
 		}
 	})
 	for name, statements := range map[string][]string{
-		"table name":      {`CREATE TABLE idx_access_keys_created (business TEXT) STRICT`},
-		"view name":       {`CREATE VIEW IDX_ACCESS_KEYS_CREATED AS SELECT 1 AS business`},
-		"wrong columns":   {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(name)`},
-		"wrong direction": {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at ASC, id DESC)`},
-		"partial":         {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at DESC, id DESC) WHERE revoked_at=0`},
-		"wrong table":     {`CREATE TABLE business(created_at INTEGER, id TEXT) STRICT`, `CREATE INDEX idx_access_keys_created ON business(created_at DESC, id DESC)`},
+		"table name":             {`CREATE TABLE idx_access_keys_created (business TEXT) STRICT`},
+		"view name":              {`CREATE VIEW IDX_ACCESS_KEYS_CREATED AS SELECT 1 AS business`},
+		"wrong columns":          {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(name)`},
+		"wrong direction":        {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at ASC, id DESC)`},
+		"partial":                {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at DESC, id DESC) WHERE revoked_at=0`},
+		"wrong table":            {`CREATE TABLE business(created_at INTEGER, id TEXT) STRICT`, `CREATE INDEX idx_access_keys_created ON business(created_at DESC, id DESC)`},
+		"weakened glob":          {strings.Replace(accessKeySchema, "*[^0-9a-f]*", "*[^0-9a-f ]*", 1)},
+		"changed literal case":   {strings.Replace(accessKeySchema, "*[^0-9a-f]*", "*[^0-9A-F]*", 1)},
+		"changed check operator": {strings.Replace(accessKeySchema, "length(id) = 32", "length(id) >= 32", 1)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "conflict.db")
