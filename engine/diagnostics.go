@@ -127,7 +127,7 @@ func describeError(err error, now int64) (d ErrorDetail) {
 // Private logs preserve the remaining provider explanation, but redact common
 // secret formats and entire URLs. This is defense in depth, not a public-data
 // sanitizer: operator log files must remain private, including unknown SQL errors.
-var diagnosticURL = regexp.MustCompile(`(?i)(?:https?|libsql|wss?|file)://[^\s"'<>]+`)
+var diagnosticURL = regexp.MustCompile(`(?i)(?:https?|libsql|turso|wss?|file)://[^\s"'<>]+`)
 var diagnosticCredential = regexp.MustCompile(`(?i)(?:bearer\s+|(?:authorization|auth[_-]?token|token|password|secret|api[_-]?key)\s*[:=]\s*)[^\s,;]+`)
 var diagnosticToken = regexp.MustCompile(`mqk_[a-zA-Z0-9_-]+|eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+`)
 

@@ -4163,6 +4163,19 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 	}
 }
 
+func TestPrivateDiagnosticsRedactPreviewTursoURL(t *testing.T) {
+	raw := errors.New("connect turso://operator:fake-password@preview.invalid/db?fixture=private-marker: provider detail")
+	private := privateDiagnosticError(raw)
+	for _, secret := range []string{"operator", "fake-password", "preview.invalid", "private-marker", "turso://"} {
+		if strings.Contains(private, secret) {
+			t.Fatalf("private diagnostic retained %q", secret)
+		}
+	}
+	if !strings.Contains(private, "[redacted-url]") || !strings.Contains(private, "provider detail") {
+		t.Fatal("redaction discarded useful non-URL diagnostics")
+	}
+}
+
 func TestMaintenanceDiagnosticHistoryRecoveryAndLogCorrelation(t *testing.T) {
 	e, clock := testEngine(t)
 	var log bytes.Buffer
