@@ -153,14 +153,8 @@ var schemaStmts = []string{
 	 BEFORE UPDATE OF queue ON messages
 	 WHEN NOT EXISTS (SELECT 1 FROM queues WHERE name=NEW.queue)
 	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`,
-	`CREATE TRIGGER IF NOT EXISTS trg_queues_messages_delete
-	 BEFORE DELETE ON queues
-	 WHEN EXISTS (` + messageExistenceUnion("OLD.name") + `)
-	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`,
-	`CREATE TRIGGER IF NOT EXISTS trg_queues_messages_rename
-	 BEFORE UPDATE OF name ON queues
-	 WHEN NEW.name<>OLD.name AND EXISTS (` + messageExistenceUnion("OLD.name") + `)
-	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`,
+	parentDeleteGuardSchema,
+	parentRenameGuardSchema,
 
 	// optional dedup table (message_id + sliding window). active only when dedup_window_ms>0.
 	`CREATE TABLE IF NOT EXISTS dedup (
@@ -217,4 +211,28 @@ var schemaStmts = []string{
 	accessKeySchema,
 	accessKeyCreatedIndex,
 	`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`,
+}
+
+// These guards have the same semantics as their original UNION-based spelling,
+// but also compile on the Rust Turso preview. Known older definitions are
+// refreshed atomically before Open starts serving; the schema token is unchanged.
+var parentDeleteGuardSchema = `CREATE TRIGGER IF NOT EXISTS trg_queues_messages_delete
+ BEFORE DELETE ON queues
+ WHEN NOT (` + messageAbsencePredicate("OLD.name") + `)
+ BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`
+
+var parentRenameGuardSchema = `CREATE TRIGGER IF NOT EXISTS trg_queues_messages_rename
+ BEFORE UPDATE OF name ON queues
+ WHEN NEW.name<>OLD.name AND NOT (` + messageAbsencePredicate("OLD.name") + `)
+ BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`
+
+var parentGuardSchemas = []struct{ name, current, legacy string }{
+	{"trg_queues_messages_delete", parentDeleteGuardSchema, `CREATE TRIGGER IF NOT EXISTS trg_queues_messages_delete
+	 BEFORE DELETE ON queues
+	 WHEN EXISTS (` + messageExistenceUnion("OLD.name") + `)
+	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`},
+	{"trg_queues_messages_rename", parentRenameGuardSchema, `CREATE TRIGGER IF NOT EXISTS trg_queues_messages_rename
+	 BEFORE UPDATE OF name ON queues
+	 WHEN NEW.name<>OLD.name AND EXISTS (` + messageExistenceUnion("OLD.name") + `)
+	 BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END`},
 }

@@ -25,13 +25,14 @@ import (
 // (design D3): database/sql serializes mutations onto that connection, so there
 // is zero file-level write-lock contention and claims stay atomic.
 type db struct {
-	log     *slog.Logger
-	storage storageObservations
-	sql     *sql.DB
-	reader  *sql.DB // one read-only, query-only connection for local file observation reads
-	remote  bool
-	dsn     string    // the user-facing DB string (no auth token — that's only in the conn string)
-	lock    io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
+	log                 *slog.Logger
+	storage             storageObservations
+	sql                 *sql.DB
+	reader              *sql.DB // one read-only, query-only connection for local file observation reads
+	remote              bool
+	refreshParentGuards bool      // known equivalent legacy trigger SQL; only used during Open
+	dsn                 string    // the user-facing DB string (no auth token — that's only in the conn string)
+	lock                io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
 
 	// The close gate serializes every local operation against Close so Close cannot release the
 	// single-writer file lock — nor close the pool — while a write is still in flight. Without it,
@@ -276,8 +277,9 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 
 // initSchema creates the tables/indexes idempotently (CREATE IF NOT EXISTS) and
 // records the schema token. mqlite keeps a single canonical schema and does not
-// migrate: a database whose recorded token differs is refused (never altered in
-// place), so a stale experimental DB is simply recreated.
+// migrate table layouts: a database whose recorded token differs is refused
+// before DDL. Recognized equivalent parent-trigger spelling is refreshed later,
+// transactionally, before Open admits work.
 func (d *db) initSchema(ctx context.Context) error {
 	if v, ok, err := d.recordedSchemaVersion(ctx); err != nil {
 		return err
@@ -291,6 +293,11 @@ func (d *db) initSchema(ctx context.Context) error {
 	if err := d.validateAccessKeySchema(ctx); err != nil {
 		return err
 	}
+	refresh, err := d.validateParentGuardSchema(ctx)
+	if err != nil {
+		return err
+	}
+	d.refreshParentGuards = refresh
 	for _, stmt := range schemaStmts {
 		if _, err := d.exec(ctx, stmt); err != nil {
 			return fmt.Errorf("schema: %w\n%s", err, firstLine(stmt))
@@ -376,7 +383,7 @@ func normalizedSchemaSQL(s string) string {
 		}
 	}
 	// SQLite usually omits this clause in its catalog; Rust can retain it.
-	if len(tokens) >= 5 && tokens[0] == "CREATE" && (tokens[1] == "TABLE" || tokens[1] == "INDEX") &&
+	if len(tokens) >= 5 && tokens[0] == "CREATE" && (tokens[1] == "TABLE" || tokens[1] == "INDEX" || tokens[1] == "TRIGGER") &&
 		tokens[2] == "IF" && tokens[3] == "NOT" && tokens[4] == "EXISTS" {
 		tokens = append(tokens[:2], tokens[5:]...)
 	}
