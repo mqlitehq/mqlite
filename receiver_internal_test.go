@@ -2248,8 +2248,8 @@ func TestReceiverSettlementAttemptTimeoutAndPermanentBoundary(t *testing.T) {
 		ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
 		got := r.retrySettlement(ctx, func(context.Context) error { clock.advance(30 * time.Second); return terminal })
 		cancel()
-		if got != terminal || errors.Is(got, ErrOutcomeUnknown) {
-			t.Fatalf("terminal error wrapped: %v", got)
+		if !errors.Is(got, terminal) || errors.Is(got, ErrOutcomeUnknown) {
+			t.Fatalf("terminal identity lost or marked outcome unknown: %v", got)
 		}
 	}
 }
