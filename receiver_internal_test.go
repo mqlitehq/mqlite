@@ -1035,6 +1035,21 @@ func TestRenewalScheduleReservesObservedRoundTripHeadroom(t *testing.T) {
 	}
 }
 
+func TestRenewalSchedulePreserves180msLease120msRTTBoundary(t *testing.T) {
+	// Pin the original narrow arithmetic without depending on timers being
+	// scheduled within its 50ms watchdog headroom on a shared race-test runner.
+	state := renewalState{
+		deadline:    time.Now().Add(180 * time.Millisecond),
+		responseRTT: 120 * time.Millisecond,
+	}
+	if !needsInitialRenewalGate(state) {
+		t.Fatal("180ms lease with 120ms RTT must renew before handler dispatch")
+	}
+	if delay := renewalDelay(state); delay != 0 {
+		t.Fatalf("180ms lease with 120ms RTT renewal delay = %s, want immediate", delay)
+	}
+}
+
 func TestDateShortLowerBoundUsesDegradedWatchdog(t *testing.T) {
 	state := newRenewalState(time.Now().Add(500*time.Millisecond), 150*time.Millisecond, true, false)
 	if !state.deadlineUntrusted || !needsInitialRenewalGate(state) {
@@ -1259,22 +1274,26 @@ func TestReceiverRenewStartsBeforeWatchdog(t *testing.T) {
 }
 
 func TestReceiverHighRTTRenewalCompletesBeforeConservativeHorizon(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// Preserve the lease/RTT/handler ratios while giving the real timers enough
+	// scheduler headroom under the race detector. The exact original boundary is
+	// pinned above; waiting one third of this lease before renewing still fails.
+	const lease, responseRTT, handlerTime = 720 * time.Millisecond, 480 * time.Millisecond, 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	f := &fakeSource{renewResponseRTT: 120 * time.Millisecond}
-	deadline := time.Now().Add(180 * time.Millisecond)
+	f := &fakeSource{renewResponseRTT: responseRTT}
+	deadline := time.Now().Add(lease)
 	f.batch = []*Message{{
 		SequenceNumber: 1, LockedUntil: deadline, localLockedUntil: deadline,
-		localLeaseResponseRTT: 120 * time.Millisecond, queue: "q", s: f,
+		localLeaseResponseRTT: responseRTT, queue: "q", s: f,
 	}}
 	f.renewDeadlineFn = func(renewCtx context.Context) (time.Time, error) {
-		timer := time.NewTimer(120 * time.Millisecond)
+		timer := time.NewTimer(responseRTT)
 		defer timer.Stop()
 		select {
 		case <-renewCtx.Done():
 			return time.Time{}, renewCtx.Err()
 		case <-timer.C:
-			return time.Now().Add(180 * time.Millisecond), nil
+			return time.Now().Add(lease), nil
 		}
 	}
 	f.completeFn = func(context.Context) error {
@@ -1285,8 +1304,9 @@ func TestReceiverHighRTTRenewalCompletesBeforeConservativeHorizon(t *testing.T) 
 	var observed []error
 	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) {
 		observed = append(observed, err)
+		cancel()
 	})}).Run(ctx, func(hctx context.Context, _ *Message) error {
-		timer := time.NewTimer(500 * time.Millisecond)
+		timer := time.NewTimer(handlerTime)
 		defer timer.Stop()
 		select {
 		case <-hctx.Done():
@@ -1296,18 +1316,18 @@ func TestReceiverHighRTTRenewalCompletesBeforeConservativeHorizon(t *testing.T) 
 			return nil
 		}
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run = %v, want cancellation after Complete", err)
-	}
-	if !handlerCompleted {
-		t.Fatal("high-RTT conservative lease canceled the handler")
-	}
-	if len(observed) != 0 {
-		t.Fatalf("observed errors = %v, want none", observed)
-	}
 	f.mu.Lock()
 	renews, completes := f.renewCalls, f.completeCalls
 	f.mu.Unlock()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation after Complete; handler completed=%t, renew/complete=%d/%d, observed=%v", err, handlerCompleted, renews, completes, observed)
+	}
+	if len(observed) != 0 {
+		t.Fatalf("observed errors = %v, want none; handler completed=%t, renew/complete=%d/%d", observed, handlerCompleted, renews, completes)
+	}
+	if !handlerCompleted {
+		t.Fatalf("high-RTT conservative lease canceled the handler; renew/complete=%d/%d", renews, completes)
+	}
 	if renews < 3 || completes != 1 {
 		t.Fatalf("renew/complete calls = %d/%d, want at least 3/1", renews, completes)
 	}
