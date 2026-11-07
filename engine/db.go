@@ -522,6 +522,42 @@ func isBusyErr(err error) bool {
 			return true
 		}
 	}
+	return isRustTursoBusyErr(err)
+}
+
+// isRustTursoBusyErr recognizes the Rust provider's exact SQLITE_BUSY message.
+// The pinned HTTP driver discards the protocol code and wraps its plain message
+// with %w. Match that leaf, never a substring in SQL or transport diagnostics.
+// A checkpoint failure may follow a durable commit; its different explanation
+// must not become a safe replay merely because it mentions contention.
+func isRustTursoBusyErr(err error) bool {
+	return exactRemoteProviderError(err, "Tursodb error: Database is busy")
+}
+
+// exactRemoteProviderError matches one definite server explanation through the
+// pinned driver's single-cause wrappers. A transport, joined cause or caller
+// cancellation cannot become safe to replay by carrying the same words.
+func exactRemoteProviderError(err error, message string) bool {
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isConnErr(err) {
+		return false
+	}
+	var transport net.Error
+	if errors.As(err, &transport) {
+		return false
+	}
+	// Only the driver's single-cause wrapping is evidence of a provider reply.
+	// A joined transport/cancellation failure is not a definite rejection.
+	for depth := 0; depth < 32; depth++ {
+		if _, multiple := err.(interface{ Unwrap() []error }); multiple {
+			return false
+		}
+		cause := errors.Unwrap(err)
+		if cause == nil {
+			return err.Error() == message
+		}
+		err = cause
+	}
 	return false
 }
 
