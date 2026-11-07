@@ -373,7 +373,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 
 | Env | Meaning |
 |---|---|
-| `MQLITE_DB` | DB DSN: `file:./mq.db`, `:memory:`, or `libsql://<db>.turso.io` (embedded/serve) |
+| `MQLITE_DB` | DB DSN: `file:./mq.db`, `:memory:`, `libsql://<db>.turso.io`, or unreleased `turso://<db>.turso.io` ([Rust preview](docs/turso.md#rust-based-turso-technical-preview); embedded/serve) |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens for `serve` |

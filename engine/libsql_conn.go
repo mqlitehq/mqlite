@@ -12,7 +12,7 @@ import (
 	libsql "github.com/tursodatabase/libsql-client-go/libsql"
 )
 
-// openHTTPHranaDB opens the documented libsql:// transport through a conservative
+// openHTTPHranaDB opens the normalized libsql:// transport through a conservative
 // compatibility adapter for libsql-client-go's HTTP v2 connection lifecycle
 // (MQLITE-163).
 //

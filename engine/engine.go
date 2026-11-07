@@ -53,7 +53,7 @@ type Engine struct {
 
 // Options configures Open.
 type Options struct {
-	DB                string       // DB DSN: file:./mq.db | :memory: | libsql://host
+	DB                string       // DB DSN: file:./mq.db | :memory: | libsql://host | turso://host
 	AuthToken         string       // injected from env; never compiled in
 	Now               func() int64 // test clock (epoch ms)
 	DisableBackground bool         // skip reaper/scheduler loops (tests)
