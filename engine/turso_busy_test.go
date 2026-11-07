@@ -145,10 +145,11 @@ func (p *rustBusyProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.failures++
 			if p.httpStatus != 0 {
 				if p.httpApply {
-					if stage == "commit" {
+					switch stage {
+					case "commit":
 						p.applied += p.pending[baton]
 						delete(p.pending, baton)
-					} else if stage == "statement" {
+					case "statement":
 						if baton == "" {
 							p.applied++
 						} else {

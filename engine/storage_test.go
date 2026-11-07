@@ -1180,6 +1180,7 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		return nil, sqliteBusyEvidence{}
 	}
 	if c.st.queryRowsErr != nil {
+		//nolint:nilerr // QueryContext succeeds; the fixture delivers this error later through Rows.Next/Err.
 		return &terminalErrorRows{err: c.st.queryRowsErr}, nil
 	}
 	if strings.Contains(normalized, "SELECT response FROM receive_attempts") {

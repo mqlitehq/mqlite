@@ -56,6 +56,7 @@ func singleRemoteProviderLeaf(err error) error {
 		if _, multiple := err.(interface{ Unwrap() []error }); multiple {
 			return nil
 		}
+		//nolint:errorlint // Inspect this node only; errors.As can invoke custom As or traverse joined/cyclic causes.
 		if _, transport := err.(net.Error); transport {
 			return nil
 		}
@@ -93,6 +94,7 @@ func unclassifiedProviderHTTPCode(err error) bool {
 		return false
 	}
 	for depth := 0; err != nil && depth < 32; depth++ {
+		//nolint:errorlint // Recognize only this node's marker; errors.As would bypass this bounded single-cause walk.
 		if _, opaque := err.(*providerHTTPCodeFailure); opaque {
 			return true
 		}
