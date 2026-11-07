@@ -15,8 +15,9 @@ upgrade notes before replacing a broker.
 ### Allow time to confirm a slow settlement (MQLITE-171)
 
 - Give managed Receiver Complete/Abandon confirmation a 30-second total budget,
-  with at most five seconds per request, so a slow first request does not consume
-  the entire opportunity to replay its lost acknowledgement. Replays keep the
+  with at most fifteen seconds per request, so a slow first request does not consume
+  the entire opportunity to replay its lost acknowledgement. This also avoids
+  repeatedly canceling a healthy slow request at a five-second boundary. Replays keep the
   original request identity and do not rerun the handler.
 - Report exhausted transient confirmation as `ErrOutcomeUnknown` while preserving
   the final cause for `errors.Is`/`errors.As`. Definitive errors, including

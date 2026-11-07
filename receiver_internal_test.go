@@ -2155,13 +2155,74 @@ func TestReceiverSettlementSlowConfirmationBudget(t *testing.T) {
 			if len(source.identities) != 2 || source.identities[0] != source.identities[1] {
 				t.Fatalf("settlement identity changed: %v", source.identities)
 			}
-			if len(clock.timeouts) != 3 || clock.timeouts[0] != 30*time.Second || clock.timeouts[1] != 5*time.Second || clock.timeouts[2] != 5*time.Second {
-				t.Fatalf("total/attempt budgets=%v, want 30s/5s/5s", clock.timeouts)
+			if len(clock.timeouts) != 3 || clock.timeouts[0] != 30*time.Second || clock.timeouts[1] != 15*time.Second || clock.timeouts[2] != 15*time.Second {
+				t.Fatalf("total/attempt budgets=%v, want 30s/15s/15s", clock.timeouts)
 			}
 			for _, ctx := range clock.contexts {
 				if ctx.Err() == nil {
 					t.Error("confirmation context timer was not released")
 				}
+			}
+		})
+	}
+}
+
+// A committed operation can take longer than five seconds to return, and its
+// exact receipt replay can be slow too. Reserve half of the total window per
+// attempt rather than canceling every otherwise healthy slow request.
+func TestReceiverSettlementSlowAttemptHeadroom(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			f := &fakeSource{}
+			source := &settlementIdentitySource{fakeSource: f}
+			f.batch = []*Message{{SequenceNumber: 42, LockedUntil: time.Now().Add(time.Minute), queue: "q", lockToken: "same-token", s: source}}
+			observed, handlers, attempts, effects := 0, 0, 0, 0
+			r := newReceiver(source, "q", []ReceiverOption{WithErrorHandler(func(error) { observed++; cancel() })})
+			clock := useSettlementClock(r)
+			advanceRPC := func(callCtx context.Context, d time.Duration) bool {
+				if deadline, ok := callCtx.Deadline(); ok && deadline.Sub(clock.time()) < d {
+					d = deadline.Sub(clock.time())
+				}
+				clock.advance(d)
+				return callCtx.Err() == nil
+			}
+			settle := func(callCtx context.Context) error {
+				attempts++
+				if attempts == 1 {
+					if !advanceRPC(callCtx, time.Second) {
+						return callCtx.Err()
+					}
+					effects++ // provider committed; the response is delayed and then lost
+					if !advanceRPC(callCtx, 7*time.Second) {
+						return callCtx.Err()
+					}
+					return io.EOF
+				}
+				if !advanceRPC(callCtx, 8*time.Second) {
+					return callCtx.Err()
+				}
+				cancel()
+				return nil
+			}
+			if operation == "complete" {
+				f.completeFn = settle
+			} else {
+				f.abandonFn = settle
+			}
+			err := r.Run(ctx, func(context.Context, *Message) error {
+				handlers++
+				if operation == "abandon" {
+					return errors.New("handler failure")
+				}
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || observed != 0 || handlers != 1 || attempts != 2 || effects != 1 {
+				t.Fatalf("Run=%v observed=%d handlers=%d attempts=%d effects=%d", err, observed, handlers, attempts, effects)
+			}
+			if len(source.identities) != 2 || source.identities[0] != source.identities[1] {
+				t.Fatalf("request identity changed: %v", source.identities)
 			}
 		})
 	}
@@ -2225,22 +2286,32 @@ func TestReceiverSettlementExhaustionPreservesLastCause(t *testing.T) {
 func TestReceiverSettlementAttemptTimeoutAndPermanentBoundary(t *testing.T) {
 	r := newReceiver(nil, "q", nil)
 	clock := useSettlementClock(r)
+	var retryWait time.Duration
+	r.settlement.wait = func(ctx context.Context, d time.Duration) bool {
+		retryWait += d
+		return clock.wait(ctx, d)
+	}
 	start := clock.time()
 	ctx, cancel := clock.withTimeout(context.Background(), r.settlement.totalTimeout)
 	defer cancel()
 	attempts := 0
+	var attemptBudgets []time.Duration
 	err := r.retrySettlement(ctx, func(callCtx context.Context) error {
 		attempts++
 		deadline, _ := callCtx.Deadline()
 		remaining := deadline.Sub(clock.time())
-		if remaining <= 0 || remaining > 5*time.Second {
+		if remaining <= 0 || remaining > 15*time.Second {
 			t.Fatalf("attempt remaining=%s", remaining)
 		}
+		attemptBudgets = append(attemptBudgets, remaining)
 		clock.advance(remaining)
 		return callCtx.Err()
 	})
-	if attempts < 2 || clock.time().Sub(start) != 30*time.Second || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, context.DeadlineExceeded) {
+	if attempts != 2 || clock.time().Sub(start) != 30*time.Second || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("attempts=%d elapsed=%s err=%v", attempts, clock.time().Sub(start), err)
+	}
+	if retryWait <= 0 || attemptBudgets[0] != 15*time.Second || attemptBudgets[1] != 15*time.Second-retryWait {
+		t.Fatalf("blackhole attempt budgets=%v, want first 15s and total-budget-clipped replay", attemptBudgets)
 	}
 	for _, terminal := range []error{ErrLockLost, ErrUnauthenticated, ErrInvalidArgument, &HTTPError{StatusCode: 403, cause: ErrPermissionDenied}} {
 		r := newReceiver(nil, "q", nil)

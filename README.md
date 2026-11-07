@@ -286,7 +286,7 @@ settlement can overlap later handlers, but the Receiver bounds all claimed work 
 `C + effective prefetch` deliveries (at most `2C`, and `2C` by default).
 After a handler returns, its exact Complete/Abandon request gets up to 30 seconds
 in total for confirmation, including the first request, retries and backoff;
-each request has at most five seconds. The confirmation loop reuses the original
+each request has at most fifteen seconds. The confirmation loop reuses the original
 token and sequence without calling the handler again. If transient retries
 exhaust that budget, `WithErrorHandler` receives `ErrOutcomeUnknown` with the final
 cause preserved for `errors.Is`/`errors.As`; reconcile the original settlement.
