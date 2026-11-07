@@ -156,6 +156,11 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		return nil, err
 	}
 	driver, conn, remote := resolveDSN(dsn, token, sync)
+	if remote {
+		if err := validateRemoteConnectionDSN(conn); err != nil {
+			return nil, err
+		}
+	}
 
 	// Single-writer guard (MQLITE-6): a local file DB may be opened by only one
 	// process at a time — two writers would race on crash recovery and claims.

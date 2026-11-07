@@ -12,6 +12,16 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Protect database credentials in diagnostics (MQLITE-168)
+
+- Remove injected credentials from remote URL parse errors while preserving the
+  operation and underlying error type. Reject URL fragments before connecting,
+  so a fragment cannot capture a token or appear in a later HTTP error.
+- Omit user information, query values and fragments from remote database URLs in
+  broker startup logs, including legacy `auth_token` and `jwt` credentials.
+- Redact whole `turso://` URLs in private storage diagnostics as well as legacy
+  remote schemes, retaining the non-URL provider explanation.
+
 > The canonical schema token remains **7** and no database rebuild is required.
 > This release adds an optional response header plus a Go broker-mode option;
 > older remote clients ignore the header, while programmatic brokers must add
