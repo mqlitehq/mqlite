@@ -317,6 +317,7 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 		return nil, err
 	}
 	var out []*Message
+	var bytes int64
 	for _, seq := range seqs {
 		token := randToken()
 		var (
@@ -368,6 +369,14 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 		m.ContentType = ctype.String
 		m.Properties = parseProps(props)
 		out = append(out, &m)
+		size, err := responseMessageBytes(&m)
+		if err != nil {
+			return out, err
+		}
+		bytes += size
+		if bytes >= maxResponseBytes {
+			break
+		}
 	}
 	return out, nil
 }
