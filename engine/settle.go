@@ -389,7 +389,7 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 	deadlines := make(map[string]int64, len(rows)) // the committed locked_until, per (seq, token)
 	pairs := strings.Repeat(",(?,?)", len(rows))[1:]
 	args := pairArgs(queue, rows)
-	err = e.db.queryFresh(ctx,
+	err = e.db.queryFreshWrite(ctx,
 		// MAX(locked_until, ?): a renewal may only ever EXTEND a lease, never pull it back. Two
 		// renewals can race (a retry, a concurrent renewer), and the loser writing its older
 		// deadline would shorten a lock the winner had already pushed out.

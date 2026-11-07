@@ -485,11 +485,15 @@ const maxConnAttempts = 6
 // family, not just "connection reset": the libSQL/Hrana client returns the network error
 // un-wrapped from the POST that carries a write, so a lost commit ack most often surfaces
 // as a bare io.EOF / "broken pipe" / "i/o timeout" — especially behind a proxy like Fly,
-// where an upstream drop reads as EOF, not RST (MQLITE-59). A structured server *response*
-// ("error code 500: …") is a definite non-commit and is intentionally NOT matched here.
+// where an upstream drop reads as EOF, not RST (MQLITE-59). A transient provider
+// HTTP response can also follow a committed write whose acknowledgement was
+// lost. Its status is authoritative over any SQLite words in the response body.
 func isConnErr(err error) bool {
 	if err == nil {
 		return false
+	}
+	if status := remoteProviderHTTPStatus(err); status != 0 {
+		return transientProviderHTTPStatus(status)
 	}
 	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
@@ -510,13 +514,18 @@ func isConnErr(err error) bool {
 	return false
 }
 
-// isBusyErr reports a contended-write error from the remote primary. The lock was
-// not acquired, so the statement did not run and a retry is safe (no double-apply).
+// isBusyErr recognizes contention for reads and pre-COMMIT transaction retries.
+// Plain response text alone does not prove that an issued write did not commit.
 func isBusyErr(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) || remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err) {
 		return false
 	}
-	s := err.Error()
+	leaf := singleRemoteProviderLeaf(err)
+	if leaf == nil {
+		return false
+	}
+	s := leaf.Error()
 	for _, sub := range []string{"database is locked", "database table is locked", "SQLITE_BUSY"} {
 		if strings.Contains(s, sub) {
 			return true
@@ -525,18 +534,17 @@ func isBusyErr(err error) bool {
 	return isRustTursoBusyErr(err)
 }
 
-// isRustTursoBusyErr recognizes the Rust provider's exact SQLITE_BUSY message.
-// The pinned HTTP driver discards the protocol code and wraps its plain message
-// with %w. Match that leaf, never a substring in SQL or transport diagnostics.
-// A checkpoint failure may follow a durable commit; its different explanation
-// must not become a safe replay merely because it mentions contention.
+// isRustTursoBusyErr recognizes the Rust provider's exact SQLITE_BUSY message
+// for reads and pre-COMMIT retries. The pinned driver discards protocol metadata,
+// so this leaf alone cannot authorize replay of an issued write or COMMIT.
+// Match the leaf, never a substring in SQL, transport or checkpoint diagnostics.
 func isRustTursoBusyErr(err error) bool {
 	return exactRemoteProviderError(err, "Tursodb error: Database is busy")
 }
 
-// exactRemoteProviderError matches one definite server explanation through the
-// pinned driver's single-cause wrappers. A transport, joined cause or caller
-// cancellation cannot become safe to replay by carrying the same words.
+// exactRemoteProviderError recognizes one known explanation for safe reads and
+// pre-COMMIT transaction retries. It is not proof that an issued write failed:
+// the pinned driver can discard an HTTP error status around the same message.
 func exactRemoteProviderError(err error, message string) bool {
 	if err == nil || errors.Is(err, ErrOutcomeUnknown) ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isConnErr(err) {
@@ -561,9 +569,9 @@ func exactRemoteProviderError(err error, message string) bool {
 	return false
 }
 
-// isExpiredRemoteTransactionErr accepts a definite provider rollback receipt,
-// not a generic timeout or a missing COMMIT acknowledgement. The pinned driver
-// discards the protocol code, so every word of this explanation is significant.
+// isExpiredRemoteTransactionErr recognizes the exact expiry explanation, never a
+// generic timeout. After an issued write/COMMIT this text still lacks sufficient
+// protocol provenance to authorize replay.
 func isExpiredRemoteTransactionErr(err error) bool {
 	return exactRemoteProviderError(err, "SQLite error: interactive transaction was rolled back "+
 		"because the stream was idle for too long; retry the transaction")
@@ -719,19 +727,64 @@ func (d *db) attempts() int {
 }
 
 func (d *db) retryable(err error) bool {
-	return d.remote && (isConnErr(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
+	return d.remote && !errors.Is(err, ErrOutcomeUnknown) && !unclassifiedProviderHTTPCode(err) &&
+		(isConnErr(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
 }
 
-// retryableWrite is retryable for a WRITE or COMMIT: safe to replay only when the error
-// guarantees the write effect or transaction did not commit — driver.ErrBadConn
-// (database/sql's "retry on a
-// fresh connection" signal), a busy error (the lock was never acquired), or the
-// exact provider acknowledgement that the whole idle transaction was rolled back. A broad transport
-// error like "connection reset" on a write is outcome-unknown (the primary may have committed
-// before the ack was lost), so it is NOT replayed — the caller gets ErrOutcomeUnknown instead
-// of a silent double-apply (MQLITE-59).
+// retryableWrite accepts only a before-dispatch ErrBadConn or typed SQLITE_BUSY
+// evidence. The pinned HTTP driver can turn a non-200 response into plain SQL
+// error text, including Busy or an idle-rollback explanation. That text cannot
+// prove an issued standalone write or COMMIT had no durable effect (MQLITE-174).
 func (d *db) retryableWrite(err error) bool {
-	return d.remote && (errors.Is(err, driver.ErrBadConn) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
+	if !d.remote || err == nil || errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) || remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err) || singleRemoteProviderLeaf(err) == nil {
+		return false
+	}
+	var coded interface{ Code() int }
+	return errors.Is(err, driver.ErrBadConn) || errors.As(err, &coded) && coded.Code()&255 == 5
+}
+
+// A discarded HTTP status must not leak an untrusted safe-retry sentinel to
+// callers. Keep its explanation opaque while retaining the original privately.
+type providerHTTPCodeFailure struct{ cause error }
+
+func (e *providerHTTPCodeFailure) Error() string { return e.cause.Error() }
+
+func isolateProviderBadConn(err error) error {
+	if errors.Is(err, driver.ErrBadConn) && unclassifiedProviderHTTPCode(err) {
+		return &providerHTTPCodeFailure{cause: err}
+	}
+	return err
+}
+
+func remoteWriteMayHaveCommitted(err error) bool {
+	return isConnErr(err) || unclassifiedProviderHTTPCode(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err)
+}
+
+// providerWriteOutcomeUnknown retains one HTTP provider cause for diagnostics
+// without making an ambiguous write eligible for the engine's retry policy.
+type providerWriteOutcomeUnknown struct{ cause error }
+
+func (e *providerWriteOutcomeUnknown) Error() string {
+	return fmt.Sprintf("%v: %v", ErrOutcomeUnknown, e.cause)
+}
+func (e *providerWriteOutcomeUnknown) Unwrap() error        { return e.cause }
+func (e *providerWriteOutcomeUnknown) Is(target error) bool { return target == ErrOutcomeUnknown }
+func (e *providerWriteOutcomeUnknown) HTTPStatus() int      { return remoteProviderHTTPStatus(e.cause) }
+
+func unknownRemoteWrite(err error) error {
+	if remoteProviderHTTPStatus(err) != 0 {
+		return &providerWriteOutcomeUnknown{cause: err}
+	}
+	if unclassifiedProviderHTTPCode(err) {
+		return &providerWriteOutcomeUnknown{cause: isolateProviderBadConn(err)}
+	}
+	if isBusyErr(err) || isExpiredRemoteTransactionErr(err) {
+		return &providerWriteOutcomeUnknown{cause: err}
+	}
+	// Preserve the established broad-transport contract: EOF/reset is not a
+	// safe-retry sentinel once an issued write's acknowledgement is lost.
+	return fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
 }
 
 func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql.Result, error) {
@@ -781,15 +834,13 @@ func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql
 			break
 		}
 	}
-	// A remote write that ended on an outcome-unknown transport error (a broad "connection
-	// reset", not driver.ErrBadConn/busy) may have applied server-side before the ack was
-	// lost — surface it as ErrOutcomeUnknown so the caller can't blindly retry into a
-	// double-apply (MQLITE-59).
-	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
-		// %s (not %w) on purpose: the raw transport error must stay OUT of the
-		// errors.Is chain — a caller checks errors.Is(err, ErrOutcomeUnknown), never
-		// the underlying EOF/reset (which reads as "safe to retry").
-		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
+	// A remote write with a lost response or untyped Busy/rollback explanation may
+	// already have applied. Only before-dispatch ErrBadConn or typed SQLITE_BUSY
+	// proves a safe rejection; other ambiguous replies remain outcome-unknown.
+	if err != nil && d.remote && remoteWriteMayHaveCommitted(err) && !d.retryableWrite(err) {
+		// Retain a structured provider response for status diagnostics. Broad
+		// EOF/reset errors keep the established non-retryable unknown wrapper.
+		return res, unknownRemoteWrite(err)
 	}
 	return res, err
 }
@@ -859,8 +910,8 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 			break
 		}
 	}
-	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
-		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
+	if err != nil && d.remote && remoteWriteMayHaveCommitted(err) && !d.retryableWrite(err) {
+		return res, unknownRemoteWrite(err)
 	}
 	return res, err
 }
@@ -869,6 +920,14 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 // connection this attempt holds: the caller cannot be trusted to consume them before we release
 // it.
 func (d *db) queryFreshUnobserved(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	return d.queryFreshMode(ctx, query, buildArgs, scan, false)
+}
+
+func (d *db) queryFreshWriteUnobserved(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	return d.queryFreshMode(ctx, query, buildArgs, scan, true)
+}
+
+func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error, write bool) error {
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			args := buildArgs() // then look again — see execFresh
@@ -914,14 +973,35 @@ func (d *db) queryFreshUnobserved(ctx context.Context, query string, buildArgs f
 		rows, err = conn.QueryContext(ctx, query, args...)
 		if err != nil {
 			_ = conn.Close()
+			if write {
+				if d.retryableWrite(err) {
+					continue
+				}
+				if remoteWriteMayHaveCommitted(err) {
+					return unknownRemoteWrite(err)
+				}
+				return err
+			}
 			if d.retryable(err) {
 				continue
 			}
 			return err
 		}
 		err = scan(rows)
-		_ = rows.Close()
+		if write && err == nil {
+			err = rows.Err()
+		}
+		closeErr := rows.Close()
 		_ = conn.Close()
+		if write {
+			if err == nil {
+				err = closeErr
+			}
+			if err != nil {
+				return unknownRemoteWrite(err)
+			}
+			return nil
+		}
 		if err == nil || !d.retryable(err) {
 			return err
 		}
@@ -1297,14 +1377,14 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 				return err
 			}
 			if e.db.retryableWrite(err) {
-				continue // ErrBadConn / busy: the commit provably didn't land, safe to replay
+				continue // Before-dispatch ErrBadConn or typed SQLITE_BUSY proves a safe rejection.
 			}
-			if e.db.remote && isConnErr(err) {
+			if e.db.remote && remoteWriteMayHaveCommitted(err) {
 				// Outcome-unknown commit transport error: the primary may have durably
 				// committed before the ack was lost, so replaying the whole closure would
 				// double-apply (e.g. a second insert). Surface it instead of retrying
 				// (MQLITE-59). Transparent retry needs durable per-op idempotency — deferred.
-				return fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error()) // %s: keep raw err out of the errors.Is chain
+				return unknownRemoteWrite(err)
 			}
 			return err
 		}

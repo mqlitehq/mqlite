@@ -738,6 +738,8 @@ func storageErrorCode(err error) string {
 		return "canceled"
 	case errors.Is(err, ErrClosed):
 		return "closed"
+	case remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err):
+		return "connection"
 	case isBusyErr(err):
 		return "busy"
 	case isExpiredRemoteTransactionErr(err):
@@ -859,6 +861,12 @@ func (d *db) execFresh(ctx context.Context, q string, args func() []any) (sql.Re
 func (d *db) queryFresh(ctx context.Context, q string, args func() []any, scan func(*sql.Rows) error) error {
 	ctx, a := startStorage(ctx, storageQueryOperation(q))
 	err := d.queryFreshUnobserved(ctx, q, args, scan)
+	d.finishStorage(a, err)
+	return err
+}
+func (d *db) queryFreshWrite(ctx context.Context, q string, args func() []any, scan func(*sql.Rows) error) error {
+	ctx, a := startStorage(ctx, storageQueryOperation(q))
+	err := d.queryFreshWriteUnobserved(ctx, q, args, scan)
 	d.finishStorage(a, err)
 	return err
 }

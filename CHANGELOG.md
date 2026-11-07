@@ -12,12 +12,24 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+- Recognize pinned libSQL provider HTTP failures through single-cause driver
+  wrappers, including newline-wrapped 502 responses. Reads and transactions that
+  have not attempted COMMIT can retry transient provider statuses within the
+  existing six-attempt budget. Standalone writes and COMMIT responses remain
+  outcome-unknown without automatic replay, preserving their cause and safe HTTP
+  status. Response-body SQLite words cannot turn a proxy failure into safe write
+  replay; nontransient responses and canceled callers do not gain retries.
+  Untyped Busy and idle-rollback explanations cannot prove an issued write or
+  COMMIT was rejected, because the driver may discard their HTTP status. They now
+  remain `ErrOutcomeUnknown`; reads and pre-COMMIT callbacks retain bounded retry.
+
 ### Retry confirmed idle-transaction rollbacks (MQLITE-170)
 
-- Treat the provider's exact acknowledgement that an idle interactive transaction
-  was rolled back as a definite rejection. Remote operations can reopen and retry
-  the whole transaction within the existing six-attempt budget, instead of
-  failing that maintenance pass with an unclassified error.
+- Recognize the provider's exact idle-transaction rollback explanation for reads
+  and pre-COMMIT transaction callbacks. Those paths can reopen the whole
+  transaction within the existing six-attempt budget. After an issued standalone
+  write or COMMIT, the same untyped text remains `ErrOutcomeUnknown` because the
+  pinned driver may have discarded a non-200 HTTP status.
 - Expose exhausted retries with precise `transaction_expired` error details while
   retaining the existing `connection` counter category and observation matrix. Generic timeouts, transport loss, joined causes and
   checkpoint failures still do not prove that a COMMIT was rolled back; ambiguous
@@ -25,9 +37,10 @@ upgrade notes before replacing a broker.
 
 ### Retry definite Rust Turso contention (MQLITE-173)
 
-- Recognize the Rust provider's exact `Database is busy` rejection through the
-  pinned HTTP driver's error wrapping. These definite rejections now use the
-  existing bounded remote retry policy and report `busy` / SQLite code 5.
+- Recognize the Rust provider's exact `Database is busy` explanation through the
+  pinned HTTP driver's error wrapping. Reads and pre-COMMIT transaction callbacks
+  use the bounded retry policy and report `busy` / SQLite code 5. Issued standalone
+  writes and COMMIT keep untyped Busy responses outcome-unknown.
 - Keep transport loss, cancellation, joined causes and post-commit checkpoint
   explanations outside this compatibility rule. They are not made safe to replay
   by merely mentioning contention. Local SQLite retry behavior is unchanged.

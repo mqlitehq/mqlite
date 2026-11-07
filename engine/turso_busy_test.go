@@ -42,8 +42,8 @@ func TestRustTursoBusyClassificationIsExactAndTransportSafe(t *testing.T) {
 			if got := isBusyErr(tc.err); got != tc.want {
 				t.Fatalf("busy classification=%t, want %t", got, tc.want)
 			}
-			if got := (&db{remote: true}).retryableWrite(tc.err); got != tc.want {
-				t.Fatalf("safe write replay=%t, want %t", got, tc.want)
+			if (&db{remote: true}).retryableWrite(tc.err) {
+				t.Fatal("untyped provider text authorized issued write replay")
 			}
 			if (&db{}).retryableWrite(tc.err) {
 				t.Fatal("local store started retrying")
@@ -57,12 +57,16 @@ func TestRustTursoBusyClassificationIsExactAndTransportSafe(t *testing.T) {
 }
 
 // This small provider model runs through the pinned HTTP driver and database/sql.
-// Its failed statement/COMMIT explicitly has no committed effect. Transport-loss
-// and post-commit ambiguity are separate negative controls below.
+// Its protocol-level busy response has no committed effect. HTTP failure controls
+// can instead commit before returning a proxy error, preserving that ambiguity.
 type rustBusyProvider struct {
 	failureMessage                                                string
 	failureCode                                                   string
 	rollbackOnFailure                                             bool
+	httpStatus                                                    int
+	httpBody                                                      string
+	httpApply                                                     bool
+	onFailure                                                     func()
 	skipAtStage                                                   int
 	expiredRollbacks                                              int
 	reads                                                         int
@@ -106,6 +110,7 @@ func (p *rustBusyProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch req.Stmt.SQL {
 		case "BEGIN":
 			p.starts++
+			stage = "begin"
 			p.next++
 			baton = "tx-" + strconv.Itoa(p.next)
 			p.pending[baton] = 0
@@ -122,8 +127,13 @@ func (p *rustBusyProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			delete(p.pending, baton)
 			baton = ""
 		default:
-			http.Error(w, "unexpected test SQL", 400)
-			return
+			if strings.HasPrefix(strings.Join(strings.Fields(req.Stmt.SQL), " "), "UPDATE messages SET locked_until=MAX(") {
+				p.writes++
+				stage = "statement"
+			} else {
+				http.Error(w, "unexpected test SQL", 400)
+				return
+			}
 		}
 		shouldFail := stage == p.failStage && p.remaining > 0
 		if shouldFail && p.skipAtStage > 0 {
@@ -133,6 +143,30 @@ func (p *rustBusyProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if shouldFail {
 			p.remaining--
 			p.failures++
+			if p.httpStatus != 0 {
+				if p.httpApply {
+					if stage == "commit" {
+						p.applied += p.pending[baton]
+						delete(p.pending, baton)
+					} else if stage == "statement" {
+						if baton == "" {
+							p.applied++
+						} else {
+							p.pending[baton]++
+						}
+					}
+				}
+				w.WriteHeader(p.httpStatus)
+				body := p.httpBody
+				if body == "" {
+					body = `{"error":"upstream forward failed"}`
+				}
+				_, _ = io.WriteString(w, body)
+				if p.onFailure != nil {
+					p.onFailure()
+				}
+				return
+			}
 			message, code := p.failureMessage, p.failureCode
 			if message == "" {
 				message = "Tursodb error: Database is busy"
@@ -202,6 +236,17 @@ func TestRustTursoStatementAndCommitBusyReplayOnlyOneCommittedEffect(t *testing.
 				}
 				return err
 			})
+			if stage == "commit" {
+				if !errors.Is(err, ErrOutcomeUnknown) || runs != 1 {
+					t.Fatalf("untyped commit response runs=%d err=%v", runs, err)
+				}
+				p.mu.Lock()
+				defer p.mu.Unlock()
+				if p.applied != 0 || p.commits != 1 {
+					t.Fatalf("effects=%d commits=%d", p.applied, p.commits)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("definite provider busy was not replayed: %v", err)
 			}
@@ -214,7 +259,7 @@ func TestRustTursoStatementAndCommitBusyReplayOnlyOneCommittedEffect(t *testing.
 	}
 }
 func TestRustTursoBusyExhaustionIsBoundedAndObservable(t *testing.T) {
-	p := &rustBusyProvider{failStage: "commit", remaining: maxConnAttempts + 1}
+	p := &rustBusyProvider{failStage: "statement", remaining: maxConnAttempts + 1}
 	e := newRustBusyEngine(t, p)
 	runs := 0
 	err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
@@ -227,7 +272,7 @@ func TestRustTursoBusyExhaustionIsBoundedAndObservable(t *testing.T) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if runs != maxConnAttempts || p.commits != maxConnAttempts || p.applied != 0 {
+	if runs != maxConnAttempts || p.commits != 0 || p.applied != 0 {
 		t.Fatalf("retry bound/effect mismatch runs=%d commits=%d effects=%d", runs, p.commits, p.applied)
 	}
 }

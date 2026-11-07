@@ -46,7 +46,63 @@ type MaintenanceDiagnostics struct {
 
 const maintenanceHistoryLimit = 8
 
-var providerHTTPCode = regexp.MustCompile(`(?i)(?:^|: )error code ([1-5][0-9]{2}):`)
+var providerHTTPCode = regexp.MustCompile(`^error code ([1-5][0-9]{2}):`)
+
+// singleRemoteProviderLeaf follows only the pinned driver's single-cause
+// wrappers. Joined errors, network wrappers and overly deep chains are not
+// evidence of one provider response.
+func singleRemoteProviderLeaf(err error) error {
+	for depth := 0; err != nil && depth < 32; depth++ {
+		if _, multiple := err.(interface{ Unwrap() []error }); multiple {
+			return nil
+		}
+		if _, transport := err.(net.Error); transport {
+			return nil
+		}
+		cause := errors.Unwrap(err)
+		if cause == nil {
+			return err
+		}
+		err = cause
+	}
+	return nil
+}
+
+// remoteProviderHTTPStatus recognizes the pinned driver's HTTP response leaf,
+// never matching SQL or explanations in outer wrappers.
+func remoteProviderHTTPStatus(err error) int {
+	if leaf := singleRemoteProviderLeaf(err); leaf != nil {
+		if match := providerHTTPCode.FindStringSubmatch(leaf.Error()); len(match) == 2 {
+			status, _ := strconv.Atoi(match[1])
+			return status
+		}
+	}
+	return 0
+}
+
+func transientProviderHTTPStatus(status int) bool {
+	return status == 408 || status == 429 || status == 499 || status >= 500 && status <= 599
+}
+
+// The pinned driver's fallback JSON decoder can discard the HTTP status and
+// return "error code SQLITE_BUSY" or wrap ErrBadConn under STREAM_EXPIRED.
+// Neither proves a write was rejected. This guard only refuses unsafe replay;
+// it does not invent the missing status or permit a read retry.
+func unclassifiedProviderHTTPCode(err error) bool {
+	if singleRemoteProviderLeaf(err) == nil || remoteProviderHTTPStatus(err) != 0 {
+		return false
+	}
+	for depth := 0; err != nil && depth < 32; depth++ {
+		if _, opaque := err.(*providerHTTPCodeFailure); opaque {
+			return true
+		}
+		if strings.HasPrefix(err.Error(), "error code ") {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
 
 func describeError(err error, now int64) (d ErrorDetail) {
 	d = ErrorDetail{AtMs: now, Category: storageErrorCode(err)}
@@ -67,8 +123,8 @@ func describeError(err error, now int64) (d ErrorDetail) {
 		d.Message = "Remote database rolled back an idle transaction; the permitted retries were exhausted."
 		return d
 	}
-	if match := providerHTTPCode.FindStringSubmatch(raw); len(match) == 2 {
-		d.HTTPStatus, _ = strconv.Atoi(match[1])
+	if status := remoteProviderHTTPStatus(err); status != 0 {
+		d.HTTPStatus = status
 		switch {
 		case d.HTTPStatus == 401 || d.HTTPStatus == 403:
 			d.Category = "provider_auth"
