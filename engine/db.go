@@ -1264,8 +1264,9 @@ func normalizeCanceledRemoteCommitError(ctx context.Context, err error) (error, 
 	return err, false
 }
 
-// inTx runs fn inside a transaction, retrying the whole transaction on a
-// connection error (the aborted tx leaves nothing committed, so retry is safe).
+// inTxUnobserved retries a remote transaction only when the failure evidence
+// permits it. An ambiguous issued COMMIT remains ErrOutcomeUnknown; a connection
+// error alone does not establish that the transaction aborted.
 func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) error {
 	if !e.db.remote {
 		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
