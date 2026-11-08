@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -63,6 +64,44 @@ type renewalLease struct {
 
 type deadlineRenewer interface {
 	renewDeadline(context.Context, string, int64, string) (renewalLease, error)
+}
+
+// initialBatchRenewer is internal so existing custom receive sources retain the
+// single-message renewal contract. A broker batch is still one fenced write.
+type initialBatchRenewer interface {
+	renewInitialBatch(context.Context, string, []*Message) ([]initialRenewalResult, error)
+}
+
+type initialRenewalResult struct {
+	lease      renewalLease
+	err        error
+	attemptErr error
+}
+
+type initialRenewalPlan struct {
+	attemptDeadline time.Time
+	result          *initialRenewalResult
+	previous        <-chan struct{}
+	done            chan struct{}
+	once            sync.Once
+}
+
+func (p *initialRenewalPlan) release() {
+	if p != nil && p.done != nil {
+		p.once.Do(func() { close(p.done) })
+	}
+}
+
+func (p *initialRenewalPlan) wait(ctx context.Context) bool {
+	if p == nil || p.previous == nil {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-p.previous:
+		return ctx.Err() == nil
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func exponentialBackoff(base, max time.Duration, step int) time.Duration {
@@ -538,8 +577,21 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			releasePaired(handlerSlots, totalSlots, n)
 			return done()
 		}
-		// Release the slots we reserved but did not fill, then run a worker per message.
+		// Release the slots we reserved but did not fill, then confirm short
+		// initial leases together before user work can consume those leases.
 		releasePaired(handlerSlots, totalSlots, n-len(msgs))
+		initial, initialErr := r.prepareInitialRenewals(rctx, msgs, hadTransientFailure)
+		if initialErr != nil {
+			releasePaired(handlerSlots, totalSlots, len(msgs))
+			afterCancel := cancelled()
+			fail(initialErr, afterCancel)
+			r.notify(initialErr)
+			return done()
+		}
+		if rctx.Err() != nil {
+			releasePaired(handlerSlots, totalSlots, len(msgs))
+			return done()
+		}
 		for _, m := range msgs {
 			wg.Add(1)
 			go func(m *Message, forceInitialRenewal bool) {
@@ -552,15 +604,150 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 				// A panic or future early return must not strand handler capacity.
 				// On the normal path process calls this immediately after handler.
 				defer releaseHandler()
-				r.process(rctx, m, handler, releaseHandler, cancelled, fail, forceInitialRenewal)
+				r.process(rctx, m, handler, releaseHandler, cancelled, fail, forceInitialRenewal, initial[m])
 			}(m, hadTransientFailure)
 		}
 	}
 }
 
-func (r *Receiver) process(ctx context.Context, m *Message, handler func(context.Context, *Message) error, releaseHandler func(), cancelled func() bool, fail func(error, bool), forceInitialRenewal bool) {
+// initialRenewalStates preserves the single-message dispatch fence and watchdog
+// rules for both batched and legacy initial confirmation.
+func initialRenewalStates(m *Message, force bool) (state, attempt renewalState) {
+	deadline := m.LockedUntil
+	if !m.localLockedUntil.IsZero() {
+		deadline = m.localLockedUntil
+	}
+	state = newRenewalState(deadline, m.localLeaseResponseRTT, m.localLeaseCoarseClock, m.localLeaseClockUnavailable)
+	attempt = state
+	if force {
+		if m.localLockedUntil.IsZero() {
+			attempt.deadline = time.Time{}
+			attempt.deadlineUntrusted = true
+		}
+		state.deadline = time.Time{}
+		state.deadlineUntrusted = true
+	}
+	return state, attempt
+}
+
+// prepareInitialRenewals prevents a slow remote writer from consuming an early
+// batch member's lease behind N separately scheduled initial RPCs (MQLITE-183).
+// The earliest original watchdog bounds the one fenced batch; it is never reset
+// after a capability probe or a wait for a preceding legacy confirmation.
+func (r *Receiver) prepareInitialRenewals(ctx context.Context, messages []*Message, force bool) (map[*Message]*initialRenewalPlan, error) {
+	if !r.cfg.autoRenew && !force {
+		return nil, nil
+	}
+	var pending []*Message
+	plans := make(map[*Message]*initialRenewalPlan)
+	sequences := make(map[int64]bool)
+	for _, m := range messages {
+		state, attempt := initialRenewalStates(m, force)
+		if !force && !needsInitialRenewalGate(state) {
+			continue
+		}
+		if plans[m] != nil || m.SequenceNumber > 0 && sequences[m.SequenceNumber] {
+			return nil, fmt.Errorf("%w: duplicate message in initial confirmation batch", ErrInvalidArgument)
+		}
+		sequences[m.SequenceNumber] = true
+		attemptCtx, cancel := initialRenewalAttemptContext(ctx, attempt)
+		deadline, _ := attemptCtx.Deadline()
+		cancel()
+		pending = append(pending, m)
+		plans[m] = &initialRenewalPlan{attemptDeadline: deadline}
+	}
+	if len(pending) < 2 {
+		return nil, nil
+	}
+	sort.SliceStable(pending, func(i, j int) bool {
+		return plans[pending[i]].attemptDeadline.Before(plans[pending[j]].attemptDeadline)
+	})
+	var previous <-chan struct{}
+	var earliest time.Time
+	for _, m := range pending {
+		plan := plans[m]
+		plan.previous, plan.done = previous, make(chan struct{})
+		previous = plan.done
+		if earliest.IsZero() || plan.attemptDeadline.Before(earliest) {
+			earliest = plan.attemptDeadline
+		}
+	}
+	source, supported := r.src.(initialBatchRenewer)
+	r.renewCapabilityMu.Lock()
+	unsupported := r.deadlineRenewUnsupported
+	r.renewCapabilityMu.Unlock()
+	if !supported || unsupported || len(pending) > MaxRenewBatch {
+		return plans, nil
+	}
+	attemptCtx, cancel := context.WithDeadline(ctx, earliest)
+	defer cancel()
+	type outcome struct {
+		results []initialRenewalResult
+		err     error
+	}
+	returned := make(chan outcome, 1)
+	go func() {
+		finished := false
+		defer func() {
+			if !finished {
+				returned <- outcome{err: fmt.Errorf("%w: initial batch renewal terminated without a result", ErrLockLost)}
+			}
+		}()
+		results, err := source.renewInitialBatch(attemptCtx, r.queue, pending)
+		finished = true
+		returned <- outcome{results: results, err: err}
+	}()
+	// A cooperative transport observes attemptCtx. Always join it, including a
+	// custom transport's Goexit; never leave an initial RPC behind on Run cancel.
+	result := <-returned
+	// Match the original initial fence: a caller cancellation that already won
+	// cannot be overwritten by a late routing or authorization response.
+	if ctx.Err() != nil {
+		return nil, nil
+	}
+	attemptErr := attemptCtx.Err()
+	if errors.Is(result.err, ErrUnsupported) {
+		r.renewCapabilityMu.Lock()
+		r.deadlineRenewUnsupported = true
+		r.renewCapabilityMu.Unlock()
+		// Plans retain their original absolute watchdog even when a capability
+		// response arrives late. Fallback must fail that expired window, not turn a
+		// late 404 into a fatal Run error or obtain a new untrusted timeout.
+		return plans, nil
+	}
+	if result.err != nil && !retryableManagedError(result.err) && isPermanent(result.err) {
+		return nil, result.err
+	}
+	if result.err == nil && len(result.results) != len(pending) {
+		result.err = fmt.Errorf("%w: initial batch renewal returned an invalid result count", ErrLockLost)
+	}
+	if result.err == nil {
+		for _, item := range result.results {
+			if item.err != nil && !retryableManagedError(item.err) && isPermanent(item.err) {
+				return nil, item.err
+			}
+		}
+	}
+	for i, m := range pending {
+		item := initialRenewalResult{err: result.err, attemptErr: attemptErr}
+		if result.err == nil {
+			item = result.results[i]
+			item.attemptErr = attemptErr
+		}
+		plans[m].result = &item
+	}
+	return plans, nil
+}
+
+func (r *Receiver) process(ctx context.Context, m *Message, handler func(context.Context, *Message) error, releaseHandler func(), cancelled func() bool, fail func(error, bool), forceInitialRenewal bool, initial ...*initialRenewalPlan) {
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	defer cancelHandler()
+	var plan *initialRenewalPlan
+	if len(initial) != 0 {
+		plan = initial[0]
+	}
+	// Release the next confirmation on every exit, including transport Goexit.
+	defer plan.release()
 
 	var cancelRenew context.CancelFunc
 	var renewWG sync.WaitGroup
@@ -569,31 +756,16 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 	var state renewalState
 	if r.cfg.autoRenew || forceInitialRenewal {
 		renewCtx, cancel := context.WithCancel(ctx)
-		leaseDeadline := m.LockedUntil
-		if !m.localLockedUntil.IsZero() {
-			leaseDeadline = m.localLockedUntil
-		}
-		state = newRenewalState(leaseDeadline, m.localLeaseResponseRTT, m.localLeaseCoarseClock, m.localLeaseClockUnavailable)
-		if forceInitialRenewal || needsInitialRenewalGate(state) {
-			attemptState := state
-			if forceInitialRenewal {
-				// A replay always needs a fresh broker fence. A mapped monotonic
-				// deadline may bound that one RPC, but do not reuse the old replay
-				// horizon as the cadence after renewal. RenewBatch will supply the
-				// new mapped deadline; a legacy success stays in conservative mode.
-				if m.localLockedUntil.IsZero() {
-					attemptState.deadline = time.Time{}
-					attemptState.deadlineUntrusted = true
-				}
-				state.deadline = time.Time{}
-				state.deadlineUntrusted = true
-			}
+		defer cancel()
+		var attemptState renewalState
+		state, attemptState = initialRenewalStates(m, forceInitialRenewal)
+		if forceInitialRenewal || needsInitialRenewalGate(state) || plan != nil && plan.result != nil {
 			if renewCtx.Err() != nil {
 				cancel()
 				return
 			}
 			var confirmed bool
-			state, confirmed = r.confirmInitialRenewal(renewCtx, m, state, attemptState, cancelHandler, cancelled, fail)
+			state, confirmed = r.confirmInitialRenewal(renewCtx, m, state, attemptState, cancelHandler, cancelled, fail, plan)
 			if !confirmed {
 				cancel()
 				return
@@ -606,6 +778,9 @@ func (r *Receiver) process(ctx context.Context, m *Message, handler func(context
 				return
 			}
 		}
+		// Only confirmation is ordered; the previous handler can run while the
+		// following legacy confirmation is pending.
+		plan.release()
 		if r.cfg.autoRenew {
 			cancelRenew = cancel
 			renewWG.Add(1)
@@ -963,11 +1138,36 @@ func (r *Receiver) stopRenewal(cancelHandler context.CancelFunc, err error, canc
 // Receive response is already inside the local safety window. Starting the
 // handler and an immediate renew goroutine concurrently would let a fast handler
 // win the race, perform side effects, and cancel the renewal before it was sent.
-func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state, attemptState renewalState, cancelHandler context.CancelFunc, cancelled func() bool, fail func(error, bool)) (renewalState, bool) {
-	attemptCtx, cancelAttempt := initialRenewalAttemptContext(ctx, attemptState)
-	lease, err := r.renewMessage(attemptCtx, m)
-	attemptErr := attemptCtx.Err()
-	cancelAttempt()
+func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state, attemptState renewalState, cancelHandler context.CancelFunc, cancelled func() bool, fail func(error, bool), initial ...*initialRenewalPlan) (renewalState, bool) {
+	var plan *initialRenewalPlan
+	if len(initial) != 0 {
+		plan = initial[0]
+	}
+	var lease renewalLease
+	var err, attemptErr error
+	if plan != nil && plan.result != nil {
+		lease, err, attemptErr = plan.result.lease, plan.result.err, plan.result.attemptErr
+	} else {
+		attemptCtx, cancelAttempt := initialRenewalAttemptContext(ctx, attemptState)
+		defer cancelAttempt()
+		if plan != nil && !plan.attemptDeadline.IsZero() {
+			cancelAttempt()
+			attemptCtx, cancelAttempt = context.WithDeadline(ctx, plan.attemptDeadline)
+			defer cancelAttempt()
+		}
+		// Waiting for a prior legacy confirmation consumes this original watchdog;
+		// reaching the front of the line never starts a fresh timeout.
+		if plan.wait(attemptCtx) {
+			lease, err = r.renewMessage(attemptCtx, m)
+		}
+		attemptErr = attemptCtx.Err()
+		cancelAttempt()
+	}
+	// A lost or transiently failed item must not hold later confirmations behind
+	// its synchronous observer. Permanent errors first stop Run below.
+	if attemptErr != nil || retryableManagedError(err) || !isPermanent(err) {
+		plan.release()
+	}
 	if ctx.Err() != nil {
 		return state, false
 	}
@@ -1001,6 +1201,7 @@ func (r *Receiver) confirmInitialRenewal(ctx context.Context, m *Message, state,
 		r.loseRenewal(cancelHandler, fmt.Errorf("%w: renewed lease is shorter than the minimum safe renewal interval", ErrLockLost))
 		return state, false
 	}
+	plan.release()
 	return state, true
 }
 

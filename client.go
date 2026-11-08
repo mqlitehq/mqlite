@@ -1124,6 +1124,28 @@ func (c *Client) renew(ctx context.Context, q string, seq int64, tok string) err
 	return c.settle(ctx, wire.PathRenew, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok})
 }
 
+// renewInitialBatch shares the exact response clock across all fenced results;
+// it does not mutate message handles or create additional commit boundaries.
+func (c *Client) renewInitialBatch(ctx context.Context, queue string, messages []*Message) ([]initialRenewalResult, error) {
+	results, observation, err := c.renewBatchObserved(ctx, queue, messages...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]initialRenewalResult, len(results))
+	for i, result := range results {
+		if !result.Ok {
+			out[i].err = ErrLockLost
+			continue
+		}
+		lease := renewalLease{deadline: result.LockedUntil, responseRTT: observation.responseRTT, coarseClock: observation.coarseClock, clockUnavailable: observation.serverUpper.IsZero()}
+		if local, ok := observation.localLeaseDeadline(result.LockedUntil); ok {
+			lease.deadline = local
+		}
+		out[i].lease = lease
+	}
+	return out, nil
+}
+
 func (c *Client) renewDeadline(ctx context.Context, q string, seq int64, tok string) (renewalLease, error) {
 	results, observation, err := c.renewBatchObserved(ctx, q, c.Message(q, seq, tok))
 	if err != nil {
