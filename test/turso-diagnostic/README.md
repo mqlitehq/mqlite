@@ -41,6 +41,12 @@ remain separate in the ledger.
 
 `--case all` keeps each mode's order. An exact case ID selects only that case;
 unknown, ambiguous and cross-mode selections fail before database access.
+`--mode contention --case originals` selects exactly the original eight native
+and low-floor profiles in their existing order. It omits only the three separate
+pool/admission controls; `all` continues to select all eleven. No original
+profile's message count, B64 batch size, C8/C32 concurrency, SDK, deadline,
+backend budget or cleanup rules change. `originals` is rejected in other modes,
+and every other group name is rejected.
 The mixed IDs are `mixed_native_lock3`, `mixed_native_lock30`,
 `mixed_low-floor_lock3`, and `mixed_low-floor_lock30`. A focused PASS covers only
 the selected scope. SQLite always runs before selected remote backends. Remote

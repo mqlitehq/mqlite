@@ -22,6 +22,10 @@ func TestDiagnosticSelectionCLIProcess(t *testing.T) {
 		mode, selection string
 		want            int
 	}{
+		{"contention", "originals", 0},
+		{"quick", "originals", 2}, {"mixed", "originals", 2},
+		{"contention", "originals ", 2}, {"contention", "ORIGINALS", 2},
+		{"contention", "originals,all", 2}, {"contention", "controls", 2},
 		{"mixed", "mixed_native_lock3", 0}, {"mixed", "mixed_low-floor_lock30", 0},
 		{"mixed", "original_native_c32_b1", 2}, {"contention", "mixed_native_lock3", 2},
 		{"mixed", "mixed_native_lock3,mixed_native_lock30", 2}, {"mixed", "mixed_native_lock3 ", 2},

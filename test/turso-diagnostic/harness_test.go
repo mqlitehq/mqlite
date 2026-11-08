@@ -329,3 +329,35 @@ func verifySQLiteMode(t *testing.T, mode string) {
 
 	}
 }
+
+func TestOriginalsGroupPreservesExactEightProfilesAndOrder(t *testing.T) {
+	want := plans("contention")[:8]
+	got, err := selectedPlans("contention", "originals")
+	if err != nil || len(got) != 8 || !reflect.DeepEqual(got, want) {
+		t.Fatal("originals changed the original eight profiles or their order")
+	}
+	for _, p := range got {
+		if p.Family != "original_v11_contention" {
+			t.Fatal("group included a counterfactual")
+		}
+	}
+	all, err := selectedPlans("contention", "all")
+	if err != nil || len(all) != 11 || !reflect.DeepEqual(all, plans("contention")) {
+		t.Fatal("all no longer retains all eleven profiles")
+	}
+	for _, x := range []struct{ mode, selection string }{{"quick", "originals"}, {"mixed", "originals"}, {"contention", "originals "}, {"contention", "ORIGINALS"}, {"contention", "originals,all"}, {"contention", "controls"}} {
+		_, err := preflight(options{mode: x.mode, caseID: x.selection, selected: "both"}, func(k string) (string, bool) {
+			if strings.HasPrefix(k, "MQLITE_DIAG_") {
+				t.Fatal("invalid group read credentials before selection rejection")
+			}
+			return "", false
+		})
+		if err == nil || safeFailure(err).Class != "oracle_invalid_case_selection" {
+			t.Fatal("invalid or cross-mode group was accepted")
+		}
+	}
+	// Selection-only preflight never needs remote credentials or a DB owner.
+	if _, err := preflight(options{mode: "contention", caseID: "originals", selected: "local"}, lookupMap(nil)); err != nil {
+		t.Fatal("originals hermetic preflight failed")
+	}
+}

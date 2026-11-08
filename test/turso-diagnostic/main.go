@@ -257,7 +257,7 @@ func runMain() int {
 	var validateSelectionOnly bool
 	flag.StringVar(&o.mode, "mode", "quick", "quick, contention, or mixed")
 	flag.StringVar(&o.selected, "backend", "local", "local, standard, rust, or both")
-	flag.StringVar(&o.caseID, "case", "all", "all or one exact case ID from the selected mode")
+	flag.StringVar(&o.caseID, "case", "all", "all, contention-only originals, or one exact case ID")
 	flag.BoolVar(&validateSelectionOnly, "validate-selection-only", false, "check mode/case without credentials, artifacts or database access")
 	flag.StringVar(&o.out, "out", "", "public output directory")
 	flag.Parse()

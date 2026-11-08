@@ -17,12 +17,13 @@ on:
         default: quick
         options: [quick, contention, mixed]
       case_id:
-        description: All cases or one exact case from the selected mode
+        description: All cases, contention-only originals, or one exact case
         type: choice
         required: true
         default: all
         options:
           - all
+          - originals
           - mixed_native_lock3
           - mixed_native_lock30
           - mixed_low-floor_lock3

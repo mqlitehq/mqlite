@@ -88,6 +88,15 @@ func selectedPlans(mode, selection string) ([]casePlan, error) {
 	if selection == "all" {
 		return ps, nil
 	}
+	if selection == "originals" && mode == "contention" {
+		var original []casePlan
+		for _, p := range ps {
+			if p.Family == "original_v11_contention" {
+				original = append(original, p)
+			}
+		}
+		return original, nil
+	}
 	for _, p := range ps {
 		if selection == p.ID {
 			return []casePlan{p}, nil
