@@ -120,18 +120,19 @@ type sourceInfo struct {
 	ProxyConfigured bool   `json:"proxy_configured"`
 }
 type report struct {
-	Schema        string          `json:"schema"`
-	Run           string          `json:"run"`
-	Mode          string          `json:"mode"`
-	CaseSelection string          `json:"case_selection"`
-	Source        sourceInfo      `json:"source"`
-	Started       string          `json:"started"`
-	Finished      string          `json:"finished,omitempty"`
-	Passed        bool            `json:"passed"`
-	Blocked       bool            `json:"blocked"`
-	Failure       *failure        `json:"failure,omitempty"`
-	Backends      []backendResult `json:"backends"`
-	Limitations   []string        `json:"limitations"`
+	Schema             string          `json:"schema"`
+	Run                string          `json:"run"`
+	Mode               string          `json:"mode"`
+	CaseSelection      string          `json:"case_selection"`
+	Source             sourceInfo      `json:"source"`
+	Started            string          `json:"started"`
+	Finished           string          `json:"finished,omitempty"`
+	Passed             bool            `json:"passed"`
+	Blocked            bool            `json:"blocked"`
+	Failure            *failure        `json:"failure,omitempty"`
+	Backends           []backendResult `json:"backends"`
+	EnginePhaseTracing bool            `json:"engine_phase_tracing"`
+	Limitations        []string        `json:"limitations"`
 }
 type ownedQueue struct {
 	Backend string `json:"backend"`
@@ -183,7 +184,7 @@ func preflight(o options, lookup func(string) (string, bool)) ([]backend, error)
 			return nil, oracle("legacy_reset_environment_refused")
 		}
 	}
-	if o.mode != "quick" && o.mode != "contention" {
+	if o.mode != "quick" && o.mode != "contention" && o.mode != "mixed" {
 		return nil, oracle("invalid_mode")
 	}
 	if _, err := selectedPlans(o.mode, o.caseID); err != nil {
@@ -254,7 +255,7 @@ func main() { os.Exit(runMain()) }
 func runMain() int {
 	var o options
 	var validateSelectionOnly bool
-	flag.StringVar(&o.mode, "mode", "quick", "quick or contention")
+	flag.StringVar(&o.mode, "mode", "quick", "quick, contention, or mixed")
 	flag.StringVar(&o.selected, "backend", "local", "local, standard, rust, or both")
 	flag.StringVar(&o.caseID, "case", "all", "all or one exact case ID from the selected mode")
 	flag.BoolVar(&validateSelectionOnly, "validate-selection-only", false, "check mode/case without credentials, artifacts or database access")
@@ -304,7 +305,7 @@ func runMain() int {
 			src.ProxyConfigured = true
 		}
 	}
-	rep := report{Schema: "turso-performance-attribution-v1", Run: run, Mode: o.mode, CaseSelection: o.caseID, Source: src, Started: time.Now().UTC().Format(time.RFC3339Nano), Limitations: []string{"Finite diagnostic; no production capacity, soak, power-loss or managed Receiver claim.", "Original contention profiles retain send-then-drain, per-worker empty Receive, all errors and strict identity oracle; controls are separate cases.", "Provider HTTP connection wait is not database/sql pool wait. Concurrent/background provider events are phase-correlated, not exact per-operation attribution.", "Synthetic provider delay is separately reported; it is a latency control, not a fault-injection correctness proof.", "No reset, no foreign queue cleanup, no weakening of retries, deadlines, single-writer guard or transaction rules to obtain a pass."}}
+	rep := report{Schema: "turso-performance-attribution-v1", Run: run, Mode: o.mode, CaseSelection: o.caseID, Source: src, Started: time.Now().UTC().Format(time.RFC3339Nano), Limitations: []string{"Finite acceptance; no production capacity, soak or power-loss claim. Only mixed mode exercises managed Receiver behavior.", "Original contention profiles retain send-then-drain, per-worker empty Receive, all errors and strict identity oracle; controls are separate cases.", "Engine phase tracing is disabled. Provider HTTP connection wait is not database/sql pool wait; concurrent/background provider events are phase-correlated, not exact operation attribution.", "Synthetic provider delay is separately reported; it is a latency control, not a fault-injection correctness proof.", "No reset, no foreign queue cleanup, no weakening of retries, deadlines, single-writer guard or transaction rules to obtain a pass."}}
 	m := manifest{Schema: rep.Schema, Run: run, CaseSelection: o.caseID}
 	for _, b := range bs {
 		for i, p := range ps {

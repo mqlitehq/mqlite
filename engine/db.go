@@ -51,6 +51,7 @@ type db struct {
 	closing  bool // admission gate: enter() refuses new ops once set
 	torn     bool // teardown-once guard for close()
 	inFlight sync.WaitGroup
+	writer   remoteWriter // remote mutation admission; local stores retain their sole SQL writer
 }
 
 // enter admits a local operation, or reports that the store is closing so the caller fails fast.
@@ -420,6 +421,9 @@ func (d *db) beginClosing() {
 	d.closeMu.Lock()
 	d.closing = true
 	d.closeMu.Unlock()
+	if d.remote {
+		d.writer.close()
+	}
 }
 
 // isClosing is used before serving an observation result that needs no database
@@ -445,6 +449,9 @@ func (d *db) close() error {
 	d.torn = true
 	d.closing = true
 	d.closeMu.Unlock()
+	if d.remote {
+		d.writer.close()
+	}
 	d.inFlight.Wait()
 
 	var err error
@@ -580,8 +587,6 @@ func isExpiredRemoteTransactionErr(err error) bool {
 // backoff pauses before a retry so a contended remote write doesn't immediately
 // re-collide; it escalates a little per attempt and honors ctx cancellation.
 func (d *db) backoff(ctx context.Context, attempt int) {
-	span := diagnosticStart(ctx, "retry_backoff", "")
-	defer func() { span.end(ctx.Err()) }()
 	if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
 		a.retries.Add(1)
 	}
@@ -599,7 +604,6 @@ func (d *db) backoff(ctx context.Context, attempt int) {
 // returning the caller's exact cancellation identity is both safe and more
 // precise than treating a deadline as an outcome-unknown network timeout.
 func (d *db) beforeRemoteAttempt(ctx context.Context, attempt int) error {
-	diagnosticMark(ctx, "attempt_start", "", nil)
 	if err := checkCtx(ctx); err != nil {
 		return err
 	}
@@ -790,17 +794,12 @@ func unknownRemoteWrite(err error) error {
 	return fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
 }
 
-func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (result sql.Result, resultErr error) {
-	ctx = diagnosticOperationContext(ctx)
-	span := diagnosticStart(ctx, "write_total", query)
-	defer func() { span.end(resultErr) }()
+func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if !d.remote { // local: no retries; the wait is cancellable, the running statement is not
 		var res sql.Result
 		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			var e error
-			statement := diagnosticStart(ctx, "sql_exec", query)
 			res, e = c.ExecContext(ec, query, args...)
-			statement.end(e)
 			return e
 		})
 		return res, err
@@ -813,36 +812,20 @@ func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (res
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		ctx = diagnosticAttemptContext(ctx, i+1)
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return res, err
 		}
-		// Acquire the pool lease explicitly so a caller deadline while waiting
-		// for capacity cannot be confused with a timeout from an issued write.
-		// No SQL exists until Conn.ExecContext below.
-		var conn *sql.Conn
-		acquire := diagnosticStart(ctx, "lease_acquire_total", "")
-		conn, err = d.sql.Conn(ctx)
-		acquire.end(err)
-		if err != nil {
+		var issued bool
+		res, err, issued = d.remoteExecAttempt(ctx, query, func() []any { return args })
+		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
 				return res, ctxErr
 			}
 			if d.retryable(err) && i+1 < d.attempts() {
 				continue
 			}
-			// Connection acquisition cannot have issued SQL. Even a broad EOF or
-			// timeout is a definite connection failure here, never outcome unknown.
-			return res, err
+			return res, err // admission/pool acquisition cannot have issued SQL
 		}
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = conn.Close()
-			return res, ctxErr
-		}
-		statement := diagnosticStart(ctx, "sql_exec", query)
-		res, err = conn.ExecContext(ctx, query, args...)
-		statement.end(err)
-		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
 		}
@@ -873,10 +856,7 @@ func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (res
 // For a lock deadline (`locked_until = now + lockDuration`) this is not cosmetic: the write can
 // otherwise commit a lease that has ALREADY EXPIRED, while still reporting success, and the
 // reaper then reclaims the message immediately (MQLITE-97).
-func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs func() []any) (result sql.Result, resultErr error) {
-	ctx = diagnosticOperationContext(ctx)
-	span := diagnosticStart(ctx, "write_total", query)
-	defer func() { span.end(resultErr) }()
+func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs func() []any) (sql.Result, error) {
 	if !d.remote { // local: one attempt; the wait is cancellable, the running statement is not
 		var res sql.Result
 		err := d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
@@ -888,9 +868,7 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 				return err
 			}
 			var e error
-			statement := diagnosticStart(ctx, "sql_exec", query)
 			res, e = c.ExecContext(ec, query, args...)
-			statement.end(e)
 			return e
 		})
 		return res, err
@@ -903,32 +881,20 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		ctx = diagnosticAttemptContext(ctx, i+1)
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return res, err
 		}
-		var conn *sql.Conn
-		acquire := diagnosticStart(ctx, "lease_acquire_total", "")
-		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
-		acquire.end(err)
-		if err != nil {
+		var issued bool
+		res, err, issued = d.remoteExecAttempt(ctx, query, buildArgs)
+		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
-				return res, ctxErr // acquiring a pool lease cannot have issued SQL
+				return res, ctxErr
 			}
 			if d.retryable(err) && i+1 < d.attempts() {
 				continue
 			}
 			return res, err
 		}
-		args := buildArgs()
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = conn.Close()
-			return res, ctxErr
-		}
-		statement := diagnosticStart(ctx, "sql_exec", query)
-		res, err = conn.ExecContext(ctx, query, args...)
-		statement.end(err)
-		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
 		}
@@ -950,23 +916,21 @@ func (d *db) queryFreshWriteUnobserved(ctx context.Context, query string, buildA
 	return d.queryFreshMode(ctx, query, buildArgs, scan, true)
 }
 
-func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error, write bool) (resultErr error) {
-	ctx = diagnosticOperationContext(ctx)
-	span := diagnosticStart(ctx, "read_or_returning_total", query)
-	defer func() { span.end(resultErr) }()
+func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error, write bool) error {
+	if d.remote && write {
+		return d.remoteReturningWrite(ctx, query, buildArgs, scan)
+	}
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			args := buildArgs() // then look again — see execFresh
 			if err := checkCtx(ctx); err != nil {
 				return err
 			}
-			statement := diagnosticStart(ctx, "sql_query", query)
 			rows, qerr := c.QueryContext(ec, query, args...)
-			statement.end(qerr)
 			if qerr != nil {
 				return qerr
 			}
-			serr := diagnosticScanRows(ctx, query, rows, scan)
+			serr := scan(rows)
 			_ = rows.Close()
 			return serr
 		})
@@ -978,14 +942,11 @@ func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() 
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		ctx = diagnosticAttemptContext(ctx, i+1)
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return err
 		}
 		var conn *sql.Conn
-		acquire := diagnosticStart(ctx, "lease_acquire_total", "")
 		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
-		acquire.end(err)
 		if err != nil {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
 				return ctxErr
@@ -1001,40 +962,17 @@ func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() 
 			return ctxErr
 		}
 		var rows *sql.Rows
-		statement := diagnosticStart(ctx, "sql_query", query)
 		rows, err = conn.QueryContext(ctx, query, args...)
-		statement.end(err)
 		if err != nil {
 			_ = conn.Close()
-			if write {
-				if d.retryableWrite(err) {
-					continue
-				}
-				if remoteWriteMayHaveCommitted(err) {
-					return unknownRemoteWrite(err)
-				}
-				return err
-			}
 			if d.retryable(err) {
 				continue
 			}
 			return err
 		}
-		err = diagnosticScanRows(ctx, query, rows, scan)
-		if write && err == nil {
-			err = rows.Err()
-		}
-		closeErr := rows.Close()
+		err = scan(rows)
+		_ = rows.Close()
 		_ = conn.Close()
-		if write {
-			if err == nil {
-				err = closeErr
-			}
-			if err != nil {
-				return unknownRemoteWrite(err)
-			}
-			return nil
-		}
 		if err == nil || !d.retryable(err) {
 			return err
 		}
@@ -1053,24 +991,19 @@ func (d *db) queryFreshReadUnobserved(ctx context.Context, query string, buildAr
 		if err := checkCtx(ctx); err != nil {
 			return err
 		}
-		statement := diagnosticStart(ctx, "sql_query", query)
 		rows, err := c.QueryContext(ec, query, args...)
-		statement.end(err)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
-		return diagnosticScanRows(ctx, query, rows, scan)
+		return scan(rows)
 	})
 }
 
 // queryRows is query for a LOCAL store: the rows are consumed inside scan, which is what lets the
 // connection be reserved — a cancellable wait, then an uninterruptible statement (see stmtCtx).
 // Returning *sql.Rows cannot do that: the rows would outlive the reservation.
-func (d *db) queryRowsUnobserved(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) (resultErr error) {
-	ctx = diagnosticOperationContext(ctx)
-	span := diagnosticStart(ctx, "read_or_returning_total", q)
-	defer func() { span.end(resultErr) }()
+func (d *db) queryRowsUnobserved(ctx context.Context, q string, scan func(*sql.Rows) error, args ...any) error {
 	if d.remote {
 		// Gate the WHOLE read — the query, the scan, and Rows.Close — not just the query call: the
 		// rows outlive d.query, so releasing the admission when query returns would let Close tear
@@ -1084,17 +1017,15 @@ func (d *db) queryRowsUnobserved(ctx context.Context, q string, scan func(*sql.R
 			return err
 		}
 		defer rows.Close()
-		return diagnosticScanRows(ctx, q, rows, scan)
+		return scan(rows)
 	}
 	return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
-		statement := diagnosticStart(ctx, "sql_query", q)
 		rows, err := c.QueryContext(ec, q, args...)
-		statement.end(err)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
-		return diagnosticScanRows(ctx, q, rows, scan)
+		return scan(rows)
 	})
 }
 
@@ -1104,13 +1035,10 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 	// No admission gate here: query only ever runs inside queryRows's remote branch, which holds the
 	// admission across the scan (the rows outlive this call, so gating here would release too early).
 	for i := 0; i < d.attempts(); i++ {
-		ctx = diagnosticAttemptContext(ctx, i+1)
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return rows, err
 		}
-		statement := diagnosticStart(ctx, "sql_query", query)
 		rows, err = d.sql.QueryContext(ctx, query, args...)
-		statement.end(err)
 		if err == nil || !d.retryable(err) {
 			return rows, err
 		}
@@ -1120,30 +1048,21 @@ func (d *db) query(ctx context.Context, query string, args ...any) (*sql.Rows, e
 
 // queryRowScan runs a single-row query and scans it, retrying connection errors.
 // Returns sql.ErrNoRows when there is no row.
-func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query string, args ...any) (resultErr error) {
-	ctx = diagnosticOperationContext(ctx)
-	span := diagnosticStart(ctx, "read_or_returning_total", query)
-	defer func() { span.end(resultErr) }()
+func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query string, args ...any) error {
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
-			statement := diagnosticStart(ctx, "sql_query", query)
 			rows, qerr := c.QueryContext(ec, query, args...)
-			statement.end(qerr)
 			if qerr != nil {
 				return qerr
 			}
 			defer rows.Close()
 			if !rows.Next() {
 				if cerr := rows.Err(); cerr != nil {
-					diagnosticMark(ctx, "sql_rows_error", query, cerr)
 					return cerr
 				}
 				return sql.ErrNoRows
 			}
-			span := diagnosticStart(ctx, "sql_scan", query)
-			err := rows.Scan(dest...)
-			span.end(err)
-			return err
+			return rows.Scan(dest...)
 		})
 	}
 	var err error
@@ -1153,14 +1072,11 @@ func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query strin
 	}
 	defer d.inFlight.Done()
 	for i := 0; i < d.attempts(); i++ {
-		ctx = diagnosticAttemptContext(ctx, i+1)
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return err
 		}
 		var rows *sql.Rows
-		statement := diagnosticStart(ctx, "sql_query", query)
 		rows, err = d.sql.QueryContext(ctx, query, args...)
-		statement.end(err)
 		if err != nil {
 			if d.retryable(err) {
 				continue
@@ -1171,7 +1087,6 @@ func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query strin
 			cerr := rows.Err()
 			rows.Close()
 			if cerr != nil {
-				diagnosticMark(ctx, "sql_rows_error", query, cerr)
 				err = cerr
 				if d.retryable(cerr) {
 					continue
@@ -1180,9 +1095,7 @@ func (d *db) queryRowScanUnobserved(ctx context.Context, dest []any, query strin
 			}
 			return sql.ErrNoRows
 		}
-		scanSpan := diagnosticStart(ctx, "sql_scan", query)
 		err = rows.Scan(dest...)
-		scanSpan.end(err)
 		rows.Close()
 		if err != nil && d.retryable(err) {
 			continue
@@ -1201,9 +1114,7 @@ func (d *db) queryRowScanReadUnobserved(ctx context.Context, dest []any, query s
 		return d.queryRowScanUnobserved(ctx, dest, query, args...)
 	}
 	return d.withReadConn(ctx, func(ec context.Context, c *sql.Conn) error {
-		statement := diagnosticStart(ctx, "sql_query", query)
 		rows, err := c.QueryContext(ec, query, args...)
-		statement.end(err)
 		if err != nil {
 			return err
 		}
@@ -1214,10 +1125,7 @@ func (d *db) queryRowScanReadUnobserved(ctx context.Context, dest []any, query s
 			}
 			return sql.ErrNoRows
 		}
-		scanSpan := diagnosticStart(ctx, "sql_scan", query)
-		err = rows.Scan(dest...)
-		scanSpan.end(err)
-		return err
+		return rows.Scan(dest...)
 	})
 }
 
@@ -1260,41 +1168,34 @@ func (t *txn) ctx() context.Context {
 }
 
 func (t *txn) ExecContext(_ context.Context, q string, args ...any) (sql.Result, error) {
-	span := diagnosticStart(t.caller, "sql_exec", q)
 	res, err := t.tx.ExecContext(t.ctx(), q, args...)
-	span.end(err)
 	if err != nil {
 		t.statementError = err
 	}
 	return res, err
 }
-func (t *txn) QueryContext(_ context.Context, q string, args ...any) (*diagnosticRows, error) {
-	span := diagnosticStart(t.caller, "sql_query", q)
+func (t *txn) QueryContext(_ context.Context, q string, args ...any) (*sql.Rows, error) {
 	rows, err := t.tx.QueryContext(t.ctx(), q, args...)
-	span.end(err)
 	if err != nil {
 		t.statementError = err
 	}
-	return diagnosticWrapRows(rows, t.caller, q, span), err
+	return rows, err
 }
 
 type transactionRow struct {
 	row   *sql.Row
 	owner *txn
-	span  diagnosticSpan
 }
 
 func (r transactionRow) Scan(dest ...any) error {
 	err := r.row.Scan(dest...)
-	r.span.end(err)
 	if err != nil {
 		r.owner.statementError = err
 	}
 	return err
 }
 func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) transactionRow {
-	span := diagnosticStart(t.caller, "sql_query_row_scan", q)
-	return transactionRow{row: t.tx.QueryRowContext(t.ctx(), q, args...), owner: t, span: span}
+	return transactionRow{row: t.tx.QueryRowContext(t.ctx(), q, args...), owner: t}
 }
 
 // SQL exposes the raw transaction for the one caller that needs it: Embedded.Tx, whose user
@@ -1303,12 +1204,10 @@ func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) transact
 func (t *txn) SQL() *sql.Tx { return t.tx }
 
 // commitAttempt keeps confirmed commits and their in-memory topology effects in
-// the same order. Remote transactions may overlap, so a delayed deletion reply
-// must publish retirement before a later creation publishes the reused name.
+// the same order. A deletion must publish retirement before a later creation
+// publishes the reused name, including when its commit acknowledgement is delayed.
 func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
-	wait := diagnosticStart(attempt.caller, "commit_mutex_wait", "")
 	e.commitMu.Lock()
-	wait.end(nil)
 	defer e.commitMu.Unlock()
 	// Waiting for the commit sequencer is not part of the database commit. If
 	// the caller stopped while queued here, no commit has started and the exact
@@ -1316,12 +1215,9 @@ func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
 	if err := checkCtx(attempt.caller); err != nil {
 		return err, true
 	}
-	commit := diagnosticStart(attempt.caller, "commit", "")
 	if err := attempt.tx.Commit(); err != nil {
-		commit.end(err)
 		return err, false
 	}
-	commit.end(nil)
 	e.observation.commit(attempt)
 	return nil, false
 }
@@ -1341,19 +1237,21 @@ func normalizeCanceledRemoteCommitError(ctx context.Context, err error) (error, 
 
 // inTx runs fn inside a transaction, retrying the whole transaction on a
 // connection error (the aborted tx leaves nothing committed, so retry is safe).
-func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) (resultErr error) {
-	ctx = diagnosticOperationContext(ctx)
-	span := diagnosticStart(ctx, "transaction_total", "")
-	defer func() { span.end(resultErr) }()
+func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) error {
+	return e.inTxMode(ctx, fn, false)
+}
+
+// inTxMode keeps lifecycle checks and the result in one snapshot. Only private
+// SELECT-only callbacks may bypass remote mutation admission; public Tx remains
+// a writer because its callback can issue arbitrary business-table mutations.
+func (e *Engine) inTxMode(ctx context.Context, fn func(context.Context, *txn) error, readOnly bool) error {
 	if !e.db.remote {
 		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
 		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
 		// still honours the caller's context, and an already-cancelled caller never begins at all.
 		return e.db.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			observationEpoch := e.observationEpoch()
-			begin := diagnosticStart(ctx, "begin_total", "")
 			tx, berr := c.BeginTx(ec, nil)
-			begin.end(berr)
 			if berr != nil {
 				return berr
 			}
@@ -1365,7 +1263,7 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			// single writer until it returns. Nothing BEGINS for a caller who has given up, and
 			// that includes the callback (codex).
 			if cerr := ctx.Err(); cerr != nil {
-				_ = diagnosticRollback(ctx, tx)
+				_ = tx.Rollback()
 				return cerr
 			}
 			// Deferred, not just on the error path: an Engine.Tx callback is USER code and it can
@@ -1373,12 +1271,9 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 			// transaction still open — and Close blocks on it forever, so the panic never reaches
 			// the caller and the process's one writer is wedged for good (codex). Rollback after a
 			// successful Commit is a no-op (ErrTxDone).
-			defer func() { _ = diagnosticRollback(ctx, tx) }()
+			defer func() { _ = tx.Rollback() }()
 			attempt := &txn{tx: tx, caller: ctx, exec: ec, observationEpoch: observationEpoch}
-			callback := diagnosticStart(ctx, "transaction_callback", "")
-			ferr := fn(ec, attempt)
-			callback.end(ferr)
-			if ferr != nil {
+			if ferr := fn(ec, attempt); ferr != nil {
 				return ferr
 			}
 			// The statements are protected from interruption; the TRANSACTION is not. A callback
@@ -1395,60 +1290,27 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		})
 	}
 	var err error
-	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	// Track the whole remote operation so Close waits for it and refuses new work.
+	// Each attempt takes write admission separately, after its cancellable backoff.
 	if !e.db.enter() {
 		return ErrClosed
 	}
 	defer e.db.inFlight.Done()
 	for i := 0; i < e.db.attempts(); i++ {
-		ctx = diagnosticAttemptContext(ctx, i+1)
 		if err = e.db.beforeRemoteAttempt(ctx, i); err != nil {
 			return err
 		}
 		if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
 			a.callbackRejected.Store(false)
 		}
-		var tx *sql.Tx
-		observationEpoch := e.observationEpoch()
-		begin := diagnosticStart(ctx, "begin_total", "")
-		tx, err = e.db.sql.BeginTx(ctx, nil)
-		begin.end(err)
-		if err != nil {
+		ferr, cerr, commitNotStarted, beginErr := e.remoteTransactionAttempt(ctx, fn, readOnly)
+		if beginErr != nil {
+			err = beginErr
 			if e.db.retryable(err) {
 				continue
 			}
 			return err
 		}
-		// BeginTx can finish at the same instant its context is canceled. Match
-		// the local contract: if the caller stopped before its callback begins,
-		// roll back the new transaction and never run application code.
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = diagnosticRollback(ctx, tx)
-			return ctxErr
-		}
-		// The rollback is deferred across BOTH the callback and the commit — scoped to the
-		// callback alone it would fire on the success path too, BEFORE Commit, silently rolling
-		// back every remote transaction (TestRemoteTxClosureCanBeReplayed caught exactly that).
-		// After a successful Commit it is a no-op (ErrTxDone); after a PANIC in fn it is what
-		// stops the transaction from being abandoned open.
-		//
-		// The two errors stay separate because they are not retryable on the same terms: a failed
-		// statement retries on any connection error (retryable), a failed COMMIT only when the
-		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
-		// replayable statement failures into ErrOutcomeUnknown.
-		var ferr, cerr error
-		var commitNotStarted bool
-		attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx), observationEpoch: observationEpoch}
-		func() {
-			defer func() { _ = diagnosticRollback(ctx, tx) }()
-			callback := diagnosticStart(ctx, "transaction_callback", "")
-			ferr = fn(e.db.stmtCtx(ctx), attempt)
-			callback.end(ferr)
-			if ferr != nil {
-				return
-			}
-			cerr, commitNotStarted = e.commitAttempt(attempt)
-		}()
 		if ferr != nil {
 			err = ferr
 			if e.db.retryable(err) {

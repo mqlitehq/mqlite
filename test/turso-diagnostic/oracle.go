@@ -46,38 +46,42 @@ func checkACK(seqs []int64, n int) error {
 }
 
 type identity struct {
-	ID               string `json:"id"`
-	SHA256           string `json:"sha256"`
-	Sequence         int64  `json:"confirmed_sequence,omitempty"`
-	ObservedSequence int64  `json:"observed_sequence,omitempty"`
-	Status           string `json:"send_status"`
-	Received         int    `json:"received"`
-	Settled          bool   `json:"settled"`
+	ID                 string `json:"id"`
+	SHA256             string `json:"sha256"`
+	Sequence           int64  `json:"confirmed_sequence,omitempty"`
+	ObservedSequence   int64  `json:"observed_sequence,omitempty"`
+	Status             string `json:"send_status"`
+	Received           int    `json:"received"`
+	Settled            bool   `json:"settled"`
+	SettlementEvidence string `json:"settlement_evidence,omitempty"`
 }
 type accounting struct {
-	Attempted         int        `json:"attempted_messages"`
-	Confirmed         int        `json:"confirmed_sends"`
-	SendUnknown       int        `json:"unknown_sends"`
-	SendRejected      int        `json:"rejected_sends"`
-	SendPending       int        `json:"pending_send_results"`
-	Received          int        `json:"received_deliveries"`
-	UniqueReceived    int        `json:"unique_received"`
-	Settled           int        `json:"confirmed_client_settlement_items"`
-	SettleUnknown     int        `json:"unknown_settlement_items"`
-	SettleRejected    int        `json:"rejected_settlement_items"`
-	Missing           int        `json:"missing_confirmed"`
-	UnknownObserved   int        `json:"unknown_sends_observed"`
-	UnknownUnobserved int        `json:"unknown_sends_unobserved"`
-	Duplicates        int        `json:"duplicate_deliveries"`
-	Unexpected        int        `json:"unexpected_deliveries"`
-	Corrupted         int        `json:"corrupted_deliveries"`
-	UnsettledObserved int        `json:"unsettled_observed_identities"`
-	OperationFailures int        `json:"operation_failures"`
-	Ledger            []identity `json:"identity_ledger"`
+	Attempted                      int        `json:"attempted_messages"`
+	Confirmed                      int        `json:"confirmed_sends"`
+	SendUnknown                    int        `json:"unknown_sends"`
+	SendRejected                   int        `json:"rejected_sends"`
+	SendPending                    int        `json:"pending_send_results"`
+	Received                       int        `json:"received_deliveries"`
+	UniqueReceived                 int        `json:"unique_received"`
+	Settled                        int        `json:"settled_identities"`
+	SettleUnknown                  int        `json:"unknown_settlement_items"`
+	SettleRejected                 int        `json:"rejected_settlement_items"`
+	Missing                        int        `json:"missing_confirmed"`
+	UnknownObserved                int        `json:"unknown_sends_observed"`
+	UnknownUnobserved              int        `json:"unknown_sends_unobserved"`
+	Duplicates                     int        `json:"duplicate_deliveries"`
+	Unexpected                     int        `json:"unexpected_deliveries"`
+	Corrupted                      int        `json:"corrupted_deliveries"`
+	UnsettledObserved              int        `json:"unsettled_observed_identities"`
+	OperationFailures              int        `json:"operation_failures"`
+	ConfirmedClientSettlementItems int        `json:"confirmed_client_settlement_items"`
+	ClientObservedCompleteResponse int        `json:"client_observed_complete_response"`
+	Ledger                         []identity `json:"identity_ledger"`
 }
 type identityBook struct {
 	mu                                                                                          sync.Mutex
 	ids                                                                                         map[string]*identity
+	explicitSettled, observedSettled                                                            int
 	received, settled, unknownSettle, rejectedSettle, duplicates, unexpected, corrupt, failures int
 }
 
@@ -168,6 +172,8 @@ func (b *identityBook) complete(ms []*delivery, mask []bool, err error) {
 		}
 		if id, found := b.ids[ms[i].ID]; found && !id.Settled {
 			id.Settled = true
+			id.SettlementEvidence = "explicit_client_result"
+			b.explicitSettled++
 			b.settled++
 		}
 	}
@@ -176,7 +182,7 @@ func (b *identityBook) failed() { b.mu.Lock(); b.failures++; b.mu.Unlock() }
 func (b *identityBook) snapshot() accounting {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	r := accounting{Received: b.received, Settled: b.settled, SettleUnknown: b.unknownSettle, SettleRejected: b.rejectedSettle, Duplicates: b.duplicates, Unexpected: b.unexpected, Corrupted: b.corrupt, OperationFailures: b.failures}
+	r := accounting{ConfirmedClientSettlementItems: b.explicitSettled, ClientObservedCompleteResponse: b.observedSettled, Received: b.received, Settled: b.settled, SettleUnknown: b.unknownSettle, SettleRejected: b.rejectedSettle, Duplicates: b.duplicates, Unexpected: b.unexpected, Corrupted: b.corrupt, OperationFailures: b.failures}
 	for _, id := range b.ids {
 		r.Attempted++
 		switch id.Status {
@@ -209,6 +215,15 @@ func (b *identityBook) snapshot() accounting {
 	return r
 }
 func (r accounting) valid(n int, s mq.Metrics) bool {
+	if len(r.Ledger) != n {
+		return false
+	}
+	for _, id := range r.Ledger {
+		if id.Status != "confirmed" || id.Sequence <= 0 || id.ObservedSequence != id.Sequence || id.Received != 1 || !id.Settled {
+			return false
+		}
+	}
+
 	return r.Attempted == n && n > 0 && r.Confirmed == n && r.SendUnknown == 0 && r.SendRejected == 0 && r.SendPending == 0 && r.Received == n && r.UniqueReceived == n && r.Settled == n && r.SettleUnknown == 0 && r.SettleRejected == 0 && r.UnsettledObserved == 0 && r.Missing == 0 && r.Duplicates == 0 && r.Unexpected == 0 && r.Corrupted == 0 && r.OperationFailures == 0 && s.Total == 0 && s.Active == 0 && s.Locked == 0 && s.Scheduled == 0 && s.Deferred == 0 && s.DeadLettered == 0
 }
 

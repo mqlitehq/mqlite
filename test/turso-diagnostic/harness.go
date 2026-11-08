@@ -41,6 +41,14 @@ type casePlan struct {
 
 func plans(mode string) []casePlan {
 	var ps []casePlan
+	if mode == "mixed" {
+		for _, sdk := range []string{"native", "low-floor"} {
+			for _, lock := range []int{3, 30} {
+				ps = append(ps, casePlan{ID: fmt.Sprintf("mixed_%s_lock%d", sdk, lock), SDK: sdk, Family: "mixed_receiver", Concurrency: 4, Batch: 16, Count: 68, Payload: 256, LockSeconds: lock, DedupSeconds: 3600, Background: true})
+			}
+		}
+		return ps
+	}
 	if mode == "quick" {
 		for _, p := range []struct {
 			id                 string
@@ -73,7 +81,7 @@ func plans(mode string) []casePlan {
 }
 
 func selectedPlans(mode, selection string) ([]casePlan, error) {
-	if mode != "quick" && mode != "contention" {
+	if mode != "quick" && mode != "contention" && mode != "mixed" {
 		return nil, oracle("invalid_mode")
 	}
 	ps := plans(mode)
@@ -99,35 +107,6 @@ type operationSample struct {
 	AdmissionWaitMS float64  `json:"admission_wait_ms"`
 	Failure         *failure `json:"failure,omitempty"`
 }
-type engineEvent struct {
-	OperationID string  `json:"operation_id"`
-	Attempt     int     `json:"attempt"`
-	Phase       string  `json:"phase"`
-	SQLTag      string  `json:"sql_tag"`
-	ElapsedMS   float64 `json:"elapsed_ms"`
-	ErrorClass  string  `json:"error_class"`
-}
-type engineCollector struct {
-	mu      sync.Mutex
-	events  []engineEvent
-	dropped uint64
-}
-
-func (c *engineCollector) add(e engine.DiagnosticEvent) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.events) >= 65536 {
-		c.dropped++
-		return
-	}
-	c.events = append(c.events, engineEvent{e.OperationID, e.Attempt, e.Phase, e.SQLTag, e.ElapsedMS, e.ErrorClass})
-}
-func (c *engineCollector) snapshot() ([]engineEvent, uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]engineEvent(nil), c.events...), c.dropped
-}
-
 type poolSnapshot struct {
 	MaxOpen   int     `json:"max_open"`
 	Open      int     `json:"open"`
@@ -143,6 +122,7 @@ func poolView(p sql.DBStats) poolSnapshot {
 
 type brokerEvent struct {
 	OperationID     string   `json:"operation_id"`
+	Method          string   `json:"method"`
 	Status          int      `json:"status"`
 	HeaderElapsedMS float64  `json:"headers_elapsed_ms"`
 	Failure         *failure `json:"failure,omitempty"`
@@ -156,6 +136,7 @@ type brokerTrace struct {
 	mu      sync.Mutex
 	events  []brokerEvent
 	dropped int
+	mixed   *mixedState
 }
 
 func (t *brokerTrace) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -173,13 +154,24 @@ func (t *brokerTrace) RoundTrip(r *http.Request) (*http.Response, error) {
 		s = resp.StatusCode
 	}
 	t.mu.Lock()
-	if len(t.events) < 4096 {
-		t.events = append(t.events, brokerEvent{id, s, float64(time.Since(start)) / float64(time.Millisecond), safeFailure(err)})
+	if len(t.events) < 65536 {
+		t.events = append(t.events, brokerEvent{OperationID: id, Method: brokerMethod(r.URL.Path), Status: s, HeaderElapsedMS: float64(time.Since(start)) / float64(time.Millisecond), Failure: safeFailure(err)})
 	} else {
 		t.dropped++
 	}
 	t.mu.Unlock()
+	if t.mixed != nil && err == nil {
+		t.mixed.observe(r, resp, start)
+	}
 	return resp, err
+}
+func brokerMethod(path string) string {
+	for _, method := range []string{"CreateQueue", "DeleteQueue", "ListQueues", "Send", "Receive", "Complete", "CompleteBatch", "Renew", "RenewBatch", "Peek", "Stats"} {
+		if path == "/mqlite.v1.QueueService/"+method {
+			return method
+		}
+	}
+	return "other"
 }
 func (t *brokerTrace) snapshot() ([]brokerEvent, int) {
 	t.mu.Lock()
@@ -292,17 +284,15 @@ type caseResult struct {
 	PoolWaitCountDelta       int64                 `json:"pool_wait_count_delta"`
 	Operations               []operationSample     `json:"operations"`
 	Latency                  map[string]latency    `json:"latency"`
-	EngineEvents             []engineEvent         `json:"engine_events"`
-	EnginePhaseTotalsMS      map[string]float64    `json:"engine_phase_totals_ms"`
-	EngineObserverDropped    uint64                `json:"engine_observer_dropped"`
-	EngineCollectorDropped   uint64                `json:"engine_collector_dropped"`
+	EnginePhaseTracing       bool                  `json:"engine_phase_tracing"`
+	Mixed                    *mixedResult          `json:"mixed,omitempty"`
 	BrokerHTTP               []brokerEvent         `json:"broker_http"`
 	BrokerHTTPDropped        int                   `json:"broker_http_dropped"`
 	Provider                 providerTraceSnapshot `json:"provider_http"`
 	ProviderQuiet            quietResult           `json:"provider_quiet_barrier"`
 	BackgroundLogs           map[string]int        `json:"background_log_event_counts"`
 	BackgroundErrors         int                   `json:"background_error_records"`
-	InstrumentationComplete  bool                  `json:"instrumentation_complete"`
+	InstrumentationComplete  bool                  `json:"provider_broker_trace_complete"`
 }
 type backendResult struct {
 	Alias         string                `json:"backend"`
@@ -329,7 +319,6 @@ func (p *caseProgress) call(parent context.Context, id, phase string, admission 
 	ctx, cancel := context.WithTimeout(parent, callerBudget)
 	defer cancel()
 	ctx = context.WithValue(ctx, operationKey{}, op)
-	ctx = engine.DiagnosticContext(ctx, op)
 	start := time.Now()
 	var waited time.Duration
 	if admission != nil {
@@ -382,9 +371,6 @@ func runBackendSelected(parent context.Context, b backend, mode, selection, run 
 	previous := http.DefaultTransport
 	http.DefaultTransport = provider
 	defer func() { http.DefaultTransport = previous }()
-	collector := &engineCollector{}
-	restore := engine.SetDiagnosticObserver(collector.add)
-	defer restore()
 	for i, p := range ps {
 		if ctx.Err() != nil {
 			r.Cases = append(r.Cases, caseResult{Plan: p, Status: "not_run_after_backend_budget", Blocked: true, Failure: &failure{Class: "backend_budget"}})
@@ -399,7 +385,7 @@ func runBackendSelected(parent context.Context, b backend, mode, selection, run 
 		progress := &caseProgress{book: newBook()}
 		caseCtx, cancelCase := context.WithTimeout(ctx, caseBudget)
 		done := make(chan caseResult, 1)
-		go func() { done <- runCase(caseCtx, b, p, q, provider, collector, progress, base, owned, i == 0) }()
+		go func() { done <- runCase(caseCtx, b, p, q, provider, progress, base, owned, i == 0) }()
 		cr := awaitCase(caseCtx, done, progress, p, q, joinBudget)
 		cancelCase()
 		r.Cases = append(r.Cases, cr)
@@ -442,13 +428,11 @@ func awaitCase(ctx context.Context, done <-chan caseResult, progress *caseProgre
 	}
 }
 
-func runCase(ctx context.Context, b backend, p casePlan, q string, provider *providerTrace, collector *engineCollector, progress *caseProgress, base *http.Transport, owned []ownedQueue, warm bool) (res caseResult) {
-	res = caseResult{Plan: p, Queue: q, Status: "failed", CallerBudgetSeconds: int(callerBudget / time.Second), EnginePhaseTotalsMS: map[string]float64{}}
+func runCase(ctx context.Context, b backend, p casePlan, q string, provider *providerTrace, progress *caseProgress, base *http.Transport, owned []ownedQueue, warm bool) (res caseResult) {
+	res = caseResult{Plan: p, Queue: q, Status: "failed", CallerBudgetSeconds: int(callerBudget / time.Second)}
 	phase := func(s string) { provider.SetPhase(p.ID + "/" + s) }
 	phase("open")
 	provider.SetDelay(0)
-	startEvents, _ := collector.snapshot()
-	dropBefore := engine.DiagnosticObserverDropped()
 	providerBefore := provider.Snapshot()
 	logger := &logCollector{counts: map[string]int{}}
 	dir := ""
@@ -463,17 +447,10 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 		dsn = "file:" + filepath.Join(dir, "queue.db")
 	}
 	started := time.Now()
-	eng, err := engine.Open(engine.DiagnosticContext(ctx, p.ID+"-open"), engine.Options{DB: dsn, AuthToken: b.token, DisableBackground: !p.Background, Logger: slog.New(logger)})
+	eng, err := engine.Open(ctx, engine.Options{DB: dsn, AuthToken: b.token, DisableBackground: !p.Background, Logger: slog.New(logger)})
 	res.OpenMS = float64(time.Since(started)) / float64(time.Millisecond)
 	if err != nil {
 		res.Failure = safeFailure(err)
-		barrier, stop := context.WithTimeout(context.Background(), joinBudget)
-		drainErr := engine.DiagnosticDrain(barrier)
-		stop()
-		events, dropped := collector.snapshot()
-		res.EngineEvents = append([]engineEvent(nil), events[len(startEvents):]...)
-		res.EngineCollectorDropped = dropped
-		res.EngineObserverDropped = engine.DiagnosticObserverDropped() - dropBefore
 		if b.Alias != "sqlite" {
 			quiet, stopQuiet := context.WithTimeout(context.Background(), joinBudget)
 			res.ProviderQuiet = waitProviderQuiet(quiet, provider.Snapshot, 200*time.Millisecond, 25*time.Millisecond)
@@ -481,7 +458,7 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 		}
 		res.Provider = providerDelta(providerBefore, provider.Snapshot())
 		res.OwnerReleased = res.Provider.Active == 0 && res.Provider.OpenBodies == 0 && (!res.ProviderQuiet.Required || res.ProviderQuiet.ObservedQuiet)
-		res.InstrumentationComplete = drainErr == nil && dropped == 0 && res.EngineObserverDropped == 0 && res.Provider.Dropped == 0
+		res.InstrumentationComplete = res.Provider.Dropped == 0
 		res.Blocked = !res.OwnerReleased
 		if res.Blocked {
 			res.Status = "blocked_open_owner"
@@ -546,16 +523,6 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 		if res.OwnerReleased && dir != "" {
 			_ = os.RemoveAll(dir)
 		}
-		barrier, stop := context.WithTimeout(context.Background(), joinBudget)
-		drainErr := engine.DiagnosticDrain(barrier)
-		stop()
-		events, collectorDropped := collector.snapshot()
-		res.EngineCollectorDropped = collectorDropped
-		res.EngineObserverDropped = engine.DiagnosticObserverDropped() - dropBefore
-		res.EngineEvents = append([]engineEvent(nil), events[len(startEvents):]...)
-		for _, e := range res.EngineEvents {
-			res.EnginePhaseTotalsMS[e.Phase] += e.ElapsedMS
-		}
 		res.Provider = providerDelta(providerBefore, provider.Snapshot())
 		if res.Provider.Active != 0 || res.Provider.OpenBodies != 0 {
 			res.Blocked = true
@@ -574,7 +541,7 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 		}
 		res.Operations = progress.operations()
 		res.Latency = latencies(res.Operations)
-		res.InstrumentationComplete = drainErr == nil && res.EngineCollectorDropped == 0 && res.EngineObserverDropped == 0 && res.Provider.Dropped == 0 && res.Provider.Active == 0 && res.Provider.OpenBodies == 0 && res.BrokerHTTPDropped == 0
+		res.InstrumentationComplete = res.Provider.Dropped == 0 && res.Provider.Active == 0 && res.Provider.OpenBodies == 0 && res.BrokerHTTPDropped == 0
 		if !res.InstrumentationComplete && res.Failure == nil {
 			res.Failure = &failure{Class: "instrumentation_incomplete"}
 		}
@@ -622,7 +589,7 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 			http.Error(w, "invalid diagnostic operation", 400)
 			return
 		}
-		handler.ServeHTTP(w, r.WithContext(engine.DiagnosticContext(r.Context(), id)))
+		handler.ServeHTTP(w, r)
 	}))
 	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
 	ts.Start()
@@ -633,7 +600,9 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 	}
 	phase("setup")
 	started = time.Now()
-	err = progress.call(ctx, p.ID, "create_queue", nil, func(call context.Context) error { return a.create(call, q, time.Duration(p.DedupSeconds)*time.Second) })
+	err = progress.call(ctx, p.ID, "create_queue", nil, func(call context.Context) error {
+		return a.createWithLock(call, q, time.Duration(p.DedupSeconds)*time.Second, time.Duration(p.LockSeconds)*time.Second)
+	})
 	res.SetupMS = float64(time.Since(started)) / float64(time.Millisecond)
 	if err != nil {
 		res.Failure = safeFailure(err)
@@ -643,12 +612,23 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 		res.PoolBefore = poolView(before)
 		phase("send")
 		started = time.Now()
-		runSend(ctx, a, p, q, progress)
-		res.SendMS = float64(time.Since(started)) / float64(time.Millisecond)
-		phase("drain")
-		started = time.Now()
-		runDrain(ctx, a, p, q, progress)
-		res.DrainMS = float64(time.Since(started)) / float64(time.Millisecond)
+		if p.Family == "mixed_receiver" {
+			res.Mixed, err = runMixed(ctx, a, p, q, progress, bt, provider, b.Alias != "sqlite")
+			if err != nil {
+				res.Failure = safeFailure(err)
+				if res.Mixed != nil && (!res.Mixed.ReceiverJoined || !res.Mixed.WorkersJoined) {
+					res.Blocked = true
+					return
+				}
+			}
+		} else {
+			runSend(ctx, a, p, q, progress)
+			res.SendMS = float64(time.Since(started)) / float64(time.Millisecond)
+			phase("drain")
+			started = time.Now()
+			runDrain(ctx, a, p, q, progress)
+			res.DrainMS = float64(time.Since(started)) / float64(time.Millisecond)
+		}
 		after := eng.DiagnosticPoolStats()
 		res.PoolAfter = poolView(after)
 		res.PoolWaitDeltaMS = float64(after.WaitDuration-before.WaitDuration) / float64(time.Millisecond)
@@ -659,7 +639,7 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 		res.FinalStatsValid = err == nil
 		if err != nil {
 			res.Failure = safeFailure(err)
-		} else if !progress.book.snapshot().valid(p.Count, res.FinalStats) {
+		} else if !progress.book.snapshot().valid(p.Count, res.FinalStats) && res.Failure == nil {
 			res.Failure = &failure{Class: "oracle_integrity_or_operation_failure"}
 		}
 		if err = progress.call(ctx, p.ID, "final_empty", nil, func(call context.Context) error { return a.empty(call, q) }); err != nil {
@@ -705,7 +685,7 @@ func cleanupOwned(eng *engine.Engine, alias, id, q string, owned []ownedQueue) c
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
 	defer cancel()
 	for attempt := 0; ctx.Err() == nil && attempt < 64; attempt++ {
-		d, e := eng.DeleteQueueWithOptions(engine.DiagnosticContext(ctx, id+"-cleanup"), q, engine.DeleteOptions{Force: true})
+		d, e := eng.DeleteQueueWithOptions(ctx, q, engine.DeleteOptions{Force: true})
 		if e != nil {
 			r.Failure = safeFailure(e)
 			return r
@@ -722,7 +702,7 @@ func cleanupOwned(eng *engine.Engine, alias, id, q string, owned []ownedQueue) c
 		r.Failure = &failure{Class: "cleanup_not_deleted"}
 		return r
 	}
-	_, e := eng.Stats(engine.DiagnosticContext(ctx, id+"-cleanup-readback"), q)
+	_, e := eng.Stats(ctx, q)
 	if errors.Is(e, engine.ErrQueueNotFound) {
 		r.AbsentReadback = true
 	} else if e != nil {

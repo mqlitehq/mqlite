@@ -11,8 +11,8 @@ import (
 	low "github.com/mqlitehq/mqlite-go"
 )
 
-// Only low-level Send/Receive/CompleteBatch are exercised. This is deliberately
-// not a managed Receiver benchmark, and neither SDK is retried by this harness.
+// Low-level profiles retain explicit settlement. Mixed mode uses the real
+// managed Receiver; the harness never manually settles its deliveries.
 type adapter struct {
 	name   string
 	native *mq.Client
@@ -47,10 +47,13 @@ func (a *adapter) close() {
 	}
 }
 func (a *adapter) create(ctx context.Context, q string, dedup time.Duration) error {
+	return a.createWithLock(ctx, q, dedup, 10*time.Minute)
+}
+func (a *adapter) createWithLock(ctx context.Context, q string, dedup, lock time.Duration) error {
 	if a.native != nil {
-		return a.native.CreateQueue(ctx, q, mq.QueueConfig{LockDuration: 10 * time.Minute, MaxDeliveryCount: 10, DedupWindow: dedup})
+		return a.native.CreateQueue(ctx, q, mq.QueueConfig{LockDuration: lock, MaxDeliveryCount: 10, DedupWindow: dedup})
 	}
-	return a.low.CreateQueue(ctx, q, low.QueueConfig{LockDuration: 10 * time.Minute, MaxDeliveryCount: 10, DedupWindow: dedup})
+	return a.low.CreateQueue(ctx, q, low.QueueConfig{LockDuration: lock, MaxDeliveryCount: 10, DedupWindow: dedup})
 }
 func (a *adapter) send(ctx context.Context, q string, ms []mq.OutMessage) ([]int64, error) {
 	if a.native != nil {
@@ -151,4 +154,15 @@ func (a *adapter) empty(ctx context.Context, q string) error {
 		return oracle("nonempty_stats")
 	}
 	return nil
+}
+
+func (a *adapter) runReceiver(ctx context.Context, q string, handler func(context.Context, *delivery) error, onError func(error)) error {
+	if a.native != nil {
+		return a.native.Receiver(q, mq.WithAutoRenew(), mq.WithConcurrency(4), mq.WithErrorHandler(onError)).Run(ctx, func(call context.Context, m *mq.Message) error {
+			return handler(call, &delivery{m.SequenceNumber, m.Body, m.MessageID, m.GroupID, m.CorrelationID, m.ReplyTo, m.Subject, m.ContentType, m.LockToken(), m.Properties, m.DeliveryCount, m.EnqueuedAt, m.LockedUntil})
+		})
+	}
+	return a.low.Receiver(q, low.WithAutoRenew(), low.WithConcurrency(4), low.WithErrorHandler(onError)).Run(ctx, func(call context.Context, m *low.Message) error {
+		return handler(call, &delivery{m.SequenceNumber, m.Body, m.MessageID, m.GroupID, m.CorrelationID, m.ReplyTo, m.Subject, m.ContentType, m.LockToken(), m.Properties, m.DeliveryCount, m.EnqueuedAt, m.LockedUntil})
+	})
 }

@@ -77,7 +77,7 @@ func TestOriginalProfilesRemainSeparateFromControls(t *testing.T) {
 }
 
 func TestCaseSelectionPreservesPlansAndRejectsAmbiguity(t *testing.T) {
-	for _, mode := range []string{"quick", "contention"} {
+	for _, mode := range []string{"quick", "contention", "mixed"} {
 		want := plans(mode)
 		all, err := selectedPlans(mode, "all")
 		if err != nil || !reflect.DeepEqual(all, want) {
@@ -323,17 +323,9 @@ func verifySQLiteMode(t *testing.T, mode string) {
 		if c.Status == "not_applicable_local_single_writer" {
 			continue
 		}
-		if !c.Workload.valid(c.Plan.Count, c.FinalStats) || !c.FinalStatsValid || !c.FinalPeekEmpty || !c.OwnerReleased || len(c.BrokerHTTP) == 0 || len(c.EngineEvents) == 0 || c.Provider.Observed != 0 {
+		if !c.Workload.valid(c.Plan.Count, c.FinalStats) || !c.FinalStatsValid || !c.FinalPeekEmpty || !c.OwnerReleased || len(c.BrokerHTTP) == 0 || c.EnginePhaseTracing || c.Provider.Observed != 0 {
 			t.Fatal("required accounting or HTTP evidence missing")
 		}
-		mapped := false
-		for _, e := range c.EngineEvents {
-			if strings.HasPrefix(e.OperationID, c.Plan.ID+"-send-") {
-				mapped = true
-			}
-		}
-		if !mapped {
-			t.Fatal("loopback SDK context was not mapped to engine operation")
-		}
+
 	}
 }

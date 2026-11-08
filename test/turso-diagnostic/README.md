@@ -1,179 +1,102 @@
-# Finite Turso performance attribution
+# Finite remote write acceptance
 
-This nested diagnostic module is opt-in (`mqlite_perf_diag`). It does not change
-the product's ordinary build or add the remote-only SDK to the main module.
-It compares a local SQLite control with the two explicitly approved test
-databases, using the same source, Go version, payload and operation budgets.
-It does not certify production capacity, a soak, managed `Receiver` behavior,
-power-loss durability, or all previous functional acceptance criteria.
+This opt-in nested module (`mqlite_perf_diag`) compares fresh local SQLite with
+two explicitly approved disposable remote databases. Product engine files match
+the source under test. `engine_phase_tracing` is false: the command observes
+public outcomes, provider/broker HTTP and local `database/sql.DBStats`, without
+private engine phase hooks. It does not certify production capacity, long soaks,
+power-loss durability or every functional scenario.
+
+## Modes and scope
+
+- `quick`: native SDK C1, B1/B16/B64, plus separate dedup-off and 75ms provider
+  delay controls. It measures bounded batch amplification.
+- `contention`: unchanged original native and low-floor SDK C1/B1, C1/B64,
+  C8/B1 and C32/B1 profiles. They send before draining, retain each worker's empty
+  Receive, one-hour dedup, ten-minute leases, background maintenance and ordinary
+  pool settings. Separate pool/admission controls cannot replace original results.
+- `mixed`: real managed Receivers in both SDKs, concurrency four, automatic
+  renewal and background maintenance. Each SDK runs a three-second and default
+  thirty-second lease case. Four seed handlers hold for six or twelve seconds.
+  After all four start, four separate B16 Sends add 64 new unique messages at
+  0.75/1.75/2.75/3.75 seconds (short lease), or 2/5/8/10 seconds (default lease).
+  This finite `periodic_b16` profile creates actual message INSERTs; it does not
+  substitute duplicate-ID read-only replays for write contention. A concurrent
+  Stats reader has a five-second sample deadline. New handlers take 50ms. Only
+  the Receiver settles messages. B64 batch acceptance remains in the other modes.
+
+Mixed cases require all 68 unique Send acknowledgements, exact bodies and
+headers, one delivery per identity, no unknown outcomes, handler cancellation,
+SDK error callback, duplicate or DLQ. On remote backends a successful Renew RPC interval must overlap a provider
+request tagged `message_insert`; absence is a coverage failure. Provider events
+and renewal intervals use a common local monotonic origin and expose their
+relative start/end milliseconds. SQLite has no provider HTTP and reports that
+coverage as not applicable; it still requires successful renewal and full SDK
+lifecycle and identity acceptance. Successful Complete responses are counted only
+when the SDK reads a complete valid 2xx body; this is explicitly named
+`client_observed_complete_response`, not an internal SDK settlement hook.
+Receiver cancellation/join, zero error callbacks and empty final metrics are
+independent acceptance checks. Explicit low-level client settlement results
+remain separate in the ledger.
+
+`--case all` keeps each mode's order. An exact case ID selects only that case;
+unknown, ambiguous and cross-mode selections fail before database access.
+The mixed IDs are `mixed_native_lock3`, `mixed_native_lock30`,
+`mixed_low-floor_lock3`, and `mixed_low-floor_lock30`. A focused PASS covers only
+the selected scope. SQLite always runs before selected remote backends. Remote
+pool controls are explicitly not applicable to SQLite's single-writer pool.
 
 ## Safety and reproducibility
 
-- Remote access is possible only through the `MQLITE_DIAG_STANDARD_DB` /
-  `MQLITE_DIAG_STANDARD_TOKEN` and `MQLITE_DIAG_RUST_DB` /
-  `MQLITE_DIAG_RUST_TOKEN` environment variables. Database DSNs must match
-  the two fixed SHA-256 allowlist constants. No URL, token or allowlist override
-  is accepted through command-line or workflow inputs.
-- Any presence of `MQLITE_TEST_DB` or `MQLITE_TEST_DB_RESET_CONFIRM`, including
-  an empty value, refuses the run. The command does not run engine `TestMain`,
-  drop tables, reset the schema, or delete other queues. Normal `engine.Open`
-  still performs its ordinary compatible initialization and startup recovery.
-- A manifest lists every exact queue name before the first engine opens. Every
-  queue has an unpredictable run namespace. Cleanup accepts only an exact
-  `(backend, case, queue)` entry in this manifest, force-deletes that queue,
-  requires `Deleted && State == "deleted"`, then verifies queue-not-found by
-  readback. A failed test stays failed after cleanup. Cleanup can discard this
-  run's retained messages and never makes unknown outcomes successful.
-  An output directory containing prior run/preflight evidence is refused, so a
-  rerun cannot overwrite an earlier FAIL with a later PASS.
-- SQLite, standard Turso and Rust Turso run sequentially. Every case closes its
-  HTTP server and engine before the next owner opens. An outer timeout, unjoined
-  request, driver or Close blocks all remaining owners. A pending send result is
-  recorded as pending; it is not called rejected or acknowledged.
-  The pinned driver also starts private close-only HTTP goroutines. After Close,
-  remote cases require 200ms of unchanged HTTP counters with no active request
-  or open body, bounded by ten seconds. `owner_released` means the engine Close
-  returned and this observable HTTP barrier passed; it **does not prove that
-  private driver goroutines were joined**. That limitation is explicit in the
-  artifact. A failed quiet barrier blocks subsequent owners.
-- Each SDK API call keeps a **180 second caller deadline**. A case has a seven
-  minute outer watchdog; each backend has an eighteen minute outer budget.
-  Cancellation gets a bounded ten second join. A stuck process is also bounded
-  by the Actions process/job watchdogs. Shortening product retries or deadlines
-  to make a run pass is outside this diagnostic.
-  Long all-case runs can exhaust that backend budget. Follow-up attribution
-  should dispatch an exact case, rather than enlarge the budget or reinterpret
-  a canceled case as a completed workload.
-- The workflow is manual-only, contents-read, does not persist checkout
-  credentials, fixes Go 1.27.3 and SDK commit `316b01c`, verifies the exact
-  workflow source and ancestry of frozen base `e27f4ce`, and uses the existing
-  `turso-verification-db` concurrency group with cancellation disabled. This
-  serializes Actions users of that group; external owners still need coordination.
+Remote URLs and tokens come only from `MQLITE_DIAG_STANDARD_DB` /
+`MQLITE_DIAG_STANDARD_TOKEN` and `MQLITE_DIAG_RUST_DB` /
+`MQLITE_DIAG_RUST_TOKEN`. Original DSN spellings must match fixed SHA-256
+allowlists. No command-line/workflow target or allowlist override exists.
+Presence of legacy `MQLITE_TEST_DB` or `MQLITE_TEST_DB_RESET_CONFIRM`, even empty,
+refuses execution. This executable never runs engine TestMain or resets tables.
+Normal compatible engine initialization and startup recovery still apply.
 
-## Modes
+An unpredictable namespace and exact `(backend, case, queue)` manifest are
+written before any owner opens. Cleanup deletes only an exact manifest entry,
+requires a completed deletion and queue-not-found readback, and never rewrites
+failure/unknown outcomes into success. Existing evidence directories are refused.
+Each owner closes before the next opens. Remote Close additionally requires a
+200ms stable HTTP observation window with zero active requests/open bodies,
+bounded by ten seconds. This observable barrier does not claim to join private
+driver goroutines. An unjoined owner blocks all later cases.
 
-SQLite runs first. `--backend standard`, `rust`, or `both` selects the dedicated
-remote comparisons. `--backend local` is hermetic and uses only fresh temporary
-SQLite files. It is not exposed as a dispatch choice.
+SDK calls retain a 180-second caller deadline; cases have seven-minute and
+backends eighteen-minute watchdogs. Mixed read samples use the stated five-second
+bound. Cancellation/join is bounded by ten seconds. An outer watchdog or partial
+artifact is failure, never a completed workload. Focused runs do not enlarge
+these budgets. Provider events are bounded at 65,536 per backend; broker events
+at 65,536 per case. Any drops prevent PASS. Request/response inspection is bounded
+at one MiB to accommodate B64 batches without publishing SQL, arguments or bodies.
 
-`--case all` is the default and retains the original case order and settings.
-`--case <exact-id>` runs only that case from the selected mode; unknown IDs,
-cross-mode IDs, empty values and whitespace/list variants are refused before
-the first engine opens. The manifest contains only the selected queues and
-`case_selection` in the manifest/report records the scope. A focused PASS is
-not acceptance of the omitted profiles. SQLite pool controls remain explicitly
-not applicable, including when one is the only selected case.
+Only allowlisted JSON artifacts are public: identities/content hashes, safe error
+classes, per-call latency, provider statement/HTTP counts and transport timing,
+EOF/Close/late/drop counters, DBStats deltas, final metrics and cleanup evidence.
+No URL, credential, lock token, SQL text, raw error, header or message body is
+published. Default logging is suppressed; raw logs remain private on ephemeral
+runners. Proxy configuration is a presence boolean only. Instrumentation copies
+bounded bytes, so timings are not a zero-overhead benchmark. TTFB combines network
+and service work; provider connection wait is not SQL-pool wait. Concurrent and
+background provider events have case/phase correlation, not invented operation
+attribution or summed private engine phases.
 
-The manual workflow's `case_id` choices expose all contention case IDs. Use
-`mode=contention` for a non-`all` workflow selection. Its early
-`--validate-selection-only` call requires no credentials, writes no artifacts
-and accesses no database; it rejects an incompatible selection before the
-read-only protocol baseline and before the separately scoped interrupted-queue
-cleanup. Failure of that exact cleanup blocks every new workload owner.
-
-`quick` runs only the native SDK, through a real loopback HTTP broker. It is a
-small attribution experiment, **not acceptance of the original four profiles**:
-
-| Case | Concurrency | Batch / exact messages | Dedup | Background |
-|---|---:|---:|---:|---|
-| isolated B1 | 1 | 1 / 16 | 1 hour | off |
-| isolated B16 | 1 | 16 / 16 | 1 hour | off |
-| isolated B64 | 1 | 64 / 64 | 1 hour | off |
-| separate dedup-off B16 control | 1 | 16 / 16 | off | off |
-| separate provider-delay B16 control | 1 | 16 / 16 | 1 hour | off |
-
-The last case injects 75ms **before each matching provider HTTP request**, only
-during send/drain. Actual delay, not-sent requests and network/request time are
-reported separately. SQLite has zero provider HTTP and receives no artificial
-delay. This control measures HTTP amplification; it is not a weak-network or
-failure-recovery certification.
-
-`contention` preserves the V11 performance workload for **both** native and
-remote-only SDKs, with a 256-byte payload, one-hour dedup, ten-minute locks,
-ordinary background maintenance and the original database pool defaults:
-
-| Original profile | Concurrency | Batch | Exact messages |
-|---|---:|---:|---:|
-| C1/B1 | 1 | 1 | 16 |
-| C1/B64 | 1 | 64 | 64 |
-| C8/B1 | 8 | 1 | 32 |
-| C32/B1 | 32 | 1 | 32 |
-
-The original send-then-drain structure, each worker's empty Receive, full-content
-oracle, all failures and caller deadline remain. This is low-level
-`Receive` plus real client `CompleteBatch` acknowledgement, **not managed
-`Receiver.Run` throughput**. Additional native C32/B1 pool-1, pool-4 and
-admission-1 counterfactuals have separate case IDs and cannot replace a failed
-original. Pool-limit controls are explicitly not applicable to local SQLite;
-its single-writer invariant is preserved.
-
-## Evidence and interpretation
-
-The first case of each backend records two fixed `SELECT 1` warmup calls and
-five measured calls outside setup and workload timing. Open, setup, send, drain
-and Close are separate. The workflow also runs a separate read-only protocol
-baseline before any MQLite owner; any baseline failure stops the later workload.
-
-Every operation retains an exact, bounded sample, an opaque ID and a safe error
-class. Quantiles use the documented floor-rank method over all samples; they
-are not clipped at 100ms. A loopback-only diagnostic header maps API operations
-to tag-only engine contexts. It is not a product or provider request header.
-Provider HTTP observations are correlated to case/phase; simultaneous worker
-and background calls are **not** assigned a fabricated exact operation ID.
-Instrumentation adds callbacks and bounded copying, so these diagnostic timings
-are not a zero-overhead production benchmark.
-
-The public artifact contains:
-
-- an identity ledger with acknowledged and observed sequences, send result,
-  receive count, content hash and real per-item client settlement result;
-- explicit unknown, rejected, pending, missing, duplicate, corrupt, unsettled and
-  DLQ counts, final stats/readback and exact-queue cleanup evidence;
-- API latency, provider HTTP counts, connection reuse, DNS/TCP/TLS/TTFB/body and
-  separately measured synthetic delay; EOF, Close, active bodies, late completion
-  and dropped trace samples remain visible;
-- engine attempt, BEGIN, statement, callback, commit-mutex, COMMIT, rollback and
-  total spans, plus before/after local `database/sql.DBStats` counters.
-
-Provider observations have a finite 65,536-event bound per backend. If it is
-exhausted, the dropped count still makes instrumentation incomplete and prevents
-a PASS. The larger bound and focused runs avoid repeating the prior 8,192-event
-overflow; they do not retroactively validate that earlier incomplete trace.
-
-`DBStats.WaitDuration` is an aggregate workload pool counter. HTTP GetConn wait
-is a different measure. `begin_total` includes pool acquisition plus driver
-BEGIN. SQL/row lifetime, transaction and total spans overlap and **must not be
-summed as disjoint service stages**. TTFB includes network and server processing;
-it is not pure network RTT. Dedup `no_rows` is an expected lookup result, not
-automatically an operation failure. The public Observability API is not polled
-inside timing windows because it would add database queries.
-
-`passed` requires the exact requested identity count, all positive Send ACKs,
-one intact delivery per identity, every client CompleteBatch item acknowledged,
-no operation/unknown/accounting failure, empty final queue including DLQ,
-joined owner, complete tracing and confirmed cleanup. No later control or
-successful retry rewrites an earlier failed case. Missing/partial artifact data
-or a watchdog exit must not be interpreted as success.
-
-Only the fixed public JSON directory is uploaded. Default logs are suppressed,
-and unfiltered process logs stay private on the ephemeral runner. Artifacts never
-contain provider URLs, credentials, SQL text, headers, response bodies, raw error
-strings, message bodies or local secret files. Proxy configuration is recorded
-only as a presence boolean. The test does not change proxy or TLS configuration.
+The manual-only registered workflow fixes source identity, Go 1.27.3 and SDK
+`316b01c`, verifies frozen-base ancestry and all 70 production non-test Go files against
+reviewed product commit `5d71a14`, uses contents-read permissions and the
+shared `turso-verification-db` concurrency group without cancellation. It does
+not deploy. Do not substitute destructive nightly/soak suites for this command.
 
 ## Hermetic commands
 
-Run from this directory with the adjacent `sdk-src` checkout at the pinned SDK
-commit. These commands do not need remote credentials:
+Run in this directory with the pinned adjacent `sdk-src` checkout:
 
 ```sh
 go test -race -tags mqlite_perf_diag -count=1 -timeout=240s ./...
 go vet -tags mqlite_perf_diag ./...
-go run -tags mqlite_perf_diag . --backend local --mode quick --out /tmp/mqlite-diag-public
-go run -tags mqlite_perf_diag . --validate-selection-only --mode contention --case original_native_c32_b1
-go run -tags mqlite_perf_diag . --backend local --mode contention --case original_native_c32_b1 --out /tmp/mqlite-diag-focused-public
+go run -tags mqlite_perf_diag . --validate-selection-only --mode mixed --case mixed_native_lock3
+go run -tags mqlite_perf_diag . --backend local --mode mixed --out /tmp/mqlite-mixed-public
 ```
-
-Live execution is maintainer-controlled through the manual workflow on this
-test branch. Do not dispatch main's ordinary nightly or soak workflow as a
-substitute: those use the destructive integration harness.

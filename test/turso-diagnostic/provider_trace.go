@@ -25,7 +25,7 @@ import (
 
 const (
 	maxProviderTraceEvents  = 65536
-	maxProviderInspectBytes = 64 << 10
+	maxProviderInspectBytes = 1 << 20
 )
 
 type providerHTTPEvent struct {
@@ -36,6 +36,8 @@ type providerHTTPEvent struct {
 	ClosePhase                  string   `json:"close_phase,omitempty"`
 	HTTPStatus                  int      `json:"http_status"`
 	Finished                    bool     `json:"finished"`
+	StartedMS                   float64  `json:"started_ms"`
+	FinishedMS                  float64  `json:"finished_ms"`
 	HTTPMS                      float64  `json:"http_ms"`
 	HeadersMS                   float64  `json:"headers_ms"`
 	ConnWaitMS                  float64  `json:"conn_wait_ms"`
@@ -99,6 +101,7 @@ type providerEventState struct {
 }
 
 type providerTrace struct {
+	origin     time.Time
 	next       http.RoundTripper
 	host       string
 	port       string
@@ -136,7 +139,7 @@ func newProviderTrace(targetDSN string, next http.RoundTripper) (*providerTrace,
 	if next == nil {
 		next = http.DefaultTransport
 	}
-	return &providerTrace{next: next, host: strings.ToLower(u.Hostname()), port: port, phase: "unassigned"}, nil
+	return &providerTrace{origin: time.Now(), next: next, host: strings.ToLower(u.Hostname()), port: port, phase: "unassigned"}, nil
 }
 
 // Phase is a diagnostic case label, not a request/transaction correlation ID.
@@ -214,6 +217,7 @@ func (p *providerTrace) finishLocked(s *providerEventState, err error) {
 	}
 	s.finished = true
 	s.e.Finished = true
+	s.e.FinishedMS = providerMillis(time.Since(p.origin))
 	s.e.FinishPhase = p.phase
 	s.e.ErrorClass = providerErrorClass(err)
 	if !s.started.IsZero() {
@@ -275,6 +279,7 @@ func (p *providerTrace) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	s.started = time.Now()
+	s.e.StartedMS = providerMillis(s.started.Sub(p.origin))
 	p.sent++
 	p.mu.Unlock()
 	var connStart, dnsStart, tlsStart time.Time
