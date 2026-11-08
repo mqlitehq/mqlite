@@ -29,6 +29,7 @@ const (
 )
 
 type providerHTTPEvent struct {
+	BrokerRequestID             uint64   `json:"broker_request_id"`
 	ID                          uint64   `json:"id"`
 	Phase                       string   `json:"phase"`
 	FinishPhase                 string   `json:"finish_phase,omitempty"`
@@ -197,7 +198,7 @@ func (p *providerTrace) Snapshot() providerTraceSnapshot {
 	defer p.mu.Unlock()
 	r := providerTraceSnapshot{Dropped: p.dropped, Observed: p.observed, Sent: p.sent, NotSent: p.notSent, Finished: p.finished, Active: p.active, OpenBodies: p.openBodies, LateEOF: p.lateEOF, LateClose: p.lateClose,
 		ConnectionWaitMeaning: "GetConn-to-GotConn HTTP acquisition, including connection setup; not database/sql pool wait. Timing spans can overlap.",
-		CorrelationMeaning:    "Case/phase attribution only. No request or transaction ID is inferred when driver contexts are absent.",
+		CorrelationMeaning:    "A nonzero broker_request_id is inherited only from a verified loopback request context. Missing context remains zero with case/phase attribution; transaction identity and private queue order are not inferred.",
 		SentMeaning:           "Sent counts calls to the underlying RoundTripper, not proof that bytes reached the provider.",
 		BodyTimingMeaning:     "Body time includes client read scheduling and ends at EOF, read error or Close; HTTP time excludes synthetic delay.",
 		StatementCountMeaning: "Declared protocol statement slots, not proof of server execution or commit."}
@@ -239,7 +240,7 @@ func (p *providerTrace) RoundTrip(req *http.Request) (*http.Response, error) {
 	inspection := inspectProviderRequest(req)
 	p.mu.Lock()
 	p.observed++
-	s := &providerEventState{expected: inspection.expected, e: providerHTTPEvent{ID: p.observed, Phase: p.phase, ErrorClass: "none", CloseErrorClass: "none", ServerTiming: "not_observed", RequestInspection: inspection.state, StatementCount: inspection.statements, CloseCount: inspection.closes, SQLKinds: inspection.kinds, SQLTags: inspection.tags}}
+	s := &providerEventState{expected: inspection.expected, e: providerHTTPEvent{BrokerRequestID: verifiedBrokerRequestID(req.Context()), ID: p.observed, Phase: p.phase, ErrorClass: "none", CloseErrorClass: "none", ServerTiming: "not_observed", RequestInspection: inspection.state, StatementCount: inspection.statements, CloseCount: inspection.closes, SQLKinds: inspection.kinds, SQLTags: inspection.tags}}
 	_, s.e.ContextHasDeadline = req.Context().Deadline()
 	delay := p.delay
 	s.e.SyntheticDelayMS = providerMillis(delay)

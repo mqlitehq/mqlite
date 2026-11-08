@@ -12,13 +12,39 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Renew managed leases through settlement confirmation (MQLITE-180)
+
+- With auto-renew enabled, continue the heartbeat while Complete or Abandon
+  waits for its exact acknowledgement, within the existing 30-second confirmation
+  budget. Canceling Run still cancels a running handler; a returned handler's
+  bounded settlement and heartbeat are joined before its worker is released.
+- A renewal may lose its token after the same settlement committed. Resolve
+  that ownership race through the settlement acknowledgement or receipt replay,
+  retaining its definitive error or outcome-unknown status. Permanent renewal
+  failures still stop receiving immediately.
+- Give remote renewal attempts a separate FIFO ahead of settlements, yielding
+  after four renewals. Settlement priority also remains bounded so ordinary
+  writes and maintenance can progress. Local storage and lease fencing are unchanged.
+
+### Exclude broker processing from lease clock uncertainty (MQLITE-179)
+
+- Return `X-Mqlite-Server-Elapsed-Ms`, a monotonic lower bound on processing time
+  before the broker clock stamp. The managed Go client deducts a valid value from
+  clock uncertainty, so storage waits and long polls do not shorten a lease twice.
+- Preserve the full measured RPC duration for renewal scheduling and request
+  budgets. Missing, repeated, malformed or excessive elapsed values retain the
+  conservative full-RTT clock bound. Older clients ignore the additive header.
+
 ### Serialize remote write attempts and batch Send transport (MQLITE-175)
 
 - Queue remote mutations before acquiring a provider connection, retaining read
   capacity and giving renewals and settlements bounded priority. Cancellation
   and shutdown release queued work; an issued transaction keeps its permit until
   its SQL lease returns. Retry backoff does not hold the permit. Local storage
-  and the four-connection remote pool limit are unchanged.
+  and the four-connection remote pool limit are unchanged. Remote `Tx` callbacks
+  hold admission until their attempt finishes; use the supplied transaction for
+  business writes and enqueueing, and finish the callback before waiting for
+  another mutation through the same owner.
 - Transport direct HTTP Hrana queue batches in bounded parameterized groups,
   retaining input-to-sequence mapping, deduplication decisions and a single
   transaction commit. A failure in any group rolls back the whole Send. Topic
@@ -26,6 +52,8 @@ upgrade notes before replacing a broker.
 - Ambiguous commit acknowledgements remain outcome-unknown. Write admission
   cannot preempt a running transaction, so network latency and batch size still
   need to fit the application's lease and request budgets.
+
+### Preserve provider HTTP write outcomes
 
 - Recognize pinned libSQL provider HTTP failures through single-cause driver
   wrappers, including newline-wrapped 502 responses. Reads and transactions that

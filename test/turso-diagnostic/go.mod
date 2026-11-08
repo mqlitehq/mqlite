@@ -27,4 +27,4 @@ require (
 
 replace github.com/mqlitehq/mqlite => ../..
 
-replace github.com/mqlitehq/mqlite-go => ../../../sdk-src
+replace github.com/mqlitehq/mqlite-go => ../../../sdk-source

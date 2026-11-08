@@ -27,12 +27,22 @@ power-loss durability or every functional scenario.
 
 Mixed cases require all 68 unique Send acknowledgements, exact bodies and
 headers, one delivery per identity, no unknown outcomes, handler cancellation,
-SDK error callback, duplicate or DLQ. On remote backends a successful Renew RPC interval must overlap a provider
-request tagged `message_insert`; absence is a coverage failure. Provider events
-and renewal intervals use a common local monotonic origin and expose their
-relative start/end milliseconds. SQLite has no provider HTTP and reports that
-coverage as not applicable; it still requires successful renewal and full SDK
-lifecycle and identity acceptance. Successful Complete responses are counted only
+SDK error callback, duplicate or DLQ. On remote backends a successful Renew must
+start while the loopback broker has already received a real new Send and has
+not returned that Send's response headers. The same Send must execute a complete,
+strictly successful `message_insert` provider request and return its client ACK.
+The observer correlates only a unique HTTP request ID validated against the
+loopback trace's current in-flight method/path/operation registry, then inherited
+through the actual request context into the SQL driver. Missing/unverified
+context remains ID zero; unrelated requests and read-only dedup replays cannot
+satisfy coverage. Every evidence item records the request ID and relative timing.
+This proves a successful renewal coexisted with a pending real write request;
+it does not infer private admission state or require INSERT execution to overlap
+renewal. Priority renewal may correctly run before that queued Send's INSERT.
+The original strict SQL-INSERT/Renew interval intersection remains a secondary
+statistic. No correlated witness is a coverage failure, separate from message
+integrity. SQLite has no provider HTTP and reports coverage not applicable while
+still requiring renewal and full SDK lifecycle/identity acceptance. Successful Complete responses are counted only
 when the SDK reads a complete valid 2xx body; this is explicitly named
 `client_observed_complete_response`, not an internal SDK settlement hook.
 Receiver cancellation/join, zero error callbacks and empty final metrics are
@@ -86,19 +96,21 @@ No URL, credential, lock token, SQL text, raw error, header or message body is
 published. Default logging is suppressed; raw logs remain private on ephemeral
 runners. Proxy configuration is a presence boolean only. Instrumentation copies
 bounded bytes, so timings are not a zero-overhead benchmark. TTFB combines network
-and service work; provider connection wait is not SQL-pool wait. Concurrent and
-background provider events have case/phase correlation, not invented operation
-attribution or summed private engine phases.
+and service work; provider connection wait is not SQL-pool wait. A nonzero
+`broker_request_id` proves only the verified context association described above.
+Events without that context (including background work) retain case/phase
+correlation; no transaction identity, private queue order or engine phases are
+invented.
 
 The manual-only registered workflow fixes source identity, Go 1.27.3 and SDK
-`316b01c`, verifies frozen-base ancestry and all 70 production non-test Go files against
-reviewed product commit `5d71a14`, uses contents-read permissions and the
+`5b2d471`, verifies frozen-base ancestry and all 70 production non-test Go files against
+reviewed product commit `fb6e7de`, uses contents-read permissions and the
 shared `turso-verification-db` concurrency group without cancellation. It does
 not deploy. Do not substitute destructive nightly/soak suites for this command.
 
 ## Hermetic commands
 
-Run in this directory with the pinned adjacent `sdk-src` checkout:
+Run in this directory with the pinned adjacent `sdk-source` checkout:
 
 ```sh
 go test -race -tags mqlite_perf_diag -count=1 -timeout=240s ./...

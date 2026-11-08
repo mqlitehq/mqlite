@@ -241,7 +241,7 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	// execFresh, not exec: a remote retry backs off, so a deadline computed once — before the
 	// loop — could commit a lease that has already expired by the time the write that actually
 	// lands runs (MQLITE-97). It is measured against the clock of each attempt.
-	res, err := e.db.execFresh(e.leaseWriteContext(ctx),
+	res, err := e.db.execFresh(e.renewWriteContext(ctx),
 		// MAX(): a renewal only ever extends a lease. A racing renewal writing an older deadline
 		// would otherwise shorten a lock that had already been pushed further out.
 		`UPDATE messages SET locked_until=MAX(locked_until, ?)
@@ -389,7 +389,7 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 	deadlines := make(map[string]int64, len(rows)) // the committed locked_until, per (seq, token)
 	pairs := strings.Repeat(",(?,?)", len(rows))[1:]
 	args := pairArgs(queue, rows)
-	err = e.db.queryFreshWrite(e.leaseWriteContext(ctx),
+	err = e.db.queryFreshWrite(e.renewWriteContext(ctx),
 		// MAX(locked_until, ?): a renewal may only ever EXTEND a lease, never pull it back. Two
 		// renewals can race (a retry, a concurrent renewer), and the loser writing its older
 		// deadline would shorten a lock the winner had already pushed out.

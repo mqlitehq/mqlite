@@ -65,8 +65,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: mqlitehq/mqlite-go
-          ref: 316b01c569dfa66afd73262c96c9160d72395a6e
-          path: sdk-src
+          ref: 5b2d47142f8cfdafd73cf1b7d3cb9ea8473d0cc0
+          path: sdk-source
           persist-credentials: false
       - uses: actions/setup-go@v7
         with:
@@ -82,14 +82,14 @@ jobs:
           def git(path, *args):
               return subprocess.check_output(["git", "-C", path, *args], text=True).strip()
           source = git("source", "rev-parse", "HEAD")
-          sdk = git("sdk-src", "rev-parse", "HEAD")
+          sdk = git("sdk-source", "rev-parse", "HEAD")
           base = "e27f4ce6ded287ecf43f770c762a4017fb533049"
-          production = "5d71a144081c27fbc3e631e04d95b735625f5c11"
+          production = "fb6e7deb636049d1a468c51c84287ae7815ac471"
           assert source == os.environ["EXPECTED_SOURCE"], "unexpected source identity"
-          assert sdk == "316b01c569dfa66afd73262c96c9160d72395a6e", "unexpected SDK identity"
+          assert sdk == "5b2d47142f8cfdafd73cf1b7d3cb9ea8473d0cc0", "unexpected SDK identity"
           subprocess.run(["git", "-C", "source", "merge-base", "--is-ancestor", base, source], check=True)
           assert not git("source", "status", "--porcelain"), "source is dirty"
-          assert not git("sdk-src", "status", "--porcelain"), "SDK is dirty"
+          assert not git("sdk-source", "status", "--porcelain"), "SDK is dirty"
           # Fetch only the reviewed public product commit; no DB access occurs.
           subprocess.run(["git", "-C", "source", "fetch", "--no-tags", "origin", production],
                          check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

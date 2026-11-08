@@ -176,11 +176,12 @@ func TestManagedReceiverObserverCloseUnblocksConcurrentRead(t *testing.T) {
 }
 
 func TestMixedSnapshotOwnsMutableErrorMapAndIntervals(t *testing.T) {
-	state := &mixedState{result: mixedResult{ReceiverErrorClasses: map[string]int{"busy": 1}, RenewalRPCIntervals: []observationInterval{{1, 2}}}}
+	state := &mixedState{result: mixedResult{ReceiverErrorClasses: map[string]int{"busy": 1}, RenewalRPCIntervals: []observationInterval{{1, 2}}, QueuedWriteEvidence: []queuedWriteEvidence{{BrokerRequestID: 7}}}}
 	snapshot := state.snapshot()
 	snapshot.ReceiverErrorClasses["busy"] = 99
 	snapshot.RenewalRPCIntervals[0].EndMS = 99
-	if got := state.snapshot(); got.ReceiverErrorClasses["busy"] != 1 || got.RenewalRPCIntervals[0].EndMS != 2 {
+	snapshot.QueuedWriteEvidence[0].BrokerRequestID = 99
+	if got := state.snapshot(); got.ReceiverErrorClasses["busy"] != 1 || got.RenewalRPCIntervals[0].EndMS != 2 || got.QueuedWriteEvidence[0].BrokerRequestID != 7 {
 		t.Fatal("snapshot aliases live mutable state")
 	}
 	var wg sync.WaitGroup

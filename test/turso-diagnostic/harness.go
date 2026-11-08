@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,50 +131,122 @@ func poolView(p sql.DBStats) poolSnapshot {
 }
 
 type brokerEvent struct {
-	OperationID     string   `json:"operation_id"`
-	Method          string   `json:"method"`
-	Status          int      `json:"status"`
-	HeaderElapsedMS float64  `json:"headers_elapsed_ms"`
-	Failure         *failure `json:"failure,omitempty"`
+	OperationID      string   `json:"operation_id"`
+	BrokerRequestID  uint64   `json:"broker_request_id"`
+	Method           string   `json:"method"`
+	Status           int      `json:"status"`
+	StartedMS        float64  `json:"started_ms"`
+	ServerReceivedMS float64  `json:"server_received_ms"`
+	ServerReceived   bool     `json:"server_received"`
+	HeadersEndMS     float64  `json:"headers_end_ms"`
+	HeaderElapsedMS  float64  `json:"headers_elapsed_ms"`
+	Failure          *failure `json:"failure,omitempty"`
 }
 type operationKey struct{}
+type brokerRequestContextKey struct{}
+type verifiedBrokerRequest struct{ id uint64 }
 
 const diagnosticHeader = "X-Mqlite-Diag-Operation"
+const diagnosticRequestHeader = "X-Mqlite-Diag-Request"
 
+var brokerRequestSequence atomic.Uint64
+
+type brokerInflight struct {
+	operation, method, path string
+	eventIndex              int
+	received                bool
+}
 type brokerTrace struct {
-	next    http.RoundTripper
-	mu      sync.Mutex
-	events  []brokerEvent
-	dropped int
-	mixed   *mixedState
+	next     http.RoundTripper
+	origin   time.Time
+	mu       sync.Mutex
+	events   []brokerEvent
+	dropped  int
+	mixed    *mixedState
+	inflight map[uint64]*brokerInflight
 }
 
-func (t *brokerTrace) RoundTrip(r *http.Request) (*http.Response, error) {
-	id, _ := r.Context().Value(operationKey{}).(string)
-	if !safeID(id) {
-		id = "unknown_operation"
+func verifiedBrokerRequestID(ctx context.Context) uint64 {
+	value, ok := ctx.Value(brokerRequestContextKey{}).(verifiedBrokerRequest)
+	if !ok {
+		return 0
 	}
+	return value.id
+}
+
+// Only a request registered by this exact trace can enter the loopback broker
+// with correlation context. A copied header is insufficient to attribute SQL.
+func (t *brokerTrace) loopbackHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseUint(r.Header.Get(diagnosticRequestHeader), 10, 64)
+		operation := r.Header.Get(diagnosticHeader)
+		t.mu.Lock()
+		entry := t.inflight[id]
+		valid := err == nil && id > 0 && safeID(operation) && entry != nil && !entry.received && entry.operation == operation && entry.method == r.Method && entry.path == r.URL.Path
+		if valid {
+			entry.received = true
+			if entry.eventIndex >= 0 {
+				t.events[entry.eventIndex].ServerReceived = true
+				t.events[entry.eventIndex].ServerReceivedMS = providerMillis(time.Since(t.origin))
+			}
+		}
+		t.mu.Unlock()
+		if !valid {
+			http.Error(w, "invalid diagnostic request", http.StatusBadRequest)
+			return
+		}
+		ctx := context.WithValue(r.Context(), brokerRequestContextKey{}, verifiedBrokerRequest{id})
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+func (t *brokerTrace) RoundTrip(r *http.Request) (*http.Response, error) {
+	operation, _ := r.Context().Value(operationKey{}).(string)
+	if !safeID(operation) {
+		operation = "unknown_operation"
+	}
+	requestID := brokerRequestSequence.Add(1)
 	copy := r.Clone(r.Context())
 	copy.Header = r.Header.Clone()
-	copy.Header.Set(diagnosticHeader, id)
+	copy.Header.Set(diagnosticHeader, operation)
+	copy.Header.Set(diagnosticRequestHeader, strconv.FormatUint(requestID, 10))
 	start := time.Now()
-	resp, err := t.next.RoundTrip(copy)
-	s := 0
-	if resp != nil {
-		s = resp.StatusCode
-	}
 	t.mu.Lock()
+	if t.origin.IsZero() {
+		t.origin = start
+	}
+	if t.inflight == nil {
+		t.inflight = map[uint64]*brokerInflight{}
+	}
+	index := -1
 	if len(t.events) < 65536 {
-		t.events = append(t.events, brokerEvent{OperationID: id, Method: brokerMethod(r.URL.Path), Status: s, HeaderElapsedMS: float64(time.Since(start)) / float64(time.Millisecond), Failure: safeFailure(err)})
+		index = len(t.events)
+		t.events = append(t.events, brokerEvent{OperationID: operation, BrokerRequestID: requestID, Method: brokerMethod(r.URL.Path), StartedMS: providerMillis(start.Sub(t.origin))})
 	} else {
 		t.dropped++
 	}
+	t.inflight[requestID] = &brokerInflight{operation: operation, method: r.Method, path: r.URL.Path, eventIndex: index}
+	t.mu.Unlock()
+	resp, err := t.next.RoundTrip(copy)
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	t.mu.Lock()
+	if index >= 0 {
+		event := &t.events[index]
+		event.Status = status
+		event.HeadersEndMS = providerMillis(time.Since(t.origin))
+		event.HeaderElapsedMS = providerMillis(time.Since(start))
+		event.Failure = safeFailure(err)
+	}
+	delete(t.inflight, requestID)
 	t.mu.Unlock()
 	if t.mixed != nil && err == nil {
 		t.mixed.observe(r, resp, start)
 	}
 	return resp, err
 }
+
 func brokerMethod(path string) string {
 	for _, method := range []string{"CreateQueue", "DeleteQueue", "ListQueues", "Send", "Receive", "Complete", "CompleteBatch", "Renew", "RenewBatch", "Peek", "Stats"} {
 		if path == "/mqlite.v1.QueueService/"+method {
@@ -583,7 +656,7 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 			}
 		}
 	}
-	bt := &brokerTrace{}
+	bt := &brokerTrace{origin: provider.origin}
 	clientTransport = base.Clone()
 	clientTransport.MaxIdleConnsPerHost = 64
 	if clientTransport.MaxIdleConns < 64 {
@@ -592,14 +665,7 @@ func runCase(ctx context.Context, b backend, p casePlan, q string, provider *pro
 	bt.next = clientTransport
 	srv := server.New(eng, nil)
 	handler := srv.Handler()
-	ts = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get(diagnosticHeader)
-		if !safeID(id) {
-			http.Error(w, "invalid diagnostic operation", 400)
-			return
-		}
-		handler.ServeHTTP(w, r)
-	}))
+	ts = httptest.NewUnstartedServer(bt.loopbackHandler(handler))
 	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
 	ts.Start()
 	a, err = openAdapter(ctx, p.SDK, ts.URL, &http.Client{Transport: bt})

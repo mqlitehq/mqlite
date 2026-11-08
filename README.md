@@ -290,12 +290,17 @@ each request has at most fifteen seconds. The confirmation loop reuses the origi
 token and sequence without calling the handler again. If transient retries
 exhaust that budget, `WithErrorHandler` receives `ErrOutcomeUnknown` with the final
 cause preserved for `errors.Is`/`errors.As`; reconcile the original settlement.
-This does not extend the lease; retries do not resume after the confirmation
-budget expires. Canceling `Run` still joins handlers, renewal shutdown and their
-terminal confirmation, so allow for cleanup before closing the client or engine.
+The confirmation budget does not itself extend the lease. With auto-renew enabled,
+the Receiver keeps renewing within that same bounded confirmation phase.
+This protects a live token while
+the settlement waits, including if `Run` is canceled during that phase. A renewal
+may see lock loss after the settlement already committed; its exact acknowledgement
+or receipt replay determines the final result. Retries and heartbeat stop when
+the confirmation budget ends. Canceling `Run` still joins handlers and terminal
+cleanup, so allow for cleanup before closing the client or engine.
 With auto-renew enabled, it retries a transient heartbeat while the known lease
-still has time. If the lock is lost or can no longer be confirmed, it cancels that
-message's handler context and skips terminal settlement; handlers must honor
+still has time. If the lock is lost or can no longer be confirmed while the handler
+is running, it cancels that handler context and skips terminal settlement; handlers must honor
 `ctx.Done()` and remain idempotent because delivery is still at-least-once. If a
 successful renewal carries an absolute deadline that is unusable against the
 client clock, current brokers' `X-Mqlite-Server-Time-Ms` response header lets the

@@ -43,6 +43,11 @@ values replace earlier ones, while repeated object and map values may merge.
   used for lease, TTL, scheduling, and settlement decisions. The managed Go
   client trusts it only on successful broker responses and maps absolute lease
   deadlines onto its local monotonic clock with a conservative transport budget.
+  `X-Mqlite-Server-Elapsed-Ms` is the whole-millisecond lower bound on monotonic
+  processing time before that clock stamp. A valid value removes storage and
+  long-poll time from clock uncertainty; renewal scheduling and request budgets
+  still use the full measured RPC duration. Missing, repeated, malformed or
+  excessive elapsed values keep the original full-RTT bound.
   Older clients ignore the additive header. With an older broker, the client can
   use HTTP `Date` at its one-second precision; a short lower bound dominated by
   that precision uses bounded degraded-clock pacing. Without either header the
@@ -55,7 +60,7 @@ values replace earlier ones, while repeated object and map values may merge.
   fail closed when it cannot prove enough lease remains for a very short lease.
   Raw HTTP callers should preserve one time header, map broker time, or synchronize
   clocks.
-  CORS-enabled brokers expose this header to browser clients.
+  CORS-enabled brokers expose both headers to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
@@ -535,7 +540,9 @@ it. And `ok=true` means the lease was live **when the broker's statement finishe
 answer reaches you. The result still has to be mapped, encoded and travel back, so on a very short
 lease it can lapse on the way. Current brokers return `X-Mqlite-Server-Time-Ms` from the same clock
 as the lease; the managed Receiver combines that observation with local monotonic time and a
-conservative transport budget instead of directly comparing two hosts' wall clocks. It performs a
+conservative transport budget instead of directly comparing two hosts' wall clocks.
+A validated `X-Mqlite-Server-Elapsed-Ms` excludes processing from clock uncertainty;
+the full RPC duration remains available for renewal timing. It performs a
 bounded synchronous Renew before dispatch when a deadline is unusable, separates renewal cadence
 from the request watchdog, reserves two observed round trips for the next request, and never extends
 a lease merely because the local wall clock falls in a wide uncertainty interval. A confirmed exact

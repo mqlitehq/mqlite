@@ -79,10 +79,14 @@ database. What differs between storage modes is the connection pool:
 
 Remote mutations wait for one cancellable write permit before acquiring a SQL
 connection. The permit covers one attempt through commit or rollback; retry
-backoff releases it. Renewals and settlements have a separate FIFO with bounded
-priority so normal writes and maintenance also progress. Reads retain access to
+backoff releases it. Renewals precede settlements in separate FIFO queues, with
+bounded bursts at each level so ordinary writes and maintenance also progress. Reads retain access to
 the four-connection pool. This cannot interrupt an already running transaction
 and does not make overlapping brokers or `Engine` instances safe.
+
+A public `Tx` callback holds the write permit until that attempt finishes. Keep
+callbacks short and use the supplied `EngineTx` for business SQL and enqueueing.
+Complete the callback before waiting for another mutation through the same owner.
 
 For HTTP Hrana, a direct queue batch transports bounded groups of parameterized
 statements together while retaining one transaction and one commit for the whole

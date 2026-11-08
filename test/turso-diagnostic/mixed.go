@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,16 @@ import (
 type observationInterval struct {
 	StartMS float64 `json:"start_ms"`
 	EndMS   float64 `json:"end_ms"`
+}
+type queuedWriteEvidence struct {
+	BrokerRequestID       uint64  `json:"broker_request_id"`
+	SendOperationID       string  `json:"send_operation_id"`
+	SendServerReceivedMS  float64 `json:"send_server_received_ms"`
+	SendHeadersEndMS      float64 `json:"send_headers_end_ms"`
+	RenewalStartMS        float64 `json:"renewal_start_ms"`
+	InsertProviderEventID uint64  `json:"insert_provider_event_id"`
+	InsertStartedMS       float64 `json:"insert_started_ms"`
+	InsertFinishedMS      float64 `json:"insert_finished_ms"`
 }
 type mixedResult struct {
 	LoadProfile                    string                `json:"load_profile"`
@@ -44,6 +55,8 @@ type mixedResult struct {
 	ProviderWriteCoverageRequired  bool                  `json:"provider_write_coverage_required"`
 	ProviderWriteCoverage          string                `json:"provider_write_coverage"`
 	ProviderInsertRenewalOverlaps  int                   `json:"provider_insert_renewal_overlaps"`
+	QueuedNewSendRenewalMatches    int                   `json:"queued_new_send_renewal_matches"`
+	QueuedWriteEvidence            []queuedWriteEvidence `json:"queued_write_evidence"`
 	RenewalRPCIntervals            []observationInterval `json:"successful_renewal_rpc_intervals"`
 }
 type mixedState struct {
@@ -58,6 +71,7 @@ func (m *mixedState) snapshot() mixedResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.result
+	r.QueuedWriteEvidence = append([]queuedWriteEvidence(nil), m.result.QueuedWriteEvidence...)
 	r.RenewalRPCIntervals = append([]observationInterval(nil), m.result.RenewalRPCIntervals...)
 	r.ReceiverErrorClasses = map[string]int{}
 	for k, v := range m.result.ReceiverErrorClasses {
@@ -210,19 +224,24 @@ func joinManagedReceiver(cancel context.CancelFunc, done <-chan error) (bool, *f
 	}
 }
 
+func successfulMessageInsert(e providerHTTPEvent, minimum uint64) bool {
+	if e.ID <= minimum || !e.ProtocolSuccess || e.ResponseInspectionTruncated || e.NotSent || !e.Finished || !e.BodyEOF || e.HTTPStatus < 200 || e.HTTPStatus >= 300 || e.ErrorClass != "none" || len(e.SQLiteCodes) != 0 || e.StartedMS <= 0 || e.FinishedMS < e.StartedMS {
+		return false
+	}
+	for _, tag := range e.SQLTags {
+		if tag == "message_insert" {
+			return true
+		}
+	}
+	return false
+}
+
+// SQL overlap remains a secondary timing observation. Priority renewals may
+// intentionally run before an already-received Send reaches its INSERT.
 func mixedWriteCoverage(events []providerHTTPEvent, minimum uint64, renewals []observationInterval) int {
 	overlaps := 0
 	for _, e := range events {
-		if e.ID <= minimum || !e.ProtocolSuccess || e.ResponseInspectionTruncated || e.NotSent || !e.Finished || !e.BodyEOF || e.HTTPStatus < 200 || e.HTTPStatus >= 300 || e.ErrorClass != "none" || len(e.SQLiteCodes) != 0 || e.StartedMS <= 0 || e.FinishedMS < e.StartedMS {
-			continue
-		}
-		insert := false
-		for _, tag := range e.SQLTags {
-			if tag == "message_insert" {
-				insert = true
-			}
-		}
-		if !insert {
+		if !successfulMessageInsert(e, minimum) {
 			continue
 		}
 		for _, renew := range renewals {
@@ -233,6 +252,44 @@ func mixedWriteCoverage(events []providerHTTPEvent, minimum uint64, renewals []o
 		}
 	}
 	return overlaps
+}
+
+// Correlation comes only from the validated loopback request context. A matching
+// successful API operation proves this Send returned its ACK; the global exact
+// 68-message ledger is checked independently. This does not infer queue order or
+// private admission state from SQL timings.
+func mixedQueuedWriteCoverage(events []providerHTTPEvent, requests []brokerEvent, minimum uint64, renewals []observationInterval, caseID string, operations []operationSample) []queuedWriteEvidence {
+	acknowledged := map[string]bool{}
+	prefix := caseID + "-mixed_new_send_b16-"
+	for _, op := range operations {
+		if op.Phase == "mixed_new_send_b16" && strings.HasPrefix(op.ID, prefix) && op.Failure == nil {
+			acknowledged[op.ID] = true
+		}
+	}
+	var evidence []queuedWriteEvidence
+	for _, send := range requests {
+		if send.BrokerRequestID == 0 || send.Method != "Send" || !send.ServerReceived || !acknowledged[send.OperationID] || send.Status < 200 || send.Status >= 300 || send.Failure != nil || send.ServerReceivedMS <= 0 || send.HeadersEndMS <= send.ServerReceivedMS {
+			continue
+		}
+		found := false
+		for _, renew := range renewals {
+			if !(send.ServerReceivedMS < renew.StartMS && renew.StartMS < send.HeadersEndMS) || renew.EndMS < renew.StartMS {
+				continue
+			}
+			for _, insert := range events {
+				if insert.BrokerRequestID != send.BrokerRequestID || !successfulMessageInsert(insert, minimum) || insert.StartedMS < send.ServerReceivedMS || insert.FinishedMS > send.HeadersEndMS {
+					continue
+				}
+				evidence = append(evidence, queuedWriteEvidence{send.BrokerRequestID, send.OperationID, send.ServerReceivedMS, send.HeadersEndMS, renew.StartMS, insert.ID, insert.StartedMS, insert.FinishedMS})
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+	}
+	return evidence
 }
 
 func runMixed(ctx context.Context, a *adapter, p casePlan, q string, progress *caseProgress, trace *brokerTrace, provider *providerTrace, remote bool) (result *mixedResult, resultErr error) {
@@ -259,7 +316,7 @@ func runMixed(ctx context.Context, a *adapter, p casePlan, q string, progress *c
 		}
 		r := state.snapshot()
 		result = &r
-		if resultErr == nil && (r.ReceiverErrors != 0 || r.HandlerContextLost != 0 || r.SendErrors != 0 || r.ReaderErrors != 0 || !r.ReceiverJoined || !r.WorkersJoined || r.SeedHandlersStarted != 4 || r.SeedHandlersFinished != 4 || r.ClientObservedCompleteResponse != 68 || r.RenewalResponses == 0 || r.ReaderSamples == 0 || r.NewSendCalls != 4 || (remote && r.ProviderInsertRenewalOverlaps == 0)) {
+		if resultErr == nil && (r.ReceiverErrors != 0 || r.HandlerContextLost != 0 || r.SendErrors != 0 || r.ReaderErrors != 0 || !r.ReceiverJoined || !r.WorkersJoined || r.SeedHandlersStarted != 4 || r.SeedHandlersFinished != 4 || r.ClientObservedCompleteResponse != 68 || r.RenewalResponses == 0 || r.ReaderSamples == 0 || r.NewSendCalls != 4 || (remote && r.QueuedNewSendRenewalMatches == 0)) {
 			resultErr = oracle("mixed_contract_or_write_coverage")
 		}
 	}()
@@ -475,12 +532,17 @@ func runMixed(ctx context.Context, a *adapter, p casePlan, q string, progress *c
 			return nil, oracle("mixed_operation_failure")
 		}
 		if r.ClientObservedCompleteResponse == 68 {
-			overlaps := mixedWriteCoverage(provider.Snapshot().Events, minimum, r.RenewalRPCIntervals)
+			providerEvents := provider.Snapshot().Events
+			requests, _ := trace.snapshot()
+			overlaps := mixedWriteCoverage(providerEvents, minimum, r.RenewalRPCIntervals)
+			evidence := mixedQueuedWriteCoverage(providerEvents, requests, minimum, r.RenewalRPCIntervals, p.ID, progress.operations())
 			state.mu.Lock()
 			state.result.ProviderInsertRenewalOverlaps = overlaps
+			state.result.QueuedNewSendRenewalMatches = len(evidence)
+			state.result.QueuedWriteEvidence = evidence
 			if remote {
 				state.result.ProviderWriteCoverage = "observed"
-				if overlaps == 0 {
+				if len(evidence) == 0 {
 					state.result.ProviderWriteCoverage = "not_observed"
 				}
 			}

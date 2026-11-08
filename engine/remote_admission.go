@@ -8,16 +8,18 @@ import (
 )
 
 // remoteWriter serializes this owner's remote write attempts before they occupy
-// SQL connections. The provider pool remains available to ordinary reads. Lease
-// work has a separate FIFO, with a bounded burst so maintenance and sends also
-// progress. This cannot preempt an already executing transaction.
+// SQL connections. The provider pool remains available to ordinary reads.
+// Renewals precede settlements, each with its own FIFO and bounded burst, so
+// maintenance and sends also progress. Active SQL cannot be preempted.
 type remoteWriter struct {
 	mu          sync.Mutex
 	closed      bool
 	held        bool
 	urgentBurst int
+	renewBurst  int
 	normal      list.List
 	urgent      list.List
+	renew       list.List
 }
 
 const maxLeaseWriteBurst = 4
@@ -30,6 +32,7 @@ type remoteWriteWaiter struct {
 }
 
 type leaseWritePriorityKey struct{}
+type renewWritePriorityKey struct{}
 
 func leaseWriteContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, leaseWritePriorityKey{}, true)
@@ -42,6 +45,17 @@ func (e *Engine) leaseWriteContext(ctx context.Context) context.Context {
 	return leaseWriteContext(ctx)
 }
 
+func renewWriteContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, renewWritePriorityKey{}, true)
+}
+
+func (e *Engine) renewWriteContext(ctx context.Context) context.Context {
+	if !e.db.remote {
+		return ctx
+	}
+	return renewWriteContext(ctx)
+}
+
 func (w *remoteWriter) acquire(ctx context.Context) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -51,15 +65,23 @@ func (w *remoteWriter) acquire(ctx context.Context) (func(), error) {
 		w.mu.Unlock()
 		return nil, ErrClosed
 	}
-	if !w.held && w.normal.Len() == 0 && w.urgent.Len() == 0 {
+	renewal, _ := ctx.Value(renewWritePriorityKey{}).(bool)
+	if !w.held && w.normal.Len() == 0 && w.urgent.Len() == 0 && w.renew.Len() == 0 {
 		w.held = true
 		// A new contention period starts without inherited priority debt.
 		w.urgentBurst = 0
+		w.renewBurst = 0
+		if renewal {
+			// Count this grant too if lower-priority work arrives while it runs.
+			w.renewBurst = 1
+		}
 		w.mu.Unlock()
 		return w.releaseFunc(), nil
 	}
 	q := &w.normal
-	if urgent, _ := ctx.Value(leaseWritePriorityKey{}).(bool); urgent {
+	if renewal {
+		q = &w.renew
+	} else if urgent, _ := ctx.Value(leaseWritePriorityKey{}).(bool); urgent {
 		q = &w.urgent
 	}
 	p := &remoteWriteWaiter{ready: make(chan struct{}), queue: q}
@@ -118,15 +140,23 @@ func (w *remoteWriter) releaseLocked() {
 	}
 	var q *list.List
 	switch {
+	case w.renew.Len() > 0 && (w.normal.Len()+w.urgent.Len() == 0 || w.renewBurst < maxLeaseWriteBurst):
+		q = &w.renew
+		if w.renewBurst < maxLeaseWriteBurst {
+			w.renewBurst++
+		}
 	case w.urgent.Len() > 0 && (w.normal.Len() == 0 || w.urgentBurst < maxLeaseWriteBurst):
 		q = &w.urgent
+		w.renewBurst = 0
 		if w.urgentBurst < maxLeaseWriteBurst {
 			w.urgentBurst++
 		}
 	case w.normal.Len() > 0:
 		q = &w.normal
+		w.renewBurst = 0
 		w.urgentBurst = 0
 	default:
+		w.renewBurst = 0
 		w.urgentBurst = 0
 		return
 	}
@@ -142,7 +172,7 @@ func (w *remoteWriter) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.closed = true
-	for _, q := range []*list.List{&w.normal, &w.urgent} {
+	for _, q := range []*list.List{&w.normal, &w.urgent, &w.renew} {
 		for q.Len() > 0 {
 			p := q.Front().Value.(*remoteWriteWaiter)
 			q.Remove(p.element)

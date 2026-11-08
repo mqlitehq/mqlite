@@ -20,6 +20,13 @@ import (
 // potentially skewed wall clock. Older clients safely ignore the additive header.
 const ServerTimeHeader = "X-Mqlite-Server-Time-Ms"
 
+// ServerElapsedHeader is a lower bound, in whole milliseconds, on monotonic
+// server processing time before ServerTimeHeader is sampled. It includes storage
+// waits and long polls. Clients may subtract a valid value from the observed
+// request duration when bounding transport uncertainty, not from RPC budgets.
+// Older clients safely ignore the additive header.
+const ServerElapsedHeader = "X-Mqlite-Server-Elapsed-Ms"
+
 // Route paths (Connect-style: /package.Service/Method).
 const (
 	PathSend            = "/mqlite.v1.QueueService/Send"

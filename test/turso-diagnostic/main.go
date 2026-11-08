@@ -27,7 +27,7 @@ import (
 	low "github.com/mqlitehq/mqlite-go"
 )
 
-const expectedSDK = "316b01c569dfa66afd73262c96c9160d72395a6e"
+const expectedSDK = "5b2d47142f8cfdafd73cf1b7d3cb9ea8473d0cc0"
 
 // These constants are deliberately not overridable by dispatch inputs or env.
 // They identify only the two maintainer-approved, dedicated diagnostic DBs.
@@ -305,7 +305,7 @@ func runMain() int {
 			src.ProxyConfigured = true
 		}
 	}
-	rep := report{Schema: "turso-performance-attribution-v1", Run: run, Mode: o.mode, CaseSelection: o.caseID, Source: src, Started: time.Now().UTC().Format(time.RFC3339Nano), Limitations: []string{"Finite acceptance; no production capacity, soak or power-loss claim. Only mixed mode exercises managed Receiver behavior.", "Original contention profiles retain send-then-drain, per-worker empty Receive, all errors and strict identity oracle; controls are separate cases.", "Engine phase tracing is disabled. Provider HTTP connection wait is not database/sql pool wait; concurrent/background provider events are phase-correlated, not exact operation attribution.", "Synthetic provider delay is separately reported; it is a latency control, not a fault-injection correctness proof.", "No reset, no foreign queue cleanup, no weakening of retries, deadlines, single-writer guard or transaction rules to obtain a pass."}}
+	rep := report{Schema: "turso-performance-attribution-v1", Run: run, Mode: o.mode, CaseSelection: o.caseID, Source: src, Started: time.Now().UTC().Format(time.RFC3339Nano), Limitations: []string{"Finite acceptance; no production capacity, soak or power-loss claim. Only mixed mode exercises managed Receiver behavior.", "Original contention profiles retain send-then-drain, per-worker empty Receive, all errors and strict identity oracle; controls are separate cases.", "Engine phase tracing is disabled. Provider HTTP acquisition is not database/sql pool wait. Only verified inherited broker_request_id values correlate requests; missing context retains phase attribution without inferred transaction identity.", "Synthetic provider delay is separately reported; it is a latency control, not a fault-injection correctness proof.", "No reset, no foreign queue cleanup, no weakening of retries, deadlines, single-writer guard or transaction rules to obtain a pass."}}
 	m := manifest{Schema: rep.Schema, Run: run, CaseSelection: o.caseID}
 	for _, b := range bs {
 		for i, p := range ps {
