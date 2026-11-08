@@ -51,6 +51,7 @@ type db struct {
 	closing  bool // admission gate: enter() refuses new ops once set
 	torn     bool // teardown-once guard for close()
 	inFlight sync.WaitGroup
+	writer   remoteWriter // remote mutation admission; local stores retain their sole SQL writer
 }
 
 // enter admits a local operation, or reports that the store is closing so the caller fails fast.
@@ -420,6 +421,9 @@ func (d *db) beginClosing() {
 	d.closeMu.Lock()
 	d.closing = true
 	d.closeMu.Unlock()
+	if d.remote {
+		d.writer.close()
+	}
 }
 
 // isClosing is used before serving an observation result that needs no database
@@ -445,6 +449,9 @@ func (d *db) close() error {
 	d.torn = true
 	d.closing = true
 	d.closeMu.Unlock()
+	if d.remote {
+		d.writer.close()
+	}
 	d.inFlight.Wait()
 
 	var err error
@@ -808,28 +815,17 @@ func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return res, err
 		}
-		// Acquire the pool lease explicitly so a caller deadline while waiting
-		// for capacity cannot be confused with a timeout from an issued write.
-		// No SQL exists until Conn.ExecContext below.
-		var conn *sql.Conn
-		conn, err = d.sql.Conn(ctx)
-		if err != nil {
+		var issued bool
+		res, err, issued = d.remoteExecAttempt(ctx, query, func() []any { return args })
+		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
 				return res, ctxErr
 			}
 			if d.retryable(err) && i+1 < d.attempts() {
 				continue
 			}
-			// Connection acquisition cannot have issued SQL. Even a broad EOF or
-			// timeout is a definite connection failure here, never outcome unknown.
-			return res, err
+			return res, err // admission/pool acquisition cannot have issued SQL
 		}
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = conn.Close()
-			return res, ctxErr
-		}
-		res, err = conn.ExecContext(ctx, query, args...)
-		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
 		}
@@ -888,24 +884,17 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return res, err
 		}
-		var conn *sql.Conn
-		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
-		if err != nil {
+		var issued bool
+		res, err, issued = d.remoteExecAttempt(ctx, query, buildArgs)
+		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
-				return res, ctxErr // acquiring a pool lease cannot have issued SQL
+				return res, ctxErr
 			}
 			if d.retryable(err) && i+1 < d.attempts() {
 				continue
 			}
 			return res, err
 		}
-		args := buildArgs()
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = conn.Close()
-			return res, ctxErr
-		}
-		res, err = conn.ExecContext(ctx, query, args...)
-		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
 		}
@@ -928,6 +917,9 @@ func (d *db) queryFreshWriteUnobserved(ctx context.Context, query string, buildA
 }
 
 func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error, write bool) error {
+	if d.remote && write {
+		return d.remoteReturningWrite(ctx, query, buildArgs, scan)
+	}
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			args := buildArgs() // then look again — see execFresh
@@ -973,35 +965,14 @@ func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() 
 		rows, err = conn.QueryContext(ctx, query, args...)
 		if err != nil {
 			_ = conn.Close()
-			if write {
-				if d.retryableWrite(err) {
-					continue
-				}
-				if remoteWriteMayHaveCommitted(err) {
-					return unknownRemoteWrite(err)
-				}
-				return err
-			}
 			if d.retryable(err) {
 				continue
 			}
 			return err
 		}
 		err = scan(rows)
-		if write && err == nil {
-			err = rows.Err()
-		}
-		closeErr := rows.Close()
+		_ = rows.Close()
 		_ = conn.Close()
-		if write {
-			if err == nil {
-				err = closeErr
-			}
-			if err != nil {
-				return unknownRemoteWrite(err)
-			}
-			return nil
-		}
 		if err == nil || !d.retryable(err) {
 			return err
 		}
@@ -1233,8 +1204,8 @@ func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) transact
 func (t *txn) SQL() *sql.Tx { return t.tx }
 
 // commitAttempt keeps confirmed commits and their in-memory topology effects in
-// the same order. Remote transactions may overlap, so a delayed deletion reply
-// must publish retirement before a later creation publishes the reused name.
+// the same order. A deletion must publish retirement before a later creation
+// publishes the reused name, including when its commit acknowledgement is delayed.
 func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
 	e.commitMu.Lock()
 	defer e.commitMu.Unlock()
@@ -1267,6 +1238,13 @@ func normalizeCanceledRemoteCommitError(ctx context.Context, err error) (error, 
 // inTx runs fn inside a transaction, retrying the whole transaction on a
 // connection error (the aborted tx leaves nothing committed, so retry is safe).
 func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) error {
+	return e.inTxMode(ctx, fn, false)
+}
+
+// inTxMode keeps lifecycle checks and the result in one snapshot. Only private
+// SELECT-only callbacks may bypass remote mutation admission; public Tx remains
+// a writer because its callback can issue arbitrary business-table mutations.
+func (e *Engine) inTxMode(ctx context.Context, fn func(context.Context, *txn) error, readOnly bool) error {
 	if !e.db.remote {
 		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
 		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
@@ -1312,7 +1290,8 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		})
 	}
 	var err error
-	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	// Track the whole remote operation so Close waits for it and refuses new work.
+	// Each attempt takes write admission separately, after its cancellable backoff.
 	if !e.db.enter() {
 		return ErrClosed
 	}
@@ -1324,42 +1303,14 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
 			a.callbackRejected.Store(false)
 		}
-		var tx *sql.Tx
-		observationEpoch := e.observationEpoch()
-		tx, err = e.db.sql.BeginTx(ctx, nil)
-		if err != nil {
+		ferr, cerr, commitNotStarted, beginErr := e.remoteTransactionAttempt(ctx, fn, readOnly)
+		if beginErr != nil {
+			err = beginErr
 			if e.db.retryable(err) {
 				continue
 			}
 			return err
 		}
-		// BeginTx can finish at the same instant its context is canceled. Match
-		// the local contract: if the caller stopped before its callback begins,
-		// roll back the new transaction and never run application code.
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = tx.Rollback()
-			return ctxErr
-		}
-		// The rollback is deferred across BOTH the callback and the commit — scoped to the
-		// callback alone it would fire on the success path too, BEFORE Commit, silently rolling
-		// back every remote transaction (TestRemoteTxClosureCanBeReplayed caught exactly that).
-		// After a successful Commit it is a no-op (ErrTxDone); after a PANIC in fn it is what
-		// stops the transaction from being abandoned open.
-		//
-		// The two errors stay separate because they are not retryable on the same terms: a failed
-		// statement retries on any connection error (retryable), a failed COMMIT only when the
-		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
-		// replayable statement failures into ErrOutcomeUnknown.
-		var ferr, cerr error
-		var commitNotStarted bool
-		attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx), observationEpoch: observationEpoch}
-		func() {
-			defer func() { _ = tx.Rollback() }()
-			if ferr = fn(e.db.stmtCtx(ctx), attempt); ferr != nil {
-				return
-			}
-			cerr, commitNotStarted = e.commitAttempt(attempt)
-		}()
 		if ferr != nil {
 			err = ferr
 			if e.db.retryable(err) {

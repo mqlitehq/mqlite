@@ -187,8 +187,11 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
   sidecar (`engine/lock_unix.go` / `lock_windows.go`). A second process — or second
   `OpenEmbedded` on the same file — fails fast with `ErrDBLocked`. Sharing a file DB
   across processes is unsupported; run the broker instead (one broker = one writer).
-- **Remote Turso/libSQL** → small pool (`MaxOpenConns(4)`) because the Turso primary
-  serializes writes server-side. The documented `libsql://` HTTP transport gives
+- **Remote Turso/libSQL** → small pool (`MaxOpenConns(4)`) with one cancellable
+  write-attempt permit acquired before a SQL connection. Reads retain pool
+  capacity; renewals and settlements have bounded FIFO priority over normal
+  writes. Each attempt holds its permit through SQL-lease return, including
+  canceled transaction rollback, and releases it before retry backoff. The documented `libsql://` HTTP transport gives
   each logical driver connection one `database/sql` lease (a whole transaction is
   one lease), then rejects it before idle reuse or direct waiter handoff; Go's
   shared HTTP transport still reuses physical TCP/TLS connections. `ws://` and

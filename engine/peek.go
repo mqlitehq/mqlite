@@ -31,7 +31,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 	args = append(args, max)
 	var out []*PeekedMessage
 	var bytes int64
-	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	err := e.inReadTx(ctx, func(ctx context.Context, tx *txn) error {
 		out = nil
 		bytes = 0
 		if _, err := e.checkQueueLiveTx(ctx, tx, queue); err != nil {

@@ -60,7 +60,7 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 	if token == "" {
 		return ErrLockLost
 	}
-	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	return e.inTx(e.leaseWriteContext(ctx), func(ctx context.Context, tx *txn) error {
 		// `ctx` here is the one inTx hands us — protected on a local store. Passing it to `do` is
 		// what keeps the fenced settle WRITE from being interrupted: an interrupted local write
 		// leaks the connection and wedges (or erases) the database. The do-closures used to capture
@@ -241,7 +241,7 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	// execFresh, not exec: a remote retry backs off, so a deadline computed once — before the
 	// loop — could commit a lease that has already expired by the time the write that actually
 	// lands runs (MQLITE-97). It is measured against the clock of each attempt.
-	res, err := e.db.execFresh(ctx,
+	res, err := e.db.execFresh(e.leaseWriteContext(ctx),
 		// MAX(): a renewal only ever extends a lease. A racing renewal writing an older deadline
 		// would otherwise shorten a lock that had already been pushed further out.
 		`UPDATE messages SET locked_until=MAX(locked_until, ?)
@@ -389,7 +389,7 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 	deadlines := make(map[string]int64, len(rows)) // the committed locked_until, per (seq, token)
 	pairs := strings.Repeat(",(?,?)", len(rows))[1:]
 	args := pairArgs(queue, rows)
-	err = e.db.queryFreshWrite(ctx,
+	err = e.db.queryFreshWrite(e.leaseWriteContext(ctx),
 		// MAX(locked_until, ?): a renewal may only ever EXTEND a lease, never pull it back. Two
 		// renewals can race (a retry, a concurrent renewer), and the loser writing its older
 		// deadline would shorten a lock the winner had already pushed out.
@@ -508,7 +508,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 	replayed := make(map[string]bool, len(rows)) // (seq, token) pairs with a live receipt from an earlier settle
 	var removed int64
 
-	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	err := e.inTx(e.leaseWriteContext(ctx), func(ctx context.Context, tx *txn) error {
 		// The remote inTx may replay this closure — never inherit a previous attempt's results.
 		removed = 0
 		for k := range settled {

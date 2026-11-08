@@ -71,16 +71,25 @@ database. What differs between storage modes is the connection pool:
 
 | | local file / `:memory:` | `libsql://` / `turso://` (HTTP Hrana) | `ws://` / `wss://` |
 |---|---|---|---|
-| write ownership | 1 connection = local writer (file lock, MQLITE-6) | one broker owns a 4-connection pool; Turso serializes commits | same remote ownership |
-| writer pool | MaxOpen=1, MaxIdle=1 | MaxOpen=4, MaxIdle=0 | MaxOpen=4, MaxIdle=2 |
+| write ownership | 1 connection = local writer (file lock, MQLITE-6) | one owner admits one write attempt at a time | same remote ownership |
+| provider pool | MaxOpen=1, MaxIdle=1 | MaxOpen=4, MaxIdle=0 | MaxOpen=4, MaxIdle=2 |
 | observation | file: 1 read-only connection; `:memory:`: writer connection | provider-backed pool | provider-backed pool |
 | lifecycle | ConnMaxLifetime=0 | one logical Hrana connection per `database/sql` lease | IdleTime=3s, Lifetime=55s |
 | physical reuse | SQLite connection stays open | `http.DefaultTransport` still reuses TCP/TLS connections | the WebSocket itself is pooled |
 
-A small remote pool is safe within that one MQLite process because the Turso
-primary serializes writes across its connections; this does not make two brokers
-or embedded `Engine` instances safe. On `libsql://`, a lease is one ordinary
-operation or one complete transaction. Returning the lease discards its logical
+Remote mutations wait for one cancellable write permit before acquiring a SQL
+connection. The permit covers one attempt through commit or rollback; retry
+backoff releases it. Renewals and settlements have a separate FIFO with bounded
+priority so normal writes and maintenance also progress. Reads retain access to
+the four-connection pool. This cannot interrupt an already running transaction
+and does not make overlapping brokers or `Engine` instances safe.
+
+For HTTP Hrana, a direct queue batch transports bounded groups of parameterized
+statements together while retaining one transaction and one commit for the whole
+Send. Fan-out and expiring subscriptions retain their existing fenced paths.
+Network latency still contributes to transaction and lease budgets.
+
+On `libsql://`, a lease is one ordinary operation or one complete transaction. Returning the lease discards its logical
 Hrana connection before it can enter an idle slot or be handed directly to a
 waiting caller; this does **not** tear down the shared HTTP transport or its
 TCP/TLS keep-alive connections. Each broker process shares its expensive all-queue

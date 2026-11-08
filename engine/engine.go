@@ -753,7 +753,7 @@ func (e *Engine) ListSubscriptionsWithOptions(ctx context.Context, opts ListSubs
 	}
 
 	var page SubscriptionPage
-	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	err := e.inReadTx(ctx, func(ctx context.Context, tx *txn) error {
 		// Allocate the exact page ceiling on each transaction attempt. The item
 		// includes lifecycle timestamps, so geometric append growth is otherwise
 		// material for the common 100-row page.
@@ -1071,6 +1071,18 @@ func (e *Engine) sendTracked(ctx context.Context, name string, ms []OutMessage, 
 			conflicts[i] = false
 		}
 		woke = map[string]bool{}
+		if e.canBatchDirectSend(targets, ms) {
+			batchSeqs, batchConflicts, inserted, err := e.insertDirectBatch(ctx, tx, targets[0].queue, ms, atMs, forced, publishNow)
+			if err != nil {
+				return err
+			}
+			copy(seqs, batchSeqs)
+			copy(conflicts, batchConflicts)
+			if inserted && forced == StateActive {
+				woke[targets[0].name] = true
+			}
+			return nil
+		}
 		for i, m := range ms {
 			// fan-out: identical body to each subscription target (topic) or the one queue.
 			var lastSeq int64
