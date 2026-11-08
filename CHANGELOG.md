@@ -186,6 +186,19 @@ upgrade notes before replacing a broker.
   v0.4.2 documentation for operators using the published binary, and clarify
   that broker shutdown does not implement application consumer draining.
 
+### Honor remote transaction deadlines (MQLITE-163)
+
+- Keep Hrana HTTP COMMIT on the transaction's original context. A stalled
+  response no longer detaches the commit from the caller's cancellation or
+  deadline and indefinitely holds admitted work and engine shutdown open.
+- An interrupted COMMIT remains `ErrOutcomeUnknown`; the transaction callback
+  is not automatically replayed. ROLLBACK gets a separate, five-second cleanup
+  budget so an already-canceled caller does not prevent a cleanup attempt.
+- Detached stream-close requests retain their separate per-handle limit and
+  five-second deadline (MQLITE-164). Neither cleanup path proves remote release,
+  and `Close` does not synchronously join detached stream cleanup. Local SQLite,
+  the schema and SDK wire contracts are unchanged.
+
 ### Make preserving live leases the safe startup default (MQLITE-137 follow-up)
 
 - Preserve every unexpired Peek-Lock lease on an active resource across any
