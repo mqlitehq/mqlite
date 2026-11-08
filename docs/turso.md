@@ -84,6 +84,10 @@ priority so normal writes and maintenance also progress. Reads retain access to
 the four-connection pool. This cannot interrupt an already running transaction
 and does not make overlapping brokers or `Engine` instances safe.
 
+A public `Tx` callback holds the write permit until that attempt finishes. Keep
+callbacks short and use the supplied `EngineTx` for business SQL and enqueueing.
+Complete the callback before waiting for another mutation through the same owner.
+
 For HTTP Hrana, a direct queue batch transports bounded groups of parameterized
 statements together while retaining one transaction and one commit for the whole
 Send. Fan-out and expiring subscriptions retain their existing fenced paths.

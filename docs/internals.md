@@ -128,9 +128,6 @@ a time — most systems fight that; mqlite **builds on it**:
   WebSocket transports retain their bounded connection pooling, and the local
   SQLite path is unchanged.
 
-The punchline: mqlite doesn't *implement* mutual exclusion between consumers —
-it **arranges to never need it**. Concurrency control by subtraction.
-
 ## 4 · Claiming: Peek-Lock is one atomic UPDATE
 
 The hot path — a consumer asking for work — is a single statement
