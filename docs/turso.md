@@ -251,11 +251,13 @@ using the [unreleased compatibility candidate](https://github.com/mqlitehq/mqlit
 
 ### Repeatable test suites
 
-The always-on hermetic tests in `engine/storage_test.go` check retry classifiers
-and logical-connection lifecycle handling. The credentials-gated
-`engine/turso_test.go` suite checks representative lifecycle contracts against a
-real database. These suites define repeatable checks; their existence, or a
-local run that skips the live tests, is not an online compatibility result.
+```
+hermetic (always, CI)       engine/storage_test.go  retry classifiers and connection lifecycle
+live (credentials-gated)   engine/turso_test.go    representative lifecycle contracts
+```
+
+Online compatibility statements refer to completed live checks against the
+stated backend and source candidate.
 
 Run the live suite only against a dedicated, disposable test database. `TestMain`
 drops every MQLite-managed table before the selected tests begin, including when
