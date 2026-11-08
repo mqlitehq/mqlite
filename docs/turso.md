@@ -79,8 +79,8 @@ database. What differs between storage modes is the connection pool:
 
 Remote mutations wait for one cancellable write permit before acquiring a SQL
 connection. The permit covers one attempt through commit or rollback; retry
-backoff releases it. Renewals and settlements have a separate FIFO with bounded
-priority so normal writes and maintenance also progress. Reads retain access to
+backoff releases it. Renewals precede settlements in separate FIFO queues, with
+bounded bursts at each level so ordinary writes and maintenance also progress. Reads retain access to
 the four-connection pool. This cannot interrupt an already running transaction
 and does not make overlapping brokers or `Engine` instances safe.
 

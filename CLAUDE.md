@@ -189,8 +189,8 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
   across processes is unsupported; run the broker instead (one broker = one writer).
 - **Remote Turso/libSQL** → small pool (`MaxOpenConns(4)`) with one cancellable
   write-attempt permit acquired before a SQL connection. Reads retain pool
-  capacity; renewals and settlements have bounded FIFO priority over normal
-  writes. Each attempt holds its permit through SQL-lease return, including
+  capacity; renewals have bounded FIFO priority over settlements, which have
+  bounded priority over normal writes. Each attempt holds its permit through SQL-lease return, including
   canceled transaction rollback, and releases it before retry backoff. The documented `libsql://` HTTP transport gives
   each logical driver connection one `database/sql` lease (a whole transaction is
   one lease), then rejects it before idle reuse or direct waiter handoff; Go's

@@ -118,8 +118,9 @@ a time — most systems fight that; mqlite **builds on it**:
   worth ~4–11× of your local throughput (on remote Turso it's a no-op — the
   server owns durability).
 - **Remote Turso/libSQL** keeps a four-connection pool for reads and admits
-  one mutation attempt before it acquires a connection. Renewal and settlement
-  work has bounded FIFO priority; other writes and maintenance also progress.
+  one mutation attempt before it acquires a connection. Renewal work has bounded
+  FIFO priority over settlement, with bounded priority over other writes so
+  maintenance also progresses.
   A permit lasts through commit or rollback and SQL-lease return, then is released
   before retry backoff. This is also the only path that retries transient errors — locally a failed statement never ran, so there is nothing
   to retry. For HTTP Hrana (`libsql://`), one logical driver connection lasts for

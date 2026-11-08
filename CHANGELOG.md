@@ -12,6 +12,20 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Renew managed leases through settlement confirmation (MQLITE-180)
+
+- With auto-renew enabled, continue the heartbeat while Complete or Abandon
+  waits for its exact acknowledgement, within the existing 30-second confirmation
+  budget. Canceling Run still cancels a running handler; a returned handler's
+  bounded settlement and heartbeat are joined before its worker is released.
+- A renewal may lose its token after the same settlement committed. Resolve
+  that ownership race through the settlement acknowledgement or receipt replay,
+  retaining its definitive error or outcome-unknown status. Permanent renewal
+  failures still stop receiving immediately.
+- Give remote renewal attempts a separate FIFO ahead of settlements, yielding
+  after four renewals. Settlement priority also remains bounded so ordinary
+  writes and maintenance can progress. Local storage and lease fencing are unchanged.
+
 ### Exclude broker processing from lease clock uncertainty (MQLITE-179)
 
 - Return `X-Mqlite-Server-Elapsed-Ms`, a monotonic lower bound on processing time

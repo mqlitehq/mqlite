@@ -17,17 +17,22 @@ import (
 
 func waitRemoteQueue(t *testing.T, w *remoteWriter, normal, urgent int) {
 	t.Helper()
+	waitRemoteQueues(t, w, normal, urgent, 0)
+}
+
+func waitRemoteQueues(t *testing.T, w *remoteWriter, normal, urgent, renew int) {
+	t.Helper()
 	deadline := time.After(3 * time.Second)
 	for {
 		w.mu.Lock()
-		n, u := w.normal.Len(), w.urgent.Len()
+		n, u, r := w.normal.Len(), w.urgent.Len(), w.renew.Len()
 		w.mu.Unlock()
-		if n == normal && u == urgent {
+		if n == normal && u == urgent && r == renew {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("queue has normal=%d urgent=%d, want %d/%d", n, u, normal, urgent)
+			t.Fatalf("queue has normal=%d urgent=%d renew=%d, want %d/%d/%d", n, u, r, normal, urgent, renew)
 		default:
 			runtime.Gosched()
 		}
@@ -77,11 +82,118 @@ func TestRemoteWriterFIFOAndBoundedLeasePriority(t *testing.T) {
 	}
 }
 
+func TestRemoteWriterRenewalFIFOAndBothLowerPrioritiesProgress(t *testing.T) {
+	w := &remoteWriter{}
+	first, err := w.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(w.close)
+	order := make(chan string, 40)
+	releases := make(chan func(), 40)
+	queue := func(id string, ctx context.Context, n, u, r int) {
+		go func() {
+			release, err := w.acquire(ctx)
+			if err != nil {
+				return
+			}
+			order <- id
+			releases <- release
+		}()
+		waitRemoteQueues(t, w, n, u, r)
+	}
+	for i := 0; i < 2; i++ {
+		queue(fmt.Sprintf("n%d", i), context.Background(), i+1, 0, 0)
+	}
+	for i := 0; i < 6; i++ {
+		queue(fmt.Sprintf("s%d", i), leaseWriteContext(context.Background()), 2, i+1, 0)
+	}
+	for i := 0; i < 26; i++ {
+		queue(fmt.Sprintf("r%d", i), renewWriteContext(context.Background()), 2, 6, i+1)
+	}
+	var want []string
+	for group := 0; group < 5; group++ {
+		for i := 0; i < 4; i++ {
+			want = append(want, fmt.Sprintf("r%d", 4*group+i))
+		}
+		if group < 4 {
+			want = append(want, fmt.Sprintf("s%d", group))
+		} else {
+			want = append(want, "n0")
+		}
+	}
+	want = append(want, "r20", "r21", "r22", "r23", "s4", "r24", "r25", "s5", "n1")
+	first()
+	for i, next := range want {
+		select {
+		case got := <-order:
+			if got != next {
+				t.Fatalf("grant %d=%s, want %s: renewals must not consume settlement fairness", i, got, next)
+			}
+			(<-releases)()
+		case <-time.After(3 * time.Second):
+			t.Fatalf("grant %s did not progress", next)
+		}
+	}
+}
+
+func TestRemoteWriterUncontendedRenewalCountsTowardBoundedBurst(t *testing.T) {
+	w := &remoteWriter{}
+	first, err := w.acquire(renewWriteContext(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(w.close)
+	order := make(chan string, 6)
+	releases := make(chan func(), 6)
+	queue := func(id string, ctx context.Context, n, r int) {
+		go func() {
+			release, err := w.acquire(ctx)
+			if err != nil {
+				return
+			}
+			order <- id
+			releases <- release
+		}()
+		waitRemoteQueues(t, w, n, 0, r)
+	}
+	queue("normal", context.Background(), 1, 0)
+	for i := 0; i < 5; i++ {
+		queue(fmt.Sprintf("r%d", i), renewWriteContext(context.Background()), 1, i+1)
+	}
+	first()
+	for _, want := range []string{"r0", "r1", "r2", "normal", "r3", "r4"} {
+		if got := <-order; got != want {
+			t.Fatalf("grant=%s want=%s", got, want)
+		}
+		(<-releases)()
+	}
+}
+
+func admissionPriorityContext(ctx context.Context, priority int) context.Context {
+	switch priority {
+	case 1:
+		return leaseWriteContext(ctx)
+	case 2:
+		return renewWriteContext(ctx)
+	default:
+		return ctx
+	}
+}
+
+func waitRemotePriority(t *testing.T, w *remoteWriter, priority int) {
+	t.Helper()
+	counts := [3]int{}
+	counts[priority] = 1
+	waitRemoteQueues(t, w, counts[0], counts[1], counts[2])
+}
+
 func TestRemoteWriterCanceledGrantDoesNotLeakPermit(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		w := &remoteWriter{}
 		release, _ := w.acquire(context.Background())
 		ctx, cancel := context.WithCancel(context.Background())
+		ctx = admissionPriorityContext(ctx, i%3)
 		done := make(chan error, 1)
 		go func() {
 			p, err := w.acquire(ctx)
@@ -90,7 +202,7 @@ func TestRemoteWriterCanceledGrantDoesNotLeakPermit(t *testing.T) {
 			}
 			done <- err
 		}()
-		waitRemoteQueue(t, w, 1, 0)
+		waitRemotePriority(t, w, i%3)
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -110,18 +222,18 @@ func TestRemoteWriterCanceledGrantDoesNotLeakPermit(t *testing.T) {
 	}
 }
 
-func TestRemoteWriterCloseWakesBothQueuesAndRejectsLaterWork(t *testing.T) {
+func TestRemoteWriterCloseWakesAllQueuesAndRejectsLaterWork(t *testing.T) {
 	w := &remoteWriter{}
 	release, _ := w.acquire(context.Background())
 	defer release()
-	done := make(chan error, 2)
-	for _, ctx := range []context.Context{context.Background(), leaseWriteContext(context.Background())} {
+	done := make(chan error, 3)
+	for _, ctx := range []context.Context{context.Background(), leaseWriteContext(context.Background()), renewWriteContext(context.Background())} {
 		go func(ctx context.Context) { _, err := w.acquire(ctx); done <- err }(ctx)
 	}
-	waitRemoteQueue(t, w, 1, 1)
+	waitRemoteQueues(t, w, 1, 1, 1)
 	w.close()
 	w.close()
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		if err := <-done; !errors.Is(err, ErrClosed) {
 			t.Fatalf("pending work after Close: %v", err)
 		}
@@ -136,6 +248,7 @@ func TestRemoteWriterCancellationGrantAndCloseRace(t *testing.T) {
 		w := &remoteWriter{}
 		release, _ := w.acquire(context.Background())
 		ctx, cancel := context.WithCancel(context.Background())
+		ctx = admissionPriorityContext(ctx, i%3)
 		done := make(chan error, 1)
 		go func() {
 			p, err := w.acquire(ctx)
@@ -144,7 +257,7 @@ func TestRemoteWriterCancellationGrantAndCloseRace(t *testing.T) {
 			}
 			done <- err
 		}()
-		waitRemoteQueue(t, w, 1, 0)
+		waitRemotePriority(t, w, i%3)
 		var wg sync.WaitGroup
 		start := make(chan struct{})
 		for _, action := range []func(){release, cancel, w.close} {
@@ -157,7 +270,7 @@ func TestRemoteWriterCancellationGrantAndCloseRace(t *testing.T) {
 			t.Fatalf("iteration %d: unexpected race result %v", i, err)
 		}
 		w.mu.Lock()
-		leaked := w.held || w.normal.Len() != 0 || w.urgent.Len() != 0
+		leaked := w.held || w.normal.Len() != 0 || w.urgent.Len() != 0 || w.renew.Len() != 0
 		w.mu.Unlock()
 		if leaked {
 			t.Fatalf("iteration %d: canceled/closed grant leaked ownership", i)
@@ -432,6 +545,34 @@ func TestRemoteWriterRetryBackoffDoesNotHoldAdmission(t *testing.T) {
 	}
 }
 
+func TestRemoteRenewalOvertakesQueuedSettlement(t *testing.T) {
+	f := &admissionFixture{}
+	d := admissionTestDB(t, f)
+	e := fakeRemoteEngine(d)
+	e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	release, _ := d.writer.acquire(context.Background())
+	defer release()
+	done := make(chan error, 2)
+	go func() {
+		_, err := d.exec(leaseWriteContext(context.Background()), "UPDATE queued_settlement")
+		done <- err
+	}()
+	waitRemoteQueue(t, &d.writer, 0, 1)
+	go func() { done <- e.Renew(context.Background(), "q", 1, "token") }()
+	waitRemoteQueues(t, &d.writer, 0, 1, 1)
+	release()
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.queryMu.Lock()
+	defer f.queryMu.Unlock()
+	if len(f.execQueries) != 2 || f.execQueries[0] == "UPDATE queued_settlement" {
+		t.Fatalf("renewal did not overtake queued settlement: SQL=%v", f.execQueries)
+	}
+}
+
 func TestRemoteWriterCancellationWaitsOutsideSQLPool(t *testing.T) {
 	f := &admissionFixture{}
 	d := admissionTestDB(t, f)
@@ -455,7 +596,7 @@ func TestRemoteWriterCancellationWaitsOutsideSQLPool(t *testing.T) {
 	}
 }
 
-func TestRemoteLeaseMutationAPIsUseUrgentAdmission(t *testing.T) {
+func TestRemoteLeaseMutationAPIsUseDistinctAdmission(t *testing.T) {
 	for _, name := range []string{"renew", "renew_batch", "complete", "complete_batch", "abandon", "reject", "defer"} {
 		t.Run(name, func(t *testing.T) {
 			f := &admissionFixture{}
@@ -487,7 +628,11 @@ func TestRemoteLeaseMutationAPIsUseUrgentAdmission(t *testing.T) {
 				}
 				done <- err
 			}()
-			waitRemoteQueue(t, &d.writer, 0, 1)
+			if name == "renew" || name == "renew_batch" {
+				waitRemoteQueues(t, &d.writer, 0, 0, 1)
+			} else {
+				waitRemoteQueue(t, &d.writer, 0, 1)
+			}
 			cancel()
 			if err := <-done; !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled lease mutation: %v", err)
@@ -496,6 +641,57 @@ func TestRemoteLeaseMutationAPIsUseUrgentAdmission(t *testing.T) {
 				t.Fatal("queued lease mutation executed SQL")
 			}
 		})
+	}
+}
+
+func TestRemoteRenewalAdmissionReleasedOnPanicAndGoexit(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		for _, goexit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("batch=%v/goexit=%v", batch, goexit), func(t *testing.T) {
+				f := &admissionFixture{}
+				d := admissionTestDB(t, f)
+				e := fakeRemoteEngine(d)
+				e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+				var clockCalls atomic.Int64
+				e.now = func() int64 {
+					if clockCalls.Add(1) == 1 {
+						return 1 // the queue-liveness check precedes write admission
+					}
+					if goexit {
+						runtime.Goexit()
+					}
+					panic("controlled renewal-clock panic")
+				}
+				release, _ := d.writer.acquire(context.Background())
+				defer release()
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					defer func() { _ = recover() }()
+					if batch {
+						_, _ = e.RenewBatch(context.Background(), "q", []SettleItem{{SeqNumber: 1, LockToken: "token"}})
+					} else {
+						_ = e.Renew(context.Background(), "q", 1, "token")
+					}
+				}()
+				waitRemoteQueues(t, &d.writer, 0, 0, 1)
+				release()
+				<-done
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if _, err := d.exec(ctx, "UPDATE after_renewal_exit"); err != nil {
+					t.Fatalf("renewal exit leaked admission: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestLocalLeasePriorityContextsRemainUnchanged(t *testing.T) {
+	e := &Engine{db: &db{}}
+	ctx := context.Background()
+	if e.leaseWriteContext(ctx) != ctx || e.renewWriteContext(ctx) != ctx {
+		t.Fatal("local lease operations acquired a remote admission marker")
 	}
 }
 
