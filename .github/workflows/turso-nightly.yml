@@ -28,10 +28,11 @@ jobs:
     if: ${{ github.repository == 'mqlitehq/mqlite' && github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      PUBLIC_DIR: ${{ runner.temp }}/turso-attribution/public
-      PRIVATE_DIR: ${{ runner.temp }}/turso-attribution/private
     steps:
+      - name: Initialize isolated evidence paths
+        run: |
+          echo "PUBLIC_DIR=$RUNNER_TEMP/turso-attribution/public" >> "$GITHUB_ENV"
+          echo "PRIVATE_DIR=$RUNNER_TEMP/turso-attribution/private" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
