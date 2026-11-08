@@ -40,9 +40,14 @@ This proves a successful renewal coexisted with a pending real write request;
 it does not infer private admission state or require INSERT execution to overlap
 renewal. Priority renewal may correctly run before that queued Send's INSERT.
 The original strict SQL-INSERT/Renew interval intersection remains a secondary
-statistic. No correlated witness is a coverage failure, separate from message
-integrity. SQLite has no provider HTTP and reports coverage not applicable while
-still requiring renewal and full SDK lifecycle/identity acceptance. Successful Complete responses are counted only
+statistic. No correlated witness after the complete workload is a coverage
+failure, separate from message integrity. Remote cases that return before the
+coverage calculation report `not_evaluated`; they are not labeled as SQLite or
+as a measured zero. Historical early-return artifacts retain their raw value;
+offline interpretation marks that remote initialization value as unevaluated.
+SQLite has no provider HTTP and reports coverage not applicable while still
+requiring renewal and full SDK lifecycle/identity acceptance. Successful
+Complete responses are counted only
 when the SDK reads a complete valid 2xx body; this is explicitly named
 `client_observed_complete_response`, not an internal SDK settlement hook.
 Receiver cancellation/join, zero error callbacks and empty final metrics are
@@ -103,8 +108,8 @@ correlation; no transaction identity, private queue order or engine phases are
 invented.
 
 The manual-only registered workflow fixes source identity, Go 1.27.3 and SDK
-`5b2d471`, verifies frozen-base ancestry and all 70 production non-test Go files against
-reviewed product commit `fb6e7de`, uses contents-read permissions and the
+`48c9107`, verifies frozen-base ancestry and all 70 production non-test Go files against
+reviewed product commit `2a08e10`, uses contents-read permissions and the
 shared `turso-verification-db` concurrency group without cancellation. It does
 not deploy. Do not substitute destructive nightly/soak suites for this command.
 
@@ -118,3 +123,25 @@ go vet -tags mqlite_perf_diag ./...
 go run -tags mqlite_perf_diag . --validate-selection-only --mode mixed --case mixed_native_lock3
 go run -tags mqlite_perf_diag . --backend local --mode mixed --out /tmp/mqlite-mixed-public
 ```
+
+The additional synthetic latency reproduction is isolated behind a second build
+tag. It does not join the default 240-second controls or change their coverage.
+The unchanged real SQLite/Hrana fixture supplies 200ms per provider HTTP call;
+a separate wrapper adds 100ms only before renewal UPDATE requests. HTTP/TTFB
+include both synthetic components, and cancellation during the wrapper wait can
+prevent that SQL request from reaching the fixture. This vector is a scheduling
+stress case, not a measurement of network latency. Its full mixed vector retains
+the original three-second leases, four seed handlers, six-second seed work, 68 identities,
+four B16 Sends, concurrency four, background maintenance and all outcome checks.
+A separate seed-only vector omits the 64 new messages to isolate lease handoff.
+Both SDK cases retain their seven-minute case budgets. The 16-minute Go test
+watchdog bounds this explicit local two-case reproduction; it does not enlarge
+the remote command's seven-minute case or eighteen-minute backend budget.
+
+```sh
+go test -race -tags 'mqlite_perf_diag mqlite_latency_repro' -count=1 \
+  -run '^TestHranaMixed68RenewDelayVectorThreeSecondLease$' -timeout=16m ./...
+```
+
+A passing synthetic baseline is preserved as a passing baseline; it is not
+rewritten as a failure or used as proof that a later candidate fixed that run.

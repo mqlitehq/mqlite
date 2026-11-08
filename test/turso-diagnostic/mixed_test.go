@@ -279,3 +279,32 @@ func TestWriteCoverageRejectsReadOnlyReplaysAndDisjointWrites(t *testing.T) {
 		t.Fatal("actual overlapping successful message INSERT not counted")
 	}
 }
+
+func TestMixedEarlyRemoteFailureReportsCoverageNotEvaluated(t *testing.T) {
+	for _, sdk := range []string{"native", "low-floor"} {
+		t.Run(sdk, func(t *testing.T) {
+			reject := providerRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 400, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"code":"invalid_argument","message":"synthetic seed rejection"}`))}, nil
+			})
+			a, err := openAdapter(context.Background(), sdk, "http://uncontacted.invalid", &http.Client{Transport: reject})
+			if err != nil {
+				t.Fatal("SDK setup")
+			}
+			defer a.close()
+			provider, err := newProviderTrace("libsql://uncontacted.invalid", reject)
+			if err != nil {
+				t.Fatal("observer setup")
+			}
+			var plan casePlan
+			for _, p := range plans("mixed") {
+				if p.SDK == sdk && p.LockSeconds == 3 {
+					plan = p
+				}
+			}
+			result, err := runMixed(context.Background(), a, plan, "synthetic", &caseProgress{book: newBook()}, &brokerTrace{}, provider, true)
+			if err == nil || result == nil || !result.ProviderWriteCoverageRequired || result.ProviderWriteCoverage != "not_evaluated" || result.ClientObservedCompleteResponse != 0 {
+				t.Fatal("early remote failure mislabeled as local or evaluated coverage")
+			}
+		})
+	}
+}

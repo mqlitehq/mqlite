@@ -27,7 +27,7 @@ import (
 	low "github.com/mqlitehq/mqlite-go"
 )
 
-const expectedSDK = "5b2d47142f8cfdafd73cf1b7d3cb9ea8473d0cc0"
+const expectedSDK = "48c91072ec6815bf2746254aa58bbc451b554fba"
 
 // These constants are deliberately not overridable by dispatch inputs or env.
 // They identify only the two maintainer-approved, dedicated diagnostic DBs.

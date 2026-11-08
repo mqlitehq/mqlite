@@ -293,7 +293,11 @@ func mixedQueuedWriteCoverage(events []providerHTTPEvent, requests []brokerEvent
 }
 
 func runMixed(ctx context.Context, a *adapter, p casePlan, q string, progress *caseProgress, trace *brokerTrace, provider *providerTrace, remote bool) (result *mixedResult, resultErr error) {
-	state := &mixedState{book: progress.book, queue: q, origin: provider.origin, result: mixedResult{LoadProfile: "periodic_b16", ReceiverErrorClasses: map[string]int{}, WorkersJoined: true, ProviderWriteCoverageRequired: remote, ProviderWriteCoverage: "not_applicable_local_sqlite"}}
+	coverage := "not_applicable_local_sqlite"
+	if remote {
+		coverage = "not_evaluated"
+	}
+	state := &mixedState{book: progress.book, queue: q, origin: provider.origin, result: mixedResult{LoadProfile: "periodic_b16", ReceiverErrorClasses: map[string]int{}, WorkersJoined: true, ProviderWriteCoverageRequired: remote, ProviderWriteCoverage: coverage}}
 	failed := make(chan struct{})
 	var failOnce sync.Once
 	fail := func() { failOnce.Do(func() { close(failed) }) }
