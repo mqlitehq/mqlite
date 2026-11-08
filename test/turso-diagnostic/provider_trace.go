@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	maxProviderTraceEvents  = 8192
+	maxProviderTraceEvents  = 65536
 	maxProviderInspectBytes = 64 << 10
 )
 

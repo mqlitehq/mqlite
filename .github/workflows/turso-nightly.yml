@@ -16,6 +16,24 @@ on:
         required: true
         default: quick
         options: [quick, contention]
+      case_id:
+        description: All cases or one exact contention case (requires contention mode)
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - original_native_c1_b1
+          - original_native_c1_b64
+          - original_native_c8_b1
+          - original_native_c32_b1
+          - original_low-floor_c1_b1
+          - original_low-floor_c1_b64
+          - original_low-floor_c8_b1
+          - original_low-floor_c32_b1
+          - control_pool1_c32_b1
+          - control_pool4_c32_b1
+          - control_admission1_c32_b1
 
 permissions:
   contents: read
@@ -106,6 +124,13 @@ jobs:
       - name: Build isolated diagnostic executable
         working-directory: source/test/turso-diagnostic
         run: go build -tags mqlite_perf_diag -o "$PRIVATE_DIR/diagnostic" .
+      - name: Validate exact case selection before any database access
+        env:
+          DIAGNOSTIC_MODE: ${{ inputs.mode }}
+          DIAGNOSTIC_CASE: ${{ inputs.case_id }}
+        run: >-
+          "$PRIVATE_DIR/diagnostic" --validate-selection-only
+          --mode "$DIAGNOSTIC_MODE" --case "$DIAGNOSTIC_CASE"
       - name: Hermetic read-only protocol controls
         working-directory: source
         run: go test -race -count=1 -timeout=60s ./test/turso-protocol-baseline
@@ -121,6 +146,18 @@ jobs:
           timeout --signal=TERM --kill-after=15s 8m go run ./test/turso-protocol-baseline \
             --backend "$DIAGNOSTIC_BACKEND" --count 10 --out "$PUBLIC_DIR/protocol" \
             > "$PRIVATE_DIR/protocol.log" 2>&1
+      - name: Hermetic exact interrupted-queue cleanup controls
+        working-directory: source
+        run: go test -race -count=1 -timeout=60s ./test/turso-diagnostic-cleanup
+      - name: Clean only the prior interrupted diagnostic queue
+        working-directory: source
+        env:
+          MQLITE_DIAG_STANDARD_DB: ${{ secrets.MQLITE_DIAG_STANDARD_DB }}
+          MQLITE_DIAG_STANDARD_TOKEN: ${{ secrets.MQLITE_DIAG_STANDARD_TOKEN }}
+          MQLITE_DIAG_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          timeout --signal=TERM --kill-after=15s 4m go run ./test/turso-diagnostic-cleanup \
+            --out "$PUBLIC_DIR/cleanup" > "$PRIVATE_DIR/cleanup.log" 2>&1
       - name: Finite serial diagnostic against approved test databases
         env:
           MQLITE_DIAG_STANDARD_DB: ${{ secrets.MQLITE_DIAG_STANDARD_DB }}
@@ -130,10 +167,11 @@ jobs:
           MQLITE_DIAG_SOURCE_SHA: ${{ github.sha }}
           DIAGNOSTIC_BACKEND: ${{ inputs.backend }}
           DIAGNOSTIC_MODE: ${{ inputs.mode }}
+          DIAGNOSTIC_CASE: ${{ inputs.case_id }}
         run: |
           set +e
           timeout --signal=TERM --kill-after=15s 40m "$PRIVATE_DIR/diagnostic" \
-            --backend "$DIAGNOSTIC_BACKEND" --mode "$DIAGNOSTIC_MODE" --out "$PUBLIC_DIR" \
+            --backend "$DIAGNOSTIC_BACKEND" --mode "$DIAGNOSTIC_MODE" --case "$DIAGNOSTIC_CASE" --out "$PUBLIC_DIR" \
             > "$PRIVATE_DIR/runtime.log" 2>&1
           status=$?
           DIAGNOSTIC_STATUS="$status" python3 - <<'PY'
@@ -156,9 +194,12 @@ jobs:
           summary = p / "summary.json"
           if summary.exists():
               r = json.loads(summary.read_text())
+              lines += [f"Case selection: {r.get('case_selection', 'not recorded')}. A focused PASS covers only this selection.", ""]
               lines += [f"Passed: {bool(r.get('passed'))}; blocked: {bool(r.get('blocked'))}.", ""]
               for b in r.get("backends", []):
-                  lines.append(f"- {b['backend']}: passed={b['passed']}, blocked={b['blocked']}, cases={len(b['cases'])}")
+                  cases = b.get("cases") or []
+                  not_applicable = sum(c.get("status") == "not_applicable_local_single_writer" for c in cases)
+                  lines.append(f"- {b['backend']}: passed={b['passed']}, blocked={b['blocked']}, executed={len(cases)-not_applicable}, not_applicable={not_applicable}")
           else:
               lines.append("No completed runtime summary; inspect safe control/process evidence.")
           pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines)+"\n")

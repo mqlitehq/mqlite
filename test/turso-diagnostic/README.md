@@ -41,6 +41,9 @@ power-loss durability, or all previous functional acceptance criteria.
   Cancellation gets a bounded ten second join. A stuck process is also bounded
   by the Actions process/job watchdogs. Shortening product retries or deadlines
   to make a run pass is outside this diagnostic.
+  Long all-case runs can exhaust that backend budget. Follow-up attribution
+  should dispatch an exact case, rather than enlarge the budget or reinterpret
+  a canceled case as a completed workload.
 - The workflow is manual-only, contents-read, does not persist checkout
   credentials, fixes Go 1.27.3 and SDK commit `316b01c`, verifies the exact
   workflow source and ancestry of frozen base `e27f4ce`, and uses the existing
@@ -52,6 +55,21 @@ power-loss durability, or all previous functional acceptance criteria.
 SQLite runs first. `--backend standard`, `rust`, or `both` selects the dedicated
 remote comparisons. `--backend local` is hermetic and uses only fresh temporary
 SQLite files. It is not exposed as a dispatch choice.
+
+`--case all` is the default and retains the original case order and settings.
+`--case <exact-id>` runs only that case from the selected mode; unknown IDs,
+cross-mode IDs, empty values and whitespace/list variants are refused before
+the first engine opens. The manifest contains only the selected queues and
+`case_selection` in the manifest/report records the scope. A focused PASS is
+not acceptance of the omitted profiles. SQLite pool controls remain explicitly
+not applicable, including when one is the only selected case.
+
+The manual workflow's `case_id` choices expose all contention case IDs. Use
+`mode=contention` for a non-`all` workflow selection. Its early
+`--validate-selection-only` call requires no credentials, writes no artifacts
+and accesses no database; it rejects an incompatible selection before the
+read-only protocol baseline and before the separately scoped interrupted-queue
+cleanup. Failure of that exact cleanup blocks every new workload owner.
 
 `quick` runs only the native SDK, through a real loopback HTTP broker. It is a
 small attribution experiment, **not acceptance of the original four profiles**:
@@ -117,6 +135,11 @@ The public artifact contains:
 - engine attempt, BEGIN, statement, callback, commit-mutex, COMMIT, rollback and
   total spans, plus before/after local `database/sql.DBStats` counters.
 
+Provider observations have a finite 65,536-event bound per backend. If it is
+exhausted, the dropped count still makes instrumentation incomplete and prevents
+a PASS. The larger bound and focused runs avoid repeating the prior 8,192-event
+overflow; they do not retroactively validate that earlier incomplete trace.
+
 `DBStats.WaitDuration` is an aggregate workload pool counter. HTTP GetConn wait
 is a different measure. `begin_total` includes pool acquisition plus driver
 BEGIN. SQL/row lifetime, transaction and total spans overlap and **must not be
@@ -147,6 +170,8 @@ commit. These commands do not need remote credentials:
 go test -race -tags mqlite_perf_diag -count=1 -timeout=240s ./...
 go vet -tags mqlite_perf_diag ./...
 go run -tags mqlite_perf_diag . --backend local --mode quick --out /tmp/mqlite-diag-public
+go run -tags mqlite_perf_diag . --validate-selection-only --mode contention --case original_native_c32_b1
+go run -tags mqlite_perf_diag . --backend local --mode contention --case original_native_c32_b1 --out /tmp/mqlite-diag-focused-public
 ```
 
 Live execution is maintainer-controlled through the manual workflow on this

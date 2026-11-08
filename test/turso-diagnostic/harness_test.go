@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -22,21 +23,21 @@ func lookupMap(m map[string]string) func(string) (string, bool) {
 func TestPreflightRefusesResetAndUnapprovedTargets(t *testing.T) {
 	for _, key := range []string{"MQLITE_TEST_DB", "MQLITE_TEST_DB_RESET_CONFIRM"} {
 		t.Run(key, func(t *testing.T) {
-			_, e := preflight(options{mode: "quick", selected: "local"}, lookupMap(map[string]string{key: ""}))
+			_, e := preflight(options{mode: "quick", caseID: "all", selected: "local"}, lookupMap(map[string]string{key: ""}))
 			if safeFailure(e).Class != "oracle_legacy_reset_environment_refused" {
 				t.Fatal("legacy environment was not refused")
 			}
 		})
 	}
-	_, e := preflight(options{mode: "quick", selected: "standard"}, lookupMap(map[string]string{"MQLITE_DIAG_STANDARD_DB": "libsql://unapproved.invalid", "MQLITE_DIAG_STANDARD_TOKEN": "test-canary"}))
+	_, e := preflight(options{mode: "quick", caseID: "all", selected: "standard"}, lookupMap(map[string]string{"MQLITE_DIAG_STANDARD_DB": "libsql://unapproved.invalid", "MQLITE_DIAG_STANDARD_TOKEN": "test-canary"}))
 	if e == nil || safeFailure(e).Class != "oracle_test_database_not_allowlisted" {
 		t.Fatal("unapproved target was not refused")
 	}
-	_, e = preflight(options{mode: "quick", selected: "rust"}, lookupMap(nil))
+	_, e = preflight(options{mode: "quick", caseID: "all", selected: "rust"}, lookupMap(nil))
 	if e == nil || safeFailure(e).Class != "oracle_test_credentials_missing" {
 		t.Fatal("missing credentials were not refused")
 	}
-	if _, e = preflight(options{mode: "quick", selected: "local"}, lookupMap(nil)); e != nil {
+	if _, e = preflight(options{mode: "quick", caseID: "all", selected: "local"}, lookupMap(nil)); e != nil {
 		t.Fatal("hermetic preflight failed")
 	}
 }
@@ -72,6 +73,80 @@ func TestOriginalProfilesRemainSeparateFromControls(t *testing.T) {
 		if p.SDK != "native" || p.Background || p.Concurrency != 1 {
 			t.Fatal("quick is no longer isolated")
 		}
+	}
+}
+
+func TestCaseSelectionPreservesPlansAndRejectsAmbiguity(t *testing.T) {
+	for _, mode := range []string{"quick", "contention"} {
+		want := plans(mode)
+		all, err := selectedPlans(mode, "all")
+		if err != nil || !reflect.DeepEqual(all, want) {
+			t.Fatal("all selection changed original plans")
+		}
+		for _, p := range want {
+			one, err := selectedPlans(mode, p.ID)
+			if err != nil || len(one) != 1 || one[0] != p {
+				t.Fatal("exact selection changed the requested plan")
+			}
+		}
+	}
+	for _, x := range []struct{ mode, selection string }{
+		{"quick", ""}, {"quick", " "}, {"quick", "all "}, {"quick", "ALL"},
+		{"quick", "original_native_c32_b1"}, {"contention", "isolated_c1_b1"},
+		{"contention", "original_native"}, {"contention", "original_native_c32_b1,control_pool1_c32_b1"},
+		{"contention", "unknown_case"}, {"unknown_mode", "all"},
+	} {
+		if _, err := selectedPlans(x.mode, x.selection); err == nil {
+			t.Fatal("unknown, incompatible or ambiguous selection was accepted")
+		}
+	}
+}
+
+func TestPreflightRejectsCaseSelectionBeforeReadingCredentials(t *testing.T) {
+	_, err := preflight(options{mode: "quick", selected: "both", caseID: "original_native_c32_b1"}, func(k string) (string, bool) {
+		if strings.HasPrefix(k, "MQLITE_DIAG_") {
+			t.Fatal("invalid case read credentials before rejection")
+		}
+		return "", false
+	})
+	if err == nil || safeFailure(err).Class != "oracle_invalid_case_selection" {
+		t.Fatal("incompatible case was not refused during preflight")
+	}
+}
+
+func TestSQLiteExactCaseRunsOnlyTheSelectedPlan(t *testing.T) {
+	const mode = "contention"
+	const selection = "original_low-floor_c8_b1"
+	const run = "0123456789abcdef"
+	ps, err := selectedPlans(mode, selection)
+	if err != nil {
+		t.Fatal("fixture selection failed")
+	}
+	q := queueName(run, 0, ps[0].SDK)
+	owned := []ownedQueue{{"sqlite", selection, q}}
+	m := manifest{Schema: "turso-performance-attribution-v1", Run: run, CaseSelection: selection, Queues: owned}
+	encoded, err := json.Marshal(m)
+	if err != nil || strings.Contains(string(encoded), "original_native_c8_b1") || len(m.Queues) != 1 {
+		t.Fatal("focused manifest includes an unselected case")
+	}
+	r := runBackendSelected(context.Background(), backend{Alias: "sqlite"}, mode, selection, run, m.Queues)
+	if !r.Passed || r.Blocked || len(r.Cases) != 1 {
+		t.Fatal("focused SQLite HTTP control did not run exactly one case")
+	}
+	c := r.Cases[0]
+	if c.Plan != ps[0] || c.Queue != q || !c.Workload.valid(c.Plan.Count, c.FinalStats) || !c.Cleanup.Deleted || !c.Cleanup.AbsentReadback {
+		t.Fatal("focused plan, manifest, client ACK ledger or cleanup changed")
+	}
+	reportJSON, err := json.Marshal(report{Mode: mode, CaseSelection: selection, Backends: []backendResult{r}})
+	if err != nil || !strings.Contains(string(reportJSON), `"case_selection":"`+selection+`"`) {
+		t.Fatal("report does not identify focused scope")
+	}
+}
+
+func TestSQLiteSelectedPoolControlRemainsNotApplicable(t *testing.T) {
+	r := runBackendSelected(context.Background(), backend{Alias: "sqlite"}, "contention", "control_pool1_c32_b1", "0123456789abcdef", nil)
+	if !r.Passed || r.Blocked || len(r.Cases) != 1 || r.Cases[0].Status != "not_applicable_local_single_writer" || r.Cases[0].Workload.Attempted != 0 {
+		t.Fatal("focused pool control weakened local single-writer guard")
 	}
 }
 func TestApprovedDSNChecksOriginalAliasSpecificScheme(t *testing.T) {

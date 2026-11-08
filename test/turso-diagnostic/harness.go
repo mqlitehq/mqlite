@@ -71,6 +71,23 @@ func plans(mode string) []casePlan {
 	}
 	return ps
 }
+
+func selectedPlans(mode, selection string) ([]casePlan, error) {
+	if mode != "quick" && mode != "contention" {
+		return nil, oracle("invalid_mode")
+	}
+	ps := plans(mode)
+	if selection == "all" {
+		return ps, nil
+	}
+	for _, p := range ps {
+		if selection == p.ID {
+			return []casePlan{p}, nil
+		}
+	}
+	return nil, oracle("invalid_case_selection")
+}
+
 func queueName(run string, i int, sdk string) string {
 	return fmt.Sprintf("diag_%s_%02d_%s", run, i, strings.ReplaceAll(sdk, "-", "_"))
 }
@@ -336,7 +353,16 @@ func (p *caseProgress) record(s operationSample) {
 	p.mu.Unlock()
 }
 func runBackend(parent context.Context, b backend, mode, run string, owned []ownedQueue) backendResult {
+	return runBackendSelected(parent, b, mode, "all", run, owned)
+}
+
+func runBackendSelected(parent context.Context, b backend, mode, selection, run string, owned []ownedQueue) backendResult {
 	r := backendResult{Alias: b.Alias, BudgetSeconds: int(backendBudget / time.Second)}
+	ps, err := selectedPlans(mode, selection)
+	if err != nil {
+		r.Cases = []caseResult{{Status: "refused", Failure: safeFailure(err)}}
+		return r
+	}
 	ctx, cancel := context.WithTimeout(parent, backendBudget)
 	defer cancel()
 	base, ok := http.DefaultTransport.(*http.Transport)
@@ -359,7 +385,7 @@ func runBackend(parent context.Context, b backend, mode, run string, owned []own
 	collector := &engineCollector{}
 	restore := engine.SetDiagnosticObserver(collector.add)
 	defer restore()
-	for i, p := range plans(mode) {
+	for i, p := range ps {
 		if ctx.Err() != nil {
 			r.Cases = append(r.Cases, caseResult{Plan: p, Status: "not_run_after_backend_budget", Blocked: true, Failure: &failure{Class: "backend_budget"}})
 			r.Blocked = true
@@ -383,7 +409,7 @@ func runBackend(parent context.Context, b backend, mode, run string, owned []own
 		}
 	}
 	r.Provider = provider.Snapshot()
-	r.Passed = !r.Blocked && len(r.Cases) == len(plans(mode))
+	r.Passed = !r.Blocked && len(r.Cases) == len(ps)
 	for _, c := range r.Cases {
 		if !c.Passed && c.Status != "not_applicable_local_single_writer" {
 			r.Passed = false
