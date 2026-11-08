@@ -528,14 +528,14 @@ func (r *sendBatchRows) NextResultSet() error {
 type sendBatchRowsConnector struct{ rows *sendBatchRows }
 
 func (c sendBatchRowsConnector) Connect(context.Context) (driver.Conn, error) {
-	return sendBatchRowsConn{c.rows}, nil
+	return sendBatchRowsConn(c), nil
 }
-func (c sendBatchRowsConnector) Driver() driver.Driver { return sendBatchRowsDriver{c.rows} }
+func (c sendBatchRowsConnector) Driver() driver.Driver { return sendBatchRowsDriver(c) }
 
 type sendBatchRowsDriver struct{ rows *sendBatchRows }
 
 func (d sendBatchRowsDriver) Open(string) (driver.Conn, error) {
-	return sendBatchRowsConn{d.rows}, nil
+	return sendBatchRowsConn(d), nil
 }
 
 type sendBatchRowsConn struct{ rows *sendBatchRows }

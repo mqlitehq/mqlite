@@ -176,24 +176,24 @@ func (d *db) remoteExecAttempt(ctx context.Context, query string, buildArgs func
 // remoteReturningAttempt distinguishes pool/admission, Query, and row-reading
 // failures so the existing no-replay contract for an issued RETURNING write is
 // retained. Time-sensitive arguments are built only after both waits finish.
-func (d *db) remoteReturningAttempt(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) (err error, issued, queried bool) {
+func (d *db) remoteReturningAttempt(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) (issued, queried bool, err error) {
 	release, err := d.writer.acquire(ctx)
 	if err != nil {
-		return err, false, false
+		return false, false, err
 	}
 	defer release()
 	conn, err := d.sql.Conn(ctx)
 	if err != nil {
-		return err, false, false
+		return false, false, err
 	}
 	defer conn.Close()
 	args := buildArgs()
 	if err := checkCtx(ctx); err != nil {
-		return err, false, false
+		return false, false, err
 	}
 	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return err, true, false
+		return true, false, err
 	}
 	defer rows.Close()
 	err = scan(rows)
@@ -204,7 +204,7 @@ func (d *db) remoteReturningAttempt(ctx context.Context, query string, buildArgs
 	if err == nil {
 		err = closeErr
 	}
-	return err, true, true
+	return true, true, err
 }
 
 func (d *db) remoteReturningWrite(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
@@ -218,7 +218,7 @@ func (d *db) remoteReturningWrite(ctx context.Context, query string, buildArgs f
 			return err
 		}
 		var issued, queried bool
-		err, issued, queried = d.remoteReturningAttempt(ctx, query, buildArgs, scan)
+		issued, queried, err = d.remoteReturningAttempt(ctx, query, buildArgs, scan)
 		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
 				return ctxErr
@@ -271,7 +271,7 @@ func (e *Engine) remoteTransactionAttempt(ctx context.Context, fn func(context.C
 	if err != nil {
 		return nil, nil, false, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if err := checkCtx(ctx); err != nil {
 		return nil, nil, false, err
 	}

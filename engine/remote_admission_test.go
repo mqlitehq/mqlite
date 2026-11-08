@@ -685,7 +685,6 @@ func TestRemoteCanceledTransactionWaitsForAsynchronousRollback(t *testing.T) {
 	if !nextReturned {
 		select {
 		case nextErr = <-next:
-			nextReturned = true
 		case <-time.After(3 * time.Second):
 			t.Fatal("Close did not wake the queued writer")
 		}

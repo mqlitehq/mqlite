@@ -49,8 +49,12 @@ func TestSQLiteHranaBatchCommittedResponseLossNeverReplays(t *testing.T) {
 		response := httptest.NewRecorder()
 		f.serveHTTP(response, r)
 		var committed int
-		if err := f.db.QueryRow(`SELECT count(*) FROM messages WHERE queue='batch'`).Scan(&committed); err != nil || committed != 64 {
-			fault <- fmt.Errorf("disconnect was not after durable synthetic commit: rows=%d error=%v", committed, err)
+		err = f.db.QueryRow(`SELECT count(*) FROM messages WHERE queue='batch'`).Scan(&committed)
+		if err == nil && committed != 64 {
+			err = fmt.Errorf("committed synthetic rows=%d, want 64", committed)
+		}
+		if err != nil {
+			fault <- fmt.Errorf("disconnect was not after synthetic commit: %w", err)
 			http.Error(w, "invalid fault point", http.StatusInternalServerError)
 			return
 		}
