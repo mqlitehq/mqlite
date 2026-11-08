@@ -62,6 +62,7 @@ type providerHTTPEvent struct {
 	SQLTags                     []string `json:"sql_tags"`
 	SQLiteCodes                 []string `json:"sqlite_codes"`
 	RequestInspection           string   `json:"request_inspection"`
+	ProtocolSuccess             bool     `json:"strict_protocol_success"`
 	ResponseInspectionTruncated bool     `json:"response_inspection_truncated"`
 	ErrorClass                  string   `json:"error_class"`
 	CloseErrorClass             string   `json:"close_error_class"`
@@ -92,6 +93,7 @@ type providerTraceSnapshot struct {
 }
 
 type providerEventState struct {
+	expected  []providerResponseShape
 	e         providerHTTPEvent
 	started   time.Time
 	headers   time.Time
@@ -237,7 +239,7 @@ func (p *providerTrace) RoundTrip(req *http.Request) (*http.Response, error) {
 	inspection := inspectProviderRequest(req)
 	p.mu.Lock()
 	p.observed++
-	s := &providerEventState{e: providerHTTPEvent{ID: p.observed, Phase: p.phase, ErrorClass: "none", CloseErrorClass: "none", ServerTiming: "not_observed", RequestInspection: inspection.state, StatementCount: inspection.statements, CloseCount: inspection.closes, SQLKinds: inspection.kinds, SQLTags: inspection.tags}}
+	s := &providerEventState{expected: inspection.expected, e: providerHTTPEvent{ID: p.observed, Phase: p.phase, ErrorClass: "none", CloseErrorClass: "none", ServerTiming: "not_observed", RequestInspection: inspection.state, StatementCount: inspection.statements, CloseCount: inspection.closes, SQLKinds: inspection.kinds, SQLTags: inspection.tags}}
 	_, s.e.ContextHasDeadline = req.Context().Deadline()
 	delay := p.delay
 	s.e.SyntheticDelayMS = providerMillis(delay)
@@ -392,6 +394,7 @@ func (b *providerObservedBody) Read(dst []byte) (int, error) {
 		}
 		if !b.truncated {
 			b.state.e.SQLiteCodes = inspectProviderCodes(b.prefix, b.state.e.HTTPStatus)
+			b.state.e.ProtocolSuccess = b.state.e.RequestInspection == "ok" && inspectProviderSuccess(b.prefix, b.state.e.HTTPStatus, b.state.expected)
 		}
 	}
 	if err != nil {
@@ -466,7 +469,12 @@ func providerErrorClass(err error) string {
 	return "other"
 }
 
+type providerResponseShape struct {
+	kind         string
+	allowSkipped []bool
+}
 type providerRequestInspection struct {
+	expected           []providerResponseShape
 	state              string
 	statements, closes int
 	kinds, tags        []string
@@ -510,7 +518,8 @@ func inspectProviderRequest(req *http.Request) providerRequestInspection {
 			Stmt  statement `json:"stmt"`
 			Batch struct {
 				Steps []struct {
-					Stmt statement `json:"stmt"`
+					Stmt      statement       `json:"stmt"`
+					Condition json.RawMessage `json:"condition"`
 				} `json:"steps"`
 			} `json:"batch"`
 		} `json:"requests"`
@@ -527,6 +536,14 @@ func inspectProviderRequest(req *http.Request) providerRequestInspection {
 		out.tags = providerUnique(out.tags, tag)
 	}
 	for _, r := range envelope.Requests {
+		shape := providerResponseShape{kind: r.Type}
+		if r.Type == "batch" {
+			for _, step := range r.Batch.Steps {
+				kind, _ := providerSQLClass(step.Stmt.SQL)
+				shape.allowSkipped = append(shape.allowSkipped, kind == "rollback" && len(step.Condition) > 0 && !bytes.Equal(bytes.TrimSpace(step.Condition), []byte("null")))
+			}
+		}
+		out.expected = append(out.expected, shape)
 		switch r.Type {
 		case "execute":
 			add(r.Stmt.SQL)

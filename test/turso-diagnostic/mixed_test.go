@@ -247,10 +247,10 @@ func TestReceiverJoinRejectsEarlyNilAndRequiresCanceledAfterStop(t *testing.T) {
 func TestWriteCoverageRejectsReadOnlyReplaysAndDisjointWrites(t *testing.T) {
 	renewal := []observationInterval{{10, 20}}
 	successful := func(id uint64, start, end float64, tag string) providerHTTPEvent {
-		return providerHTTPEvent{ID: id, StartedMS: start, FinishedMS: end, Finished: true, BodyEOF: true, HTTPStatus: 200, ErrorClass: "none", SQLTags: []string{tag}}
+		return providerHTTPEvent{ID: id, StartedMS: start, FinishedMS: end, Finished: true, BodyEOF: true, HTTPStatus: 200, ErrorClass: "none", ProtocolSuccess: true, SQLTags: []string{tag}}
 	}
 	events := []providerHTTPEvent{successful(1, 11, 19, "message_insert"), successful(2, 11, 19, "dedup_lookup"), successful(3, 1, 10, "message_insert")}
-	for i := uint64(4); i < 9; i++ {
+	for i := uint64(4); i < 11; i++ {
 		e := successful(i, 11, 19, "message_insert")
 		switch i {
 		case 4:
@@ -263,13 +263,17 @@ func TestWriteCoverageRejectsReadOnlyReplaysAndDisjointWrites(t *testing.T) {
 			e.HTTPStatus = 503
 		case 8:
 			e.BodyEOF = false
+		case 9:
+			e.ProtocolSuccess = false
+		case 10:
+			e.ResponseInspectionTruncated = true
 		}
 		events = append(events, e)
 	}
 	if mixedWriteCoverage(events, 1, renewal) != 0 {
 		t.Fatal("failed, unverified, read-only, old, disjoint or unsent work counted as successful write coverage")
 	}
-	events = append(events, successful(9, 15, 25, "message_insert"))
+	events = append(events, successful(11, 15, 25, "message_insert"))
 	if mixedWriteCoverage(events, 1, renewal) != 1 {
 		t.Fatal("actual overlapping successful message INSERT not counted")
 	}

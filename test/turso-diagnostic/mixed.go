@@ -213,7 +213,7 @@ func joinManagedReceiver(cancel context.CancelFunc, done <-chan error) (bool, *f
 func mixedWriteCoverage(events []providerHTTPEvent, minimum uint64, renewals []observationInterval) int {
 	overlaps := 0
 	for _, e := range events {
-		if e.ID <= minimum || e.NotSent || !e.Finished || !e.BodyEOF || e.HTTPStatus < 200 || e.HTTPStatus >= 300 || e.ErrorClass != "none" || len(e.SQLiteCodes) != 0 || e.StartedMS <= 0 || e.FinishedMS < e.StartedMS {
+		if e.ID <= minimum || !e.ProtocolSuccess || e.ResponseInspectionTruncated || e.NotSent || !e.Finished || !e.BodyEOF || e.HTTPStatus < 200 || e.HTTPStatus >= 300 || e.ErrorClass != "none" || len(e.SQLiteCodes) != 0 || e.StartedMS <= 0 || e.FinishedMS < e.StartedMS {
 			continue
 		}
 		insert := false
