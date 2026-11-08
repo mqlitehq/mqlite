@@ -231,10 +231,31 @@ read-your-writes semantics, the Go 1.21 floor and every supported release target
 
 ## Validation status
 
-```
-hermetic (always, in CI)   engine/storage_test.go    conn-error retry classifier
-live  (creds-gated, nightly) engine/turso_test.go     full lifecycle vs real Turso
-```
+Functional checks exercised MQLite's queue and message contracts against standard
+Turso and the Rust-backed technical preview over libSQL-compatible HTTP/Hrana,
+using the [unreleased compatibility candidate](https://github.com/mqlitehq/mqlite/commit/e01577ec938902bf853026461e27bf86dcc9511f).
+
+- **Transport:** MQLite uses the pure-Go `github.com/tursodatabase/libsql-client-go`
+  driver, pinned at `v0.0.0-20251219100830-236aa1ff8acc`. MQLite retains its Go 1.21
+  source floor. Rust preview checks used an unreleased URI adapter that maps `turso://`
+  to the same HTTP/Hrana transport. For v0.4.2, use the documented `libsql://` URI.
+- **Ownership and transactions:** run one active broker or embedded `Engine` per
+  database. MQLite uses ordinary transactions rather than `BEGIN CONCURRENT`;
+  provider concurrent-write features do not change this ownership model.
+- **Write acknowledgements:** a lost COMMIT acknowledgement returns
+  `ErrOutcomeUnknown`. Reconcile the operation before retrying; a disconnected
+  response does not establish whether the write committed.
+- **Deployment:** place the broker near its Turso primary. Measure latency and
+  throughput with your payloads, concurrency and batch sizes, then choose lease
+  durations and request deadlines for that workload.
+
+### Repeatable test suites
+
+The always-on hermetic tests in `engine/storage_test.go` check retry classifiers
+and logical-connection lifecycle handling. The credentials-gated
+`engine/turso_test.go` suite checks representative lifecycle contracts against a
+real database. These suites define repeatable checks; their existence, or a
+local run that skips the live tests, is not an online compatibility result.
 
 Run the live suite only against a dedicated, disposable test database. `TestMain`
 drops every MQLite-managed table before the selected tests begin, including when
