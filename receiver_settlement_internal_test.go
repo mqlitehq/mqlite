@@ -19,7 +19,325 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
-func TestSettlementHandoffJoinsCanceledRenewAndRetainsConfirmedLease(t *testing.T) {
+func TestRenewalHandoffStopDoesNotHideInFlightErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response error
+		want     error
+		fatal    bool
+		late     bool
+	}{
+		{"transient_with_live_lease", &HTTPError{StatusCode: 503}, nil, false, false},
+		{"lock_lost", &HTTPError{StatusCode: 409, cause: ErrLockLost}, ErrLockLost, false, false},
+		{"unauthenticated", &HTTPError{StatusCode: 401, cause: ErrUnauthenticated}, ErrUnauthenticated, true, false},
+		{"permission_denied", &HTTPError{StatusCode: 403, cause: ErrPermissionDenied}, ErrPermissionDenied, true, false},
+		{"late_ack_after_deadline", nil, ErrLockLost, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSource{}
+			m := &Message{SequenceNumber: 1, queue: "q", s: f}
+			started, release, stop := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) {
+				close(started)
+				if tc.late {
+					<-ctx.Done()
+					return time.Now().Add(time.Hour), nil
+				}
+				<-release
+				return time.Time{}, tc.response
+			}
+			observed := make(chan error, 2)
+			order := make(chan string, 2)
+			r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(err error) { order <- "notify"; observed <- err })})
+			state := newRenewalState(time.Now().Add(200*time.Millisecond), 0, false, false)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan renewalOutcome, 1)
+			go func() {
+				done <- r.renewLoop(ctx, m, &state, func() {}, func() bool { return false }, func(error, bool) { order <- "fail" }, false, stop)
+			}()
+			<-started
+			// Order is deterministic: quiescence was requested before this RPC finished.
+			close(stop)
+			close(release)
+			select {
+			case outcome := <-done:
+				if outcome.skipSettlement != (tc.want != nil) {
+					t.Fatalf("skipSettlement=%v", outcome.skipSettlement)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("stopped heartbeat did not finish its in-flight response")
+			}
+			if tc.want == nil {
+				if len(observed) != 0 || len(order) != 0 {
+					t.Fatal("live transient failure became terminal")
+				}
+				return
+			}
+			select {
+			case err := <-observed:
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("error=%v,want %v", err, tc.want)
+				}
+			default:
+				t.Fatal("quiescence swallowed an in-flight failure")
+			}
+			if tc.fatal {
+				if <-order != "fail" || <-order != "notify" {
+					t.Fatal("permanent failure ordering changed")
+				}
+			} else if <-order != "notify" || len(order) != 0 {
+				t.Fatal("advisory loss became fatal")
+			}
+		})
+	}
+}
+
+func TestSettlementHandoffRetainsLeaseAfterTransientRenewalFailure(t *testing.T) {
+	f := &fakeSource{}
+	message := &Message{SequenceNumber: 1, LockedUntil: time.Now().Add(500 * time.Millisecond), queue: "q", s: f}
+	started, handoffStarted, allowError, settlingRenewed := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls int32
+	f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) {
+		switch atomic.AddInt32(&calls, 1) {
+		case 1:
+			return time.Now().Add(500 * time.Millisecond), nil
+		case 2:
+			close(started)
+			<-allowError
+			return time.Time{}, &HTTPError{StatusCode: 503}
+		default:
+			close(settlingRenewed)
+			return time.Now().Add(time.Hour), nil
+		}
+	}
+	f.completeFn = func(ctx context.Context) error {
+		select {
+		case <-settlingRenewed:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	observed := make(chan error, 2)
+	r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) { observed <- err })})
+	var once sync.Once
+	r.settlement.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+		once.Do(func() { close(handoffStarted) })
+		return context.WithTimeout(ctx, d)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.process(context.Background(), message, func(context.Context, *Message) error { <-started; return nil }, func() {}, func() bool { return false }, func(error, bool) {}, false)
+	}()
+	<-handoffStarted
+	close(allowError)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handoff did not preserve a live confirmed lease after a transient renewal error")
+	}
+	if atomic.LoadInt32(&calls) != 3 || len(observed) != 0 {
+		t.Fatalf("renew calls/errors=%d/%d", atomic.LoadInt32(&calls), len(observed))
+	}
+}
+
+func TestSettlementHandoffPreservesFinalRenewalFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		response  error
+		want      error
+		permanent bool
+		late      bool
+	}{
+		{"lock_lost", &HTTPError{StatusCode: 409, cause: ErrLockLost}, ErrLockLost, false, false},
+		{"unauthenticated", &HTTPError{StatusCode: 401, cause: ErrUnauthenticated}, ErrUnauthenticated, true, false},
+		{"permission_denied", &HTTPError{StatusCode: 403, cause: ErrPermissionDenied}, ErrPermissionDenied, true, false},
+		{"late_ack_after_attempt_deadline", nil, ErrLockLost, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSource{}
+			message := &Message{SequenceNumber: 1, LockedUntil: time.Now().Add(500 * time.Millisecond), queue: "q", s: f}
+			started, handlerReturned, allowReturn := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var calls, settled int32
+			f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) {
+				if atomic.AddInt32(&calls, 1) == 1 {
+					return time.Now().Add(200 * time.Millisecond), nil
+				}
+				close(started)
+				if tc.late {
+					<-ctx.Done()
+					return time.Now().Add(time.Hour), nil
+				}
+				<-allowReturn
+				return time.Time{}, tc.response
+			}
+			f.completeFn = func(context.Context) error { atomic.AddInt32(&settled, 1); return nil }
+			observed := make(chan error, 2)
+			order := make(chan string, 2)
+			r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) { order <- "notify"; observed <- err })})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				r.process(context.Background(), message, func(context.Context, *Message) error { <-started; close(handlerReturned); return nil }, func() {}, func() bool { return false }, func(error, bool) { order <- "fail" }, false)
+			}()
+			<-handlerReturned
+			close(allowReturn)
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("handoff failed to join terminal renewal")
+			}
+			select {
+			case err := <-observed:
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("renewal error=%v, want %v", err, tc.want)
+				}
+			default:
+				t.Fatal("handoff swallowed terminal renewal error")
+			}
+			if atomic.LoadInt32(&settled) != 0 || len(observed) != 0 {
+				t.Fatal("handoff settled after failure or duplicated notification")
+			}
+			if tc.permanent {
+				if <-order != "fail" || <-order != "notify" {
+					t.Fatal("permanent failure was not observed before notification")
+				}
+			} else if <-order != "notify" || len(order) != 0 {
+				t.Fatal("advisory renewal failure became fatal")
+			}
+		})
+	}
+}
+
+func TestSettlementHandoffSharesConfirmationBudget(t *testing.T) {
+	f := &fakeSource{}
+	message := &Message{SequenceNumber: 1, LockedUntil: time.Now().Add(500 * time.Millisecond), queue: "q", s: f}
+	started, canceled, allowExit := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls, settled, budgets int32
+	f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return time.Now().Add(time.Second), nil
+		}
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-allowExit
+		return time.Now().Add(time.Hour), nil
+	}
+	f.completeFn = func(context.Context) error { atomic.AddInt32(&settled, 1); return nil }
+	observed := make(chan error, 2)
+	r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) { observed <- err })})
+	r.settlement.totalTimeout = 30 * time.Millisecond
+	r.settlement.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+		if d == r.settlement.totalTimeout {
+			atomic.AddInt32(&budgets, 1)
+		}
+		return context.WithTimeout(ctx, d)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.process(context.Background(), message, func(context.Context, *Message) error { <-started; return nil }, func() {}, func() bool { return false }, func(error, bool) {}, false)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		close(allowExit)
+		t.Fatal("handoff did not cancel at the shared confirmation deadline")
+	}
+	select {
+	case <-done:
+		close(allowExit)
+		t.Fatal("handoff deadline released its worker before renewal joined")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(allowExit)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not join after cancellation")
+	}
+	if atomic.LoadInt32(&budgets) != 1 || atomic.LoadInt32(&settled) != 0 {
+		t.Fatal("handoff reset its budget or attempted settlement after exhaustion")
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("handoff deadline error=%v", err)
+		}
+	default:
+		t.Fatal("exhausted confirmation budget was silent")
+	}
+}
+
+func TestSettlementHandoffFinishesHealthyRenewal(t *testing.T) {
+	f := &fakeSource{}
+	message := &Message{SequenceNumber: 1, LockedUntil: time.Now().Add(500 * time.Millisecond), queue: "q", s: f}
+	started, handlerReturned, allowReturn, exited := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	canceled := make(chan struct{}, 1)
+	var calls int32
+	f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) {
+		switch atomic.AddInt32(&calls, 1) {
+		case 1:
+			return time.Now().Add(time.Second), nil
+		case 2:
+			close(started)
+			select {
+			case <-ctx.Done():
+				canceled <- struct{}{}
+			case <-allowReturn:
+			}
+			close(exited)
+			return time.Now().Add(time.Hour), nil
+		default:
+			return time.Now().Add(time.Hour), nil
+		}
+	}
+	var settled int32
+	f.completeFn = func(ctx context.Context) error {
+		select {
+		case <-exited:
+		default:
+			t.Error("Complete preceded renewal join")
+		}
+		atomic.AddInt32(&settled, 1)
+		// A fresh confirmed lease must replace the old short schedule during handoff.
+		select {
+		case <-time.After(700 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	observed := make(chan error, 4)
+	r := newReceiver(f, "q", []ReceiverOption{WithAutoRenew(), WithErrorHandler(func(err error) { observed <- err })})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.process(context.Background(), message, func(context.Context, *Message) error { <-started; close(handlerReturned); return nil }, func() {}, func() bool { return false }, func(error, bool) {}, false)
+	}()
+	<-handlerReturned
+	select {
+	case <-canceled:
+		close(allowReturn)
+		<-done
+		t.Fatal("normal handoff canceled a healthy in-flight renewal")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(allowReturn)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("healthy renewal did not join before settlement")
+	}
+	if atomic.LoadInt32(&calls) != 2 || atomic.LoadInt32(&settled) != 1 || len(observed) != 0 {
+		t.Fatalf("renew/settle/errors = %d/%d/%d", atomic.LoadInt32(&calls), atomic.LoadInt32(&settled), len(observed))
+	}
+}
+
+func TestSettlementHandoffAfterRunCancellationJoinsRenewAndRetainsConfirmedLease(t *testing.T) {
 	f := &fakeSource{}
 	message := &Message{SequenceNumber: 1, LockedUntil: time.Now().Add(500 * time.Millisecond), queue: "q", s: f}
 	secondStarted, secondCanceled, allowSecond := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -57,10 +375,12 @@ func TestSettlementHandoffJoinsCanceledRenewAndRetainsConfirmedLease(t *testing.
 		atomic.AddInt32(&observed, 1)
 		t.Errorf("handoff error: %v", err)
 	})})
+	ctx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		r.process(context.Background(), message, func(context.Context, *Message) error { <-secondStarted; return nil }, func() {}, func() bool { return false }, func(error, bool) {}, false)
+		r.process(ctx, message, func(context.Context, *Message) error { <-secondStarted; cancelRun(); return nil }, func() {}, func() bool { return false }, func(error, bool) {}, false)
 	}()
 	select {
 	case <-secondCanceled:

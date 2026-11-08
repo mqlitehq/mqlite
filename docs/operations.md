@@ -160,12 +160,15 @@ listener is ready, including database open and schema checks. The default lease
 is 30 seconds; use a longer configured lease when measured remote-store restart
 time and renewal/settlement latency need more margin.
 The managed Receiver on `main` also has bounded renewal and settlement budgets:
-terminal Complete/Abandon confirmation gets up to 30 seconds in total, including
-the first request, all replays and backoff, with at most fifteen seconds per request.
+terminal Complete/Abandon confirmation gets up to 30 seconds from handler return,
+including the renewal handoff, first request, all replays and backoff, with at most
+fifteen seconds per settlement request.
 The same queue, sequence, token, operation and arguments are reused; confirmation
 does not rerun the handler. An exhausted transient confirmation reports
 `ErrOutcomeUnknown` through `WithErrorHandler` and preserves the final cause for
-`errors.Is`/`errors.As`. Definitive errors such as `ErrLockLost` are reported
+`errors.Is`/`errors.As`. If the budget expires while joining the handling heartbeat,
+no new settlement is sent; expiry before any settlement request does not imply an
+unknown settlement outcome. Definitive errors such as `ErrLockLost` are reported
 unchanged without retry; permanent errors also stop `Run`. The budget does not
 extend a lease; an exact retained receipt may confirm a previously committed effect after the original lease
 expires, while a new effect still requires a live token. Returning before lease
@@ -239,8 +242,11 @@ automatic context cancellation; `mqlite serve` does not read stdin.
 
 After a handler returns, `nil` requests Complete and a non-nil result requests
 Abandon. A confirmed handling-phase lease failure still skips new settlement.
-Otherwise confirmation has a fresh 30-second total budget and at most fifteen
-seconds per request. With auto-renew enabled, its heartbeat shares that bounded
+Otherwise one shared 30-second confirmation budget starts when the handler returns.
+Normal handoff lets the last in-flight renewal finish under its original watchdog
+and Run context, then joins it before settlement. Run cancellation, budget expiry
+and abnormal exits still cancel and join it. Each settlement request gets at most
+fifteen seconds. With auto-renew enabled, its heartbeat shares that bounded
 context until confirmation finishes, including if Run is canceled during this
 phase. The Receiver then cancels and joins the heartbeat before releasing the
 delivery's total-inflight slot. A lease-loss response after this delivery's own

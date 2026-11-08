@@ -18,6 +18,10 @@ upgrade notes before replacing a broker.
   waits for its exact acknowledgement, within the existing 30-second confirmation
   budget. Canceling Run still cancels a running handler; a returned handler's
   bounded settlement and heartbeat are joined before its worker is released.
+  On normal handler return, finish a healthy in-flight renewal and adopt its
+  acknowledgement before settlement, instead of canceling and reissuing it.
+  That handoff shares the same confirmation budget; Run cancellation, budget
+  expiry and abnormal exits still cancel and join the handling heartbeat.
 - A renewal may lose its token after the same settlement committed. Resolve
   that ownership race through the settlement acknowledgement or receipt replay,
   retaining its definitive error or outcome-unknown status. Permanent renewal

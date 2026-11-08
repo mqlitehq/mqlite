@@ -284,14 +284,18 @@ own retry policies.
 `WithConcurrency(C)` limits concurrently executing handlers. Renewal shutdown and
 settlement can overlap later handlers, but the Receiver bounds all claimed work to
 `C + effective prefetch` deliveries (at most `2C`, and `2C` by default).
-After a handler returns, its exact Complete/Abandon request gets up to 30 seconds
-in total for confirmation, including the first request, retries and backoff;
-each request has at most fifteen seconds. The confirmation loop reuses the original
+A single 30-second confirmation budget starts when the handler returns. It includes
+joining its last in-flight renewal, then the exact Complete/Abandon request, retries
+and backoff; each settlement request has at most fifteen seconds. The loop reuses the original
 token and sequence without calling the handler again. If transient retries
 exhaust that budget, `WithErrorHandler` receives `ErrOutcomeUnknown` with the final
 cause preserved for `errors.Is`/`errors.As`; reconcile the original settlement.
+Expiry before any settlement request is issued has the local cause
+`context.DeadlineExceeded`; it does not imply an unknown settlement outcome.
 The confirmation budget does not itself extend the lease. With auto-renew enabled,
 the Receiver keeps renewing within that same bounded confirmation phase.
+A normal return lets the handling-phase renewal finish within its original lease
+watchdog; Run cancellation and budget expiry still cancel and join that heartbeat.
 This protects a live token while
 the settlement waits, including if `Run` is canceled during that phase. A renewal
 may see lock loss after the settlement already committed; its exact acknowledgement
