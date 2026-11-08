@@ -5,6 +5,7 @@ go 1.21
 retract v0.3.3 // Withdrawn: unstable queue Generation API; use v0.4.0 or later.
 
 require (
+	github.com/antlr4-go/antlr/v4 v4.13.0
 	github.com/charmbracelet/log v1.0.0
 	github.com/expr-lang/expr v1.17.8
 	github.com/tursodatabase/libsql-client-go v0.0.0-20251219100830-236aa1ff8acc
@@ -13,7 +14,6 @@ require (
 )
 
 require (
-	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.2.3-0.20250311203215-f60798e515dc // indirect
 	github.com/charmbracelet/lipgloss v1.1.0 // indirect

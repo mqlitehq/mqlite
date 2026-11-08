@@ -39,6 +39,18 @@ archives:
   # one archive per OS/arch containing both binaries (mqlite + mqlite-mcp).
   - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
+    files:
+      # Retain GoReleaser's default documentation globs plus the copied MIT code.
+      - license*
+      - LICENSE*
+      - readme*
+      - README*
+      - changelog*
+      - CHANGELOG*
+      - src: internal/libsqlcompat/LICENSE
+        dst: licenses/libsql-client-go/LICENSE
+      - src: internal/libsqlcompat/NOTICE
+        dst: licenses/libsql-client-go/NOTICE
     format_overrides:
       - goos: windows
         formats: [zip]

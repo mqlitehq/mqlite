@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
 	libsql "github.com/tursodatabase/libsql-client-go/libsql"
 )
 
@@ -26,14 +27,15 @@ import (
 // one lease). Validator runs only when that lease is returned, so it never breaks
 // a transaction in progress; returning false prevents both idle reuse and direct
 // waiter handoff. The driver's shared http.DefaultTransport still reuses the
-// underlying TCP/TLS connection. Remove this adapter when MQLite can move to a
-// maintained pure-Go remote driver with an equivalent validity contract.
+// underlying TCP/TLS connection. The internal pinned HTTP compatibility copy
+// also bounds detached cleanup without changing foreground SQL (MQLITE-164).
+// Remove this adapter when a maintained pure-Go driver provides both contracts.
 func openHTTPHranaDB(dsn string) (*sql.DB, error) {
 	// Use the driver's sql.Open-compatible DSN parser so this adapter preserves
 	// the existing authToken/tls URL contract exactly. NewConnector intentionally
 	// rejects those legacy query parameters, while resolveDSN still emits them.
 	// Re-parsing the URL here would risk changing credential or TLS behavior.
-	base := libsqlDSNConnector{dsn: dsn}
+	base := libsqlDSNConnector{dsn: dsn, opener: libsqlcompat.NewOpener()}
 	return sql.OpenDB(singleLeaseConnector{Connector: base}), nil
 }
 
@@ -41,7 +43,8 @@ func openHTTPHranaDB(dsn string) (*sql.DB, error) {
 // dsn). The upstream Driver does not implement driver.DriverContext, so this is
 // the narrow bridge needed to place the validity adapter around each connection.
 type libsqlDSNConnector struct {
-	dsn string
+	dsn    string
+	opener *libsqlcompat.Opener
 }
 
 func (c libsqlDSNConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -51,7 +54,11 @@ func (c libsqlDSNConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := validateRemoteConnectionDSN(c.dsn); err != nil {
 		return nil, err
 	}
-	conn, err := (libsql.Driver{}).Open(c.dsn)
+	opener := c.opener
+	if opener == nil {
+		opener = libsqlcompat.NewOpener()
+	}
+	conn, err := opener.OpenHTTP(c.dsn)
 	return conn, redactedRemoteURLError(err)
 }
 
