@@ -50,7 +50,8 @@ values replace earlier ones, while repeated object and map values may merge.
   excessive elapsed values keep the original full-RTT bound.
   Older clients ignore the additive header. With an older broker, the client can
   use HTTP `Date` at its one-second precision; a short lower bound dominated by
-  that precision uses bounded degraded-clock pacing. Without either header the
+  that precision uses bounded degraded-clock pacing. Without either
+  `X-Mqlite-Server-Time-Ms` or HTTP `Date`, the
   public absolute deadline is retained, but the managed Receiver reports one
   diagnostic, confirms the lease before dispatch, and keeps a bounded
   untrusted-clock cadence instead of using that foreign timestamp as a local
@@ -58,9 +59,10 @@ values replace earlier ones, while repeated object and map values may merge.
   or a lock duration from 1 second through 1 hour. Legacy databases containing a
   duration outside that range remain readable, but this no-header fallback may
   fail closed when it cannot prove enough lease remains for a very short lease.
-  Raw HTTP callers should preserve one time header, map broker time, or synchronize
-  clocks.
-  CORS-enabled brokers expose both headers to browser clients.
+  Raw HTTP callers should preserve `X-Mqlite-Server-Time-Ms` or HTTP `Date`, map
+  broker time, or synchronize clocks.
+  CORS-enabled brokers expose `X-Mqlite-Server-Time-Ms` and
+  `X-Mqlite-Server-Elapsed-Ms` to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.

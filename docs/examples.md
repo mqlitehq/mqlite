@@ -221,8 +221,8 @@ still waits for returning handlers' terminal confirmation to finish. See the
 handoff, cancellation and expiry before a settlement request is sent.
 If a broker or intermediary returns HTTP 499, it is retried while the Receiver's
 own context remains live, using the same Receive attempt ID. If a proxy removes
-both broker-time headers, `WithErrorHandler` receives one degraded-clock
-diagnostic.
+both `X-Mqlite-Server-Time-Ms` and HTTP `Date`, `WithErrorHandler` receives one
+degraded-clock diagnostic.
 
 ## 4. Topic subscription lifecycle
 
