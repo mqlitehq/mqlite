@@ -3,15 +3,20 @@
 import copy
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+import errno
+import http.client
 import importlib.util
 import io
 import json
 from pathlib import Path
 import subprocess
+import socket
+import ssl
 import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 
@@ -24,6 +29,306 @@ release_smoke = importlib.util.module_from_spec(SMOKE_SPEC)
 SMOKE_SPEC.loader.exec_module(release_smoke)
 SHA = "1" * 40
 SCAN_DATE = date(2026, 9, 10)
+
+
+class DownloadTests(unittest.TestCase):
+    """No network or real sleeps: exercise the production downloader and its hard timers."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.destination = self.root / "trivy.tar.gz"
+        self.now = 0
+        self.original_open = candidate.open_trivy
+        self.previous_handler = object()
+        self.download = self.enterContext(patch.object(candidate, "open_trivy"))
+        self.download.side_effect = AssertionError("unexpected network request")
+        self.enterContext(patch.object(candidate, "TRIVY_SHA256", candidate.digest(b"verified archive")))
+        self.enterContext(patch.object(candidate.time, "monotonic", side_effect=lambda: self.now))
+        self.sleep = self.enterContext(patch.object(candidate.time, "sleep", side_effect=self.advance))
+        self.gettimer = self.enterContext(patch.object(candidate.signal, "getitimer", return_value=(0, 0)))
+        self.getsignal = self.enterContext(patch.object(candidate.signal, "getsignal", return_value=self.previous_handler))
+        self.settimer = self.enterContext(patch.object(candidate.signal, "setitimer"))
+        self.setsignal = self.enterContext(patch.object(candidate.signal, "signal"))
+        self.enterContext(patch("builtins.print"))
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def assert_clean(self):
+        self.assertEqual(list(self.root.glob(".*.part")), [])
+        self.assertEqual(self.settimer.call_args.args, (candidate.signal.ITIMER_REAL, 0))
+        self.assertEqual(self.setsignal.call_args.args, (candidate.signal.SIGALRM, self.previous_handler))
+
+    def http_error(self, status):
+        return urllib.error.HTTPError(candidate.TRIVY_URL, status, "fixture", {}, io.BytesIO())
+
+    def test_retryable_statuses_retry_the_pinned_download_and_verify_every_byte(self):
+        for status in (408, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                self.download.reset_mock()
+                self.sleep.reset_mock()
+                self.download.side_effect = [self.http_error(status), io.BytesIO(b"verified archive")]
+                candidate.download_trivy(self.destination)
+                self.assertEqual(self.download.call_count, 2)
+                self.assertEqual(self.sleep.call_args_list, [unittest.mock.call(2)])
+                self.assertEqual(self.destination.read_bytes(), b"verified archive")
+                self.assert_clean()
+                self.destination.unlink()
+
+    def test_three_failures_stop_without_a_partial_or_success_artifact(self):
+        self.download.side_effect = [self.http_error(504) for _ in range(3)]
+        with self.assertRaisesRegex(RuntimeError, "three transient failures: HTTP 504"):
+            candidate.download_trivy(self.destination)
+        self.assertEqual(self.download.call_count, 3)
+        self.assertEqual(self.sleep.call_args_list, [unittest.mock.call(2), unittest.mock.call(4)])
+        self.assertFalse(self.destination.exists())
+        self.assert_clean()
+
+    def test_interrupted_body_starts_a_fresh_file_and_does_not_resume_partial_bytes(self):
+        class Interrupted(io.BytesIO):
+            def read(self, _size):
+                if self.tell() == 0:
+                    return super().read(4)
+                raise http.client.IncompleteRead(b"untrusted partial")
+        self.download.side_effect = [Interrupted(b"bad bytes"), io.BytesIO(b"verified archive")]
+        candidate.download_trivy(self.destination)
+        self.assertEqual(self.destination.read_bytes(), b"verified archive")
+        self.assertEqual(self.download.call_count, 2)
+        self.assert_clean()
+
+    def test_network_classification_does_not_retry_certificates_or_unknown_failures(self):
+        errors = [self.http_error(status) for status in (302, 400, 401, 403, 404, 410, 501, 505)]
+        errors += [ssl.SSLCertVerificationError("fixture certificate"), ssl.SSLError("fixture TLS"),
+                   socket.gaierror(socket.EAI_NONAME, "fixture DNS"),
+                   urllib.error.URLError("unknown reason"), OSError(errno.ENOSPC, "fixture disk")]
+        for error in errors:
+            with self.subTest(error=type(error).__name__, status=getattr(error, "code", None)):
+                self.download.reset_mock()
+                self.sleep.reset_mock()
+                self.download.side_effect = error
+                with self.assertRaises(type(error)):
+                    candidate.download_trivy(self.destination)
+                self.assertEqual(self.download.call_count, 1)
+                self.sleep.assert_not_called()
+                self.assertFalse(self.destination.exists())
+                self.assert_clean()
+
+    def test_explicit_transport_failures_retry_but_generic_os_errors_do_not(self):
+        for error in (TimeoutError(), ConnectionResetError(), ConnectionRefusedError(),
+                      urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, "fixture")),
+                      http.client.RemoteDisconnected()):
+            with self.subTest(error=type(error).__name__):
+                self.download.reset_mock()
+                self.download.side_effect = [error, io.BytesIO(b"verified archive")]
+                candidate.download_trivy(self.destination)
+                self.assertEqual(self.download.call_count, 2)
+                self.destination.unlink()
+                self.assert_clean()
+
+    def test_hash_local_io_and_publish_failures_never_retry(self):
+        cases = ((candidate, "TRIVY_SHA256", "0" * 64),
+                 (candidate, "file_digest", unittest.mock.Mock(side_effect=OSError(errno.ENOSPC, "fixture hash"))),
+                 (candidate.os, "link", unittest.mock.Mock(side_effect=OSError(errno.ECONNRESET, "fixture publish"))))
+        for target, name, value in cases:
+            with self.subTest(stage=name):
+                self.download.reset_mock()
+                self.sleep.reset_mock()
+                self.download.side_effect = lambda _timeout: io.BytesIO(b"verified archive")
+                with patch.object(target, name, value), self.assertRaises((RuntimeError, OSError)):
+                    candidate.download_trivy(self.destination)
+                self.assertEqual(self.download.call_count, 1)
+                self.sleep.assert_not_called()
+                self.assertFalse(self.destination.exists())
+                self.assert_clean()
+        with patch.object(candidate.os, "open", side_effect=OSError(errno.ENOSPC, "fixture open")):
+            self.download.reset_mock()
+            with self.assertRaises(OSError):
+                candidate.download_trivy(self.destination)
+            self.download.assert_not_called()
+        self.assert_clean()
+
+    def test_partial_local_write_failure_is_not_a_retryable_network_error(self):
+        original_fdopen = candidate.os.fdopen
+        class BrokenWriter:
+            def __init__(self, stream):
+                self.stream = stream
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                self.stream.close()
+            def write(self, block):
+                self.stream.write(block[:3])
+                raise OSError(errno.ENOSPC, "fixture write")
+        def open_file(descriptor, mode):
+            return BrokenWriter(original_fdopen(descriptor, mode))
+        self.download.side_effect = lambda _timeout: io.BytesIO(b"verified archive")
+        with patch.object(candidate.os, "fdopen", side_effect=open_file), self.assertRaises(OSError):
+            candidate.download_trivy(self.destination)
+        self.assertEqual(self.download.call_count, 1)
+        self.sleep.assert_not_called()
+        self.assertFalse(self.destination.exists())
+        self.assert_clean()
+
+    def test_partial_and_published_archive_are_private_even_with_a_permissive_umask(self):
+        previous = candidate.os.umask(0o022)
+        try:
+            def download(_timeout):
+                parts = list(self.root.glob(".*.part"))
+                self.assertEqual(len(parts), 1)
+                self.assertEqual(parts[0].stat().st_mode & 0o777, 0o600)
+                return io.BytesIO(b"verified archive")
+            self.download.side_effect = download
+            candidate.download_trivy(self.destination)
+            self.assertEqual(self.destination.stat().st_mode & 0o777, 0o600)
+        finally:
+            candidate.os.umask(previous)
+        self.assert_clean()
+
+    def test_destination_and_unrelated_partial_are_never_overwritten_or_deleted(self):
+        self.destination.write_bytes(b"existing")
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            candidate.download_trivy(self.destination)
+        self.download.assert_not_called()
+        self.assertEqual(self.destination.read_bytes(), b"existing")
+        self.destination.unlink()
+        unrelated = self.root / ".trivy.tar.gz.someone-else.part"
+        unrelated.write_bytes(b"not ours")
+        original_link = candidate.os.link
+        def concurrent_file(source, destination):
+            destination.write_bytes(b"concurrent owner")
+            original_link(source, destination)
+        self.download.side_effect = lambda _timeout: io.BytesIO(b"verified archive")
+        with patch.object(candidate.os, "link", side_effect=concurrent_file), self.assertRaises(FileExistsError):
+            candidate.download_trivy(self.destination)
+        self.assertEqual(self.destination.read_bytes(), b"concurrent owner")
+        self.assertEqual(unrelated.read_bytes(), b"not ours")
+        self.assertEqual(list(self.root.glob(".*.part")), [unrelated])
+
+    def test_exclusive_partial_collision_does_not_delete_another_owner_file(self):
+        partial = self.root / ".trivy.tar.gz.collision.part"
+        partial.write_bytes(b"another owner")
+        with patch.object(candidate.uuid, "uuid4", return_value=SimpleNamespace(hex="collision")):
+            with self.assertRaises(FileExistsError):
+                candidate.download_trivy(self.destination)
+        self.download.assert_not_called()
+        self.assertEqual(partial.read_bytes(), b"another owner")
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.root.glob(".*.part")), [partial])
+
+    def test_hard_attempt_deadline_retries_and_hard_total_deadline_does_not(self):
+        class SlowResponse(io.BytesIO):
+            def read(response, size):
+                self.advance(60)
+                self.setsignal.call_args_list[0].args[1](candidate.signal.SIGALRM, None)
+        self.download.side_effect = [SlowResponse(b"never complete"), io.BytesIO(b"verified archive")]
+        candidate.download_trivy(self.destination)
+        self.assertEqual(self.download.call_count, 2)
+        self.assertEqual(self.sleep.call_args_list, [unittest.mock.call(2)])
+        self.assertTrue(any(call.args == (candidate.signal.ITIMER_REAL, 60)
+                            for call in self.settimer.call_args_list))
+        self.assert_clean()
+        self.destination.unlink()
+        self.download.reset_mock()
+        # The current handler is the last installation, before the restore call.
+        def install(_signal, handler):
+            if callable(handler):
+                self.handler = handler
+        self.setsignal.side_effect = install
+        def exhausted(_timeout):
+            self.advance(180)
+            self.handler(candidate.signal.SIGALRM, None)
+        self.download.side_effect = exhausted
+        with self.assertRaises(candidate.DownloadBudgetExpired):
+            candidate.download_trivy(self.destination)
+        self.assertEqual(self.download.call_count, 1)
+        self.assertFalse(self.destination.exists())
+        self.assert_clean()
+
+    def test_third_attempt_uses_the_remaining_total_budget_not_another_full_minute(self):
+        timeouts = []
+        def response(timeout):
+            timeouts.append(timeout)
+            self.advance(60 if len(timeouts) < 3 else 54)
+            raise TimeoutError()
+        self.download.side_effect = response
+        with self.assertRaises(candidate.DownloadBudgetExpired):
+            candidate.download_trivy(self.destination)
+        self.assertEqual(timeouts, [60, 60, 54])
+        self.assertEqual(self.now, 180)
+        self.assert_clean()
+
+    def test_attempt_timeout_keeps_a_hard_total_timer_while_response_cleanup_unwinds(self):
+        def install(_signal, handler):
+            if callable(handler):
+                self.handler = handler
+        self.setsignal.side_effect = install
+        class SlowCleanup:
+            def __enter__(response):
+                return response
+            def read(response, _size):
+                self.advance(60)
+                self.handler(candidate.signal.SIGALRM, None)
+            def __exit__(response, *_args):
+                self.assertEqual(self.settimer.call_args.args, (candidate.signal.ITIMER_REAL, 120))
+                self.advance(120)
+                self.handler(candidate.signal.SIGALRM, None)
+        self.download.side_effect = [SlowCleanup()]
+        with self.assertRaises(candidate.DownloadBudgetExpired):
+            candidate.download_trivy(self.destination)
+        self.assertEqual(self.now, 180)
+        self.assertEqual(self.download.call_count, 1)
+        self.assertFalse(self.destination.exists())
+        self.sleep.assert_not_called()
+        self.assert_clean()
+
+    def test_no_retry_when_the_remaining_budget_cannot_cover_backoff(self):
+        def failure(_timeout):
+            self.advance(179)
+            raise TimeoutError()
+        self.download.side_effect = failure
+        with self.assertRaises(candidate.DownloadBudgetExpired):
+            candidate.download_trivy(self.destination)
+        self.assertEqual(self.download.call_count, 1)
+        self.sleep.assert_not_called()
+        self.assert_clean()
+
+    def test_active_prior_alarm_is_rejected_without_delaying_or_replacing_it(self):
+        for timer in ((1, 0), (0, 2)):
+            with self.subTest(timer=timer):
+                self.gettimer.return_value = timer
+                with self.assertRaisesRegex(RuntimeError, "active deadline timer"):
+                    candidate.download_trivy(self.destination)
+                self.settimer.assert_not_called()
+                self.setsignal.assert_not_called()
+                self.getsignal.assert_not_called()
+                self.download.assert_not_called()
+
+    def test_no_worker_thread_or_unsupported_platform_fallback(self):
+        with patch.object(candidate.threading, "current_thread", return_value=object()):
+            with self.assertRaisesRegex(RuntimeError, "main-thread POSIX"):
+                candidate.download_trivy(self.destination)
+        with patch.object(candidate, "signal", SimpleNamespace()):
+            with self.assertRaisesRegex(RuntimeError, "main-thread POSIX"):
+                candidate.download_trivy(self.destination)
+        self.download.assert_not_called()
+        self.settimer.assert_not_called()
+
+    def test_fixed_source_and_redirect_allowlist_are_checked_before_following(self):
+        with patch.object(candidate.urllib.request, "build_opener") as opener:
+            self.original_open(17)
+            opener.return_value.open.assert_called_once_with(candidate.TRIVY_URL, timeout=17)
+            self.assertEqual(candidate.TRIVY_URL, "https://github.com/aquasecurity/trivy/releases/download/v0.74.0/"
+                             "trivy_0.74.0_Linux-64bit.tar.gz")
+        handler = candidate.TrivyRedirectHandler()
+        request = candidate.urllib.request.Request(candidate.TRIVY_URL)
+        for url in ("http://github.com/file", "https://unknown.example/file", "https://github.com.evil/file",
+                    "https://user@github.com/file", "https://github.com:444/file"):
+            with self.subTest(url=url), self.assertRaisesRegex(RuntimeError, "unapproved"):
+                handler.redirect_request(request, None, 302, "fixture", {}, url)
+        for host in candidate.TRIVY_DOWNLOAD_HOSTS:
+            redirected = handler.redirect_request(request, None, 302, "fixture", {}, "https://" + host + "/file")
+            self.assertEqual(redirected.full_url, "https://" + host + "/file")
 
 
 def build_info(arch):
@@ -75,7 +380,7 @@ class CandidateTests(unittest.TestCase):
         fixture(self.archive)
 
     @contextmanager
-    def verify_commands(self, output, failure=None, failed_arch=None):
+    def verify_commands(self, output, failure=None, failed_arch=None, download_failure=False):
         identity = candidate.inspect_archive(self.archive, "0.3.0", SHA)
         download = io.BytesIO()
         with tarfile.open(fileobj=download, mode="w:gz") as archive:
@@ -157,7 +462,10 @@ class CandidateTests(unittest.TestCase):
             else:
                 self.fail("unexpected external command: " + repr(args))
 
-        with patch.object(candidate.urllib.request, "urlopen", return_value=io.BytesIO(download_bytes)), \
+        downloads = ([urllib.error.HTTPError("https://github.com/fixture", 504, "Gateway Timeout", {}, None)]
+                     if download_failure else []) + [io.BytesIO(download_bytes)]
+        with patch.object(candidate, "open_trivy", side_effect=downloads), \
+                patch.object(candidate.time, "sleep"), \
                 patch.object(candidate, "TRIVY_SHA256", candidate.digest(download_bytes)), \
                 patch.object(candidate, "command", side_effect=run), patch("builtins.print"), \
                 patch.object(candidate, "datetime") as clock:
@@ -181,6 +489,36 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(events["smokes"], ["amd64", "arm64"])
         self.assertEqual(len(events["loaded"]), 2)
         self.assertEqual(events["removed"], events["loaded"])
+
+    def test_verify_recovers_from_scanner_download_gateway_timeout(self):
+        output = self.root / "verify-download-retry"
+        with self.verify_commands(output, download_failure=True) as (_, events):
+            candidate.verify(self.archive, output, "0.3.0", SHA)
+        self.assertEqual(events["scans"], ["amd64", "arm64"])
+        self.assertEqual(events["smokes"], ["amd64", "arm64"])
+        self.assertEqual(json.loads((output / "verified.json").read_text())["status"], "PASS")
+
+    def test_failed_or_unverified_download_never_reaches_scan_or_writes_pass(self):
+        for failure in ("exhausted", "checksum", "budget", "certificate"):
+            with self.subTest(failure=failure):
+                output = self.root / ("download-" + failure)
+                with self.verify_commands(output) as (_, events):
+                    if failure == "exhausted":
+                        download = [urllib.error.HTTPError(candidate.TRIVY_URL, 504, "fixture", {}, None)
+                                    for _ in range(3)]
+                    elif failure == "checksum":
+                        download = [io.BytesIO(b"wrong archive")]
+                    elif failure == "budget":
+                        download = candidate.DownloadBudgetExpired("fixture deadline")
+                    else:
+                        download = ssl.SSLCertVerificationError("fixture certificate")
+                    with patch.object(candidate, "open_trivy", side_effect=download):
+                        with self.assertRaises((RuntimeError, ssl.SSLCertVerificationError)):
+                            candidate.verify(self.archive, output, "0.3.0", SHA)
+                self.assertFalse((output / "verified.json").exists())
+                self.assertFalse((output / "trivy.tar.gz").exists())
+                self.assertEqual(list(output.glob(".*.part")), [])
+                self.assertEqual(events, {"loaded": [], "removed": [], "scans": [], "smokes": []})
 
     def test_verify_gate_failures_never_write_pass_and_clean_loaded_images(self):
         for failure in ("scan-command", "scan-report", "loaded-image", "build-info", "smoke"):
