@@ -455,48 +455,10 @@ func (c *Client) postObserved(ctx context.Context, path string, reqBody, respOut
 		*raw = data
 		return observation, nil
 	}
-	if response, ok := respOut.(*wire.SendResponse); ok {
-		if err := decodeSendResponse(data, response); err != nil {
-			return observation, &invalidSuccessResponseError{cause: err}
-		}
-		return observation, nil
-	}
 	if err := json.Unmarshal(data, respOut); err != nil {
 		return observation, &invalidSuccessResponseError{cause: err}
 	}
 	return observation, nil
-}
-
-// decodeSendResponse validates only the known numeric acknowledgement field.
-// A RawMessage keeps unknown extension fields compatible, including strings
-// containing "null", without allocating a pointer for every sequence number.
-func decodeSendResponse(data []byte, response *wire.SendResponse) error {
-	// Preserve the original integer decoder's type errors, including an invalid
-	// earlier occurrence of a repeated field followed by a valid occurrence.
-	if err := json.Unmarshal(data, response); err != nil {
-		return err
-	}
-	var fields struct {
-		SeqNumbers json.RawMessage `json:"seq_numbers"`
-	}
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
-	}
-	if len(fields.SeqNumbers) == 0 {
-		response.SeqNumbers = nil // The caller's exact-count check rejects a missing acknowledgement.
-		return nil
-	}
-	// []int64's normal JSON decoder otherwise turns null elements into zero,
-	// which is indistinguishable from a valid topic publish with no match.
-	if bytes.Contains(fields.SeqNumbers, []byte("null")) {
-		return fmt.Errorf("mqlite: send acknowledgement contains a null sequence number")
-	}
-	for i, sequence := range response.SeqNumbers {
-		if sequence < 0 {
-			return fmt.Errorf("mqlite: send acknowledgement has a negative sequence number at index %d", i)
-		}
-	}
-	return nil
 }
 
 func mapErr(eb wire.ErrorBody) error {

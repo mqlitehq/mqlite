@@ -1774,7 +1774,8 @@ func TestManagedRetryClassifiesHTTPStatus(t *testing.T) {
 		{500, true},
 		{503, true},
 		{599, true},
-		{600, true}, // preserve the established renewal/settlement classification
+		{600, false},
+		{999, false},
 	} {
 		err := &HTTPError{StatusCode: tc.status}
 		if got := retryableManagedError(err); got != tc.want {
@@ -1812,9 +1813,36 @@ func TestManagedReceiveUsesStrict5xxBoundary(t *testing.T) {
 		{600, false},
 	} {
 		err := &HTTPError{StatusCode: tc.status}
-		if got := retryableManagedReceiveError(err); got != tc.want {
+		if got := retryableManagedError(err); got != tc.want {
 			t.Errorf("HTTP %d Receive retryable = %v, want %v", tc.status, got, tc.want)
 		}
+	}
+}
+
+func TestManagedRenewalDoesNotReplayNonstandardHTTPStatus(t *testing.T) {
+	for _, status := range []int{600, 999} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			httpErr := &HTTPError{StatusCode: status, cause: errors.New("synthetic nonstandard response")}
+			calls := 0
+			f := &fakeSource{renewDeadlineFn: func(context.Context) (time.Time, error) {
+				calls++
+				if calls == 1 {
+					return time.Time{}, httpErr
+				}
+				return time.Time{}, ErrLockLost
+			}}
+			var observed []error
+			r := newReceiver(f, "q", []ReceiverOption{WithErrorHandler(func(err error) { observed = append(observed, err) })})
+			m := &Message{SequenceNumber: 1, queue: "q", s: f, lockToken: "synthetic-token"}
+			state := newRenewalState(time.Now().Add(time.Second), time.Second, false, false)
+			canceled := 0
+			result := r.renewLoop(ctx, m, &state, func() { canceled++ }, func() bool { return false }, func(error, bool) { t.Error("nonstandard HTTP status is not a permanent broker sentinel") }, false, nil)
+			if !result.skipSettlement || calls != 1 || canceled != 1 || len(observed) != 1 || !errors.Is(observed[0], httpErr) {
+				t.Fatalf("renewal calls=%d canceled=%d observed=%v skip=%v, want one terminal status without replay", calls, canceled, observed, result.skipSettlement)
+			}
+		})
 	}
 }
 

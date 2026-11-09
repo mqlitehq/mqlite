@@ -64,7 +64,9 @@ based only on API similarity; there is no promised replacement or migration date
 
 The HTTP v2 transport and its protocol/result helpers are a small internal copy
 of that same pin (`internal/libsqlcompat`), with bounded asynchronous stream
-cleanup (MQLITE-164). The original public SQL parser and WebSocket driver remain
+cleanup (MQLITE-164) and explicit success-acknowledgement validation (MQLITE-191).
+Incomplete or mismatched acknowledgements cannot authorize success or a safe
+write retry. The original public SQL parser and WebSocket driver remain
 at the pin. Source/delta hashes and a module-version guard detect drift; there is
 no library-local `replace` or reliance on a caller's vendor directory. The copied
 MIT license and source notice ship with binary archives and container images.

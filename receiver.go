@@ -499,7 +499,7 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			// Sample the shutdown ordering the moment the error is observed — before a retry or
 			// notify callback can span a caller cancellation (codex).
 			errAfterCancel = err != nil && cancelled()
-			if err == nil || !retryableManagedReceiveError(err) || rctx.Err() != nil {
+			if err == nil || !retryableManagedError(err) || rctx.Err() != nil {
 				break
 			}
 			hadTransientFailure = true
@@ -522,7 +522,7 @@ func (r *Receiver) Run(ctx context.Context, handler func(context.Context, *Messa
 			if rctx.Err() != nil && !isPermanent(err) {
 				return done()
 			}
-			if !retryableManagedReceiveError(err) {
+			if !retryableManagedError(err) {
 				r.notify(err)
 				fail(err, errAfterCancel)
 				return done()
@@ -886,7 +886,7 @@ func retryableManagedError(err error) bool {
 		// HTTP 499 is an actual broker/intermediary response, not proof that the
 		// caller canceled its controlling context. Managed operations are fenced or
 		// idempotent, and every retry loop separately stops when that context is done.
-		return status == 408 || status == 429 || status == 499 || status >= 500
+		return status == 408 || status == 429 || status == 499 || status/100 == 5
 	}
 	if errors.Is(err, context.Canceled) {
 		return false
@@ -901,17 +901,6 @@ func retryableManagedError(err error) bool {
 	// from a custom http.Client.Timeout while the operation's own context is still
 	// live; each retry loop separately checks that controlling context.
 	return true
-}
-
-// retryableManagedReceiveError narrows nonstandard HTTP status handling for the
-// Receive loop without changing the established renewal and settlement policy.
-// Only actual 5xx responses are server failures; 600 and above are terminal.
-func retryableManagedReceiveError(err error) bool {
-	var httpErr *HTTPError
-	if errors.As(err, &httpErr) && httpErr != nil && httpErr.StatusCode >= 500 {
-		return httpErr.StatusCode/100 == 5
-	}
-	return retryableManagedError(err)
 }
 
 // managedReceiveRetryAfter returns a private server pacing hint only for the

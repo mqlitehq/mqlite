@@ -99,7 +99,7 @@ func replacePinnedBlock(t *testing.T, text, changed, original string) string {
 	return strings.Replace(text, changed, original, 1)
 }
 
-func TestCopiedRuntimeMatchesPinnedSourceOutsideApprovedLifecycleDelta(t *testing.T) {
+func TestCopiedRuntimeMatchesPinnedSourceOutsideApprovedCompatibilityDelta(t *testing.T) {
 	var upstream struct {
 		SourceCommit  string `json:"source_commit"`
 		SourceVersion string `json:"source_version"`
@@ -114,7 +114,7 @@ func TestCopiedRuntimeMatchesPinnedSourceOutsideApprovedLifecycleDelta(t *testin
 		t.Fatal(err)
 	}
 	manifestSum := sha256.Sum256(raw)
-	if hex.EncodeToString(manifestSum[:]) != "9ffc8053f62732c86af7c6b7b612b51abdbadf4ecc72988b106f54f628507f85" {
+	if hex.EncodeToString(manifestSum[:]) != "2245158b1040bcd9546ca2d3de02c0c2d696968b70388d68276c960fcfb0ca9b" {
 		t.Fatal("review the full pinned source manifest before updating its golden")
 	}
 	if err := json.Unmarshal(raw, &upstream); err != nil {
@@ -147,11 +147,63 @@ func TestCopiedRuntimeMatchesPinnedSourceOutsideApprovedLifecycleDelta(t *testin
 		if file.Path == "httpv2/hranaV2.go" {
 			text = restorePinnedHTTPLifecycle(t, text)
 		}
+		text = restorePinnedAcknowledgements(t, file.Path, text)
 		sum := sha256.Sum256([]byte(text))
 		if hex.EncodeToString(sum[:]) != file.SHA {
 			t.Fatalf("unreviewed upstream protocol/SQL/result delta in %s", file.Path)
 		}
 	}
+}
+
+// Remove only the reviewed acknowledgement checks. Every remaining copied byte
+// must still match the original driver, including its SQL and retry behavior.
+func restorePinnedAcknowledgements(t *testing.T, path, text string) string {
+	t.Helper()
+	switch path {
+	case "httpv2/hranaV2.go":
+		text = replacePinnedBlock(t, text,
+			`return hrana.PipelineResponse{}, false, hrana.IncompleteAcknowledgement(err)`,
+			`return hrana.PipelineResponse{}, false, err`)
+		text = replacePinnedBlock(t, text,
+			`return hrana.PipelineResponse{}, false, hrana.InvalidAcknowledgement(err)`,
+			`return hrana.PipelineResponse{}, false, err`)
+		text = replacePinnedBlock(t, text, `	if err := validateAcknowledgement(msg, result); err != nil {
+		return nil, err
+	}
+`, "")
+		text = replacePinnedBlock(t, text, `			if r == nil {
+				continue // A conditional step may legitimately be skipped.
+			}
+`, "")
+	case "hrana/stream_result.go":
+		text = replacePinnedBlock(t, text, `	// RequestedBatch is set from the sent request, never from provider JSON.
+	RequestedBatch *Batch `+"`json:\"-\"`"+`
+`, "")
+		const wrapped = `return nil, InvalidAcknowledgement(err)`
+		if strings.Count(text, wrapped) != 2 {
+			t.Fatal("review both statement and batch acknowledgement decode errors")
+		}
+		text = strings.ReplaceAll(text, wrapped, `return nil, err`)
+		const objectCheck = `	if err := validateResultObject(r.Result); err != nil {
+		return nil, err
+	}
+`
+		if strings.Count(text, objectCheck) != 2 {
+			t.Fatal("review both statement and batch result object checks")
+		}
+		text = strings.ReplaceAll(text, objectCheck, "")
+		text = replacePinnedBlock(t, text, `	if err := validateBatchAcknowledgement(r, &res); err != nil {
+		return nil, err
+	}
+`, "")
+	case "hrana/stmt_result.go":
+		text = replacePinnedBlock(t, text, "\t\tAffectedRowCount *int32      `json:\"affected_row_count\"`\n", "")
+		text = replacePinnedBlock(t, text, `	if err := validateStatementAcknowledgement(r, aux.AffectedRowCount); err != nil {
+		return err
+	}
+`, "")
+	}
+	return text
 }
 
 func matchesPinnedParserDependency(moduleFile, module, version string) bool {

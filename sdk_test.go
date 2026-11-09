@@ -4671,6 +4671,73 @@ func TestReceiverReplaysExactSettlementAfterInvalidSemanticAcknowledgement(t *te
 	}
 }
 
+// A nonstandard response is not a 5xx server failure. Check both settlement
+// verbs through the public HTTP client, including bounded shutdown cleanup.
+func TestReceiverSettlementUsesStrictHTTPStatusBoundary(t *testing.T) {
+	for _, operation := range []string{"complete", "abandon"} {
+		for _, status := range []int{599, 600} {
+			t.Run(fmt.Sprintf("%s/%d", operation, status), func(t *testing.T) {
+				var calls atomic.Int32
+				route := wire.PathComplete
+				if operation == "abandon" {
+					route = wire.PathAbandon
+				}
+				stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					_, _ = io.Copy(io.Discard, request.Body)
+					switch request.URL.Path {
+					case wire.PathReceive:
+						_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":7,"lock_token":"lock-7","locked_until_ms":%d}]}`, time.Now().Add(time.Minute).UnixMilli())
+					case route:
+						if calls.Add(1) == 1 {
+							w.WriteHeader(status)
+							_, _ = io.WriteString(w, `{"code":"internal","message":"synthetic status"}`)
+						} else {
+							_, _ = io.WriteString(w, `{"ok":true}`)
+						}
+					default:
+						t.Errorf("unexpected route %s", request.URL.Path)
+						w.WriteHeader(http.StatusNotFound)
+					}
+				}))
+				defer stub.Close()
+				client, err := mqlite.Open(context.Background(), stub.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				handlers := 0
+				var observed []error
+				err = client.Receiver("q", mqlite.WithErrorHandler(func(err error) { observed = append(observed, err) })).Run(ctx, func(context.Context, *mqlite.Message) error {
+					handlers++
+					cancel()
+					if operation == "abandon" {
+						return errors.New("handler failed")
+					}
+					return nil
+				})
+				if !errors.Is(err, context.Canceled) || handlers != 1 {
+					t.Fatalf("Run=%v handlers=%d, want one joined handler and cancellation", err, handlers)
+				}
+				if status == 599 {
+					if calls.Load() != 2 || len(observed) != 0 {
+						t.Fatalf("599 settlement calls=%d observed=%v, want exact successful replay", calls.Load(), observed)
+					}
+				} else {
+					if calls.Load() != 1 || len(observed) != 1 {
+						t.Fatalf("600 settlement calls=%d observed=%v, want one terminal error", calls.Load(), observed)
+					}
+					var httpErr *mqlite.HTTPError
+					if !errors.As(observed[0], &httpErr) || httpErr.StatusCode != 600 || errors.Is(observed[0], mqlite.ErrOutcomeUnknown) {
+						t.Fatalf("600 outcome lost its definitive status: %v", observed[0])
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestRemoteSendInvalidSuccessIsOutcomeUnknown(t *testing.T) {
 	const marker = "untrusted-ack-marker"
 	tests := []struct {

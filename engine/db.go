@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
+
 	// Pure-Go local driver, no CGO (design D2 default). The remote libSQL
 	// connector is opened explicitly in libsql_conn.go.
 	_ "modernc.org/sqlite" // driver "sqlite" (local file/:memory:)
@@ -211,8 +213,8 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		return nil, fmt.Errorf("open %s: %w", driver, err)
 	}
 	if remote {
-		// Remote Turso/libSQL: the broker is still the single logical writer, but
-		// the Turso primary serializes writes for us, so a tiny pool is safe.
+		// Remote Turso/libSQL: write admission serializes this owner's mutations
+		// before they take a connection; the small pool retains capacity for reads.
 		sdb.SetMaxOpenConns(4)
 		if httpHrana {
 			// The Validator in singleLeaseConn is the correctness mechanism. Keep
@@ -471,18 +473,15 @@ func (d *db) close() error {
 
 // ── remote write resilience (Turso/libSQL only) ─────────────────────────────
 //
-// Two transient remote failures are retried (a local SQLite single writer never
-// retries):
-//   - a closed idle Hrana stream surfaces as a wrapped driver.ErrBadConn ("stream
-//     is closed") — the statement never reached the server, so a retry on a fresh
-//     pooled connection can't double-execute; and
-//   - a contended write surfaces as "database is locked" (SQLITE_BUSY) — the lock
-//     was never acquired so nothing ran, and a retry after a short backoff is
-//     equally safe.
+// Local SQLite never retries. Remote reads and pre-COMMIT transactions use
+// bounded retry for classified transport, contention and confirmed rollback
+// failures. Standalone writes replay only proven pre-execution rejections;
+// an attempted COMMIT is never automatically replayed. Incomplete or malformed
+// acknowledgements cannot establish that an issued write had no effect.
 //
-// The remote pool is small (4) but the Turso primary serializes writes, so a burst
-// of concurrent enqueues races for the write lock; bounded retry + backoff lets
-// them through instead of erroring (the MQLITE-4 pool-vs-single-writer tension).
+// Remote mutations enter the single-writer admission queue before taking a
+// connection. Retry backoff holds neither that permit nor the SQL connection;
+// reads retain the remaining capacity in the four-connection pool.
 
 const maxConnAttempts = 6
 
@@ -734,7 +733,8 @@ func (d *db) attempts() int {
 }
 
 func (d *db) retryable(err error) bool {
-	return d.remote && !errors.Is(err, ErrOutcomeUnknown) && !unclassifiedProviderHTTPCode(err) &&
+	return d.remote && !errors.Is(err, ErrOutcomeUnknown) &&
+		(!libsqlcompat.IsInvalidAcknowledgement(err) || libsqlcompat.IsIncompleteAcknowledgement(err)) && !unclassifiedProviderHTTPCode(err) &&
 		(isConnErr(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
 }
 
@@ -743,7 +743,7 @@ func (d *db) retryable(err error) bool {
 // error text, including Busy or an idle-rollback explanation. That text cannot
 // prove an issued standalone write or COMMIT had no durable effect (MQLITE-174).
 func (d *db) retryableWrite(err error) bool {
-	if !d.remote || err == nil || errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) ||
+	if !d.remote || err == nil || errors.Is(err, ErrOutcomeUnknown) || libsqlcompat.IsInvalidAcknowledgement(err) || errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) || remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err) || singleRemoteProviderLeaf(err) == nil {
 		return false
 	}
@@ -765,7 +765,7 @@ func isolateProviderBadConn(err error) error {
 }
 
 func remoteWriteMayHaveCommitted(err error) bool {
-	return isConnErr(err) || unclassifiedProviderHTTPCode(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err)
+	return libsqlcompat.IsInvalidAcknowledgement(err) || isConnErr(err) || unclassifiedProviderHTTPCode(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err)
 }
 
 // providerWriteOutcomeUnknown retains one HTTP provider cause for diagnostics
@@ -1281,8 +1281,9 @@ func normalizeCanceledRemoteCommitError(ctx context.Context, err error) (error, 
 	return err, false
 }
 
-// inTx runs fn inside a transaction, retrying the whole transaction on a
-// connection error (the aborted tx leaves nothing committed, so retry is safe).
+// inTxUnobserved retries a remote transaction only when the failure evidence
+// permits it. An ambiguous issued COMMIT remains ErrOutcomeUnknown; a connection
+// error alone does not establish that the transaction aborted.
 func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) error {
 	return e.inTxMode(ctx, fn, false)
 }

@@ -12,6 +12,19 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Validate remote SQL acknowledgements (MQLITE-191)
+
+- Reject missing or mismatched HTTP Hrana results as protocol errors instead of
+  panicking or accepting an incomplete success. Preserve valid conditional batch
+  skips, statement errors, and matching stream-close results.
+- A malformed acknowledgement after an issued standalone write or COMMIT is
+  `ErrOutcomeUnknown`, since its effect may already be durable. It is not
+  transparently replayed. Ordinary read failures remain protocol errors; normal
+  requests, transaction boundaries and the driver pin are unchanged.
+
+- Keep managed HTTP retry and error classification aligned across both Go SDKs;
+  server-status retries are limited to the actual 500–599 range (MQLITE-192).
+
 ### Coalesce compatible pending remote renewals (MQLITE-190)
 
 - Combine compatible HTTP Hrana `RenewBatch` calls already queued behind the
@@ -22,15 +35,12 @@ upgrade notes before replacing a broker.
   the actual SQL and connection finish. Idle, local and legacy renewal paths
   retain their synchronous behavior.
 
+### Preserve cancellation before commit sequencing (MQLITE-189)
+
 - Honor caller cancellation while waiting for commit sequencing. A canceled
   remote read can finish its own rollback without waiting for an unrelated
   COMMIT; commit ordering and interrupted-commit uncertainty remain unchanged
   (MQLITE-189).
-
-- Reject negative or null sequence-number slots in successful Send acknowledgements
-  as `ErrOutcomeUnknown`, without replaying the request. Preserve valid zero
-  results for unmatched topic publishes and duplicate positive results from dedup
-  (MQLITE-188).
 
 ### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
 
@@ -190,7 +200,7 @@ upgrade notes before replacing a broker.
   the timestamp-overflow check adds no SQL to the ordinary settlement path.
 
 > The canonical schema token remains **7** and no database rebuild is required.
-> This release adds an optional response header plus a Go broker-mode option;
+> This release adds optional timing headers and explicit broker/reclaim options;
 > older remote clients ignore the header, while programmatic brokers must add
 > `WithBrokerMode` before calling `Serve` to select the server lifecycle contract.
 > An older binary does not know the new safe-open default and may still reclaim
@@ -198,7 +208,7 @@ upgrade notes before replacing a broker.
 > and settle all deliveries, or wait for every lease to expire and verify
 > `locked=0`; do not run an old local CLI against a stopped broker DB with live work.
 
-### Reject impossible message acknowledgements (MQLITE-152)
+### Reject impossible message acknowledgements (MQLITE-152, MQLITE-188)
 
 - Reject null Receive items, nonpositive or duplicate delivery sequences, and
   Peek-Lock deliveries without a fencing token before exposing any batch prefix.
@@ -212,6 +222,8 @@ upgrade notes before replacing a broker.
 - Reject null or negative Send/Schedule acknowledgement sequences while preserving
   legitimate zero results for topic no-match and skipped batch dedup slots.
   Valid empty message bodies and empty Receive lists remain supported.
+  Numeric-domain validation runs once at the wire boundary; each client retains
+  the operation-specific exact-count check (MQLITE-193).
 
 ### Account for metadata in response batches (MQLITE-151)
 

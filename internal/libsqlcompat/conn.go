@@ -4,11 +4,27 @@ package libsqlcompat
 
 import (
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/url"
 
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat/hrana"
 	httpv2 "github.com/mqlitehq/mqlite/internal/libsqlcompat/httpv2"
 )
+
+// IsInvalidAcknowledgement distinguishes a received malformed success from a
+// definite rejection. An issued write may already have committed in this case.
+func IsInvalidAcknowledgement(err error) bool {
+	var invalid *hrana.InvalidAcknowledgementError
+	return errors.As(err, &invalid)
+}
+
+// IsIncompleteAcknowledgement preserves ordinary read retries when a known
+// transport error interrupted the body. It never authorizes replay of a write.
+func IsIncompleteAcknowledgement(err error) bool {
+	var invalid *hrana.InvalidAcknowledgementError
+	return errors.As(err, &invalid) && invalid.BodyRead
+}
 
 // OpenHTTP preserves the legacy libsql Driver.Open HTTP DSN contract. The caller
 // selects this entry point only for libsql://, http:// and https:// transports;

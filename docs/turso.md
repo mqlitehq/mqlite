@@ -235,13 +235,24 @@ This write-first shape addresses claim transactions in one broker or embedded
 `SQLITE_BUSY`, and the change does not make overlapping brokers against one database
 safe.
 
+## Remote SQL acknowledgement failures
+
+The HTTP Hrana compatibility layer validates pipeline result counts and types,
+statement result fields and batch-step positions before accepting success.
+Malformed acknowledgements are protocol errors. After an issued standalone write
+or COMMIT, they are `ErrOutcomeUnknown`: reconcile the effect before retrying.
+Ordinary reads do not become outcome-unknown writes. Valid conditional batch
+skips and explicit SQL errors keep their existing interpretation. These checks
+add no requests or transparent write retries.
+
 ## Bounded HTTP stream cleanup
 
 MQLite carries the pinned driver's HTTP v2 compatibility code internally, with a
 narrow stream-cleanup patch (MQLITE-164). Its source revision, license and local
 changes are recorded in `internal/libsqlcompat/NOTICE` and `UPSTREAM.json`. The
 original pure-Go parser, HTTP client and TCP/TLS transport reuse are retained;
-normal SQL, transaction acknowledgement and retry decisions are unchanged.
+normal SQL and TCP/TLS reuse are unchanged. The separate acknowledgement checks
+above do not change cleanup's best-effort contract.
 
 Stream cleanup is asynchronous and best effort. Each opened database handle has a fixed cap of
 16 active cleanup requests, each with a five-second deadline created before the

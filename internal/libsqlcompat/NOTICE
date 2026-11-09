@@ -8,9 +8,18 @@ UPSTREAM.json records the original paths and SHA-256 hashes for all 13 copied
 runtime files. The public sqliteparser and sqliteparserutils packages remain
 dependencies of the same pinned upstream module; they are not copied here.
 
-The copied files retain their original protocol, SQL parsing, transaction,
-response, and error behavior. Local changes are limited to private import paths
-and one cleanup manager shared by each opened database handle (one SQL pool).
+The copied files retain their original protocol, SQL parsing and transaction
+behavior, with two explicit compatibility fixes: acknowledgement validation and
+bounded detached cleanup. Private import paths are rewritten for this namespace.
+Success acknowledgements must match the sent pipeline's request count and types,
+contain complete statement results, and retain one result/error position per
+batch step. Conditional skips and definite SQL errors remain valid. Malformed
+acknowledgements carry a private marker so the engine can distinguish an unknown
+issued-write outcome from a read protocol failure without adding SQL or retries.
+These checks address inherited driver behavior; they do not attribute a historical
+production failure to a malformed provider response.
+
+One cleanup manager is shared by each opened database handle (one SQL pool).
 Each accepted detached
 stream-close request has a five-second deadline established before its goroutine
 starts. At most 16 cleanup HTTP requests run per opener; capacity overflow is skipped without
