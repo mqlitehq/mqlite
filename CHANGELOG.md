@@ -12,6 +12,10 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+- Anchor deadline-less legacy `Renew` acknowledgements to the request start.
+  Delayed replies no longer extend the renewal watchdog beyond the fixed
+  conservative lease estimate (MQLITE-196).
+
 > The canonical schema token remains **7** and no database rebuild is required.
 > This release adds an optional response header plus a Go broker-mode option;
 > older remote clients ignore the header, while programmatic brokers must add

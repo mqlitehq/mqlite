@@ -3407,3 +3407,206 @@ func TestReceiverPermissionDeniedStopsEveryPath(t *testing.T) {
 		})
 	}
 }
+
+type legacyRenewObservedTransport struct {
+	next    http.RoundTripper
+	observe func(*http.Request)
+}
+
+func (t legacyRenewObservedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.observe(req)
+	return t.next.RoundTrip(req)
+}
+
+// Repeated successful legacy Renew replies carry no deadline. Their network
+// latency must reduce this RPC's remaining window, not the next lease estimate.
+func TestLegacyRenewRetainsLeaseEstimate(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		hangAt       int
+		wantComplete bool
+	}{
+		{"repeated-success", 0, true},
+		{"hung-renewal-still-obeys-watchdog", 3, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var claimed bool
+			var lockedUntil time.Time
+			var renews, batches, completes int
+			var callbackErrors []error
+			type observedDeadline struct {
+				deadline, actualLease time.Time
+				present               bool
+			}
+			var deadlines []observedDeadline
+			settled := make(chan struct{}, 1)
+			stopServer := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Mqlite-Server-Time-Ms", strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
+				switch req.URL.Path {
+				case "/mqlite.v1.QueueService/Receive":
+					mu.Lock()
+					if claimed {
+						mu.Unlock()
+						select {
+						case <-req.Context().Done():
+						case <-stopServer:
+						}
+						return
+					}
+					claimed = true
+					// This delivery has already spent 100ms of its one-second lease.
+					// Renew below always grants the full one-second duration.
+					lockedUntil = time.Now().Add(900 * time.Millisecond)
+					deadline := lockedUntil.UnixNano() / int64(time.Millisecond)
+					mu.Unlock()
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{"messages": []interface{}{map[string]interface{}{
+						"seq_number": 1, "body": "eA==", "lock_token": "legacy-token", "locked_until_ms": deadline,
+					}}})
+				case "/mqlite.v1.QueueService/RenewBatch":
+					mu.Lock()
+					batches++
+					mu.Unlock()
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = fmt.Fprint(w, `{"message":"no such path: RenewBatch"}`)
+				case "/mqlite.v1.QueueService/Renew":
+					mu.Lock()
+					renews++
+					call := renews
+					mu.Unlock()
+					if call == tc.hangAt {
+						select {
+						case <-req.Context().Done():
+						case <-stopServer:
+						}
+						return
+					}
+					mu.Lock()
+					valid := time.Now().Before(lockedUntil)
+					if valid {
+						lockedUntil = time.Now().Add(time.Second)
+					}
+					mu.Unlock()
+					if !valid {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = fmt.Fprint(w, `{"code":"lock_lost"}`)
+						return
+					}
+					// Delay the response after the broker has extended the lock, so
+					// the watchdog must account for response-path network latency.
+					select {
+					case <-time.After(200 * time.Millisecond):
+					case <-req.Context().Done():
+						return
+					}
+					_, _ = fmt.Fprint(w, `{"ok":true}`)
+				case "/mqlite.v1.QueueService/Complete":
+					mu.Lock()
+					valid := time.Now().Before(lockedUntil)
+					if valid {
+						completes++
+					}
+					mu.Unlock()
+					if !valid {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = fmt.Fprint(w, `{"code":"lock_lost"}`)
+						return
+					}
+					_, _ = fmt.Fprint(w, `{"ok":true}`)
+					settled <- struct{}{}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			defer close(stopServer)
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			defer transport.CloseIdleConnections()
+			observed := legacyRenewObservedTransport{next: transport, observe: func(req *http.Request) {
+				if req.URL.Path != "/mqlite.v1.QueueService/Renew" {
+					return
+				}
+				deadline, present := req.Context().Deadline()
+				mu.Lock()
+				deadlines = append(deadlines, observedDeadline{deadline: deadline, actualLease: lockedUntil, present: present})
+				mu.Unlock()
+			}}
+			client, err := Open(ctx, server.URL, WithHTTPClient(&http.Client{Transport: observed}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			type handlerResult struct {
+				completed bool
+				remaining time.Duration
+			}
+			handlerExit := make(chan handlerResult, 1)
+			runDone := make(chan error, 1)
+			receiver := client.Receiver("jobs", WithAutoRenew(), WithErrorHandler(func(err error) {
+				mu.Lock()
+				callbackErrors = append(callbackErrors, err)
+				mu.Unlock()
+			}))
+			go func() {
+				runDone <- receiver.Run(ctx, func(handlerCtx context.Context, _ *Message) error {
+					var result error
+					completed := false
+					select {
+					case <-time.After(4 * time.Second):
+						completed = true
+					case <-handlerCtx.Done():
+						result = handlerCtx.Err()
+					}
+					mu.Lock()
+					remaining := time.Until(lockedUntil)
+					mu.Unlock()
+					handlerExit <- handlerResult{completed: completed, remaining: remaining}
+					return result
+				})
+			}()
+			var outcome handlerResult
+			select {
+			case outcome = <-handlerExit:
+			case <-ctx.Done():
+				t.Fatal("handler did not finish within the test budget")
+			}
+			if outcome.completed {
+				select {
+				case <-settled:
+				case <-ctx.Done():
+					t.Fatal("completed handler did not settle")
+				}
+			}
+			callerErr := ctx.Err()
+			cancel()
+			if err := <-runDone; !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run returned %v", err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			t.Logf("completed=%t remaining=%s renews=%d batch_probes=%d completes=%d callbacks=%v", outcome.completed, outcome.remaining, renews, batches, completes, callbackErrors)
+			if batches != 1 || outcome.completed != tc.wantComplete {
+				t.Fatalf("legacy renewal outcome: completed=%t want=%t; batch probes=%d", outcome.completed, tc.wantComplete, batches)
+			}
+			if tc.wantComplete && (completes != 1 || renews < 5 || len(callbackErrors) != 0) {
+				t.Fatalf("successful renewals did not retain the lease: complete=%d renews=%d callbacks=%v", completes, renews, callbackErrors)
+			}
+			if tc.hangAt > 0 {
+				if len(deadlines) < tc.hangAt {
+					t.Fatalf("missing hung request deadline: %d", len(deadlines))
+				}
+				captured := deadlines[tc.hangAt-1]
+				if !captured.present || captured.deadline.After(captured.actualLease) {
+					t.Fatalf("hung request watchdog %s exceeds the last confirmed real lease %s", captured.deadline, captured.actualLease)
+				}
+			}
+			if !tc.wantComplete && (completes != 0 || len(callbackErrors) != 1 || !errors.Is(callbackErrors[0], ErrLockLost) || callerErr != nil) {
+				t.Fatalf("hung renewal did not stop independently or settled: complete=%d remaining=%s caller=%v callbacks=%v", completes, outcome.remaining, callerErr, callbackErrors)
+			}
+		})
+	}
+}
