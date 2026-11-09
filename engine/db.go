@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
+
 	// Pure-Go local driver, no CGO (design D2 default). The remote libSQL
 	// connector is opened explicitly in libsql_conn.go.
 	_ "modernc.org/sqlite" // driver "sqlite" (local file/:memory:)
@@ -25,13 +27,14 @@ import (
 // (design D3): database/sql serializes mutations onto that connection, so there
 // is zero file-level write-lock contention and claims stay atomic.
 type db struct {
-	log     *slog.Logger
-	storage storageObservations
-	sql     *sql.DB
-	reader  *sql.DB // one read-only, query-only connection for local file observation reads
-	remote  bool
-	dsn     string    // the user-facing DB string (no auth token — that's only in the conn string)
-	lock    io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
+	log                 *slog.Logger
+	storage             storageObservations
+	sql                 *sql.DB
+	reader              *sql.DB // one read-only, query-only connection for local file observation reads
+	remote              bool
+	refreshParentGuards bool      // known equivalent legacy trigger SQL; only used during Open
+	dsn                 string    // the user-facing DB string (no auth token — that's only in the conn string)
+	lock                io.Closer // single-writer advisory lock on a local file DB (MQLITE-6); nil for :memory:/remote
 
 	// The close gate serializes every local operation against Close so Close cannot release the
 	// single-writer file lock — nor close the pool — while a write is still in flight. Without it,
@@ -50,6 +53,7 @@ type db struct {
 	closing  bool // admission gate: enter() refuses new ops once set
 	torn     bool // teardown-once guard for close()
 	inFlight sync.WaitGroup
+	writer   remoteWriter // remote mutation admission; local stores retain their sole SQL writer
 }
 
 // enter admits a local operation, or reports that the store is closing so the caller fails fast.
@@ -70,10 +74,16 @@ func (d *db) enter() bool {
 func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 	low := strings.ToLower(strings.TrimSpace(dsn))
 	switch {
-	case strings.HasPrefix(low, "libsql://"),
+	case isHTTPHranaDSN(dsn),
 		strings.HasPrefix(low, "wss://"),
 		strings.HasPrefix(low, "ws://"):
 		conn = dsn
+		// The Rust Turso service accepts the same HTTP v2 protocol. The pinned
+		// driver's parser knows the libsql scheme; keep that normalization internal
+		// rather than mistaking the public turso URL for a local SQLite filename.
+		if strings.HasPrefix(low, "turso://") {
+			conn = "libsql://" + strings.TrimSpace(dsn)[len("turso://"):]
+		}
 		if token != "" {
 			sep := "?"
 			if strings.Contains(conn, "?") {
@@ -107,6 +117,11 @@ func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 		"&_pragma=auto_vacuum(INCREMENTAL)" +
 		"&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)"
 	return "sqlite", "file:" + path + "?" + pragmas, false
+}
+
+func isHTTPHranaDSN(dsn string) bool {
+	low := strings.ToLower(strings.TrimSpace(dsn))
+	return strings.HasPrefix(low, "libsql://") || strings.HasPrefix(low, "turso://")
 }
 
 // localFilePath returns the on-disk path of a local file DSN, or ok=false for an
@@ -156,6 +171,11 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		return nil, err
 	}
 	driver, conn, remote := resolveDSN(dsn, token, sync)
+	if remote {
+		if err := validateRemoteConnectionDSN(conn); err != nil {
+			return nil, err
+		}
+	}
 
 	// Single-writer guard (MQLITE-6): a local file DB may be opened by only one
 	// process at a time — two writers would race on crash recovery and claims.
@@ -178,7 +198,7 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 	// single-lease adapter. WebSocket transports keep their existing pooled
 	// connection behavior; making those one-shot would reconnect a WebSocket for
 	// every operation. Local SQLite remains on the unchanged sql.Open path.
-	httpHrana := strings.HasPrefix(strings.ToLower(strings.TrimSpace(dsn)), "libsql://")
+	httpHrana := isHTTPHranaDSN(dsn)
 	var sdb *sql.DB
 	var err error
 	if httpHrana {
@@ -193,8 +213,8 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		return nil, fmt.Errorf("open %s: %w", driver, err)
 	}
 	if remote {
-		// Remote Turso/libSQL: the broker is still the single logical writer, but
-		// the Turso primary serializes writes for us, so a tiny pool is safe.
+		// Remote Turso/libSQL: write admission serializes this owner's mutations
+		// before they take a connection; the small pool retains capacity for reads.
 		sdb.SetMaxOpenConns(4)
 		if httpHrana {
 			// The Validator in singleLeaseConn is the correctness mechanism. Keep
@@ -260,12 +280,14 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 
 // initSchema creates the tables/indexes idempotently (CREATE IF NOT EXISTS) and
 // records the schema token. mqlite keeps a single canonical schema and does not
-// migrate: a database whose recorded token differs is refused (never altered in
-// place), so a stale experimental DB is simply recreated.
+// migrate table layouts: a database whose recorded token differs is refused
+// before DDL. Recognized equivalent parent-trigger spelling is refreshed later,
+// transactionally, before Open admits work.
 func (d *db) initSchema(ctx context.Context) error {
-	if v, ok, err := d.recordedSchemaVersion(ctx); err != nil {
+	v, recorded, err := d.recordedSchemaVersion(ctx)
+	if err != nil {
 		return err
-	} else if ok && v != schemaVersion {
+	} else if recorded && v != schemaVersion {
 		return fmt.Errorf("%w: database schema is %q but this build expects %q; "+
 			"recreate it (delete the file / drop the tables) — mqlite keeps a single schema and does not migrate",
 			ErrSchemaVersionMismatch, v, schemaVersion)
@@ -275,9 +297,23 @@ func (d *db) initSchema(ctx context.Context) error {
 	if err := d.validateAccessKeySchema(ctx); err != nil {
 		return err
 	}
-	for _, stmt := range schemaStmts {
-		if _, err := d.exec(ctx, stmt); err != nil {
-			return fmt.Errorf("schema: %w\n%s", err, firstLine(stmt))
+	refresh, err := d.validateParentGuardSchema(ctx)
+	if err != nil {
+		return err
+	}
+	d.refreshParentGuards = refresh
+	complete := false
+	if recorded && d.remote && isHTTPHranaDSN(d.dsn) && !refresh {
+		complete, err = d.hasCompleteWarmSchema(ctx)
+		if err != nil {
+			return fmt.Errorf("check current schema: %w", err)
+		}
+	}
+	if !complete {
+		for _, stmt := range schemaStmts {
+			if _, err := d.exec(ctx, stmt); err != nil {
+				return fmt.Errorf("schema: %w\n%s", err, firstLine(stmt))
+			}
 		}
 	}
 	if _, err := d.exec(ctx,
@@ -288,12 +324,9 @@ func (d *db) initSchema(ctx context.Context) error {
 }
 
 func (d *db) validateAccessKeySchema(ctx context.Context) error {
-	// SQLite drops IF NOT EXISTS when recording the statement. Compare the entire
-	// canonical definition (including STRICT, checks and unique constraints), not
-	// just column names: accepting weakened constraints would weaken authentication.
-	normalize := func(s string) string {
-		return strings.Join(strings.Fields(strings.Replace(s, " IF NOT EXISTS", "", 1)), " ")
-	}
+	// Backends can reformat punctuation and keyword case in the schema catalog.
+	// Compare every SQL token, preserving string literals and constraints: merely
+	// checking columns would allow a weakened authentication schema to be adopted.
 	for _, object := range []struct{ name, kind, ddl string }{
 		{"access_keys", "table", accessKeySchema},
 		{"idx_access_keys_created", "index", accessKeyCreatedIndex},
@@ -306,11 +339,84 @@ func (d *db) validateAccessKeySchema(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("check access key schema: %w", err)
 		}
-		if kind != object.kind || normalize(ddl) != normalize(object.ddl) {
+		if kind != object.kind || normalizedSchemaSQL(ddl) != normalizedSchemaSQL(object.ddl) {
 			return fmt.Errorf("%w: existing %s object does not match the access key schema; move the conflicting application object before opening this database", ErrSchemaVersionMismatch, object.name)
 		}
 	}
 	return nil
+}
+
+// normalizedSchemaSQL accepts formatting changes, not different SQL definitions.
+// In particular, whitespace and case inside quoted strings remain significant.
+// Quoted identifiers are kept verbatim too; unfamiliar rewrites fail closed.
+func normalizedSchemaSQL(s string) string {
+	var tokens []string
+	word := func(c byte) bool {
+		return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$'
+	}
+	for i := 0; i < len(s); {
+		if strings.ContainsRune(" \t\r\n\f", rune(s[i])) {
+			i++
+			continue
+		}
+		if strings.HasPrefix(s[i:], "--") {
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(s[i:], "/*") {
+			if end := strings.Index(s[i+2:], "*/"); end >= 0 {
+				i += end + 4
+				continue
+			}
+		}
+		start := i
+		if s[i] == '\'' || s[i] == '"' || s[i] == '`' || s[i] == '[' {
+			end := s[i]
+			if end == '[' {
+				end = ']'
+			}
+			i++
+			for i < len(s) {
+				if s[i] == end {
+					i++
+					if end != ']' && i < len(s) && s[i] == end {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+			tokens = append(tokens, s[start:i])
+		} else if word(s[i]) {
+			for i < len(s) && word(s[i]) {
+				i++
+			}
+			tokens = append(tokens, strings.ToUpper(s[start:i]))
+		} else {
+			end := i + 1
+			for _, operator := range []string{"->>", ">=", "<=", "!=", "<>", "==", "||", "<<", ">>", "->"} {
+				if strings.HasPrefix(s[i:], operator) {
+					end = i + len(operator)
+					break
+				}
+			}
+			tokens = append(tokens, s[i:end])
+			i = end
+		}
+	}
+	// SQLite usually omits this clause in its catalog; Rust can retain it.
+	kindAt := 1
+	if len(tokens) > kindAt && tokens[kindAt] == "UNIQUE" {
+		kindAt++
+	}
+	if len(tokens) > kindAt+3 && tokens[0] == "CREATE" && (tokens[kindAt] == "TABLE" || tokens[kindAt] == "INDEX" || tokens[kindAt] == "TRIGGER") &&
+		tokens[kindAt+1] == "IF" && tokens[kindAt+2] == "NOT" && tokens[kindAt+3] == "EXISTS" {
+		tokens = append(tokens[:kindAt+1], tokens[kindAt+4:]...)
+	}
+	return strings.Join(tokens, " ")
 }
 
 // recordedSchemaVersion returns the schema_version stored in meta, or ok=false for
@@ -343,6 +449,9 @@ func (d *db) beginClosing() {
 	d.closeMu.Lock()
 	d.closing = true
 	d.closeMu.Unlock()
+	if d.remote {
+		d.writer.close()
+	}
 }
 
 // isClosing is used before serving an observation result that needs no database
@@ -368,6 +477,9 @@ func (d *db) close() error {
 	d.torn = true
 	d.closing = true
 	d.closeMu.Unlock()
+	if d.remote {
+		d.writer.close()
+	}
 	d.inFlight.Wait()
 
 	var err error
@@ -387,18 +499,15 @@ func (d *db) close() error {
 
 // ── remote write resilience (Turso/libSQL only) ─────────────────────────────
 //
-// Two transient remote failures are retried (a local SQLite single writer never
-// retries):
-//   - a closed idle Hrana stream surfaces as a wrapped driver.ErrBadConn ("stream
-//     is closed") — the statement never reached the server, so a retry on a fresh
-//     pooled connection can't double-execute; and
-//   - a contended write surfaces as "database is locked" (SQLITE_BUSY) — the lock
-//     was never acquired so nothing ran, and a retry after a short backoff is
-//     equally safe.
+// Local SQLite never retries. Remote reads and pre-COMMIT transactions use
+// bounded retry for classified transport, contention and confirmed rollback
+// failures. Standalone writes replay only proven pre-execution rejections;
+// an attempted COMMIT is never automatically replayed. Incomplete or malformed
+// acknowledgements cannot establish that an issued write had no effect.
 //
-// The remote pool is small (4) but the Turso primary serializes writes, so a burst
-// of concurrent enqueues races for the write lock; bounded retry + backoff lets
-// them through instead of erroring (the MQLITE-4 pool-vs-single-writer tension).
+// Remote mutations enter the single-writer admission queue before taking a
+// connection. Retry backoff holds neither that permit nor the SQL connection;
+// reads retain the remaining capacity in the four-connection pool.
 
 const maxConnAttempts = 6
 
@@ -408,11 +517,15 @@ const maxConnAttempts = 6
 // family, not just "connection reset": the libSQL/Hrana client returns the network error
 // un-wrapped from the POST that carries a write, so a lost commit ack most often surfaces
 // as a bare io.EOF / "broken pipe" / "i/o timeout" — especially behind a proxy like Fly,
-// where an upstream drop reads as EOF, not RST (MQLITE-59). A structured server *response*
-// ("error code 500: …") is a definite non-commit and is intentionally NOT matched here.
+// where an upstream drop reads as EOF, not RST (MQLITE-59). A transient provider
+// HTTP response can also follow a committed write whose acknowledgement was
+// lost. Its status is authoritative over any SQLite words in the response body.
 func isConnErr(err error) bool {
 	if err == nil {
 		return false
+	}
+	if status := remoteProviderHTTPStatus(err); status != 0 {
+		return transientProviderHTTPStatus(status)
 	}
 	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
@@ -433,19 +546,67 @@ func isConnErr(err error) bool {
 	return false
 }
 
-// isBusyErr reports a contended-write error from the remote primary. The lock was
-// not acquired, so the statement did not run and a retry is safe (no double-apply).
+// isBusyErr recognizes contention for reads and pre-COMMIT transaction retries.
+// Plain response text alone does not prove that an issued write did not commit.
 func isBusyErr(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) || remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err) {
 		return false
 	}
-	s := err.Error()
+	leaf := singleRemoteProviderLeaf(err)
+	if leaf == nil {
+		return false
+	}
+	s := leaf.Error()
 	for _, sub := range []string{"database is locked", "database table is locked", "SQLITE_BUSY"} {
 		if strings.Contains(s, sub) {
 			return true
 		}
 	}
+	return isRustTursoBusyErr(err)
+}
+
+// isRustTursoBusyErr recognizes the Rust provider's exact SQLITE_BUSY message
+// for reads and pre-COMMIT retries. The pinned driver discards protocol metadata,
+// so this leaf alone cannot authorize replay of an issued write or COMMIT.
+// Match the leaf, never a substring in SQL, transport or checkpoint diagnostics.
+func isRustTursoBusyErr(err error) bool {
+	return exactRemoteProviderError(err, "Tursodb error: Database is busy")
+}
+
+// exactRemoteProviderError recognizes one known explanation for safe reads and
+// pre-COMMIT transaction retries. It is not proof that an issued write failed:
+// the pinned driver can discard an HTTP error status around the same message.
+func exactRemoteProviderError(err error, message string) bool {
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isConnErr(err) {
+		return false
+	}
+	var transport net.Error
+	if errors.As(err, &transport) {
+		return false
+	}
+	// Only the driver's single-cause wrapping is evidence of a provider reply.
+	// A joined transport/cancellation failure is not a definite rejection.
+	for depth := 0; depth < 32; depth++ {
+		if _, multiple := err.(interface{ Unwrap() []error }); multiple {
+			return false
+		}
+		cause := errors.Unwrap(err)
+		if cause == nil {
+			return err.Error() == message
+		}
+		err = cause
+	}
 	return false
+}
+
+// isExpiredRemoteTransactionErr recognizes the exact expiry explanation, never a
+// generic timeout. After an issued write/COMMIT this text still lacks sufficient
+// protocol provenance to authorize replay.
+func isExpiredRemoteTransactionErr(err error) bool {
+	return exactRemoteProviderError(err, "SQLite error: interactive transaction was rolled back "+
+		"because the stream was idle for too long; retry the transaction")
 }
 
 // backoff pauses before a retry so a contended remote write doesn't immediately
@@ -598,17 +759,65 @@ func (d *db) attempts() int {
 }
 
 func (d *db) retryable(err error) bool {
-	return d.remote && (isConnErr(err) || isBusyErr(err))
+	return d.remote && !errors.Is(err, ErrOutcomeUnknown) &&
+		(!libsqlcompat.IsInvalidAcknowledgement(err) || libsqlcompat.IsIncompleteAcknowledgement(err)) && !unclassifiedProviderHTTPCode(err) &&
+		(isConnErr(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
 }
 
-// retryableWrite is retryable for a WRITE or COMMIT: safe to replay only when the error
-// guarantees the statement never applied — driver.ErrBadConn (database/sql's "retry on a
-// fresh connection" signal) or a busy error (the lock was never acquired). A broad transport
-// error like "connection reset" on a write is outcome-unknown (the primary may have committed
-// before the ack was lost), so it is NOT replayed — the caller gets ErrOutcomeUnknown instead
-// of a silent double-apply (MQLITE-59).
+// retryableWrite accepts only a before-dispatch ErrBadConn or typed SQLITE_BUSY
+// evidence. The pinned HTTP driver can turn a non-200 response into plain SQL
+// error text, including Busy or an idle-rollback explanation. That text cannot
+// prove an issued standalone write or COMMIT had no durable effect (MQLITE-174).
 func (d *db) retryableWrite(err error) bool {
-	return d.remote && (errors.Is(err, driver.ErrBadConn) || isBusyErr(err))
+	if !d.remote || err == nil || errors.Is(err, ErrOutcomeUnknown) || libsqlcompat.IsInvalidAcknowledgement(err) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) || remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err) || singleRemoteProviderLeaf(err) == nil {
+		return false
+	}
+	var coded interface{ Code() int }
+	return errors.Is(err, driver.ErrBadConn) || errors.As(err, &coded) && coded.Code()&255 == 5
+}
+
+// A discarded HTTP status must not leak an untrusted safe-retry sentinel to
+// callers. Keep its explanation opaque while retaining the original privately.
+type providerHTTPCodeFailure struct{ cause error }
+
+func (e *providerHTTPCodeFailure) Error() string { return e.cause.Error() }
+
+func isolateProviderBadConn(err error) error {
+	if errors.Is(err, driver.ErrBadConn) && unclassifiedProviderHTTPCode(err) {
+		return &providerHTTPCodeFailure{cause: err}
+	}
+	return err
+}
+
+func remoteWriteMayHaveCommitted(err error) bool {
+	return libsqlcompat.IsInvalidAcknowledgement(err) || isConnErr(err) || unclassifiedProviderHTTPCode(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err)
+}
+
+// providerWriteOutcomeUnknown retains one HTTP provider cause for diagnostics
+// without making an ambiguous write eligible for the engine's retry policy.
+type providerWriteOutcomeUnknown struct{ cause error }
+
+func (e *providerWriteOutcomeUnknown) Error() string {
+	return fmt.Sprintf("%v: %v", ErrOutcomeUnknown, e.cause)
+}
+func (e *providerWriteOutcomeUnknown) Unwrap() error        { return e.cause }
+func (e *providerWriteOutcomeUnknown) Is(target error) bool { return target == ErrOutcomeUnknown }
+func (e *providerWriteOutcomeUnknown) HTTPStatus() int      { return remoteProviderHTTPStatus(e.cause) }
+
+func unknownRemoteWrite(err error) error {
+	if remoteProviderHTTPStatus(err) != 0 {
+		return &providerWriteOutcomeUnknown{cause: err}
+	}
+	if unclassifiedProviderHTTPCode(err) {
+		return &providerWriteOutcomeUnknown{cause: isolateProviderBadConn(err)}
+	}
+	if isBusyErr(err) || isExpiredRemoteTransactionErr(err) {
+		return &providerWriteOutcomeUnknown{cause: err}
+	}
+	// Preserve the established broad-transport contract: EOF/reset is not a
+	// safe-retry sentinel once an issued write's acknowledgement is lost.
+	return fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
 }
 
 func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql.Result, error) {
@@ -632,41 +841,28 @@ func (d *db) execUnobserved(ctx context.Context, query string, args ...any) (sql
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return res, err
 		}
-		// Acquire the pool lease explicitly so a caller deadline while waiting
-		// for capacity cannot be confused with a timeout from an issued write.
-		// No SQL exists until Conn.ExecContext below.
-		var conn *sql.Conn
-		conn, err = d.sql.Conn(ctx)
-		if err != nil {
+		var issued bool
+		res, err, issued = d.remoteExecAttempt(ctx, query, func() []any { return args })
+		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
 				return res, ctxErr
 			}
 			if d.retryable(err) && i+1 < d.attempts() {
 				continue
 			}
-			// Connection acquisition cannot have issued SQL. Even a broad EOF or
-			// timeout is a definite connection failure here, never outcome unknown.
-			return res, err
+			return res, err // admission/pool acquisition cannot have issued SQL
 		}
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = conn.Close()
-			return res, ctxErr
-		}
-		res, err = conn.ExecContext(ctx, query, args...)
-		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
 		}
 	}
-	// A remote write that ended on an outcome-unknown transport error (a broad "connection
-	// reset", not driver.ErrBadConn/busy) may have applied server-side before the ack was
-	// lost — surface it as ErrOutcomeUnknown so the caller can't blindly retry into a
-	// double-apply (MQLITE-59).
-	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
-		// %s (not %w) on purpose: the raw transport error must stay OUT of the
-		// errors.Is chain — a caller checks errors.Is(err, ErrOutcomeUnknown), never
-		// the underlying EOF/reset (which reads as "safe to retry").
-		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
+	// A remote write with a lost response or untyped Busy/rollback explanation may
+	// already have applied. Only before-dispatch ErrBadConn or typed SQLITE_BUSY
+	// proves a safe rejection; other ambiguous replies remain outcome-unknown.
+	if err != nil && d.remote && remoteWriteMayHaveCommitted(err) && !d.retryableWrite(err) {
+		// Retain a structured provider response for status diagnostics. Broad
+		// EOF/reset errors keep the established non-retryable unknown wrapper.
+		return res, unknownRemoteWrite(err)
 	}
 	return res, err
 }
@@ -714,30 +910,23 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return res, err
 		}
-		var conn *sql.Conn
-		conn, err = d.sql.Conn(ctx) // wait for a connection BEFORE reading the clock
-		if err != nil {
+		var issued bool
+		res, err, issued = d.remoteExecAttempt(ctx, query, buildArgs)
+		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
-				return res, ctxErr // acquiring a pool lease cannot have issued SQL
+				return res, ctxErr
 			}
 			if d.retryable(err) && i+1 < d.attempts() {
 				continue
 			}
 			return res, err
 		}
-		args := buildArgs()
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = conn.Close()
-			return res, ctxErr
-		}
-		res, err = conn.ExecContext(ctx, query, args...)
-		_ = conn.Close()
 		if err == nil || !d.retryableWrite(err) {
 			break
 		}
 	}
-	if err != nil && d.remote && isConnErr(err) && !d.retryableWrite(err) {
-		return res, fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error())
+	if err != nil && d.remote && remoteWriteMayHaveCommitted(err) && !d.retryableWrite(err) {
+		return res, unknownRemoteWrite(err)
 	}
 	return res, err
 }
@@ -746,6 +935,17 @@ func (d *db) execFreshUnobserved(ctx context.Context, query string, buildArgs fu
 // connection this attempt holds: the caller cannot be trusted to consume them before we release
 // it.
 func (d *db) queryFreshUnobserved(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	return d.queryFreshMode(ctx, query, buildArgs, scan, false)
+}
+
+func (d *db) queryFreshWriteUnobserved(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error) error {
+	return d.queryFreshMode(ctx, query, buildArgs, scan, true)
+}
+
+func (d *db) queryFreshMode(ctx context.Context, query string, buildArgs func() []any, scan func(*sql.Rows) error, write bool) error {
+	if d.remote && write {
+		return d.remoteReturningWrite(ctx, query, buildArgs, scan)
+	}
 	if !d.remote {
 		return d.withConn(ctx, func(ec context.Context, c *sql.Conn) error {
 			args := buildArgs() // then look again — see execFresh
@@ -1029,17 +1229,69 @@ func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) transact
 // cannot see their boundaries — so they are not guarded. EngineTx documents this.
 func (t *txn) SQL() *sql.Tx { return t.tx }
 
+// commitMutex preserves commit/effect serialization while allowing a queued
+// caller to cancel before any COMMIT starts (MQLITE-189). Its zero value is ready
+// to use. Waiting needs no polling, timer, or detached goroutine.
+type commitMutex struct {
+	once sync.Once
+	held chan struct{}
+}
+
+func (m *commitMutex) channel() chan struct{} {
+	m.once.Do(func() { m.held = make(chan struct{}, 1) })
+	return m.held
+}
+
+func (m *commitMutex) Lock() { m.channel() <- struct{}{} }
+
+func (m *commitMutex) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.channel() <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *commitMutex) TryLock() bool {
+	select {
+	case m.channel() <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *commitMutex) Unlock() {
+	select {
+	case <-m.channel():
+	default:
+		panic("mqlite: unlock of unlocked commit mutex")
+	}
+}
+
 // commitAttempt keeps confirmed commits and their in-memory topology effects in
-// the same order. Remote transactions may overlap, so a delayed deletion reply
-// must publish retirement before a later creation publishes the reused name.
+// the same order. A deletion must publish retirement before a later creation
+// publishes the reused name, including when its commit acknowledgement is delayed.
 func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
-	e.commitMu.Lock()
+	if e.db.remote {
+		setTransactionPhase(attempt.caller, transactionPhaseCommitWait)
+	}
+	if err := e.commitMu.LockContext(attempt.caller); err != nil {
+		return err, true
+	}
 	defer e.commitMu.Unlock()
 	// Waiting for the commit sequencer is not part of the database commit. If
 	// the caller stopped while queued here, no commit has started and the exact
 	// context error is the only truthful outcome.
 	if err := checkCtx(attempt.caller); err != nil {
 		return err, true
+	}
+	if e.db.remote {
+		setTransactionPhase(attempt.caller, transactionPhaseCommitCall)
 	}
 	if err := attempt.tx.Commit(); err != nil {
 		return err, false
@@ -1061,9 +1313,17 @@ func normalizeCanceledRemoteCommitError(ctx context.Context, err error) (error, 
 	return err, false
 }
 
-// inTx runs fn inside a transaction, retrying the whole transaction on a
-// connection error (the aborted tx leaves nothing committed, so retry is safe).
+// inTxUnobserved retries a remote transaction only when the failure evidence
+// permits it. An ambiguous issued COMMIT remains ErrOutcomeUnknown; a connection
+// error alone does not establish that the transaction aborted.
 func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *txn) error) error {
+	return e.inTxMode(ctx, fn, false)
+}
+
+// inTxMode keeps lifecycle checks and the result in one snapshot. Only private
+// SELECT-only callbacks may bypass remote mutation admission; public Tx remains
+// a writer because its callback can issue arbitrary business-table mutations.
+func (e *Engine) inTxMode(ctx context.Context, fn func(context.Context, *txn) error, readOnly bool) error {
 	if !e.db.remote {
 		// Local: one attempt, and the transaction is not interruptible once begun — interrupting it
 		// leaks the connection and wedges (or erases) the database. The WAIT for the single writer
@@ -1109,54 +1369,28 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 		})
 	}
 	var err error
-	// remote path: gate for the whole attempt so Close waits for it and post-Close work is refused.
+	// Track the whole remote operation so Close waits for it and refuses new work.
+	// Each attempt takes write admission separately, after its cancellable backoff.
 	if !e.db.enter() {
 		return ErrClosed
 	}
 	defer e.db.inFlight.Done()
 	for i := 0; i < e.db.attempts(); i++ {
+		setTransactionPhase(ctx, transactionPhaseAttemptWait)
 		if err = e.db.beforeRemoteAttempt(ctx, i); err != nil {
 			return err
 		}
 		if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
 			a.callbackRejected.Store(false)
 		}
-		var tx *sql.Tx
-		observationEpoch := e.observationEpoch()
-		tx, err = e.db.sql.BeginTx(ctx, nil)
-		if err != nil {
+		ferr, cerr, commitNotStarted, beginErr := e.remoteTransactionAttempt(ctx, fn, readOnly)
+		if beginErr != nil {
+			err = beginErr
 			if e.db.retryable(err) {
 				continue
 			}
 			return err
 		}
-		// BeginTx can finish at the same instant its context is canceled. Match
-		// the local contract: if the caller stopped before its callback begins,
-		// roll back the new transaction and never run application code.
-		if ctxErr := checkCtx(ctx); ctxErr != nil {
-			_ = tx.Rollback()
-			return ctxErr
-		}
-		// The rollback is deferred across BOTH the callback and the commit — scoped to the
-		// callback alone it would fire on the success path too, BEFORE Commit, silently rolling
-		// back every remote transaction (TestRemoteTxClosureCanBeReplayed caught exactly that).
-		// After a successful Commit it is a no-op (ErrTxDone); after a PANIC in fn it is what
-		// stops the transaction from being abandoned open.
-		//
-		// The two errors stay separate because they are not retryable on the same terms: a failed
-		// statement retries on any connection error (retryable), a failed COMMIT only when the
-		// error proves it never landed (retryableWrite). Collapsing them would quietly downgrade
-		// replayable statement failures into ErrOutcomeUnknown.
-		var ferr, cerr error
-		var commitNotStarted bool
-		attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx), observationEpoch: observationEpoch}
-		func() {
-			defer func() { _ = tx.Rollback() }()
-			if ferr = fn(e.db.stmtCtx(ctx), attempt); ferr != nil {
-				return
-			}
-			cerr, commitNotStarted = e.commitAttempt(attempt)
-		}()
 		if ferr != nil {
 			err = ferr
 			if e.db.retryable(err) {
@@ -1174,14 +1408,14 @@ func (e *Engine) inTxUnobserved(ctx context.Context, fn func(context.Context, *t
 				return err
 			}
 			if e.db.retryableWrite(err) {
-				continue // ErrBadConn / busy: the commit provably didn't land, safe to replay
+				continue // Before-dispatch ErrBadConn or typed SQLITE_BUSY proves a safe rejection.
 			}
-			if e.db.remote && isConnErr(err) {
+			if e.db.remote && remoteWriteMayHaveCommitted(err) {
 				// Outcome-unknown commit transport error: the primary may have durably
 				// committed before the ack was lost, so replaying the whole closure would
 				// double-apply (e.g. a second insert). Surface it instead of retrying
 				// (MQLITE-59). Transparent retry needs durable per-op idempotency — deferred.
-				return fmt.Errorf("%w: %s", ErrOutcomeUnknown, err.Error()) // %s: keep raw err out of the errors.Is chain
+				return unknownRemoteWrite(err)
 			}
 			return err
 		}

@@ -118,6 +118,11 @@ clients are sending or receiving.
 
 Structured stderr events `maintenance.failure`, `maintenance.interrupted`,
 `maintenance.recovered`, `storage.interrupted`, and `storage.failure` record the task/step or operation.
+Existing storage failure records also include a fixed `transaction_phase`: `attempt_wait`,
+`admission`, `connection`, `begin`, `body`, `commit_wait`, or `commit_call`;
+`unavailable` is normal for paths without transaction phase tracking.
+`commit_call` means entry into `sql.Tx.Commit`, not proof of wire dispatch or
+commit confirmation; this private log field does not add a metric label or wire field.
 Failure events include the same fingerprint as Observe and a bounded provider
 explanation with common credentials and URLs redacted. Public monitor responses
 contain generated explanations only, never the raw provider/SQL error. Private
@@ -334,7 +339,11 @@ Error categories are empty on success or one of
 `canceled`, `closed`, `busy`, `connection`, `full`, `corrupt`, `io`,
 `application`, `outcome_unknown`, `other`. Fixed storage outcome/error combinations
 and registered RPC/result combinations are initialized to zero, so the first
-event can be detected after an earlier successful scrape. Use `rate`/`increase`
+event can be detected after an earlier successful scrape.
+A confirmed idle-transaction rollback remains in the existing `connection`
+counter category; its optional error detail uses the more precise
+`transaction_expired` category. This preserves the required counter matrix and
+allows observations from older brokers to decode unchanged. Use `rate`/`increase`
 across observed samples; a first scrape after an event cannot reconstruct its time.
 Maintenance tasks are `locks`, `scheduled`, `ttl`,
 `dedup`, `receipts`, `retention`, `reclaim`, `subscription_expiry`,

@@ -979,7 +979,8 @@ func TestForceDeleteConcurrentSendIsSerialized(t *testing.T) {
 }
 
 func TestRemoteSnapshotRetryRechecksParentAfterConcurrentDelete(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	e, err := Open(ctx, Options{DB: filepath.Join(t.TempDir(), "snapshot-race.db"), DisableBackground: true})
 	if err != nil {
 		t.Fatal(err)
@@ -994,6 +995,9 @@ func TestRemoteSnapshotRetryRechecksParentAfterConcurrentDelete(t *testing.T) {
 	e.db.sql.SetMaxOpenConns(4)
 	firstSnapshot := make(chan struct{})
 	releaseFirst := make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(releaseFirst) }) }
+	defer unblock()
 	txDone := make(chan error, 1)
 	callbacks := 0
 	go func() {
@@ -1021,12 +1025,17 @@ func TestRemoteSnapshotRetryRechecksParentAfterConcurrentDelete(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("transaction did not establish its first queue snapshot")
 	}
-	result, err := e.DeleteQueueWithOptions(ctx, "q", DeleteOptions{Force: true})
-	if err != nil || !result.Deleted {
-		close(releaseFirst)
-		t.Fatalf("concurrent delete=%+v, %v", result, err)
+	// This owner's writes now queue before taking a connection. Use an external
+	// backend mutation to retain the stale-snapshot/retry invariant: admission
+	// cannot serialize a different database owner or an administrative SQL write.
+	result, err := e.db.sql.ExecContext(ctx, `DELETE FROM queues WHERE name='q'`)
+	if err != nil {
+		t.Fatalf("external delete=%v", err)
 	}
-	close(releaseFirst)
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		t.Fatalf("external delete affected=%d, err=%v", n, err)
+	}
+	unblock()
 	select {
 	case err := <-txDone:
 		if !errors.Is(err, ErrQueueNotFound) {
@@ -1348,7 +1357,7 @@ func TestLifecycleCleanupQueriesUseQueuePrefixIndexes(t *testing.T) {
 			}
 		})
 	}
-	existencePlan := explainPlan(t, e, `SELECT EXISTS(`+messageExistenceUnion("?")+`)`, repeatedQueueArgs("q")...)
+	existencePlan := explainPlan(t, e, `SELECT NOT (`+messageAbsencePredicate("?")+`)`, repeatedQueueArgs("q")...)
 	for _, state := range lifecycleMessageStates {
 		if !strings.Contains(existencePlan, state.index) {
 			t.Fatalf("message existence check does not use %s:\n%s", state.index, existencePlan)
@@ -1420,10 +1429,30 @@ func TestRemoteCommitPublishesRetirementBeforeReplacement(t *testing.T) {
 			return nil
 		})
 	}()
+	// The later transaction must wait before BEGIN/callback, not merely at the
+	// commit sequencer. Observe its queued admission so this assertion does not
+	// depend on the second goroutine happening to be scheduled slowly.
+	deadline := time.Now().Add(time.Second)
+	for {
+		d.writer.mu.Lock()
+		queued := d.writer.normal.Len()
+		d.writer.mu.Unlock()
+		if queued == 1 {
+			break
+		}
+		select {
+		case <-createReady:
+			t.Fatal("replacement callback overtook the unacknowledged retirement")
+		case <-time.After(time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("replacement transaction did not queue for admission")
+		}
+	}
 	select {
 	case <-createReady:
-	case <-time.After(time.Second):
-		t.Fatal("replacement callback was blocked")
+		t.Fatal("queued replacement callback ran before retirement acknowledgement")
+	default:
 	}
 	if e.commitMu.TryLock() {
 		e.commitMu.Unlock()
@@ -1595,7 +1624,7 @@ func TestMessageParentDeleteStaysIndexedBesideDeepUnrelatedBacklog(t *testing.T)
 	// This is the exact predicate embedded in both parent triggers. Pinning every
 	// branch to its queue-prefix partial index is deterministic evidence that an
 	// empty target does six bounded seeks instead of scanning the unrelated rows.
-	plan := explainPlan(t, e, `SELECT EXISTS(`+messageExistenceUnion("?")+`)`, repeatedQueueArgs("empty-target")...)
+	plan := explainPlan(t, e, `SELECT NOT (`+messageAbsencePredicate("?")+`)`, repeatedQueueArgs("empty-target")...)
 	for _, state := range lifecycleMessageStates {
 		if !strings.Contains(plan, state.index) {
 			t.Errorf("parent guard for %s does not use %s:\n%s", state.name, state.index, plan)

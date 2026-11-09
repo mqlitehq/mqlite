@@ -78,8 +78,11 @@ the delivery limit. This is process-death recovery; it does not test power-loss 
 Go floor is **1.21** (`go.mod`); CI matrixes 1.21 + stable across linux/macos/windows.
 The Go 1.21 macOS leg uses the supported `macos-latest` runner with external linking:
 Go 1.21's internal Darwin linker does not emit the `LC_UUID` required by current
-macOS releases. This is a source-floor compatibility gate; supported Go release
-builds continue to use their default linker.
+macOS releases. External linking can also leave an invalid ad-hoc signature;
+the CLI blackbox `TestMain` locally re-signs and strictly verifies only its own
+new temporary test binary on macOS with Go 1.21.x. Signing or verification failure
+fails the suite before any test runs. This is a source-floor compatibility gate;
+supported Go release builds keep their default linker and signing behavior.
 
 ## Releasing, versioning & dependencies
 
@@ -187,8 +190,11 @@ Every operation is one HTTP POST with a JSON body — curl-able by construction.
   sidecar (`engine/lock_unix.go` / `lock_windows.go`). A second process — or second
   `OpenEmbedded` on the same file — fails fast with `ErrDBLocked`. Sharing a file DB
   across processes is unsupported; run the broker instead (one broker = one writer).
-- **Remote Turso/libSQL** → small pool (`MaxOpenConns(4)`) because the Turso primary
-  serializes writes server-side. The documented `libsql://` HTTP transport gives
+- **Remote Turso/libSQL** → small pool (`MaxOpenConns(4)`) with one cancellable
+  write-attempt permit acquired before a SQL connection. Reads retain pool
+  capacity; renewals have bounded FIFO priority over settlements, which have
+  bounded priority over normal writes. Each attempt holds its permit through SQL-lease return, including
+  canceled transaction rollback, and releases it before retry backoff. The documented `libsql://` HTTP transport gives
   each logical driver connection one `database/sql` lease (a whole transaction is
   one lease), then rejects it before idle reuse or direct waiter handoff; Go's
   shared HTTP transport still reuses physical TCP/TLS connections. `ws://` and
@@ -304,8 +310,12 @@ mqlite is honestly **at-least-once** — handlers must be idempotent. Three mech
   `[]string` of single statements (`engine/schema.go`). Tables are `STRICT`.
 - **Schema versioning**: there is a **single canonical schema** (`schemaStmts`); we do
   not keep version history or migrations. `schemaVersion` is just an opaque guard
-  token. `initSchema` is CREATE-IF-NOT-EXISTS only: it does not rewrite existing
+  token. `initSchema` uses CREATE-IF-NOT-EXISTS: it does not rewrite existing
   table layouts, but can add a proven-compatible table under the same token.
+  The one expression repair replaces only the two exact recognized legacy
+  message-parent triggers with equivalent indexed predicates in one transaction,
+  for Rust Turso compatibility; unknown definitions refuse Open before DDL.
+  This is not an arbitrary schema migration path.
   Additions require the complete schema golden, actual prior-version upgrade /
   downgrade checks, and backup/restore coverage. `Open` **refuses** a DB whose recorded token differs
   (`ErrSchemaVersionMismatch`). Change the token whenever the schema changes

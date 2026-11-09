@@ -19,23 +19,9 @@ func sha256hex(b []byte) string {
 // Returns (seq, deduped). When deduped==true the message was silently dropped
 // and seq is the original message's seq_number.
 func (e *Engine) insertOne(ctx context.Context, tx *txn, q queueRow, m OutMessage, atMs int64, forced State, now int64) (int64, bool, error) {
-	visibleAt := now
-	if forced == StateScheduled {
-		visibleAt = atMs
-	}
-	// Effective TTL — Azure Service Bus DefaultMessageTimeToLive semantics: a per-message
-	// TTL is honored but the queue's default TTL is a CEILING (a message cannot outlive
-	// it). With no per-message TTL the queue default applies. defaultTTLMs==0 = unlimited.
-	ttl := m.TTLMs
-	if q.defaultTTLMs > 0 && (ttl <= 0 || ttl > q.defaultTTLMs) {
-		ttl = q.defaultTTLMs
-	}
-	var expiresAt int64
-	if ttl > 0 {
-		if visibleAt > math.MaxInt64-ttl {
-			return 0, false, fmt.Errorf("%w: ttl_ms overflows expires_at_ms", ErrInvalidArgument)
-		}
-		expiresAt = visibleAt + ttl // TTL anchored at visible_at (§8.7)
+	visibleAt, expiresAt, err := messageTimes(q, m, atMs, forced, now)
+	if err != nil {
+		return 0, false, err
 	}
 
 	// dedup gate (only when the queue enabled a window).
@@ -88,26 +74,61 @@ func (e *Engine) insertOne(ctx context.Context, tx *txn, q queueRow, m OutMessag
 	return seq, false, err
 }
 
-func (e *Engine) rawInsert(ctx context.Context, tx *txn, queue string, m OutMessage, visibleAt, expiresAt int64, forced State, now int64) (int64, error) {
+// messageTimes is shared by the single-message and bounded HTTP batch paths.
+// Validate before dedup: an existing id does not make an overflowing TTL valid.
+func messageTimes(q queueRow, m OutMessage, atMs int64, forced State, now int64) (int64, int64, error) {
+	visibleAt := now
+	if forced == StateScheduled {
+		visibleAt = atMs
+	}
+	// Effective TTL — Azure Service Bus DefaultMessageTimeToLive semantics: a per-message
+	// TTL is honored but the queue's default TTL is a CEILING (a message cannot outlive
+	// it). With no per-message TTL the queue default applies. defaultTTLMs==0 = unlimited.
+	ttl := m.TTLMs
+	if q.defaultTTLMs > 0 && (ttl <= 0 || ttl > q.defaultTTLMs) {
+		ttl = q.defaultTTLMs
+	}
+	var expiresAt int64
+	if ttl > 0 {
+		if visibleAt > math.MaxInt64-ttl {
+			return 0, 0, fmt.Errorf("%w: ttl_ms overflows expires_at_ms", ErrInvalidArgument)
+		}
+		expiresAt = visibleAt + ttl // TTL anchored at visible_at (§8.7)
+	}
+
+	return visibleAt, expiresAt, nil
+}
+
+const insertMessageSQL = `
+	INSERT INTO messages
+	  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
+	   message_id,correlation_id,reply_to,group_id,content_type,subject,properties,body)
+	VALUES (?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)
+	RETURNING id`
+
+func messageInsertArgs(queue string, m OutMessage, visibleAt, expiresAt int64, forced State, now int64) ([]any, error) {
 	props, err := propsJSON(m.Properties)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	body := m.Body
 	if body == nil {
 		body = []byte{} // body column is NOT NULL; nil -> empty blob
 	}
-	var seq int64
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO messages
-		  (queue,state,visible_at,locked_until,lock_token,delivery_count,enqueued_at,expires_at,
-		   message_id,correlation_id,reply_to,group_id,content_type,subject,properties,body)
-		VALUES (?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)
-		RETURNING id`,
+	return []any{
 		queue, string(forced), visibleAt, now, expiresAt,
 		nz(m.MessageID), nz(m.CorrelationID), nz(m.ReplyTo), nz(m.GroupID),
 		nz(m.ContentType), nz(m.Subject), props, body,
-	).Scan(&seq)
+	}, nil
+}
+
+func (e *Engine) rawInsert(ctx context.Context, tx *txn, queue string, m OutMessage, visibleAt, expiresAt int64, forced State, now int64) (int64, error) {
+	args, err := messageInsertArgs(queue, m, visibleAt, expiresAt, forced, now)
+	if err != nil {
+		return 0, err
+	}
+	var seq int64
+	err = tx.QueryRowContext(ctx, insertMessageSQL, args...).Scan(&seq)
 	if err == nil {
 		tx.record(queue, "enqueued", 1)
 		if forced == StateScheduled {

@@ -43,9 +43,15 @@ values replace earlier ones, while repeated object and map values may merge.
   used for lease, TTL, scheduling, and settlement decisions. The managed Go
   client trusts it only on successful broker responses and maps absolute lease
   deadlines onto its local monotonic clock with a conservative transport budget.
+  `X-Mqlite-Server-Elapsed-Ms` is the whole-millisecond lower bound on monotonic
+  processing time before that clock stamp. A valid value removes storage and
+  long-poll time from clock uncertainty; renewal scheduling and request budgets
+  still use the full measured RPC duration. Missing, repeated, malformed or
+  excessive elapsed values keep the original full-RTT bound.
   Older clients ignore the additive header. With an older broker, the client can
   use HTTP `Date` at its one-second precision; a short lower bound dominated by
-  that precision uses bounded degraded-clock pacing. Without either header the
+  that precision uses bounded degraded-clock pacing. Without either
+  `X-Mqlite-Server-Time-Ms` or HTTP `Date`, the
   public absolute deadline is retained, but the managed Receiver reports one
   diagnostic, confirms the lease before dispatch, and keeps a bounded
   untrusted-clock cadence instead of using that foreign timestamp as a local
@@ -53,9 +59,10 @@ values replace earlier ones, while repeated object and map values may merge.
   or a lock duration from 1 second through 1 hour. Legacy databases containing a
   duration outside that range remain readable, but this no-header fallback may
   fail closed when it cannot prove enough lease remains for a very short lease.
-  Raw HTTP callers should preserve one time header, map broker time, or synchronize
-  clocks.
-  CORS-enabled brokers expose this header to browser clients.
+  Raw HTTP callers should preserve `X-Mqlite-Server-Time-Ms` or HTTP `Date`, map
+  broker time, or synchronize clocks.
+  CORS-enabled brokers expose `X-Mqlite-Server-Time-Ms` and
+  `X-Mqlite-Server-Elapsed-Ms` to browser clients.
 - **Sequence numbers** (`seq_number`) are broker-assigned integers, strictly increasing
   and **never reused** (they may gap) — **the handle you settle with**, valid only while
   the message lives. You never set them.
@@ -87,6 +94,17 @@ reasonable (they count toward the JSON request you send, not toward the body cap
 | `Peek` `max` | 32 default, 1000 max | request field |
 | retained subscriptions | 10,000 active + deleting | `MQLITE_MAX_SUBSCRIPTIONS` (serve) / `Options.MaxSubscriptions` or `WithMaxSubscriptions` (embedded) |
 | filter `expr` source | capped length + AST node count | internal (see [concepts.md](concepts.md#subscription-filters-expr)) |
+
+Unreleased `main` also applies a 32 MiB serialization-accounting threshold to
+new Peek, Receive, and ReceiveDeferred batches. The accounting includes message
+bodies, base64 expansion, JSON escaping and metadata. The engine returns the
+message that reaches the threshold, then stops before claiming another one;
+the bound is therefore the threshold plus one message, not a hard per-message
+rejection limit. This allows existing individually large messages to make
+progress. Peek continues with `from_seq`; ReceiveDeferred callers request the
+unreturned sequence numbers again. An existing Receive attempt replays its
+original committed batch, including records created before this accounting
+change; it is never truncated and its outstanding tokens are not revoked.
 
 ## The base URL
 
@@ -425,6 +443,14 @@ is terminal. Renew and settlement use separate retry policies.
 - **Response** `ReceiveResponse`: `messages` ([Message]) — each carries a
   `lock_token` to settle with (peek-lock mode).
 
+Go clients validate the entire batch before returning handles: every delivery
+must have a positive, unique sequence number, and Peek-Lock (including
+ReceiveDeferred) requires a nonempty fencing token. Receive-and-Delete grants no
+token, and Peek remains a tokenless browse operation. Tokens stay opaque and need
+not be globally unique. A malformed Peek-Lock Receive success can be replayed
+with its original attempt ID; ReceiveDeferred has no attempt-ID replay contract.
+A malformed Receive-and-Delete success is outcome-unknown.
+
 ```bash
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   --data '{"queue":"orders","max_messages":1,"wait_time_ms":5000}' \
@@ -457,7 +483,7 @@ retain application-side evidence when reconciliation must outlive this window.
 | Method | Extra fields | Effect |
 |---|---|---|
 | `Complete` | — | delete the message (done) |
-| `Abandon` | `delay_ms` (int, optional) | release the lock without incrementing `delivery_count`: below max, redeliver after `delay_ms` (a delayed head keeps holding its group's line on ordered queues); at max, move to the DLQ |
+| `Abandon` | `delay_ms` (nonnegative int, optional) | release the lock without incrementing `delivery_count`: below max, redeliver after `delay_ms` (a delayed head keeps holding its group's line on ordered queues); at max, move to the DLQ |
 | `Reject` | `dead_letter_reason`, `dead_letter_description` (optional) | move to the DLQ |
 | `Defer` | — | set aside; retrieve later by seq via `ReceiveDeferred` |
 | `Renew` | — | extend the same live lease without changing state, token, or `delivery_count`; cannot revive an expired lease |
@@ -485,6 +511,12 @@ differs, as described below.
 > via `ReceiveDeferred` and settled (other groups proceed). Normal `Receive` never
 > returns a deferred message, and with no TTL there is no auto-recovery, so recover a
 > lost `seq_number` via `Peek` with `state=deferred`.
+
+Abandon rejects a negative delay or a new absolute visibility deadline that
+overflows epoch milliseconds with `invalid_argument`, without changing the live
+delivery. An exact request that already committed can still replay its live
+receipt after the clock advances. Go SDK delays must be zero or at least 1ms;
+positive sub-millisecond durations are rejected before any HTTP request.
 
 > **Abandon + ordering.** With `delay_ms > 0` the message parks as `scheduled` until the
 > backoff lapses and — like a deferred head — holds its head-of-line position on ordered
@@ -535,7 +567,9 @@ it. And `ok=true` means the lease was live **when the broker's statement finishe
 answer reaches you. The result still has to be mapped, encoded and travel back, so on a very short
 lease it can lapse on the way. Current brokers return `X-Mqlite-Server-Time-Ms` from the same clock
 as the lease; the managed Receiver combines that observation with local monotonic time and a
-conservative transport budget instead of directly comparing two hosts' wall clocks. It performs a
+conservative transport budget instead of directly comparing two hosts' wall clocks.
+A validated `X-Mqlite-Server-Elapsed-Ms` excludes processing from clock uncertainty;
+the full RPC duration remains available for renewal timing. It performs a
 bounded synchronous Renew before dispatch when a deadline is unusable, separates renewal cadence
 from the request watchdog, reserves two observed round trips for the next request, and never extends
 a lease merely because the local wall clock falls in a wide uncertainty interval. A confirmed exact

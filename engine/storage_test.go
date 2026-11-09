@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -44,6 +45,11 @@ import (
 // netTimeout is a net.Error whose message contains none of isConnErr's substrings,
 // so it exercises the errors.As(net.Error).Timeout() branch specifically (MQLITE-59).
 type netTimeout struct{}
+
+type sqliteBusyEvidence struct{}
+
+func (sqliteBusyEvidence) Error() string { return "database is locked" }
+func (sqliteBusyEvidence) Code() int     { return 5 }
 
 func (netTimeout) Error() string   { return "deadline exceeded" }
 func (netTimeout) Timeout() bool   { return true }
@@ -139,7 +145,7 @@ func TestSchemaVersionGuard(t *testing.T) {
 func TestSchemaContentPinnedToVersionToken(t *testing.T) {
 	const (
 		wantVersion = "7"
-		wantHash    = "623db1d9c1f74775cced0fd73494dc8a04d4921de415d617139f0e84b75e0bc8"
+		wantHash    = "8ee9ca9f1f4d61a1bc9578f9324934b0adab8da1057ceae63516f9f1701c18c8"
 	)
 	sum := sha256.Sum256([]byte(strings.Join(schemaStmts, "\n")))
 	if got := hex.EncodeToString(sum[:]); got != wantHash {
@@ -159,6 +165,13 @@ func schemaVersionSixFixture(t *testing.T) []string {
 	                              expires_at=0 OR (kind='subscription' AND expires_at>created_at)),`
 	var previous []string
 	for _, statement := range schemaStmts {
+		// Freeze actual version-6 trigger spelling, rather than retroactively
+		// applying the compatible version-7 Rust expression repair to the fixture.
+		for _, guard := range parentGuardSchemas {
+			if strings.Contains(statement, guard.name) {
+				statement = guard.legacy
+			}
+		}
 		if strings.Contains(statement, "idx_subscription_expiry") {
 			continue
 		}
@@ -332,6 +345,430 @@ func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
 		'idx_queue_deleting','idx_msg_completed','idx_subs_by_subscription',
 		'trg_messages_queue_update','trg_queues_messages_delete','trg_queues_messages_rename')`); err != nil || count != 0 {
 		t.Fatalf("version 6 indexes leaked into version 5: %d %v", count, err)
+	}
+}
+
+// ─── Warm remote schema validation (MQLITE-162) ──────────────────────────────
+
+func TestWarmSchemaInventoryUsesEveryCanonicalObject(t *testing.T) {
+	objects, names, ok := warmSchemaObjects()
+	if !ok || len(objects) != len(schemaStmts) || len(names) != len(schemaStmts) {
+		t.Fatalf("canonical inventory: objects=%d names=%d statements=%d ok=%t", len(objects), len(names), len(schemaStmts), ok)
+	}
+	e, _ := testEngine(t)
+	if complete, err := e.db.hasCompleteWarmSchema(context.Background()); err != nil || !complete {
+		t.Fatalf("fresh canonical SQLite catalog did not match: complete=%t error=%v", complete, err)
+	}
+	previous := schemaStmts
+	schemaStmts = append(append([]string(nil), schemaStmts...), "CREATE VIEW future_schema AS SELECT 1")
+	defer func() { schemaStmts = previous }()
+	if _, _, understood := warmSchemaObjects(); understood {
+		t.Fatal("unrecognized future DDL silently entered the warm path")
+	}
+}
+
+func TestWarmSchemaNormalizationRetainsDefinitionSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name, left, right string
+		equal             bool
+	}{
+		{"unique-index-clause", "CREATE UNIQUE INDEX IF NOT EXISTS idx ON items(id)", "CREATE UNIQUE INDEX idx ON items ( id )", true},
+		{"comments", "CREATE TABLE t(a INTEGER /* a comment */ CHECK(a>0)) -- trailing", "CREATE TABLE t (a INTEGER CHECK(a>0))", true},
+		{"literal-comment", "CREATE TABLE t(a TEXT DEFAULT '--value')", "CREATE TABLE t(a TEXT DEFAULT 'value')", false},
+		{"literal-block-comment", "CREATE TABLE t(a TEXT DEFAULT '/*value*/')", "CREATE TABLE t(a TEXT DEFAULT '')", false},
+		{"constraint", "CREATE TABLE t(a INTEGER CHECK(a>0))", "CREATE TABLE t(a INTEGER CHECK(a>=0))", false},
+		{"unique-retained", "CREATE UNIQUE INDEX idx ON t(a)", "CREATE INDEX idx ON t(a)", false},
+		{"comment-token-boundary", "CREATE TABLE t(ab/**/cd INTEGER)", "CREATE TABLE t(abcd INTEGER)", false},
+		{"quoted-identifier", "CREATE TABLE t(\"a\" INTEGER)", "CREATE TABLE t(\"A\" INTEGER)", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizedSchemaSQL(tc.left) == normalizedSchemaSQL(tc.right); got != tc.equal {
+				t.Fatalf("normalization equality=%t want=%t", got, tc.equal)
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmOpenRestoresMissingCanonicalObjects(t *testing.T) {
+	objects, _, ok := warmSchemaObjects()
+	if !ok {
+		t.Fatal("canonical schema inventory unavailable")
+	}
+	for name, object := range objects {
+		t.Run(name, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.db.Exec("DROP " + strings.ToUpper(object.kind) + " " + name); err != nil {
+				t.Fatal(err)
+			}
+			before := f.snapshot()
+			reopened := f.openEngine(t, true)
+			after := f.snapshot()
+			if got := after.SchemaDDL - before.SchemaDDL; got != len(schemaStmts) {
+				t.Fatalf("missing object skipped canonical fallback: DDL=%d want=%d", got, len(schemaStmts))
+			}
+			if complete, err := reopened.db.hasCompleteWarmSchema(context.Background()); err != nil || !complete {
+				t.Fatalf("fallback failed to restore canonical inventory: complete=%t error=%v", complete, err)
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmOpenKeepsVersionWriteSideEffect(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		`CREATE TABLE application_audit(n INTEGER NOT NULL)`,
+		`INSERT INTO application_audit VALUES(0)`,
+		`CREATE INDEX application_extra ON application_audit(n)`,
+		`CREATE TRIGGER application_version_write BEFORE INSERT ON meta WHEN NEW.key='schema_version'
+		 BEGIN UPDATE application_audit SET n=n+1; END`,
+	} {
+		if _, err := f.db.Exec(sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := f.snapshot()
+	f.openEngine(t, true)
+	after := f.snapshot()
+	var count int
+	if err := f.db.QueryRow(`SELECT n FROM application_audit`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || after.VersionWrites-before.VersionWrites != 1 || after.SchemaDDL-before.SchemaDDL != 0 {
+		t.Fatalf("warm version write changed: effect=%d version_writes=%d DDL=%d", count, after.VersionWrites-before.VersionWrites, after.SchemaDDL-before.SchemaDDL)
+	}
+}
+
+func TestSQLiteHranaWarmOpenRetainsPreDDLGuards(t *testing.T) {
+	for _, failure := range []string{"schema-token", "auth-constraint", "parent-guard"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var statements []string
+			switch failure {
+			case "schema-token":
+				statements = []string{`UPDATE meta SET value='unknown' WHERE key='schema_version'`}
+			case "auth-constraint":
+				statements = []string{`DROP TABLE access_keys`, strings.Replace(accessKeySchema, "length(id) = 32", "length(id) >= 1", 1)}
+			case "parent-guard":
+				statements = []string{`DROP TRIGGER trg_queues_messages_delete`, `CREATE TRIGGER trg_queues_messages_delete BEFORE DELETE ON queues WHEN 0 BEGIN SELECT 1; END`}
+			}
+			for _, statement := range statements {
+				if _, err := f.db.Exec(statement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := f.snapshot()
+			e, err := Open(context.Background(), Options{DB: f.dsn, DisableBackground: true})
+			if e != nil {
+				_ = e.Close()
+			}
+			after := f.snapshot()
+			if !errors.Is(err, ErrSchemaVersionMismatch) || e != nil || after.SchemaDDL != before.SchemaDDL || after.VersionWrites != before.VersionWrites {
+				t.Fatalf("guard changed: error=%v opened=%t DDL=%d version_writes=%d", err, e != nil, after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmOpenRefreshesOnlyKnownLegacyGuards(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, guard := range parentGuardSchemas {
+		for _, statement := range []string{"DROP TRIGGER " + guard.name, guard.legacy} {
+			if _, err := f.db.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	before := f.snapshot()
+	reopened := f.openEngine(t, true)
+	after := f.snapshot()
+	if got := after.SchemaDDL - before.SchemaDDL; got != len(schemaStmts)+len(parentGuardSchemas) {
+		t.Fatalf("known legacy guard skipped normal repair: DDL=%d", got)
+	}
+	if complete, err := reopened.db.hasCompleteWarmSchema(context.Background()); err != nil || !complete {
+		t.Fatalf("legacy guard refresh incomplete: complete=%t error=%v", complete, err)
+	}
+}
+
+func TestSQLiteHranaWarmOpenAcceptsKnownRustGuardSpelling(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	guard := parentGuardSchemas[1]
+	for _, statement := range []string{"DROP TRIGGER " + guard.name, strings.Replace(guard.current, "NEW.name<>OLD.name", "NEW.name!=OLD.name", 1)} {
+		if _, err := f.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := f.snapshot()
+	f.openEngine(t, true)
+	if got := f.snapshot().SchemaDDL - before.SchemaDDL; got != 0 {
+		t.Fatalf("known current Rust inequality unnecessarily ran DDL: %d", got)
+	}
+}
+
+func TestSQLiteHranaWarmOpenStillRecoversOnlyExpiredLeases(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	ctx := context.Background()
+	if err := first.CreateQueue(ctx, "warm-leases", QueueConfig{MaxDeliveryCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Send(ctx, "warm-leases", OutMessage{Body: []byte("live")}, OutMessage{Body: []byte("expired")}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := first.Receive(ctx, "warm-leases", ReceiveOptions{MaxMessages: 2})
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("fixture claim: messages=%d error=%v", len(messages), err)
+	}
+	live, expired := messages[0], messages[1]
+	if _, err := f.db.Exec(`UPDATE messages SET locked_until=? WHERE id=?`, time.Now().Add(-time.Second).UnixMilli(), expired.SeqNumber); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := f.snapshot()
+	reopened := f.openEngine(t, true)
+	if got := f.snapshot().SchemaDDL - before.SchemaDDL; got != 0 {
+		t.Fatalf("canonical live-lease reopen ran DDL: %d", got)
+	}
+	var token, state string
+	var delivery int
+	if err := f.db.QueryRow(`SELECT lock_token,delivery_count FROM messages WHERE id=?`, live.SeqNumber).Scan(&token, &delivery); err != nil {
+		t.Fatal(err)
+	}
+	if token != live.LockToken || delivery != 1 {
+		t.Fatalf("live lease revoked: token_changed=%t delivery=%d", token != live.LockToken, delivery)
+	}
+	if err := f.db.QueryRow(`SELECT state FROM messages WHERE id=?`, expired.SeqNumber).Scan(&state); err != nil || state != string(StateDeadLettered) {
+		t.Fatalf("expired final delivery did not recover to DLQ: state=%s error=%v", state, err)
+	}
+	result, err := reopened.RenewBatch(ctx, "warm-leases", []SettleItem{{SeqNumber: live.SeqNumber, LockToken: live.LockToken}})
+	if err != nil || len(result) != 1 || !result[0].Ok {
+		t.Fatalf("original live token could not renew after reopen: result=%v error=%v", result, err)
+	}
+	if err := reopened.Complete(ctx, "warm-leases", live.SeqNumber, live.LockToken); err != nil {
+		t.Fatalf("original live token could not complete after reopen: %v", err)
+	}
+}
+
+func warmCatalogProxy(t *testing.T, f *sqliteHranaFixture, hook func(http.ResponseWriter, *http.Request) bool) {
+	t.Helper()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if err != nil {
+			http.Error(w, "fixture body failed", http.StatusBadRequest)
+			return
+		}
+		var pipeline struct {
+			Requests []sqliteHranaRequest `json:"requests"`
+		}
+		if err := json.Unmarshal(body, &pipeline); err != nil {
+			http.Error(w, "fixture JSON failed", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		catalog := len(pipeline.Requests) == 1 && strings.HasPrefix(pipeline.Requests[0].Stmt.SQL,
+			"SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name COLLATE NOCASE IN (")
+		if catalog && hook(w, r) {
+			return
+		}
+		f.serveHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	f.dsn = "libsql://" + strings.TrimPrefix(proxy.URL, "http://") + "?tls=0"
+}
+
+func TestSQLiteHranaWarmCatalogErrorsNeverFallBackToWrites(t *testing.T) {
+	for _, failure := range []string{"forbidden", "malformed-ack", "cancel"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var injected atomic.Int32
+			entered := make(chan struct{})
+			warmCatalogProxy(t, f, func(w http.ResponseWriter, r *http.Request) bool {
+				if injected.Add(1) == 1 {
+					close(entered)
+				}
+				switch failure {
+				case "forbidden":
+					http.Error(w, `{"error":"fixture forbidden"}`, http.StatusForbidden)
+				case "malformed-ack":
+					_, _ = io.WriteString(w, `{`)
+				case "cancel":
+					<-r.Context().Done()
+				}
+				return true
+			})
+			before := f.snapshot()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			type result struct {
+				e   *Engine
+				err error
+			}
+			done := make(chan result, 1)
+			go func() { e, err := Open(ctx, Options{DB: f.dsn, DisableBackground: true}); done <- result{e, err} }()
+			select {
+			case <-entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("warm catalog was not reached")
+			}
+			if failure == "cancel" {
+				cancel()
+			}
+			select {
+			case got := <-done:
+				if got.e != nil {
+					_ = got.e.Close()
+				}
+				after := f.snapshot()
+				if got.err == nil || got.e != nil || injected.Load() != 1 || after.SchemaDDL != before.SchemaDDL || after.VersionWrites != before.VersionWrites {
+					t.Fatalf("catalog failure fell through: error=%v opened=%t injected=%d DDL=%d version_writes=%d", got.err, got.e != nil, injected.Load(), after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+				}
+				if failure == "cancel" && !errors.Is(got.err, context.Canceled) {
+					t.Fatalf("catalog cancellation identity changed: %v", got.err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("catalog failure did not return")
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmCatalogMismatchUsesCanonicalFallback(t *testing.T) {
+	for _, mismatch := range []string{"missing-row", "duplicate-row", "wrong-table", "wrong-definition"} {
+		t.Run(mismatch, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var injected atomic.Int32
+			warmCatalogProxy(t, f, func(w http.ResponseWriter, r *http.Request) bool {
+				injected.Add(1)
+				recorded := httptest.NewRecorder()
+				f.serveHTTP(recorded, r)
+				var response map[string]any
+				if err := json.Unmarshal(recorded.Body.Bytes(), &response); err != nil {
+					t.Error(err)
+					return true
+				}
+				result := response["results"].([]any)[0].(map[string]any)["response"].(map[string]any)["result"].(map[string]any)
+				rows := result["rows"].([]any)
+				switch mismatch {
+				case "missing-row":
+					result["rows"] = rows[:len(rows)-1]
+				case "duplicate-row":
+					rows[len(rows)-1] = rows[0]
+				case "wrong-table":
+					rows[0].([]any)[2].(map[string]any)["value"] = "wrong_table"
+				case "wrong-definition":
+					rows[0].([]any)[3].(map[string]any)["value"] = "CREATE TABLE unrelated(n INTEGER)"
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(response)
+				return true
+			})
+			before := f.snapshot()
+			f.openEngine(t, true)
+			after := f.snapshot()
+			if injected.Load() != 1 || after.SchemaDDL-before.SchemaDDL != len(schemaStmts) || after.VersionWrites-before.VersionWrites != 1 {
+				t.Fatalf("mismatched catalog skipped canonical fallback: injected=%d DDL=%d writes=%d", injected.Load(), after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmMetaKeyQuoting(t *testing.T) {
+	for _, tc := range []struct {
+		name, ddl string
+		fast      bool
+	}{
+		{"quoted-key", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`, true},
+		{"uppercase-quoted-key", `CREATE TABLE meta ("KEY" TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`, false},
+		{"single-quoted-key", `CREATE TABLE meta ('key' TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`, false},
+		{"value-nullable", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT) STRICT`, false},
+		{"value-default-literal", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT 'key') STRICT`, false},
+		{"extra-column", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL, extra TEXT) STRICT`, false},
+		{"not-strict", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL)`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.CreateQueue(context.Background(), "quote-lease", QueueConfig{LockDurationMs: 30000, MaxDeliveryCount: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := first.Send(context.Background(), "quote-lease", OutMessage{Body: []byte("owned")}); err != nil {
+				t.Fatal(err)
+			}
+			messages, err := first.Receive(context.Background(), "quote-lease", ReceiveOptions{MaxMessages: 1})
+			if err != nil || len(messages) != 1 {
+				t.Fatalf("receive: %v count=%d", err, len(messages))
+			}
+			msg := messages[0]
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for _, sql := range []string{`DROP TABLE meta`, tc.ddl} {
+				if _, err := f.db.Exec(sql); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.db.Exec(`INSERT INTO meta(key,value) VALUES('schema_version',?)`, schemaVersion); err != nil {
+				t.Fatal(err)
+			}
+			before := f.snapshot()
+			reopened := f.openEngine(t, true)
+			after := f.snapshot()
+			wantDDL := len(schemaStmts)
+			if tc.fast {
+				wantDDL = 0
+			}
+			t.Logf("requests=%d ddl=%d version_writes=%d", after.Requests-before.Requests, after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+			if got := after.SchemaDDL - before.SchemaDDL; got != wantDDL {
+				t.Fatalf("schema DDL=%d want=%d", got, wantDDL)
+			}
+			if got := after.VersionWrites - before.VersionWrites; got != 1 {
+				t.Fatalf("version writes=%d", got)
+			}
+			if err := reopened.Complete(context.Background(), "quote-lease", msg.SeqNumber, msg.LockToken); err != nil {
+				t.Fatalf("preserved token did not complete: %v", err)
+			}
+		})
+	}
+}
+
+func TestWarmMetaQuoteDoesNotChangeGeneralNormalization(t *testing.T) {
+	canonical := `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`
+	quoted := `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`
+	if normalizedSchemaSQL(canonical) == normalizedSchemaSQL(quoted) {
+		t.Fatal("global normalization silently unquoted identifiers")
+	}
+	if normalizedSchemaSQL(`SELECT 'key'`) == normalizedSchemaSQL(`SELECT "key"`) {
+		t.Fatal("string literal was conflated with identifier")
 	}
 }
 
@@ -535,6 +972,134 @@ func newClosedStreamHranaPool(tb testing.TB, maxOpen, maxIdle int) (*sql.DB, *at
 	pool.SetMaxIdleConns(maxIdle)
 	tb.Cleanup(func() { _ = pool.Close() })
 	return pool, &calls
+}
+
+func TestHTTPHranaParseErrorDoesNotExposeAuthToken(t *testing.T) {
+	const token = "must-not-appear-in-errors+42"
+	for _, scheme := range []string{"libsql", "turso", "ws", "wss"} {
+		_, err := openDB(context.Background(), scheme+"://test.invalid/%zz", token, "")
+		if err == nil {
+			t.Fatal("malformed remote URL unexpectedly opened")
+		}
+		for _, sensitive := range []string{token, url.QueryEscape(token), "authToken="} {
+			if strings.Contains(err.Error(), sensitive) {
+				t.Fatal("remote parse error exposed an injected credential")
+			}
+		}
+		var parseError *url.Error
+		var escapeError url.EscapeError
+		if !errors.As(err, &parseError) || parseError.URL != "" || parseError.Op != "parse" || !errors.As(err, &escapeError) {
+			t.Fatal("safe parse error did not retain its operation and underlying error type")
+		}
+	}
+}
+
+func TestHTTPHranaRejectsURLFragmentsBeforeConnecting(t *testing.T) {
+	const token = "must-not-appear-in-errors+42"
+	for _, suffix := range []string{"#fragment", "#"} {
+		_, conn, _ := resolveDSN("libsql://test.invalid/"+suffix, token, "")
+		c, err := (libsqlDSNConnector{dsn: conn}).Connect(context.Background())
+		if c != nil {
+			_ = c.Close()
+		}
+		if err == nil || !strings.Contains(err.Error(), "fragment") || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), url.QueryEscape(token)) {
+			t.Fatal("fragment URL was not safely rejected before connecting")
+		}
+	}
+}
+
+// MQLITE-164: the cleanup cap must be shared by all logical leases of one
+// database, without making a foreground lease wait for a cleanup slot. A
+// separate database handle must retain its own capacity.
+func TestHTTPHranaCleanupCapacityIsSharedAndDoesNotBlockSQL(t *testing.T) {
+	var sqlCalls, closeCalls, active, canceled atomic.Int64
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request struct {
+			Requests []struct {
+				Type string `json:"type"`
+			} `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || len(request.Requests) != 1 {
+			t.Error("invalid cleanup-capacity request")
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if request.Requests[0].Type == "close" {
+			closeCalls.Add(1)
+			active.Add(1)
+			defer active.Add(-1)
+			select {
+			case <-release:
+				_, _ = io.WriteString(w, `{"baton":null,"results":[{"type":"ok","response":{"type":"close"}}]}`)
+			case <-r.Context().Done():
+				canceled.Add(1)
+			}
+			return
+		}
+		n := sqlCalls.Add(1)
+		response := strings.Replace(closedStreamHranaResponse, `"baton": null`, fmt.Sprintf(`"baton":"cleanup-%d"`, n), 1)
+		_, _ = io.WriteString(w, response)
+	}))
+	t.Cleanup(server.Close)
+	dsn := "libsql://" + strings.TrimPrefix(server.URL, "http://") + "?tls=0"
+	pool, err := openHTTPHranaDB(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMaxOpenConns(4)
+	pool.SetMaxIdleConns(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		cancel()
+		_ = pool.Close()
+		deadline := time.Now().Add(3 * time.Second)
+		for active.Load() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := active.Load(); got != 0 {
+			t.Errorf("cleanup HTTP requests remain after release: %d", got)
+		}
+	})
+	waitActive := func(want int64) {
+		t.Helper()
+		for active.Load() != want && ctx.Err() == nil {
+			time.Sleep(time.Millisecond)
+		}
+		if got := active.Load(); got != want {
+			t.Fatalf("active cleanup requests = %d, want %d", got, want)
+		}
+	}
+	for i := 0; i < 16; i++ {
+		if _, err := pool.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitActive(16)
+	for i := 0; i < 32; i++ {
+		if _, err := pool.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+			t.Fatalf("healthy SQL blocked behind stream cleanup: %v", err)
+		}
+	}
+	if got := closeCalls.Load(); got != 16 || canceled.Load() != 0 {
+		t.Fatalf("saturated cleanup changed or expired before foreground returned: calls=%d canceled=%d", got, canceled.Load())
+	}
+	other, err := openHTTPHranaDB(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	other.SetMaxIdleConns(0)
+	if _, err := other.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+		t.Fatal(err)
+	}
+	waitActive(17)
+	if got := sqlCalls.Load(); got != 49 {
+		t.Fatalf("SQL calls = %d, want 49 without retries", got)
+	}
 }
 
 // The HTTP Hrana server may return a successful result with no baton, which means
@@ -745,6 +1310,319 @@ func TestHranaTransactionKeepsOneLease(t *testing.T) {
 	}
 }
 
+type hranaTerminalFixture struct {
+	mu           sync.Mutex
+	requests     []string
+	batons       []string
+	target       string
+	lostReply    bool
+	entered      chan struct{}
+	finished     chan struct{}
+	release      chan struct{}
+	enteredOnce  sync.Once
+	finishedOnce sync.Once
+	releaseOnce  sync.Once
+}
+
+func newHranaTerminalFixture(t *testing.T, target string, lostReply bool) (*sql.DB, *hranaTerminalFixture) {
+	t.Helper()
+	f := &hranaTerminalFixture{target: target, lostReply: lostReply, entered: make(chan struct{}), finished: make(chan struct{}), release: make(chan struct{})}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request struct {
+			Baton    string `json:"baton"`
+			Requests []struct {
+				Type string `json:"type"`
+				Stmt struct {
+					SQL string `json:"sql"`
+				} `json:"stmt"`
+			} `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			http.Error(w, "bad request", 400)
+			return
+		}
+		if len(request.Requests) != 1 {
+			t.Errorf("request item count=%d", len(request.Requests))
+			http.Error(w, "bad request", 400)
+			return
+		}
+		item := request.Requests[0]
+		query := strings.ToUpper(strings.TrimSpace(item.Stmt.SQL))
+		if item.Type == "close" {
+			query = "CLOSE_STREAM"
+		}
+		f.mu.Lock()
+		f.requests = append(f.requests, query)
+		f.batons = append(f.batons, request.Baton)
+		f.mu.Unlock()
+		if query == target {
+			f.enteredOnce.Do(func() { close(f.entered) })
+			defer f.finishedOnce.Do(func() { close(f.finished) })
+			if f.lostReply {
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				_ = conn.Close()
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-f.release:
+			}
+		}
+		response := closedStreamHranaResponse
+		if query == "BEGIN" || query == "UPDATE MESSAGES SET STATE='ACTIVE'" {
+			response = strings.Replace(response, `"baton": null`, `"baton": "bounded-transaction"`, 1)
+		}
+		if query == "CLOSE_STREAM" {
+			response = `{"baton":null,"results":[{"type":"ok","response":{"type":"close"}}]}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, response)
+	}))
+	t.Cleanup(func() { f.releaseOnce.Do(func() { close(f.release) }); server.Close() })
+	pool, err := openHTTPHranaDB("libsql://" + strings.TrimPrefix(server.URL, "http://") + "?tls=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = pool.Close() })
+	return pool, f
+}
+
+func (f *hranaTerminalFixture) count(query string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, got := range f.requests {
+		if got == query {
+			count++
+		}
+	}
+	return count
+}
+
+func TestHranaCommitHonorsTransactionContext(t *testing.T) {
+	for _, deadline := range []bool{true, false} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			pool, f := newHranaTerminalFixture(t, "COMMIT", false)
+			e := &Engine{db: &db{sql: pool, remote: true}, now: func() int64 { return 1_700_000_000_000 }, observation: observations{background: true}}
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if deadline {
+				ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+			}
+			defer cancel()
+			var callbacks atomic.Int64
+			done := make(chan error, 1)
+			go func() {
+				done <- e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+					callbacks.Add(1)
+					_, err := tx.ExecContext(ctx, "UPDATE messages SET state='active'")
+					return err
+				})
+			}()
+			select {
+			case <-f.entered:
+			case err := <-done:
+				t.Fatalf("returned before COMMIT: %v", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("COMMIT did not start")
+			}
+			if !deadline {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, driver.ErrBadConn) {
+					t.Fatalf("interrupted commit=%v, want only ErrOutcomeUnknown", err)
+				}
+			case <-time.After(2 * time.Second):
+				f.releaseOnce.Do(func() { close(f.release) })
+				t.Fatal("COMMIT ignored transaction cancellation")
+			}
+			select {
+			case <-f.finished:
+			case <-time.After(time.Second):
+				t.Fatal("canceled COMMIT HTTP request is still running")
+			}
+			if got := callbacks.Load(); got != 1 {
+				t.Errorf("callback calls=%d, want one", got)
+			}
+			if got := f.count("COMMIT"); got != 1 {
+				t.Errorf("COMMIT calls=%d, want one", got)
+			}
+			if _, err := pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+				t.Fatal(err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for i, query := range f.requests {
+				if query == "DELETE FROM MESSAGES WHERE 0" && f.batons[i] != "" {
+					t.Error("failed transaction connection was reused")
+				}
+			}
+		})
+	}
+}
+
+func TestHranaRollbackHasIndependentCleanupDeadline(t *testing.T) {
+	pool, f := newHranaTerminalFixture(t, "ROLLBACK", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() { done <- tx.Rollback() }()
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ROLLBACK did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("caller cancellation stopped independent cleanup early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("rollback=%v, want cleanup deadline", err)
+		}
+		elapsed := time.Since(started)
+		if elapsed < remoteTransactionCleanupTimeout || elapsed > remoteTransactionCleanupTimeout+2*time.Second {
+			t.Errorf("cleanup elapsed=%s, want bounded %s", elapsed, remoteTransactionCleanupTimeout)
+		}
+	case <-time.After(remoteTransactionCleanupTimeout + 2*time.Second):
+		f.releaseOnce.Do(func() { close(f.release) })
+		t.Fatal("ROLLBACK ignored cleanup deadline")
+	}
+	select {
+	case <-f.finished:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup HTTP request is still running")
+	}
+	if got := f.count("ROLLBACK"); got != 1 {
+		t.Errorf("rollback calls=%d, want one", got)
+	}
+	if _, err = pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, query := range f.requests {
+		if query == "DELETE FROM MESSAGES WHERE 0" && f.batons[i] != "" {
+			t.Error("rollback connection was reused")
+		}
+	}
+}
+
+type hranaCommitCountingConn struct {
+	httpHranaConn
+	calls int
+}
+
+func (c *hranaCommitCountingConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	c.calls++
+	return driver.RowsAffected(0), nil
+}
+
+func TestHranaCommitAlreadyCanceledDoesNotSubmit(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if deadline {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+				cancel()
+			}
+			defer cancel()
+			conn := &hranaCommitCountingConn{}
+			err := (&singleLeaseTx{conn: conn, ctx: ctx}).Commit()
+			if !errors.Is(err, ctx.Err()) || errors.Is(err, ErrOutcomeUnknown) || conn.calls != 0 {
+				t.Fatalf("already-canceled COMMIT err=%v calls=%d, want caller error and no submission", err, conn.calls)
+			}
+		})
+	}
+}
+
+func TestHranaRollbackCompletesAfterCallerCancellation(t *testing.T) {
+	pool, f := newHranaTerminalFixture(t, "ROLLBACK", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- tx.Rollback() }()
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ROLLBACK did not start")
+	}
+	cancel()
+	f.releaseOnce.Do(func() { close(f.release) })
+	select {
+	case err = <-done:
+		if err != nil {
+			t.Fatalf("caller cancellation stopped cleanup: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("released ROLLBACK did not finish")
+	}
+	if f.count("ROLLBACK") != 1 {
+		t.Fatalf("rollback calls=%d", f.count("ROLLBACK"))
+	}
+	if _, err = pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, query := range f.requests {
+		if query == "ROLLBACK" && f.batons[i] != "bounded-transaction" {
+			t.Error("cleanup lost its original transaction baton")
+		}
+		if query == "DELETE FROM MESSAGES WHERE 0" && f.batons[i] != "" {
+			t.Error("settled transaction connection was reused")
+		}
+	}
+}
+
+func TestHranaLostCommitReplyRemainsOutcomeUnknown(t *testing.T) {
+	pool, f := newHranaTerminalFixture(t, "COMMIT", true)
+	e := &Engine{db: &db{sql: pool, remote: true}, now: func() int64 { return 1_700_000_000_000 }, observation: observations{background: true}}
+	var calls int
+	err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+		calls++
+		_, err := tx.ExecContext(ctx, "UPDATE messages SET state='active'")
+		return err
+	})
+	if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, io.EOF) || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("lost commit reply=%v, want ErrOutcomeUnknown without a replayable cause", err)
+	}
+	if calls != 1 || f.count("BEGIN") != 1 || f.count("COMMIT") != 1 {
+		t.Fatalf("ambiguous closure replayed: callbacks=%d BEGIN=%d COMMIT=%d", calls, f.count("BEGIN"), f.count("COMMIT"))
+	}
+}
+
 // The remote (Turso/libSQL) retry path turns on exactly when isConnErr says an
 // error is a dropped Hrana stream — never on a logical error, where a blind retry
 // could double-execute. This hermetic test pins that classification contract so a
@@ -775,7 +1653,7 @@ func TestIsConnErr(t *testing.T) {
 		{"net.Error timeout (no substring)", netTimeout{}, true},
 		// A structured server *response* is a definite non-commit — must NOT be
 		// treated as outcome-unknown (else a rejected write reads as "maybe applied").
-		{"server 500 response", errors.New("error code 500: SQLITE_ERROR"), false},
+		{"server 500 response", errors.New("error code 500: SQLITE_ERROR"), true},
 		{"no such table", errors.New("no such table: messages"), false},
 		{"unique constraint", errors.New("UNIQUE constraint failed: dedup.message_id"), false},
 		{"context canceled", errors.New("context canceled"), false},
@@ -828,8 +1706,11 @@ func TestRetryableWrite(t *testing.T) {
 	if !remote.retryableWrite(fmt.Errorf("exec: %w", driver.ErrBadConn)) {
 		t.Error("write on ErrBadConn must be retryable (the statement never ran)")
 	}
-	if !remote.retryableWrite(errors.New("database is locked")) {
-		t.Error("write on a busy error must be retryable (lock never acquired)")
+	if !remote.retryableWrite(sqliteBusyEvidence{}) {
+		t.Error("write on typed SQLITE_BUSY must be retryable")
+	}
+	if remote.retryableWrite(errors.New("database is locked")) {
+		t.Error("untyped busy text cannot prove an issued write did not commit")
 	}
 	// Every broad transport error — including the EOF/timeout/broken-pipe siblings
 	// isConnErr now spans — is outcome-unknown for a write: it may have applied before
@@ -1038,6 +1919,7 @@ func TestBackgroundReclaimFreePages(t *testing.T) {
 type busyConn struct{ st *busyState }
 
 type busyState struct {
+	queryRowsErr    error
 	failsLeft       int
 	onFailure       func()
 	connectErr      error
@@ -1083,7 +1965,7 @@ func (t *busyTx) Commit() error {
 	}
 	if t.st.failsLeft > 0 {
 		t.st.failsLeft--
-		return errors.New("database is locked") // busy: the commit provably did not land
+		return sqliteBusyEvidence{} // typed rejection: the commit provably did not land
 	}
 	return t.st.commitErr
 }
@@ -1126,7 +2008,11 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		return &oneQueueRow{values: []driver.Value{name, "queue", int64(1000), int64(10), int64(0), int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "active", c.st.queueExpiresAt}}, nil
 	}
 	if !c.record(query, args) {
-		return nil, errors.New("database is locked") // isBusyErr => retryable
+		return nil, sqliteBusyEvidence{}
+	}
+	if c.st.queryRowsErr != nil {
+		//nolint:nilerr // QueryContext succeeds; the fixture delivers this error later through Rows.Next/Err.
+		return &terminalErrorRows{err: c.st.queryRowsErr}, nil
 	}
 	if strings.Contains(normalized, "SELECT response FROM receive_attempts") {
 		if c.st.attemptResponse == "" {
@@ -1175,7 +2061,7 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.st.statements = append(c.st.statements, query)
 	if !c.record(query, args) {
-		return nil, errors.New("database is locked")
+		return nil, sqliteBusyEvidence{}
 	}
 	if c.st.execErr != nil {
 		return nil, c.st.execErr
@@ -1194,6 +2080,12 @@ func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.Na
 }
 
 type emptyRows struct{}
+
+type terminalErrorRows struct{ err error }
+
+func (*terminalErrorRows) Columns() []string           { return []string{"value"} }
+func (*terminalErrorRows) Close() error                { return nil }
+func (r *terminalErrorRows) Next([]driver.Value) error { return r.err }
 
 func (emptyRows) Columns() []string         { return []string{"id"} }
 func (emptyRows) Close() error              { return nil }
@@ -1633,8 +2525,8 @@ func TestFreshHelpersRebuildArgsPerAttempt(t *testing.T) {
 		name string
 		run  func(d *db, build func() []any) error
 	}{
-		{"queryFresh", func(d *db, build func() []any) error {
-			return d.queryFresh(ctx, "UPDATE t SET x=?", build, func(*sql.Rows) error { return nil })
+		{"queryFreshWrite", func(d *db, build func() []any) error {
+			return d.queryFreshWrite(ctx, "UPDATE t SET x=?", build, func(*sql.Rows) error { return nil })
 		}},
 		{"execFresh", func(d *db, build func() []any) error {
 			_, err := d.execFresh(ctx, "UPDATE t SET x=?", build)
@@ -1708,7 +2600,7 @@ func TestFreshHelpersBuildArgsAfterAcquiringAConn(t *testing.T) {
 	var built atomic.Bool
 	done := make(chan error, 1)
 	go func() {
-		done <- d.queryFresh(context.Background(), "UPDATE t SET x=?",
+		done <- d.queryFreshWrite(context.Background(), "UPDATE t SET x=?",
 			func() []any { built.Store(true); return []any{int64(1)} },
 			func(*sql.Rows) error { return nil })
 	}()
@@ -2979,6 +3871,79 @@ func TestAccessKeySortValidationAndIndex(t *testing.T) {
 	}
 }
 
+func TestAccessKeySchemaFormattingCompatibility(t *testing.T) {
+	// The Rust backend rewrites insignificant spaces around punctuation in its
+	// schema catalog. Opening the same valid schema again must still succeed.
+	compact := strings.ReplaceAll(strings.Join(strings.Fields(accessKeySchema), " "), ") ) STRICT", ")) STRICT")
+	for name, table := range map[string]string{
+		"compact parentheses": compact,
+		"lowercase keywords":  strings.ToLower(accessKeySchema),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "formatted.db")
+			d, err := openDB(context.Background(), path, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ddl := range []string{table, `CREATE INDEX idx_access_keys_created ON access_keys ( created_at DESC , id DESC )`} {
+				if _, err := d.exec(context.Background(), ddl); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := d.close(); err != nil {
+				t.Fatal(err)
+			}
+			e, err := Open(context.Background(), Options{DB: path, DisableBackground: true})
+			if err != nil {
+				t.Fatalf("valid reformatted schema refused: %v", err)
+			}
+			defer e.Close()
+			if _, _, err := e.CreateAccessKey(context.Background(), accessKeyOptions(1)); err != nil {
+				t.Fatalf("reformatted constraints are not usable: %v", err)
+			}
+		})
+	}
+}
+
+func TestTursoDSNUsesHTTPCompatibilityAdapter(t *testing.T) {
+	for _, scheme := range []string{"turso", "libsql"} {
+		driverName, conn, remote := resolveDSN(scheme+"://test.invalid?tls=1", "test+token", "")
+		if !remote || driverName != "libsql" || conn != "libsql://test.invalid?tls=1&authToken=test%2Btoken" {
+			t.Fatalf("%s DSN did not select authenticated remote HTTP transport", scheme)
+		}
+	}
+}
+
+func TestTursoURIKeepsTheHTTPConnectionValidityContract(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer regression-token" {
+			t.Error("Turso HTTP request lost its authorization")
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, closedStreamHranaResponse)
+	}))
+	defer server.Close()
+	d, err := openDB(context.Background(), "turso://"+strings.TrimPrefix(server.URL, "http://")+"?tls=0", "regression-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.close()
+	if !d.remote || d.lock != nil || d.reader != nil {
+		t.Fatal("Turso HTTP URL acquired local database resources")
+	}
+	for i := 0; i < 2; i++ {
+		var got int
+		if err := d.queryRowScan(context.Background(), []any{&got}, "SELECT 1"); err != nil || got != 1 {
+			t.Fatalf("Turso query after a closed logical stream: %d, %v", got, err)
+		}
+	}
+	if requests.Load() < 2 {
+		t.Fatal("Turso queries did not reach the HTTP adapter")
+	}
+}
+
 func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
 	ctx := context.Background()
 	t.Run("table-only upgrade", func(t *testing.T) {
@@ -3008,12 +3973,15 @@ func TestAccessKeyCreationIndexUpgradeAndConflicts(t *testing.T) {
 		}
 	})
 	for name, statements := range map[string][]string{
-		"table name":      {`CREATE TABLE idx_access_keys_created (business TEXT) STRICT`},
-		"view name":       {`CREATE VIEW IDX_ACCESS_KEYS_CREATED AS SELECT 1 AS business`},
-		"wrong columns":   {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(name)`},
-		"wrong direction": {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at ASC, id DESC)`},
-		"partial":         {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at DESC, id DESC) WHERE revoked_at=0`},
-		"wrong table":     {`CREATE TABLE business(created_at INTEGER, id TEXT) STRICT`, `CREATE INDEX idx_access_keys_created ON business(created_at DESC, id DESC)`},
+		"table name":             {`CREATE TABLE idx_access_keys_created (business TEXT) STRICT`},
+		"view name":              {`CREATE VIEW IDX_ACCESS_KEYS_CREATED AS SELECT 1 AS business`},
+		"wrong columns":          {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(name)`},
+		"wrong direction":        {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at ASC, id DESC)`},
+		"partial":                {accessKeySchema, `CREATE INDEX idx_access_keys_created ON access_keys(created_at DESC, id DESC) WHERE revoked_at=0`},
+		"wrong table":            {`CREATE TABLE business(created_at INTEGER, id TEXT) STRICT`, `CREATE INDEX idx_access_keys_created ON business(created_at DESC, id DESC)`},
+		"weakened glob":          {strings.Replace(accessKeySchema, "*[^0-9a-f]*", "*[^0-9a-f ]*", 1)},
+		"changed literal case":   {strings.Replace(accessKeySchema, "*[^0-9a-f]*", "*[^0-9A-F]*", 1)},
+		"changed check operator": {strings.Replace(accessKeySchema, "length(id) = 32", "length(id) >= 32", 1)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "conflict.db")
@@ -3052,6 +4020,11 @@ func TestAccessKeySchemaAdditiveCompatibility(t *testing.T) {
 	// Access-key objects remain independently additive inside schema 7.
 	var oldSchema []string
 	for _, stmt := range schemaStmts {
+		for _, guard := range parentGuardSchemas {
+			if strings.Contains(stmt, guard.name) {
+				stmt = guard.legacy
+			}
+		}
 		if stmt != accessKeySchema && stmt != accessKeyCreatedIndex {
 			oldSchema = append(oldSchema, stmt)
 		}
@@ -4080,7 +5053,7 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 		category string
 		status   int
 	}{
-		{errors.New("remote: error code 503: private provider message https://secret.example/?token=hidden"), "provider_unavailable", 503},
+		{fmt.Errorf("remote: %w", errors.New("error code 503: private provider message https://secret.example/?token=hidden")), "provider_unavailable", 503},
 		{errors.New("error code 401: token=hidden"), "provider_auth", 401},
 		{errors.New("error code 429: slow down"), "provider_rate_limit", 429},
 		{errors.New("error code 400: private SQL"), "provider_http", 400},
@@ -4095,7 +5068,8 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 		{errors.New("SQLITE_FULL"), "full", 0},
 		{errors.New("unknown private explanation mqk_hidden"), "unclassified", 0},
 		{errors.Join(ErrOutcomeUnknown, errors.New("error code 503: unknown commit")), "outcome_unknown", 0},
-		{fmt.Errorf("%w: error code 503: unknown commit", ErrOutcomeUnknown), "outcome_unknown", 503},
+		{fmt.Errorf("%w: error code 503: unknown commit", ErrOutcomeUnknown), "outcome_unknown", 0},
+		{unknownRemoteWrite(errors.New("error code 503: unknown commit")), "outcome_unknown", 503},
 	} {
 		t.Run(tc.category+fmt.Sprint(tc.status), func(t *testing.T) {
 			detail := describeError(tc.err, 123)
@@ -4125,6 +5099,350 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 	}
 	if !strings.Contains(private, "provider overloaded") || len(private) > 2060 || !utf8.ValidString(private) {
 		t.Fatalf("invalid bounded private log (%d bytes)", len(private))
+	}
+}
+
+// Provider HTTP failures use the pinned driver's real Hrana-over-HTTP path.
+// The model can commit before emitting an HTTP error: status alone is never
+// evidence that a WRITE or COMMIT had no durable effect (MQLITE-174).
+func TestProviderHTTPStatusRequiresOneExactLeaf(t *testing.T) {
+	leaf := errors.New("error code 502: upstream forward failed")
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"leaf", leaf, 502},
+		{"driver newline", fmt.Errorf("failed to execute SQL: UPDATE example\n%w", leaf), 502},
+		{"SQL text only", errors.New("failed to execute SQL: SELECT 'error code 503: private SQL'"), 0},
+		{"outer text only", fmt.Errorf("error code 503: %w", errors.New("logical SQL error")), 0},
+		{"non-three-digit", errors.New("error code 5020: unrelated"), 0},
+		{"joined", errors.Join(leaf, errors.New("another failure")), 0},
+		{"joined singleton", errors.Join(leaf), 0},
+		{"network wrapper", &net.OpError{Op: "read", Net: "tcp", Err: leaf}, 0},
+		{"URL wrapper", &url.Error{Op: "Post", Err: leaf}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := remoteProviderHTTPStatus(tc.err); got != tc.status {
+				t.Fatalf("status=%d, want %d", got, tc.status)
+			}
+			if (&db{remote: true}).retryableWrite(tc.err) {
+				t.Fatal("HTTP/ambiguous explanation became safe write replay")
+			}
+		})
+	}
+	for _, status := range []int{408, 429, 499, 500, 502, 503, 599} {
+		err := fmt.Errorf("failed to execute SQL:\n%w", fmt.Errorf("error code %d: SQLITE_BUSY no such table EOF", status))
+		if !(&db{remote: true}).retryable(err) || (&db{remote: true}).retryableWrite(err) || isBusyErr(err) || storageErrorCode(err) != "connection" {
+			t.Fatalf("HTTP %d body overrode retry boundaries", status)
+		}
+	}
+	for _, status := range []int{400, 401, 403, 404, 409, 422} {
+		err := fmt.Errorf("failed to execute SQL:\n%w", fmt.Errorf("error code %d: SQLITE_BUSY EOF", status))
+		if (&db{remote: true}).retryable(err) || (&db{remote: true}).retryableWrite(err) || isConnErr(err) || isBusyErr(err) {
+			t.Fatalf("nontransient HTTP %d was retried", status)
+		}
+	}
+	unknown := unknownRemoteWrite(leaf)
+	if !errors.Is(unknown, ErrOutcomeUnknown) || !errors.Is(unknown, leaf) || (&db{remote: true}).retryable(unknown) || (&db{remote: true}).retryableWrite(unknown) {
+		t.Fatal("unknown outcome lost its cause or became replayable")
+	}
+	var statusError interface{ HTTPStatus() int }
+	if !errors.As(unknown, &statusError) || statusError.HTTPStatus() != 502 {
+		t.Fatal("unknown outcome lost provider HTTP status")
+	}
+	detail := describeError(fmt.Errorf("failed to execute SQL:\n%w", leaf), 1)
+	if detail.HTTPStatus != 502 || detail.Category != "provider_unavailable" || strings.Contains(detail.Message, "upstream") {
+		t.Fatalf("provider failure diagnostics=%+v", detail)
+	}
+	detail = describeError(unknown, 1)
+	if detail.HTTPStatus != 502 || detail.Category != "outcome_unknown" {
+		t.Fatalf("unknown provider diagnostics=%+v", detail)
+	}
+}
+
+func TestProviderHTTPPrecommitRetriesOnlyOneCommittedEffect(t *testing.T) {
+	for _, stage := range []string{"begin", "statement"} {
+		t.Run(stage, func(t *testing.T) {
+			p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 502, httpApply: true}
+			e := newRustBusyEngine(t, p)
+			runs := 0
+			err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+				runs++
+				_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			wantRuns := 2
+			if stage == "begin" {
+				wantRuns = 1
+			}
+			if runs != wantRuns || p.starts != 2 || p.commits != 1 || p.applied != 1 || p.failures != 1 {
+				t.Fatalf("runs=%d starts=%d commits=%d effects=%d failures=%d", runs, p.starts, p.commits, p.applied, p.failures)
+			}
+		})
+	}
+}
+
+func TestProviderHTTPCommittedFailureIsUnknownAndNeverReplayed(t *testing.T) {
+	for _, operation := range []string{"commit", "exec", "exec-fresh"} {
+		t.Run(operation, func(t *testing.T) {
+			stage := "statement"
+			if operation == "commit" {
+				stage = "commit"
+			}
+			p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 502, httpApply: true}
+			e := newRustBusyEngine(t, p)
+			calls := 0
+			var err error
+			switch operation {
+			case "commit":
+				err = e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+					calls++
+					_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+					return err
+				})
+			case "exec":
+				calls++
+				_, err = e.db.execUnobserved(context.Background(), "UPDATE validation_counter SET value=value+1")
+			case "exec-fresh":
+				_, err = e.db.execFreshUnobserved(context.Background(), "UPDATE validation_counter SET value=value+1", func() []any { calls++; return nil })
+			}
+			if !errors.Is(err, ErrOutcomeUnknown) || remoteProviderHTTPStatus(err) != 502 {
+				t.Fatalf("write error=%v status=%d", err, remoteProviderHTTPStatus(err))
+			}
+			var unknown *providerWriteOutcomeUnknown
+			if !errors.As(err, &unknown) || unknown.cause == nil {
+				t.Fatal("provider cause lost")
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if calls != 1 || p.applied != 1 || p.writes != 1 || p.failures != 1 || operation == "commit" && p.commits != 1 {
+				t.Fatalf("calls=%d effects=%d writes=%d commits=%d failures=%d", calls, p.applied, p.writes, p.commits, p.failures)
+			}
+		})
+	}
+}
+
+func TestProviderHTTPReadRetryAndExhaustionAreBounded(t *testing.T) {
+	for _, failures := range []int{1, maxConnAttempts + 1} {
+		t.Run(fmt.Sprint(failures), func(t *testing.T) {
+			p := &rustBusyProvider{failStage: "read", remaining: failures, httpStatus: 502}
+			e := newRustBusyEngine(t, p)
+			var value int
+			err := e.db.queryRowScan(context.Background(), []any{&value}, "SELECT value FROM validation_counter")
+			wantReads := 2
+			if failures > 1 {
+				wantReads = maxConnAttempts
+				if err == nil || errors.Is(err, ErrOutcomeUnknown) || storageErrorCode(err) != "connection" || describeError(err, 1).HTTPStatus != 502 {
+					t.Fatalf("exhausted read=%v", err)
+				}
+			} else if err != nil || value != 0 {
+				t.Fatalf("read=%d err=%v", value, err)
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.reads != wantReads || p.applied != 0 {
+				t.Fatalf("reads=%d effects=%d", p.reads, p.applied)
+			}
+		})
+	}
+}
+
+func TestProviderHTTPBodyCannotAuthorizeWriteReplay(t *testing.T) {
+	for _, status := range []int{400, 401, 403, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			p := &rustBusyProvider{failStage: "commit", remaining: 1, httpStatus: status, httpBody: `{"error":"SQLITE_BUSY database is locked EOF"}`, httpApply: true}
+			e := newRustBusyEngine(t, p)
+			runs := 0
+			err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+				runs++
+				_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+				return err
+			})
+			if err == nil || errors.Is(err, ErrOutcomeUnknown) != (status == 503) {
+				t.Fatalf("status=%d err=%v", status, err)
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if runs != 1 || p.commits != 1 || p.applied != 1 {
+				t.Fatalf("runs=%d commits=%d effects=%d", runs, p.commits, p.applied)
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &rustBusyProvider{failStage: "begin", remaining: 2, httpStatus: 502, onFailure: cancel}
+	e := newRustBusyEngine(t, p)
+	defer cancel()
+	err := e.inTx(ctx, func(context.Context, *txn) error { t.Fatal("canceled BEGIN dispatched callback"); return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled retry=%v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.starts != 1 || p.writes != 0 || p.commits != 0 {
+		t.Fatalf("after cancellation starts=%d writes=%d commits=%d", p.starts, p.writes, p.commits)
+	}
+}
+
+func TestProviderHTTPDiscardedStatusCannotAuthorizeWriteReplay(t *testing.T) {
+	for _, code := range []string{"SQLITE_BUSY", "STREAM_EXPIRED"} {
+		t.Run(code, func(t *testing.T) {
+			for _, operation := range []string{"commit", "exec"} {
+				t.Run(operation, func(t *testing.T) {
+					// The non-string error property makes the driver's first decoder fail;
+					// its fallback keeps code/message but discards the actual HTTP status.
+					body := fmt.Sprintf(`{"error":{},"code":%q,"message":"database is locked"}`, code)
+					stage := "statement"
+					if operation == "commit" {
+						stage = "commit"
+					}
+					p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 503, httpBody: body, httpApply: true}
+					e := newRustBusyEngine(t, p)
+					runs := 0
+					var err error
+					if operation == "commit" {
+						err = e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+							runs++
+							_, err := tx.ExecContext(ctx, "UPDATE validation_counter SET value=value+1")
+							return err
+						})
+					} else {
+						runs++
+						_, err = e.db.execUnobserved(context.Background(), "UPDATE validation_counter SET value=value+1")
+					}
+					p.mu.Lock()
+					defer p.mu.Unlock()
+					if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, driver.ErrBadConn) || remoteProviderHTTPStatus(err) != 0 {
+						t.Fatalf("discarded status error=%v invented status=%d writes=%d committed_effects=%d", err, remoteProviderHTTPStatus(err), p.writes, p.applied)
+					}
+					if runs != 1 || p.writes != 1 || operation == "commit" && p.commits != 1 || p.applied != 1 {
+						t.Fatalf("runs=%d commits=%d effects=%d", runs, p.commits, p.applied)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestProviderHTTPBodyOnlyBusyCannotAuthorizeCommittedReplay(t *testing.T) {
+	for _, message := range []string{"database is locked", "Tursodb error: Database is busy", expiredTransactionProviderFixture} {
+		t.Run(message, func(t *testing.T) {
+			for _, operation := range []string{"write", "public-tx-commit"} {
+				t.Run(operation, func(t *testing.T) {
+					body := fmt.Sprintf(`{"error":{},"message":%q}`, message)
+					stage := "statement"
+					if operation == "public-tx-commit" {
+						stage = "commit"
+					}
+					p := &rustBusyProvider{failStage: stage, remaining: 1, httpStatus: 503, httpBody: body, httpApply: true}
+					e := newRustBusyEngine(t, p)
+					callbacks := 0
+					var err error
+					if operation == "public-tx-commit" {
+						err = e.Tx(context.Background(), func(tx *EngineTx) error {
+							callbacks++
+							_, err := tx.SQL().ExecContext(tx.Context(), "UPDATE validation_counter SET value=value+1")
+							return err
+						})
+					} else {
+						callbacks++
+						_, err = e.db.exec(context.Background(), "UPDATE validation_counter SET value=value+1")
+					}
+					p.mu.Lock()
+					defer p.mu.Unlock()
+					if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, driver.ErrBadConn) || remoteProviderHTTPStatus(err) != 0 || callbacks != 1 || p.writes != 1 || p.applied != 1 || operation == "public-tx-commit" && p.commits != 1 {
+						t.Fatalf("err=%v callbacks=%d writes=%d commits=%d effects=%d invented_status=%d", err, callbacks, p.writes, p.commits, p.applied, remoteProviderHTTPStatus(err))
+					}
+					var unknown *providerWriteOutcomeUnknown
+					if !errors.As(err, &unknown) || unknown.cause == nil || !errors.Is(err, unknown.cause) {
+						t.Fatal("unknown lost its original provider cause")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestProviderHTTPRenewBatchReturningIsOneIssuedWrite(t *testing.T) {
+	p := &rustBusyProvider{failStage: "statement", remaining: 1, httpStatus: 502, httpApply: true}
+	e := newRustBusyEngine(t, p)
+	e.now = func() int64 { return 1000 }
+	e.qcache = map[string]queueRow{"q": {name: "q", kind: "queue", lockDurationMs: 60000, lifecycleState: "active"}}
+	result, err := e.RenewBatch(context.Background(), "q", []SettleItem{{SeqNumber: 1, LockToken: "token"}})
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !errors.Is(err, ErrOutcomeUnknown) || remoteProviderHTTPStatus(err) != 502 || result != nil || p.writes != 1 || p.applied != 1 {
+		t.Fatalf("RenewBatch=%+v err=%v status=%d writes=%d effects=%d", result, err, remoteProviderHTTPStatus(err), p.writes, p.applied)
+	}
+}
+
+func TestQueryFreshWriteScanAndWaitingBoundaries(t *testing.T) {
+	for _, stage := range []string{"write-scan", "write-rows", "read-scan"} {
+		t.Run(stage, func(t *testing.T) {
+			d, state := remoteDBFailingFirst(t, 0)
+			calls := 0
+			scan := func(*sql.Rows) error {
+				calls++
+				if calls == 1 {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
+			}
+			var err error
+			if stage == "read-scan" {
+				err = d.queryFresh(context.Background(), "SELECT value", func() []any { return nil }, scan)
+			} else {
+				if stage == "write-rows" {
+					state.queryRowsErr = io.ErrUnexpectedEOF
+					scan = func(rows *sql.Rows) error {
+						calls++
+						for rows.Next() {
+						}
+						return nil
+					}
+				}
+				err = d.queryFreshWrite(context.Background(), "UPDATE t SET x=? RETURNING x", func() []any { return []any{1} }, scan)
+			}
+			if stage == "read-scan" {
+				if err != nil || calls != 2 || len(state.args) != 2 {
+					t.Fatalf("read calls=%d queries=%d err=%v", calls, len(state.args), err)
+				}
+			} else if !errors.Is(err, ErrOutcomeUnknown) || calls != 1 || len(state.args) != 1 {
+				t.Fatalf("write calls=%d queries=%d err=%v", calls, len(state.args), err)
+			}
+		})
+	}
+	d, state := remoteDBFailingFirst(t, 0)
+	d.sql.SetMaxOpenConns(1)
+	held, err := d.sql.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	built := false
+	err = d.queryFreshWrite(ctx, "UPDATE t SET x=? RETURNING x", func() []any { built = true; return nil }, func(*sql.Rows) error { t.Fatal("scan ran while waiting for a pool lease"); return nil })
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) || built || len(state.args) != 0 {
+		t.Fatalf("pre-dispatch err=%v built=%t queries=%d", err, built, len(state.args))
+	}
+}
+
+func TestPrivateDiagnosticsRedactPreviewTursoURL(t *testing.T) {
+	raw := errors.New("connect turso://operator:fake-password@preview.invalid/db?fixture=private-marker: provider detail")
+	private := privateDiagnosticError(raw)
+	for _, secret := range []string{"operator", "fake-password", "preview.invalid", "private-marker", "turso://"} {
+		if strings.Contains(private, secret) {
+			t.Fatalf("private diagnostic retained %q", secret)
+		}
+	}
+	if !strings.Contains(private, "[redacted-url]") || !strings.Contains(private, "provider detail") {
+		t.Fatal("redaction discarded useful non-URL diagnostics")
 	}
 }
 
@@ -4186,7 +5504,7 @@ func TestStorageLastErrorKeepsCoarseCountersAndPrivateCause(t *testing.T) {
 	snapshot := e.db.storage.snapshot(e.db.sql.Stats())
 	var detail *ErrorDetail
 	for _, row := range snapshot.Operations {
-		if row.Operation == "read" && row.ErrorCode == "other" {
+		if row.Operation == "read" && row.ErrorCode == "connection" {
 			detail = row.LastError
 			if row.Duration.Count != 2 || detail == nil || detail.Category != "provider_unavailable" || detail.HTTPStatus != 503 {
 				t.Fatalf("error bucket=%+v", row)
@@ -4241,5 +5559,165 @@ func TestOpenExpiresBeforeCrashRecovery(t *testing.T) {
 	}
 	if locked == 0 || active != 0 {
 		t.Fatalf("startup revived expired locks: locked=%d active=%d", locked, active)
+	}
+}
+
+// A private read transaction may run alongside the remote writer. Its own
+// cancellation and rollback must finish without waiting for that writer's
+// unrelated COMMIT, while Close must still wait for the admitted writer.
+func TestRemoteCanceledReadDoesNotWaitForUnrelatedCommit(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			f := &admissionFixture{
+				commitStarted:   make(chan struct{}),
+				allowCommit:     make(chan struct{}),
+				rollbackStarted: make(chan struct{}),
+				allowRollback:   make(chan struct{}),
+			}
+			d := admissionTestDB(t, f)
+			d.sql.SetMaxOpenConns(2)
+			e := fakeRemoteEngine(d)
+			e.closed = make(chan struct{})
+			firstDone, readDone, closeDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var firstErr, readErr, closeErr error
+			readStarted, closeStarted := false, false
+			cancelRead := func() {}
+			join := func(name string, done <-chan struct{}) bool {
+				t.Helper()
+				select {
+				case <-done:
+					return true
+				case <-time.After(2 * time.Second):
+					t.Errorf("%s did not join after fixture release", name)
+					return false
+				}
+			}
+			defer func() {
+				f.unblock()
+				cancelRead()
+				join("writer", firstDone)
+				if readStarted {
+					join("read", readDone)
+				}
+				if closeStarted {
+					join("close", closeDone)
+				} else if err := e.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			go func() {
+				firstErr = e.inTx(context.Background(), func(context.Context, *txn) error { return nil })
+				close(firstDone)
+			}()
+			select {
+			case <-f.commitStarted:
+			case <-time.After(time.Second):
+				t.Fatal("first COMMIT did not start")
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			wantErr := context.Canceled
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 250*time.Millisecond)
+				wantErr = context.DeadlineExceeded
+			}
+			cancelRead = cancel
+			callbackDone := make(chan struct{})
+			readStarted = true
+			go func() {
+				readErr = e.inReadTx(ctx, func(context.Context, *txn) error {
+					close(callbackDone)
+					return nil
+				})
+				close(readDone)
+			}()
+			select {
+			case <-callbackDone:
+			case <-time.After(time.Second):
+				t.Fatal("read did not acquire its independent SQL connection")
+			}
+			if !deadline {
+				cancel()
+			}
+			<-ctx.Done()
+			select {
+			case <-f.rollbackStarted:
+			case <-time.After(time.Second):
+				t.Fatal("canceled read rollback did not start")
+			}
+			select {
+			case <-readDone:
+				t.Fatal("read returned before its own SQL rollback finished")
+			case <-time.After(20 * time.Millisecond):
+			}
+			f.allowRollbackOnce.Do(func() { close(f.allowRollback) })
+			select {
+			case <-readDone:
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("read still waited for the unrelated COMMIT after its rollback")
+			}
+			if !errors.Is(readErr, wantErr) || errors.Is(readErr, ErrOutcomeUnknown) || errors.Is(readErr, sql.ErrTxDone) {
+				t.Fatalf("read result=%v, want known pre-COMMIT %v", readErr, wantErr)
+			}
+			if f.commits.Load() != 1 || d.sql.Stats().InUse != 1 {
+				t.Fatalf("canceled read committed or released the unrelated writer: commits=%d inUse=%d", f.commits.Load(), d.sql.Stats().InUse)
+			}
+			closeStarted = true
+			go func() { closeErr = e.Close(); close(closeDone) }()
+			select {
+			case <-closeDone:
+				t.Fatal("Close returned while the unrelated COMMIT was still admitted")
+			case <-time.After(20 * time.Millisecond):
+			}
+			f.allowCommitOnce.Do(func() { close(f.allowCommit) })
+			writerJoined := join("writer", firstDone)
+			closeJoined := join("close", closeDone)
+			if !writerJoined || !closeJoined {
+				return
+			}
+			if firstErr != nil || closeErr != nil || d.sql.Stats().InUse != 0 {
+				t.Fatalf("final results writer=%v close=%v inUse=%d", firstErr, closeErr, d.sql.Stats().InUse)
+			}
+		})
+	}
+}
+
+type m155ContextHandler struct {
+	mu   sync.Mutex
+	seen []bool
+}
+
+func (h *m155ContextHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *m155ContextHandler) Handle(ctx context.Context, _ slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seen = append(h.seen, ctx.Err() == nil && ctx.Value(tursoSoakPhaseKey{}) != nil)
+	return nil
+}
+func (h *m155ContextHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *m155ContextHandler) WithGroup(string) slog.Handler      { return h }
+func TestStorageFailureLoggerKeepsValuesWithoutCancellation(t *testing.T) {
+	handler := &m155ContextHandler{}
+	d := &db{log: slog.New(handler)}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), tursoSoakPhaseKey{}, &tursoSoakPhaseCapture{}))
+	_, attempt := startStorage(ctx, "transaction")
+	cancel()
+	d.finishStorage(attempt, context.Canceled)
+	if len(handler.seen) != 1 || !handler.seen[0] {
+		t.Fatal("log was canceled or lost causal context values")
+	}
+}
+
+func TestStorageSuccessfulTransactionAddsNoFailureLog(t *testing.T) {
+	d, _ := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	handler := &m155ContextHandler{}
+	d.log = slog.New(handler)
+	if err := e.Complete(context.Background(), "q", 1, "token"); err != nil {
+		t.Fatal(err)
+	}
+	if len(handler.seen) != 0 {
+		t.Fatal("successful operation added diagnostic log")
 	}
 }

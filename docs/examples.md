@@ -204,14 +204,25 @@ deadline. If an exact confirmed lease is shorter than the minimum safe cadence, 
 renewal is rejected or cannot be confirmed before that deadline, it cancels the
 individual handler context and skips Complete/Abandon for that stale delivery. The
 handler must honor `ctx.Done()` and remain idempotent:
-another consumer may receive the message after the lease is lost. Exact Complete and
-Abandon requests share a five-second total settlement budget, including the first
-request and replays after a lost acknowledgement; the broker's settlement receipt
-makes that replay safe.
+another consumer may receive the message after the lease is lost. After the handler
+returns, its selected Complete or Abandon request has one 30-second confirmation
+budget, including the renewal handoff, first settlement attempt, exact replays
+after a lost acknowledgement and backoff. Each settlement request gets at
+most fifteen seconds, clamped by the remaining total budget; the broker's exact
+settlement receipt makes replay safe without calling the handler again. A single
+blackholed request can use at most half of the initial total window; its retry is
+clamped by the remaining budget and is not guaranteed another full fifteen seconds.
+Exhausted transient confirmation reaches `WithErrorHandler` as
+`ErrOutcomeUnknown`, retaining the final cause for `errors.Is`/`errors.As`.
+The budget does not extend a lease itself. With auto-renew enabled, the heartbeat
+protects that delivery within the same bounded confirmation phase. Canceling `Run`
+still waits for returning handlers' terminal confirmation to finish. See the
+[consumer stop contract](operations.md#consumer-stops-and-host-interruptions) for
+handoff, cancellation and expiry before a settlement request is sent.
 If a broker or intermediary returns HTTP 499, it is retried while the Receiver's
 own context remains live, using the same Receive attempt ID. If a proxy removes
-both broker-time headers, `WithErrorHandler` receives one degraded-clock
-diagnostic.
+both `X-Mqlite-Server-Time-Ms` and HTTP `Date`, `WithErrorHandler` receives one
+degraded-clock diagnostic.
 
 ## 4. Topic subscription lifecycle
 

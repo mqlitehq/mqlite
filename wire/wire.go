@@ -20,6 +20,13 @@ import (
 // potentially skewed wall clock. Older clients safely ignore the additive header.
 const ServerTimeHeader = "X-Mqlite-Server-Time-Ms"
 
+// ServerElapsedHeader is a lower bound, in whole milliseconds, on monotonic
+// server processing time before ServerTimeHeader is sampled. It includes storage
+// waits and long polls. Clients may subtract a valid value from the observed
+// request duration when bounding transport uncertainty, not from RPC budgets.
+// Older clients safely ignore the additive header.
+const ServerElapsedHeader = "X-Mqlite-Server-Elapsed-Ms"
+
 // Route paths (Connect-style: /package.Service/Method).
 const (
 	PathSend            = "/mqlite.v1.QueueService/Send"
@@ -120,6 +127,28 @@ type SendResponse struct {
 	SeqNumbers []int64 `json:"seq_numbers"`
 }
 
+// UnmarshalJSON rejects impossible acknowledgements while preserving sequence
+// zero for topic publishes without a match and skipped batch dedup slots.
+func (r *SendResponse) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		SeqNumbers []*int64 `json:"seq_numbers"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	sequences := make([]int64, len(decoded.SeqNumbers))
+	for i, sequence := range decoded.SeqNumbers {
+		// A null item otherwise decodes as zero and impersonates a legitimate
+		// topic no-match or skipped batch slot.
+		if sequence == nil || *sequence < 0 {
+			return errors.New("mqlite: send response contains an invalid sequence number")
+		}
+		sequences[i] = *sequence
+	}
+	r.SeqNumbers = sequences
+	return nil
+}
+
 type ReceiveRequest struct {
 	Queue       string `json:"queue"`
 	MaxMessages int    `json:"max_messages,omitempty"`
@@ -144,6 +173,16 @@ func (r *ReceiveResponse) UnmarshalJSON(data []byte) error {
 	}
 	if response.Messages == nil {
 		return errors.New("mqlite: receive response is missing required messages")
+	}
+	// A null item decodes into a zero-valued Message. Every actual delivery
+	// has a positive sequence, including a valid empty-body delivery. Reject
+	// the whole batch before exposing any prefix to the caller.
+	seen := make(map[int64]bool, len(*response.Messages))
+	for _, message := range *response.Messages {
+		if message.SeqNumber <= 0 || seen[message.SeqNumber] {
+			return errors.New("mqlite: receive response contains an invalid message sequence")
+		}
+		seen[message.SeqNumber] = true
 	}
 	r.Messages = *response.Messages
 	return nil

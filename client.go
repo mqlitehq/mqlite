@@ -252,18 +252,19 @@ func observeServerTime(header http.Header, started, received time.Time) serverTi
 	if roundTrip < 0 {
 		roundTrip = 0
 	}
+	uncertainty := responseClockUncertainty(header, roundTrip)
 	var serverLower, serverUpper time.Time
 	coarseClock := false
 	if raw := header.Get(wire.ServerTimeHeader); raw != "" {
 		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 {
 			serverLower = time.UnixMilli(ms)
-			serverUpper = serverLower.Add(time.Millisecond + roundTrip)
+			serverUpper = serverLower.Add(time.Millisecond).Add(uncertainty)
 		}
 	}
 	if serverLower.IsZero() {
 		if parsed, err := http.ParseTime(header.Get("Date")); err == nil {
 			serverLower = parsed
-			serverUpper = parsed.Add(time.Second + roundTrip)
+			serverUpper = parsed.Add(time.Second).Add(uncertainty)
 			coarseClock = true
 		}
 	}
@@ -275,12 +276,32 @@ func observeServerTime(header http.Header, started, received time.Time) serverTi
 	}
 }
 
+// responseClockUncertainty charges the whole observed response path, less only
+// the broker's measured lower bound on processing before its clock stamp. A
+// missing or invalid elapsed header keeps the original full-RTT bound. Validate
+// milliseconds before converting to Duration so overflow cannot widen a lease.
+func responseClockUncertainty(header http.Header, roundTrip time.Duration) time.Duration {
+	values := header[http.CanonicalHeaderKey(wire.ServerElapsedHeader)]
+	if len(values) != 1 || values[0] == "" {
+		return roundTrip
+	}
+	for i := 0; i < len(values[0]); i++ {
+		if values[0][i] < '0' || values[0][i] > '9' {
+			return roundTrip
+		}
+	}
+	millis, err := strconv.ParseUint(values[0], 10, 64)
+	if err != nil || millis > uint64(roundTrip/time.Millisecond) {
+		return roundTrip
+	}
+	return roundTrip - time.Duration(millis)*time.Millisecond
+}
+
 // localLeaseDeadline maps a broker-wall deadline onto the local monotonic
-// timeline. The upper bound deliberately charges the complete observed RTT, not
-// an assumed symmetric half: a slow response may have spent almost all its time
-// after the broker committed the lease. It never substitutes the local wall
-// clock merely because it falls inside the uncertainty interval. In particular,
-// doing that after a long poll could extend a lease when the client clock is slow.
+// timeline. The upper bound charges all elapsed time outside the broker's
+// measured processing, not an assumed symmetric half of the network RTT. With
+// older brokers it charges the complete RTT. It never substitutes the local
+// wall clock merely because it falls inside that uncertainty interval.
 func (o serverTimeObservation) localLeaseDeadline(deadline time.Time) (time.Time, bool) {
 	if deadline.IsZero() || o.localAt.IsZero() || o.serverUpper.IsZero() {
 		return time.Time{}, false
@@ -800,6 +821,11 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			return nil, err
 		}
 	}
+	if len(o.Pick) > 0 || !o.AtMostOnce {
+		if err := validatePeekLockResponse(resp.Messages); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
 		out[i] = c.wireToMessage(queue, wm, observation)
@@ -815,11 +841,27 @@ func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs i
 	if err != nil {
 		return nil, err
 	}
+	if mode == engine.PeekLock {
+		if err := validatePeekLockResponse(resp.Messages); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
 		out[i] = c.wireToMessage(queue, wm, observation)
 	}
 	return out, nil
+}
+
+// Validate the entire lease-bearing response before creating any public handle.
+// ReceiveAndDelete deliberately grants no token; Peek is a separate browse path.
+func validatePeekLockResponse(messages []wire.Message) error {
+	for _, message := range messages {
+		if message.LockToken == "" {
+			return &invalidSuccessResponseError{cause: errors.New("mqlite: peek-lock response is missing a fencing token")}
+		}
+	}
+	return nil
 }
 
 // Peek browses without locking.
@@ -1101,6 +1143,28 @@ func (c *Client) deferMsg(ctx context.Context, q string, seq int64, tok string) 
 }
 func (c *Client) renew(ctx context.Context, q string, seq int64, tok string) error {
 	return c.settle(ctx, wire.PathRenew, wire.SettleRequest{Queue: q, SeqNumber: seq, LockToken: tok})
+}
+
+// renewInitialBatch shares the exact response clock across all fenced results;
+// it does not mutate message handles or create additional commit boundaries.
+func (c *Client) renewInitialBatch(ctx context.Context, queue string, messages []*Message) ([]initialRenewalResult, error) {
+	results, observation, err := c.renewBatchObserved(ctx, queue, messages...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]initialRenewalResult, len(results))
+	for i, result := range results {
+		if !result.Ok {
+			out[i].err = ErrLockLost
+			continue
+		}
+		lease := renewalLease{deadline: result.LockedUntil, responseRTT: observation.responseRTT, coarseClock: observation.coarseClock, clockUnavailable: observation.serverUpper.IsZero()}
+		if local, ok := observation.localLeaseDeadline(result.LockedUntil); ok {
+			lease.deadline = local
+		}
+		out[i].lease = lease
+	}
+	return out, nil
 }
 
 func (c *Client) renewDeadline(ctx context.Context, q string, seq int64, tok string) (renewalLease, error) {

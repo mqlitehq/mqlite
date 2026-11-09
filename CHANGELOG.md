@@ -12,14 +12,250 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+- Anchor deadline-less legacy `Renew` acknowledgements to the request start.
+  Delayed replies no longer extend the next watchdog beyond the fixed
+  conservative lease estimate.
+
+### Preserve bounded failure evidence in Turso verification (MQLITE-155)
+
+- Retain safe cause types, known error identities, caller cancellation state and
+  transaction phase when a foreground soak operation fails. Private provider
+  messages, SQL and credentials remain excluded from verification artifacts.
+- Add the transaction phase to existing private failure logs. `commit_call`
+  records entry into `sql.Tx.Commit`, not proof of network dispatch or commit.
+  This improves future diagnosis; it does not establish the cause of the
+  historical unclassified Complete failure.
+
+### Avoid redundant remote schema initialization (MQLITE-162)
+
+- Reopening a complete current-schema HTTP Hrana database validates its owned
+  catalog in one read and omits repeated no-op schema DDL. Cold, incomplete and
+  unrecognized catalogs retain the existing initialization path.
+- Keep schema-version, access-key and parent-guard validation, the schema-version
+  write and all startup recovery. This reduces remote round trips; it does not
+  increase lease durations or guarantee that an arbitrary outage fits a lease.
+
+### Validate remote SQL acknowledgements (MQLITE-191)
+
+- Reject missing or mismatched HTTP Hrana results as protocol errors instead of
+  panicking or accepting an incomplete success. Preserve valid conditional batch
+  skips, statement errors, and matching stream-close results.
+- A malformed acknowledgement after an issued standalone write or COMMIT is
+  `ErrOutcomeUnknown`, since its effect may already be durable. It is not
+  transparently replayed. Ordinary read failures remain protocol errors; normal
+  requests, transaction boundaries and the driver pin are unchanged.
+
+- Keep managed HTTP retry and error classification aligned across both Go SDKs;
+  server-status retries are limited to the actual 500–599 range (MQLITE-192).
+
+### Coalesce compatible pending remote renewals (MQLITE-190)
+
+- Combine compatible HTTP Hrana `RenewBatch` calls already queued behind the
+  same writer into one fenced statement, without a collection delay or a new
+  caller API. Keep the existing single-writer and bounded priority rules.
+- Preserve each caller's cancellation and per-token result. Canceling one
+  caller does not cancel its peers; shared work keeps its shutdown owner until
+  the actual SQL and connection finish. Idle, local and legacy renewal paths
+  retain their synchronous behavior.
+
+### Preserve cancellation before commit sequencing (MQLITE-189)
+
+- Honor caller cancellation while waiting for commit sequencing. A canceled
+  remote read can finish its own rollback without waiting for an unrelated
+  COMMIT; commit ordering and interrupted-commit uncertainty remain unchanged
+  (MQLITE-189).
+
+### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
+
+- Give asynchronous libSQL HTTP stream-close requests a five-second deadline and
+  a fixed per-handle concurrency limit. When cleanup is saturated, skip that
+  best-effort request instead of delaying Send, Renew or settlement. Completed
+  cleanup workers report observed saturation at most once per handle.
+  Unconfirmed streams remain subject to the provider's expiration policy.
+- Keep foreground SQL, transaction outcomes and TCP/TLS reuse unchanged. A
+  committed operation is not failed or replayed because cleanup failed. Cleanup
+  remains asynchronous; `Close` does not confirm that the provider released the
+  stream. Local SQLite, WebSocket transport and the remote-only SDK are unchanged.
+
+### Confirm short initial leases together (MQLITE-183)
+
+- Confirm received messages that need an initial lease check with one fenced
+  `RenewBatch` request before dispatching handlers. This prevents separately
+  queued confirmations from exhausting a short lease on a serialized remote
+  writer. Keep the earliest original watchdog and per-message ownership checks;
+  older brokers retain bounded, ordered single-message confirmation.
+
+### Renew managed leases through settlement confirmation (MQLITE-180)
+
+- With auto-renew enabled, continue the heartbeat while Complete or Abandon
+  waits for its exact acknowledgement, within the existing 30-second confirmation
+  budget. Canceling Run still cancels a running handler; a returned handler's
+  bounded settlement and heartbeat are joined before its worker is released.
+  On normal handler return, finish a healthy in-flight renewal and adopt its
+  acknowledgement before settlement, instead of canceling and reissuing it.
+  That handoff shares the same confirmation budget; Run cancellation, budget
+  expiry and abnormal exits still cancel and join the handling heartbeat.
+- A renewal may lose its token after the same settlement committed. Resolve
+  that ownership race through the settlement acknowledgement or receipt replay,
+  retaining its definitive error or outcome-unknown status. Permanent renewal
+  failures still stop receiving immediately.
+- Give remote renewal attempts a separate FIFO ahead of settlements, yielding
+  after four renewals. Settlement priority also remains bounded so ordinary
+  writes and maintenance can progress. Local storage and lease fencing are unchanged.
+
+### Exclude broker processing from lease clock uncertainty (MQLITE-179)
+
+- Return `X-Mqlite-Server-Elapsed-Ms`, a monotonic lower bound on processing time
+  before the broker clock stamp. The managed Go client deducts a valid value from
+  clock uncertainty, so storage waits and long polls do not shorten a lease twice.
+- Preserve the full measured RPC duration for renewal scheduling and request
+  budgets. Missing, repeated, malformed or excessive elapsed values retain the
+  conservative full-RTT clock bound. Older clients ignore the additive header.
+
+### Serialize remote write attempts and batch Send transport (MQLITE-175)
+
+- Queue remote mutations before acquiring a provider connection, retaining read
+  capacity and giving renewals and settlements bounded priority. Cancellation
+  and shutdown release queued work; an issued transaction keeps its permit until
+  its SQL lease returns. Retry backoff does not hold the permit. Local storage
+  and the four-connection remote pool limit are unchanged. Remote `Tx` callbacks
+  hold admission until their attempt finishes; use the supplied transaction for
+  business writes and enqueueing, and finish the callback before waiting for
+  another mutation through the same owner.
+- Transport direct HTTP Hrana queue batches in bounded parameterized groups,
+  retaining input-to-sequence mapping, deduplication decisions and a single
+  transaction commit. A failure in any group rolls back the whole Send. Topic
+  fan-out and expiring subscriptions retain their existing fenced paths.
+- Ambiguous commit acknowledgements remain outcome-unknown. Write admission
+  cannot preempt a running transaction, so network latency and batch size still
+  need to fit the application's lease and request budgets.
+
+### Preserve provider HTTP write outcomes
+
+- Recognize pinned libSQL provider HTTP failures through single-cause driver
+  wrappers, including newline-wrapped 502 responses. Reads and transactions that
+  have not attempted COMMIT can retry transient provider statuses within the
+  existing six-attempt budget. Standalone writes and COMMIT responses remain
+  outcome-unknown without automatic replay, preserving their cause and safe HTTP
+  status. Response-body SQLite words cannot turn a proxy failure into safe write
+  replay; nontransient responses and canceled callers do not gain retries.
+  Untyped Busy and idle-rollback explanations cannot prove an issued write or
+  COMMIT was rejected, because the driver may discard their HTTP status. They now
+  remain `ErrOutcomeUnknown`; reads and pre-COMMIT callbacks retain bounded retry.
+
+### Retry confirmed idle-transaction rollbacks (MQLITE-170)
+
+- Recognize the provider's exact idle-transaction rollback explanation for reads
+  and pre-COMMIT transaction callbacks. Those paths can reopen the whole
+  transaction within the existing six-attempt budget. After an issued standalone
+  write or COMMIT, the same untyped text remains `ErrOutcomeUnknown` because the
+  pinned driver may have discarded a non-200 HTTP status.
+- Expose exhausted retries with precise `transaction_expired` error details while
+  retaining the existing `connection` counter category and observation matrix. Generic timeouts, transport loss, joined causes and
+  checkpoint failures still do not prove that a COMMIT was rolled back; ambiguous
+  acknowledgements retain `ErrOutcomeUnknown`. Local SQLite behavior is unchanged.
+
+### Retry definite Rust Turso contention (MQLITE-173)
+
+- Recognize the Rust provider's exact `Database is busy` explanation through the
+  pinned HTTP driver's error wrapping. Reads and pre-COMMIT transaction callbacks
+  use the bounded retry policy and report `busy` / SQLite code 5. Issued standalone
+  writes and COMMIT keep untyped Busy responses outcome-unknown.
+- Keep transport loss, cancellation, joined causes and post-commit checkpoint
+  explanations outside this compatibility rule. They are not made safe to replay
+  by merely mentioning contention. Local SQLite retry behavior is unchanged.
+
+### Keep resource cleanup compatible with Rust Turso (MQLITE-172)
+
+- Use independent indexed existence probes instead of compound SELECT subqueries
+  for resource emptiness checks and parent guards. Rust-based Turso currently
+  rejects the compound form at execution time, even after accepting its trigger.
+- Refresh only exact recognized legacy parent-trigger definitions atomically on
+  Open. No table layout, message content, live token or schema token changes;
+  unknown application definitions are refused before schema DDL. The known Rust
+  catalog rewrite of the rename guard from `<>` to `!=` is accepted explicitly;
+  other operator and literal changes remain rejected. Older binaries
+  can still use the equivalent guards. This is a compatibility repair rather
+  than a general migration mechanism.
+
+### Allow time to confirm a slow settlement (MQLITE-171)
+
+- Give managed Receiver Complete/Abandon confirmation a 30-second total budget,
+  with at most fifteen seconds per request, so a slow first request does not consume
+  the entire opportunity to replay its lost acknowledgement. This also avoids
+  repeatedly canceling a healthy slow request at a five-second boundary. Replays keep the
+  original request identity and do not rerun the handler.
+- Report exhausted transient confirmation as `ErrOutcomeUnknown` while preserving
+  the final cause for `errors.Is`/`errors.As`. Definitive errors, including
+  `ErrLockLost`, still return unchanged without retry.
+- Cancellation still joins cleanup. A returning handler may now need up to
+  30 seconds for terminal confirmation; this does not extend its lease or impose
+  a hard deadline on callbacks or transports that ignore context cancellation.
+
+### Protect database credentials in diagnostics (MQLITE-168)
+
+- Remove injected credentials from remote URL parse errors while preserving the
+  operation and underlying error type. Reject URL fragments before connecting,
+  so a fragment cannot capture a token or appear in a later HTTP error.
+- Omit user information, query values and fragments from remote database URLs in
+  broker startup logs, including legacy `auth_token` and `jwt` credentials.
+- Redact whole `turso://` URLs in private storage diagnostics as well as legacy
+  remote schemes, retaining the non-URL provider explanation.
+
+### Rust-based Turso preview compatibility (MQLITE-167)
+
+- Accept `turso://` database URLs through the existing HTTP v2 compatibility
+  adapter, without changing the Go 1.21 source floor or adding native libraries.
+  Transactions remain ordinary `BEGIN`; one broker / `Engine` per DB is required.
+- Accept backend formatting of access-key schema SQL, including punctuation
+  spacing and keyword case, so a Rust-backed DB can reopen after initialization.
+  String literals, constraints, index columns/directions and STRICT remain checked;
+  conflicting application objects still fail before any schema DDL runs.
+
+### Validate Abandon delays before settlement (MQLITE-154)
+
+- Reject negative Abandon delays and Go durations below the wire's one-millisecond
+  precision instead of silently releasing or dead-lettering the delivery.
+- Reject a new delay whose absolute visibility deadline would overflow epoch
+  milliseconds without changing the live token or writing a receipt. Previously
+  committed exact requests retain receipt replay when the clock advances.
+- Keep zero-delay abandonment immediate and ordinary valid delays unchanged;
+  the timestamp-overflow check adds no SQL to the ordinary settlement path.
+
 > The canonical schema token remains **7** and no database rebuild is required.
-> This release adds an optional response header plus a Go broker-mode option;
+> This release adds optional timing headers and explicit broker/reclaim options;
 > older remote clients ignore the header, while programmatic brokers must add
 > `WithBrokerMode` before calling `Serve` to select the server lifecycle contract.
 > An older binary does not know the new safe-open default and may still reclaim
 > live tokens when it opens the same database. Before downgrading, drain consumers
 > and settle all deliveries, or wait for every lease to expire and verify
 > `locked=0`; do not run an old local CLI against a stopped broker DB with live work.
+
+### Reject impossible message acknowledgements (MQLITE-152, MQLITE-188)
+
+- Reject null Receive items, nonpositive or duplicate delivery sequences, and
+  Peek-Lock deliveries without a fencing token before exposing any batch prefix.
+  Receive-and-delete does not require tokens, and read-only Peek stays tokenless.
+  The token remains opaque; no global token-uniqueness or format rule is added.
+- Validate the whole delivery list before
+  exposing any part of the returned batch. A damaged receive-and-delete response
+  reports `ErrOutcomeUnknown`; ordinary Peek-Lock Receive remains replayable with
+  the same attempt ID, including through the managed Receiver. ReceiveDeferred
+  gains validation, not an attempt-ID replay contract.
+- Reject null or negative Send/Schedule acknowledgement sequences while preserving
+  legitimate zero results for topic no-match and skipped batch dedup slots.
+  Valid empty message bodies and empty Receive lists remain supported.
+  Numeric-domain validation runs once at the wire boundary; each client retains
+  the operation-specific exact-count check (MQLITE-193).
+
+### Account for metadata in response batches (MQLITE-151)
+
+- Count complete serialized message data, including metadata, string escaping
+  and base64 expansion, toward the batch budget for Peek and both Receive paths.
+  ReceiveDeferred now uses the same accounting threshold. Only returned items
+  are claimed or removed; a large individual message still makes progress.
+- Preserve the exact original batch for an existing Receive attempt. New
+  accounting does not truncate old replay records or revoke their live tokens.
 
 ### Preserve remote cancellation identity (MQLITE-147)
 
@@ -38,6 +274,19 @@ upgrade notes before replacing a broker.
   with unreleased lease, shutdown, and managed Receiver behavior. Link the
   v0.4.2 documentation for operators using the published binary, and clarify
   that broker shutdown does not implement application consumer draining.
+
+### Honor remote transaction deadlines (MQLITE-163)
+
+- Keep Hrana HTTP COMMIT on the transaction's original context. A stalled
+  response no longer detaches the commit from the caller's cancellation or
+  deadline and indefinitely holds admitted work and engine shutdown open.
+- An interrupted COMMIT remains `ErrOutcomeUnknown`; the transaction callback
+  is not automatically replayed. ROLLBACK gets a separate, five-second cleanup
+  budget so an already-canceled caller does not prevent a cleanup attempt.
+- Detached stream-close requests retain their separate per-handle limit and
+  five-second deadline (MQLITE-164). Neither cleanup path proves remote release,
+  and `Close` does not synchronously join detached stream cleanup. Local SQLite,
+  the schema and SDK wire contracts are unchanged.
 
 ### Make preserving live leases the safe startup default (MQLITE-137 follow-up)
 

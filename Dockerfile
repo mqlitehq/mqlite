@@ -32,6 +32,8 @@ LABEL org.opencontainers.image.source="https://github.com/mqlitehq/mqlite" \
 # A supported base tag can still contain older APKs; patch the installed set too.
 RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tzdata && mkdir -p /data
 COPY --from=build /out/mqlite /usr/local/bin/mqlite
+COPY --from=build /src/LICENSE /usr/share/licenses/mqlite/LICENSE
+COPY --from=build /src/internal/libsqlcompat/LICENSE /src/internal/libsqlcompat/NOTICE /usr/share/licenses/mqlite/libsql-client-go/
 EXPOSE 6754
 # Default to a local file DB on the /data volume. Override MQLITE_DB with a
 # libsql://... URL (+ MQLITE_DB_AUTH_TOKEN) to use remote Turso instead.

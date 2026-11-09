@@ -16,7 +16,7 @@ Everything is read from the environment — the DB string is never compiled in.
 
 | Env | Meaning |
 |---|---|
-| `MQLITE_DB` | `file:/data/mq.db` (local) or `libsql://<db>.turso.io` (remote) |
+| `MQLITE_DB` | `file:/data/mq.db` (local), `libsql://<db>.turso.io` (remote libSQL), or unreleased `turso://<db>.turso.io` ([Rust preview](turso.md#rust-based-turso-technical-preview)) |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens (**set this in production**) |
 | `MQLITE_MONITOR_TOKENS` | v0.3.2+: optional comma-separated credentials for `Observe` and `/metrics` only; requires auth and distinct administrator credentials |

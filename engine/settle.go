@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -60,7 +61,7 @@ func (e *Engine) settleOp(ctx context.Context, queue string, seq int64, token, o
 	if token == "" {
 		return ErrLockLost
 	}
-	return e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	return e.inTx(e.leaseWriteContext(ctx), func(ctx context.Context, tx *txn) error {
 		// `ctx` here is the one inTx hands us — protected on a local store. Passing it to `do` is
 		// what keeps the fenced settle WRITE from being interrupted: an interrupted local write
 		// leaks the connection and wedges (or erases) the database. The do-closures used to capture
@@ -160,9 +161,31 @@ func (e *Engine) Complete(ctx context.Context, queue string, seq int64, token st
 // head keeps blocking its group and successors cannot overtake it (MQLITE-66);
 // the scheduler re-activates it at visible_at. delayMs=0 redelivers immediately.
 func (e *Engine) Abandon(ctx context.Context, queue string, seq int64, token string, delayMs int64) error {
+	if delayMs < 0 {
+		return fmt.Errorf("%w: abandon delay cannot be negative", ErrInvalidArgument)
+	}
 	// The delay is part of the request's identity: replaying Abandon with a DIFFERENT delay is a
 	// different request, not a lost-response retry, and must not inherit the first one's success.
 	err := e.settleOp(ctx, queue, seq, token, "abandoned", settleArgs(strconv.FormatInt(delayMs, 10)), func(ctx context.Context, tx *txn, now int64) (int64, error) {
+		if now > math.MaxInt64-delayMs {
+			// Reject an overflowing new effect without altering its live token.
+			// An already-settled token must instead reach settleOp's receipt
+			// lookup: the same delay may have fitted when it originally committed
+			// before the clock advanced (MQLITE-154). Ordinary delays add no query.
+			var owns bool
+			err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+				SELECT 1 FROM messages
+				 WHERE id=? AND queue=? AND lock_token=? AND state='locked'
+				   AND locked_until>? AND `+liveMessageQueueSQL+`)`,
+				seq, queue, token, now, now).Scan(&owns)
+			if err != nil {
+				return 0, err
+			}
+			if owns {
+				return 0, fmt.Errorf("%w: abandon delay exceeds the timestamp range", ErrInvalidArgument)
+			}
+			return 0, nil
+		}
 		var state string
 		err := tx.QueryRowContext(ctx, `
 			UPDATE messages SET
@@ -241,7 +264,7 @@ func (e *Engine) Renew(ctx context.Context, queue string, seq int64, token strin
 	// execFresh, not exec: a remote retry backs off, so a deadline computed once — before the
 	// loop — could commit a lease that has already expired by the time the write that actually
 	// lands runs (MQLITE-97). It is measured against the clock of each attempt.
-	res, err := e.db.execFresh(ctx,
+	res, err := e.db.execFresh(e.renewWriteContext(ctx),
 		// MAX(): a renewal only ever extends a lease. A racing renewal writing an older deadline
 		// would otherwise shorten a lock that had already been pushed further out.
 		`UPDATE messages SET locked_until=MAX(locked_until, ?)
@@ -357,10 +380,9 @@ const MaxRenewBatch = settleChunk
 //
 // Deliberately NOT in a transaction. Renewal has no cross-item invariant to protect — each lease
 // stands or falls on its own token — so a transaction buys nothing and costs two real things: the
-// deadline would have to survive the COMMIT as well as the write, and `Tx.Commit` takes no
-// context (the pinned libSQL driver sends it on context.Background()), so a stalled commit is
-// UNCANCELLABLE — and `mqlite receive` waits for its renewal goroutine before closing the client,
-// which would hang the command despite cancelling it.
+// deadline would have to survive an additional COMMIT round trip, and a canceled issued commit
+// can have an uncertain outcome. The single fenced statement needs neither this transaction
+// boundary nor an extra network exchange.
 //
 // Like Renew, an item whose lock was already lost simply comes back Ok=false; that is the
 // contract, not an error for the batch. Fencing is on LockToken, exactly as in CompleteBatch.
@@ -369,27 +391,41 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		return nil, fmt.Errorf("%w: renew at most %d messages per call (got %d) — a lease renewed by an earlier statement could expire before a later one finished, so a multi-statement renewal cannot honestly report which leases still hold",
 			ErrInvalidArgument, MaxRenewBatch, len(items))
 	}
-	out := make([]SettleResult, len(items))
-	for i, it := range items {
-		out[i] = SettleResult{SeqNumber: it.SeqNumber}
-	}
 	rows := fencible(items)
 	if len(rows) == 0 {
-		return out, nil
+		return renewalResults(items, nil), nil
 	}
 	q, err := e.loadQueue(ctx, queue)
 	if err != nil {
 		return nil, err
 	}
 
+	if result, err, handled := e.coalesceRenewals(ctx, queue, q, items); handled {
+		return result, err
+	}
+	deadlines, err := e.renewBatchStatement(e.renewWriteContext(ctx), queue, q, rows, e.db.queryFreshWrite)
+	if err != nil {
+		return nil, err
+	}
+	return renewalResults(items, deadlines), nil
+}
+
+type renewalQuery func(context.Context, string, func() []any, func(*sql.Rows) error) error
+
+func renewalSQL(count int) string {
+	pairs := strings.Repeat(",(?,?)", count)[1:]
+	return `UPDATE messages SET locked_until=MAX(locked_until, ?)
+		   WHERE state='locked' AND locked_until>? AND ` + liveMessageQueueSQL + ` AND queue=? AND (id, lock_token) IN (VALUES ` + pairs + `)
+		 RETURNING id, lock_token, locked_until`
+}
+
+func (e *Engine) renewBatchStatement(ctx context.Context, queue string, q queueRow, rows []SettleItem, query renewalQuery) (map[string]int64, error) {
 	// ONE statement: the write and the report of what it touched are the same UPDATE ... RETURNING.
 	// A separate follow-up SELECT would put another round trip between the deadline and its commit,
 	// eating into the very lease it is trying to extend.
-	renewed := make(map[string]bool, len(rows))
 	deadlines := make(map[string]int64, len(rows)) // the committed locked_until, per (seq, token)
-	pairs := strings.Repeat(",(?,?)", len(rows))[1:]
 	args := pairArgs(queue, rows)
-	err = e.db.queryFresh(ctx,
+	err := query(ctx,
 		// MAX(locked_until, ?): a renewal may only ever EXTEND a lease, never pull it back. Two
 		// renewals can race (a retry, a concurrent renewer), and the loser writing its older
 		// deadline would shorten a lock the winner had already pushed out.
@@ -397,9 +433,7 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 		// RETURNING the committed deadline — not just the row — so the caller can check it against
 		// the clock AFTER the statement finished. Whether a lease is live is a fact about the
 		// moment we answer, not the moment we asked.
-		`UPDATE messages SET locked_until=MAX(locked_until, ?)
-		   WHERE state='locked' AND locked_until>? AND `+liveMessageQueueSQL+` AND queue=? AND (id, lock_token) IN (VALUES `+pairs+`)
-		 RETURNING id, lock_token, locked_until`,
+		renewalSQL(len(rows)),
 		// The deadline is built per ATTEMPT, once a connection is already held — see queryFresh.
 		// Computed any earlier, a backoff (or a wait for a free connection) could leave it in the
 		// past by the time the successful attempt commits: the row would report Ok while the reaper
@@ -441,7 +475,6 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 			now := e.now() // AFTER EOF: the statement is done, so this is when the answer is true
 			for _, r := range got {
 				if r.until > now {
-					renewed[r.key] = true
 					deadlines[r.key] = r.until
 				}
 			}
@@ -450,17 +483,20 @@ func (e *Engine) RenewBatch(ctx context.Context, queue string, items []SettleIte
 	if err != nil {
 		return nil, err
 	}
+	return deadlines, nil
+}
+
+func renewalResults(items []SettleItem, deadlines map[string]int64) []SettleResult {
+	out := make([]SettleResult, len(items))
 	for i, it := range items {
-		if it.LockToken == "" {
-			continue
-		}
-		k := settleKey(it.SeqNumber, it.LockToken)
-		if renewed[k] {
-			out[i].Ok = true
-			out[i].LockedUntilMs = deadlines[k]
+		out[i].SeqNumber = it.SeqNumber
+		if it.LockToken != "" {
+			if until, ok := deadlines[settleKey(it.SeqNumber, it.LockToken)]; ok {
+				out[i].Ok, out[i].LockedUntilMs = true, until
+			}
 		}
 	}
-	return out, nil
+	return out
 }
 
 // SettleItem identifies one message to settle in a batch (fenced on LockToken).
@@ -508,7 +544,7 @@ func (e *Engine) CompleteBatch(ctx context.Context, queue string, items []Settle
 	replayed := make(map[string]bool, len(rows)) // (seq, token) pairs with a live receipt from an earlier settle
 	var removed int64
 
-	err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	err := e.inTx(e.leaseWriteContext(ctx), func(ctx context.Context, tx *txn) error {
 		// The remote inTx may replay this closure — never inherit a previous attempt's results.
 		removed = 0
 		for k := range settled {

@@ -4,12 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
+	"time"
 
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
 	libsql "github.com/tursodatabase/libsql-client-go/libsql"
 )
 
-// openHTTPHranaDB opens the documented libsql:// transport through a conservative
+// openHTTPHranaDB opens the normalized libsql:// transport through a conservative
 // compatibility adapter for libsql-client-go's HTTP v2 connection lifecycle
 // (MQLITE-163).
 //
@@ -23,14 +28,15 @@ import (
 // one lease). Validator runs only when that lease is returned, so it never breaks
 // a transaction in progress; returning false prevents both idle reuse and direct
 // waiter handoff. The driver's shared http.DefaultTransport still reuses the
-// underlying TCP/TLS connection. Remove this adapter when MQLite can move to a
-// maintained pure-Go remote driver with an equivalent validity contract.
+// underlying TCP/TLS connection. The internal pinned HTTP compatibility copy
+// also bounds detached cleanup without changing foreground SQL (MQLITE-164).
+// Remove this adapter when a maintained pure-Go driver provides both contracts.
 func openHTTPHranaDB(dsn string) (*sql.DB, error) {
 	// Use the driver's sql.Open-compatible DSN parser so this adapter preserves
 	// the existing authToken/tls URL contract exactly. NewConnector intentionally
 	// rejects those legacy query parameters, while resolveDSN still emits them.
 	// Re-parsing the URL here would risk changing credential or TLS behavior.
-	base := libsqlDSNConnector{dsn: dsn}
+	base := libsqlDSNConnector{dsn: dsn, opener: libsqlcompat.NewOpener()}
 	return sql.OpenDB(singleLeaseConnector{Connector: base}), nil
 }
 
@@ -38,14 +44,46 @@ func openHTTPHranaDB(dsn string) (*sql.DB, error) {
 // dsn). The upstream Driver does not implement driver.DriverContext, so this is
 // the narrow bridge needed to place the validity adapter around each connection.
 type libsqlDSNConnector struct {
-	dsn string
+	dsn    string
+	opener *libsqlcompat.Opener
 }
 
 func (c libsqlDSNConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return (libsql.Driver{}).Open(c.dsn)
+	if err := validateRemoteConnectionDSN(c.dsn); err != nil {
+		return nil, err
+	}
+	opener := c.opener
+	if opener == nil {
+		opener = libsqlcompat.NewOpener()
+	}
+	conn, err := opener.OpenHTTP(c.dsn)
+	return conn, redactedRemoteURLError(err)
+}
+
+func validateRemoteConnectionDSN(dsn string) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return redactedRemoteURLError(err)
+	}
+	// A fragment is not transmitted to the server. It can also capture an auth
+	// token appended to a caller's DSN and appear in subsequent HTTP errors.
+	if u.Fragment != "" || strings.Contains(dsn, "#") {
+		return errors.New("remote database URL must not contain a fragment")
+	}
+	return nil
+}
+
+func redactedRemoteURLError(err error) error {
+	// net/url includes the full URL in parse errors. This connection string has
+	// an injected auth token, so preserve the cause and operation without its URL.
+	var parseError *url.Error
+	if errors.As(err, &parseError) {
+		err = &url.Error{Op: parseError.Op, Err: parseError.Err}
+	}
+	return err
 }
 
 func (libsqlDSNConnector) Driver() driver.Driver { return libsql.Driver{} }
@@ -85,6 +123,50 @@ type singleLeaseConn struct {
 
 func (*singleLeaseConn) IsValid() bool { return false }
 
+// The pinned HTTP driver uses context.Background in driver.Tx.Commit and
+// Rollback, even when BeginTx received a deadline. Keep transaction control on
+// that same logical connection, but use the caller's context for COMMIT. This
+// does not return while the HTTP operation is still running in a goroutine
+// (MQLITE-163). Detached stream-close cleanup retains its separate per-opener
+// budget (MQLITE-164); this wrapper neither joins nor confirms that work.
+func (c *singleLeaseConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if _, err := c.httpHranaConn.BeginTx(ctx, opts); err != nil {
+		return nil, err
+	}
+	return &singleLeaseTx{conn: c.httpHranaConn, ctx: ctx}, nil
+}
+
+const remoteTransactionCleanupTimeout = 5 * time.Second
+
+type singleLeaseTx struct {
+	conn httpHranaConn
+	ctx  context.Context
+}
+
+func (t *singleLeaseTx) Commit() error {
+	if err := t.ctx.Err(); err != nil {
+		return err // Nothing was submitted on an already-canceled context.
+	}
+	_, err := t.conn.ExecContext(t.ctx, "COMMIT", nil)
+	if err != nil && t.ctx.Err() != nil {
+		// Once COMMIT starts, cancellation cannot prove that the server did not
+		// apply it. Preserve the engine's unknown-outcome contract; exposing the
+		// context sentinel here could invite an unsafe replay of the closure.
+		return fmt.Errorf("%w: remote commit interrupted before acknowledgement", ErrOutcomeUnknown)
+	}
+	return err
+}
+
+func (t *singleLeaseTx) Rollback() error {
+	// The caller is often canceled when database/sql asks for rollback. Give
+	// cleanup its own finite budget so cancellation does not skip the request,
+	// and a broken storage path cannot block this transaction's cleanup forever.
+	ctx, cancel := context.WithTimeout(context.Background(), remoteTransactionCleanupTimeout)
+	defer cancel()
+	_, err := t.conn.ExecContext(ctx, "ROLLBACK", nil)
+	return err
+}
+
 var (
 	_ driver.Connector          = libsqlDSNConnector{}
 	_ driver.Connector          = singleLeaseConnector{}
@@ -93,4 +175,5 @@ var (
 	_ driver.ConnBeginTx        = (*singleLeaseConn)(nil)
 	_ driver.ExecerContext      = (*singleLeaseConn)(nil)
 	_ driver.QueryerContext     = (*singleLeaseConn)(nil)
+	_ driver.Tx                 = (*singleLeaseTx)(nil)
 )

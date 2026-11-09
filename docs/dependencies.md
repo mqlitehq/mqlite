@@ -62,6 +62,17 @@ local/remote conformance suite, live Turso lifecycle and sustained-load runs, an
 all release-platform builds. Do not swap this dependency or remove the adapter
 based only on API similarity; there is no promised replacement or migration date.
 
+The HTTP v2 transport and its protocol/result helpers are a small internal copy
+of that same pin (`internal/libsqlcompat`), with bounded asynchronous stream
+cleanup (MQLITE-164) and explicit success-acknowledgement validation (MQLITE-191).
+Incomplete or mismatched acknowledgements cannot authorize success or a safe
+write retry. The original public SQL parser and WebSocket driver remain
+at the pin. Source/delta hashes and a module-version guard detect drift; there is
+no library-local `replace` or reliance on a caller's vendor directory. The copied
+MIT license and source notice ship with binary archives and container images.
+The existing ANTLR version is now listed directly because the copied helper
+imports it; dependency versions and the selected module graph are unchanged.
+
 ## Security posture
 
 Freezing requires checking upstream defects as well as running scanners. CI runs

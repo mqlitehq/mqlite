@@ -104,13 +104,18 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) withServerTime(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(&serverTimeResponseWriter{ResponseWriter: w, now: s.serverTimeMs}, r)
+		timed := &serverTimeResponseWriter{ResponseWriter: w, now: s.serverTimeMs, started: time.Now()}
+		next.ServeHTTP(timed, r)
+		// net/http sends an implicit 200 when a handler returns without writing.
+		// Set its observation before the outer handler returns as well.
+		timed.stamp()
 	})
 }
 
 type serverTimeResponseWriter struct {
 	http.ResponseWriter
 	now     func() int64
+	started time.Time
 	written bool
 }
 
@@ -125,6 +130,15 @@ func (w *serverTimeResponseWriter) stamp() {
 		return
 	}
 	w.written = true
+	// Floor before sampling the lifecycle wall clock. This is a lower bound on
+	// work already done when that clock is read, so subtracting it cannot remove
+	// response transport time from a client's uncertainty budget. Never derive
+	// this duration from the injectable wall clock: it may be skewed or adjusted.
+	elapsed := time.Since(w.started)
+	if w.started.IsZero() || elapsed < 0 {
+		elapsed = 0
+	}
+	w.Header().Set(wire.ServerElapsedHeader, strconv.FormatInt(elapsed.Milliseconds(), 10))
 	w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(w.now(), 10))
 }
 
@@ -136,6 +150,13 @@ func (w *serverTimeResponseWriter) WriteHeader(status int) {
 func (w *serverTimeResponseWriter) Write(p []byte) (int, error) {
 	w.stamp()
 	return w.ResponseWriter.Write(p)
+}
+
+// ResponseController must stamp before an explicit flush can send the headers.
+// Delegate optional capabilities and their errors to the original writer.
+func (w *serverTimeResponseWriter) FlushError() error {
+	w.stamp()
+	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func (s *Server) serverTimeMs() int64 {

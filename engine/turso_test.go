@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -1583,10 +1586,11 @@ func tursoSoakWindowPartial(final bool) bool {
 }
 
 type tursoSoakFailure struct {
-	Lane      string       `json:"lane,omitempty"`
-	Operation string       `json:"operation"`
-	Code      string       `json:"code"`
-	Detail    *ErrorDetail `json:"error,omitempty"`
+	Lane       string                      `json:"lane,omitempty"`
+	Operation  string                      `json:"operation"`
+	Code       string                      `json:"code"`
+	Detail     *ErrorDetail                `json:"error,omitempty"`
+	Diagnostic *tursoSoakFailureDiagnostic `json:"diagnostic,omitempty"`
 }
 
 func (f tursoSoakFailure) Error() string {
@@ -1611,7 +1615,7 @@ func safeTursoSoakFailure(lane, operation string, err error) error {
 
 func newTursoSoakFailure(lane, operation string, err error) tursoSoakFailure {
 	detail := describeError(err, time.Now().UnixMilli())
-	return tursoSoakFailure{Lane: lane, Operation: operation, Code: storageErrorCode(err), Detail: &detail}
+	return tursoSoakFailure{Lane: lane, Operation: operation, Code: storageErrorCode(err), Detail: &detail, Diagnostic: describeTursoSoakFailure(err)}
 }
 
 func cloneTursoSoakErrorDetail(detail *ErrorDetail) *ErrorDetail {
@@ -1629,7 +1633,8 @@ type tursoSoakLogHandler struct {
 func (h tursoSoakLogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= slog.LevelInfo
 }
-func (h tursoSoakLogHandler) Handle(_ context.Context, r slog.Record) error {
+func (h tursoSoakLogHandler) Handle(ctx context.Context, r slog.Record) error {
+	captureTursoSoakPhase(ctx, r)
 	// storage.failure is emitted synchronously before the foreground API returns.
 	// The lane records that returned error with its queue and operation, so reporting
 	// the log here would win the first-failure race and hide the useful attribution.
@@ -1968,6 +1973,10 @@ func (s tursoSoakSummary) markdown() []byte {
 		fmt.Fprintf(&b, "; change %.2f%%. No performance pass/fail threshold is applied.\n", *s.WindowTrend.ChangePercent)
 	}
 	if s.Failure != nil {
+		if diagnostic := s.Failure.Diagnostic; diagnostic != nil {
+			fmt.Fprintf(&b, "\nFailure phase: transaction=%s caller_context=%s; bounded error types=%s.\n",
+				diagnostic.TransactionPhase, diagnostic.CallerContext, strings.Join(diagnostic.ErrorTypes, ","))
+		}
 		fmt.Fprintf(&b, "\nFailure: %s\n", s.Failure.Error())
 		if detail := s.Failure.Detail; detail != nil {
 			fmt.Fprintf(&b, "Failure evidence: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
@@ -2044,11 +2053,17 @@ func (r *tursoSoakRunner) stopLanes() { r.stopOnce.Do(func() { close(r.stop) }) 
 func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.CallTimeout)
 	defer cancel()
+	trace := &tursoSoakPhaseCapture{}
+	ctx = context.WithValue(ctx, tursoSoakPhaseKey{}, trace)
 	if err := r.admission.acquire(ctx); err != nil {
-		return err
+		return &tursoSoakCallError{err: err, diagnostic: newTursoSoakDiagnostic(tursoSoakCallerState(ctx), err, trace.snapshot())}
 	}
 	defer r.admission.release()
-	return fn(ctx)
+	err := fn(ctx)
+	if err != nil {
+		return &tursoSoakCallError{err: err, diagnostic: newTursoSoakDiagnostic(tursoSoakCallerState(ctx), err, trace.snapshot())}
+	}
+	return nil
 }
 
 // tursoSoakAdmission bounds every harness-originated database call. Limiting the
@@ -2736,13 +2751,13 @@ func TestTursoSoakConfigurationGate(t *testing.T) {
 }
 
 func TestTursoSoakFailureEvidenceIsSafeAndActionable(t *testing.T) {
-	raw := errors.New("request failed: error code 503: provider detail https://db.invalid/path token=top-secret bearer eyJhbGciOiJub25lIn0.eyJzZWNyZXQiOiJ2YWx1ZSJ9.signature SQL=SELECT-card_number message_body=customer-message-body")
+	raw := fmt.Errorf("request failed: %w", errors.New("error code 503: provider detail https://db.invalid/path token=top-secret bearer eyJhbGciOiJub25lIn0.eyJzZWNyZXQiOiJ2YWx1ZSJ9.signature SQL=SELECT-card_number message_body=customer-message-body"))
 	err := safeTursoSoakFailure("group_fifo", "receive", raw)
 	var failure tursoSoakFailure
 	if !errors.As(err, &failure) {
 		t.Fatalf("failure type = %T, want tursoSoakFailure", err)
 	}
-	if failure.Code != "other" || failure.Detail == nil || failure.Detail.Category != "provider_unavailable" ||
+	if failure.Code != "connection" || failure.Detail == nil || failure.Detail.Category != "provider_unavailable" ||
 		failure.Detail.HTTPStatus != http.StatusServiceUnavailable || failure.Detail.Fingerprint == "" {
 		t.Fatalf("failure evidence = %+v", failure)
 	}
@@ -3268,5 +3283,323 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 	data, err = os.ReadFile(filepath.Join(evidence.dir, "summary.md"))
 	if err != nil || !bytes.Contains(data, []byte("## Maintenance")) || !bytes.Contains(data, []byte("## Monitoring")) {
 		t.Fatalf("summary markdown missing: err=%v", err)
+	}
+}
+
+// MQLITE-155: bounded, test-only failure evidence; never publish provider text.
+type tursoSoakFailureDiagnostic struct {
+	TransactionPhase string   `json:"transaction_phase"`
+	CallerContext    string   `json:"caller_context"`
+	ErrorTypes       []string `json:"error_types"`
+	// Sentinels reflect identity in the bounded cause graph, not custom Is methods.
+	Sentinels      map[string]bool `json:"sentinels"`
+	ChainTruncated bool            `json:"chain_truncated"`
+}
+
+type tursoSoakPhaseKey struct{}
+type tursoSoakPhaseCapture struct {
+	mu    sync.Mutex
+	phase string
+}
+
+func (c *tursoSoakPhaseCapture) snapshot() string { c.mu.Lock(); defer c.mu.Unlock(); return c.phase }
+func captureTursoSoakPhase(ctx context.Context, r slog.Record) {
+	if r.Message != "storage.failure" && r.Message != "storage.interrupted" {
+		return
+	}
+	capture, ok := ctx.Value(tursoSoakPhaseKey{}).(*tursoSoakPhaseCapture)
+	if !ok {
+		return
+	}
+	phase := "unavailable"
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "transaction_phase" {
+			for p := transactionPhaseUnavailable; p <= transactionPhaseCommitCall; p++ {
+				if a.Value.String() == p.String() {
+					phase = p.String()
+				}
+			}
+		}
+		return true
+	})
+	capture.mu.Lock()
+	capture.phase = phase
+	capture.mu.Unlock()
+}
+
+type tursoSoakCallError struct {
+	err        error
+	diagnostic *tursoSoakFailureDiagnostic
+}
+
+func (e *tursoSoakCallError) Error() string { return e.err.Error() }
+func (e *tursoSoakCallError) Unwrap() error { return e.err }
+
+func describeTursoSoakFailure(err error) *tursoSoakFailureDiagnostic {
+	if e, ok := err.(*tursoSoakCallError); ok { //nolint:errorlint // Only this call's outer recorder is authoritative; do not traverse arbitrary error hooks.
+		return e.diagnostic
+	}
+	return newTursoSoakDiagnostic("unavailable", err, "")
+}
+
+func tursoSoakCallerState(ctx context.Context) string {
+	switch ctx.Err() {
+	case context.Canceled:
+		return "canceled"
+	case context.DeadlineExceeded:
+		return "deadline_exceeded"
+	default:
+		return "live"
+	}
+}
+
+func newTursoSoakDiagnostic(callerState string, err error, phase string) *tursoSoakFailureDiagnostic {
+	d := &tursoSoakFailureDiagnostic{TransactionPhase: "unavailable", CallerContext: callerState, Sentinels: map[string]bool{}}
+	if phase != "" {
+		d.TransactionPhase = phase
+	}
+	sentinels := []struct {
+		name string
+		err  error
+	}{
+		{"context_canceled", context.Canceled}, {"context_deadline", context.DeadlineExceeded},
+		{"tx_done", sql.ErrTxDone}, {"no_rows", sql.ErrNoRows}, {"bad_conn", driver.ErrBadConn},
+		{"eof", io.EOF}, {"unexpected_eof", io.ErrUnexpectedEOF}, {"lock_lost", ErrLockLost},
+		{"outcome_unknown", ErrOutcomeUnknown}, {"closed", ErrClosed},
+	}
+	for _, s := range sentinels {
+		d.Sentinels[s.name] = false
+	}
+	// Inspect a bounded structural graph; never call a custom Is/As method.
+	pending := []error{err}
+	for seen := 0; len(pending) > 0 && seen < 16; seen++ {
+		current := pending[0]
+		pending = pending[1:]
+		if current == nil {
+			continue
+		}
+		name := fmt.Sprintf("%T", current)
+		switch name {
+		case "*errors.errorString", "*errors.joinError", "*fmt.wrapError", "*fmt.wrapErrors", "*url.Error", "*net.OpError", "*net.DNSError", "*json.SyntaxError", "*json.UnmarshalTypeError":
+		default:
+			name = "other"
+		}
+		d.ErrorTypes = append(d.ErrorTypes, name)
+		if reflect.TypeOf(current).Comparable() {
+			for _, s := range sentinels {
+				if current == s.err { //nolint:errorlint // Match this graph node by identity; errors.Is could invoke recursive custom hooks.
+					d.Sentinels[s.name] = true
+				}
+			}
+		}
+		switch e := current.(type) { //nolint:errorlint // Advance only one structural edge within the fixed traversal budget.
+		case interface{ Unwrap() []error }:
+			children := e.Unwrap()
+			remaining := 16 - len(pending) - seen - 1
+			if len(children) > remaining {
+				children = children[:remaining]
+				d.ChainTruncated = true
+			}
+			pending = append(pending, children...)
+		case interface{ Unwrap() error }:
+			pending = append(pending, e.Unwrap())
+		}
+	}
+	d.ChainTruncated = d.ChainTruncated || len(pending) > 0
+	return d
+}
+
+// MQLITE-155: a failed foreground Complete must retain safe causal evidence.
+// This exercises the actual engine transaction path without a remote database.
+func TestTursoSoakForegroundFailureTrace(t *testing.T) {
+	for _, phase := range []string{"body", "commit_call"} {
+		phase := phase // Go 1.21: each parallel subtest owns its case.
+		t.Run(phase, func(t *testing.T) {
+			t.Parallel()
+			d, state := remoteDBFailingFirst(t, 0)
+			raw := errors.New("provider-private https://private.invalid SQL=secret token=private-token body=private-body")
+			if phase == "body" {
+				state.execErr = raw
+			} else {
+				state.commitErr = raw
+			}
+			e := fakeRemoteEngine(d)
+			r := &tursoSoakRunner{cfg: tursoSoakConfig{CallTimeout: time.Second}, admission: newTursoSoakAdmission(1)}
+			d.log = slog.New(tursoSoakLogHandler{report: func(error) { t.Error("foreground error won failure attribution") }})
+			err := r.call(func(ctx context.Context) error { return e.Complete(ctx, "q", 1, "token") })
+			if err == nil || !errors.Is(err, raw) {
+				t.Fatal("original failure identity was not retained")
+			}
+			failure := newTursoSoakFailure("standard_a", "complete", err)
+			encoded, marshalErr := json.Marshal(failure)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			var got map[string]json.RawMessage
+			_ = json.Unmarshal(encoded, &got)
+			if len(got["diagnostic"]) == 0 {
+				t.Fatal("foreground failure discarded diagnostic type, context and transaction phase")
+			}
+			var trace struct {
+				TransactionPhase string   `json:"transaction_phase"`
+				CallerContext    string   `json:"caller_context"`
+				ErrorTypes       []string `json:"error_types"`
+			}
+			_ = json.Unmarshal(got["diagnostic"], &trace)
+			if trace.TransactionPhase != phase || trace.CallerContext != "live" || len(trace.ErrorTypes) == 0 {
+				t.Fatalf("unexpected safe trace: %s", got["diagnostic"])
+			}
+			for _, secret := range []string{"provider-private", "private.invalid", "SQL=secret", "private-token", "private-body"} {
+				if bytes.Contains(encoded, []byte(secret)) {
+					t.Fatalf("private text escaped diagnostic: %q", secret)
+				}
+			}
+			if !strings.Contains(string(encoded), `"operation":"complete"`) {
+				t.Fatal("lost foreground attribution")
+			}
+			// Exercise the actual report-to-summary path, including Markdown, so
+			// the private call wrapper cannot escape through formatting.
+			r.report(safeTursoSoakFailure("standard_a", "complete", err))
+			var reported tursoSoakFailure
+			if !errors.As(r.failure(), &reported) {
+				t.Fatal("report lost the safe failure wrapper")
+			}
+			summary := tursoSoakSummary{Status: "FAIL", Failure: &reported}
+			jsonSummary, marshalErr := json.Marshal(summary)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			for _, artifact := range [][]byte{jsonSummary, summary.markdown()} {
+				for _, secret := range []string{"provider-private", "private.invalid", "SQL=secret", "private-token", "private-body"} {
+					if bytes.Contains(artifact, []byte(secret)) {
+						t.Fatalf("summary artifact leaked %q", secret)
+					}
+				}
+			}
+		})
+	}
+}
+
+func m155FailureDiagnostic(t *testing.T, err error) *tursoSoakFailureDiagnostic {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected injected failure")
+	}
+	return newTursoSoakFailure("standard_a", "complete", err).Diagnostic
+}
+
+func TestTursoSoakCommitWaitCancellationTrace(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	if err := e.commitMu.LockContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer e.commitMu.Unlock()
+	commits := 0
+	state.onCommit = func() { commits++ }
+	d.log = slog.New(tursoSoakLogHandler{report: func(error) {}})
+	r := &tursoSoakRunner{cfg: tursoSoakConfig{CallTimeout: 20 * time.Millisecond}, admission: newTursoSoakAdmission(1)}
+	err := r.call(func(ctx context.Context) error { return e.Complete(ctx, "q", 1, "token") })
+	trace := m155FailureDiagnostic(t, err)
+	if !errors.Is(err, context.DeadlineExceeded) || trace.TransactionPhase != "commit_wait" || trace.CallerContext != "deadline_exceeded" || commits != 0 {
+		t.Fatalf("commit wait evidence wrong: %+v commits=%d", trace, commits)
+	}
+}
+
+func TestTursoSoakRetryFailureResetsPhase(t *testing.T) {
+	d, state := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	raw := errors.New("private-provider-error")
+	commits := 0
+	state.onCommit = func() { commits++; state.commitErr = sqliteBusyEvidence{}; state.execErr = raw }
+	d.log = slog.New(tursoSoakLogHandler{report: func(error) {}})
+	r := &tursoSoakRunner{cfg: tursoSoakConfig{CallTimeout: time.Second}, admission: newTursoSoakAdmission(1)}
+	err := r.call(func(ctx context.Context) error { return e.Complete(ctx, "q", 1, "token") })
+	trace := m155FailureDiagnostic(t, err)
+	if trace.TransactionPhase != "body" || commits != 1 {
+		t.Fatalf("retry retained old commit phase: %+v commits=%d", trace, commits)
+	}
+	var retries uint64
+	for _, op := range d.storage.snapshot(d.sql.Stats()).Operations {
+		retries += op.Retries
+	}
+	if retries != 1 {
+		t.Fatalf("retry accounting changed: %d", retries)
+	}
+}
+
+type m155BeginConnector struct{ err error }
+
+func (c m155BeginConnector) Driver() driver.Driver { return nil }
+func (c m155BeginConnector) Connect(context.Context) (driver.Conn, error) {
+	return &m155BeginConn{busyConn: &busyConn{st: &busyState{}}, err: c.err}, nil
+}
+
+type m155BeginConn struct {
+	*busyConn
+	err error
+}
+
+func (c *m155BeginConn) Begin() (driver.Tx, error) { return nil, c.err }
+
+func TestTursoSoakBeginFailureTrace(t *testing.T) {
+	pool := sql.OpenDB(m155BeginConnector{err: errors.New("private-begin-error")})
+	defer pool.Close()
+	d := &db{sql: pool, remote: true}
+	e := fakeRemoteEngine(d)
+	d.log = slog.New(tursoSoakLogHandler{report: func(error) {}})
+	r := &tursoSoakRunner{cfg: tursoSoakConfig{CallTimeout: time.Second}, admission: newTursoSoakAdmission(1)}
+	err := r.call(func(ctx context.Context) error { return e.Complete(ctx, "q", 1, "token") })
+	if trace := m155FailureDiagnostic(t, err); trace.TransactionPhase != "begin" {
+		t.Fatalf("wrong begin phase: %+v", trace)
+	}
+}
+
+type m155OpaqueError struct {
+	private string
+	next    error
+}
+
+func (e *m155OpaqueError) Error() string { return e.private }
+func (e *m155OpaqueError) Unwrap() error { return e.next }
+
+func TestTursoSoakDiagnosticAllowlistAndBounds(t *testing.T) {
+	cycle := &m155OpaqueError{private: "SQL=private token=secret"}
+	cycle.next = cycle
+	trace := newTursoSoakDiagnostic("unavailable", cycle, "")
+	if !trace.ChainTruncated || len(trace.ErrorTypes) != 16 || trace.CallerContext != "unavailable" {
+		t.Fatalf("unbounded chain: %+v", trace)
+	}
+	for _, name := range trace.ErrorTypes {
+		if name != "other" {
+			t.Fatalf("custom type escaped: %s", name)
+		}
+	}
+	joined := errors.Join(fmt.Errorf("opaque secret: %w", io.EOF), context.Canceled, sql.ErrTxDone, ErrOutcomeUnknown)
+	trace = newTursoSoakDiagnostic("live", joined, "")
+	for _, s := range []string{"eof", "context_canceled", "tx_done", "outcome_unknown"} {
+		if !trace.Sentinels[s] {
+			t.Fatalf("missing sentinel %s", s)
+		}
+	}
+	encoded, _ := json.Marshal(trace)
+	if bytes.Contains(encoded, []byte("secret")) || bytes.Contains(encoded, []byte("opaque")) {
+		t.Fatal("private error leaked")
+	}
+	if trace.TransactionPhase != "unavailable" {
+		t.Fatal("invented transaction phase")
+	}
+}
+
+func TestTursoSoakAdmissionFailureContext(t *testing.T) {
+	r := &tursoSoakRunner{cfg: tursoSoakConfig{CallTimeout: 10 * time.Millisecond}, admission: newTursoSoakAdmission(1)}
+	if err := r.admission.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.admission.release()
+	err := r.call(func(context.Context) error { t.Fatal("blocked admission ran callback"); return nil })
+	trace := m155FailureDiagnostic(t, err)
+	if trace.CallerContext != "deadline_exceeded" || trace.TransactionPhase != "unavailable" {
+		t.Fatalf("wrong admission trace: %+v", trace)
 	}
 }

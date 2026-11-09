@@ -716,7 +716,52 @@ func (o *storageObservations) initialize() {
 }
 
 type operationContextKey struct{}
+
+// transactionPhase is private diagnostic state, not a metric dimension or
+// evidence that the provider has rolled back. The transaction owner advances it.
+type transactionPhase uint32
+
+const (
+	transactionPhaseUnavailable transactionPhase = iota
+	transactionPhaseAttemptWait
+	transactionPhaseAdmission
+	transactionPhaseConnection
+	transactionPhaseBegin
+	transactionPhaseBody
+	transactionPhaseCommitWait
+	transactionPhaseCommitCall // sql.Tx.Commit was invoked; wire dispatch is not implied.
+)
+
+func (p transactionPhase) String() string {
+	switch p {
+	case transactionPhaseAttemptWait:
+		return "attempt_wait"
+	case transactionPhaseAdmission:
+		return "admission"
+	case transactionPhaseConnection:
+		return "connection"
+	case transactionPhaseBegin:
+		return "begin"
+	case transactionPhaseBody:
+		return "body"
+	case transactionPhaseCommitWait:
+		return "commit_wait"
+	case transactionPhaseCommitCall:
+		return "commit_call"
+	default:
+		return "unavailable"
+	}
+}
+
+func setTransactionPhase(ctx context.Context, phase transactionPhase) {
+	if a, ok := ctx.Value(operationContextKey{}).(*storageAttempt); ok {
+		a.transactionPhase.Store(uint32(phase))
+	}
+}
+
 type storageAttempt struct {
+	logContext       context.Context
+	transactionPhase atomic.Uint32
 	operation        string
 	start            time.Time
 	retries          atomic.Uint64
@@ -724,7 +769,7 @@ type storageAttempt struct {
 }
 
 func startStorage(ctx context.Context, operation string) (context.Context, *storageAttempt) {
-	a := &storageAttempt{operation: operation, start: time.Now()}
+	a := &storageAttempt{operation: operation, start: time.Now(), logContext: ctx}
 	return context.WithValue(ctx, operationContextKey{}, a), a
 }
 
@@ -738,8 +783,14 @@ func storageErrorCode(err error) string {
 		return "canceled"
 	case errors.Is(err, ErrClosed):
 		return "closed"
+	case remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err):
+		return "connection"
 	case isBusyErr(err):
 		return "busy"
+	case isExpiredRemoteTransactionErr(err):
+		// Keep the established counter/wire label matrix backward-compatible.
+		// ErrorDetail carries the more precise transaction_expired diagnostic.
+		return "connection"
 	case isConnErr(err):
 		return "connection"
 	}
@@ -806,9 +857,14 @@ func (d *db) finishStorage(a *storageAttempt, err error) {
 		if code == "canceled" || code == "closed" {
 			event, level = "storage.interrupted", slog.LevelInfo
 		}
-		d.log.Log(context.Background(), level, event, "operation", a.operation, "outcome", outcome, "at_ms", detail.AtMs,
+		logContext := context.Background()
+		if a.logContext != nil {
+			logContext = context.WithoutCancel(a.logContext)
+		}
+		d.log.Log(logContext, level, event, "operation", a.operation, "outcome", outcome, "at_ms", detail.AtMs,
 			"category", detail.Category, "cause", detail.Message, "fingerprint", detail.Fingerprint,
-			"http_status", detail.HTTPStatus, "sqlite_code", detail.SQLiteCode, "retries", a.retries.Load(), "error", privateDiagnosticError(err))
+			"http_status", detail.HTTPStatus, "sqlite_code", detail.SQLiteCode, "retries", a.retries.Load(),
+			"transaction_phase", transactionPhase(a.transactionPhase.Load()).String(), "error", privateDiagnosticError(err))
 	}
 }
 
@@ -858,6 +914,12 @@ func (d *db) queryFresh(ctx context.Context, q string, args func() []any, scan f
 	d.finishStorage(a, err)
 	return err
 }
+func (d *db) queryFreshWrite(ctx context.Context, q string, args func() []any, scan func(*sql.Rows) error) error {
+	ctx, a := startStorage(ctx, storageQueryOperation(q))
+	err := d.queryFreshWriteUnobserved(ctx, q, args, scan)
+	d.finishStorage(a, err)
+	return err
+}
 func (d *db) queryFreshRead(ctx context.Context, q string, args func() []any, scan func(*sql.Rows) error) error {
 	ctx, a := startStorage(ctx, storageQueryOperation(q))
 	err := d.queryFreshReadUnobserved(ctx, q, args, scan)
@@ -903,6 +965,13 @@ func (d *db) queryRowScanRead(ctx context.Context, dest []any, q string, args ..
 func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error) error {
 	ctx, a := startStorage(ctx, "transaction")
 	err := e.inTxUnobserved(ctx, fn)
+	e.db.finishStorage(a, err)
+	return err
+}
+
+func (e *Engine) inReadTx(ctx context.Context, fn func(context.Context, *txn) error) error {
+	ctx, a := startStorage(ctx, "transaction")
+	err := e.inTxMode(ctx, fn, true)
 	e.db.finishStorage(a, err)
 	return err
 }

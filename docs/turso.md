@@ -11,6 +11,24 @@ HTTP via `libsql-client-go`, so the single static binary still has no native dep
 This note records how concurrency is handled and why embedded replicas are *not*
 used.
 
+## Rust-based Turso technical preview
+
+Unreleased `main` also accepts `turso://<database>.turso.io` for a Rust-based
+Turso database. Supply its token through `MQLITE_DB_AUTH_TOKEN` or
+`WithDBAuthToken`, just as for a `libsql://` database. MQLite uses the service's
+[HTTP v2 compatibility endpoint](https://github.com/tursodatabase/turso/blob/65a31536512e3ae906277796f520785b7d68ba93/serverless/PROTOCOL.md#2-overview)
+with its existing pure-Go driver and connection-validity adapter; it normalizes
+the scheme inside the driver connection string. No native library or higher Go
+source floor is required.
+
+The Rust service is a technical preview. Validate its queue operations, repeated
+opens, recovery and query performance with your workload before adopting it.
+MQLite still uses ordinary `BEGIN` transactions and requires one broker / `Engine`
+per database. A provider's concurrent-write capability does not enable
+`BEGIN CONCURRENT` or make multiple MQLite owners safe. The new provider's SQL
+compatibility and optimizer are independent of libSQL's; do not assume identical
+throughput or query plans.
+
 ## Backend parity contract
 
 Storage selection is a deployment detail, not a second API mode. Given the same
@@ -51,18 +69,47 @@ active MQLite broker or embedded `Engine`. Replace that owner stop-then-start af
 confirming the old process has exited. Do not use rolling overlap against the same
 database. What differs between storage modes is the connection pool:
 
-| | local file / `:memory:` | `libsql://` (HTTP Hrana) | `ws://` / `wss://` |
+| | local file / `:memory:` | `libsql://` / `turso://` (HTTP Hrana) | `ws://` / `wss://` |
 |---|---|---|---|
-| write ownership | 1 connection = local writer (file lock, MQLITE-6) | one broker owns a 4-connection pool; Turso serializes commits | same remote ownership |
-| writer pool | MaxOpen=1, MaxIdle=1 | MaxOpen=4, MaxIdle=0 | MaxOpen=4, MaxIdle=2 |
+| write ownership | 1 connection = local writer (file lock, MQLITE-6) | one owner admits one write attempt at a time | same remote ownership |
+| provider pool | MaxOpen=1, MaxIdle=1 | MaxOpen=4, MaxIdle=0 | MaxOpen=4, MaxIdle=2 |
 | observation | file: 1 read-only connection; `:memory:`: writer connection | provider-backed pool | provider-backed pool |
 | lifecycle | ConnMaxLifetime=0 | one logical Hrana connection per `database/sql` lease | IdleTime=3s, Lifetime=55s |
 | physical reuse | SQLite connection stays open | `http.DefaultTransport` still reuses TCP/TLS connections | the WebSocket itself is pooled |
 
-A small remote pool is safe within that one MQLite process because the Turso
-primary serializes writes across its connections; this does not make two brokers
-or embedded `Engine` instances safe. On `libsql://`, a lease is one ordinary
-operation or one complete transaction. Returning the lease discards its logical
+Remote mutations wait for one cancellable write permit before acquiring a SQL
+connection. The permit covers one attempt through commit or rollback; retry
+backoff releases it. Renewals precede settlements in separate FIFO queues, with
+bounded bursts at each level so ordinary writes and maintenance also progress. Reads retain access to
+the four-connection pool. This cannot interrupt an already running transaction
+and does not make overlapping brokers or `Engine` instances safe.
+
+Compatible HTTP Hrana `RenewBatch` calls already waiting at the tail of the
+renewal FIFO can share one fenced `UPDATE ... RETURNING`. There is no collection
+delay: an idle writer uses the original synchronous path. Groups only combine
+the same queue and lease configuration, with at most 512 input positions and
+bounded payload eligibility. At most two unfinished groups own shared execution;
+incompatible or excess calls use the original FIFO path. Each caller retains
+its own cancellation and token results, and a canceled caller cannot cancel a
+live peer. Ending a caller's wait does not mean that an already issued shared
+statement was undone. Shutdown still waits for the real shared SQL and connection to end.
+Safe retries rejoin the FIFO tail under the same retry and fairness rules.
+
+This internal adaptation keeps the same API and message contract across local
+SQLite and remote backends. It reduces redundant renewal round trips; it cannot
+preempt an active transaction or guarantee that an arbitrary network delay fits
+inside a short lease. Latency and throughput still depend on the deployment.
+
+A public `Tx` callback holds the write permit until that attempt finishes. Keep
+callbacks short and use the supplied `EngineTx` for business SQL and enqueueing.
+Complete the callback before waiting for another mutation through the same owner.
+
+For HTTP Hrana, a direct queue batch transports bounded groups of parameterized
+statements together while retaining one transaction and one commit for the whole
+Send. Fan-out and expiring subscriptions retain their existing fenced paths.
+Network latency still contributes to transaction and lease budgets.
+
+On `libsql://`, a lease is one ordinary operation or one complete transaction. Returning the lease discards its logical
 Hrana connection before it can enter an idle slot or be handed directly to a
 waiting caller; this does **not** tear down the shared HTTP transport or its
 TCP/TLS keep-alive connections. Each broker process shares its expensive all-queue
@@ -71,6 +118,18 @@ brokers do not share that cache. Per-queue `Stats` and each observation's
 lightweight storage probe still use the backend shown above.
 
 ## Connection resilience (the remote hardening)
+
+On a complete current-schema HTTP database, Open checks the owned schema catalog
+and avoids repeating no-op CREATE statements. It still verifies the schema token,
+access-key objects and parent guards, records the schema version, and performs
+normal subscription/lifecycle and lease recovery. Missing objects and known
+legacy guards follow the existing initialization and repair path; a catalog read
+error stops Open instead of authorizing an unverified fast path. Local SQLite and
+WebSocket initialization are unchanged.
+
+This optimization reduces startup round trips, not the scope of a lease. Budget
+the complete stop, storage cleanup, Open, readiness, reconnection and settlement
+window against the lease that actually remains when shutdown begins.
 
 An HTTP Hrana response can succeed with a null baton, which means the server has
 closed that logical stream. The pinned `libsql-client-go` records the closed state
@@ -89,17 +148,38 @@ HTTP/TLS reuse remains owned by Go's shared transport. Normal failure handling i
 still bounded as follows:
 
 - **Bounded retry on transient errors only** — `maxConnAttempts = 6`.
-- **Reads retry on any transport drop.** `retryable = remote && (isConnErr || isBusyErr)`
+- **Reads retry on transport drops and definite remote aborts.**
+  `retryable = remote && (isConnErr || isBusyErr || isExpiredRemoteTransactionErr)`
   gates `query`/`queryRowScan`: a read is idempotent, so replaying it on a fresh pooled
   connection is always safe. `isConnErr` spans the whole transport-failure family —
   `driver.ErrBadConn`, a closed Hrana stream, and their siblings `EOF` / `broken pipe` /
   `i/o timeout` (behind a proxy like Fly a dropped connection reads as `EOF`, not `RST`).
-- **Writes retry only when the statement provably never applied** — `retryableWrite =
-  remote && (ErrBadConn || isBusyErr)`. A closed stream (`ErrBadConn`) or a `SQLITE_BUSY`
-  (lock never acquired) guarantees the write never ran, so replaying `exec` / the `inTx`
-  commit cannot double-apply. The retry is bounded by `maxConnAttempts`; exhaustion is
-  returned to the caller. The `busy_timeout(5000)` DSN pragma belongs to local modernc
-  SQLite connections and does not apply to Turso/libSQL.
+  A single provider HTTP error leaf with status 408, 429, 499 or 5xx also follows
+  this policy. Before COMMIT is attempted, `inTx` discards the failed transaction
+  and may reopen the entire callback under the same six-attempt bound. A numeric
+  provider status takes precedence over SQLite words in its response body.
+- **Writes and COMMIT retry only after a proven rejection.** Only a genuine
+  before-dispatch `driver.ErrBadConn` or typed `SQLITE_BUSY` evidence permits
+  transparent replay. Plain text such as `database is locked`, the Rust preview's
+  exact `Tursodb error: Database is busy`, or an idle-transaction rollback message
+  does not prove that an issued write or COMMIT was rejected. The pinned driver
+  can discard a non-200 HTTP status and return exactly the same text as a normal
+  SQL rejection. Those issued-write outcomes are `ErrOutcomeUnknown`, preserving
+  the cause, instead of automatically repeating a possibly committed effect.
+  Before COMMIT starts, a callback error can still discard and retry the entire
+  transaction within the six-attempt budget. Local SQLite remains unchanged.
+  Supported callbacks use `EngineTx.SQL()` only for business statements; they
+  must not call its `Commit`/`Rollback` methods or issue transaction-control SQL.
+  Engine owns those boundaries. Early caller commits bypass this stage contract.
+- **Idle-transaction expiry is stage-sensitive.** The exact provider explanation
+  that an interactive transaction was rolled back because its stream was idle
+  identifies the known expiry condition for reads and pre-COMMIT callback retries.
+  These paths reopen the whole transaction, rebuilding time-sensitive arguments.
+  Exhaustion keeps the existing `connection` counter category and optional
+  `transaction_expired` detail. The same untyped text received after an issued
+  standalone write or COMMIT stays outcome-unknown; the driver no longer exposes
+  enough protocol information to prove its origin. Generic timeout/rollback text,
+  joined causes and checkpoint failures do not authorize extra retries.
 - **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
   other transport drop on a write/commit — the primary may have durably committed before
   the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead
@@ -107,11 +187,37 @@ still bounded as follows:
   `message_id`/dedup before retrying; transparent recovery would need durable per-op
   idempotency, which is deferred. **`errors.Is(err, mqlite.ErrOutcomeUnknown)` works in
   both embedded and client mode.**
+  Transient provider HTTP responses on an issued standalone write or COMMIT are
+  also outcome-unknown: a proxy 502 does not prove that the primary rejected the
+  effect. They are never automatically replayed; the error preserves its provider
+  cause and `HTTPStatus()` for reconciliation and diagnostics. HTTP authentication
+  and other nontransient responses are returned without blind retries. Provider
+  HTTP failures keep the existing `connection` storage-counter category; optional
+  details carry the safe status and `provider_unavailable` description, with
+  `outcome_unknown` remaining authoritative for ambiguous writes.
+  When fallback decoding discards the HTTP status, diagnostics do not invent it.
+  Coded fallback errors cannot promote a remote write into a safe `ErrBadConn`
+  retry. Supported remote mutations hold an explicit connection or transaction;
+  MQLite does not issue standalone writes through `sql.DB.ExecContext`.
 - **Never retry a logical storage error.** A constraint violation or `no such table`
   is final inside the engine. At the HTTP client boundary, lifecycle deletion is
   more conservative: every HTTP 5xx is `ErrOutcomeUnknown`, because a gateway can
   synthesize that response after the broker committed and its acknowledgement was
   lost. Local stores never retry at all (a single conn is the single writer).
+
+The HTTP compatibility adapter keeps COMMIT on the original transaction context.
+Use a deadline or cancellation on that context: interrupting an already-started
+COMMIT still means `ErrOutcomeUnknown`, not proof that the write was rolled back.
+The adapter waits for the context-aware HTTP call to return rather than leaving
+the commit running in a detached goroutine. ROLLBACK has a separate five-second
+cleanup deadline, so canceled work can still attempt cleanup and returning from
+an operation may include that cleanup interval (MQLITE-163).
+
+This is not a hard deadline for every driver resource. Detached stream-close
+requests retain their separate per-handle concurrency limit and five-second
+deadline (MQLITE-164), described below. Cleanup cancellation does not confirm
+remote release, and `Engine.Close` does not synchronously join that detached
+work. A successful engine close is not proof that all provider streams are gone.
 
 > **Transport caveat.** The outcome-unknown guarantee holds for the documented remote
 > transport `libsql://` (Hrana-over-HTTP). The `ws://`/`wss://` transports can wrap a
@@ -141,6 +247,42 @@ This write-first shape addresses claim transactions in one broker or embedded
 `SQLITE_BUSY`, and the change does not make overlapping brokers against one database
 safe.
 
+## Remote SQL acknowledgement failures
+
+The HTTP Hrana compatibility layer validates pipeline result counts and types,
+statement result fields and batch-step positions before accepting success.
+Malformed acknowledgements are protocol errors. After an issued standalone write
+or COMMIT, they are `ErrOutcomeUnknown`: reconcile the effect before retrying.
+Ordinary reads do not become outcome-unknown writes. Valid conditional batch
+skips and explicit SQL errors keep their existing interpretation. These checks
+add no requests or transparent write retries.
+
+## Bounded HTTP stream cleanup
+
+MQLite carries the pinned driver's HTTP v2 compatibility code internally, with a
+narrow stream-cleanup patch (MQLITE-164). Its source revision, license and local
+changes are recorded in `internal/libsqlcompat/NOTICE` and `UPSTREAM.json`. The
+original pure-Go parser, HTTP client and TCP/TLS transport reuse are retained;
+normal SQL and TCP/TLS reuse are unchanged. The separate acknowledgement checks
+above do not change cleanup's best-effort contract.
+
+Stream cleanup is asynchronous and best effort. Each opened database handle has a fixed cap of
+16 active cleanup requests, each with a five-second deadline created before the
+cleanup goroutine starts. There is no cleanup queue. A saturated cap skips that
+cleanup request rather than holding a SQL lease or write permit while waiting
+for a cleanup slot. Completed cleanup workers report observed saturation with
+one fixed warning at most per handle; logging is also best effort and never
+runs on the foreground return path. Normal operations do
+not wait for an extra cleanup round trip.
+
+The deadline bounds the client's request, not the provider's resource lifetime.
+Unconfirmed streams may remain allocated until the provider reclaims them under
+its own expiration policy; no fixed provider timeout is assumed. Neither the
+client deadline nor `Engine.Close` confirms remote resource release or transaction
+rollback. An acknowledged commit stays successful, and a lost commit
+acknowledgement remains outcome-unknown. This does not add synchronous cleanup
+draining to `Close` or change the WebSocket and local SQLite paths.
+
 ## Embedded replicas — evaluated, not adopted
 
 Turso embedded replicas keep a **local libSQL file that syncs from the remote
@@ -167,10 +309,33 @@ read-your-writes semantics, the Go 1.21 floor and every supported release target
 
 ## Validation status
 
+Functional checks exercised MQLite's queue and message contracts against standard
+Turso and the Rust-backed technical preview over libSQL-compatible HTTP/Hrana,
+using the [unreleased compatibility candidate](https://github.com/mqlitehq/mqlite/commit/e01577ec938902bf853026461e27bf86dcc9511f).
+
+- **Transport:** MQLite uses the pure-Go `github.com/tursodatabase/libsql-client-go`
+  driver, pinned at `v0.0.0-20251219100830-236aa1ff8acc`. MQLite retains its Go 1.21
+  source floor. Rust preview checks used an unreleased URI adapter that maps `turso://`
+  to the same HTTP/Hrana transport. For v0.4.2, use the documented `libsql://` URI.
+- **Ownership and transactions:** run one active broker or embedded `Engine` per
+  database. MQLite uses ordinary transactions rather than `BEGIN CONCURRENT`;
+  provider concurrent-write features do not change this ownership model.
+- **Write acknowledgements:** a lost COMMIT acknowledgement returns
+  `ErrOutcomeUnknown`. Reconcile the operation before retrying; a disconnected
+  response does not establish whether the write committed.
+- **Deployment:** place the broker near its Turso primary. Measure latency and
+  throughput with your payloads, concurrency and batch sizes, then choose lease
+  durations and request deadlines for that workload.
+
+### Repeatable test suites
+
 ```
-hermetic (always, in CI)   engine/storage_test.go    conn-error retry classifier
-live  (creds-gated, nightly) engine/turso_test.go     full lifecycle vs real Turso
+hermetic (always, CI)       engine/storage_test.go  retry classifiers and connection lifecycle
+live (credentials-gated)   engine/turso_test.go    representative lifecycle contracts
 ```
+
+Online compatibility statements refer to completed live checks against the
+stated backend and source candidate.
 
 Run the live suite only against a dedicated, disposable test database. `TestMain`
 drops every MQLite-managed table before the selected tests begin, including when

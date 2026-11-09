@@ -37,6 +37,11 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > See the [consumer stop and interruption boundaries](docs/operations.md#consumer-stops-and-host-interruptions)
 > before wiring process signals to `Run` cancellation.
 
+> **Remote storage compatibility:** the recommended Turso transport is
+> libSQL-compatible HTTP/Hrana. See the
+> [Turso guide](docs/turso.md#validation-status) for backend scope and deployment
+> guidance.
+
 ## Goal
 
 mqlite aims to be the **smallest reliable queue you can drop into a system** — and
@@ -284,9 +289,27 @@ own retry policies.
 `WithConcurrency(C)` limits concurrently executing handlers. Renewal shutdown and
 settlement can overlap later handlers, but the Receiver bounds all claimed work to
 `C + effective prefetch` deliveries (at most `2C`, and `2C` by default).
+A single 30-second confirmation budget starts when the handler returns. It includes
+joining its last in-flight renewal, then the exact Complete/Abandon request, retries
+and backoff; each settlement request has at most fifteen seconds. The loop reuses the original
+token and sequence without calling the handler again. If transient retries
+exhaust that budget, `WithErrorHandler` receives `ErrOutcomeUnknown` with the final
+cause preserved for `errors.Is`/`errors.As`; reconcile the original settlement.
+Expiry before any settlement request is issued has the local cause
+`context.DeadlineExceeded`; it does not imply an unknown settlement outcome.
+The confirmation budget does not itself extend the lease. With auto-renew enabled,
+the Receiver keeps renewing within that same bounded confirmation phase.
+A normal return lets the handling-phase renewal finish within its original lease
+watchdog; Run cancellation and budget expiry still cancel and join that heartbeat.
+This protects a live token while
+the settlement waits, including if `Run` is canceled during that phase. A renewal
+may see lock loss after the settlement already committed; its exact acknowledgement
+or receipt replay determines the final result. Retries and heartbeat stop when
+the confirmation budget ends. Canceling `Run` still joins handlers and terminal
+cleanup, so allow for cleanup before closing the client or engine.
 With auto-renew enabled, it retries a transient heartbeat while the known lease
-still has time. If the lock is lost or can no longer be confirmed, it cancels that
-message's handler context and skips terminal settlement; handlers must honor
+still has time. If the lock is lost or can no longer be confirmed while the handler
+is running, it cancels that handler context and skips terminal settlement; handlers must honor
 `ctx.Done()` and remain idempotent because delivery is still at-least-once. If a
 successful renewal carries an absolute deadline that is unusable against the
 client clock, current brokers' `X-Mqlite-Server-Time-Ms` response header lets the
@@ -309,6 +332,11 @@ returns 2xx. An invalid acknowledgement for Send, Complete/Abandon/Reject/Defer
 not retry blindly. Peek-Lock Receive is replayable instead—reuse the same
 `RecvOpts.Attempt` to recover the exact claimed batch; the managed Receiver does
 this automatically.
+
+Every Receive item must carry a positive sequence number; a null item invalidates
+the entire response. Empty message bodies and empty message lists remain valid.
+Send/Schedule acknowledgements reject null or negative sequence numbers, while zero still
+represents a legitimate topic no-match or skipped batch dedup slot.
 
 Remote-only applications that need a lower source floor can use the official
 [MQLite Remote Client for Go](https://github.com/mqlitehq/mqlite-go), whose
@@ -373,7 +401,7 @@ Connection is read from `--endpoint`/`--token`, or from the environment:
 
 | Env | Meaning |
 |---|---|
-| `MQLITE_DB` | DB DSN: `file:./mq.db`, `:memory:`, or `libsql://<db>.turso.io` (embedded/serve) |
+| `MQLITE_DB` | DB DSN: `file:./mq.db`, `:memory:`, `libsql://<db>.turso.io`, or unreleased `turso://<db>.turso.io` ([Rust preview](docs/turso.md#rust-based-turso-technical-preview); embedded/serve) |
 | `MQLITE_DB_AUTH_TOKEN` | auth token for a remote libSQL/Turso DSN |
 | `MQLITE_ENDPOINT` + `MQLITE_TOKEN` | client mode: talk to a running broker (wins if set) |
 | `MQLITE_TOKENS` | comma-separated administrator Bearer tokens for `serve` |
