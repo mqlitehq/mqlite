@@ -1,0 +1,25 @@
+{
+  "scope": "One dedicated backend per dispatch; two SDKs sequentially; one strong-random owned queue each; no schema reset or global deletion.",
+  "status": "Prepared locally only. Root must pin final source identities and publish/dispatch.",
+  "placement": "Copy standalone module to test/reopen-budget in support branch; install workflow.yml.template separately only when root authorizes publication.",
+  "ownership": "Fresh exclusive artifact directory and persisted ownership.json precede every Open. Registered queue names are the only cleanup scope. Preflight refuses existing names. Unjoined owner/receiver/provider or absent cleanup proof blocks the next SDK.",
+  "lease_contract": "QueueConfig uses default 30s, verified via ListQueues, MaxDeliveryCount=1. Actual original lease remaining is recorded at stop. Stop-to-confirmed settlement must fit it. No product transport/retry/lease setting is widened.",
+  "protocol_evidence": "Exact queue/seq/body/message ID/count/token. Explicit Renew and managed Complete additionally require matching request, HTTP200, explicit ok:true, real EOF and successful Close. Stats empty and handler count one.",
+  "measurement": "Transport-entry counts, not SQL commit proof. Full window ends after confirmed settlement and Stats. Pending requests at that instant are reported active; provider_joined requires teardown completion. Warm reopen requires zero CREATE and captured version write. Unknown route or incomplete capture invalidates evidence. Background maintenance enabled.",
+  "cleanup": "Stop/join Receiver and Serve; force-delete only the owned name; inspect full inventory for absence; close all Engine owners and require 200ms provider quiet. Persist failure/owned identity for follow-up.",
+  "privacy": "No DSN/host/token/header/raw SQL/payload/raw error. Fixed safe fields only. Max64 storage events plus drop count; no cause/error attrs. Fingerprints are correlation aids, not exact causal attribution.",
+  "credentials": [
+    "MQLITE_DIAG_STANDARD_DB",
+    "MQLITE_DIAG_STANDARD_TOKEN",
+    "MQLITE_DIAG_RUST_DB",
+    "MQLITE_DIAG_RUST_TOKEN"
+  ],
+  "limits": [
+    "One finite window is not soak/throughput proof.",
+    "Unrecognized base_url routes cause inconclusive diagnostic failure.",
+    "Killed process may leave owned queue; ownership.json is written before creation for exact recovery.",
+    "No remote tests are started by this preparation task."
+  ],
+  "supplemental_cleanup": "After confirming the original process/job has ended, run the same pinned binary with -mode cleanup -owner-exit-confirmed -backend ALIAS -out ORIGINAL_DIRECTORY. It checks backend/source identity, valid registered names and (on the same host) that the original PID is absent. It writes cleanup-result.json separately and never changes the original result.json. Workflow foreground timeout/wait ends before this always-step; an outer runner loss still requires operator confirmation and the same entrypoint. Manual cleanup must run while holding the same turso-verification-db owner lock or after verifying no competing verification job is active.",
+  "canceled_unconfirmed": "A canceled request with no complete body but successful Close is unconfirmed only if no earlier non-cancellation read error was observed. A real read truncation/other error remains invalid after later cleanup cancellation. An unconfirmed request is not a successful ACK and is not proof of SQL rollback. Required Open/Renew/Complete outcomes remain independently mandatory; failed Close remains invalid."
+}

@@ -1,45 +1,117 @@
-name: Turso nightly
-
-# Real-remote integration against a Turso/libSQL DB. Gated by repo secrets so it
-# never runs on forks or PRs (avoids burning the remote quota); nightly + manual.
+name: Finite remote reopen budget
 on:
-  schedule:
-    - cron: '0 8 * * *' # 08:00 UTC daily
   workflow_dispatch:
-
+    inputs:
+      backend:
+        description: Dedicated backend, one owner per dispatch
+        required: true
+        type: choice
+        options: [standard, rust]
+      runtime_sha:
+        description: Reviewed immutable MQLite commit
+        required: true
+        type: string
+      sdk_sha:
+        description: Reviewed immutable low-floor SDK commit
+        required: true
+        type: string
 permissions:
   contents: read
-
 concurrency:
   group: turso-verification-db
   cancel-in-progress: false
-
 jobs:
-  turso:
-    name: real Turso integration
-    runs-on: ubuntu-latest
+  finite:
     if: ${{ github.repository == 'mqlitehq/mqlite' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
+      - name: Record monotonic infrastructure start
+        run: python3 -c 'import time; print(time.monotonic())' > "$RUNNER_TEMP/reopen-budget-start"
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: runner-source
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.runtime_sha }}
+          path: runtime-source
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          repository: mqlitehq/mqlite-go
+          ref: ${{ inputs.sdk_sha }}
+          path: sdk-source
       - uses: actions/setup-go@v7
         with:
           go-version: stable
-      - name: TestTurso* against dedicated verification database
+      - name: Bind reviewed sources and run offline controls
         env:
-          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
-          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
-          MQLITE_TEST_DB_RESET_CONFIRM: '1'
+          EXPECTED_RUNTIME: ${{ inputs.runtime_sha }}
+          EXPECTED_SDK: ${{ inputs.sdk_sha }}
         run: |
-          if [ -z "$MQLITE_TEST_DB" ]; then
-            echo "MQLITE_TEST_DB is required for the dedicated nightly integration suite."
-            exit 1
+          set -euo pipefail
+          python3 runner-source/test/reopen-budget/source_guard.py --runtime "$GITHUB_WORKSPACE/runtime-source" --sdk "$GITHUB_WORKSPACE/sdk-source" --runner "$GITHUB_WORKSPACE/runner-source" --receipt "$RUNNER_TEMP/reopen-budget-meta/source-before.json"
+          cp -R runner-source/test/reopen-budget "$RUNNER_TEMP/reopen-budget-source"
+          python3 "$RUNNER_TEMP/reopen-budget-source/bind.py" "$GITHUB_WORKSPACE/runtime-source" "$GITHUB_WORKSPACE/sdk-source"
+          cd "$RUNNER_TEMP/reopen-budget-source"
+          go test -race -count=1 -timeout=3m ./...
+          go build -mod=readonly -ldflags "-X main.runtimeSHA=$EXPECTED_RUNTIME -X main.sdkSHA=$EXPECTED_SDK -X main.runnerSHA=$GITHUB_SHA" -o "$RUNNER_TEMP/reopen-budget" .
+      - name: Check remaining infrastructure budget before any owner
+        run: |
+          python3 "$RUNNER_TEMP/reopen-budget-source/pre-owner-budget.py" --job-start "$(cat "$RUNNER_TEMP/reopen-budget-start")" --public "$RUNNER_TEMP/reopen-budget-meta"
+      - name: Run one finite dedicated-backend budget check
+        env:
+          BACKEND: ${{ inputs.backend }}
+          MQLITE_DIAG_STANDARD_DB: ${{ secrets.MQLITE_DIAG_STANDARD_DB }}
+          MQLITE_DIAG_STANDARD_TOKEN: ${{ secrets.MQLITE_DIAG_STANDARD_TOKEN }}
+          MQLITE_DIAG_RUST_DB: ${{ secrets.MQLITE_DIAG_RUST_DB }}
+          MQLITE_DIAG_RUST_TOKEN: ${{ secrets.MQLITE_DIAG_RUST_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=10s 7m "$RUNNER_TEMP/reopen-budget" -backend "$BACKEND" -out "$RUNNER_TEMP/reopen-budget-result-${{ github.run_id }}-${{ github.run_attempt }}" > "$RUNNER_TEMP/reopen-budget-runtime-private.log" 2>&1
+          budget_exit=$?
+          set -e
+          printf 'Finite reopen verification exit code: %s\n' "$budget_exit"
+          exit "$budget_exit"
+      - name: Reconcile only recorded owned queues after the prior process exits
+        if: always()
+        env:
+          BACKEND: ${{ inputs.backend }}
+          MQLITE_DIAG_STANDARD_DB: ${{ secrets.MQLITE_DIAG_STANDARD_DB }}
+          MQLITE_DIAG_STANDARD_TOKEN: ${{ secrets.MQLITE_DIAG_STANDARD_TOKEN }}
+          MQLITE_DIAG_RUST_DB: ${{ secrets.MQLITE_DIAG_RUST_DB }}
+          MQLITE_DIAG_RUST_TOKEN: ${{ secrets.MQLITE_DIAG_RUST_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The preceding foreground timeout/wait has ended. There is no detached
+          # child. The verifier also rejects a live original PID on this runner.
+          if [ -x "$RUNNER_TEMP/reopen-budget" ] && [ -f "$RUNNER_TEMP/reopen-budget-result-${{ github.run_id }}-${{ github.run_attempt }}/ownership.json" ]; then
+            set +e
+            timeout --signal=TERM --kill-after=10s 100s "$RUNNER_TEMP/reopen-budget" -mode cleanup -owner-exit-confirmed -backend "$BACKEND" -out "$RUNNER_TEMP/reopen-budget-result-${{ github.run_id }}-${{ github.run_attempt }}" > "$RUNNER_TEMP/reopen-budget-cleanup-private.log" 2>&1
+            cleanup_exit=$?
+            set -e
+            printf 'Supplemental owned cleanup exit code: %s\n' "$cleanup_exit"
+            exit "$cleanup_exit"
+          else
+            printf 'Supplemental owned cleanup exit code: 0 (no ownership manifest)\n'
           fi
-          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
-            echo "MQLITE_TEST_DB_AUTH_TOKEN is required when MQLITE_TEST_DB is configured."
-            exit 1
-          fi
-          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
-            echo "MQLITE_TEST_DB is not the dedicated verification database."
-            exit 1
-          fi
-          go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
+      - name: Verify immutable sources after all work
+        if: always()
+        env:
+          EXPECTED_RUNTIME: ${{ inputs.runtime_sha }}
+          EXPECTED_SDK: ${{ inputs.sdk_sha }}
+        run: |
+          python3 runner-source/test/reopen-budget/source_guard.py --runtime "$GITHUB_WORKSPACE/runtime-source" --sdk "$GITHUB_WORKSPACE/sdk-source" --runner "$GITHUB_WORKSPACE/runner-source" --receipt "$RUNNER_TEMP/reopen-budget-meta/source-after.json"
+      - name: Upload bounded evidence and ownership manifest
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reopen-budget-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/reopen-budget-result-${{ github.run_id }}-${{ github.run_attempt }}/
+            ${{ runner.temp }}/reopen-budget-meta/
+          if-no-files-found: warn
+          retention-days: 14
