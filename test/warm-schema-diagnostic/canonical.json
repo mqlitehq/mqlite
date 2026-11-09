@@ -1,0 +1,176 @@
+[
+  {
+    "kind": "table",
+    "name": "access_keys",
+    "table": "access_keys",
+    "sql": "CREATE TABLE access_keys (\n\t    id           TEXT PRIMARY KEY CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),\n\t    name         TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 128),\n\t    token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),\n\t    permissions  INTEGER NOT NULL CHECK (permissions IN (1,2,3,7)),\n\t    created_at   INTEGER NOT NULL CHECK (created_at \u003e= 0),\n\t    expires_at   INTEGER NOT NULL DEFAULT 0 CHECK (expires_at = 0 OR expires_at \u003e created_at),\n\t    revoked_at   INTEGER NOT NULL DEFAULT 0 CHECK (revoked_at \u003e= 0)\n\t) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "dedup",
+    "table": "dedup",
+    "sql": "CREATE TABLE dedup (\n\t    queue        TEXT NOT NULL,\n\t    message_id   TEXT NOT NULL,\n\t    request_hash TEXT,\n\t    seq_number   INTEGER NOT NULL,\n\t    seen_at      INTEGER NOT NULL,\n\t    PRIMARY KEY (queue, message_id)\n\t) STRICT"
+  },
+  {
+    "kind": "index",
+    "name": "idx_access_keys_created",
+    "table": "access_keys",
+    "sql": "CREATE INDEX idx_access_keys_created ON access_keys(created_at DESC, id DESC)"
+  },
+  {
+    "kind": "index",
+    "name": "idx_dedup_seen",
+    "table": "dedup",
+    "sql": "CREATE INDEX idx_dedup_seen ON dedup(seen_at)"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_active",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_active ON messages(queue, id) WHERE state='active'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_completed",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_completed ON messages(queue, id) WHERE state='completed'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_deferred",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_deferred  ON messages(queue, id)            WHERE state='deferred'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_dlq",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_dlq       ON messages(queue, id)            WHERE state='dead_lettered'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_expire",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_expire    ON messages(expires_at)           WHERE expires_at\u003e0"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_group_inflight",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_group_inflight ON messages(queue, group_id, state, locked_until)\n\t  WHERE group_id IS NOT NULL"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_locked",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_locked    ON messages(state, locked_until)  WHERE state='locked'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_locked_head",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_locked_head ON messages(queue, id) WHERE state='locked'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_sched_head",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_sched_head  ON messages(queue, id) WHERE state='scheduled'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_msg_scheduled",
+    "table": "messages",
+    "sql": "CREATE INDEX idx_msg_scheduled ON messages(state, visible_at)    WHERE state='scheduled'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_queue_deleting",
+    "table": "queues",
+    "sql": "CREATE INDEX idx_queue_deleting ON queues(delete_started_at, name) WHERE lifecycle_state='deleting'"
+  },
+  {
+    "kind": "index",
+    "name": "idx_recv_attempt_expire",
+    "table": "receive_attempts",
+    "sql": "CREATE INDEX idx_recv_attempt_expire ON receive_attempts(expires_at)"
+  },
+  {
+    "kind": "index",
+    "name": "idx_settlement_expire",
+    "table": "settlement_receipts",
+    "sql": "CREATE INDEX idx_settlement_expire ON settlement_receipts(expires_at)"
+  },
+  {
+    "kind": "index",
+    "name": "idx_subs_by_subscription",
+    "table": "subscriptions",
+    "sql": "CREATE UNIQUE INDEX idx_subs_by_subscription ON subscriptions(subscription)"
+  },
+  {
+    "kind": "index",
+    "name": "idx_subs_by_topic",
+    "table": "subscriptions",
+    "sql": "CREATE INDEX idx_subs_by_topic ON subscriptions(topic)"
+  },
+  {
+    "kind": "index",
+    "name": "idx_subscription_expiry",
+    "table": "queues",
+    "sql": "CREATE INDEX idx_subscription_expiry ON queues(expires_at, name)\n\t  WHERE kind='subscription' AND lifecycle_state='active' AND expires_at\u003e0"
+  },
+  {
+    "kind": "table",
+    "name": "messages",
+    "table": "messages",
+    "sql": "CREATE TABLE messages (\n\t    id             INTEGER PRIMARY KEY AUTOINCREMENT,\n\t    queue          TEXT NOT NULL,\n\t    state          TEXT NOT NULL DEFAULT 'active'\n\t                       CHECK (state IN ('active','locked','deferred','scheduled','completed','dead_lettered')),\n\t    visible_at     INTEGER NOT NULL DEFAULT 0,\n\t    locked_until   INTEGER NOT NULL DEFAULT 0,\n\t    lock_token     TEXT,\n\t    delivery_count INTEGER NOT NULL DEFAULT 0,\n\t    enqueued_at    INTEGER NOT NULL,\n\t    expires_at     INTEGER NOT NULL DEFAULT 0,\n\t    message_id     TEXT,\n\t    correlation_id TEXT,\n\t    reply_to       TEXT,\n\t    group_id       TEXT,\n\t    content_type   TEXT,\n\t    subject        TEXT,\n\t    properties     TEXT,\n\t    body           BLOB NOT NULL,\n\t    dead_letter_reason      TEXT,\n\t    dead_letter_description TEXT\n\t) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "meta",
+    "table": "meta",
+    "sql": "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "queues",
+    "table": "queues",
+    "sql": "CREATE TABLE queues (\n\t    name                  TEXT PRIMARY KEY,\n\t    kind                  TEXT NOT NULL DEFAULT 'queue' CHECK (kind IN ('queue','subscription')),\n\t    lock_duration_ms      INTEGER NOT NULL DEFAULT 30000,\n\t    max_delivery_count    INTEGER NOT NULL DEFAULT 10,\n\t    default_ttl_ms        INTEGER NOT NULL DEFAULT 0,\n\t    dead_letter_on_expire INTEGER NOT NULL DEFAULT 1,\n\t    dedup_window_ms       INTEGER NOT NULL DEFAULT 0,\n\t    ordering_mode         TEXT NOT NULL DEFAULT 'standard'\n\t                              CHECK (ordering_mode IN ('standard','group_fifo','strict_fifo')),\n\t    -- per-queue DLQ retention overrides (MQLITE-29). 0 = inherit the broker/engine\n\t    -- default; \u003e0 = this queue's own bound; -1 = explicitly unbounded (opt out of\n\t    -- the default). Enforced drop-oldest by reapDLQ.\n\t    dlq_max_age_ms        INTEGER NOT NULL DEFAULT 0,\n\t    dlq_max_count         INTEGER NOT NULL DEFAULT 0,\n\t    dlq_max_bytes         INTEGER NOT NULL DEFAULT 0,\n\t    lifecycle_state       TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle_state IN ('active','deleting')),\n\t    delete_started_at     INTEGER NOT NULL DEFAULT 0,\n\t    -- Subscription lifetime is fixed when the mapping is first created. Plain\n\t    -- queues never expire; zero keeps a subscription permanent.\n\t    expires_at            INTEGER NOT NULL DEFAULT 0 CHECK (\n\t                              expires_at=0 OR (kind='subscription' AND expires_at\u003ecreated_at)),\n\t    created_at            INTEGER NOT NULL,\n\t    updated_at            INTEGER NOT NULL\n\t) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "receive_attempts",
+    "table": "receive_attempts",
+    "sql": "CREATE TABLE receive_attempts (\n\t    queue       TEXT NOT NULL,\n\t    attempt_id  TEXT NOT NULL,\n\t    response    TEXT NOT NULL,\n\t    created_at  INTEGER NOT NULL,\n\t    expires_at  INTEGER NOT NULL,\n\t    PRIMARY KEY (queue, attempt_id)\n\t) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "settlement_receipts",
+    "table": "settlement_receipts",
+    "sql": "CREATE TABLE settlement_receipts (\n\t    lock_token  TEXT NOT NULL,\n\t    queue       TEXT NOT NULL,\n\t    seq_number  INTEGER NOT NULL,\n\t    operation   TEXT NOT NULL,\n\t    args        TEXT NOT NULL,\n\t    created_at  INTEGER NOT NULL,\n\t    expires_at  INTEGER NOT NULL,\n\t    PRIMARY KEY (queue, seq_number, lock_token, operation, args)\n\t) STRICT"
+  },
+  {
+    "kind": "table",
+    "name": "subscriptions",
+    "table": "subscriptions",
+    "sql": "CREATE TABLE subscriptions (\n\t    topic        TEXT NOT NULL,\n\t    subscription TEXT NOT NULL,\n\t    filter_json  TEXT,\n\t    created_at   INTEGER NOT NULL,\n\t    PRIMARY KEY (topic, subscription),\n\t    FOREIGN KEY (subscription) REFERENCES queues(name) ON DELETE CASCADE\n\t) STRICT"
+  },
+  {
+    "kind": "trigger",
+    "name": "trg_messages_queue_update",
+    "table": "messages",
+    "sql": "CREATE TRIGGER trg_messages_queue_update\n\t BEFORE UPDATE OF queue ON messages\n\t WHEN NOT EXISTS (SELECT 1 FROM queues WHERE name=NEW.queue)\n\t BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END"
+  },
+  {
+    "kind": "trigger",
+    "name": "trg_queues_messages_delete",
+    "table": "queues",
+    "sql": "CREATE TRIGGER trg_queues_messages_delete\n BEFORE DELETE ON queues\n WHEN NOT (NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='active') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='locked') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='deferred') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='scheduled') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='completed') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='dead_lettered'))\n BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END"
+  },
+  {
+    "kind": "trigger",
+    "name": "trg_queues_messages_rename",
+    "table": "queues",
+    "sql": "CREATE TRIGGER trg_queues_messages_rename\n BEFORE UPDATE OF name ON queues\n WHEN NEW.name\u003c\u003eOLD.name AND NOT (NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='active') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='locked') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='deferred') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='scheduled') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='completed') AND NOT EXISTS (SELECT 1 FROM messages WHERE queue=OLD.name AND state='dead_lettered'))\n BEGIN SELECT RAISE(ABORT, 'FOREIGN KEY constraint failed'); END"
+  }
+]

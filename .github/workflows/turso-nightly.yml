@@ -1,45 +1,57 @@
-name: Turso nightly
-
-# Real-remote integration against a Turso/libSQL DB. Gated by repo secrets so it
-# never runs on forks or PRs (avoids burning the remote quota); nightly + manual.
+name: Read-only warm schema comparison
 on:
-  schedule:
-    - cron: '0 8 * * *' # 08:00 UTC daily
   workflow_dispatch:
-
+    inputs:
+      backend:
+        description: Dedicated test database alias
+        required: true
+        type: choice
+        options: [standard, rust]
 permissions:
   contents: read
-
 concurrency:
   group: turso-verification-db
   cancel-in-progress: false
-
 jobs:
-  turso:
-    name: real Turso integration
-    runs-on: ubuntu-latest
+  catalog:
     if: ${{ github.repository == 'mqlitehq/mqlite' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
-      - name: TestTurso* against dedicated verification database
-        env:
-          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
-          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
-          MQLITE_TEST_DB_RESET_CONFIRM: '1'
+          go-version: '1.27.3'
+          cache: false
+      - name: Run offline comparison and privacy controls
+        working-directory: test/warm-schema-diagnostic
         run: |
-          if [ -z "$MQLITE_TEST_DB" ]; then
-            echo "MQLITE_TEST_DB is required for the dedicated nightly integration suite."
-            exit 1
-          fi
-          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
-            echo "MQLITE_TEST_DB_AUTH_TOKEN is required when MQLITE_TEST_DB is configured."
-            exit 1
-          fi
-          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
-            echo "MQLITE_TEST_DB is not the dedicated verification database."
-            exit 1
-          fi
-          go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
+          go test -race -count=1 -timeout=2m ./...
+          go build -o "$RUNNER_TEMP/catalog-read" .
+      - name: Compare only fixed owned schema definitions
+        env:
+          BACKEND: ${{ inputs.backend }}
+          MQLITE_DIAG_STANDARD_DB: ${{ secrets.MQLITE_DIAG_STANDARD_DB }}
+          MQLITE_DIAG_STANDARD_TOKEN: ${{ secrets.MQLITE_DIAG_STANDARD_TOKEN }}
+          MQLITE_DIAG_RUST_DB: ${{ secrets.MQLITE_DIAG_RUST_DB }}
+          MQLITE_DIAG_RUST_TOKEN: ${{ secrets.MQLITE_DIAG_RUST_TOKEN }}
+        working-directory: test/warm-schema-diagnostic
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=5s 60s "$RUNNER_TEMP/catalog-read" -backend "$BACKEND" -out "$RUNNER_TEMP/catalog-public" > "$RUNNER_TEMP/catalog-private.log" 2>&1
+          catalog_exit=$?
+          set -e
+          printf 'Read-only comparison exit code: %s\n' "$catalog_exit"
+          exit "$catalog_exit"
+      - name: Verify source remains clean
+        if: always()
+        run: test -z "$(git status --porcelain)"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: warm-catalog-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/catalog-public/
+          if-no-files-found: error
+          retention-days: 14
