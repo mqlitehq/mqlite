@@ -702,6 +702,76 @@ func TestSQLiteHranaWarmCatalogMismatchUsesCanonicalFallback(t *testing.T) {
 	}
 }
 
+func TestSQLiteHranaWarmMetaKeyQuoting(t *testing.T) {
+	for _, tc := range []struct {
+		name, ddl string
+		fast      bool
+	}{
+		{"quoted-key", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`, true},
+		{"uppercase-quoted-key", `CREATE TABLE meta ("KEY" TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`, false},
+		{"single-quoted-key", `CREATE TABLE meta ('key' TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`, false},
+		{"value-nullable", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT) STRICT`, false},
+		{"value-default-literal", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT 'key') STRICT`, false},
+		{"extra-column", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL, extra TEXT) STRICT`, false},
+		{"not-strict", `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL)`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.CreateQueue(context.Background(), "quote-lease", QueueConfig{LockDurationMs: 30000, MaxDeliveryCount: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := first.Send(context.Background(), "quote-lease", OutMessage{Body: []byte("owned")}); err != nil {
+				t.Fatal(err)
+			}
+			messages, err := first.Receive(context.Background(), "quote-lease", ReceiveOptions{MaxMessages: 1})
+			if err != nil || len(messages) != 1 {
+				t.Fatalf("receive: %v count=%d", err, len(messages))
+			}
+			msg := messages[0]
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for _, sql := range []string{`DROP TABLE meta`, tc.ddl} {
+				if _, err := f.db.Exec(sql); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.db.Exec(`INSERT INTO meta(key,value) VALUES('schema_version',?)`, schemaVersion); err != nil {
+				t.Fatal(err)
+			}
+			before := f.snapshot()
+			reopened := f.openEngine(t, true)
+			after := f.snapshot()
+			wantDDL := len(schemaStmts)
+			if tc.fast {
+				wantDDL = 0
+			}
+			t.Logf("requests=%d ddl=%d version_writes=%d", after.Requests-before.Requests, after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+			if got := after.SchemaDDL - before.SchemaDDL; got != wantDDL {
+				t.Fatalf("schema DDL=%d want=%d", got, wantDDL)
+			}
+			if got := after.VersionWrites - before.VersionWrites; got != 1 {
+				t.Fatalf("version writes=%d", got)
+			}
+			if err := reopened.Complete(context.Background(), "quote-lease", msg.SeqNumber, msg.LockToken); err != nil {
+				t.Fatalf("preserved token did not complete: %v", err)
+			}
+		})
+	}
+}
+
+func TestWarmMetaQuoteDoesNotChangeGeneralNormalization(t *testing.T) {
+	canonical := `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`
+	quoted := `CREATE TABLE meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`
+	if normalizedSchemaSQL(canonical) == normalizedSchemaSQL(quoted) {
+		t.Fatal("global normalization silently unquoted identifiers")
+	}
+	if normalizedSchemaSQL(`SELECT 'key'`) == normalizedSchemaSQL(`SELECT "key"`) {
+		t.Fatal("string literal was conflated with identifier")
+	}
+}
+
 // ─── Free-page reclamation ──────────────────────────────────────────────────
 
 // Compact(full=false) must actually return freed pages to the OS — a single

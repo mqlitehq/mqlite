@@ -84,6 +84,9 @@ func (d *db) hasCompleteWarmSchema(ctx context.Context) (bool, error) {
 			}
 			seen[name] = true
 			matches := normalizedSchemaSQL(definition.String) == object.definition
+			if !matches && name == "meta" {
+				matches = matchesQuotedMetaKey(definition.String, object.definition)
+			}
 			for _, guard := range parentGuardSchemas {
 				if name == guard.name {
 					matches = matchesParentGuardDefinition(definition.String, guard.current)
@@ -100,4 +103,16 @@ func (d *db) hasCompleteWarmSchema(ctx context.Context) (bool, error) {
 		return rows.Close()
 	}, names...)
 	return complete && len(seen) == len(objects), err
+}
+
+// Accept only the known catalog spelling of meta's first column declaration.
+// The entire remaining definition must still equal the canonical definition;
+// general quoted identifiers and string literals retain their usual meaning.
+func matchesQuotedMetaKey(actual, canonical string) bool {
+	const declaration = "CREATE TABLE META ( KEY TEXT PRIMARY KEY ,"
+	if !strings.HasPrefix(canonical, declaration) {
+		return false
+	}
+	alternate := strings.Replace(canonical, declaration, `CREATE TABLE META ( "key" TEXT PRIMARY KEY ,`, 1)
+	return normalizedSchemaSQL(actual) == alternate
 }
