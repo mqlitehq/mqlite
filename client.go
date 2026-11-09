@@ -821,6 +821,11 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			return nil, err
 		}
 	}
+	if len(o.Pick) > 0 || !o.AtMostOnce {
+		if err := validatePeekLockResponse(resp.Messages); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
 		out[i] = c.wireToMessage(queue, wm, observation)
@@ -836,11 +841,27 @@ func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs i
 	if err != nil {
 		return nil, err
 	}
+	if mode == engine.PeekLock {
+		if err := validatePeekLockResponse(resp.Messages); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
 		out[i] = c.wireToMessage(queue, wm, observation)
 	}
 	return out, nil
+}
+
+// Validate the entire lease-bearing response before creating any public handle.
+// ReceiveAndDelete deliberately grants no token; Peek is a separate browse path.
+func validatePeekLockResponse(messages []wire.Message) error {
+	for _, message := range messages {
+		if message.LockToken == "" {
+			return &invalidSuccessResponseError{cause: errors.New("mqlite: peek-lock response is missing a fencing token")}
+		}
+	}
+	return nil
 }
 
 // Peek browses without locking.

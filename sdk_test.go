@@ -40,6 +40,259 @@ import (
 	"github.com/mqlitehq/mqlite/wire"
 )
 
+func TestRemoteMalformedMessageResponses(t *testing.T) {
+	for _, body := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":0}]}`, `{"messages":[{"seq_number":-1}]}`, `{"messages":[{"seq_number":7},null]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"token"},{"seq_number":7,"lock_token":"token"}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"first"},{"seq_number":7,"lock_token":"second"}]}`} {
+		for _, atMostOnce := range []bool{false, true} {
+			t.Run(fmt.Sprintf("receive delete=%v %s", atMostOnce, body), func(t *testing.T) {
+				var calls int32
+				stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					atomic.AddInt32(&calls, 1)
+					_, _ = io.WriteString(w, body)
+				}))
+				defer stub.Close()
+				client, err := mqlite.Open(context.Background(), stub.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				messages, err := client.Receive(context.Background(), "q", mqlite.RecvOpts{AtMostOnce: atMostOnce})
+				if err == nil || len(messages) != 0 || errors.Is(err, mqlite.ErrOutcomeUnknown) != atMostOnce {
+					t.Fatalf("Receive = (%+v,%v), want empty result and uncertainty only for receive-and-delete", messages, err)
+				}
+				if atomic.LoadInt32(&calls) != 1 {
+					t.Fatalf("public Receive silently replayed: calls=%d", calls)
+				}
+			})
+		}
+	}
+	for _, invalidSequence := range []string{"-1", "null"} {
+		for _, operation := range []string{"single", "batch", "schedule"} {
+			t.Run("invalid send "+operation+" "+invalidSequence, func(t *testing.T) {
+				var calls int32
+				stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					atomic.AddInt32(&calls, 1)
+					if operation == "batch" {
+						_, _ = fmt.Fprintf(w, `{"seq_numbers":[7,%s]}`, invalidSequence)
+					} else {
+						_, _ = fmt.Fprintf(w, `{"seq_numbers":[%s]}`, invalidSequence)
+					}
+				}))
+				defer stub.Close()
+				client, err := mqlite.Open(context.Background(), stub.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				switch operation {
+				case "single":
+					_, err = client.SendOne(context.Background(), "q", mqlite.OutMessage{})
+				case "batch":
+					_, err = client.Send(context.Background(), "q", mqlite.OutMessage{}, mqlite.OutMessage{})
+				case "schedule":
+					_, err = client.SendOne(context.Background(), "q", mqlite.OutMessage{}, mqlite.SendOpts{At: time.Now().Add(time.Hour)})
+				}
+				if !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+					t.Fatalf("invalid send acknowledgement error=%v, want ErrOutcomeUnknown", err)
+				}
+				if atomic.LoadInt32(&calls) != 1 {
+					t.Fatalf("ambiguous Send silently replayed: calls=%d", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestRemoteCorruptedReceiveKeepsCommittedOutcomeExplicit(t *testing.T) {
+	for _, atMostOnce := range []bool{false, true} {
+		t.Run(fmt.Sprint(atMostOnce), func(t *testing.T) {
+			ctx := context.Background()
+			eng, err := mqlite.OpenEmbedded(ctx, ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eng.Close()
+			if err := eng.CreateQueue(ctx, "q", mqlite.QueueConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			seq, err := eng.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("retained payload")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := server.New(eng.Engine(), nil).Handler()
+			var receiveCalls int32
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				recorder := httptest.NewRecorder()
+				next.ServeHTTP(recorder, r) // Commit the actual claim/delete first.
+				for key, values := range recorder.Header() {
+					w.Header()[key] = values
+				}
+				w.WriteHeader(recorder.Code)
+				if r.URL.Path == wire.PathReceive && atomic.AddInt32(&receiveCalls, 1) == 1 {
+					_, _ = io.WriteString(w, `{"messages":[null]}`)
+				} else {
+					_, _ = w.Write(recorder.Body.Bytes())
+				}
+			}))
+			defer proxy.Close()
+			client, err := mqlite.Open(ctx, proxy.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			opts := mqlite.RecvOpts{AtMostOnce: atMostOnce, Attempt: "corrupted-receive"}
+			messages, err := client.Receive(ctx, "q", opts)
+			if err == nil || len(messages) != 0 || errors.Is(err, mqlite.ErrOutcomeUnknown) != atMostOnce {
+				t.Fatalf("corrupted committed receive = (%+v, %v)", messages, err)
+			}
+			stats, err := eng.Stats(ctx, "q")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if atMostOnce {
+				if stats.Total != 0 {
+					t.Fatalf("receive-and-delete did not commit: %+v", stats)
+				}
+			} else {
+				if stats.Locked != 1 {
+					t.Fatalf("damaged response did not preserve the original claim: %+v", stats)
+				}
+				messages, err = client.Receive(ctx, "q", opts)
+				if err != nil || len(messages) != 1 || messages[0].SequenceNumber != seq || messages[0].DeliveryCount != 1 || string(messages[0].Body) != "retained payload" {
+					t.Fatalf("same-attempt recovery = (%+v, %v)", messages, err)
+				}
+				if err := messages[0].Complete(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestRemoteReceiveRequiresPeekLockOwnership(t *testing.T) {
+	for _, body := range []string{
+		`{"messages":[{"seq_number":7}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":null}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"first"},{"seq_number":8}]}`,
+	} {
+		for _, deferred := range []bool{false, true} {
+			t.Run(fmt.Sprintf("deferred=%v %s", deferred, body), func(t *testing.T) {
+				stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+				defer stub.Close()
+				client, err := mqlite.Open(context.Background(), stub.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				opts := mqlite.RecvOpts{Max: 2}
+				if deferred {
+					opts.Pick = []int64{7, 8}
+					opts.AtMostOnce = true
+				}
+				messages, err := client.Receive(context.Background(), "q", opts)
+				if err == nil || len(messages) != 0 || errors.Is(err, mqlite.ErrOutcomeUnknown) {
+					t.Fatalf("unowned Peek-Lock batch exposed: n=%d err=%v", len(messages), err)
+				}
+			})
+		}
+	}
+	for _, body := range []string{`{"messages":[{"seq_number":7}]}`, `{"messages":[{"seq_number":7,"lock_token":"same arbitrary token"},{"seq_number":8,"lock_token":"same arbitrary token"}]}`} {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+		client, err := mqlite.Open(context.Background(), stub.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages, err := client.Receive(context.Background(), "q", mqlite.RecvOpts{AtMostOnce: true})
+		if err != nil || len(messages) == 0 {
+			t.Fatalf("valid ReceiveAndDelete rejected: n=%d err=%v", len(messages), err)
+		}
+		peeked, err := client.Peek(context.Background(), "q")
+		if err != nil || len(peeked) == 0 {
+			t.Fatalf("tokenless Peek rejected: n=%d err=%v", len(peeked), err)
+		}
+		if strings.Contains(body, "same arbitrary token") {
+			messages, err = client.Receive(context.Background(), "q")
+			if err != nil || len(messages) != 2 {
+				t.Fatalf("independent sequences sharing an opaque token rejected: n=%d err=%v", len(messages), err)
+			}
+		}
+		_ = client.Close()
+		stub.Close()
+	}
+}
+
+func TestManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T) {
+	for _, corrupt := range []string{`{"messages":[null]}`, `{"messages":[{"seq_number":7}]}`,
+		`{"messages":[{"seq_number":7,"lock_token":"token"},{"seq_number":7,"lock_token":"token"}]}`} {
+		t.Run(corrupt, func(t *testing.T) { testManagedReceiveReplaysMalformedItemWithSameAttempt(t, corrupt) })
+	}
+}
+
+func testManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T, corrupt string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var receives, handlers, completes int32
+	var mu sync.Mutex
+	var attempts []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Mqlite-Server-Time-Ms", fmt.Sprint(time.Now().UnixNano()/int64(time.Millisecond)))
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/Receive"):
+			var request struct {
+				Attempt string `json:"receive_attempt_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			mu.Lock()
+			attempts = append(attempts, request.Attempt)
+			mu.Unlock()
+			switch atomic.AddInt32(&receives, 1) {
+			case 1:
+				_, _ = io.WriteString(w, corrupt)
+			case 2:
+				if atomic.LoadInt32(&handlers) != 0 || atomic.LoadInt32(&completes) != 0 {
+					t.Error("malformed batch reached handler or settlement before replay")
+				}
+				_, _ = fmt.Fprintf(w, `{"messages":[{"seq_number":7,"body":"","lock_token":"token","delivery_count":1,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
+			default:
+				<-r.Context().Done()
+			}
+		case strings.HasSuffix(r.URL.Path, "/RenewBatch"):
+			_, _ = fmt.Fprintf(w, `{"results":[{"seq_number":7,"ok":true,"locked_until_ms":%d}]}`, time.Now().Add(5*time.Second).UnixNano()/int64(time.Millisecond))
+		case strings.HasSuffix(r.URL.Path, "/Complete"):
+			atomic.AddInt32(&completes, 1)
+			cancel()
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	err = client.Receiver("q", mqlite.WithConcurrency(2)).Run(ctx, func(_ context.Context, message *mqlite.Message) error {
+		atomic.AddInt32(&handlers, 1)
+		if message.SequenceNumber != 7 || len(message.Body) != 0 {
+			t.Errorf("invalid dispatch: %+v", message)
+		}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || atomic.LoadInt32(&handlers) != 1 || atomic.LoadInt32(&completes) != 1 {
+		t.Fatalf("Run=%v,handlers=%d,completes=%d", err, handlers, completes)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attempts) < 2 || attempts[0] == "" || attempts[0] != attempts[1] {
+		t.Fatalf("malformed claimed batch lost attempt ID: %q", attempts)
+	}
+}
+
 // Keep the released public type's exact field order, tags and arity. This also
 // preserves external unkeyed SubscriptionInfo literals at compile time.
 var _ struct {
