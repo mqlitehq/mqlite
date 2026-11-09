@@ -12,6 +12,11 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+- Honor caller cancellation while waiting for commit sequencing. A canceled
+  remote read can finish its own rollback without waiting for an unrelated
+  COMMIT; commit ordering and interrupted-commit uncertainty remain unchanged
+  (MQLITE-189).
+
 ### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
 
 - Give asynchronous libSQL HTTP stream-close requests a five-second deadline and

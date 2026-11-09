@@ -5137,3 +5137,124 @@ func TestOpenExpiresBeforeCrashRecovery(t *testing.T) {
 		t.Fatalf("startup revived expired locks: locked=%d active=%d", locked, active)
 	}
 }
+
+// A private read transaction may run alongside the remote writer. Its own
+// cancellation and rollback must finish without waiting for that writer's
+// unrelated COMMIT, while Close must still wait for the admitted writer.
+func TestRemoteCanceledReadDoesNotWaitForUnrelatedCommit(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			f := &admissionFixture{
+				commitStarted:   make(chan struct{}),
+				allowCommit:     make(chan struct{}),
+				rollbackStarted: make(chan struct{}),
+				allowRollback:   make(chan struct{}),
+			}
+			d := admissionTestDB(t, f)
+			d.sql.SetMaxOpenConns(2)
+			e := fakeRemoteEngine(d)
+			e.closed = make(chan struct{})
+			firstDone, readDone, closeDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var firstErr, readErr, closeErr error
+			readStarted, closeStarted := false, false
+			cancelRead := func() {}
+			join := func(name string, done <-chan struct{}) bool {
+				t.Helper()
+				select {
+				case <-done:
+					return true
+				case <-time.After(2 * time.Second):
+					t.Errorf("%s did not join after fixture release", name)
+					return false
+				}
+			}
+			defer func() {
+				f.unblock()
+				cancelRead()
+				join("writer", firstDone)
+				if readStarted {
+					join("read", readDone)
+				}
+				if closeStarted {
+					join("close", closeDone)
+				} else if err := e.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			go func() {
+				firstErr = e.inTx(context.Background(), func(context.Context, *txn) error { return nil })
+				close(firstDone)
+			}()
+			select {
+			case <-f.commitStarted:
+			case <-time.After(time.Second):
+				t.Fatal("first COMMIT did not start")
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			wantErr := context.Canceled
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 250*time.Millisecond)
+				wantErr = context.DeadlineExceeded
+			}
+			cancelRead = cancel
+			callbackDone := make(chan struct{})
+			readStarted = true
+			go func() {
+				readErr = e.inReadTx(ctx, func(context.Context, *txn) error {
+					close(callbackDone)
+					return nil
+				})
+				close(readDone)
+			}()
+			select {
+			case <-callbackDone:
+			case <-time.After(time.Second):
+				t.Fatal("read did not acquire its independent SQL connection")
+			}
+			if !deadline {
+				cancel()
+			}
+			<-ctx.Done()
+			select {
+			case <-f.rollbackStarted:
+			case <-time.After(time.Second):
+				t.Fatal("canceled read rollback did not start")
+			}
+			select {
+			case <-readDone:
+				t.Fatal("read returned before its own SQL rollback finished")
+			case <-time.After(20 * time.Millisecond):
+			}
+			f.allowRollbackOnce.Do(func() { close(f.allowRollback) })
+			select {
+			case <-readDone:
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("read still waited for the unrelated COMMIT after its rollback")
+			}
+			if !errors.Is(readErr, wantErr) || errors.Is(readErr, ErrOutcomeUnknown) || errors.Is(readErr, sql.ErrTxDone) {
+				t.Fatalf("read result=%v, want known pre-COMMIT %v", readErr, wantErr)
+			}
+			if f.commits.Load() != 1 || d.sql.Stats().InUse != 1 {
+				t.Fatalf("canceled read committed or released the unrelated writer: commits=%d inUse=%d", f.commits.Load(), d.sql.Stats().InUse)
+			}
+			closeStarted = true
+			go func() { closeErr = e.Close(); close(closeDone) }()
+			select {
+			case <-closeDone:
+				t.Fatal("Close returned while the unrelated COMMIT was still admitted")
+			case <-time.After(20 * time.Millisecond):
+			}
+			f.allowCommitOnce.Do(func() { close(f.allowCommit) })
+			writerJoined := join("writer", firstDone)
+			closeJoined := join("close", closeDone)
+			if !writerJoined || !closeJoined {
+				return
+			}
+			if firstErr != nil || closeErr != nil || d.sql.Stats().InUse != 0 {
+				t.Fatalf("final results writer=%v close=%v inUse=%d", firstErr, closeErr, d.sql.Stats().InUse)
+			}
+		})
+	}
+}
