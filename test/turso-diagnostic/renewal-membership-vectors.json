@@ -1,0 +1,5231 @@
+[
+  {
+    "name": "anonymous_single_pair",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 0
+  },
+  {
+    "name": "direct_verified_request",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 1,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 0
+  },
+  {
+    "name": "anonymous_same_pair_two_rpc",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 2
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 1
+  },
+  {
+    "name": "anonymous_distinct_pairs_two_rpc",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 2
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                "ok": true,
+                "deadline_ms": 400
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                },
+                {
+                  "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                  "deadline_ms": 400
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 1
+  },
+  {
+    "name": "duplicate_positions",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              },
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              },
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 0
+  },
+  {
+    "name": "wrong_queue",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "wrong_input_pair",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "missing_row",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "wrong_deadline",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 251
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "duplicate_row",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                },
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "extra_unrequested_row",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                },
+                {
+                  "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "not_eof",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": false,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "not_closed",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": false,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "close_error",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "io",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "physical_http201",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 201,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "protocol_failed",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": false,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "sqlite_error",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [
+              "SQLITE_BUSY"
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "truncated",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": true,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "not_sent",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": true,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "not_finished",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": false,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "outside_rpc",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 0.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "finish_before_eof",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 2.5,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "close_after_ack",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 5.1,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "borrowed_leader",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 2,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "duplicate_event_id",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "ambiguous_events",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "duplicate_rpc_id",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "request_invalid",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": false,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "response_invalid",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": false,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "wrong_ack_sequence",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 8,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "logical_http201",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 201,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "logical_close_error",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "io"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "logical_start_after_server",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 1.1,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "provider_drop",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 1,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "broker_drop",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 1,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "whole_rpc_must_not_stitch_two_sql",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                "ok": true,
+                "deadline_ms": 400
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                  "deadline_ms": 400
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "partial_true_ack_not_many_to_one",
+    "backend": "standard",
+    "case": {
+      "business_passed": false,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                "ok": false,
+                "deadline_ms": 0
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 0
+  },
+  {
+    "name": "partial_missing_close",
+    "backend": "standard",
+    "case": {
+      "business_passed": false,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                "ok": false,
+                "deadline_ms": 0
+              }
+            ],
+            "body_eof": true,
+            "body_closed": false,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "partial_wrong_sequence",
+    "backend": "standard",
+    "case": {
+      "business_passed": false,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 9,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                "ok": false,
+                "deadline_ms": 0
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "partial_unverified",
+    "backend": "standard",
+    "case": {
+      "business_passed": false,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": false,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                "ok": false,
+                "deadline_ms": 0
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "partial_false_pair_missing_from_common_sql",
+    "backend": "standard",
+    "case": {
+      "business_passed": false,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              },
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef",
+                "ok": false,
+                "deadline_ms": 0
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "canceled_no_ack_stays_uncovered",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": {
+            "class": "canceled"
+          },
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 8,
+                "pair_hash": "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              }
+            ],
+            "response_valid": false,
+            "response_positions": [],
+            "body_eof": false,
+            "body_closed": true,
+            "eof_ms": 0.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "0bda281dc490e2dfa2b6d5c7e99eaf45d56c21e8fe72055758c3c2c7de63c5ef"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 0
+  },
+  {
+    "name": "sqlite_not_applicable",
+    "backend": "sqlite",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 0
+      },
+      "broker_http": [],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": []
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 0
+  },
+  {
+    "name": "second_successful_sql_has_unobserved_returning_rows",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 2
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": false,
+              "returned_rows": [],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "complete_zero_row_sql_and_false_ack_do_not_fake_or_block_coalescing",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 1
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 8,
+                "pair_hash": "a321cfc9653ae451539e85e27c8cc1171fb68f2756f59593ea6711800e197561"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 8,
+                "pair_hash": "a321cfc9653ae451539e85e27c8cc1171fb68f2756f59593ea6711800e197561",
+                "ok": false,
+                "deadline_ms": 0
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "a321cfc9653ae451539e85e27c8cc1171fb68f2756f59593ea6711800e197561"
+              ],
+              "rows_valid": true,
+              "returned_rows": [],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 0
+  },
+  {
+    "name": "extra_truncated_unknown_sql_must_not_be_ignored",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 2
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": false,
+            "response_inspection_truncated": true,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": false,
+              "returned_rows": null,
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "extra_no_eof_unknown_sql_must_not_be_ignored",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 2
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 0.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": false,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": false,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": false,
+              "returned_rows": null,
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  },
+  {
+    "name": "complete_explicit_rejection_cannot_supply_positive_ack",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 2
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": false,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [
+              "SQLITE_BUSY"
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": false,
+              "returned_rows": null,
+              "rejection_observed": true
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": true,
+    "expected_many_to_one_events": 1
+  },
+  {
+    "name": "extra_http201_must_not_be_ignored",
+    "backend": "standard",
+    "case": {
+      "business_passed": true,
+      "mixed": {
+        "renewal_success_responses": 2
+      },
+      "broker_http": [
+        {
+          "broker_request_id": 1,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        },
+        {
+          "broker_request_id": 2,
+          "method": "RenewBatch",
+          "status": 200,
+          "server_received": true,
+          "started_ms": 0.5,
+          "server_received_ms": 1.0,
+          "headers_end_ms": 4.5,
+          "failure": null,
+          "renewal": {
+            "request_valid": true,
+            "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+            "request_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              }
+            ],
+            "response_valid": true,
+            "response_positions": [
+              {
+                "seq_number": 7,
+                "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                "ok": true,
+                "deadline_ms": 250
+              }
+            ],
+            "body_eof": true,
+            "body_closed": true,
+            "eof_ms": 5.0,
+            "close_ms": 6.0,
+            "close_error_class": "none"
+          }
+        }
+      ],
+      "broker_http_dropped": 0,
+      "provider_http": {
+        "dropped": 0,
+        "events": [
+          {
+            "id": 10,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 200,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          },
+          {
+            "id": 11,
+            "broker_request_id": 0,
+            "phase": "mixed_native_lock3/send",
+            "http_status": 201,
+            "started_ms": 2.0,
+            "finished_ms": 3.0,
+            "body_eof_ms": 3.0,
+            "body_close_ms": 4.0,
+            "finished": true,
+            "not_sent": false,
+            "statement_count": 1,
+            "strict_protocol_success": true,
+            "response_inspection_truncated": false,
+            "error_class": "none",
+            "close_error_class": "none",
+            "sqlite_codes": [],
+            "body_eof": true,
+            "body_closed": true,
+            "renewal": {
+              "request_valid": true,
+              "kind": "renew_batch_update_returning_v1",
+              "queue_hash": "f5e6d024c05c9cc2746a3e127408b91a8b7a7f2a30da0c259bc54265502ddef4",
+              "input_pair_hashes": [
+                "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5"
+              ],
+              "rows_valid": true,
+              "returned_rows": [
+                {
+                  "pair_hash": "be169458dea8ed680e34387c9462d3793d4c4e68ad93785856eeed733a776ff5",
+                  "deadline_ms": 250
+                }
+              ],
+              "rejection_observed": false
+            }
+          }
+        ]
+      }
+    },
+    "expected_membership_passed": false,
+    "expected_many_to_one_events": null
+  }
+]
