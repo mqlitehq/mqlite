@@ -37,6 +37,11 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > See the [consumer stop and interruption boundaries](docs/operations.md#consumer-stops-and-host-interruptions)
 > before wiring process signals to `Run` cancellation.
 
+> **Remote storage compatibility:** the recommended Turso transport is
+> libSQL-compatible HTTP/Hrana. See the
+> [Turso guide](docs/turso.md#validation-status) for backend scope and deployment
+> guidance.
+
 ## Goal
 
 mqlite aims to be the **smallest reliable queue you can drop into a system** — and
