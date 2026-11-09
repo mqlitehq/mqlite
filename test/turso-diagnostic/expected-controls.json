@@ -1,0 +1,979 @@
+{
+  "expected_test_count": 242,
+  "provenance": {
+    "meaning": "Exact name/action union of original134 controls and108 new observer/membership controls, to be independently confirmed by the final complete registered-layout run.",
+    "new108_actual_local_go_test_json_sha256": "ee729f16ce62178b15a0de938743ee6bfd747589abcbe01ad26012bcca795e7f",
+    "original134_expected_fixture_sha256": "32333f30fe651017f53d0fc66bd26376f280cda4c0ee5a21eca831b078f076d7"
+  },
+  "schema": "finite-offline-audit-expected-controls-v1",
+  "tests": {
+    "TestApprovedDSNChecksOriginalAliasSpecificScheme": [
+      "run",
+      "pass"
+    ],
+    "TestCallerDeadlineAndOperationContext": [
+      "run",
+      "pass"
+    ],
+    "TestCaseSelectionPreservesPlansAndRejectsAmbiguity": [
+      "run",
+      "pass"
+    ],
+    "TestCleanupRefusesForeignQueueWithoutDatabaseAccess": [
+      "run",
+      "pass"
+    ],
+    "TestConcurrentLoopbackRequestsPropagateIDsThroughRealSQLProvider": [
+      "run",
+      "pass"
+    ],
+    "TestConcurrentLoopbackRequestsPropagateIDsThroughRealSQLProvider/low-floor": [
+      "run",
+      "pass"
+    ],
+    "TestConcurrentLoopbackRequestsPropagateIDsThroughRealSQLProvider/native": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/contention/ORIGINALS": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/contention/controls": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/contention/mixed_native_lock3": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/contention/originals": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/contention/originals,all": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/contention/originals_": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/mixed/mixed_low-floor_lock30": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/mixed/mixed_native_lock3": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/mixed/mixed_native_lock3,mixed_native_lock30": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/mixed/mixed_native_lock3_": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/mixed/original_native_c32_b1": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/mixed/originals": [
+      "run",
+      "pass"
+    ],
+    "TestDiagnosticSelectionCLIProcess/quick/originals": [
+      "run",
+      "pass"
+    ],
+    "TestEvidenceDirectoryCannotOverwriteAnEarlierFailure": [
+      "run",
+      "pass"
+    ],
+    "TestHranaSeedOnlyThreeSecondLeaseOverProviderLatency": [
+      "run",
+      "pass"
+    ],
+    "TestHranaSeedOnlyThreeSecondLeaseOverProviderLatency/low-floor": [
+      "run",
+      "pass"
+    ],
+    "TestHranaSeedOnlyThreeSecondLeaseOverProviderLatency/native": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/corrupt": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/dlq": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/duplicate": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/missing": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/settle_rejected": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/settle_unknown": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/unknown_send": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/valid": [
+      "run",
+      "pass"
+    ],
+    "TestIdentityOracleNeverForgivesUnknownDuplicateOrCorrupt/wrong_sequence": [
+      "run",
+      "pass"
+    ],
+    "TestLatencyHasNoHundredMillisecondClipping": [
+      "run",
+      "pass"
+    ],
+    "TestLoopbackCorrelationRejectsUnregisteredAndMismatchedRequests": [
+      "run",
+      "pass"
+    ],
+    "TestLoopbackCorrelationRejectsUnregisteredAndMismatchedRequests/method": [
+      "run",
+      "pass"
+    ],
+    "TestLoopbackCorrelationRejectsUnregisteredAndMismatchedRequests/operation": [
+      "run",
+      "pass"
+    ],
+    "TestLoopbackCorrelationRejectsUnregisteredAndMismatchedRequests/path": [
+      "run",
+      "pass"
+    ],
+    "TestLoopbackCorrelationRejectsUnregisteredAndMismatchedRequests/unregistered": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody/complete": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody/early_close": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody/invalid": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody/missing_ok": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody/negative": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody/server_error": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverCompletionObserverRequiresCompleteSuccessfulBody/too_large": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverObserverCloseUnblocksConcurrentRead": [
+      "run",
+      "pass"
+    ],
+    "TestManagedReceiverObserverPreservesReadAndCloseErrors": [
+      "run",
+      "pass"
+    ],
+    "TestMixedCasesUseBothSDKsShortAndDefaultLeases": [
+      "run",
+      "pass"
+    ],
+    "TestMixedEarlyRemoteFailureReportsCoverageNotEvaluated": [
+      "run",
+      "pass"
+    ],
+    "TestMixedEarlyRemoteFailureReportsCoverageNotEvaluated/low-floor": [
+      "run",
+      "pass"
+    ],
+    "TestMixedEarlyRemoteFailureReportsCoverageNotEvaluated/native": [
+      "run",
+      "pass"
+    ],
+    "TestMixedPreflightRefusesResetBeforeDatabaseAccess": [
+      "run",
+      "pass"
+    ],
+    "TestMixedSnapshotOwnsMutableErrorMapAndIntervals": [
+      "run",
+      "pass"
+    ],
+    "TestOriginalProfilesRemainSeparateFromControls": [
+      "run",
+      "pass"
+    ],
+    "TestOriginalsGroupPreservesExactEightProfilesAndOrder": [
+      "run",
+      "pass"
+    ],
+    "TestOutcomeMetadataDoesNotFabricateEnginePhaseEvidence": [
+      "run",
+      "pass"
+    ],
+    "TestPreflightRefusesResetAndUnapprovedTargets": [
+      "run",
+      "pass"
+    ],
+    "TestPreflightRefusesResetAndUnapprovedTargets/MQLITE_TEST_DB": [
+      "run",
+      "pass"
+    ],
+    "TestPreflightRefusesResetAndUnapprovedTargets/MQLITE_TEST_DB_RESET_CONFIRM": [
+      "run",
+      "pass"
+    ],
+    "TestPreflightRejectsCaseSelectionBeforeReadingCredentials": [
+      "run",
+      "pass"
+    ],
+    "TestProviderCorrelationDoesNotTrustUnverifiedContextOrHeaders": [
+      "run",
+      "pass"
+    ],
+    "TestProviderInspectionAcceptsBoundedB64BatchWithoutPublishingPayload": [
+      "run",
+      "pass"
+    ],
+    "TestProviderQuietBarrierSeesLateHTTPAndBlocksActiveBodies": [
+      "run",
+      "pass"
+    ],
+    "TestProviderSQLClassesStayFixed": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/200_error_unknown_code": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/200_error_without_code": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/bare_busy_step_error": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/batch_skipped_rollback": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/empty_results": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/execute": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/invalid_json": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/malformed_execute": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/malformed_step_errors": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/missing_results": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/null_row": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/null_rows": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/ok_with_error": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/partial_batch_error": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/skipped_insert": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/step_count_mismatch": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/truncated": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/unknown_step_error_code": [
+      "run",
+      "pass"
+    ],
+    "TestProviderStrictProtocolProofAndWriteCoverage/unknown_type": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceBoundedEventsAndConcurrentSnapshots": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceDelayCancellationIsNotSent": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceDelayIsSeparateAndResettable": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceGetBodyDoesNotConsumeOriginal": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceGetBodyDoesNotConsumeOriginal/copy_error": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceGetBodyDoesNotConsumeOriginal/invalid_json": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceGetBodyDoesNotConsumeOriginal/too_large": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceGetBodyDoesNotConsumeOriginal/unavailable": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceInvalidTargetDoesNotEchoInput": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceLargeResponseAndUnsafePhase": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceLateEOFAndClose": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceNonTargetRequestsAreNotCountedOrDelayed": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTracePreservesReadAndCloseErrors": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTracePrivacyAndSQLBusy": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceRoundTripEOFIsNotBodyEOF": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceSQLiteCodeAllowlist": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceSQLiteCodeAllowlist/batch": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceSQLiteCodeAllowlist/http-error": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceSQLiteCodeAllowlist/invalid": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceSQLiteCodeAllowlist/numeric": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceSQLiteCodeAllowlist/payload-not-error": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceSQLiteCodeAllowlist/untrusted-code": [
+      "run",
+      "pass"
+    ],
+    "TestProviderTraceTLSAndConnectionReuse": [
+      "run",
+      "pass"
+    ],
+    "TestPublicFailureDoesNotContainProviderText": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/dedup_read": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/failed_insert": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/failed_send": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/insert_outside_request": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/no_context": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/no_overlap": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/other_request_insert": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/truncated_insert": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/unacknowledged_api": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/unverified_request": [
+      "run",
+      "pass"
+    ],
+    "TestQueuedNewWriteCoverageUsesSameAcknowledgedRequest/wrong_operation": [
+      "run",
+      "pass"
+    ],
+    "TestReceiveBeforeSendACKStillChecksFinalSequence": [
+      "run",
+      "pass"
+    ],
+    "TestReceiverJoinRejectsEarlyNilAndRequiresCanceledAfterStop": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipAnonymousAndDirectPositive": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipAnonymousAndDirectPositive/anonymous-single-pair": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipAnonymousAndDirectPositive/different-pairs-distinct-rpcs": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipAnonymousAndDirectPositive/direct-verified-id": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipAnonymousAndDirectPositive/duplicate-input-positions": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipAnonymousAndDirectPositive/same-pair-distinct-rpcs": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipCannotStitchOneRPCFromTwoSQLStatements": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipCompleteEmptyRowsAreObservedNotMissing": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipDoesNotSilentlySkipDamagedPartialACK": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipDoesNotSilentlySkipDamagedPartialACK/missing-close": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipDoesNotSilentlySkipDamagedPartialACK/unverified": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipDoesNotSilentlySkipDamagedPartialACK/wrong-sequence": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipExplicitProtocolRejectionIsNotUnknownSuccess": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipIncomplete200CannotManufactureUniqueness": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipIncomplete200CannotManufactureUniqueness/bad-rows": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipIncomplete200CannotManufactureUniqueness/not-closed": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipIncomplete200CannotManufactureUniqueness/not-eof": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipIncomplete200CannotManufactureUniqueness/truncated": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipLocalIsExplicitlyNotApplicable": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipLogicalObserverPreservesReaderAndClose": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipLogicalObserverPreservesReaderAndClose/broken=false": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipLogicalObserverPreservesReaderAndClose/broken=true": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipPartialDoesNotInventAcknowledgementsOrCoalescing": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipPhysicalParserUsesExactStatementAndActualReturnedDeadline": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipPhysicalParserUsesExactStatementAndActualReturnedDeadline/duplicate-returned-pair": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipPhysicalParserUsesExactStatementAndActualReturnedDeadline/extra-result-slot": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipPhysicalParserUsesExactStatementAndActualReturnedDeadline/wrong-columns": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipPhysicalParserUsesExactStatementAndActualReturnedDeadline/wrong-token": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipProviderObserverCapturesEOFAndDelegatedClose": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/ambiguous-events": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/borrowed-leader-id": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/broker-drop": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/close-after-ack": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/close-error": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/duplicate-event-id": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/duplicate-row": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/duplicate-rpc-id": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/extra-row": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/http201": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/logical-close-error": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/logical-http201": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/missing-close": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/missing-eof": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/missing-request": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/missing-response": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/missing-row": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/not-finished": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/not-sent": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/outside-rpc": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/protocol-failed": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/sqlite-error": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/trace-drop": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/truncated": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/wrong-ack-sequence": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/wrong-deadline": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/wrong-pair": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipRejectsFalsePhysicalProof/wrong-queue": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/ambiguous_events": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/anonymous_distinct_pairs_two_rpc": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/anonymous_same_pair_two_rpc": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/anonymous_single_pair": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/borrowed_leader": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/broker_drop": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/canceled_no_ack_stays_uncovered": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/close_after_ack": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/close_error": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/complete_explicit_rejection_cannot_supply_positive_ack": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/complete_zero_row_sql_and_false_ack_do_not_fake_or_block_coalescing": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/direct_verified_request": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/duplicate_event_id": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/duplicate_positions": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/duplicate_row": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/duplicate_rpc_id": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/extra_http201_must_not_be_ignored": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/extra_no_eof_unknown_sql_must_not_be_ignored": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/extra_truncated_unknown_sql_must_not_be_ignored": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/extra_unrequested_row": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/finish_before_eof": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/logical_close_error": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/logical_http201": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/logical_start_after_server": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/missing_row": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/not_closed": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/not_eof": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/not_finished": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/not_sent": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/outside_rpc": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/partial_false_pair_missing_from_common_sql": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/partial_missing_close": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/partial_true_ack_not_many_to_one": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/partial_unverified": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/partial_wrong_sequence": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/physical_http201": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/protocol_failed": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/provider_drop": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/request_invalid": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/response_invalid": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/second_successful_sql_has_unobserved_returning_rows": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/sqlite_error": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/sqlite_not_applicable": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/truncated": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/whole_rpc_must_not_stitch_two_sql": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/wrong_ack_sequence": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/wrong_deadline": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/wrong_input_pair": [
+      "run",
+      "pass"
+    ],
+    "TestRenewalMembershipSharedCrossLanguageVectors/wrong_queue": [
+      "run",
+      "pass"
+    ],
+    "TestSQLiteExactCaseRunsOnlyTheSelectedPlan": [
+      "run",
+      "pass"
+    ],
+    "TestSQLiteManagedReceiverMixedBothSDKs": [
+      "run",
+      "pass"
+    ],
+    "TestSQLiteOriginalProfilesThroughBothSDKs": [
+      "run",
+      "pass"
+    ],
+    "TestSQLiteQuickThroughRealHTTPAndNativeClientACK": [
+      "run",
+      "pass"
+    ],
+    "TestSQLiteSelectedPoolControlRemainsNotApplicable": [
+      "run",
+      "pass"
+    ],
+    "TestStrictProtocolProofRequiresExactPipelineResponseCount": [
+      "run",
+      "pass"
+    ],
+    "TestWatchdogBlocksAnUnjoinedOwner": [
+      "run",
+      "pass"
+    ],
+    "TestWriteCoverageRejectsReadOnlyReplaysAndDisjointWrites": [
+      "run",
+      "pass"
+    ]
+  }
+}

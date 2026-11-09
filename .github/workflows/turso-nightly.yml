@@ -1,45 +1,226 @@
-name: Turso nightly
+name: Turso remote write acceptance
 
-# Real-remote integration against a Turso/libSQL DB. Gated by repo secrets so it
-# never runs on forks or PRs (avoids burning the remote quota); nightly + manual.
+# Manual-only test branch: reuse the registered path, never reset or deploy.
 on:
-  schedule:
-    - cron: '0 8 * * *' # 08:00 UTC daily
   workflow_dispatch:
+    inputs:
+      backend:
+        description: Dedicated test databases (SQLite control always runs first)
+        type: choice
+        required: true
+        default: standard
+        options: [standard, rust]
+      mode:
+        description: Finite batch, contention or managed Receiver acceptance
+        type: choice
+        required: true
+        default: mixed
+        options: [mixed]
+      case_id:
+        description: All cases, contention-only originals, or one exact case
+        type: choice
+        required: true
+        default: all
+        options: [all]
 
 permissions:
   contents: read
-
 concurrency:
   group: turso-verification-db
   cancel-in-progress: false
 
 jobs:
-  turso:
-    name: real Turso integration
-    runs-on: ubuntu-latest
-    if: ${{ github.repository == 'mqlitehq/mqlite' }}
+  attribution:
+    if: ${{ github.repository == 'mqlitehq/mqlite' && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      GOFLAGS: -mod=readonly
+      GOWORK: 'off'
+      GOENV: 'off'
+      GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: stable
-      - name: TestTurso* against dedicated verification database
-        env:
-          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
-          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
-          MQLITE_TEST_DB_RESET_CONFIRM: '1'
+      - name: Initialize isolated evidence paths
+        timeout-minutes: 1
         run: |
-          if [ -z "$MQLITE_TEST_DB" ]; then
-            echo "MQLITE_TEST_DB is required for the dedicated nightly integration suite."
-            exit 1
-          fi
-          if [ -z "$MQLITE_TEST_DB_AUTH_TOKEN" ]; then
-            echo "MQLITE_TEST_DB_AUTH_TOKEN is required when MQLITE_TEST_DB is configured."
-            exit 1
-          fi
-          if [ "$MQLITE_TEST_DB" != "libsql://mqlite-verify-jiba.aws-ap-northeast-1.turso.io" ]; then
-            echo "MQLITE_TEST_DB is not the dedicated verification database."
-            exit 1
-          fi
-          go test ./engine/ -run TestTurso -count=1 -v -timeout 300s
+          echo "PUBLIC_DIR=$RUNNER_TEMP/turso-attribution/public" >> "$GITHUB_ENV"
+          echo "PRIVATE_DIR=$RUNNER_TEMP/turso-attribution/private" >> "$GITHUB_ENV"
+          python3 -c 'import os,time; open(os.environ["GITHUB_ENV"], "a").write("MQLITE_DIAG_JOB_MONOTONIC=" + str(time.monotonic()) + "\n")'
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+        with:
+          repository: mqlitehq/mqlite-go
+          ref: 93002d0d47e2e9e876e8b4f4c8a66c5167f29b10
+          path: sdk-source
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        timeout-minutes: 8
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: source/test/turso-diagnostic/go.sum
+      - name: Verify exact diagnostic source and SDK
+        timeout-minutes: 2
+        id: source_before
+        env:
+          EXPECTED_SOURCE: ${{ github.sha }}
+          EXPECTED_HARNESS_SHA: 0863b130092a941a5f4fb994536ac58f91e1ac817f6668de4bed6e3165758e7f
+        run: |
+          mkdir -p "$PUBLIC_DIR" "$PRIVATE_DIR"
+          python3 -B source/test/turso-diagnostic/verify-source.py \
+            --source source --sdk sdk-source --phase before --output "$PUBLIC_DIR"
+      - name: Hermetic privacy, accounting, observer and watchdog controls
+        timeout-minutes: 5
+        working-directory: source/test/turso-diagnostic
+        run: |
+          set +e
+          go test -race -tags mqlite_perf_diag -count=1 -timeout=240s -json ./... > "$PRIVATE_DIR/controls.jsonl" 2>&1
+          status=$?
+          CONTROL_STATUS="$status" python3 - <<'PY'
+          import json, os, pathlib
+          tests = {}
+          malformed = 0
+          for line in pathlib.Path(os.environ["PRIVATE_DIR"], "controls.jsonl").read_text().splitlines():
+              try: event = json.loads(line)
+              except ValueError:
+                  malformed += 1
+                  continue
+              name, action = event.get("Test"), event.get("Action")
+              if name and action in ("run", "pass", "fail", "skip"):
+                  tests.setdefault(name, []).append(action)
+          expected = json.loads(pathlib.Path("expected-controls.json").read_text())["tests"]
+          status = int(os.environ["CONTROL_STATUS"])
+          result = {"exit_code": status, "tests": tests, "unparsed_lines": malformed,
+                    "expected_test_count": len(expected), "actual_test_count": len(tests),
+                    "passed": status == 0 and tests == expected}
+          pathlib.Path(os.environ["PUBLIC_DIR"], "controls.json").write_text(json.dumps(result, indent=2)+"\n")
+          assert result["passed"], "hermetic controls failed"
+          PY
+          parser_status=$?
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          exit "$parser_status"
+      - name: Hermetic final-state and remaining-budget controls
+        timeout-minutes: 1
+        run: python3 -B source/test/turso-diagnostic/test-finalize-state.py
+      - name: Build isolated diagnostic executable
+        timeout-minutes: 5
+        working-directory: source/test/turso-diagnostic
+        run: go build -tags mqlite_perf_diag -o "$PRIVATE_DIR/diagnostic" .
+      - name: Validate exact case selection before any database access
+        timeout-minutes: 1
+        env:
+          DIAGNOSTIC_MODE: ${{ inputs.mode }}
+          DIAGNOSTIC_CASE: ${{ inputs.case_id }}
+        run: >-
+          "$PRIVATE_DIR/diagnostic" --validate-selection-only
+          --mode "$DIAGNOSTIC_MODE" --case "$DIAGNOSTIC_CASE"
+      - name: Hermetic read-only protocol controls
+        timeout-minutes: 2
+        working-directory: source
+        run: go test -race -count=1 -timeout=60s ./test/turso-protocol-baseline
+      - name: Read-only provider protocol baseline
+        timeout-minutes: 9
+        working-directory: source
+        env:
+          MQLITE_DIAG_STANDARD_DB: ${{ secrets.MQLITE_DIAG_STANDARD_DB }}
+          MQLITE_DIAG_STANDARD_TOKEN: ${{ secrets.MQLITE_DIAG_STANDARD_TOKEN }}
+          MQLITE_DIAG_RUST_DB: ${{ secrets.MQLITE_DIAG_RUST_DB }}
+          MQLITE_DIAG_RUST_TOKEN: ${{ secrets.MQLITE_DIAG_RUST_TOKEN }}
+          DIAGNOSTIC_BACKEND: ${{ inputs.backend }}
+        run: |
+          timeout --signal=TERM --kill-after=15s 8m go run ./test/turso-protocol-baseline \
+            --backend "$DIAGNOSTIC_BACKEND" --count 10 --out "$PUBLIC_DIR/protocol" \
+            > "$PRIVATE_DIR/protocol.log" 2>&1
+      - name: Hermetic exact interrupted-queue cleanup controls
+        timeout-minutes: 2
+        working-directory: source
+        run: go test -race -count=1 -timeout=60s ./test/turso-diagnostic-cleanup
+      - name: Admit finite owner only with infrastructure finalization reserve
+        timeout-minutes: 1
+        run: >-
+          python3 -B source/test/turso-diagnostic/pre-owner-budget.py
+          --job-start "$MQLITE_DIAG_JOB_MONOTONIC" --public "$PUBLIC_DIR"
+      - name: Finite serial diagnostic against approved test databases
+        timeout-minutes: 41
+        id: diagnostic
+        env:
+          MQLITE_DIAG_STANDARD_DB: ${{ secrets.MQLITE_DIAG_STANDARD_DB }}
+          MQLITE_DIAG_STANDARD_TOKEN: ${{ secrets.MQLITE_DIAG_STANDARD_TOKEN }}
+          MQLITE_DIAG_RUST_DB: ${{ secrets.MQLITE_DIAG_RUST_DB }}
+          MQLITE_DIAG_RUST_TOKEN: ${{ secrets.MQLITE_DIAG_RUST_TOKEN }}
+          MQLITE_DIAG_SOURCE_SHA: ${{ github.sha }}
+          DIAGNOSTIC_BACKEND: ${{ inputs.backend }}
+          DIAGNOSTIC_MODE: ${{ inputs.mode }}
+          DIAGNOSTIC_CASE: ${{ inputs.case_id }}
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=15s 40m "$PRIVATE_DIR/diagnostic" \
+            --backend "$DIAGNOSTIC_BACKEND" --mode "$DIAGNOSTIC_MODE" --case "$DIAGNOSTIC_CASE" --out "$PUBLIC_DIR" \
+            > "$PRIVATE_DIR/runtime.log" 2>&1
+          status=$?
+          DIAGNOSTIC_STATUS="$status" python3 - <<'PY'
+          import json, os, pathlib
+          code = int(os.environ["DIAGNOSTIC_STATUS"])
+          p = pathlib.Path(os.environ["PUBLIC_DIR"])
+          report = {"diagnostic_launch_attempted": True, "process_wait_returned": True,
+                    "process_exit_code": code, "watchdog_terminated": code in (124, 137, 143),
+                    "raw_runtime_log_published": False}
+          (p / "process.json").write_text(json.dumps(report, indent=2)+"\n")
+          print("Diagnostic process exit:", code)
+          PY
+          exit "$status"
+      - name: Verify source and all compile inputs after validation
+        timeout-minutes: 1
+        if: ${{ always() && steps.source_before.outcome == 'success' }}
+        env:
+          EXPECTED_SOURCE: ${{ github.sha }}
+          EXPECTED_HARNESS_SHA: 0863b130092a941a5f4fb994536ac58f91e1ac817f6668de4bed6e3165758e7f
+        run: >-
+          python3 -B source/test/turso-diagnostic/verify-source.py
+          --source source --sdk sdk-source --phase after --output "$PUBLIC_DIR"
+      - name: Always record current manifest owner and cleanup state
+        timeout-minutes: 1
+        if: always()
+        env:
+          DIAGNOSTIC_STEP_OUTCOME: ${{ steps.diagnostic.outcome }}
+        run: >-
+          python3 -B source/test/turso-diagnostic/finalize-state.py
+          --public "$PUBLIC_DIR" --diagnostic-outcome "$DIAGNOSTIC_STEP_OUTCOME"
+      - name: Safe evidence summary
+        timeout-minutes: 1
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path(os.environ["PUBLIC_DIR"])
+          lines = ["## Finite Turso performance attribution", "", "No deployment, schema reset, or production capacity claim.", ""]
+          owner = p / "owner-final-state.json"
+          state = json.loads(owner.read_text()) if owner.exists() else {}
+          lines += ["Owner final state: " + state.get("state", "MISSING; progression forbidden"), "Independent review is required before any next run.", ""]
+          summary = p / "summary.json"
+          if summary.exists():
+              r = json.loads(summary.read_text())
+              lines += [f"Case selection: {r.get('case_selection', 'not recorded')}. A focused PASS covers only this selection.", ""]
+              lines += [f"Passed: {r.get('passed') is True}; blocked: {r.get('blocked') is True}.", ""]
+              for b in r.get("backends", []):
+                  cases = b.get("cases") or []
+                  not_applicable = sum(c.get("status") == "not_applicable_local_single_writer" for c in cases)
+                  lines.append(f"- {b['backend']}: passed={b['passed']}, blocked={b['blocked']}, executed={len(cases)-not_applicable}, not_applicable={not_applicable}")
+          else:
+              lines.append("No completed runtime summary; inspect safe control/process evidence.")
+          pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines)+"\n")
+          PY
+      - uses: actions/upload-artifact@v6
+        timeout-minutes: 2
+        if: always()
+        with:
+          name: turso-attribution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PUBLIC_DIR }}
+          if-no-files-found: error
+          retention-days: 14
