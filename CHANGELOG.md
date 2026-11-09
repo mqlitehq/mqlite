@@ -12,6 +12,16 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Coalesce compatible pending remote renewals (MQLITE-190)
+
+- Combine compatible HTTP Hrana `RenewBatch` calls already queued behind the
+  same writer into one fenced statement, without a collection delay or a new
+  caller API. Keep the existing single-writer and bounded priority rules.
+- Preserve each caller's cancellation and per-token result. Canceling one
+  caller does not cancel its peers; shared work keeps its shutdown owner until
+  the actual SQL and connection finish. Idle, local and legacy renewal paths
+  retain their synchronous behavior.
+
 ### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
 
 - Give asynchronous libSQL HTTP stream-close requests a five-second deadline and

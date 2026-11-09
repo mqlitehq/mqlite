@@ -3,11 +3,13 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"reflect"
 	"sort"
 	"strconv"
@@ -1024,6 +1026,70 @@ func TestRenewBatchRefusesToClaimALeaseTheWriteOutlived(t *testing.T) {
 	}
 	if committed != msgs[0].LockedUntilMs+500 {
 		t.Fatalf("the write must have extended the live lease before its response became stale: %d", committed)
+	}
+}
+
+type renewalExpiryRows struct {
+	driver.Rows
+	expire func()
+}
+
+func (r renewalExpiryRows) Next(values []driver.Value) error {
+	err := r.Rows.Next(values)
+	if errors.Is(err, io.EOF) {
+		r.expire()
+	}
+	return err
+}
+
+// MQLITE-175: sharing RETURNING must not turn a lease that expired during EOF
+// into a successful response for any member of the group.
+func TestRemoteCoalescedRenewalJudgesEveryCallerAfterEOF(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(1000)
+	f := &admissionFixture{}
+	var statements atomic.Int64
+	f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		statements.Add(1)
+		rows, err := renewalAdmissionRows(query, args)
+		if err != nil {
+			return nil, err
+		}
+		return renewalExpiryRows{Rows: rows, expire: func() { clock.Store(4001) }}, nil
+	}
+	d := admissionTestDB(t, f)
+	d.dsn = "libsql://fixture.invalid"
+	e := fakeRemoteEngine(d)
+	e.now = clock.Load
+	e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	release, err := d.writer.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	requests := [][]SettleItem{
+		{{SeqNumber: 1, LockToken: "valid"}, {SeqNumber: 1, LockToken: "stale"}},
+		{{SeqNumber: 2, LockToken: "valid"}, {SeqNumber: 1, LockToken: "valid"}},
+	}
+	var answers []<-chan pendingRenewalAnswer
+	for i, request := range requests {
+		answers = append(answers, startPendingRenewal(e, context.Background(), "q", request))
+		waitPendingRenewalCalls(t, &d.writer, i+1)
+	}
+	release()
+	for i, answer := range answers {
+		result := receivePendingRenewal(t, answer)
+		if result.err != nil || len(result.items) != len(requests[i]) {
+			t.Fatalf("caller %d: result=%v err=%v", i, result.items, result.err)
+		}
+		for j, item := range result.items {
+			if item.SeqNumber != requests[i][j].SeqNumber || item.Ok || item.LockedUntilMs != 0 {
+				t.Errorf("caller %d item %d reported an expired lease: %+v", i, j, item)
+			}
+		}
+	}
+	if statements.Load() != 1 || f.active.Load() != 0 || f.maximum.Load() != 1 {
+		t.Errorf("shared statement ownership: count=%d active=%d maximum=%d", statements.Load(), f.active.Load(), f.maximum.Load())
 	}
 }
 

@@ -84,6 +84,22 @@ bounded bursts at each level so ordinary writes and maintenance also progress. R
 the four-connection pool. This cannot interrupt an already running transaction
 and does not make overlapping brokers or `Engine` instances safe.
 
+Compatible HTTP Hrana `RenewBatch` calls already waiting at the tail of the
+renewal FIFO can share one fenced `UPDATE ... RETURNING`. There is no collection
+delay: an idle writer uses the original synchronous path. Groups only combine
+the same queue and lease configuration, with at most 512 input positions and
+bounded payload eligibility. At most two unfinished groups own shared execution;
+incompatible or excess calls use the original FIFO path. Each caller retains
+its own cancellation and token results, and a canceled caller cannot cancel a
+live peer. Ending a caller's wait does not mean that an already issued shared
+statement was undone. Shutdown still waits for the real shared SQL and connection to end.
+Safe retries rejoin the FIFO tail under the same retry and fairness rules.
+
+This internal adaptation keeps the same API and message contract across local
+SQLite and remote backends. It reduces redundant renewal round trips; it cannot
+preempt an active transaction or guarantee that an arbitrary network delay fits
+inside a short lease. Latency and throughput still depend on the deployment.
+
 A public `Tx` callback holds the write permit until that attempt finishes. Keep
 callbacks short and use the supplied `EngineTx` for business SQL and enqueueing.
 Complete the callback before waiting for another mutation through the same owner.

@@ -39,6 +39,37 @@ func waitRemoteQueues(t *testing.T, w *remoteWriter, normal, urgent, renew int) 
 	}
 }
 
+func waitPendingRenewalCalls(t *testing.T, w *remoteWriter, calls int) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		w.mu.Lock()
+		pending := 0
+		for element := w.renew.Front(); element != nil; element = element.Next() {
+			waiter := element.Value.(*remoteWriteWaiter)
+			if waiter.renewal == nil {
+				pending++
+				continue
+			}
+			for _, member := range waiter.renewal.members {
+				if member.active && member.ctx.Err() == nil {
+					pending++
+				}
+			}
+		}
+		w.mu.Unlock()
+		if pending == calls {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("pending renewal calls=%d, want %d", pending, calls)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
 func TestRemoteWriterFIFOAndBoundedLeasePriority(t *testing.T) {
 	w := &remoteWriter{}
 	first, err := w.acquire(context.Background())
@@ -299,6 +330,7 @@ type admissionFixture struct {
 	overlapOnce       sync.Once
 	read              chan struct{}
 	failFirstExec     bool
+	returning         func(context.Context, string, []driver.NamedValue) (driver.Rows, error)
 	queryMu           sync.Mutex
 	execQueries       []string
 }
@@ -375,10 +407,18 @@ func (c *admissionConn) ExecContext(_ context.Context, query string, _ []driver.
 	}
 	return driver.RowsAffected(1), nil
 }
-func (c *admissionConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *admissionConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	if !strings.HasPrefix(q, "SELECT") && !c.inTxn.Load() {
 		c.f.enter()
 		c.f.pause()
+		if c.f.returning != nil {
+			rows, err := c.f.returning(ctx, q, args)
+			if err != nil {
+				c.f.active.Add(-1)
+				return nil, err
+			}
+			return &admissionRows{inner: rows, release: func() { c.f.active.Add(-1) }}, nil
+		}
 		return &admissionRows{release: func() { c.f.active.Add(-1) }}, nil
 	}
 	if c.f.read != nil {
@@ -414,21 +454,34 @@ func (t *admissionTx) Rollback() error {
 }
 
 type admissionRows struct {
-	done    bool
-	once    sync.Once
-	release func()
+	done     bool
+	once     sync.Once
+	release  func()
+	inner    driver.Rows
+	closeErr error
 }
 
-func (*admissionRows) Columns() []string { return []string{"value"} }
+func (r *admissionRows) Columns() []string {
+	if r.inner != nil {
+		return r.inner.Columns()
+	}
+	return []string{"value"}
+}
 func (r *admissionRows) Close() error {
 	r.once.Do(func() {
+		if r.inner != nil {
+			r.closeErr = r.inner.Close()
+		}
 		if r.release != nil {
 			r.release()
 		}
 	})
-	return nil
+	return r.closeErr
 }
 func (r *admissionRows) Next(dest []driver.Value) error {
+	if r.inner != nil {
+		return r.inner.Next(dest)
+	}
 	if r.done {
 		return io.EOF
 	}
@@ -444,6 +497,786 @@ func admissionTestDB(t *testing.T, f *admissionFixture) *db {
 	d := &db{sql: sdb, remote: true}
 	t.Cleanup(func() { f.unblock(); _ = d.close() })
 	return d
+}
+
+// MQLITE-175: calls already waiting behind a writer should share one renewal
+// statement, while retaining every caller's original shape and token fence.
+func TestRemotePendingRenewalsShareStatementAndPreserveMasks(t *testing.T) {
+	f := &admissionFixture{}
+	var statements atomic.Int64
+	f.returning = func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		if ctx.Value(renewalCallerContextKey{}) != nil {
+			return nil, errors.New("shared SQL inherited one caller's context value")
+		}
+		if !strings.Contains(query, "UPDATE messages SET locked_until") {
+			return nil, fmt.Errorf("unexpected statement: %s", query)
+		}
+		statements.Add(1)
+		until := args[0].Value.(int64)
+		var values [][]driver.Value
+		for i := 4; i < len(args); i += 2 {
+			if args[i+1].Value == "valid" {
+				values = append(values, []driver.Value{args[i].Value, args[i+1].Value, until})
+			}
+		}
+		return &valueRows{values: values}, nil
+	}
+	d := admissionTestDB(t, f)
+	d.dsn = "libsql://fixture.invalid" // The injected Connector never performs network I/O.
+	e := fakeRemoteEngine(d)
+	e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	release, err := d.writer.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	requests := [][]SettleItem{
+		{{SeqNumber: 1, LockToken: "valid"}, {SeqNumber: 1, LockToken: "stale"}, {SeqNumber: 19}},
+		{{SeqNumber: 2, LockToken: "valid"}, {SeqNumber: 1, LockToken: "valid"}, {SeqNumber: 999, LockToken: "stale"}},
+	}
+	type answer struct {
+		items []SettleResult
+		err   error
+	}
+	answers := []chan answer{make(chan answer, 1), make(chan answer, 1)}
+	for i := range requests {
+		go func(i int) {
+			ctx := context.WithValue(context.Background(), renewalCallerContextKey{}, i)
+			items, err := e.RenewBatch(ctx, "q", requests[i])
+			answers[i] <- answer{items: items, err: err}
+		}(i)
+		waitPendingRenewalCalls(t, &d.writer, i+1)
+	}
+	release()
+	for i, ch := range answers {
+		select {
+		case got := <-ch:
+			if got.err != nil || len(got.items) != len(requests[i]) {
+				t.Fatalf("caller %d: result=%v err=%v", i, got.items, got.err)
+			}
+			for j, result := range got.items {
+				wantOK := requests[i][j].LockToken == "valid"
+				if result.SeqNumber != requests[i][j].SeqNumber || result.Ok != wantOK ||
+					(result.Ok && result.LockedUntilMs != 4000) || (!result.Ok && result.LockedUntilMs != 0) {
+					t.Errorf("caller %d item %d: result=%+v", i, j, result)
+				}
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("caller %d did not return", i)
+		}
+	}
+	if got := statements.Load(); got != 1 {
+		t.Errorf("pending compatible renewals issued %d statements, want one", got)
+	}
+	if f.active.Load() != 0 || f.maximum.Load() != 1 {
+		t.Errorf("SQL ownership: active=%d maximum=%d", f.active.Load(), f.maximum.Load())
+	}
+	assertRenewalLogicalWrites(t, d, 2, 0)
+}
+
+type renewalCallerContextKey struct{}
+
+func assertRenewalLogicalWrites(t *testing.T, d *db, ok, canceled uint64) {
+	t.Helper()
+	got := make(map[string]uint64)
+	for _, operation := range d.storage.snapshot(d.sql.Stats()).Operations {
+		if operation.Operation == "write" && operation.Duration.Count != 0 {
+			got[operation.Outcome+"/"+operation.ErrorCode] += operation.Duration.Count
+		}
+	}
+	if got["ok/"] != ok || got["error/canceled"] != canceled {
+		t.Errorf("logical write observations=%v, want ok=%d canceled=%d", got, ok, canceled)
+	}
+	delete(got, "ok/")
+	delete(got, "error/canceled")
+	if len(got) != 0 {
+		t.Errorf("unexpected aggregate or extra logical write observations: %v", got)
+	}
+}
+
+func renewalAdmissionRows(query string, args []driver.NamedValue) (driver.Rows, error) {
+	if !strings.Contains(query, "UPDATE messages SET locked_until") || len(args) < 6 || len(args)%2 != 0 {
+		return nil, fmt.Errorf("unexpected renewal statement or argument count: %s (%d)", query, len(args))
+	}
+	var values [][]driver.Value
+	for i := 4; i < len(args); i += 2 {
+		if args[i+1].Value == "valid" {
+			values = append(values, []driver.Value{args[i].Value, args[i+1].Value, args[0].Value})
+		}
+	}
+	return &valueRows{values: values}, nil
+}
+
+type pendingRenewalAnswer struct {
+	items []SettleResult
+	err   error
+}
+
+func startPendingRenewal(e *Engine, ctx context.Context, queue string, items []SettleItem) <-chan pendingRenewalAnswer {
+	result := make(chan pendingRenewalAnswer, 1)
+	go func() {
+		items, err := e.RenewBatch(ctx, queue, items)
+		result <- pendingRenewalAnswer{items: items, err: err}
+	}()
+	return result
+}
+
+func receivePendingRenewal(t *testing.T, ch <-chan pendingRenewalAnswer) pendingRenewalAnswer {
+	t.Helper()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(3 * time.Second):
+		t.Fatal("renewal caller did not return")
+		return pendingRenewalAnswer{}
+	}
+}
+
+func TestRemotePendingRenewalCancellationPreservesOtherCaller(t *testing.T) {
+	for canceled := 0; canceled < 2; canceled++ {
+		t.Run(fmt.Sprintf("canceled_caller_%d", canceled), func(t *testing.T) {
+			f := &admissionFixture{}
+			var statements atomic.Int64
+			var submitted []int64
+			f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+				statements.Add(1)
+				for i := 4; i < len(args); i += 2 {
+					submitted = append(submitted, args[i].Value.(int64))
+				}
+				return renewalAdmissionRows(query, args)
+			}
+			d := admissionTestDB(t, f)
+			d.dsn = "libsql://fixture.invalid"
+			e := fakeRemoteEngine(d)
+			e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+			release, err := d.writer.acquire(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			contexts := make([]context.Context, 2)
+			cancel := make([]context.CancelFunc, 2)
+			for i := range contexts {
+				contexts[i], cancel[i] = context.WithCancel(context.Background())
+				defer cancel[i]()
+			}
+			requests := [][]SettleItem{
+				{{SeqNumber: 1, LockToken: "valid"}, {SeqNumber: 2, LockToken: "valid"}},
+				{{SeqNumber: 2, LockToken: "valid"}, {SeqNumber: 3, LockToken: "valid"}},
+			}
+			answers := make([]<-chan pendingRenewalAnswer, 2)
+			for i := range answers {
+				answers[i] = startPendingRenewal(e, contexts[i], "q", requests[i])
+				waitPendingRenewalCalls(t, &d.writer, i+1)
+			}
+			cancel[canceled]()
+			abandoned := receivePendingRenewal(t, answers[canceled])
+			if !errors.Is(abandoned.err, context.Canceled) || errors.Is(abandoned.err, ErrOutcomeUnknown) {
+				t.Fatalf("canceled caller changed error identity: %v", abandoned.err)
+			}
+			if f.active.Load() != 0 || d.sql.Stats().OpenConnections != 0 {
+				t.Fatal("pending cancellation occupied a SQL connection")
+			}
+			release()
+			peer := receivePendingRenewal(t, answers[1-canceled])
+			if peer.err != nil || len(peer.items) != 2 || !peer.items[0].Ok || !peer.items[1].Ok {
+				t.Fatalf("live peer inherited cancellation: result=%v err=%v", peer.items, peer.err)
+			}
+			for i, item := range peer.items {
+				if item.SeqNumber != requests[1-canceled][i].SeqNumber {
+					t.Errorf("live peer result order changed: %v", peer.items)
+				}
+			}
+			want := []int64{1, 2}
+			if canceled == 0 {
+				want = []int64{2, 3}
+			}
+			seen := make(map[int64]bool)
+			for _, id := range submitted {
+				seen[id] = true
+			}
+			if statements.Load() != 1 || len(submitted) != 2 || len(seen) != 2 || !seen[want[0]] || !seen[want[1]] {
+				t.Errorf("canceled sole pairs retained or shared pair lost: SQL=%d pairs=%v want=%v", statements.Load(), submitted, want)
+			}
+			if f.active.Load() != 0 || f.maximum.Load() != 1 {
+				t.Errorf("SQL ownership: active=%d maximum=%d", f.active.Load(), f.maximum.Load())
+			}
+			assertRenewalLogicalWrites(t, d, 1, 1)
+		})
+	}
+}
+
+func TestRemotePendingRenewalsAllCanceledDoNotAcquireSQL(t *testing.T) {
+	f := &admissionFixture{}
+	var statements atomic.Int64
+	f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		statements.Add(1)
+		return renewalAdmissionRows(query, args)
+	}
+	d := admissionTestDB(t, f)
+	d.dsn = "libsql://fixture.invalid"
+	e := fakeRemoteEngine(d)
+	e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	release, err := d.writer.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	var answers []<-chan pendingRenewalAnswer
+	var cancellations []context.CancelFunc
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cancellations = append(cancellations, cancel)
+		answers = append(answers, startPendingRenewal(e, ctx, "q", []SettleItem{{SeqNumber: int64(i + 1), LockToken: "valid"}}))
+		waitPendingRenewalCalls(t, &d.writer, i+1)
+	}
+	for _, cancel := range cancellations {
+		cancel()
+	}
+	for _, answer := range answers {
+		if result := receivePendingRenewal(t, answer); !errors.Is(result.err, context.Canceled) {
+			t.Errorf("canceled caller: %v", result.err)
+		}
+	}
+	release()
+	if err := d.close(); err != nil {
+		t.Fatal(err)
+	}
+	if statements.Load() != 0 || f.active.Load() != 0 || d.sql.Stats().OpenConnections != 0 {
+		t.Errorf("abandoned pending work touched SQL: statements=%d active=%d connections=%d", statements.Load(), f.active.Load(), d.sql.Stats().OpenConnections)
+	}
+}
+
+func TestRemoteExecutingRenewalCancellationKeepsPhysicalOwnerUntilDriverReturns(t *testing.T) {
+	started, canceled, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var finishOnce sync.Once
+	unblock := func() { finishOnce.Do(func() { close(finish) }) }
+	defer unblock()
+	f := &admissionFixture{}
+	var statements atomic.Int64
+	f.returning = func(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+		statements.Add(1)
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		// Model a driver that has seen cancellation but has not returned its SQL
+		// lease. Cancellation alone is not proof that ownership has ended.
+		<-finish
+		return nil, ctx.Err()
+	}
+	d := admissionTestDB(t, f)
+	d.dsn = "libsql://fixture.invalid"
+	e := fakeRemoteEngine(d)
+	e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	release, err := d.writer.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	var answers []<-chan pendingRenewalAnswer
+	var cancellations []context.CancelFunc
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cancellations = append(cancellations, cancel)
+		answers = append(answers, startPendingRenewal(e, ctx, "q", []SettleItem{{SeqNumber: int64(i + 1), LockToken: "valid"}}))
+		waitPendingRenewalCalls(t, &d.writer, i+1)
+	}
+	release()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shared SQL did not start")
+	}
+	for _, cancel := range cancellations {
+		cancel()
+	}
+	for _, answer := range answers {
+		if result := receivePendingRenewal(t, answer); !errors.Is(result.err, context.Canceled) || errors.Is(result.err, ErrOutcomeUnknown) {
+			t.Errorf("canceled member changed context identity: %v", result.err)
+		}
+	}
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("all canceled members did not cancel their shared SQL")
+	}
+	if f.active.Load() != 1 || d.sql.Stats().InUse != 1 {
+		t.Errorf("caller return released a live SQL lease: active=%d in_use=%d", f.active.Load(), d.sql.Stats().InUse)
+	}
+	next := make(chan error, 1)
+	go func() { _, err := d.exec(context.Background(), "UPDATE after_canceled_renewal"); next <- err }()
+	waitRemoteQueues(t, &d.writer, 1, 0, 0)
+	closed := make(chan error, 1)
+	go func() { closed <- d.close() }()
+	select {
+	case err := <-next:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("queued writer after Close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not wake the queued writer")
+	}
+	if f.execs.Load() != 0 {
+		t.Error("another writer ran before the canceled SQL released its lease")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before the admitted group joined: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not finish after the driver returned")
+	}
+	if statements.Load() != 1 || f.active.Load() != 0 || f.maximum.Load() != 1 || d.sql.Stats().InUse != 0 {
+		t.Errorf("physical ownership leaked or overlapped: statements=%d active=%d maximum=%d in_use=%d", statements.Load(), f.active.Load(), f.maximum.Load(), d.sql.Stats().InUse)
+	}
+}
+
+func TestRemoteExecutingRenewalMemberCancellationDoesNotCancelPeerSQL(t *testing.T) {
+	for abandoned := 0; abandoned < 2; abandoned++ {
+		t.Run(fmt.Sprintf("canceled_caller_%d", abandoned), func(t *testing.T) {
+			started, finish := make(chan struct{}), make(chan struct{})
+			var finishOnce sync.Once
+			unblock := func() { finishOnce.Do(func() { close(finish) }) }
+			defer unblock()
+			f := &admissionFixture{}
+			var statements atomic.Int64
+			f.returning = func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+				statements.Add(1)
+				close(started)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-finish:
+					return renewalAdmissionRows(query, args)
+				}
+			}
+			d := admissionTestDB(t, f)
+			d.dsn = "libsql://fixture.invalid"
+			e := fakeRemoteEngine(d)
+			e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+			release, err := d.writer.acquire(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			var answers []<-chan pendingRenewalAnswer
+			var cancellations []context.CancelFunc
+			for i := 0; i < 2; i++ {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				cancellations = append(cancellations, cancel)
+				answers = append(answers, startPendingRenewal(e, ctx, "q", []SettleItem{{SeqNumber: int64(i + 1), LockToken: "valid"}}))
+				waitPendingRenewalCalls(t, &d.writer, i+1)
+			}
+			release()
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("shared SQL did not start")
+			}
+			cancellations[abandoned]()
+			if result := receivePendingRenewal(t, answers[abandoned]); !errors.Is(result.err, context.Canceled) {
+				t.Errorf("canceled member: %v", result.err)
+			}
+			unblock()
+			peer := receivePendingRenewal(t, answers[1-abandoned])
+			if peer.err != nil || len(peer.items) != 1 || !peer.items[0].Ok || peer.items[0].SeqNumber != int64(2-abandoned) {
+				t.Errorf("one caller canceled the peer SQL: result=%v err=%v", peer.items, peer.err)
+			}
+			if statements.Load() != 1 || f.active.Load() != 0 || f.maximum.Load() != 1 {
+				t.Errorf("shared SQL ownership: statements=%d active=%d maximum=%d", statements.Load(), f.active.Load(), f.maximum.Load())
+			}
+			assertRenewalLogicalWrites(t, d, 1, 1)
+		})
+	}
+}
+
+func TestRemotePendingRenewalsDoNotMergeAcrossQueueFIFO(t *testing.T) {
+	f := &admissionFixture{}
+	var order []string
+	f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		order = append(order, args[3].Value.(string))
+		return renewalAdmissionRows(query, args)
+	}
+	d := admissionTestDB(t, f)
+	d.dsn = "libsql://fixture.invalid"
+	e := fakeRemoteEngine(d)
+	for _, name := range []string{"a", "b"} {
+		e.qcache[name] = queueRow{name: name, kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	}
+	release, err := d.writer.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	var answers []<-chan pendingRenewalAnswer
+	for i, queue := range []string{"a", "b", "a"} {
+		answers = append(answers, startPendingRenewal(e, context.Background(), queue, []SettleItem{{SeqNumber: int64(i + 1), LockToken: "valid"}}))
+		waitPendingRenewalCalls(t, &d.writer, i+1)
+	}
+	d.writer.mu.Lock()
+	groups := d.writer.renewGroups
+	d.writer.mu.Unlock()
+	if groups > 2 {
+		t.Errorf("pending renewal workers=%d, want at most two", groups)
+	}
+	release()
+	for i, answer := range answers {
+		result := receivePendingRenewal(t, answer)
+		if result.err != nil || len(result.items) != 1 || !result.items[0].Ok || result.items[0].SeqNumber != int64(i+1) {
+			t.Errorf("caller %d: result=%v err=%v", i, result.items, result.err)
+		}
+	}
+	if fmt.Sprint(order) != "[a b a]" {
+		t.Errorf("a later queue-a call crossed queue-b: order=%v", order)
+	}
+	if f.active.Load() != 0 || f.maximum.Load() != 1 {
+		t.Errorf("FIFO writes overlapped or leaked: active=%d maximum=%d", f.active.Load(), f.maximum.Load())
+	}
+}
+
+func TestRemotePendingRenewalsKeepConfigurationSnapshotsSeparate(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		durations    [2]int64
+		expires      [2]int64
+		wantDeadline [2]int64
+	}{
+		{name: "duration", durations: [2]int64{3000, 5000}, wantDeadline: [2]int64{4000, 6000}},
+		{name: "resource_expiry", durations: [2]int64{3000, 3000}, expires: [2]int64{2000, 3500}, wantDeadline: [2]int64{2000, 3500}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &admissionFixture{}
+			var statements atomic.Int64
+			f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+				statements.Add(1)
+				return renewalAdmissionRows(query, args)
+			}
+			d := admissionTestDB(t, f)
+			d.dsn = "libsql://fixture.invalid"
+			e := fakeRemoteEngine(d)
+			release, err := d.writer.acquire(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			var answers []<-chan pendingRenewalAnswer
+			for i := 0; i < 2; i++ {
+				e.qmu.Lock()
+				e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: tc.durations[i], expiresAtMs: tc.expires[i]}
+				e.qmu.Unlock()
+				answers = append(answers, startPendingRenewal(e, context.Background(), "q", []SettleItem{{SeqNumber: int64(i + 1), LockToken: "valid"}}))
+				waitPendingRenewalCalls(t, &d.writer, i+1)
+			}
+			release()
+			for i, answer := range answers {
+				result := receivePendingRenewal(t, answer)
+				if result.err != nil || len(result.items) != 1 || !result.items[0].Ok || result.items[0].LockedUntilMs != tc.wantDeadline[i] {
+					t.Errorf("configuration snapshot %d: result=%v err=%v want_deadline=%d", i, result.items, result.err, tc.wantDeadline[i])
+				}
+			}
+			if statements.Load() != 2 || f.active.Load() != 0 || f.maximum.Load() != 1 {
+				t.Errorf("configuration snapshots merged or overlapped: count=%d active=%d maximum=%d", statements.Load(), f.active.Load(), f.maximum.Load())
+			}
+			assertRenewalLogicalWrites(t, d, 2, 0)
+		})
+	}
+}
+
+func TestRemoteRenewalSafeRetryRequeuesAndPrunesCanceledMember(t *testing.T) {
+	bStarted, finishB := make(chan struct{}), make(chan struct{})
+	var finishOnce sync.Once
+	unblockB := func() { finishOnce.Do(func() { close(finishB) }) }
+	defer unblockB()
+	f := &admissionFixture{}
+	var order []string
+	var retryPairs []int64
+	f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		queue := args[3].Value.(string)
+		order = append(order, queue)
+		if len(order) == 1 {
+			return nil, sqliteBusyEvidence{} // The typed rejection proves no write ran.
+		}
+		if queue == "b" {
+			close(bStarted)
+			<-finishB
+		} else {
+			for i := 4; i < len(args); i += 2 {
+				retryPairs = append(retryPairs, args[i].Value.(int64))
+			}
+		}
+		return renewalAdmissionRows(query, args)
+	}
+	d := admissionTestDB(t, f)
+	d.dsn = "libsql://fixture.invalid"
+	e := fakeRemoteEngine(d)
+	for _, name := range []string{"a", "b"} {
+		e.qcache[name] = queueRow{name: name, kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	}
+	release, err := d.writer.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leader := startPendingRenewal(e, ctx, "a", []SettleItem{{SeqNumber: 1, LockToken: "valid"}, {SeqNumber: 4, LockToken: "valid"}})
+	waitPendingRenewalCalls(t, &d.writer, 1)
+	peer := startPendingRenewal(e, context.Background(), "a", []SettleItem{{SeqNumber: 2, LockToken: "valid"}, {SeqNumber: 4, LockToken: "valid"}})
+	waitPendingRenewalCalls(t, &d.writer, 2)
+	other := startPendingRenewal(e, context.Background(), "b", []SettleItem{{SeqNumber: 3, LockToken: "valid"}})
+	waitPendingRenewalCalls(t, &d.writer, 3)
+	release()
+	select {
+	case <-bStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("safe retry retained its permit or jumped ahead of queued work")
+	}
+	cancel()
+	if result := receivePendingRenewal(t, leader); !errors.Is(result.err, context.Canceled) || errors.Is(result.err, ErrOutcomeUnknown) {
+		t.Errorf("canceled retry member: %v", result.err)
+	}
+	unblockB()
+	if result := receivePendingRenewal(t, other); result.err != nil || len(result.items) != 1 || !result.items[0].Ok {
+		t.Errorf("queued queue-b work failed: result=%v err=%v", result.items, result.err)
+	}
+	if result := receivePendingRenewal(t, peer); result.err != nil || len(result.items) != 2 || !result.items[0].Ok || !result.items[1].Ok {
+		t.Errorf("live retry peer failed: result=%v err=%v", result.items, result.err)
+	}
+	seen := make(map[int64]bool)
+	for _, id := range retryPairs {
+		seen[id] = true
+	}
+	if fmt.Sprint(order) != "[a b a]" || len(retryPairs) != 2 || len(seen) != 2 || !seen[2] || !seen[4] {
+		t.Errorf("retry did not requeue/prune sole pairs: order=%v retry_pairs=%v", order, retryPairs)
+	}
+	if f.active.Load() != 0 || f.maximum.Load() != 1 {
+		t.Errorf("retry SQL overlapped or leaked: active=%d maximum=%d", f.active.Load(), f.maximum.Load())
+	}
+	assertRenewalLogicalWrites(t, d, 2, 1)
+}
+
+func TestRemoteAbandonedPendingRenewalDoesNotCancelFreshCaller(t *testing.T) {
+	f := &admissionFixture{}
+	var statements atomic.Int64
+	var submitted []int64
+	f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		statements.Add(1)
+		for i := 4; i < len(args); i += 2 {
+			submitted = append(submitted, args[i].Value.(int64))
+		}
+		return renewalAdmissionRows(query, args)
+	}
+	d := admissionTestDB(t, f)
+	d.dsn = "libsql://fixture.invalid"
+	e := fakeRemoteEngine(d)
+	e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+	release, err := d.writer.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	var answers []<-chan pendingRenewalAnswer
+	var cancellations []context.CancelFunc
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cancellations = append(cancellations, cancel)
+		answers = append(answers, startPendingRenewal(e, ctx, "q", []SettleItem{{SeqNumber: int64(i + 1), LockToken: "valid"}}))
+		waitPendingRenewalCalls(t, &d.writer, i+1)
+	}
+	for _, cancel := range cancellations {
+		cancel()
+	}
+	for _, answer := range answers {
+		if result := receivePendingRenewal(t, answer); !errors.Is(result.err, context.Canceled) {
+			t.Errorf("abandoned member: %v", result.err)
+		}
+	}
+	fresh := startPendingRenewal(e, context.Background(), "q", []SettleItem{{SeqNumber: 3, LockToken: "valid"}})
+	waitPendingRenewalCalls(t, &d.writer, 1)
+	release()
+	result := receivePendingRenewal(t, fresh)
+	if result.err != nil || len(result.items) != 1 || !result.items[0].Ok || result.items[0].SeqNumber != 3 {
+		t.Errorf("fresh caller inherited abandoned group: result=%v err=%v", result.items, result.err)
+	}
+	if err := d.close(); err != nil {
+		t.Fatal(err)
+	}
+	if statements.Load() != 1 || fmt.Sprint(submitted) != "[3]" || f.active.Load() != 0 || f.maximum.Load() != 1 {
+		t.Errorf("abandoned pairs were dispatched: count=%d pairs=%v active=%d maximum=%d", statements.Load(), submitted, f.active.Load(), f.maximum.Load())
+	}
+	assertRenewalLogicalWrites(t, d, 1, 2)
+}
+
+// Force the scheduling window where the last caller cancels before the worker
+// gets its first instruction. No runtime hook or scheduler timing is involved.
+func TestRemoteCanceledRenewalBeforeWorkerStartsRetiresAdmissionTicket(t *testing.T) {
+	for _, granted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("already_granted=%v", granted), func(t *testing.T) {
+			f := &admissionFixture{}
+			var renewalSQL atomic.Int64
+			f.returning = func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+				renewalSQL.Add(1)
+				return renewalAdmissionRows(query, args)
+			}
+			d := admissionTestDB(t, f)
+			d.dsn = "libsql://fixture.invalid"
+			e := fakeRemoteEngine(d)
+			release, err := d.writer.acquire(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			if !d.enter() {
+				t.Fatal("could not register the admitted physical group")
+			}
+			ctx, attempt := startStorage(renewWriteContext(context.Background()), "write")
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			memberCtx, cancelMember := context.WithCancel(context.Background())
+			cancelMember()
+			_, memberAttempt := startStorage(memberCtx, "write")
+			d.finishStorage(memberAttempt, context.Canceled)
+			items := []SettleItem{{SeqNumber: 1, LockToken: "valid"}}
+			bytes, _ := renewalMergeSize("q", items)
+			g := &renewalGroup{
+				e: e, queue: "q", config: queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000},
+				ctx: ctx, cancel: cancel, attempt: attempt, sealed: true, positions: 1, bytes: bytes,
+				members: []*renewalMember{{ctx: memberCtx, items: items, done: make(chan struct{}), active: false, attempt: memberAttempt}},
+			}
+			p := &remoteWriteWaiter{ready: make(chan struct{}), queue: &d.writer.renew, renewal: g}
+			g.waiter = p
+			d.writer.mu.Lock()
+			p.element = d.writer.renew.PushBack(p)
+			d.writer.renewGroups++
+			d.writer.mu.Unlock()
+			// Only fixture containment on a failing implementation: after recording
+			// the defect, do not leave a synthetic broken permit in test cleanup.
+			defer func() {
+				d.writer.mu.Lock()
+				if p.element != nil {
+					p.queue.Remove(p.element)
+					p.element = nil
+				}
+				if p.granted && d.writer.held {
+					d.writer.releaseLocked()
+				}
+				d.writer.mu.Unlock()
+			}()
+			if granted {
+				release()
+			}
+			cancel()
+			g.run()
+			release()
+			d.writer.mu.Lock()
+			pending, held, groups := d.writer.renew.Len(), d.writer.held, d.writer.renewGroups
+			d.writer.mu.Unlock()
+			if pending != 0 || held || groups != 0 {
+				t.Errorf("canceled startup left an admission ticket: pending=%d held=%v groups=%d", pending, held, groups)
+			}
+			ctxNext, cancelNext := context.WithTimeout(context.Background(), time.Second)
+			defer cancelNext()
+			if _, err := d.exec(ctxNext, "UPDATE after_canceled_group_startup"); err != nil {
+				t.Errorf("next writer cannot acquire after the canceled group finished: %v", err)
+			}
+			closed := make(chan error, 1)
+			go func() { closed <- d.close() }()
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("Close did not join the canceled startup owner")
+			}
+			if renewalSQL.Load() != 0 || f.active.Load() != 0 || d.sql.Stats().InUse != 0 {
+				t.Errorf("canceled startup executed renewal SQL or leaked a lease: SQL=%d active=%d in_use=%d", renewalSQL.Load(), f.active.Load(), d.sql.Stats().InUse)
+			}
+		})
+	}
+}
+
+func TestRemoteCoalescedRenewalPanicAndGoexitReleaseOwner(t *testing.T) {
+	for _, goexit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("goexit=%v", goexit), func(t *testing.T) {
+			f := &admissionFixture{}
+			d := admissionTestDB(t, f)
+			d.dsn = "libsql://fixture.invalid"
+			e := fakeRemoteEngine(d)
+			e.qcache["q"] = queueRow{name: "q", kind: "queue", lifecycleState: "active", lockDurationMs: 3000}
+			originalPanic := &struct{ message string }{"controlled coalesced renewal panic"}
+			var reads atomic.Int64
+			e.now = func() int64 {
+				if reads.Add(1) > 2 { // Both cached queue checks finish before the writer grant.
+					if goexit {
+						runtime.Goexit()
+					}
+					panic(originalPanic)
+				}
+				return 1000
+			}
+			release, err := d.writer.acquire(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			type outcome struct {
+				returned bool
+				panic    any
+				err      error
+			}
+			answers := make(chan outcome, 2)
+			for i := 0; i < 2; i++ {
+				go func(i int) {
+					result := outcome{}
+					defer func() { result.panic = recover(); answers <- result }()
+					_, result.err = e.RenewBatch(context.Background(), "q", []SettleItem{{SeqNumber: int64(i + 1), LockToken: "valid"}})
+					result.returned = true
+				}(i)
+				waitPendingRenewalCalls(t, &d.writer, i+1)
+			}
+			release()
+			for i := 0; i < 2; i++ {
+				select {
+				case result := <-answers:
+					if goexit {
+						if !result.returned || result.panic != nil || !errors.Is(result.err, ErrOutcomeUnknown) {
+							t.Errorf("worker Goexit stranded or exited caller: %+v", result)
+						}
+					} else if result.returned || result.panic != originalPanic {
+						t.Errorf("original panic was swallowed or changed: %+v", result)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("abnormal worker stranded a caller")
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := d.exec(ctx, "UPDATE after_coalesced_exit"); err != nil {
+				t.Errorf("abnormal worker retained its writer permit: %v", err)
+			}
+			if err := d.close(); err != nil {
+				t.Fatal(err)
+			}
+			d.writer.mu.Lock()
+			groups := d.writer.renewGroups
+			d.writer.mu.Unlock()
+			if groups != 0 || f.active.Load() != 0 || d.sql.Stats().InUse != 0 {
+				t.Errorf("abnormal worker did not join: groups=%d active=%d in_use=%d", groups, f.active.Load(), d.sql.Stats().InUse)
+			}
+		})
+	}
 }
 
 func TestRemoteMutationEntrypointsDoNotOverlap(t *testing.T) {
