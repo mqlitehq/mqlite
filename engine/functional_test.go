@@ -156,6 +156,109 @@ func TestAbandonWithDelay(t *testing.T) {
 	}
 }
 
+func TestAbandonRejectsInvalidDelayWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	for _, maximum := range []int{1, 3} {
+		for _, delay := range []int64{-1, math.MaxInt64} {
+			t.Run(fmt.Sprintf("max=%d delay=%d", maximum, delay), func(t *testing.T) {
+				e, _ := testEngine(t)
+				mustQueue(t, e, "q", QueueConfig{MaxDeliveryCount: maximum})
+				if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("keep")}); err != nil {
+					t.Fatal(err)
+				}
+				message := recvOne(t, e, "q")
+				before, err := e.Peek(ctx, "q", PeekOptions{State: StateLocked})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := e.Abandon(ctx, "q", message.SeqNumber, message.LockToken, delay); !errors.Is(err, ErrInvalidArgument) {
+					t.Fatalf("Abandon(%d) = %v, want ErrInvalidArgument", delay, err)
+				}
+				after, err := e.Peek(ctx, "q", PeekOptions{State: StateLocked})
+				if err != nil || !reflect.DeepEqual(before, after) {
+					t.Fatalf("invalid delay changed delivery: before=%+v after=%+v err=%v", before, after, err)
+				}
+				var receipts int
+				if err := e.db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM settlement_receipts`).Scan(&receipts); err != nil || receipts != 0 {
+					t.Fatalf("invalid delay wrote receipts=%d err=%v", receipts, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAbandonDelayBoundaryAndOverflowingReceiptReplay(t *testing.T) {
+	ctx := context.Background()
+	e, clock := testEngine(t)
+	atomic.StoreInt64(clock, math.MaxInt64-2000)
+	mustQueue(t, e, "q", QueueConfig{MaxDeliveryCount: 3})
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("boundary")}); err != nil {
+		t.Fatal(err)
+	}
+	message := recvOne(t, e, "q")
+	if err := e.Abandon(ctx, "q", message.SeqNumber, message.LockToken, 2000); err != nil {
+		t.Fatalf("exact MaxInt64 boundary rejected: %v", err)
+	}
+	before, err := e.Peek(ctx, "q", PeekOptions{State: StateScheduled})
+	if err != nil || len(before) != 1 || before[0].VisibleAtMs != math.MaxInt64 {
+		t.Fatalf("maximum deadline = %+v, %v", before, err)
+	}
+	advance(clock, time.Millisecond)
+	// Recomputing now+delay would now overflow, but this exact request already
+	// committed and its receipt remains live. Replay must retain that success.
+	if err := e.Abandon(ctx, "q", message.SeqNumber, message.LockToken, 2000); err != nil {
+		t.Fatalf("clock advancement broke exact receipt replay: %v", err)
+	}
+	if err := e.Abandon(ctx, "q", message.SeqNumber, message.LockToken, 2001); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("different overflowing request inherited a receipt: %v", err)
+	}
+	if err := e.Abandon(ctx, "q", message.SeqNumber, message.LockToken+"wrong", 2000); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("wrong token inherited a receipt: %v", err)
+	}
+	after, err := e.Peek(ctx, "q", PeekOptions{State: StateScheduled})
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("receipt replay mutated deadline: before=%+v after=%+v err=%v", before, after, err)
+	}
+	if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("new ownership")}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := recvOne(t, e, "q")
+	if fresh == nil {
+		t.Fatal("fresh message was not claimable")
+	}
+	if err := e.Abandon(ctx, "q", fresh.SeqNumber, fresh.LockToken, 2000); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("new effect overflowing by one millisecond = %v, want ErrInvalidArgument", err)
+	}
+	if err := e.Complete(ctx, "q", fresh.SeqNumber, fresh.LockToken); err != nil {
+		t.Fatalf("overflow rejection changed the new token: %v", err)
+	}
+}
+
+func TestAbandonZeroAndOneMillisecondDelay(t *testing.T) {
+	ctx := context.Background()
+	for _, delay := range []int64{0, 1} {
+		t.Run(fmt.Sprint(delay), func(t *testing.T) {
+			e, clock := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{MaxDeliveryCount: 3})
+			if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("valid")}); err != nil {
+				t.Fatal(err)
+			}
+			message := recvOne(t, e, "q")
+			if err := e.Abandon(ctx, "q", message.SeqNumber, message.LockToken, delay); err != nil {
+				t.Fatal(err)
+			}
+			state := StateActive
+			if delay > 0 {
+				state = StateScheduled
+			}
+			rows, err := e.Peek(ctx, "q", PeekOptions{State: state})
+			if err != nil || len(rows) != 1 || rows[0].VisibleAtMs != atomicNow(clock)+delay {
+				t.Fatalf("valid Abandon(%d) = %+v, %v", delay, rows, err)
+			}
+		})
+	}
+}
+
 // TTL expiry routes to the DLQ (dead_letter_on_expire=1) with reason TTLExpired.
 func TestTTLToDeadLetter(t *testing.T) {
 	ctx := context.Background()

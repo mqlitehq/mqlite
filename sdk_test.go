@@ -293,6 +293,99 @@ func testManagedReceiveReplaysMalformedItemWithSameAttempt(t *testing.T, corrupt
 	}
 }
 
+func TestAbandonRejectsInvalidDurationBeforeRequest(t *testing.T) {
+	var calls int32
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer stub.Close()
+	client, err := mqlite.Open(context.Background(), stub.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	for _, delay := range []time.Duration{-time.Second, -time.Nanosecond, time.Nanosecond, time.Millisecond - time.Nanosecond} {
+		if err := client.Message("q", 1, "token").Abandon(context.Background(), mqlite.AbandonOpts{Delay: delay}); !errors.Is(err, mqlite.ErrInvalidArgument) {
+			t.Errorf("Abandon(%s) = %v, want ErrInvalidArgument", delay, err)
+		}
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("invalid delays sent %d HTTP requests", calls)
+	}
+}
+
+func TestAbandonPreservesZeroAndOneMillisecond(t *testing.T) {
+	for _, delay := range []time.Duration{0, time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			var calls int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				var request struct {
+					Delay int64 `json:"delay_ms"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Delay != int64(delay/time.Millisecond) {
+					t.Errorf("delay=%d error=%v", request.Delay, err)
+				}
+				_, _ = io.WriteString(w, `{"ok":true}`)
+			}))
+			defer stub.Close()
+			client, err := mqlite.Open(context.Background(), stub.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if err := client.Message("q", 1, "token").Abandon(context.Background(), mqlite.AbandonOpts{Delay: delay}); err != nil {
+				t.Fatal(err)
+			}
+			if atomic.LoadInt32(&calls) != 1 {
+				t.Fatalf("valid Abandon calls=%d", calls)
+			}
+		})
+	}
+}
+
+func TestRemoteAbandonInvalidDelayLeavesFinalDeliveryLocked(t *testing.T) {
+	ctx := context.Background()
+	client, eng := newBroker(t, "")
+	if err := client.CreateQueue(ctx, "q", mqlite.QueueConfig{MaxDeliveryCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SendOne(ctx, "q", mqlite.OutMessage{Body: []byte("final delivery")}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := client.Receive(ctx, "q")
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("receive = (%+v, %v)", messages, err)
+	}
+	message := messages[0]
+	stub := httptest.NewServer(server.New(eng.Engine(), nil).Handler())
+	defer stub.Close()
+	for _, delay := range []int64{-1, math.MaxInt64} {
+		body, err := json.Marshal(wire.SettleRequest{Queue: "q", SeqNumber: message.SequenceNumber, LockToken: message.LockToken(), DelayMs: delay})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.Post(stub.URL+wire.PathAbandon, "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope struct{ Code string }
+		decodeErr := json.NewDecoder(response.Body).Decode(&envelope)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest || decodeErr != nil || envelope.Code != "invalid_argument" {
+			t.Fatalf("Abandon delay=%d HTTP=%d envelope=%+v error=%v", delay, response.StatusCode, envelope, decodeErr)
+		}
+		stats, err := client.Stats(ctx, "q")
+		if err != nil || stats.Locked != 1 || stats.DeadLettered != 0 || stats.Total != 1 {
+			t.Fatalf("invalid delay settled the final delivery: %+v, %v", stats, err)
+		}
+	}
+	if err := message.Complete(ctx); err != nil {
+		t.Fatalf("invalid delays invalidated the live token: %v", err)
+	}
+}
+
 // Keep the released public type's exact field order, tags and arity. This also
 // preserves external unkeyed SubscriptionInfo literals at compile time.
 var _ struct {

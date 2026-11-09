@@ -2,6 +2,7 @@ package mqlite
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -49,9 +50,12 @@ func (m *Message) Complete(ctx context.Context) error {
 
 // Abandon ends the current delivery attempt. Below the delivery limit the message
 // becomes available again immediately or after the optional delay; at the limit it
-// is dead-lettered instead.
+// is dead-lettered instead. Delay must be zero or at least one millisecond.
 func (m *Message) Abandon(ctx context.Context, opts ...AbandonOpts) error {
 	o := firstOpt(opts)
+	if o.Delay < 0 || o.Delay > 0 && o.Delay < time.Millisecond {
+		return fmt.Errorf("%w: abandon delay must be zero or at least 1ms", ErrInvalidArgument)
+	}
 	return m.s.abandon(ctx, m.queue, m.SequenceNumber, m.lockToken, o.Delay.Milliseconds())
 }
 
