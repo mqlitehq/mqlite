@@ -4739,3 +4739,87 @@ func TestRemoteSendInvalidSuccessIsOutcomeUnknown(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteSendSequenceAcknowledgementDomain(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		batch     bool
+		scheduled bool
+		want      []int64
+	}{
+		{name: "negative", body: `{"seq_numbers":[-1]}`},
+		{name: "null", body: `{"seq_numbers":[null]}`},
+		{name: "batch negative", body: `{"seq_numbers":[7,-1]}`, batch: true},
+		{name: "batch null", body: `{"seq_numbers":[7,null]}`, batch: true},
+		{name: "scheduled negative", body: `{"seq_numbers":[-1]}`, scheduled: true},
+		{name: "scheduled null", body: `{"seq_numbers":[null]}`, scheduled: true},
+		{name: "string", body: `{"seq_numbers":["7"]}`},
+		{name: "fraction", body: `{"seq_numbers":[7.0]}`},
+		{name: "exponent", body: `{"seq_numbers":[7e0]}`},
+		{name: "repeated field earlier string", body: `{"seq_numbers":["7"],"seq_numbers":[0]}`},
+		{name: "repeated field earlier fraction", body: `{"seq_numbers":[7.0],"seq_numbers":[0]}`},
+		{name: "repeated valid field", body: `{"seq_numbers":[7],"seq_numbers":[0]}`, want: []int64{0}},
+		{name: "missing", body: `{}`},
+		{name: "null array", body: `{"seq_numbers":null}`},
+		{name: "positive", body: `{"seq_numbers":[7]}`, want: []int64{7}},
+		{name: "zero unmatched topic", body: `{"seq_numbers":[0]}`, want: []int64{0}},
+		{name: "batch positive", body: `{"seq_numbers":[7,8]}`, batch: true, want: []int64{7, 8}},
+		{name: "batch duplicate dedup", body: `{"seq_numbers":[7,7]}`, batch: true, want: []int64{7, 7}},
+		{name: "batch zero unmatched topic", body: `{"seq_numbers":[0,0]}`, batch: true, want: []int64{0, 0}},
+		{name: "unknown extension string", body: `{"seq_numbers":[0],"extension":"null is extension text"}`, want: []int64{0}},
+		{name: "unknown extension null", body: `{"seq_numbers":[0],"extension":null}`, want: []int64{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			hc := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				wantPath := wire.PathSend
+				if tc.scheduled {
+					wantPath = wire.PathSchedule
+				}
+				if req.URL.Path != wantPath {
+					t.Errorf("path=%s, want %s", req.URL.Path, wantPath)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+					Body: io.NopCloser(strings.NewReader(tc.body)), Request: req}, nil
+			})}
+			client, err := mqlite.Open(context.Background(), "http://broker.invalid", mqlite.WithHTTPClient(hc))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			var got []int64
+			if tc.batch {
+				// Duplicate positive ACKs are valid when identical inputs deduplicate.
+				message := mqlite.OutMessage{Body: []byte("same"), MessageID: "same-id"}
+				got, err = client.Send(context.Background(), "topic", message, message)
+			} else {
+				var seq int64
+				var options []mqlite.SendOpts
+				if tc.scheduled {
+					options = []mqlite.SendOpts{{At: time.Unix(5000, 0)}}
+				}
+				seq, err = client.SendOne(context.Background(), "topic", mqlite.OutMessage{Body: []byte("one")}, options...)
+				got = []int64{seq}
+			}
+			if calls != 1 {
+				t.Fatalf("calls=%d, want exactly one RPC", calls)
+			}
+			if tc.want == nil {
+				if !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+					t.Fatalf("result=%v err=%v, want ErrOutcomeUnknown", got, err)
+				}
+				return
+			}
+			if err != nil || len(got) != len(tc.want) {
+				t.Fatalf("result=%v err=%v, want %v", got, err, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("result=%v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
