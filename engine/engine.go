@@ -45,7 +45,7 @@ type Engine struct {
 	filterMu    sync.Mutex              // guards filterCache
 	filterCache map[string]*filterEntry // compiled subscription filters, keyed by subscription
 
-	commitMu                 sync.Mutex    // orders confirmed commits and their in-memory topology effects
+	commitMu                 commitMutex   // orders confirmed commits and their in-memory topology effects
 	lifecycleWake            chan struct{} // coalesced durable-cleanup work; never closed
 	uncertainLifecycleProbes atomic.Int32  // delayed discovery after an ambiguous remote delete commit
 	observation              observations

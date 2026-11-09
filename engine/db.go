@@ -1203,11 +1203,57 @@ func (t *txn) QueryRowContext(_ context.Context, q string, args ...any) transact
 // cannot see their boundaries — so they are not guarded. EngineTx documents this.
 func (t *txn) SQL() *sql.Tx { return t.tx }
 
+// commitMutex preserves commit/effect serialization while allowing a queued
+// caller to cancel before any COMMIT starts (MQLITE-189). Its zero value is ready
+// to use. Waiting needs no polling, timer, or detached goroutine.
+type commitMutex struct {
+	once sync.Once
+	held chan struct{}
+}
+
+func (m *commitMutex) channel() chan struct{} {
+	m.once.Do(func() { m.held = make(chan struct{}, 1) })
+	return m.held
+}
+
+func (m *commitMutex) Lock() { m.channel() <- struct{}{} }
+
+func (m *commitMutex) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.channel() <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *commitMutex) TryLock() bool {
+	select {
+	case m.channel() <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *commitMutex) Unlock() {
+	select {
+	case <-m.channel():
+	default:
+		panic("mqlite: unlock of unlocked commit mutex")
+	}
+}
+
 // commitAttempt keeps confirmed commits and their in-memory topology effects in
 // the same order. A deletion must publish retirement before a later creation
 // publishes the reused name, including when its commit acknowledgement is delayed.
 func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
-	e.commitMu.Lock()
+	if err := e.commitMu.LockContext(attempt.caller); err != nil {
+		return err, true
+	}
 	defer e.commitMu.Unlock()
 	// Waiting for the commit sequencer is not part of the database commit. If
 	// the caller stopped while queued here, no commit has started and the exact
