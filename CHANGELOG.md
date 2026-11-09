@@ -12,6 +12,11 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+- Reject negative or null sequence-number slots in successful Send acknowledgements
+  as `ErrOutcomeUnknown`, without replaying the request. Preserve valid zero
+  results for unmatched topic publishes and duplicate positive results from dedup
+  (MQLITE-188).
+
 ### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
 
 - Give asynchronous libSQL HTTP stream-close requests a five-second deadline and
