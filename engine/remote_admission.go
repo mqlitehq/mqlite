@@ -301,6 +301,7 @@ func (d *db) retryRemoteReturning(ctx context.Context, attempt func() (issued, q
 // The permit covers exactly one transaction attempt, through driver Commit or
 // Rollback and SQL-lease return. The outer retry loop backs off without it.
 func (e *Engine) remoteTransactionAttempt(ctx context.Context, fn func(context.Context, *txn) error, readOnly bool) (ferr, cerr error, commitNotStarted bool, beginErr error) {
+	setTransactionPhase(ctx, transactionPhaseAdmission)
 	if !readOnly {
 		release, err := e.db.writer.acquire(ctx)
 		if err != nil {
@@ -308,6 +309,7 @@ func (e *Engine) remoteTransactionAttempt(ctx context.Context, fn func(context.C
 		}
 		defer release()
 	}
+	setTransactionPhase(ctx, transactionPhaseConnection)
 	observationEpoch := e.observationEpoch()
 	conn, err := e.db.sql.Conn(ctx)
 	if err != nil {
@@ -320,6 +322,7 @@ func (e *Engine) remoteTransactionAttempt(ctx context.Context, fn func(context.C
 	if err := checkCtx(ctx); err != nil {
 		return nil, nil, false, err
 	}
+	setTransactionPhase(ctx, transactionPhaseBegin)
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, false, err
@@ -329,6 +332,7 @@ func (e *Engine) remoteTransactionAttempt(ctx context.Context, fn func(context.C
 		return nil, nil, false, err
 	}
 	attempt := &txn{tx: tx, caller: ctx, exec: e.db.stmtCtx(ctx), observationEpoch: observationEpoch}
+	setTransactionPhase(ctx, transactionPhaseBody)
 	if ferr = fn(e.db.stmtCtx(ctx), attempt); ferr != nil {
 		return ferr, nil, false, nil
 	}

@@ -4407,3 +4407,101 @@ func TestInitialLegacyGoexitReleasesFollowingConfirmation(t *testing.T) {
 		t.Fatalf("Run=%v handlers=%d", err, handled)
 	}
 }
+
+// HTTP status controls capability detection, even when an intermediary's body
+// advertises an unrelated "unimplemented" error.
+func TestRenewalCapabilityUsesHTTPStatus(t *testing.T) {
+	for _, phase := range []string{"initial-batch", "heartbeat"} {
+		for _, tc := range []struct {
+			name     string
+			status   int
+			fallback bool
+		}{
+			{"unavailable", 503, false}, {"rate-limit", 429, false},
+			{"canceled", 499, false}, {"timeout", 408, false},
+			{"internal", 500, false}, {"invalid", 400, false},
+			{"unauthenticated", 401, false}, {"permission", 403, false},
+			{"missing-route", 404, true}, {"not-implemented", 501, false},
+		} {
+			t.Run(phase+"/"+tc.name, func(t *testing.T) {
+				var mu sync.Mutex
+				var batches, singles int
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					switch req.URL.Path {
+					case wire.PathRenewBatch:
+						var request wire.RenewBatchRequest
+						if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+							t.Errorf("renew request: %v", err)
+							w.WriteHeader(http.StatusBadRequest)
+							return
+						}
+						mu.Lock()
+						batches++
+						call := batches
+						mu.Unlock()
+						if call == 1 {
+							w.WriteHeader(tc.status)
+							if tc.fallback {
+								_, _ = io.WriteString(w, `{"code":"not_found","message":"no such path: /mqlite.v1.QueueService/RenewBatch"}`)
+							} else {
+								_, _ = io.WriteString(w, `{"code":"unimplemented","message":"proxy response"}`)
+							}
+							return
+						}
+						results := make([]wire.SettleItemResult, len(request.Messages))
+						for i, item := range request.Messages {
+							results[i] = wire.SettleItemResult{SeqNumber: item.SeqNumber, Ok: true, LockedUntilMs: time.Now().Add(30*time.Second).UnixNano() / int64(time.Millisecond)}
+						}
+						_ = json.NewEncoder(w).Encode(wire.RenewBatchResponse{Results: results})
+					case wire.PathRenew:
+						mu.Lock()
+						singles++
+						mu.Unlock()
+						_ = json.NewEncoder(w).Encode(wire.SettleResponse{Ok: true})
+					default:
+						t.Errorf("unexpected request path %s", req.URL.Path)
+						w.WriteHeader(http.StatusNotFound)
+					}
+				}))
+				defer server.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				client, err := Open(ctx, server.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				receiver := client.Receiver("jobs", WithAutoRenew())
+				messages := []*Message{
+					{SequenceNumber: 1, LockedUntil: time.Now().Add(30 * time.Second), queue: "jobs", lockToken: "one", s: client},
+					{SequenceNumber: 2, LockedUntil: time.Now().Add(30 * time.Second), queue: "jobs", lockToken: "two", s: client},
+				}
+				for attempt := 0; attempt < 2; attempt++ {
+					if phase == "initial-batch" {
+						_, _ = receiver.prepareInitialRenewals(ctx, messages, true)
+					} else {
+						_, _ = receiver.renewMessage(ctx, messages[0])
+					}
+					receiver.renewCapabilityMu.Lock()
+					unsupported := receiver.deadlineRenewUnsupported
+					receiver.renewCapabilityMu.Unlock()
+					if unsupported != tc.fallback {
+						t.Fatalf("status %d cached unsupported=%t, want %t", tc.status, unsupported, tc.fallback)
+					}
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				wantBatches, wantSingles := 2, 0
+				if tc.fallback {
+					wantBatches = 1
+					if phase == "heartbeat" {
+						wantSingles = 2
+					}
+				}
+				if batches != wantBatches || singles != wantSingles {
+					t.Fatalf("requests: RenewBatch=%d Renew=%d, want %d/%d", batches, singles, wantBatches, wantSingles)
+				}
+			})
+		}
+	}
+}

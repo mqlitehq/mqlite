@@ -12,6 +12,25 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Preserve bounded failure evidence in Turso verification (MQLITE-155)
+
+- Retain safe cause types, known error identities, caller cancellation state and
+  transaction phase when a foreground soak operation fails. Private provider
+  messages, SQL and credentials remain excluded from verification artifacts.
+- Add the transaction phase to existing private failure logs. `commit_call`
+  records entry into `sql.Tx.Commit`, not proof of network dispatch or commit.
+  This improves future diagnosis; it does not establish the cause of the
+  historical unclassified Complete failure.
+
+### Avoid redundant remote schema initialization (MQLITE-162)
+
+- Reopening a complete current-schema HTTP Hrana database validates its owned
+  catalog in one read and omits repeated no-op schema DDL. Cold, incomplete and
+  unrecognized catalogs retain the existing initialization path.
+- Keep schema-version, access-key and parent-guard validation, the schema-version
+  write and all startup recovery. This reduces remote round trips; it does not
+  increase lease durations or guarantee that an arbitrary outage fits a lease.
+
 ### Validate remote SQL acknowledgements (MQLITE-191)
 
 - Reject missing or mismatched HTTP Hrana results as protocol errors instead of

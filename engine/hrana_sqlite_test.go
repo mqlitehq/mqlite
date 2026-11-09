@@ -48,6 +48,7 @@ type sqliteHranaSession struct {
 
 type sqliteHranaStats struct {
 	Requests, Statements, Begins, Commits, Rollbacks, MessageInserts, Batches, Busy int
+	SchemaDDL, CatalogReads, VersionWrites                                          int
 }
 
 type sqliteHranaValue struct {
@@ -342,6 +343,15 @@ func (f *sqliteHranaFixture) execute(session *sqliteHranaSession, statement sqli
 	normalized := strings.ToUpper(strings.Join(strings.Fields(statement.SQL), " "))
 	f.mu.Lock()
 	f.stats.Statements++
+	if strings.HasPrefix(normalized, "CREATE ") {
+		f.stats.SchemaDDL++
+	}
+	if strings.Contains(normalized, "FROM SQLITE_MASTER") {
+		f.stats.CatalogReads++
+	}
+	if strings.HasPrefix(normalized, "INSERT OR IGNORE INTO META") {
+		f.stats.VersionWrites++
+	}
 	if normalized == "BEGIN" {
 		f.stats.Begins++
 	}
@@ -1082,6 +1092,32 @@ func TestHTTPHranaPreResponseFailureKeepsIdentity(t *testing.T) {
 	_, err = conn.(driver.QueryerContext).QueryContext(context.Background(), "SELECT 1", nil)
 	if !errors.Is(err, failure) || libsqlcompat.IsInvalidAcknowledgement(err) || calls.Load() != 1 {
 		t.Fatalf("pre-response failure: error=%v calls=%d", err, calls.Load())
+	}
+}
+
+func TestSQLiteHranaWarmOpenAvoidsRedundantSchemaWrites(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.setDelay(10 * time.Millisecond)
+	before := f.snapshot()
+	start := time.Now()
+	warm := f.openEngine(t, true)
+	elapsed := time.Since(start)
+	after := f.snapshot()
+	t.Logf("warm Open: elapsed=%s requests=%d schema_ddl=%d catalog_reads=%d version_writes=%d", elapsed,
+		after.Requests-before.Requests, after.SchemaDDL-before.SchemaDDL,
+		after.CatalogReads-before.CatalogReads, after.VersionWrites-before.VersionWrites)
+	if err := warm.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := after.SchemaDDL - before.SchemaDDL; got != 0 {
+		t.Fatalf("complete current schema executed %d redundant DDL statements", got)
+	}
+	if got := after.VersionWrites - before.VersionWrites; got != 1 {
+		t.Fatalf("schema-version write count=%d, want existing write once", got)
 	}
 }
 

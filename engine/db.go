@@ -284,9 +284,10 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 // before DDL. Recognized equivalent parent-trigger spelling is refreshed later,
 // transactionally, before Open admits work.
 func (d *db) initSchema(ctx context.Context) error {
-	if v, ok, err := d.recordedSchemaVersion(ctx); err != nil {
+	v, recorded, err := d.recordedSchemaVersion(ctx)
+	if err != nil {
 		return err
-	} else if ok && v != schemaVersion {
+	} else if recorded && v != schemaVersion {
 		return fmt.Errorf("%w: database schema is %q but this build expects %q; "+
 			"recreate it (delete the file / drop the tables) — mqlite keeps a single schema and does not migrate",
 			ErrSchemaVersionMismatch, v, schemaVersion)
@@ -301,9 +302,18 @@ func (d *db) initSchema(ctx context.Context) error {
 		return err
 	}
 	d.refreshParentGuards = refresh
-	for _, stmt := range schemaStmts {
-		if _, err := d.exec(ctx, stmt); err != nil {
-			return fmt.Errorf("schema: %w\n%s", err, firstLine(stmt))
+	complete := false
+	if recorded && d.remote && isHTTPHranaDSN(d.dsn) && !refresh {
+		complete, err = d.hasCompleteWarmSchema(ctx)
+		if err != nil {
+			return fmt.Errorf("check current schema: %w", err)
+		}
+	}
+	if !complete {
+		for _, stmt := range schemaStmts {
+			if _, err := d.exec(ctx, stmt); err != nil {
+				return fmt.Errorf("schema: %w\n%s", err, firstLine(stmt))
+			}
 		}
 	}
 	if _, err := d.exec(ctx,
@@ -349,6 +359,18 @@ func normalizedSchemaSQL(s string) string {
 			i++
 			continue
 		}
+		if strings.HasPrefix(s[i:], "--") {
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(s[i:], "/*") {
+			if end := strings.Index(s[i+2:], "*/"); end >= 0 {
+				i += end + 4
+				continue
+			}
+		}
 		start := i
 		if s[i] == '\'' || s[i] == '"' || s[i] == '`' || s[i] == '[' {
 			end := s[i]
@@ -386,9 +408,13 @@ func normalizedSchemaSQL(s string) string {
 		}
 	}
 	// SQLite usually omits this clause in its catalog; Rust can retain it.
-	if len(tokens) >= 5 && tokens[0] == "CREATE" && (tokens[1] == "TABLE" || tokens[1] == "INDEX" || tokens[1] == "TRIGGER") &&
-		tokens[2] == "IF" && tokens[3] == "NOT" && tokens[4] == "EXISTS" {
-		tokens = append(tokens[:2], tokens[5:]...)
+	kindAt := 1
+	if len(tokens) > kindAt && tokens[kindAt] == "UNIQUE" {
+		kindAt++
+	}
+	if len(tokens) > kindAt+3 && tokens[0] == "CREATE" && (tokens[kindAt] == "TABLE" || tokens[kindAt] == "INDEX" || tokens[kindAt] == "TRIGGER") &&
+		tokens[kindAt+1] == "IF" && tokens[kindAt+2] == "NOT" && tokens[kindAt+3] == "EXISTS" {
+		tokens = append(tokens[:kindAt+1], tokens[kindAt+4:]...)
 	}
 	return strings.Join(tokens, " ")
 }
@@ -1251,6 +1277,9 @@ func (m *commitMutex) Unlock() {
 // the same order. A deletion must publish retirement before a later creation
 // publishes the reused name, including when its commit acknowledgement is delayed.
 func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
+	if e.db.remote {
+		setTransactionPhase(attempt.caller, transactionPhaseCommitWait)
+	}
 	if err := e.commitMu.LockContext(attempt.caller); err != nil {
 		return err, true
 	}
@@ -1260,6 +1289,9 @@ func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
 	// context error is the only truthful outcome.
 	if err := checkCtx(attempt.caller); err != nil {
 		return err, true
+	}
+	if e.db.remote {
+		setTransactionPhase(attempt.caller, transactionPhaseCommitCall)
 	}
 	if err := attempt.tx.Commit(); err != nil {
 		return err, false
@@ -1344,6 +1376,7 @@ func (e *Engine) inTxMode(ctx context.Context, fn func(context.Context, *txn) er
 	}
 	defer e.db.inFlight.Done()
 	for i := 0; i < e.db.attempts(); i++ {
+		setTransactionPhase(ctx, transactionPhaseAttemptWait)
 		if err = e.db.beforeRemoteAttempt(ctx, i); err != nil {
 			return err
 		}

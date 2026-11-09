@@ -119,6 +119,18 @@ lightweight storage probe still use the backend shown above.
 
 ## Connection resilience (the remote hardening)
 
+On a complete current-schema HTTP database, Open checks the owned schema catalog
+and avoids repeating no-op CREATE statements. It still verifies the schema token,
+access-key objects and parent guards, records the schema version, and performs
+normal subscription/lifecycle and lease recovery. Missing objects and known
+legacy guards follow the existing initialization and repair path; a catalog read
+error stops Open instead of authorizing an unverified fast path. Local SQLite and
+WebSocket initialization are unchanged.
+
+This optimization reduces startup round trips, not the scope of a lease. Budget
+the complete stop, storage cleanup, Open, readiness, reconnection and settlement
+window against the lease that actually remains when shutdown begins.
+
 An HTTP Hrana response can succeed with a null baton, which means the server has
 closed that logical stream. The pinned `libsql-client-go` records the closed state
 but does not implement `driver.Validator`. Without the MQLite adapter,

@@ -118,6 +118,11 @@ clients are sending or receiving.
 
 Structured stderr events `maintenance.failure`, `maintenance.interrupted`,
 `maintenance.recovered`, `storage.interrupted`, and `storage.failure` record the task/step or operation.
+Existing storage failure records also include a fixed `transaction_phase`: `attempt_wait`,
+`admission`, `connection`, `begin`, `body`, `commit_wait`, or `commit_call`;
+`unavailable` is normal for paths without transaction phase tracking.
+`commit_call` means entry into `sql.Tx.Commit`, not proof of wire dispatch or
+commit confirmation; this private log field does not add a metric label or wire field.
 Failure events include the same fingerprint as Observe and a bounded provider
 explanation with common credentials and URLs redacted. Public monitor responses
 contain generated explanations only, never the raw provider/SQL error. Private

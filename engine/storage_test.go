@@ -348,6 +348,360 @@ func TestLifecycleSchemaRejectsVersionFiveWithoutMutation(t *testing.T) {
 	}
 }
 
+// ─── Warm remote schema validation (MQLITE-162) ──────────────────────────────
+
+func TestWarmSchemaInventoryUsesEveryCanonicalObject(t *testing.T) {
+	objects, names, ok := warmSchemaObjects()
+	if !ok || len(objects) != len(schemaStmts) || len(names) != len(schemaStmts) {
+		t.Fatalf("canonical inventory: objects=%d names=%d statements=%d ok=%t", len(objects), len(names), len(schemaStmts), ok)
+	}
+	e, _ := testEngine(t)
+	if complete, err := e.db.hasCompleteWarmSchema(context.Background()); err != nil || !complete {
+		t.Fatalf("fresh canonical SQLite catalog did not match: complete=%t error=%v", complete, err)
+	}
+	previous := schemaStmts
+	schemaStmts = append(append([]string(nil), schemaStmts...), "CREATE VIEW future_schema AS SELECT 1")
+	defer func() { schemaStmts = previous }()
+	if _, _, understood := warmSchemaObjects(); understood {
+		t.Fatal("unrecognized future DDL silently entered the warm path")
+	}
+}
+
+func TestWarmSchemaNormalizationRetainsDefinitionSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name, left, right string
+		equal             bool
+	}{
+		{"unique-index-clause", "CREATE UNIQUE INDEX IF NOT EXISTS idx ON items(id)", "CREATE UNIQUE INDEX idx ON items ( id )", true},
+		{"comments", "CREATE TABLE t(a INTEGER /* a comment */ CHECK(a>0)) -- trailing", "CREATE TABLE t (a INTEGER CHECK(a>0))", true},
+		{"literal-comment", "CREATE TABLE t(a TEXT DEFAULT '--value')", "CREATE TABLE t(a TEXT DEFAULT 'value')", false},
+		{"literal-block-comment", "CREATE TABLE t(a TEXT DEFAULT '/*value*/')", "CREATE TABLE t(a TEXT DEFAULT '')", false},
+		{"constraint", "CREATE TABLE t(a INTEGER CHECK(a>0))", "CREATE TABLE t(a INTEGER CHECK(a>=0))", false},
+		{"unique-retained", "CREATE UNIQUE INDEX idx ON t(a)", "CREATE INDEX idx ON t(a)", false},
+		{"comment-token-boundary", "CREATE TABLE t(ab/**/cd INTEGER)", "CREATE TABLE t(abcd INTEGER)", false},
+		{"quoted-identifier", "CREATE TABLE t(\"a\" INTEGER)", "CREATE TABLE t(\"A\" INTEGER)", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizedSchemaSQL(tc.left) == normalizedSchemaSQL(tc.right); got != tc.equal {
+				t.Fatalf("normalization equality=%t want=%t", got, tc.equal)
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmOpenRestoresMissingCanonicalObjects(t *testing.T) {
+	objects, _, ok := warmSchemaObjects()
+	if !ok {
+		t.Fatal("canonical schema inventory unavailable")
+	}
+	for name, object := range objects {
+		t.Run(name, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.db.Exec("DROP " + strings.ToUpper(object.kind) + " " + name); err != nil {
+				t.Fatal(err)
+			}
+			before := f.snapshot()
+			reopened := f.openEngine(t, true)
+			after := f.snapshot()
+			if got := after.SchemaDDL - before.SchemaDDL; got != len(schemaStmts) {
+				t.Fatalf("missing object skipped canonical fallback: DDL=%d want=%d", got, len(schemaStmts))
+			}
+			if complete, err := reopened.db.hasCompleteWarmSchema(context.Background()); err != nil || !complete {
+				t.Fatalf("fallback failed to restore canonical inventory: complete=%t error=%v", complete, err)
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmOpenKeepsVersionWriteSideEffect(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		`CREATE TABLE application_audit(n INTEGER NOT NULL)`,
+		`INSERT INTO application_audit VALUES(0)`,
+		`CREATE INDEX application_extra ON application_audit(n)`,
+		`CREATE TRIGGER application_version_write BEFORE INSERT ON meta WHEN NEW.key='schema_version'
+		 BEGIN UPDATE application_audit SET n=n+1; END`,
+	} {
+		if _, err := f.db.Exec(sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := f.snapshot()
+	f.openEngine(t, true)
+	after := f.snapshot()
+	var count int
+	if err := f.db.QueryRow(`SELECT n FROM application_audit`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || after.VersionWrites-before.VersionWrites != 1 || after.SchemaDDL-before.SchemaDDL != 0 {
+		t.Fatalf("warm version write changed: effect=%d version_writes=%d DDL=%d", count, after.VersionWrites-before.VersionWrites, after.SchemaDDL-before.SchemaDDL)
+	}
+}
+
+func TestSQLiteHranaWarmOpenRetainsPreDDLGuards(t *testing.T) {
+	for _, failure := range []string{"schema-token", "auth-constraint", "parent-guard"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var statements []string
+			switch failure {
+			case "schema-token":
+				statements = []string{`UPDATE meta SET value='unknown' WHERE key='schema_version'`}
+			case "auth-constraint":
+				statements = []string{`DROP TABLE access_keys`, strings.Replace(accessKeySchema, "length(id) = 32", "length(id) >= 1", 1)}
+			case "parent-guard":
+				statements = []string{`DROP TRIGGER trg_queues_messages_delete`, `CREATE TRIGGER trg_queues_messages_delete BEFORE DELETE ON queues WHEN 0 BEGIN SELECT 1; END`}
+			}
+			for _, statement := range statements {
+				if _, err := f.db.Exec(statement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := f.snapshot()
+			e, err := Open(context.Background(), Options{DB: f.dsn, DisableBackground: true})
+			if e != nil {
+				_ = e.Close()
+			}
+			after := f.snapshot()
+			if !errors.Is(err, ErrSchemaVersionMismatch) || e != nil || after.SchemaDDL != before.SchemaDDL || after.VersionWrites != before.VersionWrites {
+				t.Fatalf("guard changed: error=%v opened=%t DDL=%d version_writes=%d", err, e != nil, after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmOpenRefreshesOnlyKnownLegacyGuards(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, guard := range parentGuardSchemas {
+		for _, statement := range []string{"DROP TRIGGER " + guard.name, guard.legacy} {
+			if _, err := f.db.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	before := f.snapshot()
+	reopened := f.openEngine(t, true)
+	after := f.snapshot()
+	if got := after.SchemaDDL - before.SchemaDDL; got != len(schemaStmts)+len(parentGuardSchemas) {
+		t.Fatalf("known legacy guard skipped normal repair: DDL=%d", got)
+	}
+	if complete, err := reopened.db.hasCompleteWarmSchema(context.Background()); err != nil || !complete {
+		t.Fatalf("legacy guard refresh incomplete: complete=%t error=%v", complete, err)
+	}
+}
+
+func TestSQLiteHranaWarmOpenAcceptsKnownRustGuardSpelling(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	guard := parentGuardSchemas[1]
+	for _, statement := range []string{"DROP TRIGGER " + guard.name, strings.Replace(guard.current, "NEW.name<>OLD.name", "NEW.name!=OLD.name", 1)} {
+		if _, err := f.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := f.snapshot()
+	f.openEngine(t, true)
+	if got := f.snapshot().SchemaDDL - before.SchemaDDL; got != 0 {
+		t.Fatalf("known current Rust inequality unnecessarily ran DDL: %d", got)
+	}
+}
+
+func TestSQLiteHranaWarmOpenStillRecoversOnlyExpiredLeases(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	first := f.openEngine(t, true)
+	ctx := context.Background()
+	if err := first.CreateQueue(ctx, "warm-leases", QueueConfig{MaxDeliveryCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Send(ctx, "warm-leases", OutMessage{Body: []byte("live")}, OutMessage{Body: []byte("expired")}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := first.Receive(ctx, "warm-leases", ReceiveOptions{MaxMessages: 2})
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("fixture claim: messages=%d error=%v", len(messages), err)
+	}
+	live, expired := messages[0], messages[1]
+	if _, err := f.db.Exec(`UPDATE messages SET locked_until=? WHERE id=?`, time.Now().Add(-time.Second).UnixMilli(), expired.SeqNumber); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := f.snapshot()
+	reopened := f.openEngine(t, true)
+	if got := f.snapshot().SchemaDDL - before.SchemaDDL; got != 0 {
+		t.Fatalf("canonical live-lease reopen ran DDL: %d", got)
+	}
+	var token, state string
+	var delivery int
+	if err := f.db.QueryRow(`SELECT lock_token,delivery_count FROM messages WHERE id=?`, live.SeqNumber).Scan(&token, &delivery); err != nil {
+		t.Fatal(err)
+	}
+	if token != live.LockToken || delivery != 1 {
+		t.Fatalf("live lease revoked: token_changed=%t delivery=%d", token != live.LockToken, delivery)
+	}
+	if err := f.db.QueryRow(`SELECT state FROM messages WHERE id=?`, expired.SeqNumber).Scan(&state); err != nil || state != string(StateDeadLettered) {
+		t.Fatalf("expired final delivery did not recover to DLQ: state=%s error=%v", state, err)
+	}
+	result, err := reopened.RenewBatch(ctx, "warm-leases", []SettleItem{{SeqNumber: live.SeqNumber, LockToken: live.LockToken}})
+	if err != nil || len(result) != 1 || !result[0].Ok {
+		t.Fatalf("original live token could not renew after reopen: result=%v error=%v", result, err)
+	}
+	if err := reopened.Complete(ctx, "warm-leases", live.SeqNumber, live.LockToken); err != nil {
+		t.Fatalf("original live token could not complete after reopen: %v", err)
+	}
+}
+
+func warmCatalogProxy(t *testing.T, f *sqliteHranaFixture, hook func(http.ResponseWriter, *http.Request) bool) {
+	t.Helper()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if err != nil {
+			http.Error(w, "fixture body failed", http.StatusBadRequest)
+			return
+		}
+		var pipeline struct {
+			Requests []sqliteHranaRequest `json:"requests"`
+		}
+		if err := json.Unmarshal(body, &pipeline); err != nil {
+			http.Error(w, "fixture JSON failed", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		catalog := len(pipeline.Requests) == 1 && strings.HasPrefix(pipeline.Requests[0].Stmt.SQL,
+			"SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name COLLATE NOCASE IN (")
+		if catalog && hook(w, r) {
+			return
+		}
+		f.serveHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	f.dsn = "libsql://" + strings.TrimPrefix(proxy.URL, "http://") + "?tls=0"
+}
+
+func TestSQLiteHranaWarmCatalogErrorsNeverFallBackToWrites(t *testing.T) {
+	for _, failure := range []string{"forbidden", "malformed-ack", "cancel"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var injected atomic.Int32
+			entered := make(chan struct{})
+			warmCatalogProxy(t, f, func(w http.ResponseWriter, r *http.Request) bool {
+				if injected.Add(1) == 1 {
+					close(entered)
+				}
+				switch failure {
+				case "forbidden":
+					http.Error(w, `{"error":"fixture forbidden"}`, http.StatusForbidden)
+				case "malformed-ack":
+					_, _ = io.WriteString(w, `{`)
+				case "cancel":
+					<-r.Context().Done()
+				}
+				return true
+			})
+			before := f.snapshot()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			type result struct {
+				e   *Engine
+				err error
+			}
+			done := make(chan result, 1)
+			go func() { e, err := Open(ctx, Options{DB: f.dsn, DisableBackground: true}); done <- result{e, err} }()
+			select {
+			case <-entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("warm catalog was not reached")
+			}
+			if failure == "cancel" {
+				cancel()
+			}
+			select {
+			case got := <-done:
+				if got.e != nil {
+					_ = got.e.Close()
+				}
+				after := f.snapshot()
+				if got.err == nil || got.e != nil || injected.Load() != 1 || after.SchemaDDL != before.SchemaDDL || after.VersionWrites != before.VersionWrites {
+					t.Fatalf("catalog failure fell through: error=%v opened=%t injected=%d DDL=%d version_writes=%d", got.err, got.e != nil, injected.Load(), after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+				}
+				if failure == "cancel" && !errors.Is(got.err, context.Canceled) {
+					t.Fatalf("catalog cancellation identity changed: %v", got.err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("catalog failure did not return")
+			}
+		})
+	}
+}
+
+func TestSQLiteHranaWarmCatalogMismatchUsesCanonicalFallback(t *testing.T) {
+	for _, mismatch := range []string{"missing-row", "duplicate-row", "wrong-table", "wrong-definition"} {
+		t.Run(mismatch, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			first := f.openEngine(t, true)
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var injected atomic.Int32
+			warmCatalogProxy(t, f, func(w http.ResponseWriter, r *http.Request) bool {
+				injected.Add(1)
+				recorded := httptest.NewRecorder()
+				f.serveHTTP(recorded, r)
+				var response map[string]any
+				if err := json.Unmarshal(recorded.Body.Bytes(), &response); err != nil {
+					t.Error(err)
+					return true
+				}
+				result := response["results"].([]any)[0].(map[string]any)["response"].(map[string]any)["result"].(map[string]any)
+				rows := result["rows"].([]any)
+				switch mismatch {
+				case "missing-row":
+					result["rows"] = rows[:len(rows)-1]
+				case "duplicate-row":
+					rows[len(rows)-1] = rows[0]
+				case "wrong-table":
+					rows[0].([]any)[2].(map[string]any)["value"] = "wrong_table"
+				case "wrong-definition":
+					rows[0].([]any)[3].(map[string]any)["value"] = "CREATE TABLE unrelated(n INTEGER)"
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(response)
+				return true
+			})
+			before := f.snapshot()
+			f.openEngine(t, true)
+			after := f.snapshot()
+			if injected.Load() != 1 || after.SchemaDDL-before.SchemaDDL != len(schemaStmts) || after.VersionWrites-before.VersionWrites != 1 {
+				t.Fatalf("mismatched catalog skipped canonical fallback: injected=%d DDL=%d writes=%d", injected.Load(), after.SchemaDDL-before.SchemaDDL, after.VersionWrites-before.VersionWrites)
+			}
+		})
+	}
+}
+
 // ─── Free-page reclamation ──────────────────────────────────────────────────
 
 // Compact(full=false) must actually return freed pages to the OS — a single
@@ -5256,5 +5610,44 @@ func TestRemoteCanceledReadDoesNotWaitForUnrelatedCommit(t *testing.T) {
 				t.Fatalf("final results writer=%v close=%v inUse=%d", firstErr, closeErr, d.sql.Stats().InUse)
 			}
 		})
+	}
+}
+
+type m155ContextHandler struct {
+	mu   sync.Mutex
+	seen []bool
+}
+
+func (h *m155ContextHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *m155ContextHandler) Handle(ctx context.Context, _ slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seen = append(h.seen, ctx.Err() == nil && ctx.Value(tursoSoakPhaseKey{}) != nil)
+	return nil
+}
+func (h *m155ContextHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *m155ContextHandler) WithGroup(string) slog.Handler      { return h }
+func TestStorageFailureLoggerKeepsValuesWithoutCancellation(t *testing.T) {
+	handler := &m155ContextHandler{}
+	d := &db{log: slog.New(handler)}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), tursoSoakPhaseKey{}, &tursoSoakPhaseCapture{}))
+	_, attempt := startStorage(ctx, "transaction")
+	cancel()
+	d.finishStorage(attempt, context.Canceled)
+	if len(handler.seen) != 1 || !handler.seen[0] {
+		t.Fatal("log was canceled or lost causal context values")
+	}
+}
+
+func TestStorageSuccessfulTransactionAddsNoFailureLog(t *testing.T) {
+	d, _ := remoteDBFailingFirst(t, 0)
+	e := fakeRemoteEngine(d)
+	handler := &m155ContextHandler{}
+	d.log = slog.New(handler)
+	if err := e.Complete(context.Background(), "q", 1, "token"); err != nil {
+		t.Fatal(err)
+	}
+	if len(handler.seen) != 0 {
+		t.Fatal("successful operation added diagnostic log")
 	}
 }
