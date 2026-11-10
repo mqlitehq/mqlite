@@ -537,6 +537,100 @@ func newClosedStreamHranaPool(tb testing.TB, maxOpen, maxIdle int) (*sql.DB, *at
 	return pool, &calls
 }
 
+// MQLITE-164: the cleanup cap must be shared by all logical leases of one
+// database, without making a foreground lease wait for a cleanup slot. A
+// separate database handle must retain its own capacity.
+func TestHTTPHranaCleanupCapacityIsSharedAndDoesNotBlockSQL(t *testing.T) {
+	var sqlCalls, closeCalls, active, canceled atomic.Int64
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request struct {
+			Requests []struct {
+				Type string `json:"type"`
+			} `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || len(request.Requests) != 1 {
+			t.Error("invalid cleanup-capacity request")
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if request.Requests[0].Type == "close" {
+			closeCalls.Add(1)
+			active.Add(1)
+			defer active.Add(-1)
+			select {
+			case <-release:
+				_, _ = io.WriteString(w, `{"baton":null,"results":[{"type":"ok","response":{"type":"close"}}]}`)
+			case <-r.Context().Done():
+				canceled.Add(1)
+			}
+			return
+		}
+		n := sqlCalls.Add(1)
+		response := strings.Replace(closedStreamHranaResponse, `"baton": null`, fmt.Sprintf(`"baton":"cleanup-%d"`, n), 1)
+		_, _ = io.WriteString(w, response)
+	}))
+	t.Cleanup(server.Close)
+	dsn := "libsql://" + strings.TrimPrefix(server.URL, "http://") + "?tls=0"
+	pool, err := openHTTPHranaDB(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMaxOpenConns(4)
+	pool.SetMaxIdleConns(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		cancel()
+		_ = pool.Close()
+		deadline := time.Now().Add(3 * time.Second)
+		for active.Load() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := active.Load(); got != 0 {
+			t.Errorf("cleanup HTTP requests remain after release: %d", got)
+		}
+	})
+	waitActive := func(want int64) {
+		t.Helper()
+		for active.Load() != want && ctx.Err() == nil {
+			time.Sleep(time.Millisecond)
+		}
+		if got := active.Load(); got != want {
+			t.Fatalf("active cleanup requests = %d, want %d", got, want)
+		}
+	}
+	for i := 0; i < 16; i++ {
+		if _, err := pool.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitActive(16)
+	for i := 0; i < 32; i++ {
+		if _, err := pool.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+			t.Fatalf("healthy SQL blocked behind stream cleanup: %v", err)
+		}
+	}
+	if got := closeCalls.Load(); got != 16 || canceled.Load() != 0 {
+		t.Fatalf("saturated cleanup changed or expired before foreground returned: calls=%d canceled=%d", got, canceled.Load())
+	}
+	other, err := openHTTPHranaDB(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	other.SetMaxIdleConns(0)
+	if _, err := other.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+		t.Fatal(err)
+	}
+	waitActive(17)
+	if got := sqlCalls.Load(); got != 49 {
+		t.Fatalf("SQL calls = %d, want 49 without retries", got)
+	}
+}
+
 // The HTTP Hrana server may return a successful result with no baton, which means
 // it closed the logical stream. libsql-client-go remembers that state but lacks a
 // driver.Validator, so an ordinary database/sql pool can hand the known-closed

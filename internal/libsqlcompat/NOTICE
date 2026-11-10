@@ -1,0 +1,33 @@
+This directory contains a compatibility copy of the HTTP v2 runtime from:
+
+  https://github.com/tursodatabase/libsql-client-go
+  v0.0.0-20251219100830-236aa1ff8acc
+
+The original MIT license and copyright notice are preserved in LICENSE.
+UPSTREAM.json records the original paths and SHA-256 hashes for all 13 copied
+runtime files. The public sqliteparser and sqliteparserutils packages remain
+dependencies of the same pinned upstream module; they are not copied here.
+
+The copied files retain their original protocol, SQL parsing, transaction,
+response, and error behavior. Local changes are limited to private import paths
+and one cleanup manager shared by each opened database handle (one SQL pool).
+Each accepted detached
+stream-close request has a five-second deadline established before its goroutine
+starts. At most 16 cleanup HTTP requests run per opener; capacity overflow is skipped without
+queueing or waiting and increments a skip counter. A completed cleanup worker
+reports skipped work with one fixed safe warning after releasing HTTP resources
+and admission capacity; the foreground Close path never invokes the logger.
+Skipped or failed cleanup relies on server expiry rather than confirmed release.
+Cleanup remains asynchronous, does not retry, and is not synchronously joined by
+database/sql Close. Serial repeated Close does not resubmit the captured baton.
+The five-second deadline bounds the network request, not an arbitrary application
+logger. At most one completed worker can remain in a blocked warning callback;
+it holds no HTTP resource or cleanup slot and cannot delay foreground SQL or Close.
+
+conn.go adapts the upstream legacy Driver.Open HTTP entry point and preserves
+its auth-token aliases, query rejection, TLS normalization, and Host handling.
+WebSocket and file connections continue to use the original upstream driver.
+
+This is a bounded compatibility patch, not a replacement protocol or a general
+driver fork. Review any future delta against the recorded upstream source;
+do not silently change commit uncertainty, logical-stream pooling, or SQL types.

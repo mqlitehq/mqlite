@@ -7,3 +7,5 @@
 *.sh  text eol=lf
 # Prometheus exposition is a byte-exact LF contract on every platform.
 *.prom text eol=lf
+# The pinned source manifest is a byte-exact LF contract too.
+internal/libsqlcompat/UPSTREAM.json text eol=lf

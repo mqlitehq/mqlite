@@ -141,6 +141,31 @@ This write-first shape addresses claim transactions in one broker or embedded
 `SQLITE_BUSY`, and the change does not make overlapping brokers against one database
 safe.
 
+## Bounded HTTP stream cleanup
+
+MQLite carries the pinned driver's HTTP v2 compatibility code internally, with a
+narrow stream-cleanup patch (MQLITE-164). Its source revision, license and local
+changes are recorded in `internal/libsqlcompat/NOTICE` and `UPSTREAM.json`. The
+original pure-Go parser, HTTP client and TCP/TLS transport reuse are retained;
+normal SQL, transaction acknowledgement and retry decisions are unchanged.
+
+Stream cleanup is asynchronous and best effort. Each opened database handle has a fixed cap of
+16 active cleanup requests, each with a five-second deadline created before the
+cleanup goroutine starts. There is no cleanup queue. A saturated cap skips that
+cleanup request rather than holding a SQL lease while waiting
+for a cleanup slot. Completed cleanup workers report observed saturation with
+one fixed warning at most per handle; logging is also best effort and never
+runs on the foreground return path. Normal operations do
+not wait for an extra cleanup round trip.
+
+The deadline bounds the client's request, not the provider's resource lifetime.
+Unconfirmed streams may remain allocated until the provider reclaims them under
+its own expiration policy; no fixed provider timeout is assumed. Neither the
+client deadline nor `Engine.Close` confirms remote resource release or transaction
+rollback. An acknowledged commit stays successful, and a lost commit
+acknowledgement remains outcome-unknown. This does not add synchronous cleanup
+draining to `Close` or change the WebSocket and local SQLite paths.
+
 ## Embedded replicas — evaluated, not adopted
 
 Turso embedded replicas keep a **local libSQL file that syncs from the remote

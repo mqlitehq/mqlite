@@ -344,9 +344,9 @@ class WorkflowContractTests(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertEqual(hashlib.sha256((ROOT / ".github/workflows" / name).read_bytes()).hexdigest(), digest,
                                  "Review the entire release/CI contract, then update its golden")
-        self.assertEqual(hashlib.sha256((ROOT / "Dockerfile").read_bytes()).hexdigest(), "80390edb5646664e9dead97bb0b1dac0e91835e81066b858182c7cecdef3a497",
+        self.assertEqual(hashlib.sha256((ROOT / "Dockerfile").read_bytes()).hexdigest(), "6c9cb73aacd1d9271185e1e3ebae4ca0d163ceb153eb11f7dcd40b4ecdfd3df8",
                          "Review runtime APK upgrades, stage names, and artifact scans before updating the golden")
-        self.assertEqual(hashlib.sha256((ROOT / ".goreleaser.yaml").read_bytes()).hexdigest(), "57a16550597eab93319f89e89f93299ca3853fbccdb4873b922335ff952dc67a",
+        self.assertEqual(hashlib.sha256((ROOT / ".goreleaser.yaml").read_bytes()).hexdigest(), "507dea7be5c09aef5260b60a393ddd50313fd5be2b82196275edb502d2c6d5a7",
                          "Review every release build target, flag, and binary scan hook before updating the golden")
 
     def test_image_verification_command_contract(self):

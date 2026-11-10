@@ -1,0 +1,131 @@
+{
+  "source_repository": "https://github.com/tursodatabase/libsql-client-go",
+  "source_module": "github.com/tursodatabase/libsql-client-go",
+  "source_version": "v0.0.0-20251219100830-236aa1ff8acc",
+  "source_commit": "236aa1ff8accc5180a51c25b437c91630ac05221",
+  "license": "MIT",
+  "files": [
+    {
+      "source": "libsql/internal/http/hranaV2/hranaV2.go",
+      "path": "httpv2/hranaV2.go",
+      "upstream_sha256": "552cf543c65c335d0d338d7f61b83df8a15f935e28821724b79691b94d788d7c",
+      "upstream_lines": 612,
+      "upstream_bytes": 17557,
+      "import_adjusted_sha256": "0ff738d16e42619a14f32bcd57a642955623c1a9afe9bad8d68587e5c4143096"
+    },
+    {
+      "source": "libsql/internal/http/shared/result.go",
+      "path": "shared/result.go",
+      "upstream_sha256": "7116302c71d1cd3f8f9968b2e9e25a0011c71ab100d484f98f354171e33eab04",
+      "upstream_lines": 18,
+      "upstream_bytes": 303,
+      "import_adjusted_sha256": "7116302c71d1cd3f8f9968b2e9e25a0011c71ab100d484f98f354171e33eab04"
+    },
+    {
+      "source": "libsql/internal/http/shared/rows.go",
+      "path": "shared/rows.go",
+      "upstream_sha256": "739abc2a1b8989d23b989e681c441d098e570ed505c984048bc73c4f7ddaa166",
+      "upstream_lines": 69,
+      "upstream_bytes": 1451,
+      "import_adjusted_sha256": "739abc2a1b8989d23b989e681c441d098e570ed505c984048bc73c4f7ddaa166"
+    },
+    {
+      "source": "libsql/internal/http/shared/statement.go",
+      "path": "shared/statement.go",
+      "upstream_sha256": "285ae121a70536632f6c6c51762d1d66cf998f206d0e25c3e816b914e5682224",
+      "upstream_lines": 257,
+      "upstream_bytes": 6923,
+      "import_adjusted_sha256": "285ae121a70536632f6c6c51762d1d66cf998f206d0e25c3e816b914e5682224"
+    },
+    {
+      "source": "libsql/internal/hrana/batch.go",
+      "path": "hrana/batch.go",
+      "upstream_sha256": "3462264759e8357c06cd3f9c749e385e5f2709b6ecf98ff1acd8e8e5882ac321",
+      "upstream_lines": 22,
+      "upstream_bytes": 623,
+      "import_adjusted_sha256": "3462264759e8357c06cd3f9c749e385e5f2709b6ecf98ff1acd8e8e5882ac321"
+    },
+    {
+      "source": "libsql/internal/hrana/batch_result.go",
+      "path": "hrana/batch_result.go",
+      "upstream_sha256": "11f4de98e853b1de0fde5de195d7f09039cf340cabd370d307c1f690afa57906",
+      "upstream_lines": 49,
+      "upstream_bytes": 954,
+      "import_adjusted_sha256": "11f4de98e853b1de0fde5de195d7f09039cf340cabd370d307c1f690afa57906"
+    },
+    {
+      "source": "libsql/internal/hrana/pipeline_request.go",
+      "path": "hrana/pipeline_request.go",
+      "upstream_sha256": "a8f9ee521ee4d02535a970c18b9ef013a241c0792b86cf1685153f554e19a837",
+      "upstream_lines": 10,
+      "upstream_bytes": 245,
+      "import_adjusted_sha256": "a8f9ee521ee4d02535a970c18b9ef013a241c0792b86cf1685153f554e19a837"
+    },
+    {
+      "source": "libsql/internal/hrana/pipeline_response.go",
+      "path": "hrana/pipeline_response.go",
+      "upstream_sha256": "5b1c004d549ec254fcd306face56a2769fa6c2c4e46101bec41a55abfb4d9e5f",
+      "upstream_lines": 7,
+      "upstream_bytes": 190,
+      "import_adjusted_sha256": "5b1c004d549ec254fcd306face56a2769fa6c2c4e46101bec41a55abfb4d9e5f"
+    },
+    {
+      "source": "libsql/internal/hrana/stmt.go",
+      "path": "hrana/stmt.go",
+      "upstream_sha256": "af1f8a64b66c342d463dfa2894a01304ed2ec9c776bbb4f69a955fb8ba0ad1df",
+      "upstream_lines": 58,
+      "upstream_bytes": 1319,
+      "import_adjusted_sha256": "24ea161b0c9b807fb2cb01597a8f4d83aef384d414205478cdb0c28d37b4f327"
+    },
+    {
+      "source": "libsql/internal/hrana/stmt_result.go",
+      "path": "hrana/stmt_result.go",
+      "upstream_sha256": "019bcdbf648bd8980d30f97a413c260c62f781d3bb81d3ea770c3e16747c2f9e",
+      "upstream_lines": 65,
+      "upstream_bytes": 1318,
+      "import_adjusted_sha256": "019bcdbf648bd8980d30f97a413c260c62f781d3bb81d3ea770c3e16747c2f9e"
+    },
+    {
+      "source": "libsql/internal/hrana/stream_request.go",
+      "path": "hrana/stream_request.go",
+      "upstream_sha256": "c7f295b98dfb48b119b73f4ea807b974632d3359991ef98f5c3c81613ad3f921",
+      "upstream_lines": 88,
+      "upstream_bytes": 2183,
+      "import_adjusted_sha256": "394ce0652fa860767756b8a25b27c205b152915ae9da7deee412a26822ceb151"
+    },
+    {
+      "source": "libsql/internal/hrana/stream_result.go",
+      "path": "hrana/stream_result.go",
+      "upstream_sha256": "e1d772f658b7f70a3fb44973dc503a8d4b05a76ee5741c05f8ac7540705feac3",
+      "upstream_lines": 52,
+      "upstream_bytes": 1095,
+      "import_adjusted_sha256": "e1d772f658b7f70a3fb44973dc503a8d4b05a76ee5741c05f8ac7540705feac3"
+    },
+    {
+      "source": "libsql/internal/hrana/value.go",
+      "path": "hrana/value.go",
+      "upstream_sha256": "c32b5677e5706f95785ad575abe3deac2743a21f01c9568467b167069becf0fc",
+      "upstream_lines": 89,
+      "upstream_bytes": 2185,
+      "import_adjusted_sha256": "c32b5677e5706f95785ad575abe3deac2743a21f01c9568467b167069becf0fc"
+    }
+  ],
+  "local_changes": [
+    "Rewrite copied private package imports to the MQLite internal namespace.",
+    "Pass one per-database cleanup manager through the HTTP connection constructor.",
+    "Replace only Close/closeStream with a shared nonblocking best-effort cleanup path: sixteen active requests, five-second deadline before goroutine launch, no queue or retry; overload increments a skip counter and emits one fixed safe warning.",
+    "Clear each captured baton before scheduling or skipping cleanup so serial repeated Close is idempotent.",
+    "Adapt the legacy HTTP-only DSN entry point; retain the pinned upstream public SQL parser packages.",
+    "Emit the one-time capacity warning only from an existing completed cleanup worker, after network cancellation and slot release; foreground Close never invokes an application logger."
+  ],
+  "adapted_entrypoint": {
+    "source": "libsql/sql.go",
+    "source_sha256": "60092caa913513dfbc4f2f22e3d6ad8d3f2e5c915db8209309a7e515870112a6",
+    "source_ranges": [
+      "extractJwt:250-280",
+      "extractTls:281-300",
+      "Driver.Open:302-367 (HTTP path only)"
+    ],
+    "path": "conn.go"
+  }
+}
