@@ -4393,3 +4393,102 @@ func TestRemoteSendInvalidSuccessIsOutcomeUnknown(t *testing.T) {
 		})
 	}
 }
+
+func TestSendSequenceAcknowledgementHTTPContract(t *testing.T) {
+	for _, mode := range []string{"one", "batch", "scheduled"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, body string
+				bad        bool
+				want       []int64
+			}{
+				{"negative", `{"seq_numbers":[-1]}`, true, nil},
+				{"null", `{"seq_numbers":[null]}`, true, nil},
+				{"missing", `{}`, true, nil},
+				{"null_list", `{"seq_numbers":null}`, true, nil},
+				{"valid_zero", `{"seq_numbers":[0],"future":null}`, false, []int64{0}},
+				{"valid_positive", `{"seq_numbers":[7]}`, false, []int64{7}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					body := tc.body
+					want := tc.want
+					if mode == "batch" {
+						switch tc.name {
+						case "negative":
+							body = `{"seq_numbers":[7,-1]}`
+						case "null":
+							body = `{"seq_numbers":[7,null]}`
+						case "valid_zero":
+							body = `{"seq_numbers":[7,0],"future":null}`
+							want = []int64{7, 0}
+						case "valid_positive":
+							body = `{"seq_numbers":[7,7]}`
+							want = []int64{7, 7}
+						}
+					}
+					var calls int32
+					stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						atomic.AddInt32(&calls, 1)
+						path := wire.PathSend
+						if mode == "scheduled" {
+							path = wire.PathSchedule
+						}
+						if r.Method != http.MethodPost || r.URL.Path != path {
+							t.Errorf("request %s %s, want POST %s", r.Method, r.URL.Path, path)
+						}
+						var input wire.SendRequest
+						if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+							t.Error(err)
+						}
+						n := 1
+						if mode == "batch" {
+							n = 2
+						}
+						if input.Queue != "jobs" || len(input.Messages) != n {
+							t.Errorf("unexpected Send input queue=%s messages=%d", input.Queue, len(input.Messages))
+						}
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusOK)
+						_, _ = io.WriteString(w, body)
+					}))
+					defer stub.Close()
+					client, err := mqlite.Open(context.Background(), stub.URL)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer client.Close()
+					var sequences []int64
+					if mode == "batch" {
+						sequences, err = client.Send(context.Background(), "jobs", mqlite.OutMessage{Body: []byte("first")}, mqlite.OutMessage{Body: []byte("second")})
+					} else {
+						var seq int64
+						if mode == "scheduled" {
+							seq, err = client.SendOne(context.Background(), "jobs", mqlite.OutMessage{Body: []byte("scheduled")}, mqlite.SendOpts{At: time.Now().Add(time.Hour)})
+						} else {
+							seq, err = client.SendOne(context.Background(), "jobs", mqlite.OutMessage{Body: []byte("one")})
+						}
+						sequences = []int64{seq}
+					}
+					if tc.bad {
+						if !errors.Is(err, mqlite.ErrOutcomeUnknown) {
+							t.Errorf("bad successful Send returned seq=%v err=%v, want ErrOutcomeUnknown", sequences, err)
+						}
+					} else {
+						if err != nil || len(sequences) != len(want) {
+							t.Errorf("valid Send seq=%v err=%v want=%v", sequences, err, want)
+						} else {
+							for i, n := range want {
+								if sequences[i] != n {
+									t.Errorf("position %d=%d want %d", i, sequences[i], n)
+								}
+							}
+						}
+					}
+					if n := atomic.LoadInt32(&calls); n != 1 {
+						t.Errorf("Send made %d requests, want exactly one (no replay)", n)
+					}
+				})
+			}
+		})
+	}
+}
