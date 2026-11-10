@@ -24,6 +24,20 @@ linters:
     presets:
       - std-error-handling
     rules:
+      # Preserve the pinned upstream copy's exact SQL/error behavior. Its
+      # source/delta guards reject changes; our cleanup and connector stay linted.
+      - path: '^internal/libsqlcompat/shared/statement\.go$'
+        text: 'non-wrapping format verb for fmt.Errorf'
+        linters:
+          - errorlint
+      - path: '^internal/libsqlcompat/shared/statement\.go$'
+        text: 'unnecessary conversion'
+        linters:
+          - unconvert
+      - path: '^internal/libsqlcompat/httpv2/hranaV2\.go$'
+        text: 'QF1003: could use tagged switch'
+        linters:
+          - staticcheck
       - path: '_test\.go'
         linters:
           - errcheck

@@ -12,6 +12,18 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
+
+- Give asynchronous libSQL HTTP stream-close requests a five-second deadline and
+  a fixed per-handle concurrency limit. When cleanup is saturated, skip that
+  best-effort request instead of delaying Send, Renew or settlement. Completed
+  cleanup workers report observed saturation at most once per handle.
+  Unconfirmed streams remain subject to the provider's expiration policy.
+- Keep foreground SQL, transaction outcomes and TCP/TLS reuse unchanged. A
+  committed operation is not failed or replayed because cleanup failed. Cleanup
+  remains asynchronous; `Close` does not confirm that the provider released the
+  stream. Local SQLite, WebSocket transport and the remote-only SDK are unchanged.
+
 - Anchor deadline-less legacy `Renew` acknowledgements to the request start.
   Delayed replies no longer extend the renewal watchdog beyond the fixed
   conservative lease estimate (MQLITE-196).
