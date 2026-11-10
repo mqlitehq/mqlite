@@ -4749,3 +4749,212 @@ func TestOpenExpiresBeforeCrashRecovery(t *testing.T) {
 		t.Fatalf("startup revived expired locks: locked=%d active=%d", locked, active)
 	}
 }
+
+// closeWithHranaCommit holds one real HTTP COMMIT inside a registered background
+// worker. The protocol fixture controls acknowledgement timing; it does not model
+// provider durability. Real SQLite/WAL effects are covered by the diagnostic layer.
+func closeWithHranaCommit(t *testing.T) (*Engine, *hranaTerminalFixture, context.Context, <-chan error, *atomic.Int64) {
+	t.Helper()
+	pool, fixture := newHranaTerminalFixture(t, "COMMIT", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &Engine{db: &db{sql: pool, remote: true}, closed: make(chan struct{}), bgCancel: cancel,
+		now: func() int64 { return 1_700_000_000_000 }, observation: observations{background: true}}
+	t.Cleanup(func() { fixture.releaseOnce.Do(func() { close(fixture.release) }); _ = e.Close() })
+	done := make(chan error, 1)
+	callbacks := new(atomic.Int64)
+	e.bgWG.Add(1)
+	go func() {
+		defer e.bgWG.Done()
+		e.runMaintenance(ctx, "scheduled", func(ctx context.Context) {
+			err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+				callbacks.Add(1)
+				_, err := tx.ExecContext(ctx, "UPDATE messages SET state='active'")
+				return err
+			})
+			if err != nil {
+				e.maintenanceFailure(ctx, "activate_scheduled", err)
+			}
+			done <- err
+		})
+	}()
+	select {
+	case <-fixture.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background COMMIT did not enter HTTP")
+	}
+	return e, fixture, ctx, done, callbacks
+}
+
+func TestCloseAllowsAdmittedBackgroundCommitToAcknowledge(t *testing.T) {
+	e, fixture, bgctx, operation, callbacks := closeWithHranaCommit(t)
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e)
+	if _, err := e.db.exec(context.Background(), "SELECT 1"); !errors.Is(err, ErrClosed) {
+		t.Errorf("new remote operation during drain = %v, want ErrClosed", err)
+	}
+	// The one-second acknowledgement is intentionally inside the fixed five-second
+	// opportunity. Close must not cancel an admitted COMMIT before this response.
+	release := time.AfterFunc(time.Second, func() { fixture.releaseOnce.Do(func() { close(fixture.release) }) })
+	defer release.Stop()
+	select {
+	case <-bgctx.Done():
+		t.Error("Close canceled background COMMIT before its drain opportunity")
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case err := <-operation:
+		if err != nil {
+			t.Errorf("acknowledged background COMMIT = %v, want success", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("acknowledged operation did not join")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not join after acknowledgement")
+	}
+	if bgctx.Err() == nil {
+		t.Error("Close did not stop background workers after the drain")
+	}
+	if callbacks.Load() != 1 || fixture.count("COMMIT") != 1 {
+		t.Error("commit callback or request was replayed")
+	}
+	m := e.observation.maintenance["scheduled"]
+	if m.Failures != 0 || m.Diagnostics.ConsecutiveFailures != 0 {
+		t.Errorf("healthy drained maintenance failed: %+v", m)
+	}
+}
+
+func TestCloseDrainGraceStillCancelsUnacknowledgedBackgroundCommit(t *testing.T) {
+	e, fixture, _, operation, callbacks := closeWithHranaCommit(t)
+	started := time.Now()
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e)
+	select {
+	case err := <-operation:
+		if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("unacknowledged COMMIT = %v, want only ErrOutcomeUnknown", err)
+		}
+	case <-time.After(9 * time.Second):
+		t.Fatal("stalled COMMIT did not honor background cancellation")
+	}
+	if elapsed := time.Since(started); elapsed < 5*time.Second {
+		t.Errorf("background canceled after %v, before five-second drain grace", elapsed)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close or its admission waiter did not join")
+	}
+	select {
+	case <-fixture.finished:
+	case <-time.After(time.Second):
+		t.Error("canceled HTTP request did not join")
+	}
+	if callbacks.Load() != 1 || fixture.count("COMMIT") != 1 {
+		t.Error("ambiguous commit was replayed")
+	}
+	m := e.observation.maintenance["scheduled"]
+	if m.Failures != 1 || m.Interrupted != 0 || m.Diagnostics.LastOutcome != "failed" || m.Diagnostics.ConsecutiveFailures != 1 {
+		t.Errorf("unconfirmed commit was hidden as a shutdown interruption: %+v", m)
+	}
+}
+
+func TestCloseDrainClosesAdmissionAndWakesWaitersBeforeJoiningForeground(t *testing.T) {
+	e, err := Open(context.Background(), Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "q", QueueConfig{})
+	bgctx, cancel := context.WithCancel(context.Background())
+	e.bgCancel = cancel
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); _ = e.Close() })
+	received := make(chan error, 1)
+	go func() {
+		_, err := e.Receive(context.Background(), "q", ReceiveOptions{MaxMessages: 1, WaitMs: 20000})
+		received <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		e.note.mu.Lock()
+		waiter := e.note.chans["q"]
+		parked := waiter != nil && waiter.waiters > 0
+		e.note.mu.Unlock()
+		if parked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("long-poll did not subscribe")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	entered := make(chan struct{})
+	foreground := make(chan error, 1)
+	go func() {
+		foreground <- e.inTx(context.Background(), func(context.Context, *txn) error { close(entered); <-release; return nil })
+	}()
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e)
+	for _, operation := range []func() error{
+		func() error {
+			_, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("refused")})
+			return err
+		},
+		func() error {
+			_, err := e.Receive(context.Background(), "q", ReceiveOptions{MaxMessages: 1})
+			return err
+		},
+	} {
+		if err := operation(); !errors.Is(err, ErrClosed) {
+			t.Errorf("new operation during grace = %v", err)
+		}
+	}
+	select {
+	case err := <-received:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("long-poll = %v, want ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("long-poll slept through the drain grace")
+	}
+	select {
+	case <-bgctx.Done():
+	case <-time.After(8 * time.Second):
+		t.Fatal("background grace did not expire")
+	}
+	select {
+	case <-closed:
+		t.Error("Close abandoned a still-running foreground callback at the background grace deadline")
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-foreground:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("foreground did not join")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close/admission waiter did not join")
+	}
+}

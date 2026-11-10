@@ -162,6 +162,17 @@ that the provider rolled back. Detached stream-close requests still follow their
 separate best-effort budget below. Local SQLite cancellation protection and the
 WebSocket driver are unchanged.
 
+At shutdown, `Engine.Close` first refuses new database operations and wakes parked
+receivers. It gives already-admitted operations up to five seconds to acknowledge
+before canceling background maintenance. This avoids interrupting a healthy
+in-flight COMMIT solely because shutdown began. If that opportunity expires, an
+interrupted unacknowledged commit still remains `ErrOutcomeUnknown`; shutdown
+does not confirm rollback or make replay safe. The five seconds is separate from
+the ROLLBACK cleanup budget and is not a total shutdown deadline: Close still joins
+admitted foreground work and background cleanup.
+This drains engine-admitted SQL operations, not application message handlers;
+stop and join application consumers separately.
+
 The terminal-request contracts are covered by
 `TestHranaCommitHonorsTransactionContext`,
 `TestHranaCancellationBeforeDriverCommitRemainsNotStarted`,

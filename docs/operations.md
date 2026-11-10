@@ -198,7 +198,14 @@ Set the platform's outer termination grace longer than:
 ```
 
 `Engine.Close` deliberately waits for admitted work and has no unsafe timeout that
-releases ownership while a write may still be running. The outer platform deadline
+releases ownership while a write may still be running. It immediately refuses new
+database operations and wakes parked receivers, then gives admitted operations up
+to five seconds to finish before canceling background maintenance. This internal
+grace avoids interrupting a healthy commit; after it expires, an unacknowledged
+commit remains outcome-unknown and must be reconciled. The grace is separate from
+transaction cleanup and does not bound the total Close duration. This grace applies
+to engine-admitted SQL operations; it does not give application message handlers a
+graceful-drain phase. The outer platform deadline
 is therefore the final hard bound. The repository's `docker-compose.yml` sets
 `stop_grace_period: 40s`; plain Docker otherwise defaults to only 10 seconds and
 can send SIGKILL while a deliberately stalled handler is still inside the 25-second

@@ -12,6 +12,16 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Drain admitted writes before canceling maintenance
+
+- Refuse new operations and wake long polls immediately at engine shutdown, then
+  allow admitted operations up to five seconds to finish before canceling
+  background maintenance. Healthy remote commits can acknowledge during this
+  grace; unacknowledged commits still remain `ErrOutcomeUnknown` after it expires.
+- Keep the existing requirement to join admitted foreground work and background
+  cleanup. The internal grace is not a total shutdown timeout and does not add
+  work to normal SQL calls.
+
 ### Honor remote transaction cancellation (MQLITE-163)
 
 - Use the transaction's context for HTTP Hrana COMMIT instead of discarding its
