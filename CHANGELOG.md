@@ -12,6 +12,28 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Drain admitted writes before canceling maintenance
+
+- Refuse new operations and wake long polls immediately at engine shutdown, then
+  allow admitted operations up to five seconds to finish before canceling
+  background maintenance. Healthy remote commits can acknowledge during this
+  grace; unacknowledged commits still remain `ErrOutcomeUnknown` after it expires.
+- Keep the existing requirement to join admitted foreground work and background
+  cleanup. The internal grace is not a total shutdown timeout and does not add
+  work to normal SQL calls.
+
+### Honor remote transaction cancellation (MQLITE-163)
+
+- Use the transaction's context for HTTP Hrana COMMIT instead of discarding its
+  cancellation or deadline. Cancellation detected before COMMIT dispatch attempts
+  rollback and returns the original caller error; an interrupted commit without
+  confirmation remains `ErrOutcomeUnknown` and is not transparently replayed.
+- Give ROLLBACK an independent five-second request budget so a canceled caller
+  does not skip cleanup or leave the operation and shutdown waiting indefinitely.
+  A failed or timed-out rollback does not confirm provider-side rollback. Detached
+  stream cleanup keeps its separate existing budget; local SQLite and WebSocket
+  transport are unchanged.
+
 ### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
 
 - Give asynchronous libSQL HTTP stream-close requests a five-second deadline and

@@ -839,6 +839,418 @@ func TestHranaTransactionKeepsOneLease(t *testing.T) {
 	}
 }
 
+type hranaTerminalFixture struct {
+	mu           sync.Mutex
+	requests     []string
+	batons       []string
+	target       string
+	lostReply    bool
+	entered      chan struct{}
+	finished     chan struct{}
+	release      chan struct{}
+	enteredOnce  sync.Once
+	finishedOnce sync.Once
+	releaseOnce  sync.Once
+}
+
+func newHranaTerminalFixture(t *testing.T, target string, lostReply bool) (*sql.DB, *hranaTerminalFixture) {
+	t.Helper()
+	f := &hranaTerminalFixture{target: target, lostReply: lostReply, entered: make(chan struct{}), finished: make(chan struct{}), release: make(chan struct{})}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request struct {
+			Baton    string `json:"baton"`
+			Requests []struct {
+				Type string `json:"type"`
+				Stmt struct {
+					SQL string `json:"sql"`
+				} `json:"stmt"`
+			} `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			http.Error(w, "bad request", 400)
+			return
+		}
+		if len(request.Requests) != 1 {
+			t.Errorf("request item count=%d", len(request.Requests))
+			http.Error(w, "bad request", 400)
+			return
+		}
+		item := request.Requests[0]
+		query := strings.ToUpper(strings.TrimSpace(item.Stmt.SQL))
+		if item.Type == "close" {
+			query = "CLOSE_STREAM"
+		}
+		f.mu.Lock()
+		f.requests = append(f.requests, query)
+		f.batons = append(f.batons, request.Baton)
+		f.mu.Unlock()
+		if query == target {
+			f.enteredOnce.Do(func() { close(f.entered) })
+			defer f.finishedOnce.Do(func() { close(f.finished) })
+			if f.lostReply {
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				_ = conn.Close()
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-f.release:
+			}
+		}
+		response := closedStreamHranaResponse
+		if query == "BEGIN" || query == "UPDATE MESSAGES SET STATE='ACTIVE'" {
+			response = strings.Replace(response, `"baton": null`, `"baton": "bounded-transaction"`, 1)
+		}
+		if query == "CLOSE_STREAM" {
+			response = `{"baton":null,"results":[{"type":"ok","response":{"type":"close"}}]}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, response)
+	}))
+	t.Cleanup(func() { f.releaseOnce.Do(func() { close(f.release) }); server.Close() })
+	pool, err := openHTTPHranaDB("libsql://" + strings.TrimPrefix(server.URL, "http://") + "?tls=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = pool.Close() })
+	return pool, f
+}
+
+func (f *hranaTerminalFixture) count(query string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, got := range f.requests {
+		if got == query {
+			count++
+		}
+	}
+	return count
+}
+
+func TestHranaCommitHonorsTransactionContext(t *testing.T) {
+	for _, deadline := range []bool{true, false} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			pool, f := newHranaTerminalFixture(t, "COMMIT", false)
+			e := &Engine{db: &db{sql: pool, remote: true}, now: func() int64 { return 1_700_000_000_000 }, observation: observations{background: true}}
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if deadline {
+				ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+			}
+			defer cancel()
+			var callbacks atomic.Int64
+			done := make(chan error, 1)
+			go func() {
+				done <- e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+					callbacks.Add(1)
+					_, err := tx.ExecContext(ctx, "UPDATE messages SET state='active'")
+					return err
+				})
+			}()
+			select {
+			case <-f.entered:
+			case err := <-done:
+				t.Fatalf("returned before COMMIT: %v", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("COMMIT did not start")
+			}
+			if !deadline {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, driver.ErrBadConn) {
+					t.Fatalf("interrupted commit=%v, want only ErrOutcomeUnknown", err)
+				}
+			case <-time.After(2 * time.Second):
+				f.releaseOnce.Do(func() { close(f.release) })
+				t.Fatal("COMMIT ignored transaction cancellation")
+			}
+			select {
+			case <-f.finished:
+			case <-time.After(time.Second):
+				t.Fatal("canceled COMMIT HTTP request is still running")
+			}
+			if got := callbacks.Load(); got != 1 {
+				t.Errorf("callback calls=%d, want one", got)
+			}
+			if got := f.count("COMMIT"); got != 1 {
+				t.Errorf("COMMIT calls=%d, want one", got)
+			}
+			if _, err := pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+				t.Fatal(err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for i, query := range f.requests {
+				if query == "DELETE FROM MESSAGES WHERE 0" && f.batons[i] != "" {
+					t.Error("failed transaction connection was reused")
+				}
+			}
+		})
+	}
+}
+
+func TestHranaRollbackHasIndependentCleanupDeadline(t *testing.T) {
+	pool, f := newHranaTerminalFixture(t, "ROLLBACK", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() { done <- tx.Rollback() }()
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ROLLBACK did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("caller cancellation stopped independent cleanup early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("rollback=%v, want cleanup deadline", err)
+		}
+		elapsed := time.Since(started)
+		if elapsed < remoteTransactionCleanupTimeout || elapsed > remoteTransactionCleanupTimeout+2*time.Second {
+			t.Errorf("cleanup elapsed=%s, want bounded %s", elapsed, remoteTransactionCleanupTimeout)
+		}
+	case <-time.After(remoteTransactionCleanupTimeout + 2*time.Second):
+		f.releaseOnce.Do(func() { close(f.release) })
+		t.Fatal("ROLLBACK ignored cleanup deadline")
+	}
+	select {
+	case <-f.finished:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup HTTP request is still running")
+	}
+	if got := f.count("ROLLBACK"); got != 1 {
+		t.Errorf("rollback calls=%d, want one", got)
+	}
+	if _, err = pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, query := range f.requests {
+		if query == "DELETE FROM MESSAGES WHERE 0" && f.batons[i] != "" {
+			t.Error("rollback connection was reused")
+		}
+	}
+}
+
+type hranaCommitCountingConn struct {
+	httpHranaConn
+	commits         int
+	rollbacks       int
+	cleanupDeadline bool
+	cleanupCanceled bool
+	rollbackErr     error
+}
+
+func (c *hranaCommitCountingConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	switch query {
+	case "COMMIT":
+		c.commits++
+	case "ROLLBACK":
+		c.rollbacks++
+		_, c.cleanupDeadline = ctx.Deadline()
+		c.cleanupCanceled = ctx.Err() != nil
+		return driver.RowsAffected(0), c.rollbackErr
+	}
+	return driver.RowsAffected(0), nil
+}
+
+func TestHranaCommitAlreadyCanceledDoesNotSubmit(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		for _, rollbackFails := range []bool{false, true} {
+			t.Run(fmt.Sprintf("deadline=%v/rollback-fails=%v", deadline, rollbackFails), func(t *testing.T) {
+				var ctx context.Context
+				var cancel context.CancelFunc
+				if deadline {
+					ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				} else {
+					ctx, cancel = context.WithCancel(context.Background())
+					cancel()
+				}
+				defer cancel()
+				conn := &hranaCommitCountingConn{}
+				if rollbackFails {
+					conn.rollbackErr = errors.New("controlled rollback failure")
+				}
+				err := (&singleLeaseTx{conn: conn, ctx: ctx}).Commit()
+				if !errors.Is(err, ctx.Err()) || errors.Is(err, ErrOutcomeUnknown) || conn.commits != 0 || conn.rollbacks != 1 || !conn.cleanupDeadline || conn.cleanupCanceled {
+					t.Fatalf("already-canceled COMMIT err=%v commits=%d rollbacks=%d cleanup-deadline=%t cleanup-canceled=%t", err, conn.commits, conn.rollbacks, conn.cleanupDeadline, conn.cleanupCanceled)
+				}
+			})
+		}
+	}
+}
+
+type hranaCancelBeforeCommitConnector struct {
+	conn *hranaCommitCountingConn
+	stop func()
+}
+
+func (c hranaCancelBeforeCommitConnector) Driver() driver.Driver { return nil }
+func (c hranaCancelBeforeCommitConnector) Connect(context.Context) (driver.Conn, error) {
+	return &hranaCancelBeforeCommitConn{hranaCommitCountingConn: c.conn, stop: c.stop}, nil
+}
+
+type hranaCancelBeforeCommitConn struct {
+	*hranaCommitCountingConn
+	stop func()
+}
+
+func (*hranaCancelBeforeCommitConn) Close() error { return nil }
+func (c *hranaCancelBeforeCommitConn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
+	return hranaCancelBeforeCommitTx{singleLeaseTx: &singleLeaseTx{conn: c.hranaCommitCountingConn, ctx: ctx}, stop: c.stop}, nil
+}
+
+type hranaCancelBeforeCommitTx struct {
+	*singleLeaseTx
+	stop func()
+}
+
+func (t hranaCancelBeforeCommitTx) Commit() error {
+	// database/sql has already marked this transaction done. Exercise the
+	// cancellation window after its own check but before the adapter dispatches.
+	t.stop()
+	return t.singleLeaseTx.Commit()
+}
+
+func TestHranaCancellationBeforeDriverCommitRemainsNotStarted(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			stop := cancel
+			if deadline {
+				stop = func() { <-ctx.Done() }
+			}
+			conn := &hranaCommitCountingConn{}
+			pool := sql.OpenDB(hranaCancelBeforeCommitConnector{conn: conn, stop: stop})
+			defer pool.Close()
+			tx, err := pool.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e := &Engine{}
+			err, notStarted := e.commitAttempt(&txn{tx: tx, caller: ctx})
+			if !notStarted || !errors.Is(err, ctx.Err()) || errors.Is(err, ErrOutcomeUnknown) || conn.commits != 0 || conn.rollbacks != 1 {
+				t.Fatalf("pre-dispatch cancellation err=%v not-started=%t commits=%d rollbacks=%d", err, notStarted, conn.commits, conn.rollbacks)
+			}
+			if err := tx.Rollback(); !errors.Is(err, sql.ErrTxDone) || conn.rollbacks != 1 {
+				t.Fatalf("database/sql completed state err=%v rollback count=%d", err, conn.rollbacks)
+			}
+		})
+	}
+}
+
+type hranaConfirmAndCancelConn struct {
+	httpHranaConn
+	cancel context.CancelFunc
+}
+
+func (c hranaConfirmAndCancelConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	c.cancel()
+	return driver.RowsAffected(0), nil
+}
+
+func TestHranaConfirmedCommitStaysSuccessfulAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := hranaConfirmAndCancelConn{cancel: cancel}
+	if err := (&singleLeaseTx{conn: conn, ctx: ctx}).Commit(); err != nil {
+		t.Fatalf("acknowledged commit changed to failure: %v", err)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatal("control did not cancel the caller")
+	}
+}
+
+func TestHranaRollbackCompletesAfterCallerCancellation(t *testing.T) {
+	pool, f := newHranaTerminalFixture(t, "ROLLBACK", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE messages SET state='active'"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- tx.Rollback() }()
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ROLLBACK did not start")
+	}
+	cancel()
+	f.releaseOnce.Do(func() { close(f.release) })
+	select {
+	case err = <-done:
+		if err != nil {
+			t.Fatalf("caller cancellation stopped cleanup: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("released ROLLBACK did not finish")
+	}
+	if f.count("ROLLBACK") != 1 {
+		t.Fatalf("rollback calls=%d", f.count("ROLLBACK"))
+	}
+	if _, err = pool.ExecContext(context.Background(), "DELETE FROM messages WHERE 0"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, query := range f.requests {
+		if query == "ROLLBACK" && f.batons[i] != "bounded-transaction" {
+			t.Error("cleanup lost its original transaction baton")
+		}
+		if query == "DELETE FROM MESSAGES WHERE 0" && f.batons[i] != "" {
+			t.Error("settled transaction connection was reused")
+		}
+	}
+}
+
+func TestHranaLostCommitReplyRemainsOutcomeUnknown(t *testing.T) {
+	pool, f := newHranaTerminalFixture(t, "COMMIT", true)
+	e := &Engine{db: &db{sql: pool, remote: true}, now: func() int64 { return 1_700_000_000_000 }, observation: observations{background: true}}
+	var calls int
+	err := e.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+		calls++
+		_, err := tx.ExecContext(ctx, "UPDATE messages SET state='active'")
+		return err
+	})
+	if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, io.EOF) || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("lost commit reply=%v, want ErrOutcomeUnknown without a replayable cause", err)
+	}
+	if calls != 1 || f.count("BEGIN") != 1 || f.count("COMMIT") != 1 {
+		t.Fatalf("ambiguous closure replayed: callbacks=%d BEGIN=%d COMMIT=%d", calls, f.count("BEGIN"), f.count("COMMIT"))
+	}
+}
+
 // The remote (Turso/libSQL) retry path turns on exactly when isConnErr says an
 // error is a dropped Hrana stream — never on a logical error, where a blind retry
 // could double-execute. This hermetic test pins that classification contract so a
@@ -4335,5 +4747,214 @@ func TestOpenExpiresBeforeCrashRecovery(t *testing.T) {
 	}
 	if locked == 0 || active != 0 {
 		t.Fatalf("startup revived expired locks: locked=%d active=%d", locked, active)
+	}
+}
+
+// closeWithHranaCommit holds one real HTTP COMMIT inside a registered background
+// worker. The protocol fixture controls acknowledgement timing; it does not model
+// provider durability. Real SQLite/WAL effects are covered by the diagnostic layer.
+func closeWithHranaCommit(t *testing.T) (*Engine, *hranaTerminalFixture, context.Context, <-chan error, *atomic.Int64) {
+	t.Helper()
+	pool, fixture := newHranaTerminalFixture(t, "COMMIT", false)
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &Engine{db: &db{sql: pool, remote: true}, closed: make(chan struct{}), bgCancel: cancel,
+		now: func() int64 { return 1_700_000_000_000 }, observation: observations{background: true}}
+	t.Cleanup(func() { fixture.releaseOnce.Do(func() { close(fixture.release) }); _ = e.Close() })
+	done := make(chan error, 1)
+	callbacks := new(atomic.Int64)
+	e.bgWG.Add(1)
+	go func() {
+		defer e.bgWG.Done()
+		e.runMaintenance(ctx, "scheduled", func(ctx context.Context) {
+			err := e.inTx(ctx, func(ctx context.Context, tx *txn) error {
+				callbacks.Add(1)
+				_, err := tx.ExecContext(ctx, "UPDATE messages SET state='active'")
+				return err
+			})
+			if err != nil {
+				e.maintenanceFailure(ctx, "activate_scheduled", err)
+			}
+			done <- err
+		})
+	}()
+	select {
+	case <-fixture.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background COMMIT did not enter HTTP")
+	}
+	return e, fixture, ctx, done, callbacks
+}
+
+func TestCloseAllowsAdmittedBackgroundCommitToAcknowledge(t *testing.T) {
+	e, fixture, bgctx, operation, callbacks := closeWithHranaCommit(t)
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e)
+	if _, err := e.db.exec(context.Background(), "SELECT 1"); !errors.Is(err, ErrClosed) {
+		t.Errorf("new remote operation during drain = %v, want ErrClosed", err)
+	}
+	// The one-second acknowledgement is intentionally inside the fixed five-second
+	// opportunity. Close must not cancel an admitted COMMIT before this response.
+	release := time.AfterFunc(time.Second, func() { fixture.releaseOnce.Do(func() { close(fixture.release) }) })
+	defer release.Stop()
+	select {
+	case <-bgctx.Done():
+		t.Error("Close canceled background COMMIT before its drain opportunity")
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case err := <-operation:
+		if err != nil {
+			t.Errorf("acknowledged background COMMIT = %v, want success", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("acknowledged operation did not join")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not join after acknowledgement")
+	}
+	if bgctx.Err() == nil {
+		t.Error("Close did not stop background workers after the drain")
+	}
+	if callbacks.Load() != 1 || fixture.count("COMMIT") != 1 {
+		t.Error("commit callback or request was replayed")
+	}
+	m := e.observation.maintenance["scheduled"]
+	if m.Failures != 0 || m.Diagnostics.ConsecutiveFailures != 0 {
+		t.Errorf("healthy drained maintenance failed: %+v", m)
+	}
+}
+
+func TestCloseDrainGraceStillCancelsUnacknowledgedBackgroundCommit(t *testing.T) {
+	e, fixture, _, operation, callbacks := closeWithHranaCommit(t)
+	started := time.Now()
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e)
+	select {
+	case err := <-operation:
+		if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("unacknowledged COMMIT = %v, want only ErrOutcomeUnknown", err)
+		}
+	case <-time.After(9 * time.Second):
+		t.Fatal("stalled COMMIT did not honor background cancellation")
+	}
+	if elapsed := time.Since(started); elapsed < 5*time.Second {
+		t.Errorf("background canceled after %v, before five-second drain grace", elapsed)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close or its admission waiter did not join")
+	}
+	select {
+	case <-fixture.finished:
+	case <-time.After(time.Second):
+		t.Error("canceled HTTP request did not join")
+	}
+	if callbacks.Load() != 1 || fixture.count("COMMIT") != 1 {
+		t.Error("ambiguous commit was replayed")
+	}
+	m := e.observation.maintenance["scheduled"]
+	if m.Failures != 1 || m.Interrupted != 0 || m.Diagnostics.LastOutcome != "failed" || m.Diagnostics.ConsecutiveFailures != 1 {
+		t.Errorf("unconfirmed commit was hidden as a shutdown interruption: %+v", m)
+	}
+}
+
+func TestCloseDrainClosesAdmissionAndWakesWaitersBeforeJoiningForeground(t *testing.T) {
+	e, err := Open(context.Background(), Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustQueue(t, e, "q", QueueConfig{})
+	bgctx, cancel := context.WithCancel(context.Background())
+	e.bgCancel = cancel
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); _ = e.Close() })
+	received := make(chan error, 1)
+	go func() {
+		_, err := e.Receive(context.Background(), "q", ReceiveOptions{MaxMessages: 1, WaitMs: 20000})
+		received <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		e.note.mu.Lock()
+		waiter := e.note.chans["q"]
+		parked := waiter != nil && waiter.waiters > 0
+		e.note.mu.Unlock()
+		if parked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("long-poll did not subscribe")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	entered := make(chan struct{})
+	foreground := make(chan error, 1)
+	go func() {
+		foreground <- e.inTx(context.Background(), func(context.Context, *txn) error { close(entered); <-release; return nil })
+	}()
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close() }()
+	awaitClosing(t, e)
+	for _, operation := range []func() error{
+		func() error {
+			_, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("refused")})
+			return err
+		},
+		func() error {
+			_, err := e.Receive(context.Background(), "q", ReceiveOptions{MaxMessages: 1})
+			return err
+		},
+	} {
+		if err := operation(); !errors.Is(err, ErrClosed) {
+			t.Errorf("new operation during grace = %v", err)
+		}
+	}
+	select {
+	case err := <-received:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("long-poll = %v, want ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("long-poll slept through the drain grace")
+	}
+	select {
+	case <-bgctx.Done():
+	case <-time.After(8 * time.Second):
+		t.Fatal("background grace did not expire")
+	}
+	select {
+	case <-closed:
+		t.Error("Close abandoned a still-running foreground callback at the background grace deadline")
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-foreground:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("foreground did not join")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close/admission waiter did not join")
 	}
 }

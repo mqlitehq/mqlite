@@ -219,19 +219,21 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	return e, nil
 }
 
+const closeDrainGrace = 5 * time.Second
+
 // Close stops the background workers and shuts the store down. It refuses new operations immediately
 // (they get ErrClosed) and then waits for the operations already in flight — a statement executing, a
 // transaction committing — to finish before releasing the single-writer file lock, so the lock is
 // never dropped out from under a live write.
+//
+// Admitted operations get up to five seconds to finish before background contexts are canceled.
+// This is not a deadline for Close: it still joins admitted foreground work and background cleanup.
 //
 // Because it waits for in-flight work, Close MUST NOT be called from inside an operation it would
 // wait for — in particular, not from within an Engine.Tx callback (see Tx). Doing so deadlocks.
 func (e *Engine) Close() error {
 	var err error
 	e.closeOnce.Do(func() {
-		if e.bgCancel != nil {
-			e.bgCancel()
-		}
 		// Shut the admission gate BEFORE draining the background workers: that drain can be slow (a
 		// maintenance pass may be inside an uninterruptible vacuum or a large retention delete), and
 		// an external Send/Tx arriving during it must fail fast with ErrClosed, not be admitted and
@@ -242,8 +244,28 @@ func (e *Engine) Close() error {
 		// else would ever wake it and it would sleep out its full window against a closed engine
 		// (round-8).
 		close(e.closed)
+		// beginClosing forbids further inFlight.Add calls under the admission mutex.
+		// Allow an admitted COMMIT to acknowledge before canceling its background
+		// context; otherwise an ordinary shutdown can manufacture ErrOutcomeUnknown.
+		drained := make(chan struct{})
+		go func() {
+			e.db.inFlight.Wait()
+			close(drained)
+		}()
+		timer := time.NewTimer(closeDrainGrace)
+		select {
+		case <-drained:
+		case <-timer.C:
+		}
+		timer.Stop()
+		if e.bgCancel != nil {
+			e.bgCancel()
+		}
 		e.bgWG.Wait()
 		err = e.db.close()
+		// The grace only delays background cancellation. db.close still joins all
+		// admitted work, so the sole admission-wait goroutine must join as well.
+		<-drained
 	})
 	return err
 }
