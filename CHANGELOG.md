@@ -12,6 +12,18 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Honor remote transaction cancellation (MQLITE-163)
+
+- Use the transaction's context for HTTP Hrana COMMIT instead of discarding its
+  cancellation or deadline. Cancellation detected before COMMIT dispatch attempts
+  rollback and returns the original caller error; an interrupted commit without
+  confirmation remains `ErrOutcomeUnknown` and is not transparently replayed.
+- Give ROLLBACK an independent five-second request budget so a canceled caller
+  does not skip cleanup or leave the operation and shutdown waiting indefinitely.
+  A failed or timed-out rollback does not confirm provider-side rollback. Detached
+  stream cleanup keeps its separate existing budget; local SQLite and WebSocket
+  transport are unchanged.
+
 ### Bound HTTP stream cleanup without delaying SQL (MQLITE-164)
 
 - Give asynchronous libSQL HTTP stream-close requests a five-second deadline and

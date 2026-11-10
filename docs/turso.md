@@ -141,6 +141,33 @@ This write-first shape addresses claim transactions in one broker or embedded
 `SQLITE_BUSY`, and the change does not make overlapping brokers against one database
 safe.
 
+## Remote transaction cancellation
+
+For HTTP Hrana transactions, COMMIT uses the original transaction context,
+including its cancellation and deadline (MQLITE-163). Supply a deadline when a
+bounded commit wait is required; a background context adds no request timeout.
+Cancellation detected before COMMIT execution starts sends no COMMIT, attempts
+rollback, and returns the original caller error. Once execution starts, an
+interruption without confirmation remains `ErrOutcomeUnknown`, even when the
+provider may not have applied it. The engine must not replay that transaction as
+though cancellation proved it had no effect. A confirmed commit remains successful
+even if cancellation arrives at the same time as its acknowledgement.
+
+ROLLBACK uses an independent five-second request context, so canceling the caller
+does not skip cleanup. This cleanup is synchronous: an operation can include that
+interval, and `Engine.Close` waits for its admitted operation to finish. A callback
+error or known pre-COMMIT caller cancellation remains the primary error if cleanup
+also fails or times out; neither that primary error nor a cleanup timeout confirms
+that the provider rolled back. Detached stream-close requests still follow their
+separate best-effort budget below. Local SQLite cancellation protection and the
+WebSocket driver are unchanged.
+
+The terminal-request contracts are covered by
+`TestHranaCommitHonorsTransactionContext`,
+`TestHranaCancellationBeforeDriverCommitRemainsNotStarted`,
+`TestHranaRollbackHasIndependentCleanupDeadline`, and
+`TestHranaLostCommitReplyRemainsOutcomeUnknown` in `engine/storage_test.go`.
+
 ## Bounded HTTP stream cleanup
 
 MQLite carries the pinned driver's HTTP v2 compatibility code internally, with a

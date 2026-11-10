@@ -1042,6 +1042,10 @@ func (e *Engine) commitAttempt(attempt *txn) (err error, notStarted bool) {
 		return err, true
 	}
 	if err := attempt.tx.Commit(); err != nil {
+		var notStarted *remoteCommitNotStartedError
+		if errors.As(err, &notStarted) {
+			return notStarted.cause, true
+		}
 		return err, false
 	}
 	e.observation.commit(attempt)
