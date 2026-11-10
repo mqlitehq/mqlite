@@ -247,3 +247,29 @@ MQLITE_TEST_DB=libsql://<db>.turso.io MQLITE_TEST_DB_AUTH_TOKEN=<jwt> \
 
 Without `MQLITE_TEST_DB` the live tests skip; the hermetic classifier test always
 runs.
+
+## Remote HTTP failure and write replay boundaries
+
+A transient HTTP response or a body mentioning `SQLITE_BUSY` does not prove
+that a preceding write failed. The provider or an intermediary can lose the
+success acknowledgement after the database committed. An issued standalone
+write or COMMIT with such an ambiguous response returns `ErrOutcomeUnknown` and
+is not transparently replayed. Reconcile the effect before retrying.
+
+Reads and transactions that have not attempted COMMIT retain bounded retries
+for recognized transient errors. A proven pre-execution `driver.ErrBadConn` or
+typed SQLite busy rejection remains distinct from arbitrary provider text.
+`RenewBatch` uses the same issued-write rules for its `UPDATE RETURNING`,
+including response scanning and interrupted acknowledgements. Before SQL is
+issued, cancellation while waiting for pool capacity stays the original caller
+context error. Request budgets, the remote pool and local single-writer behavior
+are unchanged. These boundaries do not add Rust-preview backend support.
+
+The engine manages BEGIN, COMMIT and ROLLBACK in a transaction callback. Do not
+issue transaction-control SQL or take over those boundaries through
+`EngineTx.SQL()`; doing so bypasses its rollback and retry guarantees.
+
+Non-200 HTTP response statuses are preserved internally even when a provider
+error-body fallback omits the numeric status. A transient status received after
+a write was issued does not prove rejection; the operation returns
+`ErrOutcomeUnknown` without replay.

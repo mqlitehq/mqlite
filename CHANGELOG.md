@@ -17,6 +17,22 @@ upgrade notes before replacing a broker.
   replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
 
 
+### Preserve uncertain remote write outcomes (MQLITE-174)
+
+- Do not replay an issued write or COMMIT based on Busy words in an HTTP error
+  body. Keep transient read and pre-COMMIT retries bounded; retain provider HTTP
+  status in safe diagnostics and report ambiguous writes as `ErrOutcomeUnknown`.
+  Keep definite single-statement SQLite Busy rejection metadata so contention
+  can still use the existing bounded typed-error retry path.
+  Provider HTTP failures use the connection storage-error bucket; detailed safe
+  categories still distinguish authentication, rate limiting and availability.
+- Treat `RenewBatch`'s `UPDATE RETURNING` as a write. Lost, interrupted or damaged
+  row acknowledgements cannot authorize a second update; cancellation while
+  waiting for a connection remains the original caller cancellation.
+- The engine owns transaction control in `EngineTx.SQL`; callbacks must not
+  commit or roll back independently. No pool, dependency, request budget or local
+  SQLite retry behavior is changed.
+
 ### Drain admitted writes before canceling maintenance
 
 - Refuse new operations and wake long polls immediately at engine shutdown, then
