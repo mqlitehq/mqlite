@@ -81,6 +81,41 @@ Go 1.21's internal Darwin linker does not emit the `LC_UUID` required by current
 macOS releases. This is a source-floor compatibility gate; supported Go release
 builds continue to use their default linker.
 
+## Change verification and release acceptance
+
+- For every code-change candidate, rerun the affected functional and regression
+  tests plus the complete existing suite and local checks above. Targeted green
+  tests alone do not qualify a fix. Execute the applicable e2e, crash, live-remote,
+  compatibility and cross-platform layers; report gated skips and missing evidence
+  explicitly. Keep native and standalone SDK behavior aligned with the broker.
+- Before merge, require the exact candidate's complete CI. After each merge,
+  verify the actual main source, its complete same-run/attempt CI, and real broker
+  integration with both clients for affected contracts. Earlier PR or main greens
+  do not establish the new main's status.
+- Runtime changes need relevant performance comparisons and sustained-load
+  coverage, locally with SQLite/fault injection and in Actions against dedicated
+  remote test databases. Fix source, baseline, workload, lease, duration, budgets
+  and acceptance criteria before measuring. Check exact message/effect accounting,
+  latency, errors and resource trends; exercise cancellation, shutdown and restart
+  boundaries where relevant. Functional nightly success is not a performance soak.
+- Preserve the first failure and its source before investigating or rerunning.
+  Do not enlarge deadlines, change leases or weaken accounting to erase a failure.
+  Classify infrastructure/read errors separately; skipped, interrupted or
+  incomplete workloads are not passes. CI status polling generates no workload.
+- Finish selected fixes and version/document updates before freezing the release
+  source, artifact digests, harness and configuration. Follow
+  [production acceptance](test/production/README.md): at least 24 hours of valid
+  workload, or the maintainer's stricter agreed window. Describe periodic remote
+  windows as samples, not continuous load. Candidate or acceptance-configuration
+  changes require renewed qualification; do not splice old sources or windows.
+- Close acceptance only after supervisor PASS/exit 0, final drain, identity/effect
+  accounting, integrity/foreign-key checks, recovery drills and resource/cleanup
+  review. Documentation-only changes need an explicit impact assessment, not a
+  claim that prior runtime evidence was rerun. Release notes describe the net
+  changes since the last tag, verified support, compatibility and upgrade limits.
+  Prepare the release proposal only after all gates close; creating any tag or
+  Release still requires explicit maintainer authorization below.
+
 ## Releasing, versioning & dependencies
 
 - **Tagging is gated.** Never create a git tag or GitHub Release without the
