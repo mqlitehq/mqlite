@@ -22,6 +22,8 @@ upgrade notes before replacing a broker.
 - Do not replay an issued write or COMMIT based on Busy words in an HTTP error
   body. Keep transient read and pre-COMMIT retries bounded; retain provider HTTP
   status in safe diagnostics and report ambiguous writes as `ErrOutcomeUnknown`.
+  Keep definite single-statement SQLite Busy rejection metadata so contention
+  can still use the existing bounded typed-error retry path.
   Provider HTTP failures use the connection storage-error bucket; detailed safe
   categories still distinguish authentication, rate limiting and availability.
 - Treat `RenewBatch`'s `UPDATE RETURNING` as a write. Lost, interrupted or damaged

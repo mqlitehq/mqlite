@@ -13,6 +13,9 @@ response parsing and error text. Non-200 HTTP errors additionally preserve their
 actual response status as private typed metadata, including error-body fallbacks
 and body-read failures. This is not evidence that a write had no effect; the
 engine uses it together with the operation stage to avoid uncertain write replay.
+An unambiguous single execute error also retains a primary SQLITE_BUSY code as
+private typed rejection evidence. Busy text, non-200 HTTP failures and batch or
+mixed results cannot create that evidence. Error text and SQL remain unchanged.
 Other local changes are private import paths and one cleanup manager shared by
 each opened database handle (one SQL pool).
 Each accepted detached

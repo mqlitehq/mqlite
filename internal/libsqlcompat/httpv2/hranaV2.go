@@ -300,7 +300,7 @@ func (h *hranaV2Conn) executeMsg(ctx context.Context, msg *hrana.PipelineRequest
 
 	for _, r := range result.Results {
 		if r.Error != nil {
-			return nil, errors.New(r.Error.Message)
+			return nil, providerExecutionError(msg, result, r)
 		}
 		if r.Response == nil {
 			return nil, errors.New("no response received")

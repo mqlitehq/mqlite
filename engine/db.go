@@ -439,6 +439,10 @@ func isBusyErr(err error) bool {
 	if leaf == nil {
 		return false
 	}
+	var coded interface{ Code() int }
+	if errors.As(err, &coded) && coded.Code()&255 == 5 {
+		return true
+	}
 	s := leaf.Error()
 	for _, sub := range []string{"database is locked", "database table is locked", "SQLITE_BUSY"} {
 		if strings.Contains(s, sub) {

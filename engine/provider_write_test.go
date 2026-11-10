@@ -374,3 +374,72 @@ func TestProviderAppliedWriteCancellationIsUnknown(t *testing.T) {
 		})
 	}
 }
+
+func TestConfirmedSQLBusyStillMakesProgress(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	e := f.openEngine(t, true)
+	defer e.Close()
+	if _, err := f.db.Exec("CREATE TABLE app_busy(value INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := f.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Rollback()
+	if _, err := owner.Exec("INSERT INTO app_busy VALUES(0)"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	released := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if f.snapshot().Busy > 0 {
+				released <- owner.Rollback()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				released <- ctx.Err()
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	_, err = e.db.exec(ctx, "INSERT INTO app_busy VALUES(1)")
+	if releaseErr := <-released; releaseErr != nil {
+		t.Fatal(releaseErr)
+	}
+	var effects int
+	if readErr := f.db.QueryRow("SELECT count(*) FROM app_busy WHERE value=1").Scan(&effects); readErr != nil {
+		t.Fatal(readErr)
+	}
+	t.Logf("busy=%d effects=%d errorType=%T error=%v", f.snapshot().Busy, effects, err, err)
+	if err != nil || effects != 1 || f.snapshot().Busy == 0 {
+		t.Fatalf("confirmed pre-effect SQLite Busy lost progress: effects=%d err=%v", effects, err)
+	}
+}
+
+type providerBusyWithoutText struct{}
+
+func (providerBusyWithoutText) Error() string { return "structured statement rejection" }
+func (providerBusyWithoutText) Code() int     { return 5 }
+
+func TestTypedBusyRetriesDoNotDependOnProviderWording(t *testing.T) {
+	err := fmt.Errorf("operation: %w", providerBusyWithoutText{})
+	d := &db{remote: true}
+	if !isBusyErr(err) || !d.retryable(err) || !d.retryableWrite(err) {
+		t.Fatal("definite SQLite Busy code was lost when its message changed")
+	}
+	for _, cause := range []error{
+		errors.Join(err, context.Canceled),
+		&providerWriteOutcomeUnknown{cause: err},
+	} {
+		if isBusyErr(cause) || d.retryable(cause) || d.retryableWrite(cause) {
+			t.Fatal("a typed Busy cause bypassed cancellation or write uncertainty")
+		}
+	}
+}

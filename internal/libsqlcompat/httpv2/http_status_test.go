@@ -55,3 +55,39 @@ func TestProviderHTTPStatusSurvivesBodyFallbacks(t *testing.T) {
 		}
 	}
 }
+
+func TestOnlyDefiniteSingleStatementBusyCarriesSQLiteCode(t *testing.T) {
+	for _, name := range []string{"valid", "message-only", "other-code", "wrong-type", "mixed-result", "extra-request", "extra-result", "batch"} {
+		t.Run(name, func(t *testing.T) {
+			code := "SQLITE_BUSY"
+			request := &hrana.PipelineRequest{Requests: []hrana.StreamRequest{{Type: "execute", Stmt: &hrana.Stmt{}}}}
+			failure := hrana.StreamResult{Type: "error", Error: &hrana.Error{Code: &code, Message: "database is locked"}}
+			reply := &hrana.PipelineResponse{Results: []hrana.StreamResult{failure}}
+			switch name {
+			case "message-only":
+				failure.Error.Code = nil
+			case "other-code":
+				code = "SQLITE_ERROR"
+			case "wrong-type":
+				failure.Type = "ok"
+			case "mixed-result":
+				failure.Response = &hrana.StreamResponse{Type: "execute"}
+			case "extra-request":
+				request.Requests = append(request.Requests, request.Requests[0])
+			case "extra-result":
+				reply.Results = append(reply.Results, failure)
+			case "batch":
+				request.Requests[0].Type = "batch"
+			}
+			err := providerExecutionError(request, reply, failure)
+			var coded interface{ Code() int }
+			got := errors.As(err, &coded)
+			if got != (name == "valid") || got && coded.Code() != 5 {
+				t.Fatalf("unexpected definite Busy evidence: %s, %T, %v", name, err, err)
+			}
+			if err.Error() != "database is locked" || HTTPStatus(err) != 0 {
+				t.Fatalf("message/status changed: %v", err)
+			}
+		})
+	}
+}
