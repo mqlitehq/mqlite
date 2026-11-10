@@ -3,6 +3,7 @@ package wire_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"reflect"
@@ -942,5 +943,80 @@ func TestObserveOptionalDiagnosticsCompatibility(t *testing.T) {
 		v := decode()
 		mutate(v)
 		reject(v)
+	}
+}
+
+func TestSendSequenceAcknowledgementDomain(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"negative_one", `{"seq_numbers":[-1]}`},
+		{"negative_batch", `{"seq_numbers":[7,-1]}`},
+		{"null_one", `{"seq_numbers":[null]}`},
+		{"null_batch", `{"seq_numbers":[7,null]}`},
+		{"minimum_int64", `{"seq_numbers":[-9223372036854775808]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var response wire.SendResponse
+			if err := json.Unmarshal([]byte(tc.body), &response); err == nil {
+				t.Errorf("invalid Send acknowledgement accepted: %s -> %v", tc.body, response.SeqNumbers)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, body string
+		want       []int64
+	}{
+		{"topic_no_match", `{"seq_numbers":[0]}`, []int64{0}},
+		{"dedup_repeat", `{"seq_numbers":[7,7]}`, []int64{7, 7}},
+		{"skipped_batch_slot", `{"seq_numbers":[7,0]}`, []int64{7, 0}},
+		{"maximum_int64", `{"seq_numbers":[9223372036854775807]}`, []int64{9223372036854775807}},
+		{"negative_zero", `{"seq_numbers":[-0]}`, []int64{0}},
+		{"unknown_null_extension", `{"seq_numbers":[7],"future":null}`, []int64{7}},
+		{"unknown_nested_extension", `{"seq_numbers":[7],"future":{"seq_numbers":[null,-1]}}`, []int64{7}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var response wire.SendResponse
+			err := json.Unmarshal([]byte(tc.body), &response)
+			if err != nil || len(response.SeqNumbers) != len(tc.want) {
+				t.Fatalf("valid acknowledgement=%v, %v", response.SeqNumbers, err)
+			}
+			for i, n := range tc.want {
+				if response.SeqNumbers[i] != n {
+					t.Errorf("position %d=%d want %d", i, response.SeqNumbers[i], n)
+				}
+			}
+		})
+	}
+	for _, tc := range []struct{ name, body string }{
+		{"quoted_integer", `{"seq_numbers":["7"]}`},
+		{"fraction", `{"seq_numbers":[1.25]}`},
+		{"integer_overflow", `{"seq_numbers":[9223372036854775808]}`},
+		{"boolean", `{"seq_numbers":[true]}`},
+		{"object", `{"seq_numbers":[{}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var response wire.SendResponse
+			err := json.Unmarshal([]byte(tc.body), &response)
+			var typed *json.UnmarshalTypeError
+			if !errors.As(err, &typed) || typed.Type.String() != "int64" {
+				t.Errorf("type error=%T %v, want existing int64 UnmarshalTypeError", err, err)
+			}
+		})
+	}
+}
+
+func BenchmarkSendSequenceAcknowledgementDecode(b *testing.B) {
+	for _, tc := range []struct{ name, body string }{{"one", `{"seq_numbers":[7]}`}, {"batch64", `{"seq_numbers":[` + strings.Repeat("7,", 63) + `7]}`}} {
+		b.Run(tc.name, func(b *testing.B) {
+			data := []byte(tc.body)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(data)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var response wire.SendResponse
+				if err := json.Unmarshal(data, &response); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

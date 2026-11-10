@@ -120,6 +120,28 @@ type SendResponse struct {
 	SeqNumbers []int64 `json:"seq_numbers"`
 }
 
+// UnmarshalJSON rejects impossible acknowledgements while preserving sequence
+// zero for topic publishes without a match and skipped batch dedup slots.
+func (r *SendResponse) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		SeqNumbers []*int64 `json:"seq_numbers"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	sequences := make([]int64, len(decoded.SeqNumbers))
+	for i, sequence := range decoded.SeqNumbers {
+		// A null item otherwise decodes as zero and impersonates a legitimate
+		// topic no-match or skipped batch slot.
+		if sequence == nil || *sequence < 0 {
+			return errors.New("mqlite: send response contains an invalid sequence number")
+		}
+		sequences[i] = *sequence
+	}
+	r.SeqNumbers = sequences
+	return nil
+}
+
 type ReceiveRequest struct {
 	Queue       string `json:"queue"`
 	MaxMessages int    `json:"max_messages,omitempty"`

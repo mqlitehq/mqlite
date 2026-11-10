@@ -12,6 +12,11 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+- Reject negative and JSON null sequence entries in successful Send replies
+  (MQLITE-188). Such malformed acknowledgements return `ErrOutcomeUnknown` without
+  replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
+
+
 ### Drain admitted writes before canceling maintenance
 
 - Refuse new operations and wake long polls immediately at engine shutdown, then
