@@ -55,6 +55,7 @@ const (
 // lease estimate.
 type renewalLease struct {
 	deadline         time.Time
+	requestStarted   time.Time
 	responseRTT      time.Duration
 	coarseClock      bool
 	clockUnavailable bool
@@ -782,7 +783,13 @@ func (s renewalState) acceptRenewal(lease renewalLease, now time.Time) renewalSt
 	}
 	if lease.deadline.IsZero() {
 		if !s.deadlineUntrusted {
-			s.deadline = now.Add(s.leaseEstimate)
+			// A legacy acknowledgement carries no new lease duration. Preserve
+			// the estimate, but spend this request's latency inside its watchdog.
+			started := lease.requestStarted
+			if started.IsZero() {
+				started = now // Custom sources may not report a request timestamp.
+			}
+			s.deadline = started.Add(s.leaseEstimate)
 		}
 		s.leaseTooShort = preserveLegacyShort
 		return s
@@ -943,7 +950,11 @@ func (r *Receiver) renewMessage(ctx context.Context, m *Message) (renewalLease, 
 		r.deadlineRenewUnsupported = true
 		r.renewCapabilityMu.Unlock()
 	}
-	return renewalLease{}, m.Renew(ctx)
+	started := time.Now()
+	if err := m.Renew(ctx); err != nil {
+		return renewalLease{}, err
+	}
+	return renewalLease{requestStarted: started}, nil
 }
 
 func renewalAttemptContext(ctx context.Context, state renewalState) (context.Context, context.CancelFunc) {
