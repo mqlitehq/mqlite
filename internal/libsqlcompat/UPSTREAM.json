@@ -116,7 +116,8 @@
     "Replace only Close/closeStream with a shared nonblocking best-effort cleanup path: sixteen active requests, five-second deadline before goroutine launch, no queue or retry; overload increments a skip counter and emits one fixed safe warning.",
     "Clear each captured baton before scheduling or skipping cleanup so serial repeated Close is idempotent.",
     "Adapt the legacy HTTP-only DSN entry point; retain the pinned upstream public SQL parser packages.",
-    "Emit the one-time capacity warning only from an existing completed cleanup worker, after network cancellation and slot release; foreground Close never invokes an application logger."
+    "Emit the one-time capacity warning only from an existing completed cleanup worker, after network cancellation and slot release; foreground Close never invokes an application logger.",
+    "Preserve actual non-200 HTTP status as private typed error metadata across every existing error-body/read fallback; retain error text, body parsing, SQL and 200-success behavior."
   ],
   "adapted_entrypoint": {
     "source": "libsql/sql.go",

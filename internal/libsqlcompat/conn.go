@@ -17,6 +17,10 @@ func OpenHTTP(dbURL string) (driver.Conn, error) {
 	return NewOpener().OpenHTTP(dbURL)
 }
 
+// HTTPStatus preserves an actual provider response status for the engine's
+// stage-aware retry policy. It does not imply that a write was rejected.
+func HTTPStatus(err error) int { return httpv2.HTTPStatus(err) }
+
 // Opener shares a bounded detached-cleanup manager across one database's
 // connections. Use a separate opener for each database/sql pool.
 type Opener struct {

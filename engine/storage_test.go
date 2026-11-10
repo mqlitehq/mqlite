@@ -1279,9 +1279,10 @@ func TestIsConnErr(t *testing.T) {
 		{"broken pipe", errors.New("write tcp 10.0.0.1->10.0.0.2: broken pipe"), true},
 		{"i/o timeout string", errors.New("read tcp: i/o timeout"), true},
 		{"net.Error timeout (no substring)", netTimeout{}, true},
-		// A structured server *response* is a definite non-commit — must NOT be
-		// treated as outcome-unknown (else a rejected write reads as "maybe applied").
-		{"server 500 response", errors.New("error code 500: SQLITE_ERROR"), false},
+		// A transient HTTP reply can follow a committed write; a permanent
+		// rejection must still win over misleading body text.
+		{"server 500 response", errors.New("error code 500: SQLITE_ERROR"), true},
+		{"server 400 rejection", errors.New("error code 400: SQLITE_BUSY EOF"), false},
 		{"no such table", errors.New("no such table: messages"), false},
 		{"unique constraint", errors.New("UNIQUE constraint failed: dedup.message_id"), false},
 		{"context canceled", errors.New("context canceled"), false},
@@ -1334,8 +1335,11 @@ func TestRetryableWrite(t *testing.T) {
 	if !remote.retryableWrite(fmt.Errorf("exec: %w", driver.ErrBadConn)) {
 		t.Error("write on ErrBadConn must be retryable (the statement never ran)")
 	}
-	if !remote.retryableWrite(errors.New("database is locked")) {
-		t.Error("write on a busy error must be retryable (lock never acquired)")
+	if !remote.retryableWrite(sqliteBusyEvidence{}) {
+		t.Error("write on typed SQLITE_BUSY must be retryable")
+	}
+	if remote.retryableWrite(errors.New("database is locked")) {
+		t.Error("untyped busy text cannot prove an issued write did not commit")
 	}
 	// Every broad transport error — including the EOF/timeout/broken-pipe siblings
 	// isConnErr now spans — is outcome-unknown for a write: it may have applied before
@@ -1554,6 +1558,7 @@ type busyState struct {
 	noEffect        bool     // a fenced write matched no message; exercise receipt lookup instead
 	commitErr       error
 	execErr         error
+	queryResultRows driver.Rows
 	onCommit        func()
 	queueReads      int
 	queueExpiresAt  int64
@@ -1589,7 +1594,7 @@ func (t *busyTx) Commit() error {
 	}
 	if t.st.failsLeft > 0 {
 		t.st.failsLeft--
-		return errors.New("database is locked") // busy: the commit provably did not land
+		return sqliteBusyEvidence{} // This fixture explicitly rejects before commit.
 	}
 	return t.st.commitErr
 }
@@ -1632,8 +1637,12 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		return &oneQueueRow{values: []driver.Value{name, "queue", int64(1000), int64(10), int64(0), int64(1), int64(0), "standard", int64(0), int64(0), int64(0), "active", c.st.queueExpiresAt}}, nil
 	}
 	if !c.record(query, args) {
-		return nil, errors.New("database is locked") // isBusyErr => retryable
+		return nil, sqliteBusyEvidence{} // Explicitly rejected before execution.
 	}
+	if rows := c.st.queryResultRows; rows != nil {
+		return rows, nil
+	}
+
 	if strings.Contains(normalized, "SELECT response FROM receive_attempts") {
 		if c.st.attemptResponse == "" {
 			return emptyRows{}, nil
@@ -1681,7 +1690,7 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 func (c *busyConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.st.statements = append(c.st.statements, query)
 	if !c.record(query, args) {
-		return nil, errors.New("database is locked")
+		return nil, sqliteBusyEvidence{}
 	}
 	if c.st.execErr != nil {
 		return nil, c.st.execErr
@@ -4586,7 +4595,8 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 		category string
 		status   int
 	}{
-		{errors.New("remote: error code 503: private provider message https://secret.example/?token=hidden"), "provider_unavailable", 503},
+		{fmt.Errorf("remote: %w", errors.New("error code 503: private provider message https://secret.example/?token=hidden")), "provider_unavailable", 503},
+		{errors.New("remote: error code 503: private provider message https://secret.example/?token=hidden"), "unclassified", 0},
 		{errors.New("error code 401: token=hidden"), "provider_auth", 401},
 		{errors.New("error code 429: slow down"), "provider_rate_limit", 429},
 		{errors.New("error code 400: private SQL"), "provider_http", 400},
@@ -4601,7 +4611,8 @@ func TestDiagnosticClassificationAndPrivacy(t *testing.T) {
 		{errors.New("SQLITE_FULL"), "full", 0},
 		{errors.New("unknown private explanation mqk_hidden"), "unclassified", 0},
 		{errors.Join(ErrOutcomeUnknown, errors.New("error code 503: unknown commit")), "outcome_unknown", 0},
-		{fmt.Errorf("%w: error code 503: unknown commit", ErrOutcomeUnknown), "outcome_unknown", 503},
+		{fmt.Errorf("%w: error code 503: unknown commit", ErrOutcomeUnknown), "outcome_unknown", 0},
+		{unknownRemoteWrite(errors.New("error code 503: unknown commit")), "outcome_unknown", 503},
 	} {
 		t.Run(tc.category+fmt.Sprint(tc.status), func(t *testing.T) {
 			detail := describeError(tc.err, 123)
@@ -4692,7 +4703,7 @@ func TestStorageLastErrorKeepsCoarseCountersAndPrivateCause(t *testing.T) {
 	snapshot := e.db.storage.snapshot(e.db.sql.Stats())
 	var detail *ErrorDetail
 	for _, row := range snapshot.Operations {
-		if row.Operation == "read" && row.ErrorCode == "other" {
+		if row.Operation == "read" && row.ErrorCode == "connection" {
 			detail = row.LastError
 			if row.Duration.Count != 2 || detail == nil || detail.Category != "provider_unavailable" || detail.HTTPStatus != 503 {
 				t.Fatalf("error bucket=%+v", row)
@@ -4958,3 +4969,15 @@ func TestCloseDrainClosesAdmissionAndWakesWaitersBeforeJoiningForeground(t *test
 		t.Fatal("Close/admission waiter did not join")
 	}
 }
+
+// A before-execution SQLite rejection, unlike an arbitrary provider message.
+type sqliteBusyEvidence struct{}
+
+func (sqliteBusyEvidence) Error() string { return "database is locked" }
+func (sqliteBusyEvidence) Code() int     { return 5 }
+
+type terminalErrorRows struct{ err error }
+
+func (terminalErrorRows) Columns() []string           { return []string{"value"} }
+func (terminalErrorRows) Close() error                { return nil }
+func (r terminalErrorRows) Next([]driver.Value) error { return r.err }

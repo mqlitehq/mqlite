@@ -254,6 +254,13 @@ func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url st
 		return hrana.PipelineResponse{}, false, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		defer func() {
+			if err != nil {
+				err = &providerHTTPError{status: resp.StatusCode, cause: err}
+			}
+		}()
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return hrana.PipelineResponse{}, false, err

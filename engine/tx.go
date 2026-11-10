@@ -22,6 +22,8 @@ type EngineTx struct {
 // in the same transaction as the enqueue. It is for caller-owned tables;
 // directly modifying mqlite's internal tables is unsupported and can bypass
 // engine invariants.
+// Engine owns BEGIN, COMMIT and ROLLBACK: do not take over those boundaries
+// through SQL(). Early caller commits bypass rollback and safe-retry guarantees.
 //
 // These are YOUR statements: mqlite cannot see where one ends and the next begins, so it cannot
 // stop issuing them on your behalf the way it does for its own (see txn in db.go). Two things

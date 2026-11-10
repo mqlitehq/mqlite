@@ -114,7 +114,7 @@ func TestCopiedRuntimeMatchesPinnedSourceOutsideApprovedLifecycleDelta(t *testin
 		t.Fatal(err)
 	}
 	manifestSum := sha256.Sum256(raw)
-	if hex.EncodeToString(manifestSum[:]) != "9ffc8053f62732c86af7c6b7b612b51abdbadf4ecc72988b106f54f628507f85" {
+	if hex.EncodeToString(manifestSum[:]) != "e630bdc9a7ed2c824fa705281fd950014b5ea90c20194da11490725911e15ad4" {
 		t.Fatal("review the full pinned source manifest before updating its golden")
 	}
 	if err := json.Unmarshal(raw, &upstream); err != nil {
@@ -269,5 +269,13 @@ func restorePinnedHTTPLifecycle(t *testing.T, text string) string {
 		h.baton = ""
 	}
 }`)
+	text = replacePinnedBlock(t, text, `	if resp.StatusCode != http.StatusOK {
+		defer func() {
+			if err != nil {
+				err = &providerHTTPError{status: resp.StatusCode, cause: err}
+			}
+		}()
+	}
+`, "")
 	return text
 }

@@ -738,6 +738,8 @@ func storageErrorCode(err error) string {
 		return "canceled"
 	case errors.Is(err, ErrClosed):
 		return "closed"
+	case remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err):
+		return "connection"
 	case isBusyErr(err):
 		return "busy"
 	case isConnErr(err):
@@ -1023,4 +1025,12 @@ func storageQueryOperation(query string) string {
 		}
 	}
 	return "read"
+}
+
+// queryFreshWrite applies issued-write acknowledgement rules to UPDATE RETURNING.
+func (d *db) queryFreshWrite(ctx context.Context, q string, args func() []any, scan func(*sql.Rows) error) error {
+	ctx, a := startStorage(ctx, storageQueryOperation(q))
+	err := d.queryFreshWriteUnobserved(ctx, q, args, scan)
+	d.finishStorage(a, err)
+	return err
 }

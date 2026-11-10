@@ -2736,13 +2736,13 @@ func TestTursoSoakConfigurationGate(t *testing.T) {
 }
 
 func TestTursoSoakFailureEvidenceIsSafeAndActionable(t *testing.T) {
-	raw := errors.New("request failed: error code 503: provider detail https://db.invalid/path token=top-secret bearer eyJhbGciOiJub25lIn0.eyJzZWNyZXQiOiJ2YWx1ZSJ9.signature SQL=SELECT-card_number message_body=customer-message-body")
+	raw := fmt.Errorf("request failed: %w", errors.New("error code 503: provider detail https://db.invalid/path token=top-secret bearer eyJhbGciOiJub25lIn0.eyJzZWNyZXQiOiJ2YWx1ZSJ9.signature SQL=SELECT-card_number message_body=customer-message-body"))
 	err := safeTursoSoakFailure("group_fifo", "receive", raw)
 	var failure tursoSoakFailure
 	if !errors.As(err, &failure) {
 		t.Fatalf("failure type = %T, want tursoSoakFailure", err)
 	}
-	if failure.Code != "other" || failure.Detail == nil || failure.Detail.Category != "provider_unavailable" ||
+	if failure.Code != "connection" || failure.Detail == nil || failure.Detail.Category != "provider_unavailable" ||
 		failure.Detail.HTTPStatus != http.StatusServiceUnavailable || failure.Detail.Fingerprint == "" {
 		t.Fatalf("failure evidence = %+v", failure)
 	}

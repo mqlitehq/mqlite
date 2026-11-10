@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
 )
 
 // ErrorDetail is safe for monitor credentials. Message is a generated description,
@@ -46,7 +48,7 @@ type MaintenanceDiagnostics struct {
 
 const maintenanceHistoryLimit = 8
 
-var providerHTTPCode = regexp.MustCompile(`(?i)(?:^|: )error code ([1-5][0-9]{2}):`)
+var providerHTTPCode = regexp.MustCompile(`^error code ([1-5][0-9]{2}):`)
 
 func describeError(err error, now int64) (d ErrorDetail) {
 	d = ErrorDetail{AtMs: now, Category: storageErrorCode(err)}
@@ -60,8 +62,8 @@ func describeError(err error, now int64) (d ErrorDetail) {
 	raw := err.Error()
 	hash := sha256.Sum256([]byte(raw))
 	d.Fingerprint = hex.EncodeToString(hash[:12])
-	if match := providerHTTPCode.FindStringSubmatch(raw); len(match) == 2 {
-		d.HTTPStatus, _ = strconv.Atoi(match[1])
+	if status := remoteProviderHTTPStatus(err); status != 0 {
+		d.HTTPStatus = status
 		switch {
 		case d.HTTPStatus == 401 || d.HTTPStatus == 403:
 			d.Category = "provider_auth"
@@ -172,4 +174,65 @@ func (e *Engine) maintenanceFailure(ctx context.Context, stage string, err error
 	e.log.Error("maintenance.failure", "task", task, "stage", stage, "at_ms", detail.AtMs,
 		"category", detail.Category, "cause", detail.Message, "fingerprint", detail.Fingerprint,
 		"http_status", detail.HTTPStatus, "sqlite_code", detail.SQLiteCode, "error", privateDiagnosticError(err))
+}
+
+func singleRemoteProviderLeaf(err error) error {
+	for depth := 0; err != nil && depth < 32; depth++ {
+		if _, multiple := err.(interface{ Unwrap() []error }); multiple {
+			return nil
+		}
+		//nolint:errorlint // Inspect this node only; errors.As can invoke custom As or traverse joined/cyclic causes.
+		if _, transport := err.(net.Error); transport {
+			return nil
+		}
+		cause := errors.Unwrap(err)
+		if cause == nil {
+			return err
+		}
+		err = cause
+	}
+	return nil
+}
+
+func remoteProviderHTTPStatus(err error) int {
+	if status := libsqlcompat.HTTPStatus(err); status != 0 {
+		return status
+	}
+	if leaf := singleRemoteProviderLeaf(err); leaf != nil {
+		// An issued write must not expose ErrBadConn as safe replay evidence.
+		// The opaque wrapper still preserves its actual provider status privately.
+		//nolint:errorlint // singleRemoteProviderLeaf already bounded this exact cause chain.
+		if opaque, ok := leaf.(*providerHTTPCodeFailure); ok {
+			err = opaque.cause
+		}
+		if status := libsqlcompat.HTTPStatus(err); status != 0 {
+			return status
+		}
+		if match := providerHTTPCode.FindStringSubmatch(leaf.Error()); len(match) == 2 {
+			status, _ := strconv.Atoi(match[1])
+			return status
+		}
+	}
+	return 0
+}
+
+func transientProviderHTTPStatus(status int) bool {
+	return status == 408 || status == 429 || status == 499 || status >= 500 && status <= 599
+}
+
+func unclassifiedProviderHTTPCode(err error) bool {
+	if singleRemoteProviderLeaf(err) == nil || remoteProviderHTTPStatus(err) != 0 {
+		return false
+	}
+	for depth := 0; err != nil && depth < 32; depth++ {
+		//nolint:errorlint // Recognize only this node's marker; errors.As would bypass this bounded single-cause walk.
+		if _, opaque := err.(*providerHTTPCodeFailure); opaque {
+			return true
+		}
+		if strings.HasPrefix(err.Error(), "error code ") {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
