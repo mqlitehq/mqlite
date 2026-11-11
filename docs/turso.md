@@ -185,7 +185,9 @@ MQLite carries the pinned driver's HTTP v2 compatibility code internally, with a
 narrow stream-cleanup patch (MQLITE-164). Its source revision, license and local
 changes are recorded in `internal/libsqlcompat/NOTICE` and `UPSTREAM.json`. The
 original pure-Go parser, HTTP client and TCP/TLS transport reuse are retained;
-normal SQL, transaction acknowledgement and retry decisions are unchanged.
+normal SQL and transport reuse are retained. The separate acknowledgement
+checks below reject damaged replies without adding requests or replaying
+ambiguous writes.
 
 Stream cleanup is asynchronous and best effort. Each opened database handle has a fixed cap of
 16 active cleanup requests, each with a five-second deadline created before the
@@ -273,3 +275,17 @@ Non-200 HTTP response statuses are preserved internally even when a provider
 error-body fallback omits the numeric status. A transient status received after
 a write was issued does not prove rejection; the operation returns
 `ErrOutcomeUnknown` without replay.
+
+## Malformed remote SQL acknowledgements
+
+The HTTP Hrana compatibility layer checks pipeline result counts and types,
+statement result fields, row widths and value representations, and the actual
+conditions of batch steps before accepting success. It preserves valid
+conditional skips, explicit SQL errors, SQL NULL and matching close replies.
+
+Missing or malformed success data cannot confirm a write. After an issued
+standalone write or COMMIT it is `ErrOutcomeUnknown`, without transparent replay;
+reconcile its actual effect before retrying. Ordinary reads retain distinct
+protocol errors and bounded retries for interrupted network reads. These checks
+add no requests, do not change the pinned driver or cleanup budgets, and do not
+extend backend support beyond the verified scope.

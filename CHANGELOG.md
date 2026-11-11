@@ -17,6 +17,16 @@ upgrade notes before replacing a broker.
   replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
 
 
+### Validate remote SQL acknowledgements (MQLITE-191)
+
+- Reject incomplete or mismatched HTTP Hrana results instead of panicking or
+  accepting an incomplete success. Validate pipeline cardinality, statement
+  fields, row/value shapes and conditional batch positions while preserving
+  valid SQL values, explicit errors and matching stream-close results.
+- A damaged acknowledgement after an issued standalone write or COMMIT is
+  `ErrOutcomeUnknown` and is not transparently replayed. Read failures remain
+  distinct; healthy requests, the driver pin and cleanup budgets are unchanged.
+
 ### Preserve uncertain remote write outcomes (MQLITE-174)
 
 - Do not replay an issued write or COMMIT based on Busy words in an HTTP error

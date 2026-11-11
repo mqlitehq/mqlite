@@ -32,12 +32,16 @@ func (r *StmtResult) UnmarshalJSON(data []byte) error {
 	type Alias StmtResult
 	aux := &struct {
 		ReplicationIndex interface{} `json:"replication_index,omitempty"`
+		AffectedRowCount *int32      `json:"affected_row_count"`
 		*Alias
 	}{
 		Alias: (*Alias)(r),
 	}
 
 	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if err := validateStatementAcknowledgement(r, aux.AffectedRowCount); err != nil {
 		return err
 	}
 
