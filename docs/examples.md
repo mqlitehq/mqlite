@@ -1,8 +1,8 @@
 # Examples
 
-These examples follow `main`, including unreleased behavior. For an installed
+These examples follow `main` for release target v0.4.3. For an installed
 v0.4.2 release, use the [examples at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/examples.md);
-see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 
 For authenticated producer/consumer credentials, Go SDK key management, console and
 MCP workflows, see [Access keys](access-keys.md) (v0.3.1 and later).
@@ -142,7 +142,7 @@ concurrency.
 
 The core calls in this example also work with MQLite Remote Client for Go, the
 standard-library-only, remote-only companion module. Install
-`github.com/mqlitehq/mqlite-go@v0.1.1` and change the import to
+`github.com/mqlitehq/mqlite-go@v0.1.2` and change the import to
 `mqlite "github.com/mqlitehq/mqlite-go"`. Its source floor is Go 1.13. Use the
 main module shown below when the same application also needs embedded mode,
 `Observe`, or managed access-key administration.

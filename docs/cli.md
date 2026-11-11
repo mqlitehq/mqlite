@@ -1,9 +1,9 @@
 # CLI reference (`mqlite`)
 
-This reference follows `main`, including unreleased changes. Cross-invocation
+This reference follows `main` for release target v0.4.3. Cross-invocation
 local settlement and lease-preserving maintenance below are not included in
 v0.4.2; use the [CLI reference at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/cli.md)
-for that installed binary. See [CHANGELOG.md](../CHANGELOG.md#unreleased).
+for that installed binary. See [CHANGELOG.md](../CHANGELOG.md).
 
 One binary, **two modes** — the same commands work against a local SQLite DB
 (embedded) or a running broker (client), chosen by environment:

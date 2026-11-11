@@ -1,8 +1,8 @@
 # Core concepts & subscription filters
 
-This document follows `main`, including unreleased changes. For an installed
+This document follows `main` for release target v0.4.3. For an installed
 v0.4.2 release, use the [concepts at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/concepts.md);
-see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 
 > Goal: explain MQLite's model once, clearly, and place it against the comparable
 > services from Azure Service Bus, AWS (SQS + SNS) and GCP Pub/Sub. MQLite is designed

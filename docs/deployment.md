@@ -48,9 +48,10 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> The latest supported release is **v0.4.2**, with default port **6754** and
-> schema token **7**. Pin the exact v0.4.2 binary or image rather than relying on
-> a moving image alias. v0.3.3 is withdrawn, unsupported, and retracted by
+> This source targets **v0.4.3**, with default port **6754** and
+> schema token **7**. Verify its tag and assets on
+> [Releases](https://github.com/mqlitehq/mqlite/releases) before using the exact
+> v0.4.3 binary or image in these examples. v0.3.3 is withdrawn, unsupported, and retracted by
 > v0.4.0 and later; its public assets and exact image remain available for
 > forensic or compatibility inspection and must not be deployed.
 >
@@ -70,21 +71,21 @@ remain `manage` operations. Browser root requests that explicitly prefer HTML
 enter the enabled console, while curl and JSON clients retain the discovery
 response. The wire contract is unchanged and no database rebuild is required.
 
-The exact supported image is multi-arch (amd64 + arm64):
+The target image is multi-arch (amd64 + arm64); confirm publication before running:
 
 ```bash
-# v0.4.2, default port 6754
+# v0.4.3 release target, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
   -e MQLITE_TOKENS=mqk_prod_CHANGEME \
   -e MQLITE_MONITOR_TOKENS=mqk_monitor_CHANGEME \
   -e MQLITE_SYNC=FULL \
-  ghcr.io/mqlitehq/mqlite:0.4.2
+  ghcr.io/mqlitehq/mqlite:0.4.3
 ```
 
 - The named volume `mqlite-data` persists the SQLite file across restarts.
-- Pin exact `0.4.2` in production. Images `>= 0.3.0` listen on `6754`;
+- Pin exact `0.4.3` in production. Images `>= 0.3.0` listen on `6754`;
   **`0.2.x` and earlier listen on `8080`**.
 - Verify: `curl http://localhost:6754/` (discovery card) and `/healthz`. Metrics is
   disabled by default. For a private broker or an ingress that blocks public
@@ -103,7 +104,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.4.2"   # latest supported exact image
+  image = "ghcr.io/mqlitehq/mqlite:0.4.3"   # exact release-target image
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -217,7 +218,7 @@ online snapshots, offline directory copies, isolated restore validation and roll
 Use a fresh restore directory so an old WAL/SHM cannot attach to the snapshot.
 
 **v0.2.0 databases use schema 2; v0.3.0/v0.3.1/v0.3.2 and withdrawn
-v0.3.3 use schema 5; v0.4.0, v0.4.1, and v0.4.2 use schema 7.**
+v0.3.3 use schema 5; v0.4.0 through v0.4.3 use schema 7.**
 Intermediate untagged lifecycle builds used schema 6. There is no in-place
 migration between these tokens. Before testing a different token, account for
 retained work in every state, keep the old binary/database pair and a consistent

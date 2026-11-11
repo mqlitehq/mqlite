@@ -9,7 +9,7 @@ and how the freeze is enforced so it can't be lifted by accident.
 
 Applications that only call a broker can instead use the official
 [MQLite Remote Client for Go](https://github.com/mqlitehq/mqlite-go). Its module
-path remains `github.com/mqlitehq/mqlite-go`; release `v0.1.1` has a Go 1.13
+path remains `github.com/mqlitehq/mqlite-go`; release target `v0.1.2` has a Go 1.13
 source floor and uses only the standard library, so it does not link the embedded
 engine, SQLite, libSQL/Turso, or CGO.
 The low floor is a compatibility promise, not a recommendation to run an
