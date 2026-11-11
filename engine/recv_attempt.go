@@ -391,7 +391,11 @@ func (e *Engine) claimUpToLiveTxFrom(ctx context.Context, tx *txn, q queueRow, m
 		// Stop once the response reaches the byte budget: we only ever claim messages we
 		// return (no claim-then-truncate), so the un-claimed rest stays active for the next
 		// Receive, and a single legal batch can't materialize gigabytes (MQLITE-80).
-		bytes += int64(len(m.Body))
+		size, err := responseMessageBytes(m)
+		if err != nil {
+			return out, err
+		}
+		bytes += size
 		if bytes >= maxResponseBytes {
 			break
 		}

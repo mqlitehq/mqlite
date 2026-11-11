@@ -96,6 +96,15 @@ upgrade notes before replacing a broker.
 > and settle all deliveries, or wait for every lease to expire and verify
 > `locked=0`; do not run an old local CLI against a stopped broker DB with live work.
 
+### Account for metadata in response batches (MQLITE-151)
+
+- Count complete serialized message data, including metadata, string escaping
+  and base64 expansion, toward the batch budget for Peek and both Receive paths.
+  ReceiveDeferred now uses the same accounting threshold. Only returned items
+  are claimed or removed; a large individual message still makes progress.
+- Preserve the exact original batch for an existing Receive attempt. New
+  accounting does not truncate old replay records or revoke their live tokens.
+
 ### Preserve remote cancellation identity (MQLITE-147)
 
 - Preserve a caller's cancellation identity when remote work has provably not

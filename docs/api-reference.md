@@ -88,6 +88,17 @@ reasonable (they count toward the JSON request you send, not toward the body cap
 | retained subscriptions | 10,000 active + deleting | `MQLITE_MAX_SUBSCRIPTIONS` (serve) / `Options.MaxSubscriptions` or `WithMaxSubscriptions` (embedded) |
 | filter `expr` source | capped length + AST node count | internal (see [concepts.md](concepts.md#subscription-filters-expr)) |
 
+Unreleased `main` also applies a 32 MiB serialization-accounting threshold to
+new Peek, Receive, and ReceiveDeferred batches. The accounting includes message
+bodies, base64 expansion, JSON escaping and metadata. The engine returns the
+message that reaches the threshold, then stops before claiming another one;
+the bound is therefore the threshold plus one message, not a hard per-message
+rejection limit. This allows existing individually large messages to make
+progress. Peek continues with `from_seq`; ReceiveDeferred callers request the
+unreturned sequence numbers again. An existing Receive attempt replays its
+original committed batch, including records created before this accounting
+change; it is never truncated and its outstanding tokens are not revoked.
+
 ## The base URL
 
 Every example below is written against `$BASE_URL`, because the port is the one thing a

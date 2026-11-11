@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -687,6 +688,124 @@ func TestPeekRespectsByteBudget(t *testing.T) {
 	}
 	if len(pk2) == 0 {
 		t.Fatal("FromSeq paging should return the messages past the first budgeted page")
+	}
+}
+
+// A small accounting budget makes this a bounded regression: metadata and JSON
+// escaping must count even when the body is tiny (MQLITE-151).
+func TestResponseBudgetIncludesMetadata(t *testing.T) {
+	old := maxResponseBytes
+	maxResponseBytes = 4096
+	defer func() { maxResponseBytes = old }()
+	for _, path := range []string{"peek", "receive", "receive-delete", "deferred"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{})
+			var seqs []int64
+			for i := 0; i < 5; i++ {
+				seq, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x"), Properties: map[string]string{"pad": strings.Repeat("\x00", 800)}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				seqs = append(seqs, seq)
+			}
+			if path == "peek" {
+				items, err := e.Peek(ctx, "q", PeekOptions{Max: 5})
+				if err != nil || len(items) != 1 || items[0].SeqNumber != seqs[0] {
+					t.Fatalf("metadata budget: messages=%d err=%v", len(items), err)
+				}
+				more, err := e.Peek(ctx, "q", PeekOptions{Max: 5, FromSeq: seqs[1]})
+				if err != nil || len(more) != 1 || more[0].SeqNumber != seqs[1] {
+					t.Fatalf("metadata page continuation: messages=%d err=%v", len(more), err)
+				}
+				return
+			}
+			if path == "deferred" {
+				for range seqs {
+					m := recvOne(t, e, "q")
+					if err := e.Defer(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			mode := PeekLock
+			if path == "receive-delete" {
+				mode = ReceiveAndDelete
+			}
+			var items []*Message
+			var err error
+			if path == "deferred" {
+				items, err = e.ReceiveDeferred(ctx, "q", seqs...)
+			} else {
+				items, err = e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 5, Mode: mode, AttemptID: "small-metadata-budget"})
+			}
+			if err != nil || len(items) != 1 || items[0].SeqNumber != seqs[0] {
+				t.Fatalf("metadata budget: messages=%d err=%v", len(items), err)
+			}
+			if path != "deferred" {
+				replay, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 5, Mode: mode, AttemptID: "small-metadata-budget"})
+				if err != nil || len(replay) != 1 || replay[0].SeqNumber != items[0].SeqNumber || replay[0].LockToken != items[0].LockToken {
+					t.Fatalf("budgeted replay changed: messages=%d err=%v", len(replay), err)
+				}
+			}
+			stats, err := e.Stats(ctx, "q")
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch path {
+			case "receive":
+				if stats.Locked != 1 || stats.Active != 4 || stats.Total != 5 {
+					t.Fatalf("unreturned messages were claimed: %+v", stats)
+				}
+			case "receive-delete":
+				if stats.Active != 4 || stats.Total != 4 {
+					t.Fatalf("unreturned messages were removed: %+v", stats)
+				}
+			case "deferred":
+				if stats.Locked != 1 || stats.Deferred != 4 || stats.Total != 5 {
+					t.Fatalf("unreturned deferred messages were claimed: %+v", stats)
+				}
+			}
+		})
+	}
+}
+
+func TestResponseBudgetDoesNotTruncateAttemptReplay(t *testing.T) {
+	old := maxResponseBytes
+	defer func() { maxResponseBytes = old }()
+	for _, tc := range []struct {
+		name string
+		mode ReceiveMode
+	}{{"peek-lock", PeekLock}, {"receive-delete", ReceiveAndDelete}} {
+		t.Run(tc.name, func(t *testing.T) {
+			maxResponseBytes = 4096
+			ctx := context.Background()
+			e, _ := testEngine(t)
+			mustQueue(t, e, "q", QueueConfig{})
+			for i := 0; i < 3; i++ {
+				if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("small")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			opts := ReceiveOptions{MaxMessages: 3, Mode: tc.mode, AttemptID: "existing-batch"}
+			original, err := e.Receive(ctx, "q", opts)
+			if err != nil || len(original) != 3 {
+				t.Fatalf("original batch: messages=%d err=%v", len(original), err)
+			}
+			// An already committed response belongs to its caller. A changed budget after
+			// restart/upgrade must not hide tokens or silently change the exact replay.
+			maxResponseBytes = 1
+			replay, err := e.Receive(ctx, "q", opts)
+			if err != nil || len(replay) != len(original) {
+				t.Fatalf("existing batch was truncated: messages=%d err=%v", len(replay), err)
+			}
+			for i, m := range replay {
+				if m.SeqNumber != original[i].SeqNumber || m.LockToken != original[i].LockToken || m.DeliveryCount != 1 || !bytes.Equal(m.Body, original[i].Body) {
+					t.Fatalf("replay changed message or ownership at item %d", i)
+				}
+			}
+		})
 	}
 }
 
