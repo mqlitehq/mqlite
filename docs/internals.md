@@ -1,8 +1,8 @@
 # How mqlite works — building a reliable queue on one SQLite file
 
-This document follows `main`, including unreleased changes. For an installed
+This document follows `main` for release target v0.4.3. For an installed
 v0.4.2 release, use the [internals at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/internals.md);
-see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 
 > This is the teaching document: how mqlite is actually built, table by table and
 > decision by decision — and *why* this construction yields a queue you can trust.

@@ -62,6 +62,18 @@ func TestClaimPlanPinning(t *testing.T) {
 			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "group_fifo", int64(0), "attempt", int64(0), int64(0), int64(0)}, true, true, []string{"idx_msg_group_inflight"}},
 		{"strict_fifo/attempt", firstClaimStrictAttemptSQL,
 			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "strict_fifo", int64(0), "attempt", int64(0), int64(0), int64(0)}, true, true, []string{"idx_msg_deferred", "idx_msg_sched_head", "idx_msg_locked_head"}},
+		{"remote/group_fifo/continuation", remoteClaimSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(0)}, false, false, []string{"idx_msg_group_inflight"}},
+		{"remote/strict_fifo/continuation", remoteClaimStrictSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(0)}, false, false, []string{"idx_msg_deferred", "idx_msg_sched_head", "idx_msg_locked_head"}},
+		{"remote/group_fifo/first", remoteFirstClaimSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "group_fifo", int64(0), int64(0), int64(0)}, true, false, []string{"idx_msg_group_inflight"}},
+		{"remote/strict_fifo/first", remoteFirstClaimStrictSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "strict_fifo", int64(0), int64(0), int64(0)}, true, false, []string{"idx_msg_deferred", "idx_msg_sched_head", "idx_msg_locked_head"}},
+		{"remote/group_fifo/attempt", remoteFirstClaimAttemptSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "group_fifo", int64(0), "attempt", int64(0), int64(0), int64(0)}, true, true, []string{"idx_msg_group_inflight"}},
+		{"remote/strict_fifo/attempt", remoteFirstClaimStrictAttemptSQL,
+			[]any{int64(0), "tok", "q2", int64(0), int64(30_000), "strict_fifo", int64(0), "attempt", int64(0), int64(0), int64(0)}, true, true, []string{"idx_msg_deferred", "idx_msg_sched_head", "idx_msg_locked_head"}},
 	} {
 		plan := explainPlan(t, e, tc.sql, tc.args...)
 		if !strings.Contains(plan, "idx_msg_active") {

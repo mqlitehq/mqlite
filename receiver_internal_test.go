@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3608,5 +3610,68 @@ func TestLegacyRenewRetainsLeaseEstimate(t *testing.T) {
 				t.Fatalf("hung renewal did not stop independently or settled: complete=%d remaining=%s caller=%v callbacks=%v", completes, outcome.remaining, callerErr, callbackErrors)
 			}
 		})
+	}
+}
+
+func TestReceiveValidatesWholeDeliveryBatch(t *testing.T) {
+	valid := `{"seq_number":7,"body":"","lock_token":"private-token","locked_until_ms":1,"future":"ignored"}`
+	tests := []struct {
+		name, body         string
+		invalid, needsLock bool
+	}{
+		{"null-item", `{"messages":[` + valid + `,null]}`, true, false},
+		{"zero-id", `{"messages":[` + valid + `,{"seq_number":0,"lock_token":"other"}]}`, true, false},
+		{"negative-id", `{"messages":[` + valid + `,{"seq_number":-1,"lock_token":"other"}]}`, true, false},
+		{"duplicate-id", `{"messages":[` + valid + `,` + valid + `]}`, true, false},
+		{"missing-token", `{"messages":[` + valid + `,{"seq_number":8}]}`, false, true},
+		{"empty-bodies-and-unknown-field", `{"messages":[` + valid + `,{"seq_number":8,"body":"","lock_token":"other"}]}`, false, false},
+		{"empty-batch", `{"messages":[]}`, false, false},
+		{"max-int-and-unordered", `{"messages":[{"seq_number":9223372036854775807,"lock_token":"a"},` + valid + `]}`, false, false},
+	}
+	for _, method := range []string{"raw-peek", "raw-delete", "deferred", "managed"} {
+		for _, tc := range tests {
+			t.Run(method+"/"+tc.name, func(t *testing.T) {
+				var calls int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					atomic.AddInt32(&calls, 1)
+					_, _ = io.WriteString(w, tc.body)
+				}))
+				defer server.Close()
+				client, err := Open(context.Background(), server.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				var messages []*Message
+				switch method {
+				case "raw-peek":
+					messages, err = client.Receive(context.Background(), "jobs", RecvOpts{Max: 2})
+				case "raw-delete":
+					messages, err = client.Receive(context.Background(), "jobs", RecvOpts{Max: 2, AtMostOnce: true})
+				case "deferred":
+					messages, err = client.Receive(context.Background(), "jobs", RecvOpts{Pick: []int64{7, 8}, AtMostOnce: true})
+				case "managed":
+					messages, err = client.receiveOne(context.Background(), "jobs", 2, 0, engine.PeekLock, "stable-attempt")
+				}
+				wantInvalid := tc.invalid || tc.needsLock && method != "raw-delete"
+				if wantInvalid {
+					var invalid *invalidSuccessResponseError
+					if !errors.As(err, &invalid) || len(messages) != 0 {
+						t.Fatalf("bad whole batch escaped: n=%d err=%v", len(messages), err)
+					}
+					if method == "raw-delete" && !errors.Is(err, ErrOutcomeUnknown) {
+						t.Fatalf("destructive receive lost Unknown: %v", err)
+					}
+					if strings.Contains(err.Error(), "private-token") {
+						t.Fatalf("error exposed a fencing token")
+					}
+				} else if err != nil {
+					t.Fatalf("valid delivery rejected: %v", err)
+				}
+				if got := atomic.LoadInt32(&calls); got != 1 {
+					t.Fatalf("requests=%d, want1", got)
+				}
+			})
+		}
 	}
 }

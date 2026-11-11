@@ -1,6 +1,11 @@
 package mqlite
 
-import "testing"
+import (
+	"errors"
+	"net/url"
+	"strings"
+	"testing"
+)
 
 // TestParseDSN pins the connection-string port contract (MQLITE-84): custom mqlite/mqlites
 // schemes supply the product default port 6754 when it is omitted, an explicit port always
@@ -41,6 +46,23 @@ func TestParseDSN(t *testing.T) {
 			}
 			if tok != c.token {
 				t.Errorf("token = %q, want %q", tok, c.token)
+			}
+		})
+	}
+}
+
+func TestParseDSNErrorKeepsCauseWithoutCredentials(t *testing.T) {
+	const token = "synthetic-private-marker"
+	for _, scheme := range []string{"mqlite", "mqlites"} {
+		t.Run(scheme, func(t *testing.T) {
+			_, _, err := parseDSN(scheme + "://" + token + "@test.invalid/%zz")
+			if err == nil || strings.Contains(err.Error(), token) {
+				t.Fatal("malformed connection string did not return a credential-free error")
+			}
+			var parseError *url.Error
+			var escapeError url.EscapeError
+			if !errors.As(err, &parseError) || parseError.URL != "" || parseError.Op != "parse" || !errors.As(err, &escapeError) {
+				t.Fatal("connection string error lost its safe parse cause")
 			}
 		})
 	}

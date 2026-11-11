@@ -12,6 +12,23 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+## v0.4.3 — 2026-11-11
+
+- Preserve embedded NUL bytes in remote message metadata and dead-letter text
+  results.
+
+- Validate complete received batches before exposing any message: reject null
+  entries, nonpositive/repeated sequence numbers and missing Peek-Lock tokens.
+  Preserve valid empty bodies/batches and tokenless ReceiveAndDelete; malformed
+  destructive replies remain `ErrOutcomeUnknown`, and managed Peek-Lock recovery
+  keeps its receive-attempt ID without dispatching a valid prefix (MQLITE-153).
+
+- Omit credential-bearing URLs from remote database connection and native client
+  connection-string parse errors while preserving their operation and cause
+  (MQLITE-168). Startup logs retain only the remote scheme, host and path.
+  Reject remote URL fragments before connecting so they cannot capture an
+  appended authentication token.
+
 - Reject negative and JSON null sequence entries in successful Send replies
   (MQLITE-188). Such malformed acknowledgements return `ErrOutcomeUnknown` without
   replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
@@ -89,6 +106,15 @@ upgrade notes before replacing a broker.
 > live tokens when it opens the same database. Before downgrading, drain consumers
 > and settle all deliveries, or wait for every lease to expire and verify
 > `locked=0`; do not run an old local CLI against a stopped broker DB with live work.
+
+### Account for metadata in response batches (MQLITE-151)
+
+- Count complete serialized message data, including metadata, string escaping
+  and base64 expansion, toward the batch budget for Peek and both Receive paths.
+  ReceiveDeferred now uses the same accounting threshold. Only returned items
+  are claimed or removed; a large individual message still makes progress.
+- Preserve the exact original batch for an existing Receive attempt. New
+  accounting does not truncate old replay records or revoke their live tokens.
 
 ### Preserve remote cancellation identity (MQLITE-147)
 

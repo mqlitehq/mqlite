@@ -3,10 +3,10 @@
 # mqlite
 
 [![CI](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlitehq/mqlite/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.4.2.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.4.2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.4.3.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.4.3)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mqlitehq/mqlite)](https://goreportcard.com/report/github.com/mqlitehq/mqlite)
 [![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
-[![Supported release: v0.4.2](https://img.shields.io/badge/release-v0.4.2-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.2)
+[![Release target: v0.4.3](https://img.shields.io/badge/release_target-v0.4.3-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3)
 [![Go](https://img.shields.io/github/go-mod/go-version/mqlitehq/mqlite)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -18,14 +18,15 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
 
-> **Release status:** v0.4.2 is the latest supported release. Pin production
-> installs to v0.4.2 or `ghcr.io/mqlitehq/mqlite:0.4.2`. v0.3.3 is withdrawn
+> **Release target:** this source prepares v0.4.3. Confirm the tag and assets on
+> [Releases](https://github.com/mqlitehq/mqlite/releases) before installing. Production
+> examples target v0.4.3 or `ghcr.io/mqlitehq/mqlite:0.4.3`. v0.3.3 is withdrawn
 > and unsupported; its
 > public assets remain available only for forensic or compatibility inspection
 > and must not be deployed. v0.4.0 and later carry its retraction directive.
 
-> **Documentation scope:** this README follows `main`, including unreleased
-> changes listed in [CHANGELOG.md](CHANGELOG.md#unreleased). Lease-preserving
+> **Documentation scope:** this README follows `main` for release target v0.4.3.
+> Changes are listed in [CHANGELOG.md](CHANGELOG.md). Lease-preserving
 > startup, cross-invocation local CLI settlement, coordinated broker shutdown,
 > the broker time header, and the revised managed Receiver retry and renewal
 > behavior described below are not included in v0.4.2. For an installed v0.4.2
@@ -313,7 +314,7 @@ this automatically.
 Remote-only applications that need a lower source floor can use the official
 [MQLite Remote Client for Go](https://github.com/mqlitehq/mqlite-go), whose
 module path remains `github.com/mqlitehq/mqlite-go`
-(`go get github.com/mqlitehq/mqlite-go@v0.1.1`). It supports Go 1.13 and uses
+(`go get github.com/mqlitehq/mqlite-go@v0.1.2`). It supports Go 1.13 and uses
 only the standard library: it does not link SQLite, libSQL/Turso, CGO, or this
 main module. Keep using `github.com/mqlitehq/mqlite` for embedded queues,
 transactional outbox, canonical `Observe`, or managed access-key administration.
@@ -594,9 +595,10 @@ throughput, memory, and disk methodology and numbers:
 
 ## Status
 
-The latest supported release is **v0.4.2** (port 6754, schema token 7). Pin
-production binaries to the v0.4.2 release and containers to
-`ghcr.io/mqlitehq/mqlite:0.4.2`. v0.3.3 is withdrawn and unsupported; its public
+This source targets **v0.4.3** (port 6754, schema token 7). Confirm its tag and
+assets on [Releases](https://github.com/mqlitehq/mqlite/releases) before installation.
+The production image example is `ghcr.io/mqlitehq/mqlite:0.4.3`. v0.3.3 is
+withdrawn and unsupported; its public
 assets and exact image remain available for forensic or compatibility inspection
 and must not be deployed. v0.4.0 and later carry its retraction directive.
 

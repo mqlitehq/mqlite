@@ -3,14 +3,48 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 )
 
-// maxResponseBytes bounds the total body bytes a single Peek/Receive response accumulates.
-// Their item caps (Peek 1000, Receive 256) times the 1 MiB default body allow a legal request
-// to materialize ~1.3 GiB and OOM a small VM; this stops after the message that crosses the
-// budget (so a single large message is still returned, and only claimed messages are locked —
-// MQLITE-80). Peek pages past it with PeekOptions.FromSeq. A var so tests can lower it.
+// maxResponseBytes is a complete-message serialization budget for browsing and
+// delivery batches (MQLITE-151). Bodies, metadata, JSON escaping and base64 count.
+// Stop after the message that crosses the budget: every claimed item is returned,
+// and one individually large message still makes progress. This is a batch bound
+// plus one message, not a rejection limit for existing messages. Peek continues
+// with FromSeq; ReceiveDeferred callers retry the unreturned sequence numbers.
+// A var so bounded tests can lower it without creating large data.
 var maxResponseBytes int64 = 32 << 20 // 32 MiB
+
+// responseMessageBytes uses the engine value's JSON size without depending on
+// the HTTP wire package. That includes the same base64 and string escaping as
+// the wire representation, including Properties. The fixed allowance covers
+// differing field names and the response envelope. It also avoids turning a
+// future small wire-field addition into an unaccounted per-item cost.
+func responseMessageBytes(message any) (int64, error) {
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		return 0, err
+	}
+	return int64(len(encoded)) + 512, nil
+}
+
+const peekResultColumns = `id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
+                   properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
+                   dead_letter_reason,dead_letter_description`
+const remotePeekResultColumns = `id,state,body,
+                   CAST(message_id AS BLOB) AS message_id, CAST(group_id AS BLOB) AS group_id,
+                   CAST(correlation_id AS BLOB) AS correlation_id, CAST(reply_to AS BLOB) AS reply_to,
+                   CAST(subject AS BLOB) AS subject, CAST(content_type AS BLOB) AS content_type,
+                   properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
+                   CAST(dead_letter_reason AS BLOB) AS dead_letter_reason,
+                   CAST(dead_letter_description AS BLOB) AS dead_letter_description`
+
+func messagePeekResultColumns(remote bool) string {
+	if remote {
+		return remotePeekResultColumns
+	}
+	return peekResultColumns
+}
 
 // Peek browses messages without locking or settling them (§7.3). Useful for
 // triage and for recovering the seq_number of a deferred message.
@@ -38,9 +72,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 			return err
 		}
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
-			       properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
-			       dead_letter_reason,dead_letter_description
+			SELECT `+messagePeekResultColumns(e.db.remote)+`
 			FROM messages WHERE queue=? AND id>=?`+stateClause+`
 			ORDER BY id ASC LIMIT ?`, args...)
 		if err != nil {
@@ -68,7 +100,11 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 			p.DeadLetterDescription = dld.String
 			out = append(out, &p)
 			// Bound the response size; page past this with FromSeq (MQLITE-80).
-			bytes += int64(len(p.Body))
+			size, err := responseMessageBytes(&p)
+			if err != nil {
+				return err
+			}
+			bytes += size
 			if bytes >= maxResponseBytes {
 				break
 			}
