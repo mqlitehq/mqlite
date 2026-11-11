@@ -1985,6 +1985,8 @@ func (s tursoSoakSummary) markdown() []byte {
 }
 
 type tursoSoakRunner struct {
+	// Optional diagnostic hook; called only on an error, before ctx cancellation.
+	smokeDiagnostic func(lane, operation string, started, acquired time.Time, returned, contextErr error)
 	e               *Engine
 	cfg             tursoSoakConfig
 	evidence        *tursoSoakEvidence
@@ -2041,14 +2043,27 @@ func (r *tursoSoakRunner) failure() error {
 
 func (r *tursoSoakRunner) stopLanes() { r.stopOnce.Do(func() { close(r.stop) }) }
 
-func (r *tursoSoakRunner) call(fn func(context.Context) error) error {
+func (r *tursoSoakRunner) call(fn func(context.Context) error, labels ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.CallTimeout)
 	defer cancel()
+	started := time.Now()
+	lane, operation := "", "unlabelled"
+	if len(labels) == 2 {
+		lane, operation = labels[0], labels[1]
+	}
 	if err := r.admission.acquire(ctx); err != nil {
+		if r.smokeDiagnostic != nil {
+			r.smokeDiagnostic(lane, operation, started, time.Time{}, err, ctx.Err())
+		}
 		return err
 	}
 	defer r.admission.release()
-	return fn(ctx)
+	acquired := time.Now()
+	err := fn(ctx)
+	if err != nil && r.smokeDiagnostic != nil {
+		r.smokeDiagnostic(lane, operation, started, acquired, err, ctx.Err())
+	}
+	return err
 }
 
 // tursoSoakAdmission bounds every harness-originated database call. Limiting the
@@ -2117,7 +2132,7 @@ func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState, startDelay time.Dur
 		err := r.call(func(ctx context.Context) error {
 			_, err := r.e.SendOne(ctx, state.spec.Queue, message)
 			return err
-		})
+		}, state.spec.Name, "send")
 		state.record("send", time.Since(started), err == nil, false)
 		if err != nil {
 			r.report(safeTursoSoakFailure(state.spec.Name, "send", err))
@@ -2130,7 +2145,7 @@ func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState, startDelay time.Dur
 			var err error
 			received, err = r.e.Receive(ctx, state.spec.Queue, ReceiveOptions{MaxMessages: 1})
 			return err
-		})
+		}, state.spec.Name, "receive")
 		empty := err == nil && len(received) == 0
 		validCount := err == nil && len(received) == 1
 		state.record("receive", time.Since(started), validCount, empty)
@@ -2154,7 +2169,7 @@ func (r *tursoSoakRunner) runLane(state *tursoSoakLaneState, startDelay time.Dur
 		started = time.Now()
 		err = r.call(func(ctx context.Context) error {
 			return r.e.Complete(ctx, state.spec.Queue, received[0].SeqNumber, received[0].LockToken)
-		})
+		}, state.spec.Name, "complete")
 		state.record("complete", time.Since(started), err == nil, false)
 		if err != nil {
 			r.report(safeTursoSoakFailure(state.spec.Name, "complete", err))
@@ -3222,6 +3237,31 @@ func TestTursoSoakHarnessLocalSmoke(t *testing.T) {
 		evidence: evidence, started: started, windowStarted: started, states: make([]*tursoSoakLaneState, 0, len(tursoSoakLanes)),
 		admission: newTursoSoakAdmission(tursoSoakMaxInFlight), failureSignal: make(chan struct{}, 1),
 		stop: make(chan struct{}), storage: e.db.storage.snapshot(e.db.poolStats()),
+	}
+	runner.smokeDiagnostic = func(lane, operation string, started, acquired time.Time, returned, contextErr error) {
+		finished := time.Now()
+		phase := "engine"
+		admissionWait, engineCall := acquired.Sub(started), finished.Sub(acquired)
+		if acquired.IsZero() {
+			phase, admissionWait, engineCall = "admission", finished.Sub(started), 0
+		}
+		types := []string{}
+		for cause := returned; cause != nil && len(types) < 8; cause = errors.Unwrap(cause) {
+			types = append(types, fmt.Sprintf("%T", cause))
+		}
+		data, err := json.Marshal(map[string]any{
+			"at_utc": finished.UTC().Format(time.RFC3339Nano), "lane": lane, "operation": operation, "phase": phase,
+			"call_budget_ns": int64(runner.cfg.CallTimeout), "total_ns": int64(finished.Sub(started)),
+			"admission_wait_ns": int64(admissionWait), "engine_call_ns": int64(engineCall),
+			"context_error_type": fmt.Sprintf("%T", contextErr), "returned_error_types": types,
+			"context_deadline": errors.Is(contextErr, context.DeadlineExceeded), "context_canceled": errors.Is(contextErr, context.Canceled),
+			"returned_deadline": errors.Is(returned, context.DeadlineExceeded), "returned_canceled": errors.Is(returned, context.Canceled),
+		})
+		if err != nil {
+			t.Error("diagnostic encoding failed")
+			return
+		}
+		t.Logf("WINDOWS_SMOKE_CALL_FAILURE %s", data)
 	}
 	for _, lane := range tursoSoakLanes {
 		runner.states = append(runner.states, newTursoSoakLaneState(lane))

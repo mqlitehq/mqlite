@@ -1,0 +1,56 @@
+{
+  "scope": "Bounded diagnosis of preserved Windows Go1.21 local WAL smoke failure; not replacement CI, performance qualification or provider workload",
+  "product_source": "7eba4d394cd548b83f4cb37cf11a0da5210da12b",
+  "product_tree": "8d6ee7d5a4a7d869bd40fc98a3269b162dbe6e6b",
+  "source_policy": "Every251 baseline tracked file must equal its Git blob except engine/turso_test.go exact reviewed diagnostic patch; no product runtime modifications.",
+  "original_failure": {
+    "run": 43036409998,
+    "attempt": 1,
+    "job": 130576289223,
+    "test": "TestTursoSoakHarnessLocalSmoke",
+    "reported": "lane group_fifo receive failed (canceled)",
+    "job_log_sha256": "d5e1752f6057cc7c2587a99871b615d7acdd54ec165ad3479d9363f3b3e2e179"
+  },
+  "go_version_prefix": "go1.21.",
+  "platform": "windows/amd64",
+  "test": "TestTursoSoakHarnessLocalSmoke",
+  "repetitions": 20,
+  "stop_on_first_failure": true,
+  "build_deadline_seconds": 480,
+  "workload_deadline_seconds": 300,
+  "go_internal_deadline_seconds": 295,
+  "fixture": {
+    "storage": "original testEngine temp-file WAL",
+    "background_workers": false,
+    "fixed_engine_time_ms": 1700000000000,
+    "smoke_duration_ms": 1250,
+    "call_timeout_ms": 5000,
+    "shared_admission": 1,
+    "lanes": 4,
+    "lock_lease_ms": 60000,
+    "original_identity_accounting_and_drain": true
+  },
+  "observations": "Only on a returned error: before deferred call-context cancellation, emit lane/op, admission vs engine phase, durations, ctx.Err and errors.Is deadline/canceled flags, and bounded error type chain. Never log raw error, SQL, URL, token or environment values. Normal calls incur two clock reads and optional static label selection.",
+  "success_meaning": "Exactly20 target test passes, no fail/skip, exit0, source unchanged. This is bounded non-reproduction only; original Windows CI FAIL and its unobserved host cause remain.",
+  "failure_handling": "Stop first failure; preserve raw test2json output, first cause observation and exact source. No automatic reruns, timeout/lease/admission/accounting changes.",
+  "network": "No external database configuration, no secrets, no provider calls; Go module/toolchain acquisition only during setup/build.",
+  "supervisor": "Dedicated Windows kill-on-close Job Object; isolated Python worker cannot spawn the command until its process is assigned. Finally terminates and queries all job processes to zero on normal exit, timeout, interrupt or exception. Parent handle closure also kills the owned tree if supervisor terminates.",
+  "deadline_policy": "300 s is inclusive: active command deadline295 s, remaining5 s reserved for whole-job terminate/accounting-zero/leader-reap. If cleanup or elapsed budget cannot be proven, fail. Same policy uses build475+5=480 s.",
+  "checkout": "Before actions/checkout, set global core.autocrlf=false in this ephemeral Windows runner. Verify literal working-tree bytes against Git blobs, never normalize the hash oracle.",
+  "cleanup_primary_sources": [
+    "https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects",
+    "https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information",
+    "https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information"
+  ],
+  "supervisor_controls": {
+    "whole_controls_deadline_seconds": 60,
+    "cases": [
+      "normal leader and tree join",
+      "leader exits while descendant remains; job kills descendant",
+      "active deadline timeout terminates whole tree",
+      "KeyboardInterrupt after assignment triggers finally kill/join"
+    ],
+    "before_product_smoke": true,
+    "failure_stops_before_product_test": true
+  }
+}
