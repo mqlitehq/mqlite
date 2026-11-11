@@ -43,6 +43,11 @@ func validateStatementAcknowledgement(result *StmtResult, affected *int32) error
 	if *affected < 0 {
 		return fmt.Errorf("statement acknowledgement has a negative affected-row count")
 	}
+	if result.LastInsertRowId != nil {
+		if _, err := strconv.ParseInt(*result.LastInsertRowId, 10, 64); err != nil {
+			return fmt.Errorf("statement acknowledgement contains an invalid last-insert row ID")
+		}
+	}
 	result.AffectedRowCount = *affected
 	for _, row := range result.Rows {
 		if row == nil || len(row) != len(result.Cols) {
@@ -73,6 +78,9 @@ func validateStatementAcknowledgement(result *StmtResult, affected *int32) error
 					return fmt.Errorf("statement acknowledgement contains an invalid blob value")
 				}
 			case "null":
+				if value.Value != nil {
+					return fmt.Errorf("statement acknowledgement contains a non-null SQL NULL value")
+				}
 			default:
 				return fmt.Errorf("statement acknowledgement contains an unknown value type")
 			}

@@ -53,6 +53,8 @@ func TestHTTPHranaCommittedMalformedAcknowledgementIsUnknown(t *testing.T) {
 		{"wrong-response-type", `{"results":[{"type":"ok","response":{"type":"close"}}]}`},
 		{"negative-count", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":-1}}}]}`},
 		{"null-row", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[null],"affected_row_count":0}}}]}`},
+		{"null-with-payload", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"v"}],"rows":[[{"type":"null","value":"forged payload"}]],"affected_row_count":0}}}]}`},
+		{"invalid-last-insert-id", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":"invalid"}}}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testHTTPHranaCommittedInvalidAcknowledgement(t, tc.body)
