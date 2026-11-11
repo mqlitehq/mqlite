@@ -6,12 +6,11 @@ construction. This document is generated from the wire contract in
 [`wire/wire.go`](../wire/wire.go) (the single source of truth shared by the broker
 and the Go SDK, so the two can't drift) and the server's error mapping.
 
-This reference follows `main`, including unreleased changes. The latest supported
-release is v0.4.2; use the [v0.4.2 reference](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/api-reference.md)
+This reference follows `main` for release target v0.4.3. Use the [v0.4.2 reference](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/api-reference.md)
 for that installed broker. The broker time header, revised Go managed Receiver
 retry and renewal behavior, 1-second through 1-hour queue lock-duration bounds,
 lease-preserving startup, and coordinated shutdown responses documented here
-are unreleased; see [CHANGELOG.md](../CHANGELOG.md#unreleased). v0.3.3 is withdrawn
+are included in the v0.4.3 release target; see [CHANGELOG.md](../CHANGELOG.md). v0.3.3 is withdrawn
 and unsupported; use the documentation in the v0.3.2 tag when working with its
 smaller management surface.
 
@@ -88,7 +87,7 @@ reasonable (they count toward the JSON request you send, not toward the body cap
 | retained subscriptions | 10,000 active + deleting | `MQLITE_MAX_SUBSCRIPTIONS` (serve) / `Options.MaxSubscriptions` or `WithMaxSubscriptions` (embedded) |
 | filter `expr` source | capped length + AST node count | internal (see [concepts.md](concepts.md#subscription-filters-expr)) |
 
-Unreleased `main` also applies a 32 MiB serialization-accounting threshold to
+The v0.4.3 release target applies a 32 MiB serialization-accounting threshold to
 new Peek, Receive, and ReceiveDeferred batches. The accounting includes message
 bodies, base64 expansion, JSON escaping and metadata. The engine returns the
 message that reaches the threshold, then stops before claiming another one;

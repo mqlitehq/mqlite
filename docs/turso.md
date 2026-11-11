@@ -1,8 +1,8 @@
 # Turso / libSQL: concurrency & embedded replicas (MQLITE-4)
 
-This guide follows `main`, including unreleased driver hardening. For an installed
+This guide follows `main` for release target v0.4.3. For an installed
 v0.4.2 release, use the [Turso guide at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/turso.md);
-see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 
 MQLite runs the same engine on a local SQLite file or a remote
 [Turso](https://turso.tech)/libSQL database — set `MQLITE_DB=libsql://<db>.turso.io`
@@ -94,12 +94,14 @@ still bounded as follows:
   connection is always safe. `isConnErr` spans the whole transport-failure family —
   `driver.ErrBadConn`, a closed Hrana stream, and their siblings `EOF` / `broken pipe` /
   `i/o timeout` (behind a proxy like Fly a dropped connection reads as `EOF`, not `RST`).
-- **Writes retry only when the statement provably never applied** — `retryableWrite =
-  remote && (ErrBadConn || isBusyErr)`. A closed stream (`ErrBadConn`) or a `SQLITE_BUSY`
-  (lock never acquired) guarantees the write never ran, so replaying `exec` / the `inTx`
-  commit cannot double-apply. The retry is bounded by `maxConnAttempts`; exhaustion is
-  returned to the caller. The `busy_timeout(5000)` DSN pragma belongs to local modernc
-  SQLite connections and does not apply to Turso/libSQL.
+- **Writes retry only when the statement provably never applied.** A pre-dispatch
+  `driver.ErrBadConn` or a definite typed `SQLITE_BUSY` rejection permits a bounded
+  retry. The error must identify one provider failure, with no ambiguous HTTP status
+  or caller cancellation. An error body mentioning Busy alone cannot establish
+  rejection. See [remote HTTP failure and write replay boundaries](#remote-http-failure-and-write-replay-boundaries).
+  The retry is bounded by `maxConnAttempts`; exhaustion is returned to the caller.
+  The `busy_timeout(5000)` DSN pragma belongs to local modernc SQLite connections
+  and does not apply to Turso/libSQL.
 - **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
   other transport drop on a write/commit — the primary may have durably committed before
   the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead

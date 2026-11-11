@@ -1,8 +1,8 @@
 # Conformance — correct mqlite behavior (TCK)
 
-This specification follows `main`, including unreleased changes. For an installed
+This specification follows `main` for release target v0.4.3. For an installed
 v0.4.2 release, use the [conformance specification at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/conformance.md);
-see [CHANGELOG.md](../CHANGELOG.md#unreleased) for pending behavior changes.
+see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 
 This is the normative spec of how mqlite **must** behave — the invariants that define
 "correct," independent of any one implementation detail. Each is enforced by a

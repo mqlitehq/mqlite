@@ -1,11 +1,10 @@
 # Production operations
 
-This runbook follows `main`, including unreleased changes. The latest supported
-release is v0.4.2 (port 6754, schema token 7); use the
-[v0.4.2 runbook](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/operations.md)
+This runbook follows `main` for release target v0.4.3 (port 6754, schema token 7).
+Use the [v0.4.2 runbook](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/operations.md)
 when operating that binary. In particular, lease-preserving startup and local
 maintenance, coordinated broker shutdown, and the revised managed Receiver
-behavior below are unreleased; see [CHANGELOG.md](../CHANGELOG.md#unreleased).
+behavior below are included in the v0.4.3 release target; see [CHANGELOG.md](../CHANGELOG.md).
 v0.3.3 is withdrawn and
 unsupported; its public assets and exact image remain available for forensic or
 compatibility inspection and must not be deployed. v0.4.2 retains v0.4.0's
@@ -117,7 +116,7 @@ restore test.
 ## Graceful broker shutdown
 
 The coordinated shutdown and lease-preserving restart contract below requires
-unreleased `main`; an installed v0.4.2 broker does not provide these guarantees.
+v0.4.3; an installed v0.4.2 broker does not provide these guarantees.
 It also does not drain application consumers. Canceling `Receiver.Run` cancels
 its in-flight handler contexts. `Run` still waits for handlers and settlement to
 return, but offers no grace period for handlers to finish before cancellation.
@@ -217,7 +216,7 @@ shutdown behavior does not make overlapping brokers safe.
 
 ## Consumer stops and host interruptions
 
-These boundaries describe unreleased `main` and both Go clients' managed
+These boundaries describe release target v0.4.3 and both Go clients' managed
 `Receiver.Run`. The SDK does not install process signal handlers. The host
 application decides how SIGINT/SIGTERM, stdin EOF, and platform grace periods
 affect its contexts; `Consumer.Shutdown` and a stop-admission-then-drain API are
