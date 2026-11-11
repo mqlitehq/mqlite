@@ -1063,3 +1063,57 @@ func TestBatchPermissionDeniedNeverFallsBack(t *testing.T) {
 		t.Fatalf("RPC counts: completeBatch=%d complete=%d renewBatch=%d renew=%d", completeBatch.Load(), complete.Load(), renewBatch.Load(), renew.Load())
 	}
 }
+
+func TestRedactRemoteDatabaseDSN(t *testing.T) {
+	for _, scheme := range []string{"libsql", "turso", "ws", "wss", "LIBSQL", "TURSO"} {
+		for _, query := range []string{
+			"authToken=synthetic-token-marker",
+			"auth_token=synthetic-token-marker",
+			"jwt=synthetic-token-marker",
+			"tls=0&auth_token=synthetic-token-marker&other=synthetic-query-marker",
+			"auth%54oken=synthetic-token-marker",
+			"unknown=synthetic-query-marker",
+			"",
+		} {
+			t.Run(scheme+"/"+strings.Split(query, "=")[0], func(t *testing.T) {
+				dsn := scheme + "://synthetic-user-marker:synthetic-password-marker@db.example.invalid:443/database/path?" + query + "#synthetic-fragment-marker"
+				got := redact(dsn)
+				want := strings.ToLower(scheme) + "://db.example.invalid:443/database/path"
+				if got != want {
+					t.Errorf("redacted remote DSN = %q, want scheme, host and path only", got)
+				}
+				for _, marker := range []string{"synthetic-user-marker", "synthetic-password-marker", "synthetic-token-marker", "synthetic-query-marker", "synthetic-fragment-marker", "?", "#", "@"} {
+					if strings.Contains(got, marker) {
+						t.Errorf("remote DSN retained forbidden field %q", marker)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRedactInvalidRemoteDatabaseDSN(t *testing.T) {
+	for _, dsn := range []string{
+		"libsql://db.example.invalid/%zz?jwt=synthetic-token-marker",
+		"turso://db.example.invalid/path?auth_token=%zz",
+		"ws://synthetic-user-marker:%zz@db.example.invalid/path",
+		"wss://db.example.invalid/path#%zz",
+		"turso://db.example.invalid/path\n?jwt=synthetic-token-marker",
+		"libsql://db.example.invalid/path?jwt=synthetic-token-marker\x00",
+		"wss://db.example.invalid:invalid/path?jwt=synthetic-token-marker",
+		"libsql:///missing-host?jwt=synthetic-token-marker",
+		"turso:opaque?jwt=synthetic-token-marker",
+	} {
+		if got := redact(dsn); got != "[redacted remote database]" {
+			t.Errorf("invalid remote DSN did not fail closed: %q", got)
+		}
+	}
+}
+
+func TestRedactKeepsLocalDatabaseLocation(t *testing.T) {
+	for _, dsn := range []string{":memory:", "file:./mq.db", "file:./mq.db?_pragma=journal_mode(WAL)", "/tmp/queue.db", "relative queue.db"} {
+		if got := redact(dsn); got != dsn {
+			t.Errorf("local DSN = %q, want unchanged %q", got, dsn)
+		}
+	}
+}

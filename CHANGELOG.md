@@ -18,6 +18,12 @@ upgrade notes before replacing a broker.
   destructive replies remain `ErrOutcomeUnknown`, and managed Peek-Lock recovery
   keeps its receive-attempt ID without dispatching a valid prefix (MQLITE-153).
 
+- Omit credential-bearing URLs from remote database connection and native client
+  connection-string parse errors while preserving their operation and cause
+  (MQLITE-168). Startup logs retain only the remote scheme, host and path.
+  Reject remote URL fragments before connecting so they cannot capture an
+  appended authentication token.
+
 - Reject negative and JSON null sequence entries in successful Send replies
   (MQLITE-188). Such malformed acknowledgements return `ErrOutcomeUnknown` without
   replaying Send. Preserve valid zero slots and repeated positive dedup sequences.

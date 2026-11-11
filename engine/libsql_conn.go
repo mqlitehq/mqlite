@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
@@ -49,11 +52,37 @@ func (c libsqlDSNConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := validateRemoteConnectionDSN(c.dsn); err != nil {
+		return nil, err
+	}
 	opener := c.opener
 	if opener == nil {
 		opener = libsqlcompat.NewOpener()
 	}
-	return opener.OpenHTTP(c.dsn)
+	conn, err := opener.OpenHTTP(c.dsn)
+	return conn, redactedRemoteURLError(err)
+}
+
+func validateRemoteConnectionDSN(dsn string) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return redactedRemoteURLError(err)
+	}
+	// Fragments are omitted from HTTP requests and can capture an appended token.
+	if u.Fragment != "" || strings.Contains(dsn, "#") {
+		return errors.New("remote database URL must not contain a fragment")
+	}
+	return nil
+}
+
+// Remote connection strings can contain an injected authentication token.
+// Preserve the URL operation and cause while omitting the connection string.
+func redactedRemoteURLError(err error) error {
+	var urlError *url.Error
+	if errors.As(err, &urlError) {
+		return &url.Error{Op: urlError.Op, Err: urlError.Err}
+	}
+	return err
 }
 
 func (libsqlDSNConnector) Driver() driver.Driver { return libsql.Driver{} }

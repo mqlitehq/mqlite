@@ -1,6 +1,7 @@
 package mqlite
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -29,6 +30,10 @@ func parseDSN(dsn string) (endpoint, token string, err error) {
 	}
 	u, err := url.Parse(dsn)
 	if err != nil {
+		var urlError *url.Error
+		if errors.As(err, &urlError) {
+			err = &url.Error{Op: urlError.Op, Err: urlError.Err}
+		}
 		return "", "", fmt.Errorf("mqlite: bad connection string: %w", err)
 	}
 	switch u.Scheme {
