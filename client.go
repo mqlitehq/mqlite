@@ -800,6 +800,12 @@ func (c *Client) Receive(ctx context.Context, queue string, opts ...RecvOpts) ([
 			return nil, err
 		}
 	}
+	if err := validateDeliveryBatch(resp.Messages, len(o.Pick) > 0 || !o.AtMostOnce); err != nil {
+		if len(o.Pick) == 0 && o.AtMostOnce {
+			return nil, &ambiguousAcknowledgementError{operation: "AtMostOnce Receive", cause: err}
+		}
+		return nil, err
+	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
 		out[i] = c.wireToMessage(queue, wm, observation)
@@ -815,11 +821,34 @@ func (c *Client) receiveOne(ctx context.Context, queue string, max int, waitMs i
 	if err != nil {
 		return nil, err
 	}
+	if err := validateDeliveryBatch(resp.Messages, mode == engine.PeekLock); err != nil {
+		return nil, err
+	}
 	out := make([]*Message, len(resp.Messages))
 	for i, wm := range resp.Messages {
 		out[i] = c.wireToMessage(queue, wm, observation)
 	}
 	return out, nil
+}
+
+// Validate the entire batch before constructing any externally visible delivery.
+func validateDeliveryBatch(messages []wire.Message, peekLock bool) error {
+	var seen map[int64]struct{}
+	if len(messages) > 1 {
+		seen = make(map[int64]struct{}, len(messages))
+	}
+	for _, message := range messages {
+		if message.SeqNumber <= 0 || peekLock && message.LockToken == "" {
+			return &invalidSuccessResponseError{cause: errors.New("receive response contains an invalid delivery identity")}
+		}
+		if seen != nil {
+			if _, duplicate := seen[message.SeqNumber]; duplicate {
+				return &invalidSuccessResponseError{cause: errors.New("receive response repeats a delivery identity")}
+			}
+			seen[message.SeqNumber] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // Peek browses without locking.

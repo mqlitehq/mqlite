@@ -12,6 +12,12 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+- Validate complete received batches before exposing any message: reject null
+  entries, nonpositive/repeated sequence numbers and missing Peek-Lock tokens.
+  Preserve valid empty bodies/batches and tokenless ReceiveAndDelete; malformed
+  destructive replies remain `ErrOutcomeUnknown`, and managed Peek-Lock recovery
+  keeps its receive-attempt ID without dispatching a valid prefix (MQLITE-153).
+
 - Reject negative and JSON null sequence entries in successful Send replies
   (MQLITE-188). Such malformed acknowledgements return `ErrOutcomeUnknown` without
   replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
