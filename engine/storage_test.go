@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -4981,3 +4982,45 @@ type terminalErrorRows struct{ err error }
 func (terminalErrorRows) Columns() []string           { return []string{"value"} }
 func (terminalErrorRows) Close() error                { return nil }
 func (r terminalErrorRows) Next([]driver.Value) error { return r.err }
+
+func TestHTTPHranaParseErrorDoesNotExposeAuthToken(t *testing.T) {
+	const token = "must-not-appear-in-errors+42"
+	for _, scheme := range []string{"libsql", "ws", "wss"} {
+		_, err := openDB(context.Background(), scheme+"://test.invalid/%zz", token, "")
+		if err == nil {
+			t.Fatal("malformed remote URL unexpectedly opened")
+		}
+		for _, sensitive := range []string{token, url.QueryEscape(token), "authToken="} {
+			if strings.Contains(err.Error(), sensitive) {
+				t.Fatal("remote parse error exposed an injected credential")
+			}
+		}
+		var parseError *url.Error
+		var escapeError url.EscapeError
+		if !errors.As(err, &parseError) || parseError.URL != "" || parseError.Op != "parse" || !errors.As(err, &escapeError) {
+			t.Fatal("safe parse error did not retain its operation and underlying error type")
+		}
+	}
+}
+
+// A fragment can capture the injected token before the driver removes URL queries.
+// The fake transport keeps the first-failure control entirely local.
+type fragmentControlTransport struct{ calls int }
+
+func (f *fragmentControlTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	f.calls++
+	return nil, errors.New("synthetic connection failure")
+}
+func TestRemoteURLFragmentRejectedBeforeHTTP(t *testing.T) {
+	oldClient := http.DefaultClient
+	transport := &fragmentControlTransport{}
+	http.DefaultClient = &http.Client{Transport: transport}
+	defer func() { http.DefaultClient = oldClient }()
+	const token = "synthetic-private-token-marker"
+	for _, suffix := range []string{"#fragment", "#"} {
+		_, err := openDB(context.Background(), "libsql://test.invalid/"+suffix, token, "")
+		if err == nil || !strings.Contains(err.Error(), "fragment") || strings.Contains(err.Error(), token) || transport.calls != 0 {
+			t.Fatal("fragment connection was not rejected before HTTP")
+		}
+	}
+}

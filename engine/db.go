@@ -158,6 +158,11 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		return nil, err
 	}
 	driver, conn, remote := resolveDSN(dsn, token, sync)
+	if remote {
+		if err := validateRemoteConnectionDSN(conn); err != nil {
+			return nil, err
+		}
+	}
 
 	// Single-writer guard (MQLITE-6): a local file DB may be opened by only one
 	// process at a time — two writers would race on crash recovery and claims.
@@ -192,6 +197,9 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		if lock != nil {
 			_ = lock.Close()
 		}
+		if remote {
+			err = redactedRemoteURLError(err)
+		}
 		return nil, fmt.Errorf("open %s: %w", driver, err)
 	}
 	if remote {
@@ -224,6 +232,9 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 		sdb.Close()
 		if lock != nil {
 			_ = lock.Close()
+		}
+		if remote {
+			err = redactedRemoteURLError(err)
 		}
 		return nil, fmt.Errorf("ping %s: %w", driver, err)
 	}
