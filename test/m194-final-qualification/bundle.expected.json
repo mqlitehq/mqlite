@@ -1,0 +1,21 @@
+{
+  "harness/README.md": "25eb65cd330276b5b250bff0b3bd5f1cdbb83d40bbe9b5d1923d172cf8a5b16a",
+  "harness/adapters.go": "60fa42a1571f09c409d835dfad738e98f9f0ba28ec3395a04319bf95ad47b09b",
+  "harness/go.mod": "1163e037c7495946dcdebfa68f804d11a438e0f892780a0297c3cccf7dc2761b",
+  "harness/go.sum": "f02350a691ef7902acaf1382a41b17251b21d5eea0906d27a8bcdd2202fd2734",
+  "harness/harness_test.go": "9e5fbe53dd5c0c12949d997241dc58d82ef83e610eed4f4f18fb8acaf3a0dcc2",
+  "harness/ledger.go": "eb815726190ab51a6d504482dfd2a54e7b2477757d6217a739218d6a59b0f6e7",
+  "harness/main.go": "b45d2753eda6a896f5dc712b4106811bee40011f2af54cdc1fb25a00cf6412a8",
+  "harness/performance_test.go": "62f8bc6309525e2abbf7970126b6d1e7680941903693b30ac1bba3fa643e43b6",
+  "harness/remote_performance_test.go": "96efd965e4d1fbb6c062dd3512d9a7fc608d137a5516339ca96f456ce9e84f86",
+  "harness/run-safe.py": "99fe07804d1be251bbf3af7afdd3fbc0070ebb1f3f1d7e1261ea71b33a7cd173",
+  "harness/source_map_test.py": "fe3986e0e73e316df955297091a472bdc63f5d370ad708d9cd356d2eaef4350f",
+  "harness/supervisor_test.py": "829fb3b8141585b26bae1b79e594eace23fbbcc33982cbd01f8ee4ae9fe84e3c",
+  "harness/verify-source-map.py": "67890bd615d43d84a2b7d2c30ee331e38dae73aea7cb9dc60529806789c7fdb9",
+  "plan.json": "1f79596eadd0a551ba33e1807462f21b54e9180471ef9ea4a5879530aa415bda",
+  "remote-plan.json": "97e046a87065ae7529bcfb38c60df03abefdff429eaf56c4a5c38967b307644c",
+  "remote_audit_test.py": "b348356ea6fbbc31c42e3d33c484df331cf245c866edfb135af2db75bbae26c8",
+  "run-remote.py": "c665cc15c8bc92fa35011b825dc6c13e748cbdfc4b94027dedce336053230388",
+  "run.py": "b6e4ed1e88ff887ccc0a1966e38c72ea752a487352eea649525b8845fcf9c9b1",
+  "verify-bundle.py": "3ceffedbdf608ccab724e8cfcef4b95f91c30e3ff72943cd250d3a3cfbce5ae7"
+}

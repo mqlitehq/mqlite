@@ -1,0 +1,96 @@
+{
+  "at": "2026-11-11T14:56:24.390733+00:00",
+  "sources": {
+    "A": {
+      "main": "9f2140c26705283a8f55f282a4e2ffd38e012cbc",
+      "sdk": "ba19c456d9826fdf50df11be62268fa8240edb66"
+    },
+    "B": {
+      "main": "5ba442e7c02081bc5cf7463da90e54d3b5f43632",
+      "sdk": "68b087de54537b12e182d0c202b27c4da1fa187c"
+    }
+  },
+  "destination_sha256": "b99fe180288dcf13a7b5ab799d22ab9439a1a6443ca95db999edec42f5f9d2e5",
+  "order": [
+    "A",
+    "B",
+    "B",
+    "A",
+    "A",
+    "B",
+    "B",
+    "A"
+  ],
+  "clients": [
+    "native",
+    "sdk"
+  ],
+  "batches": [
+    1,
+    8
+  ],
+  "warmup_cycles": 1,
+  "measured_cycles": 2,
+  "payload_bytes": 256,
+  "lease_seconds": 60,
+  "caller_seconds": 15,
+  "open_seconds": 45,
+  "scenario_seconds_including_open": 240,
+  "cleanup_seconds": 60,
+  "sustained_seconds": 180,
+  "sustained_cycle_minimum_ms": 200,
+  "sustained_batch": 8,
+  "sustained_clients": "alternate nativeplain/sdkplain/nativeescaped/sdkescaped; batch8; one foregroundRPC at a time;200ms minimumcycle",
+  "wall_median_B_over_A_max": 1.1,
+  "receive_p95_median_B_over_A_max": 1.2,
+  "postdrain_heap_growth_max_bytes": 16777216,
+  "postdrain_goroutine_growth_max": 16,
+  "resource_progress_sample_interval_seconds": 10,
+  "resource_progress_sample_max_gap_seconds": 30,
+  "overall_budget_seconds": 1800,
+  "minimum_remaining_before_stage_seconds": 310,
+  "integrity_scope": "Zero six-state queue totals, exact identities/sequences/body hashes/delivery1 and per-item confirmed Complete ACK, source bytes and owned-name absence. Physical DB integrity/restore/disk-full are separate final-source gates.",
+  "failure_handling": "Retain all first failures; no budget expansion, automatic retry, or accounting weakening",
+  "scope": "Fresh M194+M198 final-source loopback requalification, broker0.4.3/SDK0.1.2. M198 changes only the shipped restore helper+README; all runtime blobs equal7eba. No old leg/result splicing.",
+  "metadata_profiles": {
+    "plain": "256-bytebody,emptyoptionalmetadata",
+    "escaped": "same256-bytebody; GroupID=id+group; subject quote/NUL; contenttype application/octet-stream; property800NUL + quote/backslash/newline/HTML"
+  },
+  "budget_decision": "Root approved bounded1800s orchestration before anyqualification workload; perstage240s/15sRPC/45sOpen/60slease/60scleanup preserved",
+  "profile_order": [
+    [
+      "A",
+      "plain"
+    ],
+    [
+      "B",
+      "plain"
+    ],
+    [
+      "B",
+      "escaped"
+    ],
+    [
+      "A",
+      "escaped"
+    ],
+    [
+      "A",
+      "escaped"
+    ],
+    [
+      "B",
+      "escaped"
+    ],
+    [
+      "B",
+      "plain"
+    ],
+    [
+      "A",
+      "plain"
+    ]
+  ],
+  "allocation_observation": "Measured TotalAlloc/Malloc differences over Send/Receive/Complete profile cycles after warmup, alongside wall and Receivep95; allocation observations have no additional pass cutoff.",
+  "execution_status": "REFERENCE_ONLY_NOT_ACTIVE_REMOTE_PROTOCOL"
+}

@@ -1,0 +1,109 @@
+{
+  "at": "2026-11-11T14:56:24.390525+00:00",
+  "scope": "Fresh M194+M198 final-source loopback requalification, broker0.4.3/SDK0.1.2. M198 changes only the shipped restore helper+README; all runtime blobs equal7eba. No old leg/result splicing.",
+  "profiles": {
+    "order": [
+      "A",
+      "B",
+      "B",
+      "A",
+      "A",
+      "B",
+      "B",
+      "A"
+    ],
+    "clients": [
+      "native",
+      "sdk"
+    ],
+    "batch": [
+      1,
+      64
+    ],
+    "batches_each": 256,
+    "warmup_batches": 4,
+    "payload_bytes": 256,
+    "RTT_added_ms": 0,
+    "caller_seconds": 1,
+    "per_phase_watchdog_seconds": 120,
+    "wall_median_B_over_A_max": 1.1,
+    "host_load1_max_for_screen": 6,
+    "if_unqualified": "Retain samples, not performance pass; no automatic retry",
+    "receive_p95_median_B_over_A_max": 1.2,
+    "total_cycles_per_profile_including_warmup": 260,
+    "lock_lease_seconds": 30,
+    "wall_endpoint": "Original time.Since(s) evaluated after the post-loop runtime.ReadMemStats; unchanged. Includes input/Send/Receive/oracle/Complete and that observer.",
+    "profiles_per_leg": 8,
+    "fixed_measured_cycle_multiplier": 8
+  },
+  "sustained": {
+    "per_pair_seconds": 180,
+    "clients": "native and SDK alternate, one foreground request at a time",
+    "batch": 16,
+    "payload_bytes": 256,
+    "cycle_period_ms": 50,
+    "caller_seconds": 1,
+    "watchdog_seconds": 240,
+    "acceptance": "exactSendAck/Receive ID,body,sequence,delivery1 and Complete acknowledgement for every item;errors0;emptyQueue/DLQ0;finalintegrity/FK;ownedresources removed;source bytes stable"
+  },
+  "resource_observation": "growing SQLite receipts are expected within fixed window; record file/WAL size and heap/goroutines before/after drain/GC; heap growth<=16MiB,goroutine growth<=16; no provider-session guarantee",
+  "failure_handling": "Retain the original 32-cycle FAIL, all diagnostics, and every new first failure independently. No auto retry, product changes, threshold/lease/call/time-budget expansion or accounting weakening. A new result never relabels the original failure or proves its unobserved cause.",
+  "sources": {
+    "A": {
+      "main": "9f2140c26705283a8f55f282a4e2ffd38e012cbc",
+      "sdk": "ba19c456d9826fdf50df11be62268fa8240edb66"
+    },
+    "B": {
+      "main": "5ba442e7c02081bc5cf7463da90e54d3b5f43632",
+      "sdk": "68b087de54537b12e182d0c202b27c4da1fa187c"
+    }
+  },
+  "metadata_profiles": {
+    "plain": "256-bytebody,emptyoptionalmetadata",
+    "escaped": "same256-bytebody; GroupID=id+group; subject quote/NUL; contenttype application/octet-stream; property800NUL + quote/backslash/newline/HTML"
+  },
+  "allocation_observation": "Measured TotalAlloc/Malloc differences over Send/Receive/Complete profile cycles after warmup, alongside wall and Receivep95; allocation observations have no additional pass cutoff.",
+  "overall_budget_seconds": 1200,
+  "overall_budget_scope": "Fresh Linux Actions orchestration including cold archive/build/controls, unchanged8profileslegs and2x180s, source/ownedprocess cleanup; SIGALRM1195 reserves5s. Original150/270child deadlines, allper-call/lease/performance/resource/accounting criteria unchanged. Whole new run, no splicing.",
+  "approval_state": "Root+independent review approved BEFORE load. Exact new source/fullPASS/committed; all workload/per-call/lease/childdeadline/ratio/resource/accounting criteria remain fixed. Fresh full run.",
+  "basis": {
+    "original_failure": "benchmarks/raw/m153-current-base/final-prepared-6cff47d/local-qualification-1/result.json",
+    "same_binary_AA": "benchmarks/raw/m194-performance-diagnostic/baseline-aa/analysis.json",
+    "fixed_binary_AB": "benchmarks/raw/m194-performance-diagnostic/paired-ab/analysis.json",
+    "rationale": "Original native/1/plain 32-cycle intervals were roughly 20 ms and one uninstrumented B leg was 56 ms. Completed A/A and instrumented A/B do not reproduce a 17% source-specific regression; A/B wall and CPU medians remain within original gates, with modest encoding-related Receive overhead. MemStats and GC pauses were tiny. The original 56 ms cause remains unattributed. Eight times the fixed measured work reduces sensitivity to startup/short-window variation while preserving all limits and validation."
+  },
+  "preexecution_budget_assessment": {
+    "original_all_8legs_measured_wall_s": 12.608067042,
+    "scaled_256cycle_measured_wall_s": 100.864536336,
+    "paired_sustained_s": 360,
+    "estimated_preparation_control_and_nonmeasured_s": 30,
+    "estimated_total_s": 491,
+    "headroom_to_780_s": 289,
+    "decision": "Keep 780 s unchanged; preserve child deadlines. A deadline/host-load/resource failure remains failure or unqualified, never budget enlargement.",
+    "inherited_guard_gap": "Original run.py contained no overall 780 s enforcement; this proposed isolated runner makes that requested ceiling explicit. Do not claim original overall enforcement existed."
+  },
+  "oracles_preserved": [
+    "Send ACK positive unique sequence accounting",
+    "Received exact message IDs, sequence, body SHA and metadata values, no duplicates/missing, delivery count one",
+    "CompleteBatch confirmation, exactly one Send/Receive/CompleteBatch RPC per cycle",
+    "All queue six-state totals and DLQ zero before delete; owned queue absent after delete",
+    "All8 rows/leg have exactly260 cycles and batch*260 identities including warmups",
+    "Final integrity_check, foreign_key_check, Close joins, source maps unchanged and temporary source directories removed",
+    "Postdrain+GC heap growth<=16MiB and goroutine growth<=16; record DB/WAL size",
+    "Median wall B/A<=1.1, median per-row Receive p95 B/A<=1.2, host load1 max<6; all8 profiles must meet screen before sustained stages",
+    "Native+SDK alternation and exact accounting for two separate180 s sustained source runs"
+  ],
+  "minimum_remaining_before_child_seconds": "child outer deadline +5; profiles155, sustained275, discovery/controls125",
+  "root_approval_basis": "Root reviewed completed A/A and fixed-binary A/B diagnostics and approved this fresh declaration before load. Original32-cycle FAIL remains unexplained and separate.",
+  "owned_process_cleanup": "Exact reuse of group_exists/stop_owned from reviewed staging/m191-performance-qualification/run.py. Reap leader and prove complete group absent; Darwin EPERM accepted only if /bin/ps inventory proves no group members. Any real-member EPERM, unjoined leader or surviving group fails. Existing qualified helper21controls reference retained separately.",
+  "preflight_failure": "benchmarks/raw/m194-stronger-qualification/preflight/failure.json; no product load; inherited cleanup edge fixed only in isolated runner with exact qualified helper reuse.",
+  "renewed_orchestration_configuration": {
+    "prior_linux_run": 43036903020,
+    "prior_linux_result": "FAIL: eight timinglegs and A180completed, B notrun because remaining145<270+5; all completed workloads verified; no reclassification",
+    "prior_macos_run": 43040005894,
+    "prior_macos_result": "FAIL: hostload18.3936>6 qualificationgate, also two timingprofiles above thresholds; sustainednotrun; no causal attribution",
+    "rationale": "Qualified Linux cold preparation+fullprofiles+A180 took635s; completing fresh B180 and retaining fullchild+cleanup headroom requires a larger bounded orchestration allowance.1200 is fixed before renewed candidate load; no product call/lease/duration or accounting relaxation.",
+    "budget_change_requires_renewal": true,
+    "source_binding": "5ba442e7c02081bc5cf7463da90e54d3b5f43632"
+  }
+}
