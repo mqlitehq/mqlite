@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
+
 	// Pure-Go local driver, no CGO (design D2 default). The remote libSQL
 	// connector is opened explicitly in libsql_conn.go.
 	_ "modernc.org/sqlite" // driver "sqlite" (local file/:memory:)
@@ -602,13 +604,14 @@ func (d *db) attempts() int {
 }
 
 func (d *db) retryable(err error) bool {
-	return d.remote && !errors.Is(err, ErrOutcomeUnknown) && !unclassifiedProviderHTTPCode(err) && (isConnErr(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
+	return d.remote && !errors.Is(err, ErrOutcomeUnknown) &&
+		(!libsqlcompat.IsInvalidAcknowledgement(err) || libsqlcompat.IsIncompleteAcknowledgement(err)) && !unclassifiedProviderHTTPCode(err) && (isConnErr(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err))
 }
 
 // retryableWrite permits only before-dispatch ErrBadConn or typed SQLITE_BUSY.
 // Plain Busy/HTTP text cannot prove that an issued write was not committed.
 func (d *db) retryableWrite(err error) bool {
-	if !d.remote || err == nil || errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, context.Canceled) ||
+	if !d.remote || err == nil || errors.Is(err, ErrOutcomeUnknown) || libsqlcompat.IsInvalidAcknowledgement(err) || errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) || remoteProviderHTTPStatus(err) != 0 || unclassifiedProviderHTTPCode(err) || singleRemoteProviderLeaf(err) == nil {
 		return false
 	}

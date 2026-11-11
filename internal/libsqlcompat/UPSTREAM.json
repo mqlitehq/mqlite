@@ -118,7 +118,8 @@
     "Adapt the legacy HTTP-only DSN entry point; retain the pinned upstream public SQL parser packages.",
     "Emit the one-time capacity warning only from an existing completed cleanup worker, after network cancellation and slot release; foreground Close never invokes an application logger.",
     "Preserve actual non-200 HTTP status as private typed error metadata across every existing error-body/read fallback; retain error text, body parsing, SQL and 200-success behavior.",
-    "Retain the primary SQLITE_BUSY code only for an unambiguous single-execute error response, preserving its original text so existing typed SQLite retry rules remain available; HTTP failures, batch/mixed results and Busy text do not mint this evidence."
+    "Retain the primary SQLITE_BUSY code only for an unambiguous single-execute error response, preserving its original text so existing typed SQLite retry rules remain available; HTTP failures, batch/mixed results and Busy text do not mint this evidence.",
+    "Validate HTTP success acknowledgements against pipeline request types/counts, complete statement fields and batch-step conditions; mark malformed or incompletely read acknowledgements so issued writes/COMMIT remain outcome-unknown while known network read retries stay bounded, without adding requests (MQLITE-191)."
   ],
   "adapted_entrypoint": {
     "source": "libsql/sql.go",

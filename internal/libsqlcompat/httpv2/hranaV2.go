@@ -263,7 +263,7 @@ func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url st
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return hrana.PipelineResponse{}, false, err
+		return hrana.PipelineResponse{}, false, hrana.IncompleteAcknowledgement(err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		// We need to remember that the stream is closed so we don't try to send any more requests using this connection.
@@ -287,7 +287,7 @@ func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url st
 		return hrana.PipelineResponse{}, true, fmt.Errorf("error code %d: %s", resp.StatusCode, string(body))
 	}
 	if err = json.Unmarshal(body, &result); err != nil {
-		return hrana.PipelineResponse{}, false, err
+		return hrana.PipelineResponse{}, false, hrana.InvalidAcknowledgement(err)
 	}
 	return result, false, nil
 }
@@ -295,6 +295,9 @@ func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url st
 func (h *hranaV2Conn) executeMsg(ctx context.Context, msg *hrana.PipelineRequest) (*hrana.PipelineResponse, error) {
 	result, err := h.sendPipelineRequest(ctx, msg, false)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateAcknowledgement(msg, result); err != nil {
 		return nil, err
 	}
 
@@ -469,6 +472,9 @@ func (h *hranaV2Conn) ExecContext(ctx context.Context, query string, args []driv
 		}
 		for idx := 0; idx < upperBound; idx++ {
 			r := res.StepResults[idx]
+			if r == nil {
+				continue // A conditional step may legitimately be skipped.
+			}
 			rowId := r.GetLastInsertRowId()
 			if rowId > 0 {
 				lastInsertRowId = rowId

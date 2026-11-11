@@ -8,8 +8,17 @@ UPSTREAM.json records the original paths and SHA-256 hashes for all 13 copied
 runtime files. The public sqliteparser and sqliteparserutils packages remain
 dependencies of the same pinned upstream module; they are not copied here.
 
-The copied files retain their original protocol, SQL parsing, transaction,
-response parsing and error text. Non-200 HTTP errors additionally preserve their
+The copied files retain their original SQL parsing, transaction behavior and
+error text. Success acknowledgements must match the sent pipeline request count
+and types,
+contain complete statement results, and retain one result/error position per
+batch step. Conditional skips and definite SQL errors remain valid. Malformed
+acknowledgements carry a private marker so the engine can distinguish an unknown
+issued-write outcome from a read protocol failure without adding SQL or retries.
+These checks address inherited behavior, without attributing a historical
+production incident to a malformed provider response.
+
+Non-200 HTTP errors additionally preserve their
 actual response status as private typed metadata, including error-body fallbacks
 and body-read failures. This is not evidence that a write had no effect; the
 engine uses it together with the operation stage to avoid uncertain write replay.

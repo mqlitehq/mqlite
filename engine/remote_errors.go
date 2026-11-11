@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
 	"net"
 )
 
@@ -54,7 +55,7 @@ func isolateProviderBadConn(err error) error {
 
 // Cancellation after SQL dispatch cannot prove the absence of an effect.
 func remoteWriteMayHaveCommitted(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isConnErr(err) || unclassifiedProviderHTTPCode(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err)
+	return libsqlcompat.IsInvalidAcknowledgement(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isConnErr(err) || unclassifiedProviderHTTPCode(err) || isBusyErr(err) || isExpiredRemoteTransactionErr(err)
 }
 
 type providerWriteOutcomeUnknown struct{ cause error }
