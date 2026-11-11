@@ -355,31 +355,26 @@ func verify(ctx context.Context, e *mq.Embedded, f *manifest, now *int64) error 
 			}
 		}
 		if item.Queue == "locked" {
-			old, err := receive(ctx, e, item, 1, mq.RecvOpts{Attempt: f.Prefix + ":before-backup"})
-			if err != nil {
+			// Explicit startup recovery revoked the old ownership coordinates.
+			// A stale attempt is invalidated against the live row, so reusing its
+			// ID must claim a fresh delivery rather than replay its obsolete token.
+			old := e.Message(item.Queue, item.Sequence, item.Token)
+			if err := requireError(old.Complete(ctx), mq.ErrLockLost, "orphan token before fresh claim"); err != nil {
 				return err
 			}
-			if old.LockToken() != item.Token {
-				return errors.New("restored attempt response changed token")
-			}
-			// Recovery has revoked the old lock. Replaying the old response is
-			// not a promise that its token is still valid for settlement.
-			if err := requireError(old.Complete(ctx), mq.ErrLockLost, "orphan token settlement"); err != nil {
-				return err
-			}
-			fresh, err := receive(ctx, e, item, 2, mq.RecvOpts{Attempt: f.Prefix + ":after-backup"})
+			fresh, err := receive(ctx, e, item, 2, mq.RecvOpts{Attempt: f.Prefix + ":before-backup"})
 			if err != nil {
 				return err
 			}
 			if fresh.LockToken() == item.Token {
 				return errors.New("recovered claim reused orphan token")
 			}
-			replay, err := receive(ctx, e, item, 2, mq.RecvOpts{Attempt: f.Prefix + ":after-backup"})
+			replay, err := receive(ctx, e, item, 2, mq.RecvOpts{Attempt: f.Prefix + ":before-backup"})
 			if err != nil {
 				return err
 			}
-			if replay.LockToken() != fresh.LockToken() {
-				return errors.New("fresh attempt replay changed token")
+			if replay.LockToken() != fresh.LockToken() || !replay.LockedUntil.Equal(fresh.LockedUntil) || !replay.EnqueuedAt.Equal(fresh.EnqueuedAt) {
+				return errors.New("fresh attempt replay changed token or timestamps")
 			}
 			if err := requireError(old.Complete(ctx), mq.ErrLockLost, "orphan token against fresh owner"); err != nil {
 				return err

@@ -57,10 +57,12 @@ After reopening, the worker advances the clock by 60 seconds and runs maintenanc
 to verify scheduled activation. This is a deterministic storage/recovery drill;
 concurrent traffic and process-death tests are separate acceptance layers.
 
-An old receive-attempt response can still contain its original token after
-restoration. The drill explicitly requires that token's settlement to fail after
-recovery, then obtains and settles a fresh claim. A cached response does not renew
-ownership.
+The fixture's explicit lease recovery revokes the saved lock. Reusing its old
+Peek-Lock receive-attempt ID must obtain a fresh delivery with an incremented
+count and a new fencing token; the next replay of that same ID must preserve the
+fresh token and timestamps. The drill rejects the old token before and after the
+fresh claim, then completes the verified new delivery. Reusing an attempt ID does
+not renew ownership.
 
 ## Read-only discipline
 
