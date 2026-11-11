@@ -29,7 +29,13 @@ func randToken() string {
 // uses the global head-of-line variant; standard and group_fifo share the
 // per-group FIFO statement (their claim eligibility is identical — group_fifo
 // only differs by requiring a GroupID at send time).
-func claimSQLFor(ordering OrderingMode) string {
+func claimSQLFor(ordering OrderingMode, remote bool) string {
+	if remote {
+		if ordering == OrderStrictFIFO {
+			return remoteClaimStrictSQL
+		}
+		return remoteClaimSQL
+	}
 	if ordering == OrderStrictFIFO {
 		return claimStrictSQL
 	}
@@ -41,7 +47,19 @@ func claimSQLFor(ordering OrderingMode) string {
 // that determine claim ordering, lease length and lifetime. An AttemptID adds a
 // live-record guard so a replay cannot lock another message before it is
 // recognized by the zero-row classification path.
-func firstClaimSQLFor(ordering OrderingMode, withAttempt bool) string {
+func firstClaimSQLFor(ordering OrderingMode, withAttempt, remote bool) string {
+	if remote {
+		if ordering == OrderStrictFIFO {
+			if withAttempt {
+				return remoteFirstClaimStrictAttemptSQL
+			}
+			return remoteFirstClaimStrictSQL
+		}
+		if withAttempt {
+			return remoteFirstClaimAttemptSQL
+		}
+		return remoteFirstClaimSQL
+	}
 	if ordering == OrderStrictFIFO {
 		if withAttempt {
 			return firstClaimStrictAttemptSQL
@@ -117,10 +135,30 @@ const claimStrictHeadEligibility = `
                         WHERE b.queue=m.queue
                           AND b.state='locked' AND b.id < m.id ) )`
 
-const claimCandidateSuffix = `
-    ORDER BY m.id ASC LIMIT 1)
-RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
+// Remote TEXT result serialization can stop at an embedded NUL (MQLITE-197) even though the
+// stored value is complete. Project caller-owned text as BLOB so the existing
+// Hrana base64 decoder and sql.NullString.Scan preserve every byte and SQL NULL.
+// This changes only returned values; storage, predicates and indexes stay intact.
+const claimResultColumns = `id, body, delivery_count, group_id, message_id, correlation_id,
           reply_to, subject, content_type, properties, enqueued_at, locked_until`
+const remoteClaimResultColumns = `id, body, delivery_count,
+          CAST(group_id AS BLOB) AS group_id, CAST(message_id AS BLOB) AS message_id,
+          CAST(correlation_id AS BLOB) AS correlation_id, CAST(reply_to AS BLOB) AS reply_to,
+          CAST(subject AS BLOB) AS subject, CAST(content_type AS BLOB) AS content_type,
+          properties, enqueued_at, locked_until`
+
+func messageClaimResultColumns(remote bool) string {
+	if remote {
+		return remoteClaimResultColumns
+	}
+	return claimResultColumns
+}
+
+const claimCandidateEnd = `
+    ORDER BY m.id ASC LIMIT 1)
+RETURNING `
+const claimCandidateSuffix = claimCandidateEnd + claimResultColumns
+const remoteClaimCandidateSuffix = claimCandidateEnd + remoteClaimResultColumns
 
 // claimSQL atomically locks the eligible head message (design §5.2 + §11.1).
 // Only state='active' is claimable — this keeps the hot path on the partial
@@ -167,6 +205,19 @@ const firstClaimAttemptSQL = claimUpdatePrefix + claimFencedCandidate + claimAtt
 
 const firstClaimStrictAttemptSQL = claimUpdatePrefix + claimFencedCandidate + claimAttemptGuard +
 	claimMessageEligibility + claimStrictHeadEligibility + claimCandidateSuffix
+
+const remoteClaimSQL = claimUpdatePrefix + claimUnfencedCandidate + claimMessageEligibility +
+	claimGroupHeadEligibility + remoteClaimCandidateSuffix
+const remoteClaimStrictSQL = claimUpdatePrefix + claimUnfencedCandidate + claimMessageEligibility +
+	claimStrictHeadEligibility + remoteClaimCandidateSuffix
+const remoteFirstClaimSQL = claimUpdatePrefix + claimFencedCandidate + claimMessageEligibility +
+	claimGroupHeadEligibility + remoteClaimCandidateSuffix
+const remoteFirstClaimStrictSQL = claimUpdatePrefix + claimFencedCandidate + claimMessageEligibility +
+	claimStrictHeadEligibility + remoteClaimCandidateSuffix
+const remoteFirstClaimAttemptSQL = claimUpdatePrefix + claimFencedCandidate + claimAttemptGuard +
+	claimMessageEligibility + claimGroupHeadEligibility + remoteClaimCandidateSuffix
+const remoteFirstClaimStrictAttemptSQL = claimUpdatePrefix + claimFencedCandidate + claimAttemptGuard +
+	claimMessageEligibility + claimStrictHeadEligibility + remoteClaimCandidateSuffix
 
 // Receive claims up to opts.MaxMessages messages (Peek-Lock by default), with
 // long-poll up to opts.WaitMs (clamped to 20s, §11.3).
@@ -341,8 +392,7 @@ func (e *Engine) ReceiveDeferred(ctx context.Context, queue string, seqs ...int6
 			   SET state='locked', locked_until=?, lock_token=?, delivery_count=delivery_count+1
 			 WHERE id=? AND queue=? AND state='deferred'
 			   AND (expires_at=0 OR expires_at>?)
-			RETURNING id, body, delivery_count, group_id, message_id, correlation_id,
-			          reply_to, subject, content_type, properties, enqueued_at, locked_until`,
+			RETURNING `+messageClaimResultColumns(e.db.remote),
 				queueLockUntil(q, now), token, seq, queue, now).Scan(
 				&m.SeqNumber, &m.Body, &m.DeliveryCount, &groupID, &messageID,
 				&correlationID, &replyTo, &subject, &ctype, &props, &m.EnqueuedAtMs, &m.LockedUntilMs)

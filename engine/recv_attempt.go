@@ -79,7 +79,7 @@ func (e *Engine) claimRound(ctx context.Context, q queueRow, max int, mode Recei
 			// Use the same instant as the UPDATE guard. If a live attempt caused
 			// that statement to return zero, advancing the clock here must not
 			// turn the same transaction into an empty response.
-			replay, state, lookupErr := lookupAttempt(ctx, tx, q.name, attemptID, mode, claimNow)
+			replay, state, lookupErr := e.lookupAttempt(ctx, tx, q.name, attemptID, mode, claimNow)
 			if lookupErr != nil {
 				return lookupErr
 			}
@@ -134,7 +134,7 @@ func claimConfigEqual(cached, current queueRow) bool {
 		cached.expiresAtMs == current.expiresAtMs
 }
 
-func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode ReceiveMode, now int64) ([]*Message, attemptLookupState, error) {
+func (e *Engine) lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode ReceiveMode, now int64) ([]*Message, attemptLookupState, error) {
 	var blob string
 	err := tx.QueryRowContext(ctx,
 		`SELECT response FROM receive_attempts WHERE queue=? AND attempt_id=? AND expires_at>?`,
@@ -177,8 +177,7 @@ func lookupAttempt(ctx context.Context, tx *txn, queue, attemptID string, mode R
 		placeholders[i] = "?"
 		args = append(args, lease.SeqNumber)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,body,delivery_count,group_id,message_id,
-		correlation_id,reply_to,subject,content_type,properties,enqueued_at,locked_until,lock_token FROM messages
+	rows, err := tx.QueryContext(ctx, `SELECT `+messageClaimResultColumns(e.db.remote)+`,lock_token FROM messages
 		WHERE queue=? AND state='locked' AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return nil, attemptMissing, err
@@ -420,7 +419,7 @@ func (e *Engine) claimFirstTx(ctx context.Context, tx *txn, q queueRow, attemptI
 		args = append(args, attemptID, now)
 	}
 	args = append(args, now, now)
-	return e.claimRowTx(ctx, tx, q.name, token, firstClaimSQLFor(q.ordering, attemptID != ""), args...)
+	return e.claimRowTx(ctx, tx, q.name, token, firstClaimSQLFor(q.ordering, attemptID != "", e.db.remote), args...)
 }
 
 func (e *Engine) claimOneTx(ctx context.Context, tx *txn, q queueRow) (*Message, error) {
@@ -432,7 +431,7 @@ func (e *Engine) claimOneTx(ctx context.Context, tx *txn, q queueRow) (*Message,
 	}
 	token := randToken()
 	lockUntil := queueLockUntil(q, now)
-	return e.claimRowTx(ctx, tx, q.name, token, claimSQLFor(q.ordering), lockUntil, token, q.name, now, now)
+	return e.claimRowTx(ctx, tx, q.name, token, claimSQLFor(q.ordering, e.db.remote), lockUntil, token, q.name, now, now)
 }
 
 func (e *Engine) claimRowTx(ctx context.Context, tx *txn, queue, token, query string, args ...any) (*Message, error) {

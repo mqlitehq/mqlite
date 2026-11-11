@@ -24,16 +24,17 @@ import (
 // It is a finite loopback protocol fixture, not a model of Turso scheduling,
 // replication, durability or capacity. No credentials or external hosts are used.
 type sqliteHranaFixture struct {
-	db         *sql.DB
-	server     *httptest.Server
-	dsn        string
-	delay      atomic.Int64
-	failInsert atomic.Bool
-	mu         sync.Mutex
-	next       int
-	sessions   map[string]*sqliteHranaSession
-	stats      sqliteHranaStats
-	insertHook func()
+	db           *sql.DB
+	server       *httptest.Server
+	dsn          string
+	delay        atomic.Int64
+	failInsert   atomic.Bool
+	truncateText atomic.Bool
+	mu           sync.Mutex
+	next         int
+	sessions     map[string]*sqliteHranaSession
+	stats        sqliteHranaStats
+	insertHook   func()
 }
 
 type sqliteHranaSession struct {
@@ -374,6 +375,13 @@ func (f *sqliteHranaFixture) execute(session *sqliteHranaSession, statement sqli
 			}
 			encoded := make([]sqliteHranaValue, len(row))
 			for i, value := range row {
+				// Model a provider that truncates ordinary TEXT results at NUL.
+				// BLOB results retain their independent base64 transport.
+				if text, ok := value.(string); ok && f.truncateText.Load() {
+					if before, _, found := strings.Cut(text, "\x00"); found {
+						value = before
+					}
+				}
 				encoded[i], err = sqliteHranaEncode(value)
 				if err != nil {
 					_ = rows.Close()

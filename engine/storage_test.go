@@ -1650,8 +1650,9 @@ func (c *busyConn) QueryContext(_ context.Context, query string, args []driver.N
 		}
 		return &oneQueueRow{values: []driver.Value{c.st.attemptResponse}}, nil
 	}
-	if strings.Contains(normalized, "SELECT id,body,delivery_count,group_id,message_id") &&
-		strings.Contains(normalized, "FROM messages") {
+	if strings.Contains(normalized, "SELECT id, body, delivery_count,") &&
+		strings.Contains(normalized, "FROM messages") &&
+		strings.Contains(normalized, "AND id IN (") {
 		c.st.attemptChecks++
 		return &valueRows{values: c.st.attemptLeases}, nil
 	}
@@ -1982,7 +1983,9 @@ func TestReceiveAttemptReplayValidationUsesOneSetQuery(t *testing.T) {
 	}
 	found := false
 	for i, query := range state.queries {
-		if !strings.Contains(strings.Join(strings.Fields(query), " "), "SELECT id,body,delivery_count,group_id,message_id") {
+		normalized := strings.Join(strings.Fields(query), " ")
+		if !strings.Contains(normalized, "SELECT id, body, delivery_count,") ||
+			!strings.Contains(normalized, "FROM messages") || !strings.Contains(normalized, "AND id IN (") {
 			continue
 		}
 		found = true
@@ -5022,5 +5025,169 @@ func TestRemoteURLFragmentRejectedBeforeHTTP(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "fragment") || strings.Contains(err.Error(), token) || transport.calls != 0 {
 			t.Fatal("fragment connection was not rejected before HTTP")
 		}
+	}
+}
+
+// A provider may preserve TEXT in storage while returning only its prefix before
+// NUL. Message metadata must use the byte-preserving result path without changing
+// stored data, NULLs, claim predicates, or the roster of an attempt replay.
+func TestMessageMetadataTextRoundTrip(t *testing.T) {
+	for _, remote := range []bool{false, true} {
+		name := "local-wal"
+		if remote {
+			name = "truncating-hrana"
+		}
+		t.Run(name, func(t *testing.T) {
+			dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "metadata.db"))
+			if remote {
+				fixture := newSQLiteHranaFixture(t)
+				fixture.truncateText.Store(true)
+				dsn = fixture.dsn
+			}
+			options := Options{DB: dsn, DisableBackground: true}
+			e, err := Open(context.Background(), options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			var absent, empty, value sql.NullString
+			if err := e.db.sql.QueryRowContext(ctx, `SELECT CAST(NULL AS BLOB), CAST('' AS BLOB), CAST(? AS BLOB)`, "nul\x00\u65e5\u672c\u8a9e\"").Scan(&absent, &empty, &value); err != nil {
+				t.Fatal(err)
+			}
+			if absent.Valid || !empty.Valid || empty.String != "" || !value.Valid || value.String != "nul\x00\u65e5\u672c\u8a9e\"" {
+				t.Fatalf("BLOB projection changed NULL, empty or text bytes: %#v %#v %#v", absent, empty, value)
+			}
+			if err := e.CreateQueue(ctx, "metadata", QueueConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			values := []string{"", "\u65e5\u672c\u8a9e \"quoted\" \\ tail", "prefix\x00suffix", "\x00leading", "trailing\x00"}
+			originals := make(map[int64]OutMessage)
+			seqs := make([]int64, 0, len(values))
+			for index, value := range values {
+				message := OutMessage{Body: []byte{0, 1, 255}, MessageID: value, GroupID: value, CorrelationID: value, ReplyTo: value, Subject: value, ContentType: value, Properties: map[string]string{"nul": "\x00property", "quote": "\"\\\n"}}
+				if index > 0 {
+					message.GroupID += fmt.Sprint(index)
+				}
+				seq, err := e.SendOne(ctx, "metadata", message)
+				if err != nil {
+					t.Fatal(err)
+				}
+				seqs = append(seqs, seq)
+				originals[seq] = message
+			}
+			// Reopen the same storage, so existing rows are read without any rewrite.
+			if err := e.Close(); err != nil {
+				t.Fatal(err)
+			}
+			e, err = Open(ctx, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := e.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			assertFields := func(seq int64, body []byte, group, id, correlation, reply, subject, content string, properties map[string]string) {
+				t.Helper()
+				want, ok := originals[seq]
+				if !ok {
+					t.Fatalf("unexpected sequence %d", seq)
+				}
+				got := OutMessage{Body: body, GroupID: group, MessageID: id, CorrelationID: correlation, ReplyTo: reply, Subject: subject, ContentType: content, Properties: properties}
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("metadata changed for sequence %d: got %#v, want %#v", seq, got, want)
+				}
+			}
+			assertMessage := func(m *Message) {
+				t.Helper()
+				assertFields(m.SeqNumber, m.Body, m.GroupID, m.MessageID, m.CorrelationID, m.ReplyTo, m.Subject, m.ContentType, m.Properties)
+			}
+			assertPeek := func(messages []*PeekedMessage) {
+				t.Helper()
+				if len(messages) != len(values) {
+					t.Fatalf("peek count %d, want %d", len(messages), len(values))
+				}
+				for _, m := range messages {
+					assertFields(m.SeqNumber, m.Body, m.GroupID, m.MessageID, m.CorrelationID, m.ReplyTo, m.Subject, m.ContentType, m.Properties)
+				}
+			}
+			peeked, err := e.Peek(ctx, "metadata", PeekOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPeek(peeked)
+			deliveries, err := e.Receive(ctx, "metadata", ReceiveOptions{MaxMessages: len(values), AttemptID: "same-attempt"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deliveries) != len(values) {
+				t.Fatalf("receive count %d, want %d", len(deliveries), len(values))
+			}
+			for _, m := range deliveries {
+				assertMessage(m)
+			}
+			replay, err := e.Receive(ctx, "metadata", ReceiveOptions{MaxMessages: 1, AttemptID: "same-attempt"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(replay, deliveries) {
+				t.Fatalf("attempt replay changed saved roster, metadata or lease: got %#v, want %#v", replay, deliveries)
+			}
+			for _, m := range deliveries {
+				if err := e.Defer(ctx, "metadata", m.SeqNumber, m.LockToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			deferred, err := e.ReceiveDeferred(ctx, "metadata", seqs...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deferred) != len(values) {
+				t.Fatalf("deferred count %d, want %d", len(deferred), len(values))
+			}
+			for _, m := range deferred {
+				assertMessage(m)
+				if err := e.Reject(ctx, "metadata", m.SeqNumber, m.LockToken, "reason\x00suffix", "description\x00\u65e5\u672c\u8a9e"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dlq, err := e.Peek(ctx, "metadata", PeekOptions{State: StateDeadLettered})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPeek(dlq)
+			for _, m := range dlq {
+				if m.DeadLetterReason != "reason\x00suffix" || m.DeadLetterDescription != "description\x00\u65e5\u672c\u8a9e" {
+					t.Errorf("DLQ text changed: %#v", m)
+				}
+			}
+			// Receive-and-delete stores a complete JSON response; replay must preserve it
+			// after the underlying row has gone, with no lease in either response.
+			message := originals[seqs[2]]
+			seq, err := e.SendOne(ctx, "metadata", message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			originals[seq] = message
+			deleted, err := e.Receive(ctx, "metadata", ReceiveOptions{MaxMessages: 1, Mode: ReceiveAndDelete, AttemptID: "deleted-attempt"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deleted) != 1 {
+				t.Fatalf("deleted count %d", len(deleted))
+			}
+			assertMessage(deleted[0])
+			if deleted[0].LockToken != "" || deleted[0].LockedUntilMs != 0 {
+				t.Fatal("deleted response granted a lease")
+			}
+			replayDeleted, err := e.Receive(ctx, "metadata", ReceiveOptions{MaxMessages: 1, Mode: ReceiveAndDelete, AttemptID: "deleted-attempt"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(replayDeleted, deleted) {
+				t.Fatal("deleted attempt replay changed response")
+			}
+		})
 	}
 }

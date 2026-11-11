@@ -14,6 +14,9 @@ upgrade notes before replacing a broker.
 
 ## v0.4.3 — 2026-11-11
 
+- Preserve embedded NUL bytes in remote message metadata and dead-letter text
+  results.
+
 - Validate complete received batches before exposing any message: reject null
   entries, nonpositive/repeated sequence numbers and missing Peek-Lock tokens.
   Preserve valid empty bodies/batches and tokenless ReceiveAndDelete; malformed

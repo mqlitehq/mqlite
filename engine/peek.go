@@ -28,6 +28,24 @@ func responseMessageBytes(message any) (int64, error) {
 	return int64(len(encoded)) + 512, nil
 }
 
+const peekResultColumns = `id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
+                   properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
+                   dead_letter_reason,dead_letter_description`
+const remotePeekResultColumns = `id,state,body,
+                   CAST(message_id AS BLOB) AS message_id, CAST(group_id AS BLOB) AS group_id,
+                   CAST(correlation_id AS BLOB) AS correlation_id, CAST(reply_to AS BLOB) AS reply_to,
+                   CAST(subject AS BLOB) AS subject, CAST(content_type AS BLOB) AS content_type,
+                   properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
+                   CAST(dead_letter_reason AS BLOB) AS dead_letter_reason,
+                   CAST(dead_letter_description AS BLOB) AS dead_letter_description`
+
+func messagePeekResultColumns(remote bool) string {
+	if remote {
+		return remotePeekResultColumns
+	}
+	return peekResultColumns
+}
+
 // Peek browses messages without locking or settling them (§7.3). Useful for
 // triage and for recovering the seq_number of a deferred message.
 func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*PeekedMessage, error) {
@@ -54,9 +72,7 @@ func (e *Engine) Peek(ctx context.Context, queue string, opts PeekOptions) ([]*P
 			return err
 		}
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id,state,body,message_id,group_id,correlation_id,reply_to,subject,content_type,
-			       properties,delivery_count,enqueued_at,visible_at,expires_at,locked_until,
-			       dead_letter_reason,dead_letter_description
+			SELECT `+messagePeekResultColumns(e.db.remote)+`
 			FROM messages WHERE queue=? AND id>=?`+stateClause+`
 			ORDER BY id ASC LIMIT ?`, args...)
 		if err != nil {
