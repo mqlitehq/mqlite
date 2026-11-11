@@ -1,0 +1,64 @@
+name: M198 final scoped standard Turso qualification
+
+on:
+  push:
+    branches: [diagnostic/qualify-m198-turso]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: turso-verification-db
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    name: plain comparison, strict escaped/outlets, independent sustained
+    if: github.repository == 'mqlitehq/mqlite'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GOMAXPROCS: '2'
+      GOTOOLCHAIN: local
+      GOENV: 'off'
+      GOWORK: 'off'
+      PYTHONDONTWRITEBYTECODE: '1'
+      M153_BUNDLE_SHA256: f0bc612c713a825d622db555bda55406be8b6f962132a556afcf6ddd6b3cc580
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: stable
+          cache-dependency-path: test/m198-remote-qualification/harness/go.sum
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: mqlitehq/mqlite-go
+          ref: 68b087de54537b12e182d0c202b27c4da1fa187c
+          fetch-depth: 0
+          path: .diagnostic-sdk
+          persist-credentials: false
+      - name: Verify frozen inputs and local controller controls
+        run: |
+          python3 -B test/m198-remote-qualification/verify-bundle.py
+          python3 -B test/m198-remote-qualification/harness/supervisor_test.py
+          python3 -B test/m198-remote-qualification/remote_audit_test.py
+      - name: Run the non-resetting standard Turso comparison
+        env:
+          MQLITE_TEST_DB: ${{ secrets.MQLITE_TEST_DB }}
+          MQLITE_TEST_DB_AUTH_TOKEN: ${{ secrets.MQLITE_TEST_DB_AUTH_TOKEN }}
+        run: |
+          unset MQLITE_TEST_DB_RESET_CONFIRM
+          python3 -B test/m198-remote-qualification/run-remote.py --main-repo "$GITHUB_WORKSPACE" --sdk-repo "$GITHUB_WORKSPACE/.diagnostic-sdk" --out "$RUNNER_TEMP/m198-remote"
+      - name: Verify inputs after execution
+        if: always()
+        run: python3 -B test/m198-remote-qualification/verify-bundle.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: m198-remote-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/m198-remote/
+          if-no-files-found: error
+          retention-days: 14

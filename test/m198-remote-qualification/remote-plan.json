@@ -1,0 +1,159 @@
+{
+  "at": "2026-11-11T14:55:17.419729+00:00",
+  "sources": {
+    "A": {
+      "main": "9f2140c26705283a8f55f282a4e2ffd38e012cbc",
+      "sdk": "ba19c456d9826fdf50df11be62268fa8240edb66"
+    },
+    "B": {
+      "main": "5ba442e7c02081bc5cf7463da90e54d3b5f43632",
+      "sdk": "68b087de54537b12e182d0c202b27c4da1fa187c"
+    }
+  },
+  "destination_sha256": "b99fe180288dcf13a7b5ab799d22ab9439a1a6443ca95db999edec42f5f9d2e5",
+  "order": [
+    "A",
+    "B",
+    "B",
+    "A",
+    "A",
+    "B",
+    "B",
+    "A"
+  ],
+  "clients": [
+    "native",
+    "sdk"
+  ],
+  "batches": [
+    1,
+    8
+  ],
+  "warmup_cycles": 1,
+  "measured_cycles": 2,
+  "payload_bytes": 256,
+  "lease_seconds": 60,
+  "caller_seconds": 15,
+  "open_seconds": 45,
+  "scenario_seconds_including_open": 240,
+  "cleanup_seconds": 60,
+  "sustained_seconds": 180,
+  "sustained_cycle_minimum_ms": 200,
+  "sustained_batch": 8,
+  "sustained_clients": {
+    "A": "alternate nativeplain/sdkplain batch8; independent stability only",
+    "B": "alternate nativeplain/sdkplain/nativeescaped/sdkescaped batch8; independent mixed stability; no throughput ratio"
+  },
+  "wall_median_B_over_A_max": 1.1,
+  "receive_p95_median_B_over_A_max": 1.2,
+  "postdrain_heap_growth_max_bytes": 16777216,
+  "postdrain_goroutine_growth_max": 16,
+  "resource_progress_sample_interval_seconds": 10,
+  "resource_progress_sample_max_gap_seconds": 30,
+  "overall_budget_seconds": 1800,
+  "minimum_remaining_before_stage_seconds": 315,
+  "integrity_scope": "Zero six-state queue totals, exact identities/sequences/body hashes/delivery1 and per-item confirmed Complete ACK, source bytes and owned-name absence. Physical DB integrity/restore/disk-full are separate final-source gates.",
+  "failure_handling": "Preserve first failure and all prior FAILs. Stop on first workload/observer/accounting failure. No automatic retry, source/payload normalization, budget extension, or acceptance weakening.",
+  "scope": "Fresh M198 final-source qualification of the exact reviewed M197 scoped remote protocol. Candidate includes restore-helper/README correction; no prior workload spliced. Same plain timing, strict B escaped/outlets and independent180s workloads.",
+  "metadata_profiles": {
+    "plain": "256-bytebody,emptyoptionalmetadata",
+    "escaped": "same256-bytebody; GroupID=id+group; subject quote/NUL; contenttype application/octet-stream; property800NUL + quote/backslash/newline/HTML"
+  },
+  "budget_decision": "Root final protocol review requires hard1800 including all preparation/controller stages; original240/15/45/60lease/60cleanup and child310 remain unchanged; no post-failure extension.",
+  "profile_order": [
+    [
+      "A",
+      "plain"
+    ],
+    [
+      "B",
+      "plain"
+    ],
+    [
+      "B",
+      "plain"
+    ],
+    [
+      "A",
+      "plain"
+    ],
+    [
+      "A",
+      "plain"
+    ],
+    [
+      "B",
+      "plain"
+    ],
+    [
+      "B",
+      "plain"
+    ],
+    [
+      "A",
+      "plain"
+    ]
+  ],
+  "allocation_observation": "Measured TotalAlloc/Malloc differences over Send/Receive/Complete profile cycles after warmup, alongside wall and Receivep95; allocation observations have no additional pass cutoff.",
+  "escaped_comparative_timing": "UNAVAILABLE: baseline truncates NUL TEXT",
+  "known_baseline_red": {
+    "source": "9f2140c26705283a8f55f282a4e2ffd38e012cbc",
+    "field_run": 43029886800,
+    "original_comparative_run": 43026836525,
+    "cast_proof_and_cleanup_run": 43034422293,
+    "original_provider_500_400_cause": "UNRESOLVED; no claim fixed; observer installed on both sources"
+  },
+  "B_only_strict_escaped_profiles": {
+    "clients": [
+      "native",
+      "sdk"
+    ],
+    "batches": [
+      1,
+      8
+    ],
+    "warmup_cycles": 1,
+    "measured_cycles": 2,
+    "all_original_identity_body_metadata_sequence_delivery_and_ack_oracles": true,
+    "comparative_timing": "UNAVAILABLE"
+  },
+  "B_only_outlets": {
+    "clients": [
+      "native",
+      "sdk"
+    ],
+    "messages_per_client": 3,
+    "outlets": [
+      "peek",
+      "receive",
+      "attempt_replay",
+      "deferred",
+      "dlq"
+    ],
+    "text_fields": [
+      "MessageID",
+      "GroupID",
+      "CorrelationID",
+      "ReplyTo",
+      "Subject",
+      "ContentType"
+    ],
+    "text_cases": "leading/interior/trailing NUL + Unicode/quotes; exact bytes; Properties800NUL safe JSON control; DLQ reason/description strict",
+    "delivery_counts": "first/replay1; deferred2; third reject1",
+    "queue_counts": "expected DLQ1 per client until owned physical cleanup"
+  },
+  "provider_observation": {
+    "both_sources": true,
+    "http_status_min": 400,
+    "approved_host_only": true,
+    "raw_auth_url_sql_saved": false,
+    "passive_grace_seconds": 10,
+    "within_cleanup_seconds": 60,
+    "server_stream_absence_verified": false,
+    "HTTP_error_acceptance": "zero observed HTTP>=400; otherwise stop and preserve diagnostic"
+  },
+  "overall_budget_scope": "1800 seconds INCLUDING exact source archives, builds, all local controls, online workloads and source-directory cleanup. SIGALRM1795 reserves5 seconds for owned-group/temp cleanup; no child starts without its full original outerdeadline+5 remaining.",
+  "controller_cleanup_reserve_seconds": 5,
+  "source_frozen": true,
+  "candidate_change": "Only test/production/restore/main.go and README differ from7eba; all249 other tracked files including all broker/engine/native runtime bytes identical, SDK68 unchanged. Fresh whole protocol execution required; prior7eba PASS not spliced."
+}
