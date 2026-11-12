@@ -119,8 +119,10 @@ restore test.
 The coordinated shutdown and lease-preserving restart contract below requires
 unreleased `main`; an installed v0.4.2 broker does not provide these guarantees.
 It also does not drain application consumers. Canceling `Receiver.Run` cancels
-its in-flight handler contexts. `Run` still waits for handlers and settlement to
-return, but offers no grace period for handlers to finish before cancellation.
+its in-flight handler contexts. `Run` still waits for handlers, renewal shutdown
+and settlement to return, including up to 30 seconds of terminal confirmation
+after each handler returns. It offers no grace period for handlers to finish
+before cancellation; a callback or transport that ignores context can wait longer.
 Interrupted deliveries can consume delivery attempts or reach the DLQ at the
 configured limit. Quiesce and drain consumers at the application layer before
 canceling them when a planned consumer stop must finish its work.
@@ -157,9 +159,16 @@ Measure the full interval from stopping the old broker until the replacement
 listener is ready, including database open and schema checks. The default lease
 is 30 seconds; use a longer configured lease when measured remote-store restart
 time and renewal/settlement latency need more margin.
-The managed Go clients also have bounded renewal and settlement retry budgets:
-terminal Complete/Abandon cleanup gets up to five seconds in total, including the
-first request and all replays. Returning before lease
+The managed Receiver on `main` also has bounded renewal and settlement budgets:
+terminal Complete/Abandon confirmation gets up to 30 seconds in total, including
+the first request, all replays and backoff, with at most fifteen seconds per request.
+The same queue, sequence, token, operation and arguments are reused; confirmation
+does not rerun the handler. An exhausted transient confirmation reports
+`ErrOutcomeUnknown` through `WithErrorHandler` and preserves the final cause for
+`errors.Is`/`errors.As`. Definitive errors such as `ErrLockLost` are reported
+unchanged without retry; permanent errors also stop `Run`. The budget does not
+extend a lease; an exact retained receipt may confirm a previously committed effect after the original lease
+expires, while a new effect still requires a live token. Returning before lease
 expiry is therefore necessary but not sufficient to preserve a particular
 handler's settlement; an exhausted retry budget does not resume automatically
 when the broker later returns. Retaining a valid token does not guarantee that an
@@ -221,7 +230,7 @@ automatic context cancellation; `mqlite serve` does not read stdin.
 |---|---|
 | Broker stops and restarts within the remaining lease | A live Receiver retries and can reuse the persisted token. Renewal and settlement must also finish inside their retry budgets. Keep a single active broker and leave the Receiver's controlling context live. |
 | Broker outage reaches lease expiry | The original token cannot renew or create a new settlement effect. The delivery returns to active below `MaxDeliveryCount`, or enters the DLQ at the limit. A retained exact-request receipt can still confirm an earlier committed settlement. |
-| Application cancels `Run` | Receive retries stop and handler/renewal contexts are canceled immediately. `Run` still waits for workers and cleanup. A returning handler's `nil` result requests Complete; a non-nil result requests Abandon on a fresh context with up to five seconds, unless terminal renewal failure already made settlement unsafe. Cancellation offers no handler grace period. |
+| Application cancels `Run` | Receive retries stop and handler/renewal contexts are canceled immediately. `Run` still waits for workers and cleanup. A returning handler's `nil` result requests Complete; a non-nil result requests Abandon with a fresh 30-second total confirmation budget and at most fifteen seconds per request, unless terminal renewal failure already made settlement unsafe. Cancellation offers no handler grace period. |
 | Handler, error callback, or custom transport ignores cancellation | Shutdown can remain blocked while joining that work. Context cancellation is cooperative; it is not a goroutine kill or a hard return deadline. |
 | Application calls a Close method | `Receiver.Close` is a no-op; `Client.Close` releases only SDK-owned idle HTTP connections. Neither cancels an active Run. `Embedded.Close` joins admitted database work, not application handlers. Cancel and join the Receiver before closing its client or engine. |
 | Consumer is killed, SIGSTOPped, or container-paused while the broker stays available | A killed process cannot settle; a paused process cannot renew. Expired leases follow the ordinary redelivery/DLQ rule. A resumed handler may already have made an external change even though its old token is fenced. |
