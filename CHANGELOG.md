@@ -22,6 +22,16 @@ upgrade notes before replacing a broker.
 - Redact whole `turso://` URLs in private storage diagnostics as well as legacy
   remote schemes, retaining the non-URL provider explanation.
 
+### Rust-based Turso preview compatibility (MQLITE-167)
+
+- Accept `turso://` database URLs through the existing HTTP v2 compatibility
+  adapter, without changing the Go 1.21 source floor or adding native libraries.
+  Transactions remain ordinary `BEGIN`; one broker / `Engine` per DB is required.
+- Accept backend formatting of access-key schema SQL, including punctuation
+  spacing and keyword case, so a Rust-backed DB can reopen after initialization.
+  String literals, constraints, index columns/directions and STRICT remain checked;
+  conflicting application objects still fail before any schema DDL runs.
+
 > The canonical schema token remains **7** and no database rebuild is required.
 > This release adds an optional response header plus a Go broker-mode option;
 > older remote clients ignore the header, while programmatic brokers must add

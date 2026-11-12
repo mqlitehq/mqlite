@@ -11,6 +11,24 @@ HTTP via `libsql-client-go`, so the single static binary still has no native dep
 This note records how concurrency is handled and why embedded replicas are *not*
 used.
 
+## Rust-based Turso technical preview
+
+Unreleased `main` also accepts `turso://<database>.turso.io` for a Rust-based
+Turso database. Supply its token through `MQLITE_DB_AUTH_TOKEN` or
+`WithDBAuthToken`, just as for a `libsql://` database. MQLite uses the service's
+[HTTP v2 compatibility endpoint](https://github.com/tursodatabase/turso/blob/65a31536512e3ae906277796f520785b7d68ba93/serverless/PROTOCOL.md#2-overview)
+with its existing pure-Go driver and connection-validity adapter; it normalizes
+the scheme inside the driver connection string. No native library or higher Go
+source floor is required.
+
+The Rust service is a technical preview. Validate its queue operations, repeated
+opens, recovery and query performance with your workload before adopting it.
+MQLite still uses ordinary `BEGIN` transactions and requires one broker / `Engine`
+per database. A provider's concurrent-write capability does not enable
+`BEGIN CONCURRENT` or make multiple MQLite owners safe. The new provider's SQL
+compatibility and optimizer are independent of libSQL's; do not assume identical
+throughput or query plans.
+
 ## Backend parity contract
 
 Storage selection is a deployment detail, not a second API mode. Given the same
@@ -51,7 +69,7 @@ active MQLite broker or embedded `Engine`. Replace that owner stop-then-start af
 confirming the old process has exited. Do not use rolling overlap against the same
 database. What differs between storage modes is the connection pool:
 
-| | local file / `:memory:` | `libsql://` (HTTP Hrana) | `ws://` / `wss://` |
+| | local file / `:memory:` | `libsql://` / `turso://` (HTTP Hrana) | `ws://` / `wss://` |
 |---|---|---|---|
 | write ownership | 1 connection = local writer (file lock, MQLITE-6) | one broker owns a 4-connection pool; Turso serializes commits | same remote ownership |
 | writer pool | MaxOpen=1, MaxIdle=1 | MaxOpen=4, MaxIdle=0 | MaxOpen=4, MaxIdle=2 |

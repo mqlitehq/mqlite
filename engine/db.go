@@ -70,10 +70,16 @@ func (d *db) enter() bool {
 func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 	low := strings.ToLower(strings.TrimSpace(dsn))
 	switch {
-	case strings.HasPrefix(low, "libsql://"),
+	case isHTTPHranaDSN(dsn),
 		strings.HasPrefix(low, "wss://"),
 		strings.HasPrefix(low, "ws://"):
 		conn = dsn
+		// The Rust Turso service accepts the same HTTP v2 protocol. The pinned
+		// driver's parser knows the libsql scheme; keep that normalization internal
+		// rather than mistaking the public turso URL for a local SQLite filename.
+		if strings.HasPrefix(low, "turso://") {
+			conn = "libsql://" + strings.TrimSpace(dsn)[len("turso://"):]
+		}
 		if token != "" {
 			sep := "?"
 			if strings.Contains(conn, "?") {
@@ -107,6 +113,11 @@ func resolveDSN(dsn, token, sync string) (driver, conn string, remote bool) {
 		"&_pragma=auto_vacuum(INCREMENTAL)" +
 		"&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)"
 	return "sqlite", "file:" + path + "?" + pragmas, false
+}
+
+func isHTTPHranaDSN(dsn string) bool {
+	low := strings.ToLower(strings.TrimSpace(dsn))
+	return strings.HasPrefix(low, "libsql://") || strings.HasPrefix(low, "turso://")
 }
 
 // localFilePath returns the on-disk path of a local file DSN, or ok=false for an
@@ -183,7 +194,7 @@ func openDB(ctx context.Context, dsn, token, sync string) (*db, error) {
 	// single-lease adapter. WebSocket transports keep their existing pooled
 	// connection behavior; making those one-shot would reconnect a WebSocket for
 	// every operation. Local SQLite remains on the unchanged sql.Open path.
-	httpHrana := strings.HasPrefix(strings.ToLower(strings.TrimSpace(dsn)), "libsql://")
+	httpHrana := isHTTPHranaDSN(dsn)
 	var sdb *sql.DB
 	var err error
 	if httpHrana {
@@ -293,12 +304,9 @@ func (d *db) initSchema(ctx context.Context) error {
 }
 
 func (d *db) validateAccessKeySchema(ctx context.Context) error {
-	// SQLite drops IF NOT EXISTS when recording the statement. Compare the entire
-	// canonical definition (including STRICT, checks and unique constraints), not
-	// just column names: accepting weakened constraints would weaken authentication.
-	normalize := func(s string) string {
-		return strings.Join(strings.Fields(strings.Replace(s, " IF NOT EXISTS", "", 1)), " ")
-	}
+	// Backends can reformat punctuation and keyword case in the schema catalog.
+	// Compare every SQL token, preserving string literals and constraints: merely
+	// checking columns would allow a weakened authentication schema to be adopted.
 	for _, object := range []struct{ name, kind, ddl string }{
 		{"access_keys", "table", accessKeySchema},
 		{"idx_access_keys_created", "index", accessKeyCreatedIndex},
@@ -311,11 +319,68 @@ func (d *db) validateAccessKeySchema(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("check access key schema: %w", err)
 		}
-		if kind != object.kind || normalize(ddl) != normalize(object.ddl) {
+		if kind != object.kind || normalizedSchemaSQL(ddl) != normalizedSchemaSQL(object.ddl) {
 			return fmt.Errorf("%w: existing %s object does not match the access key schema; move the conflicting application object before opening this database", ErrSchemaVersionMismatch, object.name)
 		}
 	}
 	return nil
+}
+
+// normalizedSchemaSQL accepts formatting changes, not different SQL definitions.
+// In particular, whitespace and case inside quoted strings remain significant.
+// Quoted identifiers are kept verbatim too; unfamiliar rewrites fail closed.
+func normalizedSchemaSQL(s string) string {
+	var tokens []string
+	word := func(c byte) bool {
+		return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$'
+	}
+	for i := 0; i < len(s); {
+		if strings.ContainsRune(" \t\r\n\f", rune(s[i])) {
+			i++
+			continue
+		}
+		start := i
+		if s[i] == '\'' || s[i] == '"' || s[i] == '`' || s[i] == '[' {
+			end := s[i]
+			if end == '[' {
+				end = ']'
+			}
+			i++
+			for i < len(s) {
+				if s[i] == end {
+					i++
+					if end != ']' && i < len(s) && s[i] == end {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+			tokens = append(tokens, s[start:i])
+		} else if word(s[i]) {
+			for i < len(s) && word(s[i]) {
+				i++
+			}
+			tokens = append(tokens, strings.ToUpper(s[start:i]))
+		} else {
+			end := i + 1
+			for _, operator := range []string{"->>", ">=", "<=", "!=", "<>", "==", "||", "<<", ">>", "->"} {
+				if strings.HasPrefix(s[i:], operator) {
+					end = i + len(operator)
+					break
+				}
+			}
+			tokens = append(tokens, s[i:end])
+			i = end
+		}
+	}
+	// SQLite usually omits this clause in its catalog; Rust can retain it.
+	if len(tokens) >= 5 && tokens[0] == "CREATE" && (tokens[1] == "TABLE" || tokens[1] == "INDEX") &&
+		tokens[2] == "IF" && tokens[3] == "NOT" && tokens[4] == "EXISTS" {
+		tokens = append(tokens[:2], tokens[5:]...)
+	}
+	return strings.Join(tokens, " ")
 }
 
 // recordedSchemaVersion returns the schema_version stored in meta, or ok=false for
