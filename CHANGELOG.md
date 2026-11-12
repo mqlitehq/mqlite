@@ -12,6 +12,14 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Confirm short initial leases together (MQLITE-183)
+
+- Confirm received messages that need an initial lease check with one fenced
+  `RenewBatch` request before dispatching handlers. This prevents separately
+  queued confirmations from exhausting a short lease on a serialized remote
+  writer. Keep the earliest original watchdog and per-message ownership checks;
+  older brokers retain bounded, ordered single-message confirmation.
+
 ### Renew managed leases through settlement confirmation (MQLITE-180)
 
 - With auto-renew enabled, continue the heartbeat while Complete or Abandon

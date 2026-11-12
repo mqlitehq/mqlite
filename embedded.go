@@ -688,6 +688,29 @@ func (e *Embedded) renew(ctx context.Context, q string, seq int64, tok string) e
 	return e.eng.Renew(ctx, q, seq, tok)
 }
 
+func (e *Embedded) renewInitialBatch(ctx context.Context, queue string, messages []*Message) ([]initialRenewalResult, error) {
+	results, err := e.RenewBatch(ctx, queue, messages...)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) != len(messages) {
+		return nil, fmt.Errorf("mqlite: invalid embedded RenewBatch result count")
+	}
+	serverNow := e.eng.ServerTimeMs()
+	out := make([]initialRenewalResult, len(results))
+	for i, result := range results {
+		if result.SequenceNumber != messages[i].SequenceNumber || result.Ok == result.LockedUntil.IsZero() {
+			return nil, fmt.Errorf("mqlite: invalid embedded RenewBatch result")
+		}
+		if !result.Ok {
+			out[i].err = ErrLockLost
+			continue
+		}
+		out[i].lease = renewalLease{deadline: embeddedLeaseDeadline(result.LockedUntil.UnixMilli(), serverNow)}
+	}
+	return out, nil
+}
+
 // renewDeadline is the managed Receiver's deadline-bearing renewal path. Keep
 // Message.Renew's public error-only signature stable while pacing later
 // heartbeats from the deadline the engine actually committed.

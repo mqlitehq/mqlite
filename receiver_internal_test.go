@@ -3811,3 +3811,571 @@ func TestReceiverPermissionDeniedStopsEveryPath(t *testing.T) {
 		})
 	}
 }
+
+// TestReceiverInitialConfirmationBatchFitsSharedLease models one remote writer
+// already occupied for 400ms followed by 350ms renewal statements. Four
+// separately confirmed deliveries cannot all fit their original 1.5s lease;
+// one set-based confirmation can, without relaxing an item's watchdog.
+func TestReceiverInitialConfirmationBatchFitsSharedLease(t *testing.T) {
+	const messages = 4
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var receiveCalls, renewalRequests, handlerCalls, completeCalls int
+	var batchSizes []int
+	var observed []error
+	deadlines := make(map[int64]time.Time)
+	handled := make(map[int64]int)
+	completed := make(map[int64]int)
+	writePermit := make(chan struct{}, 1)
+	writePermit <- struct{}{}
+	var occupied sync.Once
+	allComplete := make(chan struct{})
+	failed := make(chan error, 1)
+	serverStop := make(chan struct{})
+	writeJSON := func(w http.ResponseWriter, started time.Time, value interface{}) {
+		now := time.Now()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(now.UnixNano()/int64(time.Millisecond), 10))
+		w.Header().Set(wire.ServerElapsedHeader, strconv.FormatInt(now.Sub(started).Nanoseconds()/int64(time.Millisecond), 10))
+		_ = json.NewEncoder(w).Encode(value)
+	}
+	wait := func(call context.Context, duration time.Duration) bool {
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return true
+		case <-call.Done():
+			return false
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		started := time.Now()
+		switch req.URL.Path {
+		case wire.PathReceive:
+			var receive wire.ReceiveRequest
+			if err := json.NewDecoder(req.Body).Decode(&receive); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			receiveCalls++
+			call := receiveCalls
+			mu.Unlock()
+			if call == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "unavailable", Message: "retry the same receive attempt"})
+				return
+			}
+			if call > 2 {
+				select {
+				case <-req.Context().Done():
+				case <-serverStop:
+				}
+				return
+			}
+			deadline := time.Now().Add(1500 * time.Millisecond)
+			response := wire.ReceiveResponse{}
+			mu.Lock()
+			for i := 1; i <= messages; i++ {
+				sequence := int64(i)
+				deadlines[sequence] = deadline
+				response.Messages = append(response.Messages, wire.Message{SeqNumber: sequence, LockToken: fmt.Sprintf("token-%d", i), DeliveryCount: 1, MessageID: fmt.Sprintf("message-%d", i), Body: []byte(fmt.Sprintf("payload-%d", i)), LockedUntilMs: deadline.UnixNano() / int64(time.Millisecond)})
+			}
+			mu.Unlock()
+			writeJSON(w, started, response)
+		case wire.PathRenewBatch:
+			var request wire.RenewBatchRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			renewalRequests++
+			batchSizes = append(batchSizes, len(request.Messages))
+			mu.Unlock()
+			select {
+			case <-writePermit:
+			case <-req.Context().Done():
+				return
+			}
+			defer func() { writePermit <- struct{}{} }()
+			ready := true
+			occupied.Do(func() { ready = wait(req.Context(), 400*time.Millisecond) })
+			if !ready || !wait(req.Context(), 350*time.Millisecond) {
+				return
+			}
+			response := wire.RenewBatchResponse{}
+			now := time.Now()
+			mu.Lock()
+			for _, item := range request.Messages {
+				result := wire.SettleItemResult{SeqNumber: item.SeqNumber}
+				if item.LockToken == fmt.Sprintf("token-%d", item.SeqNumber) && deadlines[item.SeqNumber].After(now) {
+					result.Ok = true
+					deadlines[item.SeqNumber] = now.Add(3 * time.Second)
+					result.LockedUntilMs = deadlines[item.SeqNumber].UnixNano() / int64(time.Millisecond)
+				}
+				response.Results = append(response.Results, result)
+			}
+			mu.Unlock()
+			writeJSON(w, started, response)
+		case wire.PathComplete:
+			var request wire.SettleRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			if request.LockToken != fmt.Sprintf("token-%d", request.SeqNumber) || !deadlines[request.SeqNumber].After(time.Now()) {
+				mu.Unlock()
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			completed[request.SeqNumber]++
+			completeCalls++
+			count := completeCalls
+			mu.Unlock()
+			writeJSON(w, started, wire.SettleResponse{Ok: true})
+			if count == messages {
+				close(allComplete)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	defer close(serverStop)
+	client, err := Open(ctx, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Receiver("q", WithConcurrency(messages), WithPrefetch(messages), WithAutoRenew(), WithErrorHandler(func(err error) {
+			mu.Lock()
+			observed = append(observed, err)
+			mu.Unlock()
+			select {
+			case failed <- err:
+			default:
+			}
+		})).Run(ctx, func(handlerCtx context.Context, message *Message) error {
+			mu.Lock()
+			handlerCalls++
+			handled[message.SequenceNumber]++
+			mu.Unlock()
+			if message.MessageID != fmt.Sprintf("message-%d", message.SequenceNumber) || string(message.Body) != fmt.Sprintf("payload-%d", message.SequenceNumber) || message.DeliveryCount != 1 {
+				return errors.New("delivery identity differs")
+			}
+			if !wait(handlerCtx, 20*time.Millisecond) {
+				return handlerCtx.Err()
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-allComplete:
+	case <-failed:
+	case <-ctx.Done():
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v, want caller cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Receiver did not join")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(observed) != 0 || handlerCalls != messages || completeCalls != messages {
+		t.Fatalf("valid shared-budget batch failed: handlers=%d complete=%d errors=%v renewRequests=%d batchSizes=%v", handlerCalls, completeCalls, observed, renewalRequests, batchSizes)
+	}
+	for i := 1; i <= messages; i++ {
+		if handled[int64(i)] != 1 || completed[int64(i)] != 1 {
+			t.Fatalf("sequence %d handled/completed %d/%d", i, handled[int64(i)], completed[int64(i)])
+		}
+	}
+	if renewalRequests != 1 || len(batchSizes) != 1 || batchSizes[0] != messages {
+		t.Fatalf("initial confirmation requests=%d batchSizes=%v, want one batch of four", renewalRequests, batchSizes)
+	}
+}
+
+type initialBatchTestSource struct {
+	*fakeSource
+	initialFn func(context.Context, []*Message) ([]initialRenewalResult, error)
+}
+
+func (s *initialBatchTestSource) renewInitialBatch(ctx context.Context, _ string, messages []*Message) ([]initialRenewalResult, error) {
+	return s.initialFn(ctx, messages)
+}
+
+func TestInitialBatchConfirmationPreservesFences(t *testing.T) {
+	for _, name := range []string{"healthy", "partial-lost", "partial-expired", "partial-too-short", "unauthenticated", "permission-denied", "queue-missing", "transient", "invalid-count", "late-ack", "run-canceled", "transport-goexit", "misleading-503", "partial-permanent", "partial-misleading-503", "late-unsupported", "canceled-late-404", "canceled-late-403"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			base := &fakeSource{}
+			source := &initialBatchTestSource{fakeSource: base}
+			want := 4
+			switch name {
+			case "partial-lost", "partial-expired", "partial-too-short", "partial-misleading-503":
+				want = 3
+			case "healthy":
+			default:
+				want = 0
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			if name == "late-ack" || name == "late-unsupported" {
+				deadline = time.Now().Add(150 * time.Millisecond)
+			}
+			for i := int64(1); i <= 4; i++ {
+				base.batch = append(base.batch, &Message{SequenceNumber: i, LockedUntil: deadline, localLockedUntil: deadline, localLeaseResponseRTT: 2 * time.Second, queue: "q", s: source})
+			}
+			var calls int
+			source.initialFn = func(call context.Context, messages []*Message) ([]initialRenewalResult, error) {
+				calls++
+				switch name {
+				case "unauthenticated":
+					return nil, ErrUnauthenticated
+				case "permission-denied":
+					return nil, ErrPermissionDenied
+				case "queue-missing":
+					return nil, ErrQueueNotFound
+				case "transient":
+					return nil, &HTTPError{StatusCode: http.StatusServiceUnavailable}
+				case "misleading-503":
+					return nil, &HTTPError{StatusCode: http.StatusServiceUnavailable, cause: ErrPermissionDenied}
+				case "invalid-count":
+					return nil, nil
+				case "late-ack":
+					<-call.Done()
+				case "late-unsupported":
+					<-call.Done()
+					return nil, ErrUnsupported
+				case "run-canceled":
+					cancel()
+				case "canceled-late-404":
+					cancel()
+					return nil, &HTTPError{StatusCode: http.StatusNotFound, cause: ErrUnsupported}
+				case "canceled-late-403":
+					cancel()
+					return nil, &HTTPError{StatusCode: http.StatusForbidden, cause: ErrPermissionDenied}
+				case "transport-goexit":
+					runtime.Goexit()
+				}
+				results := make([]initialRenewalResult, len(messages))
+				for i := range results {
+					results[i].lease.deadline = time.Now().Add(30 * time.Second)
+				}
+				switch name {
+				case "partial-lost":
+					results[0].err = ErrLockLost
+				case "partial-expired":
+					results[0].lease.deadline = time.Now().Add(-time.Millisecond)
+				case "partial-too-short":
+					results[0].lease.deadline = time.Now().Add(20 * time.Millisecond)
+				case "partial-permanent":
+					results[3].err = ErrPermissionDenied
+				case "partial-misleading-503":
+					results[0].err = &HTTPError{StatusCode: http.StatusServiceUnavailable, cause: ErrPermissionDenied}
+				}
+				return results, nil
+			}
+			var mu sync.Mutex
+			var handled, observed int
+			var observedErrors []error
+			base.completeFn = func(context.Context) error {
+				base.mu.Lock()
+				complete := base.completeCalls
+				base.mu.Unlock()
+				if complete == want {
+					cancel()
+				}
+				return nil
+			}
+			receiver := newReceiver(source, "q", []ReceiverOption{WithConcurrency(4), WithPrefetch(4), WithAutoRenew(), WithErrorHandler(func(err error) {
+				mu.Lock()
+				observed++
+				observedErrors = append(observedErrors, err)
+				mu.Unlock()
+				if want == 0 {
+					cancel()
+				}
+			})})
+			err := receiver.Run(ctx, func(context.Context, *Message) error { mu.Lock(); handled++; mu.Unlock(); return nil })
+			switch name {
+			case "unauthenticated":
+				if !errors.Is(err, ErrUnauthenticated) {
+					t.Fatalf("Run = %v", err)
+				}
+			case "permission-denied", "partial-permanent":
+				if !errors.Is(err, ErrPermissionDenied) {
+					t.Fatalf("Run = %v", err)
+				}
+			case "queue-missing":
+				if !errors.Is(err, ErrQueueNotFound) {
+					t.Fatalf("Run = %v", err)
+				}
+			default:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Run = %v", err)
+				}
+			}
+			base.mu.Lock()
+			complete, receives, renews := base.completeCalls, base.calls, base.renewCalls
+			base.mu.Unlock()
+			mu.Lock()
+			gotHandled, gotObserved := handled, observed
+			mu.Unlock()
+			if calls != 1 || gotHandled != want || complete != want || renews != 0 {
+				t.Fatalf("initial=%d handler=%d complete=%d renew=%d want handler/complete=%d", calls, gotHandled, complete, renews, want)
+			}
+			if (name == "run-canceled" || name == "canceled-late-404" || name == "canceled-late-403") && gotObserved != 0 {
+				t.Fatal("late result notified after caller cancellation")
+			}
+			if name == "misleading-503" || name == "partial-misleading-503" {
+				for _, failure := range observedErrors {
+					if errors.Is(failure, ErrPermissionDenied) || !errors.Is(failure, ErrLockLost) {
+						t.Fatalf("misleading 503 escaped lock-loss classification: %v", failure)
+					}
+				}
+			}
+			if name == "unauthenticated" || name == "permission-denied" || name == "queue-missing" || name == "partial-permanent" {
+				if receives != 1 || gotObserved != 1 {
+					t.Fatalf("permanent failure performed extra receive or notification: %d/%d", receives, gotObserved)
+				}
+			}
+		})
+	}
+}
+
+type initialLegacyTestSource struct {
+	*fakeSource
+	confirm func(context.Context, int64) (renewalLease, error)
+}
+
+func (s *initialLegacyTestSource) renewDeadline(ctx context.Context, _ string, sequence int64, _ string) (renewalLease, error) {
+	return s.confirm(ctx, sequence)
+}
+
+func TestInitialLegacyConfirmationOrdersWithoutWaitingForHandlers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	base := &fakeSource{}
+	source := &initialLegacyTestSource{fakeSource: base}
+	firstHandler := make(chan struct{})
+	allConfirmed := make(chan struct{})
+	var mu sync.Mutex
+	var order []int64
+	var handlers int
+	now := time.Now()
+	for _, sequence := range []int64{3, 1, 2} {
+		deadline := now.Add(time.Duration(sequence+2) * 500 * time.Millisecond)
+		base.batch = append(base.batch, &Message{SequenceNumber: sequence, LockedUntil: deadline, localLockedUntil: deadline, localLeaseResponseRTT: 3 * time.Second, queue: "q", s: source})
+	}
+	source.confirm = func(call context.Context, sequence int64) (renewalLease, error) {
+		mu.Lock()
+		order = append(order, sequence)
+		mu.Unlock()
+		if sequence == 2 {
+			select {
+			case <-firstHandler:
+			case <-call.Done():
+				return renewalLease{}, call.Err()
+			}
+		}
+		if sequence == 3 {
+			close(allConfirmed)
+		}
+		return renewalLease{deadline: time.Now().Add(30 * time.Second)}, nil
+	}
+	base.completeFn = func(context.Context) error {
+		base.mu.Lock()
+		done := base.completeCalls == 3
+		base.mu.Unlock()
+		if done {
+			cancel()
+		}
+		return nil
+	}
+	err := newReceiver(source, "q", []ReceiverOption{WithConcurrency(3), WithPrefetch(3), WithAutoRenew()}).Run(ctx, func(call context.Context, message *Message) error {
+		if message.SequenceNumber == 1 {
+			close(firstHandler)
+			select {
+			case <-allConfirmed:
+			case <-call.Done():
+				return call.Err()
+			}
+		}
+		mu.Lock()
+		handlers++
+		mu.Unlock()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v", err)
+	}
+	if fmt.Sprint(order) != "[1 2 3]" || handlers != 3 {
+		t.Fatalf("confirmation order=%v handlers=%d", order, handlers)
+	}
+}
+
+func TestInitialBatchCapUsesOrderedFallback(t *testing.T) {
+	source := &initialBatchTestSource{fakeSource: &fakeSource{}}
+	source.initialFn = func(context.Context, []*Message) ([]initialRenewalResult, error) {
+		t.Fatal("over-cap batch must not be issued")
+		return nil, nil
+	}
+	receiver := newReceiver(source, "q", []ReceiverOption{WithAutoRenew()})
+	now := time.Now()
+	var messages []*Message
+	for i := 0; i <= MaxRenewBatch; i++ {
+		deadline := now.Add(2 * time.Second)
+		messages = append(messages, &Message{SequenceNumber: int64(i + 1), LockedUntil: deadline, localLockedUntil: deadline, localLeaseResponseRTT: 2 * time.Second, queue: "q", s: source})
+	}
+	plans, err := receiver.prepareInitialRenewals(context.Background(), messages, false)
+	if err != nil || len(plans) != len(messages) {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	for i, message := range messages {
+		plan := plans[message]
+		if plan.result != nil || plan.attemptDeadline.IsZero() || plan.done == nil || (i == 0) != (plan.previous == nil) {
+			t.Fatal("over-cap fallback lost its original watchdog or order")
+		}
+	}
+}
+
+func TestInitialBatchClientValidatesEveryAcknowledgement(t *testing.T) {
+	for _, name := range []string{"valid", "partial", "missing", "duplicate", "unknown", "missing-deadline", "malformed", "unauthenticated", "permission-denied", "unsupported"} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				var request wire.RenewBatchRequest
+				if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+					t.Error(err)
+					w.WriteHeader(400)
+					return
+				}
+				if len(request.Messages) != 3 {
+					t.Error("initial confirmation did not use all items")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set(wire.ServerTimeHeader, strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
+				switch name {
+				case "unauthenticated":
+					w.WriteHeader(401)
+					_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "unauthenticated"})
+					return
+				case "permission-denied":
+					w.WriteHeader(403)
+					_ = json.NewEncoder(w).Encode(wire.ErrorBody{Code: "permission_denied"})
+					return
+				case "unsupported":
+					w.WriteHeader(404)
+					_ = json.NewEncoder(w).Encode(wire.ErrorBody{Message: "no such path"})
+					return
+				case "malformed":
+					_, _ = w.Write([]byte(`{"results":`))
+					return
+				}
+				response := wire.RenewBatchResponse{}
+				for i := int64(1); i <= 3; i++ {
+					response.Results = append(response.Results, wire.SettleItemResult{SeqNumber: i, Ok: true, LockedUntilMs: time.Now().Add(30*time.Second).UnixNano() / int64(time.Millisecond)})
+				}
+				switch name {
+				case "partial":
+					response.Results[1].Ok = false
+					response.Results[1].LockedUntilMs = 0
+				case "missing":
+					response.Results = response.Results[:2]
+				case "duplicate":
+					response.Results[1].SeqNumber = 1
+				case "unknown":
+					response.Results[1].SeqNumber = 9
+				case "missing-deadline":
+					response.Results[1].LockedUntilMs = 0
+				}
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer server.Close()
+			client, err := Open(context.Background(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			messages := []*Message{client.Message("q", 1, "one"), client.Message("q", 2, "two"), client.Message("q", 3, "three")}
+			result, err := client.renewInitialBatch(context.Background(), "q", messages)
+			switch name {
+			case "valid", "partial":
+				if err != nil || len(result) != 3 {
+					t.Fatalf("results=%v err=%v", result, err)
+				}
+				for i, item := range result {
+					if name == "partial" && i == 1 {
+						if !errors.Is(item.err, ErrLockLost) {
+							t.Fatal("lost item was not fenced")
+						}
+						continue
+					}
+					if item.err != nil || item.lease.clockUnavailable || !item.lease.deadline.After(time.Now().Add(29*time.Second)) {
+						t.Fatalf("invalid confirmed result: %+v", item)
+					}
+				}
+			default:
+				if err == nil {
+					t.Fatal("invalid acknowledgement was accepted")
+				}
+				if name == "unsupported" && !errors.Is(err, ErrUnsupported) {
+					t.Fatalf("unsupported=%v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestInitialBatchDuplicateInputCannotCreateCyclicFallback(t *testing.T) {
+	base := &fakeSource{}
+	message := &Message{SequenceNumber: 1, LockedUntil: time.Now().Add(time.Second), queue: "q", s: base}
+	receiver := newReceiver(base, "q", []ReceiverOption{WithAutoRenew()})
+	_, err := receiver.prepareInitialRenewals(context.Background(), []*Message{message, message}, true)
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("duplicate input = %v", err)
+	}
+}
+
+func TestInitialLegacyGoexitReleasesFollowingConfirmation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	base := &fakeSource{}
+	source := &initialLegacyTestSource{fakeSource: base}
+	now := time.Now()
+	for i := int64(1); i <= 2; i++ {
+		deadline := now.Add(time.Duration(i+1) * time.Second)
+		base.batch = append(base.batch, &Message{SequenceNumber: i, LockedUntil: deadline, localLockedUntil: deadline, localLeaseResponseRTT: 2 * time.Second, queue: "q", s: source})
+	}
+	source.confirm = func(call context.Context, sequence int64) (renewalLease, error) {
+		if sequence == 1 {
+			runtime.Goexit()
+		}
+		return renewalLease{deadline: time.Now().Add(30 * time.Second)}, nil
+	}
+	base.completeFn = func(context.Context) error { cancel(); return nil }
+	var handled int64
+	err := newReceiver(source, "q", []ReceiverOption{WithAutoRenew(), WithConcurrency(2), WithPrefetch(2)}).Run(ctx, func(_ context.Context, message *Message) error {
+		if message.SequenceNumber != 2 {
+			t.Error("Goexit delivery reached handler")
+		}
+		handled++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || handled != 1 {
+		t.Fatalf("Run=%v handlers=%d", err, handled)
+	}
+}
