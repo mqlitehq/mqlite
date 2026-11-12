@@ -334,7 +334,11 @@ Error categories are empty on success or one of
 `canceled`, `closed`, `busy`, `connection`, `full`, `corrupt`, `io`,
 `application`, `outcome_unknown`, `other`. Fixed storage outcome/error combinations
 and registered RPC/result combinations are initialized to zero, so the first
-event can be detected after an earlier successful scrape. Use `rate`/`increase`
+event can be detected after an earlier successful scrape.
+A confirmed idle-transaction rollback remains in the existing `connection`
+counter category; its optional error detail uses the more precise
+`transaction_expired` category. This preserves the required counter matrix and
+allows observations from older brokers to decode unchanged. Use `rate`/`increase`
 across observed samples; a first scrape after an event cannot reconstruct its time.
 Maintenance tasks are `locks`, `scheduled`, `ttl`,
 `dedup`, `receipts`, `retention`, `reclaim`, `subscription_expiry`,

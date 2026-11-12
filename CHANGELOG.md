@@ -12,6 +12,17 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Retry confirmed idle-transaction rollbacks (MQLITE-170)
+
+- Treat the provider's exact acknowledgement that an idle interactive transaction
+  was rolled back as a definite rejection. Remote operations can reopen and retry
+  the whole transaction within the existing six-attempt budget, instead of
+  failing that maintenance pass with an unclassified error.
+- Expose exhausted retries with precise `transaction_expired` error details while
+  retaining the existing `connection` counter category and observation matrix. Generic timeouts, transport loss, joined causes and
+  checkpoint failures still do not prove that a COMMIT was rolled back; ambiguous
+  acknowledgements retain `ErrOutcomeUnknown`. Local SQLite behavior is unchanged.
+
 ### Retry definite Rust Turso contention (MQLITE-173)
 
 - Recognize the Rust provider's exact `Database is busy` rejection through the

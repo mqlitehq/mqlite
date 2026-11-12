@@ -107,15 +107,18 @@ HTTP/TLS reuse remains owned by Go's shared transport. Normal failure handling i
 still bounded as follows:
 
 - **Bounded retry on transient errors only** — `maxConnAttempts = 6`.
-- **Reads retry on any transport drop.** `retryable = remote && (isConnErr || isBusyErr)`
+- **Reads retry on transport drops and definite remote aborts.**
+  `retryable = remote && (isConnErr || isBusyErr || isExpiredRemoteTransactionErr)`
   gates `query`/`queryRowScan`: a read is idempotent, so replaying it on a fresh pooled
   connection is always safe. `isConnErr` spans the whole transport-failure family —
   `driver.ErrBadConn`, a closed Hrana stream, and their siblings `EOF` / `broken pipe` /
   `i/o timeout` (behind a proxy like Fly a dropped connection reads as `EOF`, not `RST`).
-- **Writes retry only when the statement provably never applied** — `retryableWrite =
-  remote && (ErrBadConn || isBusyErr)`. A closed stream (`ErrBadConn`) or a `SQLITE_BUSY`
-  (lock never acquired) guarantees the write never ran, so replaying `exec` / the `inTx`
-  commit cannot double-apply. The retry is bounded by `maxConnAttempts`; exhaustion is
+- **Writes and COMMIT retry only after a definite non-commit** — `retryableWrite =
+  remote && (ErrBadConn || isBusyErr || isExpiredRemoteTransactionErr)`. A closed
+  stream before dispatch (`ErrBadConn`), contention, or the exact whole-transaction
+  rollback acknowledgement permits a fresh attempt without duplicating a committed
+  effect. `inTx` replays the entire transaction after discarding the failed attempt;
+  it does not replay COMMIT alone. The retry is bounded by `maxConnAttempts`; exhaustion is
   returned to the caller. The `busy_timeout(5000)` DSN pragma belongs to local modernc
   SQLite connections and does not apply to Turso/libSQL.
   The Rust preview's exact provider rejection `Tursodb error: Database is busy`
@@ -124,6 +127,17 @@ still bounded as follows:
   wrapping. Arbitrary busy text, transport/cancellation wrappers, joined errors
   and post-commit checkpoint failures do not qualify. This does not add retries
   to local SQLite or make overlapping brokers safe.
+- **A confirmed idle-transaction rollback can be retried.** MQLite recognizes only
+  the exact provider explanation that an interactive transaction "was rolled back
+  because the stream was idle for too long; retry the transaction." This is a
+  rollback acknowledgement, rather than a lost COMMIT reply. The engine reopens
+  and retries the entire transaction under the same six-attempt budget, rebuilding
+  time-sensitive arguments as usual. Exhaustion keeps the existing `connection`
+  counter category and reports `transaction_expired` in optional error details;
+  it does not change the required observation counter matrix.
+  Generic "transaction timed out" or "rolled back" text, network/cancellation
+  wrappers, joined causes and checkpoint failures do not qualify. A lost COMMIT
+  reply remains outcome-unknown even if an outer diagnostic mentions expiry.
 - **A lost write acknowledgement is _outcome-unknown_, not retried** (MQLITE-59). Any
   other transport drop on a write/commit — the primary may have durably committed before
   the ack was lost — surfaces as `ErrOutcomeUnknown` (HTTP `503 outcome_unknown`) instead
