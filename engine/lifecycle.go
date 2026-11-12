@@ -37,15 +37,26 @@ var emptySubscriptionCandidatesSQL = `
 	SELECT q.name
 	  FROM queues q JOIN subscriptions s ON s.subscription=q.name
 	 WHERE q.kind='subscription' AND q.lifecycle_state='deleting'
-	   AND NOT EXISTS (` + messageExistenceUnion("q.name") + `)
+	   AND (` + messageAbsencePredicate("q.name") + `)
 	   AND NOT EXISTS (SELECT 1 FROM dedup WHERE queue=q.name)
 	   AND NOT EXISTS (SELECT 1 FROM settlement_receipts WHERE queue=q.name)
 	   AND NOT EXISTS (SELECT 1 FROM receive_attempts WHERE queue=q.name)
 	 ORDER BY q.delete_started_at,q.name LIMIT ?`
 
-// messageExistenceUnion builds literal state predicates so SQLite can prove
-// that each branch matches its queue-prefix partial index. queueExpr is either
-// a bind parameter or the outer queues.name column; both are internal constants.
+// messageAbsencePredicate uses independent, bounded existence probes. Rust-based
+// Turso does not yet support compound SELECTs in WHERE subqueries. Literal state
+// predicates still let each probe use its queue-prefix partial index. queueExpr
+// is an internal bind parameter or the outer queues.name column.
+func messageAbsencePredicate(queueExpr string) string {
+	parts := make([]string, 0, len(lifecycleMessageStates))
+	for _, state := range lifecycleMessageStates {
+		parts = append(parts, `NOT EXISTS (SELECT 1 FROM messages WHERE queue=`+queueExpr+` AND state='`+state.name+`')`)
+	}
+	return strings.Join(parts, ` AND `)
+}
+
+// messageExistenceUnion identifies the exact legacy parent-trigger spelling.
+// Runtime queries and current guards use messageAbsencePredicate instead.
 func messageExistenceUnion(queueExpr string) string {
 	parts := make([]string, 0, len(lifecycleMessageStates))
 	for _, state := range lifecycleMessageStates {
@@ -253,7 +264,7 @@ func (e *Engine) deleteEntity(ctx context.Context, topic, name, kind string, opt
 		ttlAuthorized := kind == "subscription" && q.expiresAtMs > 0 && q.expiresAtMs <= now
 		if q.lifecycleState == "active" && !opts.Force && !ttlAuthorized {
 			var occupied bool
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(`+messageExistenceUnion("?")+`)`, repeatedQueueArgs(name)...).Scan(&occupied); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT NOT (`+messageAbsencePredicate("?")+`)`, repeatedQueueArgs(name)...).Scan(&occupied); err != nil {
 				return err
 			}
 			if occupied {
@@ -532,7 +543,7 @@ func (e *Engine) deleteEntityMetadataTx(ctx context.Context, tx *txn, name, kind
 			query += ` AND EXISTS (
 				SELECT 1 FROM queues
 				WHERE name=? AND kind='subscription' AND lifecycle_state='deleting'
-				  AND NOT EXISTS (` + messageExistenceUnion("queues.name") + `)
+				  AND (` + messageAbsencePredicate("queues.name") + `)
 				  AND NOT EXISTS (SELECT 1 FROM dedup WHERE queue=queues.name)
 				  AND NOT EXISTS (SELECT 1 FROM settlement_receipts WHERE queue=queues.name)
 				  AND NOT EXISTS (SELECT 1 FROM receive_attempts WHERE queue=queues.name))`
@@ -557,7 +568,7 @@ func (e *Engine) deleteEntityMetadataTx(ctx context.Context, tx *txn, name, kind
 	query := `DELETE FROM queues WHERE name=? AND kind=? AND lifecycle_state='deleting'`
 	if requireEmpty && kind != "subscription" {
 		query += `
-			AND NOT EXISTS (` + messageExistenceUnion("queues.name") + `)
+			AND (` + messageAbsencePredicate("queues.name") + `)
 			AND NOT EXISTS (SELECT 1 FROM dedup WHERE queue=queues.name)
 			AND NOT EXISTS (SELECT 1 FROM settlement_receipts WHERE queue=queues.name)
 			AND NOT EXISTS (SELECT 1 FROM receive_attempts WHERE queue=queues.name)`
