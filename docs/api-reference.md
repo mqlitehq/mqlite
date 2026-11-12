@@ -467,7 +467,7 @@ retain application-side evidence when reconciliation must outlive this window.
 | Method | Extra fields | Effect |
 |---|---|---|
 | `Complete` | — | delete the message (done) |
-| `Abandon` | `delay_ms` (int, optional) | release the lock without incrementing `delivery_count`: below max, redeliver after `delay_ms` (a delayed head keeps holding its group's line on ordered queues); at max, move to the DLQ |
+| `Abandon` | `delay_ms` (nonnegative int, optional) | release the lock without incrementing `delivery_count`: below max, redeliver after `delay_ms` (a delayed head keeps holding its group's line on ordered queues); at max, move to the DLQ |
 | `Reject` | `dead_letter_reason`, `dead_letter_description` (optional) | move to the DLQ |
 | `Defer` | — | set aside; retrieve later by seq via `ReceiveDeferred` |
 | `Renew` | — | extend the same live lease without changing state, token, or `delivery_count`; cannot revive an expired lease |
@@ -495,6 +495,12 @@ differs, as described below.
 > via `ReceiveDeferred` and settled (other groups proceed). Normal `Receive` never
 > returns a deferred message, and with no TTL there is no auto-recovery, so recover a
 > lost `seq_number` via `Peek` with `state=deferred`.
+
+Abandon rejects a negative delay or a new absolute visibility deadline that
+overflows epoch milliseconds with `invalid_argument`, without changing the live
+delivery. An exact request that already committed can still replay its live
+receipt after the clock advances. Go SDK delays must be zero or at least 1ms;
+positive sub-millisecond durations are rejected before any HTTP request.
 
 > **Abandon + ordering.** With `delay_ms > 0` the message parks as `scheduled` until the
 > backoff lapses and — like a deferred head — holds its head-of-line position on ordered
