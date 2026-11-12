@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -175,6 +176,94 @@ func cleanupTursoQueues(t *testing.T, e *Engine, queues ...string) {
 			t.Logf("Turso cleanup OK: removed %d test queue(s) and their auxiliary rows", len(queues))
 		}
 	})
+}
+
+// TestTursoAbandonInputValidation verifies that rejected delays preserve the
+// remote delivery and that valid exact settlement requests remain replayable.
+func TestTursoAbandonInputValidation(t *testing.T) {
+	dsn := os.Getenv("MQLITE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set MQLITE_TEST_DB to verify remote Abandon validation")
+	}
+	if os.Getenv(remoteTestResetConfirmEnv) != "1" || os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN") == "" {
+		t.Fatal("explicit reset confirmation and authentication are required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	e, err := Open(ctx, Options{DB: dsn, AuthToken: os.Getenv("MQLITE_TEST_DB_AUTH_TOKEN"), DisableBackground: true,
+		Logger: slog.New(tursoSoakLogHandler{report: func(error) {}})})
+	if err != nil {
+		detail := describeError(err, time.Now().UnixMilli())
+		t.Fatalf("remote open: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+	}
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			detail := describeError(err, time.Now().UnixMilli())
+			t.Errorf("remote close: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+		}
+	})
+	if !e.Remote() {
+		t.Fatal("verification requires a remote store")
+	}
+	for _, maximum := range []int{1, 3} {
+		q := fmt.Sprintf("abandon_validation_%d_%d", time.Now().UnixNano(), maximum)
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cleanupCancel()
+			for _, statement := range []string{
+				`DELETE FROM messages WHERE queue=?`,
+				`DELETE FROM dedup WHERE queue=?`,
+				`DELETE FROM settlement_receipts WHERE queue=?`,
+				`DELETE FROM receive_attempts WHERE queue=?`,
+				`DELETE FROM subscriptions WHERE subscription=?`,
+				`DELETE FROM queues WHERE name=?`,
+			} {
+				if _, err := e.db.exec(cleanupCtx, statement, q); err != nil {
+					detail := describeError(err, time.Now().UnixMilli())
+					t.Errorf("remote cleanup: category=%s fingerprint=%s", detail.Category, detail.Fingerprint)
+				}
+			}
+		})
+		check := func(phase string, err error) {
+			t.Helper()
+			if err != nil {
+				detail := describeError(err, time.Now().UnixMilli())
+				t.Fatalf("%s: category=%s fingerprint=%s", phase, detail.Category, detail.Fingerprint)
+			}
+		}
+		check("create", e.CreateQueue(ctx, q, QueueConfig{MaxDeliveryCount: maximum}))
+		_, err := e.SendOne(ctx, q, OutMessage{Body: []byte("validation control")})
+		check("send", err)
+		messages, err := e.Receive(ctx, q, ReceiveOptions{})
+		check("receive", err)
+		if len(messages) != 1 {
+			t.Fatal("expected exactly one delivery")
+		}
+		m := messages[0]
+		before, err := e.Peek(ctx, q, PeekOptions{State: StateLocked})
+		check("peek before", err)
+		for _, delay := range []int64{-1, math.MaxInt64} {
+			if err := e.Abandon(ctx, q, m.SeqNumber, m.LockToken, delay); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatal("invalid remote delay did not return ErrInvalidArgument")
+			}
+			after, err := e.Peek(ctx, q, PeekOptions{State: StateLocked})
+			check("peek after", err)
+			if !reflect.DeepEqual(before, after) {
+				t.Fatal("invalid remote delay changed the delivery")
+			}
+			var receipts int
+			check("receipt count", e.db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM settlement_receipts WHERE queue=?`, q).Scan(&receipts))
+			if receipts != 0 {
+				t.Fatal("invalid remote delay recorded a settlement receipt")
+			}
+		}
+		check("valid abandonment", e.Abandon(ctx, q, m.SeqNumber, m.LockToken, 0))
+		check("exact abandonment replay", e.Abandon(ctx, q, m.SeqNumber, m.LockToken, 0))
+		if err := e.Abandon(ctx, q, m.SeqNumber, m.LockToken, 1); !errors.Is(err, ErrLockLost) {
+			t.Fatal("a different remote request inherited the receipt")
+		}
+	}
+	t.Log("Turso Abandon validation: invalid effects rejected, live deliveries preserved, exact receipts replayed")
 }
 
 // TestTursoIntegration runs the full lifecycle against a real remote Turso/libSQL

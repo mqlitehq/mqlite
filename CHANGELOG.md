@@ -34,6 +34,16 @@ upgrade notes before replacing a broker.
   replaying Send. Preserve valid zero slots and repeated positive dedup sequences.
 
 
+### Validate Abandon delays before settlement (MQLITE-154)
+
+- Reject negative Abandon delays and Go durations below the wire's one-millisecond
+  precision instead of silently releasing or dead-lettering the delivery.
+- Reject a new delay whose absolute visibility deadline would overflow epoch
+  milliseconds without changing the live token or writing a receipt. Previously
+  committed exact requests retain receipt replay when the clock advances.
+- Keep zero-delay abandonment immediate and ordinary valid delays unchanged;
+  the timestamp-overflow check adds no SQL to the ordinary settlement path.
+
 ### Validate remote SQL acknowledgements (MQLITE-191)
 
 - Reject incomplete or mismatched HTTP Hrana results instead of panicking or
