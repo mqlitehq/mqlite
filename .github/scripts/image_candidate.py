@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """Verify both platforms of one OCI archive, then publish those same bytes."""
 import argparse
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+import errno
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import signal
+import socket
+import ssl
 import subprocess
 import sys
 import tarfile
+import threading
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -18,6 +28,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PLATFORMS = ("amd64", "arm64")
 TRIVY_VERSION = "0.74.0"
 TRIVY_SHA256 = "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+TRIVY_URL = ("https://github.com/aquasecurity/trivy/releases/download/v" + TRIVY_VERSION
+             + "/trivy_" + TRIVY_VERSION + "_Linux-64bit.tar.gz")
+TRIVY_DOWNLOAD_HOSTS = frozenset(("github.com", "release-assets.githubusercontent.com",
+                                 "objects.githubusercontent.com"))
 SOURCE = "https://github.com/mqlitehq/mqlite"
 # Alpine 3.24 main support: https://alpinelinux.org/releases/ (reviewed 2026-09-10).
 # Trivy 0.74 can scan this branch but does not yet know its support deadline.
@@ -50,6 +64,152 @@ def file_digest(path):
         for block in iter(lambda: stream.read(1 << 20), b""):
             value.update(block)
     return value.hexdigest()
+
+
+class DownloadBudgetExpired(RuntimeError):
+    pass
+
+
+class DownloadAttemptExpired(TimeoutError):
+    pass
+
+
+class TransientDownloadError(RuntimeError):
+    pass
+
+
+class TrivyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        destination = urllib.parse.urlsplit(newurl)
+        require(destination.scheme == "https" and destination.hostname in TRIVY_DOWNLOAD_HOSTS
+                and destination.port in (None, 443) and destination.username is None
+                and destination.password is None, "unapproved Trivy download redirect")
+        return super().redirect_request(request, fp, code, message, headers, newurl)
+
+
+class DownloadBudget:
+    """Linux/macOS CLI only: bound even a peer that sends one byte per socket timeout."""
+    def __init__(self):
+        self.deadline = time.monotonic() + 180
+        self.attempt = False
+
+    def remaining(self):
+        value = self.deadline - time.monotonic()
+        if value <= 0:
+            raise DownloadBudgetExpired("Trivy download exceeded its 180-second budget")
+        return value
+
+    def arm(self, attempt=False):
+        self.attempt = attempt
+        signal.setitimer(signal.ITIMER_REAL, min(60, self.remaining()) if attempt else self.remaining())
+
+    def expired(self, _signum, _frame):
+        if self.attempt and time.monotonic() < self.deadline:
+            # A one-shot attempt timer has fired. Keep cleanup/unwinding bounded too.
+            self.arm()
+            raise DownloadAttemptExpired("Trivy download attempt exceeded 60 seconds")
+        raise DownloadBudgetExpired("Trivy download exceeded its 180-second budget")
+
+
+@contextmanager
+def download_budget():
+    require(threading.current_thread() is threading.main_thread()
+            and all(hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")),
+            "Trivy download requires a main-thread POSIX deadline timer")
+    require(signal.getitimer(signal.ITIMER_REAL) == (0, 0), "Trivy download refuses an active deadline timer")
+    previous = signal.getsignal(signal.SIGALRM)
+    budget = DownloadBudget()
+    signal.signal(signal.SIGALRM, budget.expired)
+    try:
+        budget.arm()
+        yield budget
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+
+
+def transient_download_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in (408, 429, 500, 502, 503, 504)
+    if isinstance(error, urllib.error.URLError):
+        return transient_download_error(error.reason)
+    if isinstance(error, ssl.SSLError):
+        return False
+    if isinstance(error, socket.gaierror):
+        return error.errno == socket.EAI_AGAIN
+    return (isinstance(error, (TimeoutError, ConnectionResetError, ConnectionAbortedError,
+                               ConnectionRefusedError, BrokenPipeError,
+                               http.client.IncompleteRead, http.client.RemoteDisconnected))
+            or isinstance(error, OSError) and error.errno in (
+                errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED,
+                errno.EPIPE, errno.ENETUNREACH, errno.EHOSTUNREACH))
+
+
+def download_network_call(operation):
+    # Only network open/read errors can retry; local write/hash/publish failures cannot.
+    try:
+        return operation()
+    except Exception as error:
+        retry = transient_download_error(error)
+        if isinstance(error, urllib.error.HTTPError):
+            error.close()
+        if retry:
+            reason = "HTTP " + str(error.code) if isinstance(error, urllib.error.HTTPError) else type(error).__name__
+            raise TransientDownloadError(reason) from None
+        raise
+
+
+def open_trivy(timeout):
+    return urllib.request.build_opener(TrivyRedirectHandler()).open(TRIVY_URL, timeout=timeout)
+
+
+def download_trivy_attempt(destination, budget):
+    partial = destination.with_name("." + destination.name + "." + uuid.uuid4().hex + ".part")
+    created = False
+    try:
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+        try:
+            target = os.fdopen(descriptor, "wb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with target:
+            with download_network_call(lambda: open_trivy(min(60, budget.remaining()))) as response:
+                while True:
+                    block = download_network_call(lambda: response.read(1 << 20))
+                    if not block:
+                        break
+                    target.write(block)
+        budget.arm()
+        require(file_digest(partial) == TRIVY_SHA256, "Trivy download checksum mismatch")
+        # Atomic publication without overwriting even a concurrently created destination.
+        os.link(partial, destination)
+    finally:
+        if created:
+            partial.unlink(missing_ok=True)
+
+
+def download_trivy(destination):
+    require(not destination.exists(), "Trivy download destination already exists")
+    with download_budget() as budget:
+        for attempt in range(3):
+            budget.arm(attempt=True)
+            try:
+                download_trivy_attempt(destination, budget)
+                return
+            except TransientDownloadError as error:
+                budget.arm()
+                if attempt == 2:
+                    raise RuntimeError("Trivy download failed after three transient failures: " + str(error)) from None
+                delay = 2 ** (attempt + 1)
+                if delay >= budget.remaining():
+                    raise DownloadBudgetExpired("Trivy download has no retry budget remaining") from None
+                print("Retrying verified Trivy download after " + str(error) + "; delay=" + str(delay) + "s",
+                      flush=True)
+                time.sleep(delay)
 
 
 def command(*args, capture=False, log=None):
@@ -155,12 +315,7 @@ def verify(archive, output, version, revision):
     output.mkdir(parents=True, exist_ok=False)
     identity = inspect_archive(archive, version, revision)
     trivy_archive = output / "trivy.tar.gz"
-    url = ("https://github.com/aquasecurity/trivy/releases/download/v" + TRIVY_VERSION
-           + "/trivy_" + TRIVY_VERSION + "_Linux-64bit.tar.gz")
-    with urllib.request.urlopen(url, timeout=60) as response, trivy_archive.open("wb") as target:
-        while block := response.read(1 << 20):
-            target.write(block)
-    require(file_digest(trivy_archive) == TRIVY_SHA256, "Trivy download checksum mismatch")
+    download_trivy(trivy_archive)
     trivy = output / "trivy"
     with tarfile.open(trivy_archive) as bundle:
         trivy.write_bytes(bundle.extractfile("trivy").read())

@@ -353,7 +353,7 @@ class WorkflowContractTests(unittest.TestCase):
         # The scanner flags and promotion commands moved out of YAML; pin that
         # entire execution surface too, so bypasses require deliberate review.
         self.assertEqual(hashlib.sha256((ROOT / ".github/scripts/image_candidate.py").read_bytes()).hexdigest(),
-                         "fbd87cbd5648aafa5f075b43d4620304b027d87f92c312093818c35f2bebb34d", "Review the complete image gate before updating its golden")
+                         "b52023258e4cf885e508e917e6fe1c3972a3f93e7372d5f549119e4c09df804d", "Review the complete image gate before updating its golden")
 
     def test_shared_guard_is_the_only_publish_gate(self):
         for name in ("release.yml", "release-image.yml"):
