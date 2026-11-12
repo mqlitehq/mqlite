@@ -12,6 +12,15 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Exclude broker processing from lease clock uncertainty (MQLITE-179)
+
+- Return `X-Mqlite-Server-Elapsed-Ms`, a monotonic lower bound on processing time
+  before the broker clock stamp. The managed Go client deducts a valid value from
+  clock uncertainty, so storage waits and long polls do not shorten a lease twice.
+- Preserve the full measured RPC duration for renewal scheduling and request
+  budgets. Missing, repeated, malformed or excessive elapsed values retain the
+  conservative full-RTT clock bound. Older clients ignore the additive header.
+
 ### Serialize remote write attempts and batch Send transport (MQLITE-175)
 
 - Queue remote mutations before acquiring a provider connection, retaining read
@@ -29,6 +38,8 @@ upgrade notes before replacing a broker.
 - Ambiguous commit acknowledgements remain outcome-unknown. Write admission
   cannot preempt a running transaction, so network latency and batch size still
   need to fit the application's lease and request budgets.
+
+### Preserve provider HTTP write outcomes
 
 - Recognize pinned libSQL provider HTTP failures through single-cause driver
   wrappers, including newline-wrapped 502 responses. Reads and transactions that
