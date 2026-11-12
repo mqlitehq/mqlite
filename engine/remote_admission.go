@@ -20,6 +20,7 @@ type remoteWriter struct {
 	normal      list.List
 	urgent      list.List
 	renew       list.List
+	renewGroups int // bounded short-lived owners of pending coalesced renewals
 }
 
 const maxLeaseWriteBurst = 4
@@ -29,6 +30,7 @@ type remoteWriteWaiter struct {
 	queue   *list.List
 	element *list.Element
 	granted bool
+	renewal *renewalGroup // nil for ordinary caller-owned attempts
 }
 
 type leaseWritePriorityKey struct{}
@@ -87,7 +89,10 @@ func (w *remoteWriter) acquire(ctx context.Context) (func(), error) {
 	p := &remoteWriteWaiter{ready: make(chan struct{}), queue: q}
 	p.element = q.PushBack(p)
 	w.mu.Unlock()
+	return w.await(ctx, p)
+}
 
+func (w *remoteWriter) await(ctx context.Context, p *remoteWriteWaiter) (func(), error) {
 	select {
 	case <-p.ready:
 	case <-ctx.Done():
@@ -164,6 +169,9 @@ func (w *remoteWriter) releaseLocked() {
 	q.Remove(p.element)
 	p.element = nil
 	p.granted = true
+	if p.renewal != nil {
+		p.renewal.sealed = true // membership cannot grow after this grant
+	}
 	w.held = true
 	close(p.ready)
 }
@@ -217,6 +225,12 @@ func (d *db) remoteReturningAttempt(ctx context.Context, query string, buildArgs
 		return false, false, err
 	}
 	defer conn.Close()
+	return remoteReturningOnConn(ctx, conn, query, buildArgs, scan)
+}
+
+// remoteReturningOnConn is shared by ordinary and coalesced renewals. Its
+// caller retains the write permit and SQL lease through rows close and EOF.
+func remoteReturningOnConn(ctx context.Context, conn *sql.Conn, query string, buildArgs func() []any, scan func(*sql.Rows) error) (issued, queried bool, err error) {
 	args := buildArgs()
 	if err := checkCtx(ctx); err != nil {
 		return false, false, err
@@ -242,13 +256,22 @@ func (d *db) remoteReturningWrite(ctx context.Context, query string, buildArgs f
 		return ErrClosed
 	}
 	defer d.inFlight.Done()
+	return d.retryRemoteReturning(ctx, func() (bool, bool, error) {
+		return d.remoteReturningAttempt(ctx, query, buildArgs, scan)
+	})
+}
+
+// The caller has already registered the operation's Close owner. Every retry
+// ends its real SQL lease and permit before backing off and joining the FIFO
+// again. Coalescing does not authorize any additional write replay.
+func (d *db) retryRemoteReturning(ctx context.Context, attempt func() (issued, queried bool, err error)) error {
 	var err error
 	for i := 0; i < d.attempts(); i++ {
 		if err = d.beforeRemoteAttempt(ctx, i); err != nil {
 			return err
 		}
 		var issued, queried bool
-		issued, queried, err = d.remoteReturningAttempt(ctx, query, buildArgs, scan)
+		issued, queried, err = attempt()
 		if !issued {
 			if ctxErr := checkCtx(ctx); ctxErr != nil {
 				return ctxErr
