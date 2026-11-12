@@ -2944,23 +2944,23 @@ func TestReceiverReplayInitialRenewalUsesMappedLeaseWatchdog(t *testing.T) {
 	}
 }
 
-// Complete must wait until an in-flight Renew has observed cancellation and
-// exited, avoiding a false post-completion lock_lost report.
+// Complete must wait until a healthy in-flight Renew has returned, avoiding a
+// false post-completion lock_lost report without discarding a valid renewal ACK.
 func TestReceiverJoinsRenewBeforeSettlement(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	renewStarted := make(chan struct{})
-	renewExited := make(chan struct{})
-	var once sync.Once
+	renewStarted, allowRenew, renewExited := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	f := &fakeSource{}
-	renew := func(ctx context.Context) error {
-		once.Do(func() { close(renewStarted) })
-		<-ctx.Done()
-		close(renewExited)
-		return ctx.Err()
+	f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) {
+		close(renewStarted)
+		defer close(renewExited)
+		select {
+		case <-allowRenew:
+			return time.Now().Add(time.Hour), nil
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		}
 	}
-	f.renewFn = renew
-	f.renewDeadlineFn = func(ctx context.Context) (time.Time, error) { return time.Time{}, renew(ctx) }
 	settledBeforeJoin := false
 	f.completeFn = func(context.Context) error {
 		select {
@@ -2972,15 +2972,20 @@ func TestReceiverJoinsRenewBeforeSettlement(t *testing.T) {
 		return nil
 	}
 	f.batch = []*Message{{SequenceNumber: 1, LockedUntil: time.Now().Add(1300 * time.Millisecond), queue: "q", s: f}}
-	err := newReceiver(f, "q", []ReceiverOption{WithAutoRenew()}).Run(ctx, func(hctx context.Context, _ *Message) error {
-		select {
-		case <-renewStarted:
-			return nil
-		case <-hctx.Done():
-			return hctx.Err()
-		}
-	})
-	if !errors.Is(err, context.Canceled) {
+	done := make(chan error, 1)
+	go func() {
+		done <- newReceiver(f, "q", []ReceiverOption{WithAutoRenew()}).Run(ctx, func(context.Context, *Message) error { <-renewStarted; return nil })
+	}()
+	<-renewStarted
+	select {
+	case <-renewExited:
+		close(allowRenew)
+		<-done
+		t.Fatal("normal handoff canceled the healthy renewal")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(allowRenew)
+	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run = %v, want context.Canceled", err)
 	}
 	if settledBeforeJoin {

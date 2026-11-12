@@ -160,12 +160,15 @@ listener is ready, including database open and schema checks. The default lease
 is 30 seconds; use a longer configured lease when measured remote-store restart
 time and renewal/settlement latency need more margin.
 The managed Receiver on `main` also has bounded renewal and settlement budgets:
-terminal Complete/Abandon confirmation gets up to 30 seconds in total, including
-the first request, all replays and backoff, with at most fifteen seconds per request.
+terminal Complete/Abandon confirmation gets up to 30 seconds from handler return,
+including the renewal handoff, first request, all replays and backoff, with at most
+fifteen seconds per settlement request.
 The same queue, sequence, token, operation and arguments are reused; confirmation
 does not rerun the handler. An exhausted transient confirmation reports
 `ErrOutcomeUnknown` through `WithErrorHandler` and preserves the final cause for
-`errors.Is`/`errors.As`. Definitive errors such as `ErrLockLost` are reported
+`errors.Is`/`errors.As`. If the budget expires while joining the handling heartbeat,
+no new settlement is sent; expiry before any settlement request does not imply an
+unknown settlement outcome. Definitive errors such as `ErrLockLost` are reported
 unchanged without retry; permanent errors also stop `Run`. The budget does not
 extend a lease; an exact retained receipt may confirm a previously committed effect after the original lease
 expires, while a new effect still requires a live token. Returning before lease
@@ -230,12 +233,25 @@ automatic context cancellation; `mqlite serve` does not read stdin.
 |---|---|
 | Broker stops and restarts within the remaining lease | A live Receiver retries and can reuse the persisted token. Renewal and settlement must also finish inside their retry budgets. Keep a single active broker and leave the Receiver's controlling context live. |
 | Broker outage reaches lease expiry | The original token cannot renew or create a new settlement effect. The delivery returns to active below `MaxDeliveryCount`, or enters the DLQ at the limit. A retained exact-request receipt can still confirm an earlier committed settlement. |
-| Application cancels `Run` | Receive retries stop and handler/renewal contexts are canceled immediately. `Run` still waits for workers and cleanup. A returning handler's `nil` result requests Complete; a non-nil result requests Abandon with a fresh 30-second total confirmation budget and at most fifteen seconds per request, unless terminal renewal failure already made settlement unsafe. Cancellation offers no handler grace period. |
+| Application cancels `Run` | Receive retries, handler contexts and handling-phase heartbeats are canceled immediately. `Run` still joins workers and bounded terminal confirmation. An auto-renewing delivery that has entered settlement keeps its heartbeat within that confirmation budget. Cancellation offers no handler grace period. |
 | Handler, error callback, or custom transport ignores cancellation | Shutdown can remain blocked while joining that work. Context cancellation is cooperative; it is not a goroutine kill or a hard return deadline. |
 | Application calls a Close method | `Receiver.Close` is a no-op; `Client.Close` releases only SDK-owned idle HTTP connections. Neither cancels an active Run. `Embedded.Close` joins admitted database work, not application handlers. Cancel and join the Receiver before closing its client or engine. |
 | Consumer is killed, SIGSTOPped, or container-paused while the broker stays available | A killed process cannot settle; a paused process cannot renew. Expired leases follow the ordinary redelivery/DLQ rule. A resumed handler may already have made an external change even though its old token is fenced. |
 | Broker is killed | There is no HTTP drain or cleanup guarantee. Local transactions recover atomically; default startup preserves still-valid leases. If the response is lost around a commit, the caller must reconcile the result (for example through the exact-request receipt); process death alone does not prove rollback. `:memory:` loses all state when its process exits. |
 | Screen turns off or locks; machine sleeps, freezes, or loses power | Turning off or locking the screen alone does not signal a process or cancel its contexts; the OS may separately suspend the host. During host sleep or failure, do not assume continued serving, renewal, or cleanup; broker-clock deadlines may be past on resumption. SIGSTOP, container pause/restart, and SIGKILL are process fault models, not proofs of host-sleep or power-loss behavior. |
+
+After a handler returns, `nil` requests Complete and a non-nil result requests
+Abandon. A confirmed handling-phase lease failure still skips new settlement.
+Otherwise one shared 30-second confirmation budget starts when the handler returns.
+Normal handoff lets the last in-flight renewal finish under its original watchdog
+and Run context, then joins it before settlement. Run cancellation, budget expiry
+and abnormal exits still cancel and join it. Each settlement request gets at most
+fifteen seconds. With auto-renew enabled, its heartbeat shares that bounded
+context until confirmation finishes, including if Run is canceled during this
+phase. The Receiver then cancels and joins the heartbeat before releasing the
+delivery's total-inflight slot. A lease-loss response after this delivery's own
+settlement does not turn a confirmed result into an error; an unknown settlement
+result remains unknown.
 
 For a planned consumer stop, arrange application-level admission control and let
 work settle before canceling it, or use an explicit Receive loop whose lifecycle
