@@ -919,6 +919,13 @@ func (e *Engine) inTx(ctx context.Context, fn func(context.Context, *txn) error)
 	return err
 }
 
+func (e *Engine) inReadTx(ctx context.Context, fn func(context.Context, *txn) error) error {
+	ctx, a := startStorage(ctx, "transaction")
+	err := e.inTxMode(ctx, fn, true)
+	e.db.finishStorage(a, err)
+	return err
+}
+
 // mutateMessagesFresh rebuilds time-sensitive arguments inside every transaction
 // attempt. Remote retries may back off across an expiry boundary, so the fence
 // must use the clock observed by the attempt that can actually commit.

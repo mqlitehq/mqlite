@@ -117,17 +117,16 @@ a time — most systems fight that; mqlite **builds on it**:
   durability point; `FULL` is a knob (`MQLITE_SYNC`) when an fsync per commit is
   worth ~4–11× of your local throughput (on remote Turso it's a no-op — the
   server owns durability).
-- **Remote Turso/libSQL** relaxes the pool to 4 connections because the Turso
-  primary serializes writes server-side; it is also the only path that retries
-  transient errors — locally a failed statement never ran, so there is nothing
+- **Remote Turso/libSQL** keeps a four-connection pool for reads and admits
+  one mutation attempt before it acquires a connection. Renewal and settlement
+  work has bounded FIFO priority; other writes and maintenance also progress.
+  A permit lasts through commit or rollback and SQL-lease return, then is released
+  before retry backoff. This is also the only path that retries transient errors — locally a failed statement never ran, so there is nothing
   to retry. For HTTP Hrana (`libsql://`), one logical driver connection lasts for
   one `database/sql` lease (or one whole transaction) and is then discarded;
   Go's shared HTTP transport still reuses the underlying TCP/TLS connections.
   WebSocket transports retain their bounded connection pooling, and the local
   SQLite path is unchanged.
-
-The punchline: mqlite doesn't *implement* mutual exclusion between consumers —
-it **arranges to never need it**. Concurrency control by subtraction.
 
 ## 4 · Claiming: Peek-Lock is one atomic UPDATE
 

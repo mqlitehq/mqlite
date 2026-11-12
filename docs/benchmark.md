@@ -459,7 +459,7 @@ mqlite ships sensible defaults; most deployments change nothing. In rough order 
 | `wal_autocheckpoint` | 1000 pages (~4 MB) | matched the no-long-reader historical baseline; observation snapshots and other readers can cause a larger transient WAL. Raise only after measuring the checkpoint and recovery trade-off. |
 | `cache_size` | ~2 MB | the working set (queue heads + indexes) is small; raise only after profiling shows cache pressure under deep backlogs — it costs RAM on a 256 MB machine. |
 | `mmap_size` | off | `modernc.org/sqlite` is pure-Go; don't assume C-SQLite mmap gains — measure first. |
-| writer/provider pool | local writer 1 / remote provider 4 | **don't change** — the local writer pool stays at one for atomic claims; local files also have one read-only observation connection. The remote pool is scoped to one broker and Turso serializes commits. `libsql://` logical connections are single-lease while the shared HTTP transport retains TCP/TLS reuse; see [turso.md](turso.md). |
+| writer/provider pool | local writer 1 / remote provider 4 | **don't change** — the local writer pool stays at one for atomic claims; local files also have one read-only observation connection. One remote owner admits one write attempt at a time while the four-connection pool retains read capacity. `libsql://` logical connections are single-lease while the shared HTTP transport retains TCP/TLS reuse; see [turso.md](turso.md). |
 
 `busy_timeout=5000` and `temp_store=MEMORY` are set on local modernc SQLite
 connections. They do not apply to remote Turso/libSQL connections, whose transient

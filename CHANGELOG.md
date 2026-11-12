@@ -12,6 +12,24 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
+### Serialize remote write attempts and batch Send transport (MQLITE-175)
+
+- Queue remote mutations before acquiring a provider connection, retaining read
+  capacity and giving renewals and settlements bounded priority. Cancellation
+  and shutdown release queued work; an issued transaction keeps its permit until
+  its SQL lease returns. Retry backoff does not hold the permit. Local storage
+  and the four-connection remote pool limit are unchanged. Remote `Tx` callbacks
+  hold admission until their attempt finishes; use the supplied transaction for
+  business writes and enqueueing, and finish the callback before waiting for
+  another mutation through the same owner.
+- Transport direct HTTP Hrana queue batches in bounded parameterized groups,
+  retaining input-to-sequence mapping, deduplication decisions and a single
+  transaction commit. A failure in any group rolls back the whole Send. Topic
+  fan-out and expiring subscriptions retain their existing fenced paths.
+- Ambiguous commit acknowledgements remain outcome-unknown. Write admission
+  cannot preempt a running transaction, so network latency and batch size still
+  need to fit the application's lease and request budgets.
+
 - Recognize pinned libSQL provider HTTP failures through single-cause driver
   wrappers, including newline-wrapped 502 responses. Reads and transactions that
   have not attempted COMMIT can retry transient provider statuses within the
