@@ -1,15 +1,5 @@
 package engine
 
-// Storage-layer tests — how the engine opens, guards, and persists its SQLite/
-// libSQL store, independent of queue semantics. Sections:
-//
-//   - Durability pragma   MQLITE_SYNC → PRAGMA synchronous
-//   - Schema version       refuse a DB stamped with an incompatible version
-//   - Single-writer lock   local file = one writer (ErrDBLocked); :memory: is private
-//   - Remote retry         which errors the Turso/libSQL path retries (and which it must not)
-//
-// The live remote round-trip lives in turso_test.go (creds-gated).
-
 import (
 	"bytes"
 	"context"
@@ -17,12 +7,16 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mqlitehq/mqlite/internal/authkey"
+	"github.com/mqlitehq/mqlite/internal/libsqlcompat"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,14 +26,13 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
-
-	"github.com/mqlitehq/mqlite/internal/authkey"
 )
 
 // netTimeout is a net.Error whose message contains none of isConnErr's substrings,
@@ -5190,4 +5183,1330 @@ func TestMessageMetadataTextRoundTrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPHranaEmptyAcknowledgementDoesNotPanic(t *testing.T) {
+	for _, body := range []string{`{}`, `{"results":[]}`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				_, _ = io.Copy(io.Discard, r.Body)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			conn, err := libsqlcompat.OpenHTTP("libsql://" + strings.TrimPrefix(server.URL, "http://") + "?tls=0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			defer func() {
+				if value := recover(); value != nil {
+					t.Fatalf("empty HTTP 200 acknowledgement panicked: %v", value)
+				}
+			}()
+			_, err = conn.(driver.QueryerContext).QueryContext(context.Background(), "SELECT 1", nil)
+			if err == nil {
+				t.Fatal("empty HTTP 200 acknowledgement was accepted")
+			}
+		})
+	}
+}
+
+func TestHTTPHranaCommittedMalformedAcknowledgementIsUnknown(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"malformed-json", `{`},
+		{"empty-results", `{"results":[]}`},
+		{"missing-statement", `{"results":[{"type":"ok","response":{"type":"execute","result":{}}}]}`},
+		{"wrong-response-type", `{"results":[{"type":"ok","response":{"type":"close"}}]}`},
+		{"negative-count", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":-1}}}]}`},
+		{"null-row", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[null],"affected_row_count":0}}}]}`},
+		{"null-with-payload", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[{"name":"v"}],"rows":[[{"type":"null","value":"forged payload"}]],"affected_row_count":0}}}]}`},
+		{"invalid-last-insert-id", `{"results":[{"type":"ok","response":{"type":"execute","result":{"cols":[],"rows":[],"affected_row_count":0,"last_insert_rowid":"invalid"}}}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testHTTPHranaCommittedInvalidAcknowledgement(t, tc.body)
+		})
+	}
+}
+
+func testHTTPHranaCommittedInvalidAcknowledgement(t *testing.T, acknowledgement string) {
+	t.Helper()
+	f := newSQLiteHranaFixture(t)
+	var armed atomic.Bool
+	var changed atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if err != nil {
+			http.Error(w, "fixture request read failed", http.StatusBadRequest)
+			return
+		}
+		var pipeline struct {
+			Requests []sqliteHranaRequest `json:"requests"`
+		}
+		if err := json.Unmarshal(body, &pipeline); err != nil {
+			http.Error(w, "fixture request decode failed", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		recorded := httptest.NewRecorder()
+		f.serveHTTP(recorded, r)
+		commit := len(pipeline.Requests) == 1 && pipeline.Requests[0].Type == "execute" &&
+			strings.EqualFold(strings.TrimSpace(pipeline.Requests[0].Stmt.SQL), "COMMIT")
+		if commit && armed.CompareAndSwap(true, false) {
+			changed.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, acknowledgement)
+			return
+		}
+		for key, values := range recorded.Header() {
+			w.Header()[key] = values
+		}
+		w.WriteHeader(recorded.Code)
+		_, _ = w.Write(recorded.Body.Bytes())
+	}))
+	defer proxy.Close()
+	f.dsn = "libsql://" + strings.TrimPrefix(proxy.URL, "http://") + "?tls=0"
+	e := f.openEngine(t, true)
+	ctx := context.Background()
+	if err := e.CreateQueue(ctx, "commit-ack", QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	before := f.snapshot()
+	armed.Store(true)
+	_, err := e.Send(ctx, "commit-ack", OutMessage{Body: []byte("once")})
+	var rows int
+	if readErr := f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE queue=?`, "commit-ack").Scan(&rows); readErr != nil {
+		t.Fatal(readErr)
+	}
+	after := f.snapshot()
+	if changed.Load() != 1 || rows != 1 || after.MessageInserts-before.MessageInserts != 1 || after.Commits-before.Commits != 1 {
+		t.Fatalf("committed acknowledgement control: changed=%d rows=%d inserts=%d commits=%d", changed.Load(), rows, after.MessageInserts-before.MessageInserts, after.Commits-before.Commits)
+	}
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("committed malformed acknowledgement = %v; want ErrOutcomeUnknown", err)
+	}
+}
+
+func TestHTTPHranaMalformedReadAcknowledgementIsNotUnknown(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{`)
+	}))
+	defer server.Close()
+	d, err := openDB(context.Background(), "libsql://"+strings.TrimPrefix(server.URL, "http://")+"?tls=0", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.close()
+	var value int64
+	err = d.queryRowScan(context.Background(), []any{&value}, "SELECT 1")
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) || !libsqlcompat.IsInvalidAcknowledgement(err) || calls.Load() != 1 {
+		t.Fatalf("read acknowledgement: error=%v calls=%d", err, calls.Load())
+	}
+}
+
+type hranaAcknowledgementTransport func(*http.Request) (*http.Response, error)
+
+func (f hranaAcknowledgementTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type hranaAcknowledgementReadFailure struct {
+	io.ReadCloser
+	err error
+}
+
+func (b hranaAcknowledgementReadFailure) Read([]byte) (int, error) { return 0, b.err }
+
+type hranaAcknowledgementCloseNotice struct {
+	io.ReadCloser
+	once *sync.Once
+	done chan struct{}
+}
+
+func (b hranaAcknowledgementCloseNotice) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(func() { close(b.done) })
+	return err
+}
+
+// Delegate the real HTTP request first. Only the response reader changes, after
+// SQLite has performed the selected operation and returned its HTTP headers.
+func failHTTPHranaAcknowledgementRead(t *testing.T, sql string, failure error) (*atomic.Int32, <-chan struct{}) {
+	t.Helper()
+	previous := http.DefaultClient
+	client := *previous
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	var changed atomic.Int32
+	var closed sync.Once
+	cleanupClosed := make(chan struct{})
+	client.Transport = hranaAcknowledgementTransport(func(request *http.Request) (*http.Response, error) {
+		response, err := base.RoundTrip(request)
+		if err != nil || request.GetBody == nil {
+			return response, err
+		}
+		body, err := request.GetBody()
+		if err != nil {
+			_ = response.Body.Close()
+			return nil, fmt.Errorf("test fixture could not inspect the request body: %w", err)
+		}
+		var pipeline struct {
+			Requests []sqliteHranaRequest `json:"requests"`
+		}
+		decodeErr := json.NewDecoder(body).Decode(&pipeline)
+		_ = body.Close()
+		if decodeErr == nil && len(pipeline.Requests) == 1 && pipeline.Requests[0].Type == "close" {
+			response.Body = hranaAcknowledgementCloseNotice{ReadCloser: response.Body, once: &closed, done: cleanupClosed}
+		}
+		matches := decodeErr == nil && len(pipeline.Requests) == 1 && pipeline.Requests[0].Type == "execute" &&
+			strings.EqualFold(strings.TrimSpace(pipeline.Requests[0].Stmt.SQL), sql)
+		if matches && changed.CompareAndSwap(0, 1) {
+			response.Body = hranaAcknowledgementReadFailure{ReadCloser: response.Body, err: failure}
+		}
+		return response, nil
+	})
+	http.DefaultClient = &client
+	t.Cleanup(func() { http.DefaultClient = previous })
+	return &changed, cleanupClosed
+}
+
+func TestHTTPHranaCommittedBodyReadFailureIsUnknown(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	e := f.openEngine(t, true)
+	ctx := context.Background()
+	if err := e.CreateQueue(ctx, "commit-read-ack", QueueConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	before := f.snapshot()
+	changed, cleanupClosed := failHTTPHranaAcknowledgementRead(t, "COMMIT", errors.New("fixture acknowledgement reader failed"))
+	_, err := e.Send(ctx, "commit-read-ack", OutMessage{Body: []byte("once")})
+	// The lost COMMIT baton is cleaned asynchronously. Before restoring the
+	// process HTTP client, observe that worker's delegated response close.
+	select {
+	case <-cleanupClosed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("detached cleanup did not finish its HTTP response")
+	}
+	var rows int
+	if readErr := f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE queue=?`, "commit-read-ack").Scan(&rows); readErr != nil {
+		t.Fatal(readErr)
+	}
+	after := f.snapshot()
+	if changed.Load() != 1 || rows != 1 || after.MessageInserts-before.MessageInserts != 1 || after.Commits-before.Commits != 1 {
+		t.Fatalf("committed reader failure control: changed=%d rows=%d inserts=%d commits=%d", changed.Load(), rows, after.MessageInserts-before.MessageInserts, after.Commits-before.Commits)
+	}
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("committed body read failure = %v; want ErrOutcomeUnknown", err)
+	}
+}
+
+func TestHTTPHranaReadBodyFailurePreservesRetryClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, sql string
+		failure   error
+		retry     bool
+	}{
+		{"network", "SELECT 42", io.ErrUnexpectedEOF, true},
+		{"other", "SELECT 43", errors.New("fixture acknowledgement reader failed"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			e := f.openEngine(t, true)
+			changed, _ := failHTTPHranaAcknowledgementRead(t, tc.sql, tc.failure)
+			before := f.snapshot()
+			var value int64
+			err := e.db.queryRowScan(context.Background(), []any{&value}, tc.sql)
+			attempts := f.snapshot().Requests - before.Requests
+			if tc.retry {
+				if err != nil || value != 42 || attempts != 2 {
+					t.Fatalf("read network retry: error=%v value=%d attempts=%d", err, value, attempts)
+				}
+			} else if err == nil || !libsqlcompat.IsIncompleteAcknowledgement(err) || attempts != 1 {
+				t.Fatalf("read non-network failure: error=%v attempts=%d", err, attempts)
+			}
+			if changed.Load() != 1 || errors.Is(err, ErrOutcomeUnknown) {
+				t.Fatalf("read response classification: error=%v changed=%d", err, changed.Load())
+			}
+		})
+	}
+}
+
+func TestHTTPHranaPreResponseFailureKeepsIdentity(t *testing.T) {
+	failure := errors.New("fixture transport did not receive response headers")
+	previous := http.DefaultClient
+	client := *previous
+	var calls atomic.Int32
+	client.Transport = hranaAcknowledgementTransport(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, failure
+	})
+	http.DefaultClient = &client
+	t.Cleanup(func() { http.DefaultClient = previous })
+	conn, err := libsqlcompat.OpenHTTP("libsql://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, err = conn.(driver.QueryerContext).QueryContext(context.Background(), "SELECT 1", nil)
+	if !errors.Is(err, failure) || libsqlcompat.IsInvalidAcknowledgement(err) || calls.Load() != 1 {
+		t.Fatalf("pre-response failure: error=%v calls=%d", err, calls.Load())
+	}
+}
+
+func TestHTTPHranaIssuedRenewalMalformedAcknowledgementIsUnknown(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(map[bool]string{false: "renew", true: "renew-batch"}[batch], func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			var armed atomic.Bool
+			var changed atomic.Int32
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				_ = r.Body.Close()
+				if err != nil {
+					http.Error(w, "fixture request read failed", http.StatusBadRequest)
+					return
+				}
+				var pipeline struct {
+					Requests []sqliteHranaRequest `json:"requests"`
+				}
+				if err := json.Unmarshal(body, &pipeline); err != nil {
+					http.Error(w, "fixture request decode failed", http.StatusBadRequest)
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				recorded := httptest.NewRecorder()
+				f.serveHTTP(recorded, r)
+				renewal := len(pipeline.Requests) == 1 && pipeline.Requests[0].Type == "execute" &&
+					strings.HasPrefix(strings.ToUpper(strings.Join(strings.Fields(pipeline.Requests[0].Stmt.SQL), " ")), "UPDATE MESSAGES SET LOCKED_UNTIL=MAX")
+				if renewal && armed.CompareAndSwap(true, false) {
+					changed.Add(1)
+					_, _ = io.WriteString(w, `{`)
+					return
+				}
+				w.WriteHeader(recorded.Code)
+				_, _ = w.Write(recorded.Body.Bytes())
+			}))
+			defer proxy.Close()
+			f.dsn = "libsql://" + strings.TrimPrefix(proxy.URL, "http://") + "?tls=0"
+			e := f.openEngine(t, true)
+			ctx := context.Background()
+			if err := e.CreateQueue(ctx, "renew-ack", QueueConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.SendOne(ctx, "renew-ack", OutMessage{Body: []byte("once")}); err != nil {
+				t.Fatal(err)
+			}
+			messages, err := e.Receive(ctx, "renew-ack", ReceiveOptions{})
+			if err != nil || len(messages) != 1 {
+				t.Fatalf("receive: %v", err)
+			}
+			message := messages[0]
+			now := time.Now().Add(time.Second).UnixMilli()
+			e.now = func() int64 { return now }
+			armed.Store(true)
+			if batch {
+				_, err = e.RenewBatch(ctx, "renew-ack", []SettleItem{{SeqNumber: message.SeqNumber, LockToken: message.LockToken}})
+			} else {
+				err = e.Renew(ctx, "renew-ack", message.SeqNumber, message.LockToken)
+			}
+			var deadline int64
+			if readErr := f.db.QueryRowContext(ctx, `SELECT locked_until FROM messages WHERE id=?`, message.SeqNumber).Scan(&deadline); readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !errors.Is(err, ErrOutcomeUnknown) || changed.Load() != 1 || deadline <= message.LockedUntilMs {
+				t.Fatalf("renewal acknowledgement: error=%v changed=%d deadline=%d original=%d", err, changed.Load(), deadline, message.LockedUntilMs)
+			}
+		})
+	}
+}
+
+// sqliteHranaFixture exercises the pinned HTTP driver against real SQLite SQL.
+// It is a finite loopback protocol fixture, not a model of Turso scheduling,
+// replication, durability or capacity. No credentials or external hosts are used.
+type sqliteHranaFixture struct {
+	db           *sql.DB
+	server       *httptest.Server
+	dsn          string
+	delay        atomic.Int64
+	failInsert   atomic.Bool
+	truncateText atomic.Bool
+	mu           sync.Mutex
+	next         int
+	sessions     map[string]*sqliteHranaSession
+	stats        sqliteHranaStats
+	insertHook   func()
+}
+
+type sqliteHranaSession struct {
+	mu   sync.Mutex
+	conn *sql.Conn
+	inTx bool
+}
+
+type sqliteHranaStats struct {
+	Requests, Statements, Begins, Commits, Rollbacks, MessageInserts, Batches, Busy int
+}
+
+type sqliteHranaValue struct {
+	Type   string  `json:"type"`
+	Value  any     `json:"value,omitempty"`
+	Base64 *string `json:"base64,omitempty"`
+}
+
+type sqliteHranaStatement struct {
+	SQL       string             `json:"sql"`
+	Args      []sqliteHranaValue `json:"args"`
+	NamedArgs []struct {
+		Name  string           `json:"name"`
+		Value sqliteHranaValue `json:"value"`
+	} `json:"named_args"`
+	WantRows bool `json:"want_rows"`
+}
+
+type sqliteHranaCondition struct {
+	Type  string                 `json:"type"`
+	Step  int                    `json:"step"`
+	Cond  *sqliteHranaCondition  `json:"cond"`
+	Conds []sqliteHranaCondition `json:"conds"`
+}
+
+type sqliteHranaRequest struct {
+	Type  string               `json:"type"`
+	Stmt  sqliteHranaStatement `json:"stmt"`
+	Batch struct {
+		Steps []struct {
+			Stmt      sqliteHranaStatement  `json:"stmt"`
+			Condition *sqliteHranaCondition `json:"condition"`
+		} `json:"steps"`
+	} `json:"batch"`
+}
+
+func newSQLiteHranaFixture(t *testing.T) *sqliteHranaFixture {
+	t.Helper()
+	path := filepath.ToSlash(filepath.Join(t.TempDir(), "provider.db"))
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(16)
+	if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	f := &sqliteHranaFixture{db: db, sessions: make(map[string]*sqliteHranaSession)}
+	f.server = httptest.NewServer(http.HandlerFunc(f.serveHTTP))
+	f.dsn = "libsql://" + strings.TrimPrefix(f.server.URL, "http://") + "?tls=0"
+	t.Cleanup(func() {
+		f.server.Close()
+		f.mu.Lock()
+		sessions := f.sessions
+		f.sessions = make(map[string]*sqliteHranaSession)
+		f.mu.Unlock()
+		for _, session := range sessions {
+			session.mu.Lock()
+			if session.inTx {
+				_, _ = session.conn.ExecContext(context.Background(), "ROLLBACK")
+			}
+			_ = session.conn.Close()
+			session.mu.Unlock()
+		}
+		_ = db.Close()
+	})
+	return f
+}
+
+func (f *sqliteHranaFixture) openEngine(t *testing.T, disableBackground bool) *Engine {
+	t.Helper()
+	e, err := Open(context.Background(), Options{DB: f.dsn, DisableBackground: disableBackground,
+		PreserveUnexpiredLeases: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return e
+}
+
+type sqliteHranaBusyFailure struct{}
+
+func (sqliteHranaBusyFailure) Error() string { return "database is locked (5)" }
+func (sqliteHranaBusyFailure) Code() int     { return 5 }
+
+func (f *sqliteHranaFixture) snapshot() sqliteHranaStats {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stats
+}
+
+func (f *sqliteHranaFixture) session(baton string) (string, *sqliteHranaSession, error) {
+	f.mu.Lock()
+	if baton != "" {
+		session := f.sessions[baton]
+		f.mu.Unlock()
+		if session == nil {
+			return "", nil, errors.New("unknown loopback session")
+		}
+		return baton, session, nil
+	}
+	f.next++
+	baton = "fixture-" + strconv.Itoa(f.next)
+	f.mu.Unlock()
+	conn, err := f.db.Conn(context.Background())
+	if err != nil {
+		return "", nil, err
+	}
+	session := &sqliteHranaSession{conn: conn}
+	f.mu.Lock()
+	f.sessions[baton] = session
+	f.mu.Unlock()
+	return baton, session, nil
+}
+
+func (f *sqliteHranaFixture) retire(baton string, session *sqliteHranaSession) {
+	f.mu.Lock()
+	delete(f.sessions, baton)
+	f.mu.Unlock()
+	if session.inTx {
+		_, _ = session.conn.ExecContext(context.Background(), "ROLLBACK")
+		session.inTx = false
+	}
+	_ = session.conn.Close()
+}
+
+func (f *sqliteHranaFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	if r.Method != http.MethodPost || r.URL.Path != "/v2/pipeline" {
+		http.NotFound(w, r)
+		return
+	}
+	var pipeline struct {
+		Baton    string               `json:"baton"`
+		Requests []sqliteHranaRequest `json:"requests"`
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&pipeline) != nil || len(pipeline.Requests) == 0 {
+		http.Error(w, "invalid loopback protocol request", http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	f.stats.Requests++
+	f.mu.Unlock()
+	if delay := time.Duration(f.delay.Load()); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	baton, session, err := f.session(pipeline.Baton)
+	if err != nil {
+		http.Error(w, "invalid loopback session", http.StatusBadRequest)
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	results := make([]any, 0, len(pipeline.Requests))
+	closed := false
+	for _, request := range pipeline.Requests {
+		switch request.Type {
+		case "close":
+			f.retire(baton, session)
+			closed = true
+			results = append(results, map[string]any{"type": "ok", "response": map[string]any{"type": "close"}})
+		case "execute":
+			result, err := f.execute(session, request.Stmt)
+			if err != nil {
+				results = append(results, map[string]any{"type": "error", "error": f.protocolError(err)})
+			} else {
+				results = append(results, map[string]any{"type": "ok", "response": map[string]any{"type": "execute", "result": result}})
+			}
+		case "batch":
+			f.mu.Lock()
+			f.stats.Batches++
+			f.mu.Unlock()
+			stepResults := make([]any, len(request.Batch.Steps))
+			stepErrors := make([]any, len(request.Batch.Steps))
+			for i, step := range request.Batch.Steps {
+				if !sqliteHranaConditionOK(step.Condition, stepResults, stepErrors) {
+					continue
+				}
+				result, err := f.execute(session, step.Stmt)
+				if err != nil {
+					stepErrors[i] = f.protocolError(err)
+				} else {
+					stepResults[i] = result
+				}
+			}
+			results = append(results, map[string]any{"type": "ok", "response": map[string]any{"type": "batch", "result": map[string]any{"step_results": stepResults, "step_errors": stepErrors}}})
+		default:
+			results = append(results, map[string]any{"type": "error", "error": map[string]any{"message": "unsupported loopback request", "code": "SQLITE_ERROR"}})
+		}
+	}
+	if !closed && !session.inTx {
+		f.retire(baton, session)
+		closed = true
+	}
+	var responseBaton any
+	if !closed {
+		responseBaton = baton
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"baton": responseBaton, "base_url": nil, "results": results})
+}
+
+func sqliteHranaConditionOK(condition *sqliteHranaCondition, results, failures []any) bool {
+	if condition == nil {
+		return true
+	}
+	switch condition.Type {
+	case "ok":
+		return condition.Step >= 0 && condition.Step < len(results) && results[condition.Step] != nil
+	case "error":
+		return condition.Step >= 0 && condition.Step < len(failures) && failures[condition.Step] != nil
+	case "not":
+		return !sqliteHranaConditionOK(condition.Cond, results, failures)
+	case "and":
+		for i := range condition.Conds {
+			if !sqliteHranaConditionOK(&condition.Conds[i], results, failures) {
+				return false
+			}
+		}
+		return true
+	case "or":
+		for i := range condition.Conds {
+			if sqliteHranaConditionOK(&condition.Conds[i], results, failures) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func (f *sqliteHranaFixture) protocolError(err error) map[string]any {
+	code := "SQLITE_ERROR"
+	var coded interface{ Code() int }
+	if errors.As(err, &coded) {
+		switch coded.Code() & 255 {
+		case 5:
+			code = "SQLITE_BUSY"
+		case 19:
+			code = "SQLITE_CONSTRAINT"
+		}
+	}
+	if code == "SQLITE_BUSY" {
+		f.mu.Lock()
+		f.stats.Busy++
+		f.mu.Unlock()
+	}
+	// SQLite messages here refer only to synthetic local test data.
+	return map[string]any{"message": err.Error(), "code": code}
+}
+
+func (f *sqliteHranaFixture) execute(session *sqliteHranaSession, statement sqliteHranaStatement) (map[string]any, error) {
+	args := make([]any, 0, len(statement.Args)+len(statement.NamedArgs))
+	for _, value := range statement.Args {
+		arg, err := sqliteHranaDecode(value)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+	}
+	for _, value := range statement.NamedArgs {
+		arg, err := sqliteHranaDecode(value.Value)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, sql.Named(value.Name, arg))
+	}
+	normalized := strings.ToUpper(strings.Join(strings.Fields(statement.SQL), " "))
+	f.mu.Lock()
+	f.stats.Statements++
+	if normalized == "BEGIN" {
+		f.stats.Begins++
+	}
+	if normalized == "COMMIT" {
+		f.stats.Commits++
+	}
+	if normalized == "ROLLBACK" {
+		f.stats.Rollbacks++
+	}
+	if strings.HasPrefix(normalized, "INSERT INTO MESSAGES ") {
+		f.stats.MessageInserts++
+	}
+	hook := f.insertHook
+	f.mu.Unlock()
+	isMessageInsert := strings.HasPrefix(normalized, "INSERT INTO MESSAGES ")
+	if isMessageInsert && f.failInsert.CompareAndSwap(true, false) {
+		return nil, sqliteHranaBusyFailure{}
+	}
+	var columns []map[string]any
+	values := make([][]sqliteHranaValue, 0)
+	var affected int64
+	var lastID int64
+	if statement.WantRows {
+		rows, err := session.conn.QueryContext(context.Background(), statement.SQL, args...)
+		if err != nil {
+			return nil, err
+		}
+		names, err := rows.Columns()
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		for _, name := range names {
+			columns = append(columns, map[string]any{"name": name, "decltype": nil})
+		}
+		for rows.Next() {
+			row := make([]any, len(names))
+			destinations := make([]any, len(names))
+			for i := range row {
+				destinations[i] = &row[i]
+			}
+			if err := rows.Scan(destinations...); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			encoded := make([]sqliteHranaValue, len(row))
+			for i, value := range row {
+				// Model a provider that truncates ordinary TEXT results at NUL.
+				// BLOB results retain their independent base64 transport.
+				if text, ok := value.(string); ok && f.truncateText.Load() {
+					if before, _, found := strings.Cut(text, "\x00"); found {
+						value = before
+					}
+				}
+				encoded[i], err = sqliteHranaEncode(value)
+				if err != nil {
+					_ = rows.Close()
+					return nil, err
+				}
+			}
+			values = append(values, encoded)
+		}
+		err = rows.Err()
+		closeErr := rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+	} else {
+		result, err := session.conn.ExecContext(context.Background(), statement.SQL, args...)
+		if err != nil {
+			return nil, err
+		}
+		affected, _ = result.RowsAffected()
+		lastID, _ = result.LastInsertId()
+	}
+	if normalized == "BEGIN" {
+		session.inTx = true
+	}
+	if normalized == "COMMIT" || normalized == "ROLLBACK" {
+		session.inTx = false
+	}
+	if isMessageInsert && hook != nil {
+		hook()
+	}
+	if columns == nil {
+		columns = make([]map[string]any, 0)
+	}
+	return map[string]any{"cols": columns, "rows": values, "affected_row_count": affected, "last_insert_rowid": strconv.FormatInt(lastID, 10)}, nil
+}
+
+func sqliteHranaDecode(value sqliteHranaValue) (any, error) {
+	switch value.Type {
+	case "null":
+		return nil, nil
+	case "text":
+		return value.Value, nil
+	case "integer":
+		s, ok := value.Value.(string)
+		if !ok {
+			return nil, errors.New("invalid integer fixture value")
+		}
+		return strconv.ParseInt(s, 10, 64)
+	case "float":
+		return value.Value, nil
+	case "blob":
+		if value.Base64 == nil {
+			return nil, errors.New("missing fixture blob data")
+		}
+		return base64.RawStdEncoding.DecodeString(*value.Base64)
+	default:
+		return nil, fmt.Errorf("unsupported fixture value type %q", value.Type)
+	}
+}
+
+func sqliteHranaEncode(value any) (sqliteHranaValue, error) {
+	switch v := value.(type) {
+	case nil:
+		return sqliteHranaValue{Type: "null"}, nil
+	case int64:
+		return sqliteHranaValue{Type: "integer", Value: strconv.FormatInt(v, 10)}, nil
+	case float64:
+		return sqliteHranaValue{Type: "float", Value: v}, nil
+	case string:
+		return sqliteHranaValue{Type: "text", Value: v}, nil
+	case []byte:
+		encoded := base64.RawStdEncoding.EncodeToString(v)
+		return sqliteHranaValue{Type: "blob", Base64: &encoded}, nil
+	default:
+		return sqliteHranaValue{}, fmt.Errorf("unsupported SQLite fixture value type %T", value)
+	}
+}
+
+func TestProviderIssuedWriteKeepsOneDurableEffect(t *testing.T) {
+	for _, operation := range []string{"commit", "exec", "exec-fresh", "renew-returning"} {
+		for _, body := range []string{"", `{"error":"SQLITE_BUSY database is locked"}`, `{"error":{},"code":"SQLITE_BUSY","message":"database is locked"}`, `{"error":{},"code":"STREAM_EXPIRED","message":"database is locked"}`, `{"error":{},"message":"database is locked"}`, `{"error":{},"message":"gateway overload without SQL evidence"}`} {
+			t.Run(fmt.Sprintf("%s/%d", operation, len(body)), func(t *testing.T) {
+				f := newSQLiteHranaFixture(t)
+				var armed atomic.Bool
+				var injected, dispatches atomic.Int32
+				proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					raw, er := io.ReadAll(r.Body)
+					_ = r.Body.Close()
+					if er != nil {
+						t.Error(er)
+						return
+					}
+					var p struct {
+						Requests []sqliteHranaRequest `json:"requests"`
+					}
+					if er = json.Unmarshal(raw, &p); er != nil {
+						t.Error(er)
+						return
+					}
+					target := false
+					for _, q := range p.Requests {
+						text := strings.ToUpper(strings.TrimSpace(q.Stmt.SQL))
+						switch operation {
+						case "commit":
+							target = target || text == "COMMIT"
+						case "renew-returning":
+							target = target || (strings.HasPrefix(text, "UPDATE MESSAGES") && strings.Contains(text, "RETURNING"))
+						default:
+							target = target || strings.HasPrefix(text, "UPDATE APP_COUNTER")
+						}
+					}
+					if target {
+						dispatches.Add(1)
+					}
+					r.Body = io.NopCloser(bytes.NewReader(raw))
+					rr := httptest.NewRecorder()
+					f.serveHTTP(rr, r)
+					if target && armed.CompareAndSwap(true, false) {
+						injected.Add(1)
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(503)
+						_, _ = io.WriteString(w, body)
+						return
+					}
+					for k, v := range rr.Header() {
+						w.Header()[k] = v
+					}
+					w.WriteHeader(rr.Code)
+					_, _ = w.Write(rr.Body.Bytes())
+				}))
+				defer proxy.Close()
+				f.dsn = "libsql://" + strings.TrimPrefix(proxy.URL, "http://") + "?tls=0"
+				e := f.openEngine(t, true)
+				ctx := context.Background()
+				if _, er := f.db.Exec("CREATE TABLE app_counter(value INTEGER NOT NULL)"); er != nil {
+					t.Fatal(er)
+				}
+				if _, er := f.db.Exec("INSERT INTO app_counter VALUES(0)"); er != nil {
+					t.Fatal(er)
+				}
+				var message *Message
+				if operation == "renew-returning" {
+					if er := e.CreateQueue(ctx, "renew-proof", QueueConfig{}); er != nil {
+						t.Fatal(er)
+					}
+					if _, er := e.Send(ctx, "renew-proof", OutMessage{Body: []byte("one")}); er != nil {
+						t.Fatal(er)
+					}
+					ms, er := e.Receive(ctx, "renew-proof", ReceiveOptions{MaxMessages: 1})
+					if er != nil || len(ms) != 1 {
+						t.Fatalf("receive=%v err=%v", ms, er)
+					}
+					message = ms[0]
+				}
+				beforeStats := f.snapshot()
+				dispatches.Store(0)
+				callbacks := 0
+				if body != "" {
+					armed.Store(true)
+				}
+				var er error
+				switch operation {
+				case "commit":
+					er = e.Tx(ctx, func(tx *EngineTx) error {
+						callbacks++
+						_, x := tx.SQL().ExecContext(tx.Context(), "UPDATE app_counter SET value=value+1")
+						return x
+					})
+				case "exec":
+					callbacks++
+					_, er = e.db.exec(ctx, "UPDATE app_counter SET value=value+1")
+				case "exec-fresh":
+					_, er = e.db.execFresh(ctx, "UPDATE app_counter SET value=value+1", func() []any { callbacks++; return nil })
+				case "renew-returning":
+					callbacks++
+					_, er = e.RenewBatch(ctx, "renew-proof", []SettleItem{{SeqNumber: message.SeqNumber, LockToken: message.LockToken}})
+				}
+				var effects int
+				if x := f.db.QueryRow("SELECT value FROM app_counter").Scan(&effects); x != nil {
+					t.Fatal(x)
+				}
+				if operation == "commit" && f.snapshot().Commits-beforeStats.Commits != 1 {
+					t.Errorf("COMMIT count=%d, want exactly one", f.snapshot().Commits-beforeStats.Commits)
+				}
+				wantEffects := 1
+				if operation == "renew-returning" {
+					wantEffects = 0
+				}
+				if effects != wantEffects || dispatches.Load() != 1 || callbacks != 1 {
+					t.Errorf("durable boundary: operation=%s callbacks=%d dispatches=%d effects=%d", operation, callbacks, dispatches.Load(), effects)
+				}
+				if body == "" {
+					if er != nil || injected.Load() != 0 {
+						t.Fatalf("healthy control err=%v injected=%d", er, injected.Load())
+					}
+				} else if !errors.Is(er, ErrOutcomeUnknown) || errors.Is(er, driver.ErrBadConn) || injected.Load() != 1 {
+					t.Fatalf("issued write acknowledgement err=%v injected=%d; want Unknown without safe retry", er, injected.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestProviderHTTPStatusRequiresOneExactLeaf(t *testing.T) {
+	leaf := errors.New("error code 502: upstream forward failed")
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"leaf", leaf, 502},
+		{"driver newline", fmt.Errorf("failed to execute SQL: UPDATE example\n%w", leaf), 502},
+		{"SQL text only", errors.New("failed to execute SQL: SELECT 'error code 503: private SQL'"), 0},
+		{"outer text only", fmt.Errorf("error code 503: %w", errors.New("logical SQL error")), 0},
+		{"non-three-digit", errors.New("error code 5020: unrelated"), 0},
+		{"joined", errors.Join(leaf, errors.New("another failure")), 0},
+		{"joined singleton", errors.Join(leaf), 0},
+		{"network wrapper", &net.OpError{Op: "read", Net: "tcp", Err: leaf}, 0},
+		{"URL wrapper", &url.Error{Op: "Post", Err: leaf}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := remoteProviderHTTPStatus(tc.err); got != tc.status {
+				t.Fatalf("status=%d, want %d", got, tc.status)
+			}
+			if (&db{remote: true}).retryableWrite(tc.err) {
+				t.Fatal("HTTP/ambiguous explanation became safe write replay")
+			}
+		})
+	}
+	for _, status := range []int{408, 429, 499, 500, 502, 503, 599} {
+		err := fmt.Errorf("failed to execute SQL:\n%w", fmt.Errorf("error code %d: SQLITE_BUSY no such table EOF", status))
+		if !(&db{remote: true}).retryable(err) || (&db{remote: true}).retryableWrite(err) || isBusyErr(err) || storageErrorCode(err) != "connection" {
+			t.Fatalf("HTTP %d body overrode retry boundaries", status)
+		}
+	}
+	for _, status := range []int{400, 401, 403, 404, 409, 422} {
+		err := fmt.Errorf("failed to execute SQL:\n%w", fmt.Errorf("error code %d: SQLITE_BUSY EOF", status))
+		if (&db{remote: true}).retryable(err) || (&db{remote: true}).retryableWrite(err) || isConnErr(err) || isBusyErr(err) {
+			t.Fatalf("nontransient HTTP %d was retried", status)
+		}
+	}
+	unknown := unknownRemoteWrite(leaf)
+	if !errors.Is(unknown, ErrOutcomeUnknown) || !errors.Is(unknown, leaf) || (&db{remote: true}).retryable(unknown) || (&db{remote: true}).retryableWrite(unknown) {
+		t.Fatal("unknown outcome lost its cause or became replayable")
+	}
+	var statusError interface{ HTTPStatus() int }
+	if !errors.As(unknown, &statusError) || statusError.HTTPStatus() != 502 {
+		t.Fatal("unknown outcome lost provider HTTP status")
+	}
+	detail := describeError(fmt.Errorf("failed to execute SQL:\n%w", leaf), 1)
+	if detail.HTTPStatus != 502 || detail.Category != "provider_unavailable" || strings.Contains(detail.Message, "upstream") {
+		t.Fatalf("provider failure diagnostics=%+v", detail)
+	}
+	detail = describeError(unknown, 1)
+	if detail.HTTPStatus != 502 || detail.Category != "outcome_unknown" {
+		t.Fatalf("unknown provider diagnostics=%+v", detail)
+	}
+}
+
+func TestQueryFreshWriteScanAndWaitingBoundaries(t *testing.T) {
+	for _, stage := range []string{"write-scan", "write-rows", "read-scan"} {
+		t.Run(stage, func(t *testing.T) {
+			d, state := remoteDBFailingFirst(t, 0)
+			calls := 0
+			scan := func(*sql.Rows) error {
+				calls++
+				if calls == 1 {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
+			}
+			var err error
+			if stage == "read-scan" {
+				err = d.queryFresh(context.Background(), "SELECT value", func() []any { return nil }, scan)
+			} else {
+				if stage == "write-rows" {
+					state.queryResultRows = terminalErrorRows{err: io.ErrUnexpectedEOF}
+					scan = func(rows *sql.Rows) error {
+						calls++
+						for rows.Next() {
+						}
+						return nil
+					}
+				}
+				err = d.queryFreshWrite(context.Background(), "UPDATE t SET x=? RETURNING x", func() []any { return []any{1} }, scan)
+			}
+			if stage == "read-scan" {
+				if err != nil || calls != 2 || len(state.args) != 2 {
+					t.Fatalf("read calls=%d queries=%d err=%v", calls, len(state.args), err)
+				}
+			} else if !errors.Is(err, ErrOutcomeUnknown) || calls != 1 || len(state.args) != 1 {
+				t.Fatalf("write calls=%d queries=%d err=%v", calls, len(state.args), err)
+			}
+		})
+	}
+	d, state := remoteDBFailingFirst(t, 0)
+	d.sql.SetMaxOpenConns(1)
+	held, err := d.sql.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	built := false
+	err = d.queryFreshWrite(ctx, "UPDATE t SET x=? RETURNING x", func() []any { built = true; return nil }, func(*sql.Rows) error { t.Fatal("scan ran while waiting for a pool lease"); return nil })
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) || built || len(state.args) != 0 {
+		t.Fatalf("pre-dispatch err=%v built=%t queries=%d", err, built, len(state.args))
+	}
+}
+
+// Cancel only after the provider actually executed the selected write. A caller
+// cancellation at the pool/admission boundary is covered independently.
+func TestProviderAppliedWriteCancellationIsUnknown(t *testing.T) {
+	for _, operation := range []string{"exec", "exec-fresh", "renew-returning"} {
+		t.Run(operation, func(t *testing.T) {
+			f := newSQLiteHranaFixture(t)
+			var armed atomic.Bool
+			var dispatches atomic.Int32
+			applied := make(chan struct{})
+			release := make(chan struct{})
+			defer close(release)
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, er := io.ReadAll(r.Body)
+				_ = r.Body.Close()
+				if er != nil {
+					return
+				}
+				var p struct {
+					Requests []sqliteHranaRequest `json:"requests"`
+				}
+				if json.Unmarshal(raw, &p) != nil {
+					return
+				}
+				target := false
+				for _, q := range p.Requests {
+					text := strings.ToUpper(strings.TrimSpace(q.Stmt.SQL))
+					if operation == "renew-returning" {
+						target = target || (strings.HasPrefix(text, "UPDATE MESSAGES") && strings.Contains(text, "RETURNING"))
+					} else {
+						target = target || strings.HasPrefix(text, "UPDATE APP_COUNTER")
+					}
+				}
+				if target {
+					dispatches.Add(1)
+				}
+				r.Body = io.NopCloser(bytes.NewReader(raw))
+				rr := httptest.NewRecorder()
+				f.serveHTTP(rr, r)
+				if target && armed.CompareAndSwap(true, false) {
+					close(applied)
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					case <-time.After(3 * time.Second):
+					}
+					return
+				}
+				for k, v := range rr.Header() {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(rr.Code)
+				_, _ = w.Write(rr.Body.Bytes())
+			}))
+			defer proxy.Close()
+			f.dsn = "libsql://" + strings.TrimPrefix(proxy.URL, "http://") + "?tls=0"
+			e := f.openEngine(t, true)
+			ctx := context.Background()
+			if _, er := f.db.Exec("CREATE TABLE app_counter(value INTEGER NOT NULL)"); er != nil {
+				t.Fatal(er)
+			}
+			if _, er := f.db.Exec("INSERT INTO app_counter VALUES(0)"); er != nil {
+				t.Fatal(er)
+			}
+			var message *Message
+			if operation == "renew-returning" {
+				if er := e.CreateQueue(ctx, "renew-cancel", QueueConfig{}); er != nil {
+					t.Fatal(er)
+				}
+				if _, er := e.Send(ctx, "renew-cancel", OutMessage{Body: []byte("one")}); er != nil {
+					t.Fatal(er)
+				}
+				ms, er := e.Receive(ctx, "renew-cancel", ReceiveOptions{MaxMessages: 1})
+				if er != nil || len(ms) != 1 {
+					t.Fatal(er)
+				}
+				message = ms[0]
+			}
+			dispatches.Store(0)
+			armed.Store(true)
+			caller, cancel := context.WithCancel(ctx)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				var er error
+				switch operation {
+				case "exec":
+					_, er = e.db.exec(caller, "UPDATE app_counter SET value=value+1")
+				case "exec-fresh":
+					_, er = e.db.execFresh(caller, "UPDATE app_counter SET value=value+1", func() []any { return nil })
+				case "renew-returning":
+					_, er = e.RenewBatch(caller, "renew-cancel", []SettleItem{{SeqNumber: message.SeqNumber, LockToken: message.LockToken}})
+				}
+				done <- er
+			}()
+			select {
+			case <-applied:
+			case <-time.After(3 * time.Second):
+				t.Fatal("provider did not apply")
+			}
+			cancel()
+			select {
+			case er := <-done:
+				if !errors.Is(er, ErrOutcomeUnknown) || errors.Is(er, context.Canceled) || errors.Is(er, driver.ErrBadConn) {
+					t.Fatalf("issued canceled write=%v", er)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("issued canceled write did not join")
+			}
+			var effects int
+			if er := f.db.QueryRow("SELECT value FROM app_counter").Scan(&effects); er != nil {
+				t.Fatal(er)
+			}
+			want := 1
+			if operation == "renew-returning" {
+				want = 0
+			}
+			if effects != want || dispatches.Load() != 1 {
+				t.Fatalf("effects=%d requests=%d", effects, dispatches.Load())
+			}
+		})
+	}
+}
+
+func TestConfirmedSQLBusyStillMakesProgress(t *testing.T) {
+	f := newSQLiteHranaFixture(t)
+	e := f.openEngine(t, true)
+	defer e.Close()
+	if _, err := f.db.Exec("CREATE TABLE app_busy(value INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := f.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Rollback()
+	if _, err := owner.Exec("INSERT INTO app_busy VALUES(0)"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	released := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if f.snapshot().Busy > 0 {
+				released <- owner.Rollback()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				released <- ctx.Err()
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	_, err = e.db.exec(ctx, "INSERT INTO app_busy VALUES(1)")
+	if releaseErr := <-released; releaseErr != nil {
+		t.Fatal(releaseErr)
+	}
+	var effects int
+	if readErr := f.db.QueryRow("SELECT count(*) FROM app_busy WHERE value=1").Scan(&effects); readErr != nil {
+		t.Fatal(readErr)
+	}
+	t.Logf("busy=%d effects=%d errorType=%T error=%v", f.snapshot().Busy, effects, err, err)
+	if err != nil || effects != 1 || f.snapshot().Busy == 0 {
+		t.Fatalf("confirmed pre-effect SQLite Busy lost progress: effects=%d err=%v", effects, err)
+	}
+}
+
+type providerBusyWithoutText struct{}
+
+func (providerBusyWithoutText) Error() string { return "structured statement rejection" }
+func (providerBusyWithoutText) Code() int     { return 5 }
+
+func TestTypedBusyRetriesDoNotDependOnProviderWording(t *testing.T) {
+	err := fmt.Errorf("operation: %w", providerBusyWithoutText{})
+	d := &db{remote: true}
+	if !isBusyErr(err) || !d.retryable(err) || !d.retryableWrite(err) {
+		t.Fatal("definite SQLite Busy code was lost when its message changed")
+	}
+	for _, cause := range []error{
+		errors.Join(err, context.Canceled),
+		&providerWriteOutcomeUnknown{cause: err},
+	} {
+		if isBusyErr(cause) || d.retryable(cause) || d.retryableWrite(cause) {
+			t.Fatal("a typed Busy cause bypassed cancellation or write uncertainty")
+		}
+	}
+}
+
+func envN(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if x, err := strconv.Atoi(v); err == nil && x > 0 {
+			return x
+		}
+	}
+	return def
+}
+
+// TestMessageIntegrity is the no-loss + no-corruption sweep. It sends a contiguous
+// sequence 1..N, each message carrying RANDOM body content plus that body's SHA-256
+// in a property, then consumes concurrently with redelivery stress (some Abandons).
+// It verifies two distinct guarantees:
+//
+//	(a) NO MESSAGE LOSS — every value 1..N is completed exactly once (no gap means
+//	    nothing was dropped; >1 would mean a message was double-*completed*, which the
+//	    delete-on-complete model forbids — at-least-once duplicates show up as extra
+//	    *receives*, counted separately).
+//	(b) NO CONTENT CORRUPTION — every received body still hashes to its property, so
+//	    the body and its KV properties survived the round-trip through SQLite intact.
+//
+// N defaults to 10k (fast for CI under -race); set MQLITE_INTEGRITY_N=500000 for the
+// large sweep the maintainer described.
+func TestMessageIntegrity(t *testing.T) {
+	// Default is modest so the test stays fast under CI's `-race`; set
+	// MQLITE_INTEGRITY_N=500000 for the large sweep the maintainer described.
+	n := envN("MQLITE_INTEGRITY_N", 1000)
+	ctx := context.Background()
+	e, err := Open(ctx, Options{DB: "file:" + filepath.Join(t.TempDir(), "mq.db"), DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 1_000_000})
+
+	// producer: enqueue the contiguous sequence 1..N in order, each with RANDOM body
+	// content and that body's SHA-256 carried in a property.
+	prng := rand.New(rand.NewSource(42))
+	for i := 1; i <= n; i++ {
+		body := make([]byte, 64+prng.Intn(192)) // random size 64..255
+		_, _ = prng.Read(body)                  // random content (deterministic seed)
+		sum := sha256.Sum256(body)
+		if _, err := e.SendOne(ctx, "q", OutMessage{
+			Body: body,
+			Properties: map[string]string{
+				"seq":    strconv.Itoa(i),
+				"sha256": hex.EncodeToString(sum[:]),
+			},
+		}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+
+	// drain concurrently with competing consumers + redelivery stress (some Abandons)
+	const C = 4
+	completedTimes := make([]int32, n+1) // [seq] -> times completed; must be exactly 1 for 1..n
+	var completed, receives, corrupt int64
+	var wg sync.WaitGroup
+	for c := 0; c < C; c++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(seed*7919 + 1)))
+			for atomic.LoadInt64(&completed) < int64(n) {
+				msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 64, WaitMs: 0})
+				if err != nil || len(msgs) == 0 {
+					continue
+				}
+				for _, m := range msgs {
+					atomic.AddInt64(&receives, 1)
+					// (b) content integrity: the body must still hash to its property
+					sum := sha256.Sum256(m.Body)
+					ok := hex.EncodeToString(sum[:]) == m.Properties["sha256"]
+					if !ok {
+						atomic.AddInt64(&corrupt, 1)
+					}
+					// redelivery stress: abandon ~3% of healthy messages so they come
+					// back (exercises at-least-once); always make progress otherwise.
+					if ok && rng.Intn(100) < 3 {
+						_ = e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 0)
+						continue
+					}
+					seq, _ := strconv.Atoi(m.Properties["seq"])
+					if e.Complete(ctx, "q", m.SeqNumber, m.LockToken) == nil && seq >= 1 && seq <= n {
+						if atomic.AddInt32(&completedTimes[seq], 1) == 1 {
+							atomic.AddInt64(&completed, 1)
+						}
+					}
+				}
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	if c := atomic.LoadInt64(&corrupt); c > 0 {
+		t.Fatalf("content corruption: %d message(s) whose body hash != stored property hash", c)
+	}
+	missing, dup := 0, 0
+	for i := 1; i <= n; i++ {
+		switch {
+		case completedTimes[i] == 0:
+			missing++
+		case completedTimes[i] > 1:
+			dup++
+		}
+	}
+	if missing > 0 || dup > 0 {
+		t.Fatalf("message loss: %d of %d missing, %d double-completed (total receives=%d)",
+			missing, n, dup, atomic.LoadInt64(&receives))
+	}
+	rcv := atomic.LoadInt64(&receives)
+	t.Logf("integrity OK: %d/%d delivered & content-verified, each completed exactly once; "+
+		"total receives=%d (%.1f%% redelivered by at-least-once)",
+		n, n, rcv, float64(rcv-int64(n))/float64(n)*100)
 }

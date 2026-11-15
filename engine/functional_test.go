@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mqlitehq/mqlite/internal/receivegate"
+	"log/slog"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -14,8 +16,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/mqlitehq/mqlite/internal/receivegate"
 )
 
 func TestQueueNotFoundIsGeneralNotFound(t *testing.T) {
@@ -3587,5 +3587,462 @@ func TestBackgroundMutationNotifiesOnlyQueuesChangedAtExpiryBoundary(t *testing.
 		if state != want {
 			t.Fatalf("queue %q state=%q, want %q", queue, state, want)
 		}
+	}
+}
+
+// A dedup conflict inside a batch Send must skip only the offending message, not
+// roll back the whole batch (§11 / Bug-4).
+func TestSendBatchDedupConflictSkipsOne(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{DedupWindowMs: 60_000})
+
+	seqs, err := e.Send(ctx, "q",
+		OutMessage{MessageID: "A", Body: []byte("one")},
+		OutMessage{MessageID: "A", Body: []byte("TWO-different-body")}, // conflict: same id, diff body
+		OutMessage{MessageID: "B", Body: []byte("three")},
+	)
+	if err != nil {
+		t.Fatalf("Send must not fail the whole batch on one conflict: %v", err)
+	}
+	if len(seqs) != 3 || seqs[0] == 0 || seqs[2] == 0 {
+		t.Fatalf("good messages must commit, got seqs=%v", seqs)
+	}
+	if seqs[1] != 0 {
+		t.Fatalf("conflicting message must be skipped (seq 0), got %d", seqs[1])
+	}
+	mm, _ := e.Stats(ctx, "q")
+	if mm.Active != 2 {
+		t.Fatalf("want 2 enqueued (A,B), got active=%d", mm.Active)
+	}
+
+	// single Send still surfaces the conflict as an error.
+	if _, err := e.SendOne(ctx, "q", OutMessage{MessageID: "A", Body: []byte("yet-another")}); !errors.Is(err, ErrDedupConflict) {
+		t.Fatalf("single Send conflict must return ErrDedupConflict, got %v", err)
+	}
+}
+
+// Idempotent receive: retrying Receive with the same attempt id replays the same
+// batch (same lock token, no delivery_count increment) — a dropped Receive
+// response must not burn a delivery or hand out a different message (§11).
+func TestIdempotentReceive(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("first")})
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("second")})
+
+	first, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, AttemptID: "A1"})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first receive: n=%d err=%v", len(first), err)
+	}
+	m1 := first[0]
+	if m1.DeliveryCount != 1 {
+		t.Fatalf("delivery_count want 1, got %d", m1.DeliveryCount)
+	}
+
+	// retry with the SAME attempt id -> replay, identical token, dc unchanged.
+	replay, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, AttemptID: "A1"})
+	if err != nil || len(replay) != 1 {
+		t.Fatalf("replay receive: n=%d err=%v", len(replay), err)
+	}
+	if replay[0].SeqNumber != m1.SeqNumber || replay[0].LockToken != m1.LockToken {
+		t.Fatalf("replay must return same msg+token: got seq=%d tok=%s want seq=%d tok=%s",
+			replay[0].SeqNumber, replay[0].LockToken, m1.SeqNumber, m1.LockToken)
+	}
+	if replay[0].DeliveryCount != 1 {
+		t.Fatalf("replay must NOT burn delivery_count, got %d", replay[0].DeliveryCount)
+	}
+
+	// a different attempt id claims the next message (not a replay).
+	next, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, AttemptID: "A2"})
+	if err != nil || len(next) != 1 || next[0].SeqNumber == m1.SeqNumber {
+		t.Fatalf("different attempt id must claim a new message, got %+v err=%v", next, err)
+	}
+
+	// the replayed token still settles the message exactly once.
+	if err := e.Complete(ctx, "q", replay[0].SeqNumber, replay[0].LockToken); err != nil {
+		t.Fatalf("complete via replayed token: %v", err)
+	}
+}
+
+// deadLetterN sends n messages to q and dead-letters all of them.
+func deadLetterN(t *testing.T, e *Engine, q string, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		e.SendOne(ctx, q, OutMessage{Body: []byte("x")})
+	}
+	for i := 0; i < n; i++ {
+		m := recvOne(t, e, q)
+		if m == nil {
+			t.Fatalf("expected a message to dead-letter")
+		}
+		if err := e.Reject(ctx, q, m.SeqNumber, m.LockToken, "test", ""); err != nil {
+			t.Fatalf("deadletter: %v", err)
+		}
+	}
+}
+
+// Cross-queue redrive moves the whole set atomically into the target, and the
+// source DLQ ends empty. (§11 Bug-3: was per-row tx.)
+func TestCrossQueueRedrive(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "src", QueueConfig{})
+	mustQueue(t, e, "dst", QueueConfig{})
+	deadLetterN(t, e, "src", 5)
+
+	moved, err := e.Redrive(ctx, "src", RedriveOptions{Target: "dst"})
+	if err != nil || moved != 5 {
+		t.Fatalf("cross-queue redrive moved=%d err=%v (want 5, nil)", moved, err)
+	}
+	src, _ := e.Stats(ctx, "src")
+	dst, _ := e.Stats(ctx, "dst")
+	if src.DeadLettered != 0 || dst.Active != 5 {
+		t.Fatalf("after move: src.dlq=%d dst.active=%d (want 0, 5)", src.DeadLettered, dst.Active)
+	}
+}
+
+// RatePerSec chunks the move but still relocates everything.
+func TestRedriveRatePerSec(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "src", QueueConfig{})
+	mustQueue(t, e, "dst", QueueConfig{})
+	deadLetterN(t, e, "src", 3)
+
+	moved, err := e.Redrive(ctx, "src", RedriveOptions{Target: "dst", RatePerSec: 2}) // 2 chunks
+	if err != nil || moved != 3 {
+		t.Fatalf("rate-limited redrive moved=%d err=%v (want 3, nil)", moved, err)
+	}
+	dst, _ := e.Stats(ctx, "dst")
+	if dst.Active != 3 {
+		t.Fatalf("dst.active=%d (want 3)", dst.Active)
+	}
+}
+
+// Purge permanently deletes DLQ messages.
+func TestPurgeDeadLetter(t *testing.T) {
+	ctx := context.Background()
+	e, _ := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{})
+	deadLetterN(t, e, "q", 4)
+
+	purged, err := e.Purge(ctx, "q", RedriveOptions{Max: 3})
+	if err != nil || purged != 3 {
+		t.Fatalf("purge max=3 got=%d err=%v", purged, err)
+	}
+	purged, err = e.Purge(ctx, "q", RedriveOptions{}) // purge the rest
+	if err != nil || purged != 1 {
+		t.Fatalf("purge rest got=%d err=%v", purged, err)
+	}
+	mm, _ := e.Stats(ctx, "q")
+	if mm.DeadLettered != 0 || mm.Total != 0 {
+		t.Fatalf("after purge dlq=%d total=%d (want 0,0)", mm.DeadLettered, mm.Total)
+	}
+}
+
+// Idempotent settle: a client retrying a Complete whose ack was lost must get
+// success (receipt), but a genuinely lost lock (message reclaimed) must still
+// fail with ErrLockLost. This is the difference §11 calls out.
+func TestSettleIdempotentVsLockLost(t *testing.T) {
+	ctx := context.Background()
+	e, ms := testEngine(t)
+	mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1000, MaxDeliveryCount: 50})
+
+	// --- idempotent replay: double Complete with the SAME token succeeds twice.
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("a")})
+	m := recvOne(t, e, "q")
+	if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+		t.Fatalf("first complete: %v", err)
+	}
+	if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+		t.Fatalf("retry of already-completed token must be idempotent success, got %v", err)
+	}
+
+	// --- genuine lock-loss: lock expires, message reclaimed (new token), the
+	// stale token's Complete must be ErrLockLost (no receipt for it).
+	e.SendOne(ctx, "q", OutMessage{Body: []byte("b")})
+	m1 := recvOne(t, e, "q")
+	advance(ms, 2*time.Second) // past the 1s lock
+	e.RunMaintenanceOnce(ctx)  // reaper returns it to active
+	m2 := recvOne(t, e, "q")
+	if m2 == nil || m2.LockToken == m1.LockToken {
+		t.Fatalf("expected redelivery with a fresh token; m2=%v", m2)
+	}
+	if err := e.Complete(ctx, "q", m1.SeqNumber, m1.LockToken); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("stale token after reclaim must be ErrLockLost, got %v", err)
+	}
+	// the legitimate holder still completes fine.
+	if err := e.Complete(ctx, "q", m2.SeqNumber, m2.LockToken); err != nil {
+		t.Fatalf("legit complete: %v", err)
+	}
+}
+
+// openWithDLQ opens a deterministic (clock-injected, no background) engine with
+// the DLQ retention bounds set, for the reapDLQ tests.
+func openWithDLQ(t *testing.T, ageMs int64, count int, maxBytes int64) (*Engine, *int64) {
+	t.Helper()
+	var ms int64 = 1_700_000_000_000
+	e, err := Open(context.Background(), Options{
+		DB:                "file:" + filepath.Join(t.TempDir(), "mq.db"),
+		Now:               func() int64 { return atomic.LoadInt64(&ms) },
+		DisableBackground: true,
+		DLQMaxAgeMs:       ageMs,
+		DLQMaxCount:       count,
+		DLQMaxBytes:       maxBytes,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	return e, &ms
+}
+
+func sendBodies(t *testing.T, e *Engine, q string, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if _, err := e.SendOne(context.Background(), q, OutMessage{Body: []byte{byte(i)}}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+}
+
+func dlqBodies(t *testing.T, e *Engine, q string) []byte {
+	t.Helper()
+	msgs, err := e.Peek(context.Background(), q, PeekOptions{State: StateDeadLettered, Max: 100})
+	if err != nil {
+		t.Fatalf("peek: %v", err)
+	}
+	var b []byte
+	for _, m := range msgs { // Peek is ORDER BY id ASC -> oldest first
+		if len(m.Body) > 0 {
+			b = append(b, m.Body[0])
+		}
+	}
+	return b
+}
+
+// A per-queue count cap keeps the newest N dead letters (drop-oldest) and never
+// touches messages in any other state or queue.
+func TestDLQRetentionCountDropsOldest(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 2, 0) // keep at most 2 dead letters per queue
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+	mustQueue(t, e, "live", QueueConfig{}) // no TTL -> stays active, must be untouched
+
+	sendBodies(t, e, "q", 5)    // bodies 0..4
+	sendBodies(t, e, "live", 3) // active work, never expires
+
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // expireTTL dead-letters the 5; reapDLQ keeps newest 2
+
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 2 {
+		t.Fatalf("DLQ count cap: want 2 dead-lettered, got %d", mt.DeadLettered)
+	}
+	if live, _ := e.Stats(ctx, "live"); live.Active != 3 {
+		t.Fatalf("retention must never touch non-DLQ work: want 3 active in 'live', got %d", live.Active)
+	}
+	// drop-oldest: survivors are the two NEWEST (bodies 3 and 4)
+	if got := dlqBodies(t, e, "q"); len(got) != 2 || got[0] != 3 || got[1] != 4 {
+		t.Fatalf("want survivors {3,4} (newest), got %v", got)
+	}
+}
+
+// A per-queue byte cap keeps the newest dead letters whose bodies fit, dropping the
+// oldest until total body bytes are under the cap.
+func TestDLQRetentionBytesDropsOldest(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 0, 250) // keep newest dead letters whose bodies sum <= 250B
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+	for i := 0; i < 5; i++ { // 100-byte bodies, first byte = index
+		b := make([]byte, 100)
+		b[0] = byte(i)
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: b}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // 5 dead-lettered; byte cap keeps newest 2 (200B <= 250)
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 2 {
+		t.Fatalf("byte cap: want 2 (2*100B <= 250B), got %d", mt.DeadLettered)
+	}
+	if got := dlqBodies(t, e, "q"); len(got) != 2 || got[0] != 3 || got[1] != 4 {
+		t.Fatalf("want survivors {3,4} (newest), got %v", got)
+	}
+}
+
+// An age cap drops dead letters older than the bound while keeping fresh ones.
+func TestDLQRetentionAgeDropsOld(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, time.Hour.Milliseconds(), 0, 0) // drop dead letters older than 1h
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+
+	sendBodies(t, e, "q", 3) // enqueued at T0
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // 3 dead-lettered, age ~0 -> under 1h, kept
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 3 {
+		t.Fatalf("fresh dead letters must be kept: got %d", mt.DeadLettered)
+	}
+
+	advance(ms, 2*time.Hour) // the 3 are now >1h old
+	sendBodies(t, e, "q", 1) // a fresh message, enqueued at ~T0+2h
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // age purge drops the 3 old; the fresh one stays
+
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 1 {
+		t.Fatalf("age retention: want 1 (only the fresh dead letter), got %d", mt.DeadLettered)
+	}
+}
+
+// With no bounds set (engine default), reapDLQ is a no-op — the DLQ is unbounded.
+func TestDLQRetentionDisabledByDefault(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 0, 0) // all bounds off
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+	sendBodies(t, e, "q", 5)
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx)
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 5 {
+		t.Fatalf("unbounded DLQ: want all 5 kept, got %d", mt.DeadLettered)
+	}
+}
+
+// ─── Per-queue retention overrides (MQLITE-29) ──────────────────────────────
+
+func TestEffectiveBound(t *testing.T) {
+	cases := []struct{ perQueue, def, want int64 }{
+		{0, 100, 100}, // 0 inherits the engine default
+		{50, 100, 50}, // a positive override wins
+		{200, 0, 200}, // override even when the default is off
+		{-1, 100, 0},  // negative = explicitly unbounded (opt out)
+		{0, 0, 0},     // both off
+		{-1, 0, 0},    // unbounded over an off default
+	}
+	for _, c := range cases {
+		if got := effectiveBound(c.perQueue, c.def); got != c.want {
+			t.Errorf("effectiveBound(%d, %d) = %d, want %d", c.perQueue, c.def, got, c.want)
+		}
+	}
+}
+
+// A per-queue count bound applies even when the engine default is off, and a queue
+// without an override stays unbounded.
+func TestDLQRetentionPerQueueOverride(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 0, 0) // engine defaults OFF
+	mustQueue(t, e, "capped", QueueConfig{DefaultTTLMs: 1000, DLQMaxCount: 2})
+	mustQueue(t, e, "uncapped", QueueConfig{DefaultTTLMs: 1000}) // inherits off -> unbounded
+
+	sendBodies(t, e, "capped", 5)
+	sendBodies(t, e, "uncapped", 5)
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx)
+
+	if mt, _ := e.Stats(ctx, "capped"); mt.DeadLettered != 2 {
+		t.Fatalf("per-queue cap=2: want 2 dead-lettered, got %d", mt.DeadLettered)
+	}
+	if mt, _ := e.Stats(ctx, "uncapped"); mt.DeadLettered != 5 {
+		t.Fatalf("no override inherits off (unbounded): want 5, got %d", mt.DeadLettered)
+	}
+	if got := dlqBodies(t, e, "capped"); len(got) != 2 || got[0] != 3 || got[1] != 4 {
+		t.Fatalf("drop-oldest survivors {3,4}, got %v", got)
+	}
+}
+
+// A per-queue bound of 0 inherits the engine default; -1 explicitly opts out.
+func TestDLQRetentionPerQueueInheritAndOptOut(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 2, 0)                                             // engine default: keep 2
+	mustQueue(t, e, "inherit", QueueConfig{DefaultTTLMs: 1000})                  // 0 -> inherit (2)
+	mustQueue(t, e, "keepall", QueueConfig{DefaultTTLMs: 1000, DLQMaxCount: -1}) // -1 -> unbounded
+
+	sendBodies(t, e, "inherit", 5)
+	sendBodies(t, e, "keepall", 5)
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx)
+
+	if mt, _ := e.Stats(ctx, "inherit"); mt.DeadLettered != 2 {
+		t.Fatalf("inherit engine default (2): want 2, got %d", mt.DeadLettered)
+	}
+	if mt, _ := e.Stats(ctx, "keepall"); mt.DeadLettered != 5 {
+		t.Fatalf("per-queue -1 overrides default to unbounded: want 5, got %d", mt.DeadLettered)
+	}
+}
+
+// A per-queue age bound is applied per queue independent of the engine default.
+func TestDLQRetentionPerQueueAge(t *testing.T) {
+	ctx := context.Background()
+	e, ms := openWithDLQ(t, 0, 0, 0) // engine defaults off
+	mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000, DLQMaxAgeMs: time.Hour.Milliseconds()})
+
+	sendBodies(t, e, "q", 3) // dead-lettered at ~T0
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // fresh (<1h) -> kept
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 3 {
+		t.Fatalf("fresh dead letters kept: got %d", mt.DeadLettered)
+	}
+	advance(ms, 2*time.Hour) // the 3 are now >1h old
+	sendBodies(t, e, "q", 1)
+	advance(ms, 2*time.Second)
+	e.RunMaintenanceOnce(ctx) // per-queue age drops the 3 old; fresh one stays
+	if mt, _ := e.Stats(ctx, "q"); mt.DeadLettered != 1 {
+		t.Fatalf("per-queue age bound: want 1, got %d", mt.DeadLettered)
+	}
+}
+
+// Round-3 §3.2: a DLQ that is UNDER its cap has nothing to purge — the cutoff query returns
+// sql.ErrNoRows, which is the normal steady state, not a failure. It used to be logged as an
+// ERROR, so a perfectly healthy broker cried wolf every 60 seconds; with the default cap of a
+// million dead letters that is very nearly every broker.
+//
+// Captures the retention loop's log for BOTH bounds (count and bytes) and for both an empty and
+// a populated-but-under-cap DLQ, and requires silence.
+func TestDLQRetentionUnderCapLogsNoError(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name         string
+		count        int
+		maxBytes     int64
+		deadLettered int
+	}{
+		{"count bound, empty DLQ", 100, 0, 0},
+		{"count bound, under cap", 100, 0, 3},
+		{"bytes bound, empty DLQ", 0, 1 << 20, 0},
+		{"bytes bound, under cap", 0, 1 << 20, 3},
+		{"both bounds, under cap", 100, 1 << 20, 3},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var logbuf bytes.Buffer
+			var ms int64 = 1_700_000_000_000
+			e, err := Open(ctx, Options{
+				DB:                "file:" + filepath.Join(t.TempDir(), "mq.db"),
+				Now:               func() int64 { return atomic.LoadInt64(&ms) },
+				DisableBackground: true,
+				DLQMaxCount:       c.count,
+				DLQMaxBytes:       c.maxBytes,
+				Logger:            slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.Close() })
+			mustQueue(t, e, "q", QueueConfig{DefaultTTLMs: 1000})
+			if c.deadLettered > 0 {
+				sendBodies(t, e, "q", c.deadLettered)
+				advance(&ms, 2*time.Second) // TTL dead-letters them
+			}
+
+			e.RunMaintenanceOnce(ctx)
+			e.RunMaintenanceOnce(ctx) // a second pass: the reviewer saw this repeat every minute
+
+			if m, _ := e.Stats(ctx, "q"); m.DeadLettered != int64(c.deadLettered) {
+				t.Errorf("an under-cap DLQ must not be purged: dead_lettered=%d, want %d", m.DeadLettered, c.deadLettered)
+			}
+			if out := logbuf.String(); strings.Contains(out, "level=ERROR") {
+				t.Errorf("an under-cap DLQ logged an ERROR (it has simply nothing to purge):\n%s", out)
+			}
+		})
 	}
 }

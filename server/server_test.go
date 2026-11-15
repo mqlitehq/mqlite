@@ -6,20 +6,24 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"github.com/mqlitehq/mqlite/engine"
+	"github.com/mqlitehq/mqlite/server"
+	"github.com/mqlitehq/mqlite/wire"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/mqlitehq/mqlite/engine"
-	"github.com/mqlitehq/mqlite/server"
-	"github.com/mqlitehq/mqlite/wire"
 )
 
 func TestJSONResponsesCarryServerTime(t *testing.T) {
@@ -1120,5 +1124,967 @@ func TestQueueNotFoundKeepsCompatibleCodeAndResource(t *testing.T) {
 	}
 	if envelope.Code != "not_found" || envelope.Resource != "queue" {
 		t.Fatalf("error envelope = %+v, want compatible not_found with queue resource", envelope)
+	}
+}
+
+// wantRPCRoutes is the complete RPC catalog the open "/" discovery card must enumerate,
+// in server-registration order. It IS the pinned contract (MQLITE-87): the card's
+// endpoints come straight from what server.routes() registered, so adding or removing a
+// route changes this list and fails the test until it's updated deliberately — an agent
+// iterating endpoints[] can trust it lists every route, with none stale.
+var wantRPCRoutes = []string{
+	wire.PathSend, wire.PathReceive, wire.PathComplete, wire.PathCompleteBatch,
+	wire.PathRenewBatch,
+	wire.PathAbandon, wire.PathReject, wire.PathDefer, wire.PathReceiveDeferred,
+	wire.PathRenew, wire.PathSchedule, wire.PathCancel, wire.PathPeek, wire.PathStats,
+	wire.PathCreateQueue, wire.PathSubscribe, wire.PathListQueues, wire.PathListSubscriptions,
+	wire.PathListSubscriptionsPage,
+	wire.PathTestFilter, wire.PathRedrive, wire.PathPurge, wire.PathStatus, wire.PathObserve,
+	wire.PathCreateKey, wire.PathListKeys, wire.PathRevokeKey, wire.PathDeleteQueue,
+	wire.PathDeleteSubscription,
+}
+
+func getCard(t *testing.T, url string) (wire.DiscoveryCard, []string) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Key set of the raw object — catches any field added/removed from the shape.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("decode raw %q: %v", body, err)
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var card wire.DiscoveryCard
+	if err := json.Unmarshal(body, &card); err != nil {
+		t.Fatalf("decode card: %v", err)
+	}
+	return card, keys
+}
+
+// TestDiscoveryCardPinned pins the exact "/" JSON contract agents rely on: a string
+// auth ("bearer"/"none"), a complete endpoints[] catalog, and a fixed field set — so
+// the server can't silently drift from the documented shape (MQLITE-87 / D4).
+func TestDiscoveryCardPinned(t *testing.T) {
+	// Pin both optional fields independently. Metrics require authentication;
+	// that invalid combination fails closed rather than publishing a card.
+	for _, auth := range []bool{false, true} {
+		for _, ui := range []bool{false, true} {
+			for _, metrics := range []bool{false, true} {
+				name := "anonymous"
+				if auth {
+					name = "bearer"
+				}
+				if ui {
+					name += "/console"
+				}
+				if metrics {
+					name += "/metrics"
+				}
+				t.Run(name, func(t *testing.T) {
+					eng, err := engine.Open(context.Background(), engine.Options{DB: ":memory:", DisableBackground: true})
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { eng.Close() })
+					var tokens []string
+					wantAuth := "none"
+					if auth {
+						tokens = []string{"secret"}
+						wantAuth = "bearer"
+					}
+					srv := server.New(eng, tokens)
+					srv.UI, srv.Metrics = ui, metrics
+					h := srv.Handler()
+					if metrics && !auth {
+						keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/", "", nil), http.StatusInternalServerError, "internal")
+						return
+					}
+					ts := httptest.NewServer(h)
+					t.Cleanup(ts.Close)
+					card, keys := getCard(t, ts.URL+"/")
+					wantKeys := []string{"auth", "description", "docs", "endpoints", "health", "name", "status", "version"}
+					wantUI, wantMetrics := "", ""
+					if ui {
+						wantKeys = append(wantKeys, "ui")
+						wantUI = "/ui"
+					}
+					if metrics {
+						wantKeys = append(wantKeys, "metrics")
+						wantMetrics = "/metrics"
+					}
+					sort.Strings(wantKeys)
+					if !reflect.DeepEqual(keys, wantKeys) {
+						t.Errorf("card field set = %v\n            want %v", keys, wantKeys)
+					}
+					if card.Name != "mqlite" || card.Status != "ok" || card.Health != "/healthz" || card.Metrics != wantMetrics || card.UI != wantUI || card.Auth != wantAuth {
+						t.Errorf("card metadata drift: %+v", card)
+					}
+					if !reflect.DeepEqual(card.Endpoints, wantRPCRoutes) {
+						t.Errorf("endpoints catalog drift:\n got  %v\n want %v", card.Endpoints, wantRPCRoutes)
+					}
+					// The advertised relative URL is live on this same handler, and
+					// the exporter remains independent of the optional console.
+					for _, credential := range []string{"", "secret"} {
+						want := http.StatusNotFound
+						if metrics {
+							want = http.StatusUnauthorized
+							if credential != "" {
+								want = http.StatusOK
+							}
+						}
+						keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/metrics", credential, nil), want, "")
+					}
+					wantUIStatus := http.StatusNotFound
+					if ui {
+						wantUIStatus = http.StatusOK
+					}
+					keyTestStatus(t, keyTestRequest(h, http.MethodGet, "/ui/", "", nil), wantUIStatus, "")
+				})
+			}
+		}
+	}
+}
+
+// Round-3 §3.3: the docs named `/mqlite.v1.Queue/Receive`, a route that does not exist (it is
+// `/mqlite.v1.QueueService/Receive`). Rather than fix the three occurrences and hope, pin the
+// whole surface: EVERY RPC path written in the docs must be a route the broker actually
+// registers. Invent one and this fails.
+//
+// The comparison is against the live catalog the server publishes on "/", so there is no second
+// list to keep in sync — the routes are their own source of truth.
+func TestDocsCiteOnlyRealRPCPaths(t *testing.T) {
+	card, _ := getCard(t, consoleServer(t, false, nil).URL+"/")
+	paths := card.Endpoints
+	real := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		real[p] = true
+	}
+
+	docs, err := filepath.Glob(filepath.Join("..", "docs", "*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs = append(docs, filepath.Join("..", "README.md"))
+	// Also cover the source comments, which is where the bad path was copied from.
+	more, _ := filepath.Glob(filepath.Join("..", "cmd", "mqlite", "*.go"))
+	docs = append(docs, more...)
+
+	re := regexp.MustCompile(`/mqlite\.v1\.[A-Za-z]+/[A-Za-z]+`)
+	checked := 0
+	for _, f := range docs {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, cited := range re.FindAllString(string(b), -1) {
+			checked++
+			if !real[cited] {
+				t.Errorf("%s cites %q, which the broker does not serve; the registered routes are %v",
+					filepath.Base(f), cited, paths)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no RPC paths found in the docs — the regex or the paths moved; this guard is not guarding")
+	}
+}
+
+// The reverse guard: every route the broker SERVES must be documented in the HTTP reference.
+//
+// TestDocsCiteOnlyRealRPCPaths stops the docs inventing a route that does not exist. This stops
+// the opposite drift — shipping a route nobody can find. RenewBatch was added to the wire, the
+// server, the SDK and the CLI, and the api-reference simply skipped it: raw-HTTP users could only
+// discover it by reading Go source (codex). A guard in one direction is not a guard.
+func TestEveryRPCPathIsDocumented(t *testing.T) {
+	card, _ := getCard(t, consoleServer(t, false, nil).URL+"/")
+
+	b, err := os.ReadFile(filepath.Join("..", "docs", "api-reference.md"))
+	if err != nil {
+		t.Fatalf("read api-reference.md: %v", err)
+	}
+	doc := string(b)
+
+	// The reference documents operations under `###` headings, and related verbs may share one
+	// (`### Complete / Abandon / Reject / Defer / Renew`), so collect every name any heading covers.
+	documented := map[string]bool{}
+	for _, line := range strings.Split(doc, "\n") {
+		if !strings.HasPrefix(line, "### ") {
+			continue
+		}
+		for _, part := range strings.Split(strings.TrimPrefix(line, "### "), "/") {
+			documented[strings.TrimSpace(part)] = true
+		}
+	}
+
+	for _, p := range card.Endpoints {
+		name := p[strings.LastIndexByte(p, '/')+1:] // the operation is the last element of the route
+		if !documented[name] {
+			t.Errorf("the broker serves %s but docs/api-reference.md documents no %q operation — a raw-HTTP user cannot find it",
+				p, name)
+		}
+	}
+}
+
+// The open "/" discovery endpoint returns a JSON identity card with NO auth — even
+// when Bearer tokens are configured — so hitting the broker root tells you what it is.
+func TestIndexDiscovery(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+
+	srv := server.New(eng, []string{"secret"}) // auth ON
+	srv.Version = "9.9.9"
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/") // no Authorization header
+	if err != nil {
+		t.Fatalf("get /: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / status: want 200 (open), got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type: want application/json, got %q", ct)
+	}
+	var card struct {
+		Name, Version, Status, Auth string
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &card); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	// auth is a string ("bearer" when tokens are set) so an agent can match it; the
+	// exact card shape + full endpoint catalog are pinned in TestDiscoveryCardPinned.
+	if card.Name != "mqlite" || card.Status != "ok" || card.Version != "9.9.9" || card.Auth != "bearer" {
+		t.Fatalf("unexpected index card: %+v (%s)", card, body)
+	}
+}
+
+func TestIndexNegotiatesBrowserConsole(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+
+	srv := server.New(eng, nil)
+	srv.UI = true
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := *ts.Client()
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	browserAccept := "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+	tests := []struct {
+		name         string
+		method       string
+		path         string
+		accept       string
+		wantStatus   int
+		wantLocation string
+		wantJSON     bool
+		wantVary     bool
+	}{
+		{name: "no accept", method: http.MethodGet, path: "/", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "wildcard", method: http.MethodGet, path: "/", accept: "*/*", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "json", method: http.MethodGet, path: "/", accept: "application/json", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "browser", method: http.MethodGet, path: "/", accept: browserAccept, wantStatus: http.StatusTemporaryRedirect, wantLocation: "/ui/", wantVary: true},
+		{name: "browser head", method: http.MethodHead, path: "/", accept: browserAccept, wantStatus: http.StatusTemporaryRedirect, wantLocation: "/ui/", wantVary: true},
+		{name: "html excluded", method: http.MethodGet, path: "/", accept: "text/html;q=0,*/*;q=1", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "json preferred", method: http.MethodGet, path: "/", accept: "text/html;q=0.5, application/json;q=0.9", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "html preferred", method: http.MethodGet, path: "/", accept: "application/json;q=0.5, text/html", wantStatus: http.StatusTemporaryRedirect, wantLocation: "/ui/", wantVary: true},
+		{name: "exact tie favors json", method: http.MethodGet, path: "/", accept: "text/html, application/json", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "text wildcard is not navigation", method: http.MethodGet, path: "/", accept: "text/*", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "invalid quality", method: http.MethodGet, path: "/", accept: "text/html;q=NaN, */*;q=0.8", wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "post stays discovery", method: http.MethodPost, path: "/", accept: browserAccept, wantStatus: http.StatusOK, wantJSON: true, wantVary: true},
+		{name: "unknown path stays not found", method: http.MethodGet, path: "/unknown", accept: browserAccept, wantStatus: http.StatusNotFound, wantJSON: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(tt.method, ts.URL+tt.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.accept != "" {
+				req.Header.Set("Accept", tt.accept)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%q", resp.StatusCode, tt.wantStatus, body)
+			}
+			if got := resp.Header.Get("Location"); got != tt.wantLocation {
+				t.Errorf("Location = %q, want %q", got, tt.wantLocation)
+			}
+			if tt.wantJSON {
+				if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+					t.Errorf("Content-Type = %q, want application/json", ct)
+				}
+				if !json.Valid(body) {
+					t.Errorf("body is not JSON: %q", body)
+				}
+			}
+			if got := varyContains(resp.Header, "Accept"); got != tt.wantVary {
+				t.Errorf("Vary has Accept = %v, want %v; values=%q", got, tt.wantVary, resp.Header.Values("Vary"))
+			}
+			if tt.method == http.MethodHead && len(body) != 0 {
+				t.Errorf("HEAD body = %q, want empty", body)
+			}
+		})
+	}
+
+	headless := server.New(eng, nil)
+	headlessTS := httptest.NewServer(headless.Handler())
+	defer headlessTS.Close()
+	req, _ := http.NewRequest(http.MethodGet, headlessTS.URL+"/", nil)
+	req.Header.Set("Accept", browserAccept)
+	resp, err := headlessTS.Client().Do(req)
+	if err != nil {
+		t.Fatalf("headless request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("headless browser request = %d %q, want 200 application/json", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if varyContains(resp.Header, "Accept") {
+		t.Fatalf("headless response unexpectedly varies on Accept: %q", resp.Header.Values("Vary"))
+	}
+}
+
+func TestIndexBrowserRedirectPreservesCORSVary(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+
+	srv := server.New(eng, nil)
+	srv.UI = true
+	srv.CORS = "https://console.example"
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := *ts.Client()
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/", nil)
+	req.Header.Set("Origin", "https://console.example")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", resp.StatusCode)
+	}
+	for _, name := range []string{"Accept", "Origin"} {
+		if !varyContains(resp.Header, name) {
+			t.Errorf("Vary is missing %s: %q", name, resp.Header.Values("Vary"))
+		}
+	}
+}
+
+func varyContains(header http.Header, name string) bool {
+	for _, value := range header.Values("Vary") {
+		for _, field := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(field), name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// "/" is the mux catch-all, so an unknown path returns a JSON 404 (not the card),
+// reached here with auth off.
+func TestIndexUnknownPath404(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	ts := httptest.NewServer(server.New(eng, nil).Handler()) // auth off
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/nope")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET /nope: want 404, got %d", resp.StatusCode)
+	}
+}
+
+// TestServerSendDedupConflict pins the fix for MQLITE-33: a single HTTP Send that
+// hits a dedup conflict (same message_id, different body) must be 409, not 200 with
+// a bogus seq 0 — otherwise an HTTP/curl client is told its never-enqueued message
+// succeeded. (The batch path swallows the conflict as seq 0; the handler re-surfaces
+// it for a single Send, matching engine.SendOne.)
+func TestServerSendDedupConflict(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{DedupWindowMs: 600000}); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+
+	ts := httptest.NewServer(server.New(eng, nil).Handler())
+	defer ts.Close()
+
+	send := func(id, body string) (int, []byte) {
+		t.Helper()
+		jb, _ := json.Marshal(wire.SendRequest{
+			Queue: "q", Messages: []wire.Message{{MessageID: id, Body: []byte(body)}},
+		})
+		resp, err := http.Post(ts.URL+wire.PathSend, "application/json", bytes.NewReader(jb))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		rb, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, rb
+	}
+
+	// First send: 200 with a real seq.
+	st, rb := send("k", "A")
+	var sr wire.SendResponse
+	_ = json.Unmarshal(rb, &sr)
+	if st != http.StatusOK || len(sr.SeqNumbers) != 1 || sr.SeqNumbers[0] == 0 {
+		t.Fatalf("first send: status=%d body=%s, want 200 + non-zero seq", st, rb)
+	}
+	first := sr.SeqNumbers[0]
+
+	// Same id + same body: idempotent dedup → 200, same seq.
+	st, rb = send("k", "A")
+	sr = wire.SendResponse{}
+	_ = json.Unmarshal(rb, &sr)
+	if st != http.StatusOK || len(sr.SeqNumbers) != 1 || sr.SeqNumbers[0] != first {
+		t.Fatalf("duplicate send: status=%d body=%s, want 200 + seq %d", st, rb, first)
+	}
+
+	// Same id + DIFFERENT body: dedup conflict → 409, not 200 {seq:[0]}.
+	st, rb = send("k", "B")
+	var e wire.ErrorBody
+	_ = json.Unmarshal(rb, &e)
+	if st != http.StatusConflict || e.Code != "already_exists" {
+		t.Fatalf("dedup conflict: status=%d body=%s, want 409 already_exists (MQLITE-33)", st, rb)
+	}
+}
+
+// TestServerPublishNoSubscriberIsNoOp pins the fix: a single publish to a topic that
+// matches NO subscription filter is a valid no-op (200, seq 0) — NOT a 409 "dedup
+// conflict". handleSend used to map every single-message seq-0 to ErrDedupConflict,
+// conflating a no-subscriber publish with a real conflict.
+func TestServerPublishNoSubscriberIsNoOp(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	// topic "t" with ONE filtered subscription (no match-all), so a non-matching publish
+	// reaches zero targets.
+	if err := eng.Subscribe(ctx, "t", "gold", &engine.Filter{Expr: `properties["tier"]=="gold"`}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	ts := httptest.NewServer(server.New(eng, nil).Handler())
+	defer ts.Close()
+
+	pub := func(tier string) wire.SendResponse {
+		t.Helper()
+		jb, _ := json.Marshal(wire.SendRequest{Queue: "t", Messages: []wire.Message{{
+			Body: []byte("{}"), Properties: map[string]string{"tier": tier},
+		}}})
+		resp, err := http.Post(ts.URL+wire.PathSend, "application/json", bytes.NewReader(jb))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		rb, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("tier=%s: status=%d body=%s, want 200 (a no-subscriber publish is a no-op)", tier, resp.StatusCode, rb)
+		}
+		var sr wire.SendResponse
+		_ = json.Unmarshal(rb, &sr)
+		return sr
+	}
+
+	if sr := pub("gold"); len(sr.SeqNumbers) != 1 || sr.SeqNumbers[0] == 0 {
+		t.Fatalf("matching publish: seqs=%v, want one non-zero", sr.SeqNumbers)
+	}
+	if sr := pub("silver"); len(sr.SeqNumbers) != 1 || sr.SeqNumbers[0] != 0 {
+		t.Fatalf("no-subscriber publish: seqs=%v, want [0] (200 no-op, not 409)", sr.SeqNumbers)
+	}
+}
+
+// TestServerSendPerMessageTTL pins the additive batch contract: legacy callers may
+// keep using the request-level ttl_ms, while a mixed batch carries ttl_ms on each
+// message. Ambiguous or negative inputs fail before any row is written.
+func TestServerSendPerMessageTTL(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	const queueTTL = int64(300_000)
+	if err := eng.CreateQueue(ctx, "q", engine.QueueConfig{DefaultTTLMs: queueTTL}); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+
+	ts := httptest.NewServer(server.New(eng, nil).Handler())
+	defer ts.Close()
+	post := func(req any) (int, []byte) {
+		t.Helper()
+		jb, err := json.Marshal(req)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		resp, err := http.Post(ts.URL+wire.PathSend, "application/json", bytes.NewReader(jb))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		rb, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return resp.StatusCode, rb
+	}
+	assertInvalid := func(name string, req any) {
+		t.Helper()
+		status, body := post(req)
+		var problem wire.ErrorBody
+		_ = json.Unmarshal(body, &problem)
+		if status != http.StatusBadRequest || problem.Code != "invalid_argument" {
+			t.Fatalf("%s: status=%d body=%s, want 400 invalid_argument", name, status, body)
+		}
+	}
+
+	status, body := post(wire.SendWithMessageTTLsRequest{Queue: "q", Messages: []wire.SendMessage{
+		{Message: wire.Message{Body: []byte("default")}},
+		{Message: wire.Message{Body: []byte("short")}, TTLMs: 60_000},
+		{Message: wire.Message{Body: []byte("capped")}, TTLMs: 600_000},
+		{Message: wire.Message{Body: []byte("huge-capped")}, TTLMs: math.MaxInt64},
+	}})
+	if status != http.StatusOK {
+		t.Fatalf("mixed TTL: status=%d body=%s", status, body)
+	}
+	peeked, err := eng.Peek(ctx, "q", engine.PeekOptions{Max: 10})
+	if err != nil {
+		t.Fatalf("peek: %v", err)
+	}
+	wantTTL := map[string]int64{
+		"default": queueTTL, "short": 60_000, "capped": queueTTL, "huge-capped": queueTTL,
+	}
+	if len(peeked) != len(wantTTL) {
+		t.Fatalf("peek count=%d, want %d", len(peeked), len(wantTTL))
+	}
+	for _, msg := range peeked {
+		if got, want := msg.ExpiresAtMs-msg.VisibleAtMs, wantTTL[string(msg.Body)]; got != want {
+			t.Errorf("%s effective TTL=%d, want %d", msg.Body, got, want)
+		}
+	}
+
+	assertInvalid("request and message TTL conflict", wire.SendWithMessageTTLsRequest{
+		Queue: "q", TTLMs: 1_000,
+		Messages: []wire.SendMessage{{Message: wire.Message{Body: []byte("x")}, TTLMs: 500}},
+	})
+	assertInvalid("negative request TTL", wire.SendRequest{
+		Queue: "q", TTLMs: -1, Messages: []wire.Message{{Body: []byte("x")}},
+	})
+	assertInvalid("negative message TTL", wire.SendWithMessageTTLsRequest{
+		Queue: "q", Messages: []wire.SendMessage{{Message: wire.Message{Body: []byte("x")}, TTLMs: -1}},
+	})
+	stats, err := eng.Stats(ctx, "q")
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.Total != int64(len(wantTTL)) {
+		t.Fatalf("invalid requests wrote rows: total=%d, want %d", stats.Total, len(wantTTL))
+	}
+
+	if err := eng.CreateQueue(ctx, "unlimited", engine.QueueConfig{}); err != nil {
+		t.Fatalf("create unlimited queue: %v", err)
+	}
+	assertInvalid("TTL expiry overflow", wire.SendRequest{
+		Queue: "unlimited", TTLMs: math.MaxInt64,
+		Messages: []wire.Message{{Body: []byte("overflow")}},
+	})
+	if stats, err := eng.Stats(ctx, "unlimited"); err != nil || stats.Total != 0 {
+		t.Fatalf("overflow request wrote rows: stats=%+v err=%v", stats, err)
+	}
+}
+
+func TestStatusEndpoint(t *testing.T) {
+	ctx := context.Background()
+	const now = int64(1_800_000_000_123)
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, Now: func() int64 { return now }})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	if err := eng.CreateQueue(ctx, "orders", engine.QueueConfig{}); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if err := eng.Subscribe(ctx, "events", "all", nil); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	s := server.New(eng, []string{"secret"})
+	s.Version = "9.9.9"
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+wire.PathStatus, bytes.NewReader([]byte("{}")))
+	req.Header.Set("Authorization", "Bearer secret")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", res.StatusCode)
+	}
+	var st wire.StatusResponse
+	if err := json.NewDecoder(res.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Backend != "memory" || st.Version != "9.9.9" || !st.Auth {
+		t.Fatalf("status = %+v", st)
+	}
+	if st.Queues != 1 { // the subscription's backing queue must not be counted as a queue
+		t.Errorf("queues=%d, want 1", st.Queues)
+	}
+	if st.Subscriptions != 1 {
+		t.Errorf("subscriptions=%d, want 1", st.Subscriptions)
+	}
+	if st.SchemaVersion == "" {
+		t.Error("missing schema version")
+	}
+	if st.ServerTimeMs != now {
+		t.Errorf("server_time_ms=%d, want lifecycle clock %d", st.ServerTimeMs, now)
+	}
+	if got := res.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control=%q, want no-store", got)
+	}
+
+	// Behind auth: no token → 401.
+	res2, err := http.Post(ts.URL+wire.PathStatus, "application/json", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2.Body.Close()
+	if res2.StatusCode != http.StatusUnauthorized {
+		t.Errorf("no-auth status = %d, want 401", res2.StatusCode)
+	}
+}
+
+// The console's two endpoints over HTTP: ListSubscriptions exposes topic+filter (which
+// ListQueues does not), and TestFilter dry-runs an expression.
+func TestListSubscriptionsAndTestFilter(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer eng.Close()
+	if err := eng.Subscribe(ctx, "events", "gold", &engine.Filter{Expr: `properties["tier"]=="gold"`}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	ts := httptest.NewServer(server.New(eng, nil).Handler()) // no auth
+	defer ts.Close()
+
+	post := func(path string, body, out any) []byte {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		res, err := http.Post(ts.URL+path, "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("POST %s: status %d", path, res.StatusCode)
+		}
+		response, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatalf("read POST %s: %v", path, err)
+		}
+		if out != nil {
+			if err := json.Unmarshal(response, out); err != nil {
+				t.Fatalf("decode POST %s: %v", path, err)
+			}
+		}
+		return response
+	}
+
+	var ls wire.ListSubscriptionsResponse
+	legacyBody := post(wire.PathListSubscriptions, wire.Empty{}, &ls)
+	if len(ls.Subscriptions) != 1 || ls.Subscriptions[0].Topic != "events" ||
+		ls.Subscriptions[0].Name != "gold" || ls.Subscriptions[0].Expr != `properties["tier"]=="gold"` {
+		t.Fatalf("ListSubscriptions = %+v", ls.Subscriptions)
+	}
+	var legacyWire struct {
+		Subscriptions []map[string]json.RawMessage `json:"subscriptions"`
+	}
+	if err := json.Unmarshal(legacyBody, &legacyWire); err != nil || len(legacyWire.Subscriptions) != 1 {
+		t.Fatalf("legacy wire response = %s: %v", legacyBody, err)
+	}
+	if _, present := legacyWire.Subscriptions[0]["state"]; present {
+		t.Fatalf("legacy wire response added state: %s", legacyBody)
+	}
+	var page wire.ListSubscriptionsPageResponse
+	post(wire.PathListSubscriptionsPage, wire.ListSubscriptionsPageRequest{Topic: "events", Limit: 1}, &page)
+	if page.Total != 1 || page.NextAfter != "" || len(page.Subscriptions) != 1 ||
+		page.Subscriptions[0].Topic != ls.Subscriptions[0].Topic ||
+		page.Subscriptions[0].Name != ls.Subscriptions[0].Name ||
+		page.Subscriptions[0].Expr != ls.Subscriptions[0].Expr ||
+		page.Subscriptions[0].State != "active" || page.Subscriptions[0].CreatedAtMs <= 0 ||
+		page.Subscriptions[0].ExpiresAtMs != 0 {
+		t.Fatalf("ListSubscriptionsPage = %+v", page)
+	}
+
+	// valid expr + a matching sample.
+	var tfMatch wire.TestFilterResponse
+	post(wire.PathTestFilter, wire.TestFilterRequest{
+		Expr:    `properties["tier"]=="gold"`,
+		Message: &wire.Message{Properties: map[string]string{"tier": "gold"}},
+	}, &tfMatch)
+	if !tfMatch.Valid || !tfMatch.Ran || !tfMatch.Matched || tfMatch.Error != "" {
+		t.Fatalf("TestFilter match = %+v", tfMatch)
+	}
+
+	// a non-matching sample.
+	var tfNo wire.TestFilterResponse
+	post(wire.PathTestFilter, wire.TestFilterRequest{
+		Expr:    `properties["tier"]=="gold"`,
+		Message: &wire.Message{Properties: map[string]string{"tier": "silver"}},
+	}, &tfNo)
+	if !tfNo.Ran || tfNo.Matched {
+		t.Fatalf("TestFilter no-match = %+v", tfNo)
+	}
+
+	// an invalid expression compiles to an error (not a 400 — the dry run reports it).
+	var tfBad wire.TestFilterResponse
+	post(wire.PathTestFilter, wire.TestFilterRequest{Expr: `subject ==`}, &tfBad)
+	if tfBad.Valid || tfBad.Error == "" {
+		t.Fatalf("TestFilter invalid = %+v", tfBad)
+	}
+}
+
+func TestSubscriptionLifecycleRoutes(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, MaxSubscriptions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	for _, name := range []string{"a", "b"} {
+		if err := eng.Subscribe(ctx, "events", name, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := server.New(eng, nil).Handler()
+	call := func(path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, bytes.NewReader(data)))
+		return rec
+	}
+	errorCode := func(rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		var body wire.ErrorBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Code
+	}
+
+	first := call(wire.PathListSubscriptionsPage, wire.ListSubscriptionsPageRequest{Topic: "events", Limit: 1})
+	if first.Code != http.StatusOK {
+		t.Fatalf("first page status = %d: %s", first.Code, first.Body.String())
+	}
+	var p1 wire.ListSubscriptionsPageResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &p1); err != nil {
+		t.Fatal(err)
+	}
+	if p1.Total != 2 || len(p1.Subscriptions) != 1 || p1.Subscriptions[0].State != "active" || p1.NextAfter == "" {
+		t.Fatalf("first page = %+v", p1)
+	}
+	second := call(wire.PathListSubscriptionsPage, wire.ListSubscriptionsPageRequest{Topic: "events", Limit: 1, After: p1.NextAfter})
+	var p2 wire.ListSubscriptionsPageResponse
+	if second.Code != http.StatusOK || json.Unmarshal(second.Body.Bytes(), &p2) != nil || p2.Total != 2 || len(p2.Subscriptions) != 1 || p2.NextAfter != "" {
+		t.Fatalf("second page = status %d, %+v", second.Code, p2)
+	}
+
+	limit := call(wire.PathSubscribe, wire.SubscribeRequest{Topic: "events", Name: "c"})
+	if limit.Code != http.StatusTooManyRequests || errorCode(limit) != "resource_exhausted" {
+		t.Fatalf("subscription limit = %d %s", limit.Code, limit.Body.String())
+	}
+	if _, err := eng.Send(ctx, "events", engine.OutMessage{Body: []byte("retained")}); err != nil {
+		t.Fatal(err)
+	}
+	notEmpty := call(wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: "events", Name: "a"})
+	if notEmpty.Code != http.StatusConflict || errorCode(notEmpty) != "subscription_not_empty" {
+		t.Fatalf("nonempty delete = %d %s", notEmpty.Code, notEmpty.Body.String())
+	}
+	missing := call(wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: "wrong", Name: "a", Force: true})
+	if missing.Code != http.StatusNotFound || errorCode(missing) != "not_found" {
+		t.Fatalf("wrong-topic delete = %d %s", missing.Code, missing.Body.String())
+	}
+	deleted := call(wire.PathDeleteSubscription, wire.DeleteSubscriptionRequest{Topic: "events", Name: "a", Force: true})
+	ack, decodeErr := wire.DecodeDeleteResponse(deleted.Body.Bytes())
+	if deleted.Code != http.StatusOK || decodeErr != nil || !ack.Deleted || ack.State != "deleted" {
+		t.Fatalf("force delete = %d %s: %v", deleted.Code, deleted.Body.String(), decodeErr)
+	}
+}
+
+func TestSubscriptionTTLRouteContract(t *testing.T) {
+	ctx := context.Background()
+	const createdAt = int64(1_700_000_000_000)
+	var now atomic.Int64
+	now.Store(createdAt)
+	eng, err := engine.Open(ctx, engine.Options{DB: ":memory:", DisableBackground: true, Now: now.Load})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	h := server.New(eng, nil).Handler()
+	call := func(body any) *httptest.ResponseRecorder {
+		t.Helper()
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe, bytes.NewReader(data)))
+		return rec
+	}
+	errorCode := func(rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		var body wire.ErrorBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Code
+	}
+
+	if rec := call(wire.SubscribeRequest{Topic: "events", Name: "durable"}); rec.Code != http.StatusOK {
+		t.Fatalf("legacy subscribe = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := call(wire.SubscribeWithOptionsRequest{
+		Topic: "events", Name: "temporary", Filter: &engine.Filter{Expr: `subject == "kept"`}, TTLMs: 5000,
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("TTL subscribe = %d: %s", rec.Code, rec.Body.String())
+	}
+	conflict := call(wire.SubscribeWithOptionsRequest{
+		Topic: "events", Name: "temporary", Filter: &engine.Filter{Expr: `subject == "discarded"`}, TTLMs: 1000,
+	})
+	if conflict.Code != http.StatusConflict || errorCode(conflict) != "name_conflict" {
+		t.Fatalf("changed TTL = %d: %s", conflict.Code, conflict.Body.String())
+	}
+	page, err := eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "events", IncludeDeleting: true})
+	if err != nil || page.Total != 2 {
+		t.Fatalf("inventory = %+v, %v", page, err)
+	}
+	var temporary engine.SubscriptionPageItem
+	for _, item := range page.Subscriptions {
+		if item.Name == "temporary" {
+			temporary = item
+		}
+	}
+	if temporary.Expr != `subject == "kept"` || temporary.CreatedAtMs != createdAt || temporary.ExpiresAtMs != createdAt+5000 {
+		t.Fatalf("temporary = %+v", temporary)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe, bytes.NewBufferString(
+		`{"topic":"events","name":"temporary","filter":{"expr":"subject == \"zero\""},"ttl_ms":0}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit zero TTL update = %d: %s", rec.Code, rec.Body.String())
+	}
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "events", IncludeDeleting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary = engine.SubscriptionPageItem{}
+	for _, item := range page.Subscriptions {
+		if item.Name == "temporary" {
+			temporary = item
+		}
+	}
+	if temporary.Name == "" || temporary.Expr != `subject == "zero"` ||
+		temporary.CreatedAtMs != createdAt || temporary.ExpiresAtMs != createdAt+5000 {
+		t.Fatalf("zero TTL moved the fixed deadline: %+v", temporary)
+	}
+
+	negative := call(wire.SubscribeWithOptionsRequest{Topic: "events", Name: "negative", TTLMs: -1})
+	if negative.Code != http.StatusBadRequest || errorCode(negative) != "invalid_argument" {
+		t.Fatalf("negative TTL = %d: %s", negative.Code, negative.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe,
+		bytes.NewBufferString(`{"topic":"events","name":"fractional","ttl_ms":1.5}`)))
+	if rec.Code != http.StatusBadRequest || errorCode(rec) != "invalid_argument" {
+		t.Fatalf("fractional TTL = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe,
+		bytes.NewBufferString(`{"topic":"events","name":"zero","ttl_ms":0}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("zero TTL = %d: %s", rec.Code, rec.Body.String())
+	}
+	page, err = eng.ListSubscriptionsWithOptions(ctx, engine.ListSubscriptionsOptions{Topic: "events", IncludeDeleting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zero engine.SubscriptionPageItem
+	for _, item := range page.Subscriptions {
+		if item.Name == "zero" {
+			zero = item
+		}
+	}
+	if zero.Name != "zero" || zero.ExpiresAtMs != 0 {
+		t.Fatalf("zero TTL subscription = %+v", zero)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, wire.PathSubscribe,
+		bytes.NewBufferString(`{"topic":"events","name":"null","ttl_ms":null}`)))
+	if rec.Code != http.StatusBadRequest || errorCode(rec) != "invalid_argument" {
+		t.Fatalf("null TTL = %d: %s", rec.Code, rec.Body.String())
+	}
+	now.Store(math.MaxInt64 - 100)
+	overflow := call(wire.SubscribeWithOptionsRequest{Topic: "events", Name: "overflow", TTLMs: 1000})
+	if overflow.Code != http.StatusBadRequest || errorCode(overflow) != "invalid_argument" {
+		t.Fatalf("overflow TTL = %d: %s", overflow.Code, overflow.Body.String())
 	}
 }
