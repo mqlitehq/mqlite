@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1399,4 +1402,1290 @@ func TestRedriveThrottleHandlesFarFutureSubscriptionExpiry(t *testing.T) {
 	if err := e.waitRedriveThrottle(ctx, math.MaxInt64); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("far-future expiry wait=%v, want context deadline", err)
 	}
+}
+
+// Go-native benchmarks for the embedded engine (no HTTP) — run with:
+//
+//	go test -bench=. -benchmem ./engine
+//	go test -bench=BenchmarkSendBatch64 -benchtime=3s ./engine
+//
+// These measure the in-process SDK path the same way real embedded users drive it,
+// and complement the container-based throughput/disk-IO matrix in test/bench/. Each
+// reports a msg/s metric alongside the standard ns/op + allocs.
+
+func benchEngine(b *testing.B) *Engine {
+	b.Helper()
+	e, err := Open(context.Background(), Options{
+		DB:                "file:" + filepath.Join(b.TempDir(), "mq.db"),
+		DisableBackground: true,
+	})
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	b.Cleanup(func() { _ = e.Close() })
+	return e
+}
+
+func BenchmarkSendOne(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	_ = e.CreateQueue(ctx, "q", QueueConfig{})
+	body := make([]byte, 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msg/s")
+}
+
+func BenchmarkSendBatch64(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	_ = e.CreateQueue(ctx, "q", QueueConfig{})
+	const batch = 64
+	msgs := make([]OutMessage, batch)
+	for i := range msgs {
+		msgs[i] = OutMessage{Body: make([]byte, 256)}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.Send(ctx, "q", msgs...); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N*batch)/b.Elapsed().Seconds(), "msg/s")
+}
+
+// benchmarkTopicFanout exercises routing plus enqueue for a stable topic roster.
+// Queue configuration is carried by the roster JOIN; an accidental per-subscription
+// metadata lookup makes this path visibly regress as fanout grows, especially on a
+// remote store where every lookup is a round trip.
+func benchmarkTopicFanout(b *testing.B, subscriptions int, subscriptionTTLMs int64) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	for i := 0; i < subscriptions; i++ {
+		name := fmt.Sprintf("sub-%02d", i)
+		var err error
+		if subscriptionTTLMs > 0 {
+			err = e.SubscribeWithOptions(ctx, "topic", name, nil, SubscribeOptions{TTLMs: subscriptionTTLMs})
+		} else {
+			err = e.Subscribe(ctx, "topic", name, nil)
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	body := make([]byte, 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.SendOne(ctx, "topic", OutMessage{Body: body}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "publish/s")
+	b.ReportMetric(float64(b.N*subscriptions)/b.Elapsed().Seconds(), "delivery/s")
+}
+
+func BenchmarkTopicFanout1(b *testing.B)   { benchmarkTopicFanout(b, 1, 0) }
+func BenchmarkTopicFanout32(b *testing.B)  { benchmarkTopicFanout(b, 32, 0) }
+func BenchmarkTopicFanout256(b *testing.B) { benchmarkTopicFanout(b, 256, 0) }
+
+// BenchmarkTopicFanoutTTL32 isolates the per-effect expiry fence for fixed-life
+// subscriptions. Its one-hour deadlines remain live for the whole benchmark.
+func BenchmarkTopicFanoutTTL32(b *testing.B) { benchmarkTopicFanout(b, 32, 3_600_000) }
+
+// BenchmarkSubscriptionCreateDelete measures serialized, one-use subscription
+// churn with low and high retained metadata cardinality. Seed setup is untimed.
+// Each lifecycle uses a fresh name and deletes an empty subscription, which is the
+// safe request/reply cleanup case without an ABA name reuse race.
+func BenchmarkSubscriptionCreateDelete(b *testing.B) {
+	for _, inventory := range []int{100, 10_000} {
+		b.Run(fmt.Sprintf("Retained%d", inventory), func(b *testing.B) {
+			ctx := context.Background()
+			e, err := Open(ctx, Options{
+				DB:                "file:" + filepath.Join(b.TempDir(), "mq.db"),
+				DisableBackground: true,
+				MaxSubscriptions:  inventory + 1,
+			})
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+			b.Cleanup(func() { _ = e.Close() })
+			if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+				SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+			) INSERT INTO queues(name,kind,created_at,updated_at)
+			  SELECT printf('retained-%05d',i),'subscription',1,1 FROM n`, inventory-1); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := e.db.exec(ctx, `
+				INSERT INTO subscriptions(topic,subscription,created_at)
+				SELECT 'retained',name,1 FROM queues WHERE kind='subscription'`); err != nil {
+				b.Fatal(err)
+			}
+
+			names := make([]string, b.N)
+			for i := range names {
+				names[i] = fmt.Sprintf("temporary-%08d", i)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for _, name := range names {
+				if err := e.Subscribe(ctx, "replies", name, nil); err != nil {
+					b.Fatal(err)
+				}
+				result, err := e.DeleteSubscriptionWithOptions(ctx, "replies", name, DeleteOptions{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if !result.Deleted {
+					b.Fatalf("empty subscription %q remained in state %q", name, result.State)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "lifecycle/s")
+		})
+	}
+}
+
+// BenchmarkListSubscriptionsPage measures the first 100-entry page together with
+// its exact snapshot total at representative inventories. Setup is untimed. The
+// result is page latency; it does not claim that creating 10,000 subscriptions is
+// a low-latency operation.
+func BenchmarkListSubscriptionsPage(b *testing.B) {
+	for _, inventory := range []int{1_000, 10_000} {
+		b.Run(fmt.Sprintf("Inventory%d/Page100", inventory), func(b *testing.B) {
+			ctx := context.Background()
+			e := benchEngine(b)
+			if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+				SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+			) INSERT INTO queues(name,kind,created_at,updated_at)
+			  SELECT printf('sub-%05d',i),'subscription',1,1 FROM n`, inventory-1); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := e.db.exec(ctx, `
+				INSERT INTO subscriptions(topic,subscription,created_at)
+				SELECT 'inventory',name,1 FROM queues WHERE kind='subscription'`); err != nil {
+				b.Fatal(err)
+			}
+
+			options := ListSubscriptionsOptions{Topic: "inventory", Limit: defaultSubscriptionPageSize}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				page, err := e.ListSubscriptionsWithOptions(ctx, options)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if page.Total != inventory || len(page.Subscriptions) != 100 {
+					b.Fatalf("page total/items = %d/%d, want %d/100", page.Total, len(page.Subscriptions), inventory)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "page/s")
+		})
+	}
+}
+
+// BenchmarkSubscriptionExpiryNoDue measures the once-per-second discovery pass
+// at the default metadata ceiling when every fixed lifetime is still in the
+// future. This is the steady-state cost paid by a broker that uses temporary
+// subscriptions but has no expiry work to perform.
+func BenchmarkSubscriptionExpiryNoDue(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	now := e.now()
+	const inventory = 10_000
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,expires_at,created_at,updated_at)
+	  SELECT printf('ttl-%05d',i),'subscription','active',?,?,? FROM n`,
+		inventory-1, now+3_600_000, now, now); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'temporary',name,created_at FROM queues WHERE kind='subscription'`); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		changed, pending, err := e.transitionExpiredSubscriptionsPass(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if changed != 0 || pending {
+			b.Fatalf("no-due pass changed=%d pending=%t", changed, pending)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "pass/s")
+}
+
+// BenchmarkSubscriptionExpiryBatch1000 measures one full indexed transition
+// transaction. Reactivating the fixed roster is untimed; physical cleanup is
+// covered by the lifecycle benchmarks because expired subscriptions enter that
+// same deletion path after this transition.
+func BenchmarkSubscriptionExpiryBatch1000(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	now := e.now()
+	const inventory = subscriptionExpiryBatch
+	if _, err := e.db.exec(ctx, `WITH RECURSIVE n(i) AS (
+		SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?
+	) INSERT INTO queues(name,kind,lifecycle_state,expires_at,created_at,updated_at)
+	  SELECT printf('due-%04d',i),'subscription','active',?,?,? FROM n`,
+		inventory-1, now, now-1, now-1); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := e.db.exec(ctx, `INSERT INTO subscriptions(topic,subscription,created_at)
+		SELECT 'temporary',name,created_at FROM queues WHERE kind='subscription'`); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		if _, err := e.db.exec(ctx, `UPDATE queues
+			SET lifecycle_state='active',delete_started_at=0,updated_at=?
+			WHERE kind='subscription'`, now-1); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		changed, pending, err := e.transitionExpiredSubscriptionsPass(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if changed != inventory || !pending {
+			b.Fatalf("full due pass changed=%d pending=%t", changed, pending)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N*inventory)/b.Elapsed().Seconds(), "subscription/s")
+}
+
+func BenchmarkReceiveComplete(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	_ = e.CreateQueue(ctx, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 100})
+	body := make([]byte, 256)
+	for i := 0; i < b.N; i++ { // prefill (untimed)
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for got := 0; got < b.N; {
+		msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 64})
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, m := range msgs {
+			if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+				b.Fatal(err)
+			}
+			got++
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msg/s")
+}
+
+// BenchmarkDrainConcurrent measures the path the MQLITE-50 fix actually changed: many
+// consumers draining one queue with Receive(batch)+CompleteBatch. The claim is a write,
+// so all workers serialize on the single writer — this is where N-commits-per-Receive
+// used to collapse. The msg/s metric is the regression signal: prefill b.N, drain with
+// `workers` goroutines, report throughput. (Single-threaded dequeue is BenchmarkReceiveComplete.)
+func BenchmarkDrainConcurrent(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	_ = e.CreateQueue(ctx, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 100})
+	body := make([]byte, 256)
+	for i := 0; i < b.N; i++ { // prefill (untimed)
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	const workers = 16
+	var mu sync.Mutex
+	var benchErr error
+	fail := func(err error) {
+		mu.Lock()
+		if benchErr == nil {
+			benchErr = err
+		}
+		mu.Unlock()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 50})
+				if err != nil {
+					fail(err)
+					return
+				}
+				if len(msgs) == 0 {
+					return // drained
+				}
+				items := make([]SettleItem, len(msgs))
+				for i, m := range msgs {
+					items[i] = SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+				}
+				if _, err := e.CompleteBatch(ctx, "q", items); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	b.StopTimer()
+	if benchErr != nil {
+		b.Fatal(benchErr)
+	}
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msg/s")
+}
+
+func BenchmarkE2E(b *testing.B) {
+	ctx := context.Background()
+	e := benchEngine(b)
+	_ = e.CreateQueue(ctx, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 100})
+	body := make([]byte, 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: body}); err != nil {
+			b.Fatal(err)
+		}
+		msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, m := range msgs {
+			if err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msg/s")
+}
+
+func eachLocalStore(t *testing.T, fn func(t *testing.T, dsn string)) {
+	t.Helper()
+	for _, dsn := range []string{":memory:", "file:" + filepath.Join(t.TempDir(), "mq.db")} {
+		name := "memory"
+		if dsn != ":memory:" {
+			name = "file"
+		}
+		t.Run(name, func(t *testing.T) { fn(t, dsn) })
+	}
+}
+
+// A caller who has ALREADY given up must not start work: nothing runs, so nothing can commit.
+func TestPreCancelledNeverExecutes(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+
+		dead, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := e.SendOne(dead, "q", OutMessage{Body: []byte("must-not-exist")}); err == nil {
+			t.Error("a pre-cancelled Send returned success")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+			t.Errorf("a pre-cancelled Send wrote %d message(s)", m.Total)
+		}
+	})
+}
+
+// A caller WAITING for the single writer must honour its own deadline — and must not commit after
+// it. This is the regression the round-4 review caught in the first attempt at this fix (a write
+// that waited out the holder and committed 500ms after the client had gone). It must never return.
+func TestCancelWhileWaitingWritesNothing(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+
+		held := make(chan struct{})
+		go func() {
+			_ = e.Tx(ctx, func(tx *EngineTx) error {
+				close(held)
+				time.Sleep(500 * time.Millisecond) // occupy the single writer
+				return nil
+			})
+		}()
+		<-held
+
+		start := time.Now()
+		short, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		_, err = e.SendOne(short, "q", OutMessage{Body: []byte("must-not-commit")})
+		took := time.Since(start)
+		cancel()
+
+		if err == nil {
+			t.Error("a Send that timed out while queued returned success")
+		}
+		if took > 300*time.Millisecond {
+			t.Errorf("a queued Send ignored its 80ms deadline (took %s)", took)
+		}
+		time.Sleep(600 * time.Millisecond) // the holder finishes; nothing may appear afterwards
+		if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+			t.Errorf("the timed-out Send committed LATE (total=%d)", m.Total)
+		}
+	})
+}
+
+// Cancelling EXECUTING statements — the renewer does this by design on every receive — must leave
+// the database usable. Interrupting a local statement leaks the connection: the file then stays
+// locked (SQLITE_BUSY, permanently) and `:memory:` is destroyed outright ("no such table:
+// messages"). Both were reproducible; ~40% of runs before the fix.
+func TestCancelStormLeavesTheDatabaseUsable(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000})
+		seed := make([]OutMessage, 64)
+		for i := range seed {
+			seed[i] = OutMessage{Body: []byte("m")}
+		}
+		if _, err := e.Send(ctx, "q", seed...); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 64})
+		if err != nil || len(msgs) != 64 {
+			t.Fatalf("receive: %v n=%d", err, len(msgs))
+		}
+		items := make([]SettleItem, len(msgs))
+		for i, m := range msgs {
+			items[i] = SettleItem{SeqNumber: m.SeqNumber, LockToken: m.LockToken}
+		}
+
+		// Reads, writes, batches and transactions, all interrupted mid-flight.
+		for i := 0; i < 200; i++ {
+			cctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%5)*100*time.Microsecond)
+			_, _ = e.RenewBatch(cctx, "q", items)                             // set-based write
+			_, _ = e.SendOne(cctx, "q", OutMessage{Body: []byte("x")})        // transaction
+			_ = e.Complete(cctx, "q", items[0].SeqNumber, items[0].LockToken) // settle
+			_, _ = e.Peek(cctx, "q", PeekOptions{Max: 10})                    // read
+			_ = e.Tx(cctx, func(tx *EngineTx) error { _, e := tx.SendOne("q", OutMessage{Body: []byte("t")}); return e })
+			cancel()
+		}
+
+		if _, err := e.Stats(ctx, "q"); err != nil {
+			t.Fatalf("the database is unusable after cancellations: %v", err)
+		}
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("cannot write after cancellations: %v", err)
+		}
+		if _, err := e.Peek(ctx, "q", PeekOptions{Max: 1}); err != nil {
+			t.Fatalf("cannot read after cancellations: %v", err)
+		}
+	})
+}
+
+// Two `:memory:` engines are still two separate databases.
+func TestMemoryEnginesStayIsolated(t *testing.T) {
+	ctx := context.Background()
+	a, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := Open(ctx, Options{DB: ":memory:", DisableBackground: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	mustQueue(t, a, "only-in-a", QueueConfig{})
+	if _, err := b.Stats(ctx, "only-in-a"); err == nil {
+		t.Error("a queue created in one :memory: engine is visible in another")
+	}
+}
+
+// A transaction cancelled BETWEEN its statements must roll back. The statements are protected from
+// interruption; the transaction is not. Committing here would persist work the caller had already
+// abandoned — "a statement already executing finishes" is not "a transaction already begun
+// commits" (codex, round-5 follow-up).
+func TestTxCancelledBetweenStatementsRollsBack(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		err = e.Tx(cctx, func(tx *EngineTx) error {
+			if _, err := tx.SendOne("q", OutMessage{Body: []byte("first")}); err != nil {
+				return err
+			}
+			cancel() // the caller gives up, mid-callback, between statements
+			if _, err := tx.SendOne("q", OutMessage{Body: []byte("second")}); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err == nil {
+			t.Error("a transaction cancelled mid-callback reported success")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.Total != 0 {
+			t.Errorf("a cancelled transaction committed %d message(s) — it must roll back", m.Total)
+		}
+	})
+}
+
+// The storm above completes the same message over and over, so after the first success every later
+// Complete is a no-op and its WRITE is never actually interrupted — a hole codex found in my own
+// acceptance test. This one gives every iteration a fresh, genuinely-locked message, so the fenced
+// settle write is the thing being cancelled.
+func TestCancelledSettleWritesLeaveTheDatabaseUsable(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 600_000, MaxDeliveryCount: 100})
+
+		for i := 0; i < 150; i++ {
+			if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("m")}); err != nil {
+				t.Fatalf("send %d: %v", i, err)
+			}
+			msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+			if err != nil || len(msgs) != 1 {
+				t.Fatalf("receive %d: %v n=%d", i, err, len(msgs))
+			}
+			m := msgs[0]
+
+			// Cancel while the fenced settle write is in flight. Each verb, in turn.
+			cctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%4)*80*time.Microsecond)
+			switch i % 4 {
+			case 0:
+				_ = e.Complete(cctx, "q", m.SeqNumber, m.LockToken)
+			case 1:
+				_ = e.Abandon(cctx, "q", m.SeqNumber, m.LockToken, 0)
+			case 2:
+				_ = e.Reject(cctx, "q", m.SeqNumber, m.LockToken, ReasonAppRequested, "")
+			case 3:
+				_ = e.Defer(cctx, "q", m.SeqNumber, m.LockToken)
+			}
+			cancel()
+		}
+
+		if _, err := e.Stats(ctx, "q"); err != nil {
+			t.Fatalf("the database is unusable after cancelled settle writes: %v", err)
+		}
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("cannot write after cancelled settles: %v", err)
+		}
+	})
+}
+
+// The window between "the wait returned" and "the statement starts" is real: past that point
+// cancellation is deliberately gone, so a caller who gives up THERE would otherwise have a
+// destructive operation run on its behalf anyway. Nothing may BEGIN for a caller who has given up
+// (codex, round-5 follow-up).
+//
+// Cancel the caller while it is queued behind the writer, then let the writer go: the operation
+// must not run, whatever the scheduling.
+func TestCancelInTheHandoffWindowStartsNothing(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{})
+		if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("keep-me")}); err != nil {
+			t.Fatal(err)
+		}
+		msgs, _ := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+		if len(msgs) != 1 {
+			t.Fatal("receive")
+		}
+		if err := e.Reject(ctx, "q", msgs[0].SeqNumber, msgs[0].LockToken, ReasonAppRequested, ""); err != nil {
+			t.Fatal(err) // one dead letter to purge
+		}
+
+		// Hold the writer, queue a destructive Purge behind it, and cancel that caller while it waits.
+		release := make(chan struct{})
+		held := make(chan struct{})
+		go func() {
+			_ = e.Tx(ctx, func(tx *EngineTx) error {
+				close(held)
+				<-release
+				return nil
+			})
+		}()
+		<-held
+
+		cctx, cancel := context.WithCancel(context.Background())
+
+		// Cancel the caller EXACTLY in the handoff window: the connection is in hand, the statement
+		// has not started. Cancelling any earlier is uninteresting — the wait itself would fail.
+		afterConnAcquired = func() { cancel() }
+		defer func() { afterConnAcquired = nil }()
+
+		done := make(chan error, 1)
+		go func() {
+			_, perr := e.Purge(cctx, "q", RedriveOptions{})
+			done <- perr
+		}()
+		time.Sleep(50 * time.Millisecond) // queued behind the writer
+		close(release)                    // the writer lets go; the purge acquires the conn, then dies
+
+		if err := <-done; err == nil {
+			t.Error("a Purge whose caller had given up ran anyway")
+		}
+		if m, _ := e.Stats(ctx, "q"); m.DeadLettered != 1 {
+			t.Errorf("dead_lettered=%d — the cancelled Purge destroyed data on behalf of a caller who was gone", m.DeadLettered)
+		}
+	})
+}
+
+// A transaction whose caller has given up must stop ISSUING statements — not grind through the
+// rest of the closure and roll back at the end.
+//
+// The statements inside a local transaction deliberately run on an uninterruptible context, which
+// is what keeps an in-flight write from wedging the database. The trap is that "uninterruptible"
+// used to mean the closure kept going: a cancelled caller's 256-message Send still executed all
+// 256 inserts. The rule for mqlite-owned statements is per-statement, and *txn enforces it:
+// a statement already executing finishes; the next one does not begin. Raw EngineTx.SQL calls
+// bypass these guards; the public boundary is pinned in sdk_test.go (MQLITE-103).
+func TestCancelledTransactionStopsIssuingStatements(t *testing.T) {
+	statements := []struct {
+		name string
+		run  func(context.Context, *txn) error
+	}{
+		{"ExecContext", func(ctx context.Context, tx *txn) error {
+			_, err := tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES ('probe2','1')`)
+			return err
+		}},
+		{"QueryContext", func(ctx context.Context, tx *txn) error {
+			rows, err := tx.QueryContext(ctx, `INSERT INTO meta(key,value) VALUES ('probe2','1') RETURNING value`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+			}
+			return rows.Err()
+		}},
+		{"QueryRowContext", func(ctx context.Context, tx *txn) error {
+			var value string
+			return tx.QueryRowContext(ctx, `INSERT INTO meta(key,value) VALUES ('probe2','1') RETURNING value`).Scan(&value)
+		}},
+	}
+	var want, got []string
+	for _, statement := range statements {
+		want = append(want, statement.name)
+	}
+	want = append(want, "SQL") // The raw escape hatch is intentionally outside the guard.
+	txType := reflect.TypeOf((*txn)(nil))
+	for i := 0; i < txType.NumMethod(); i++ {
+		got = append(got, txType.Method(i).Name)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("txn methods = %v, want %v; extend the cancellation checks for new methods", got, want)
+	}
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		for _, statement := range statements {
+			t.Run(statement.name, func(t *testing.T) {
+				cctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				var second error
+				txErr := e.inTx(cctx, func(ec context.Context, tx *txn) error {
+					if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('probe','1')`); err != nil {
+						t.Fatalf("the FIRST statement runs normally: %v", err)
+					}
+					cancel() // the caller gives up, mid-transaction
+					second = statement.run(ec, tx)
+					return second
+				})
+				if !errors.Is(second, context.Canceled) {
+					t.Fatalf("the statement AFTER the cancellation must not be issued at all; got err=%v", second)
+				}
+				if !errors.Is(txErr, context.Canceled) {
+					t.Fatalf("inTx must surface the cancellation, got %v", txErr)
+				}
+
+				// ...and the transaction rolled back, so not even the first statement survives.
+				var n int
+				if err := e.db.queryRowScan(context.Background(), []any{&n},
+					`SELECT COUNT(*) FROM meta WHERE key IN ('probe','probe2')`); err != nil {
+					t.Fatal(err)
+				}
+				if n != 0 {
+					t.Fatalf("a cancelled transaction committed %d row(s) — it must roll back entirely", n)
+				}
+			})
+		}
+
+		// The database is still perfectly usable: nothing was interrupted, so nothing leaked.
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable after a cancelled transaction: %v", err)
+		}
+	})
+}
+
+// A panicking transaction callback must not take the writer down with it.
+//
+// Engine.Tx runs USER code. If it panics, unwinding hits withConn's `defer conn.Close()` — and
+// Close BLOCKS while the transaction is still open. Without a deferred rollback the panic never
+// even reaches the caller: the goroutine parks inside Close, and the process's one local writer is
+// wedged for good (codex, round-6). Deadlocks do not announce themselves, so this test is written
+// to fail by TIMING OUT rather than to hang the suite.
+func TestPanickingTransactionDoesNotWedgeTheWriter(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		panicked := make(chan any, 1)
+		go func() {
+			defer func() { panicked <- recover() }()
+			_ = e.inTx(ctx, func(ec context.Context, tx *txn) error {
+				if _, err := tx.ExecContext(ec, `INSERT INTO meta(key,value) VALUES ('boom','1')`); err != nil {
+					t.Errorf("setup statement: %v", err)
+				}
+				panic("the callback blew up")
+			})
+		}()
+
+		select {
+		case got := <-panicked:
+			if got != "the callback blew up" {
+				t.Fatalf("the panic must reach the caller unchanged, got %v", got)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the panic never surfaced: the connection is still held by an open transaction " +
+				"and Close is blocked on it — the single writer is wedged")
+		}
+
+		// The writer survived, and the panicking transaction committed nothing.
+		done := make(chan error, 1)
+		go func() {
+			_, serr := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")})
+			done <- serr
+		}()
+		select {
+		case serr := <-done:
+			if serr != nil {
+				t.Fatalf("the store is unusable after a panicking transaction: %v", serr)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the writer is wedged after a panicking transaction")
+		}
+
+		var n int
+		if err := e.db.queryRowScan(context.Background(), []any{&n},
+			`SELECT COUNT(*) FROM meta WHERE key='boom'`); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("a panicking transaction committed its work (%d row(s)) — it must roll back", n)
+		}
+	})
+}
+
+// Reclamation is a multi-statement sequence pinned to one connection, so the per-statement rule has
+// to hold there too: a cancelled Compact must stop starting SQL rather than run the vacuum and a
+// second checkpoint for a caller who has gone (codex, round-6).
+func TestCancelledReclaimStopsStartingStatements(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		cctx, cancel := context.WithCancel(context.Background())
+		// Cancel with the sequence ALREADY RUNNING — after the first checkpoint. Cancelling sooner
+		// proves nothing: withConn's pre-start check would refuse the whole callback and the guards
+		// under test would never be reached.
+		afterFirstCheckpoint = func() { cancel() }
+		defer func() { afterFirstCheckpoint = nil }()
+
+		if err := e.reclaimPages(cctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("a reclaim cancelled mid-sequence must stop starting statements, not run the\n"+
+				"vacuum and a second checkpoint anyway; got err=%v", err)
+		}
+		afterFirstCheckpoint = nil
+
+		// Nothing was interrupted, so nothing leaked: the store still works.
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable after a cancelled reclaim: %v", err)
+		}
+	})
+}
+
+// The last two windows where work could still BEGIN for a caller who had already gone. Both are
+// after withConn's checks have passed, so both need a look of their own (codex, round-6).
+func TestNothingBeginsInTheLastWindowBeforeAStatement(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 60_000, MaxDeliveryCount: 10})
+
+		// 1. While buildArgs runs. It reads the clock, so it can be preempted — and a renewer that
+		//    has been told to stop must not go on to extend the lease it was about to renew.
+		t.Run("while the arguments are being built", func(t *testing.T) {
+			cctx, cancel := context.WithCancel(context.Background())
+			_, err := e.db.execFresh(cctx, `INSERT INTO meta(key,value) VALUES (?,?)`, func() []any {
+				cancel() // the caller gives up exactly here
+				return []any{"fresh", "1"}
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("a statement whose caller gave up while its arguments were being built must\n"+
+					"not run; got err=%v", err)
+			}
+			var n int
+			if err := e.db.queryRowScan(context.Background(), []any{&n},
+				`SELECT COUNT(*) FROM meta WHERE key='fresh'`); err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Fatal("it ran anyway")
+			}
+		})
+
+		// 2. Between BeginTx and the callback. fn is PUBLIC code — an Engine.Tx callback — and once
+		//    it starts it holds the single writer until it returns.
+		t.Run("between BeginTx and the callback", func(t *testing.T) {
+			cctx, cancel := context.WithCancel(context.Background())
+			afterBeginTx = func() { cancel() }
+			defer func() { afterBeginTx = nil }()
+
+			ran := false
+			err := e.inTx(cctx, func(ec context.Context, tx *txn) error {
+				ran = true
+				return nil
+			})
+			afterBeginTx = nil
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("inTx must surface the cancellation, got %v", err)
+			}
+			if ran {
+				t.Fatal("the callback ran for a caller who had already given up — and it holds the\n" +
+					"single writer for as long as it wants to")
+			}
+		})
+
+		if _, err := e.SendOne(context.Background(), "q", OutMessage{Body: []byte("after")}); err != nil {
+			t.Fatalf("the store is unusable afterwards: %v", err)
+		}
+	})
+}
+
+// Concurrency invariants — the properties that make a queue a queue, asserted under real parallelism.
+//
+// Everything else in this suite tests what the engine SAYS when you ask it something. These tests
+// watch what it DOES while many consumers hammer it at once, and they are here because that is
+// precisely where this codebase has no eyes: every P1 found in review rounds 4-6 lived in behaviour
+// that was observable but unobserved.
+//
+// The invariants below are the ones whose violation is unrecoverable for a user — a message handled
+// twice at the same time, a message handled after it was completed, a message that simply vanishes.
+// They are checked by an oracle that watches the deliveries, not by asking the engine to grade
+// itself, because an engine with a bug will happily report that everything is fine.
+
+// exclusivity is the oracle. It records who holds what, and screams the moment two consumers hold
+// the same message at once — which is the failure a lock-based queue exists to prevent.
+//
+// It models the lease, because exclusivity IS the lease: a consumer owns a message only until
+// locked_until, and a redelivery after that instant is not a violation, it is the documented
+// at-least-once contract doing its job. The first version of this oracle ignored expiry and duly
+// "found" dozens of violations that were the reaper working correctly — a reminder that an oracle
+// which does not model the spec just measures its own misunderstanding.
+//
+// Holders are keyed by LOCK TOKEN, not by consumer: after a redelivery the same consumer may hold
+// the same seq under a new token, and the old holder's late settle must not be mistaken for the new
+// one's.
+type holder struct {
+	consumer    int
+	token       string
+	lockedUntil int64 // epoch ms; past this, the holder owns nothing
+}
+
+type exclusivity struct {
+	mu         sync.Mutex
+	held       map[int64]holder
+	done       map[int64]bool // completed: a delivery after this is a settled message coming back
+	deliveries map[int64]int
+
+	violations []string
+}
+
+func newExclusivity() *exclusivity {
+	return &exclusivity{held: map[int64]holder{}, done: map[int64]bool{}, deliveries: map[int64]int{}}
+}
+
+func (x *exclusivity) fail(format string, a ...any) {
+	x.violations = append(x.violations, fmt.Sprintf(format, a...))
+}
+
+// claim records a delivery, the instant a consumer receives a message.
+func (x *exclusivity) claim(seq int64, consumer int, token string, lockedUntil, now int64) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.deliveries[seq]++
+	if prev, busy := x.held[seq]; busy && prev.lockedUntil > now {
+		x.fail("seq %d was delivered to consumer %d while consumer %d STILL HELD A LIVE LOCK on it "+
+			"(%dms of lease left) — two consumers are processing the same message at the same time",
+			seq, consumer, prev.consumer, prev.lockedUntil-now)
+		return
+	}
+	if x.done[seq] {
+		x.fail("seq %d was delivered to consumer %d AFTER it had been completed "+
+			"— a settled message came back", seq, consumer)
+		return
+	}
+	x.held[seq] = holder{consumer: consumer, token: token, lockedUntil: lockedUntil}
+}
+
+// renewed extends the lease the oracle believes in, so a renewing holder does not look expired.
+func (x *exclusivity) renewed(seq int64, token string, lockedUntil int64) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if h, ok := x.held[seq]; ok && h.token == token {
+		h.lockedUntil = lockedUntil
+		x.held[seq] = h
+	}
+}
+
+// settled records the outcome of a settle by the holder of `token`. It is a no-op when the message
+// has already moved on to a newer token — that holder lost its lease and owns nothing.
+func (x *exclusivity) settled(seq int64, token string, completed bool) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	h, ok := x.held[seq]
+	if !ok || h.token != token {
+		return // stale holder; the engine will have told it ErrLockLost
+	}
+	delete(x.held, seq)
+	if completed {
+		x.done[seq] = true
+	}
+}
+
+func (x *exclusivity) completedCount() int {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return len(x.done)
+}
+
+func (x *exclusivity) report(t *testing.T) {
+	t.Helper()
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if len(x.violations) == 0 {
+		return
+	}
+	for i, v := range x.violations {
+		if i == 8 {
+			t.Errorf("... and %d more", len(x.violations)-8)
+			break
+		}
+		t.Errorf("INVARIANT VIOLATED: %s", v)
+	}
+	t.FailNow()
+}
+
+// TestConcurrentConsumersNeverShareAMessage runs many consumers against one queue, in parallel, for
+// real, and asserts the three invariants a user cannot work around:
+//
+//  1. EXCLUSIVE DELIVERY — while a consumer holds a lock, nobody else may be handed that message.
+//  2. NO ZOMBIE DELIVERY — a completed message is never delivered again.
+//  3. NO LOSS — every message sent is eventually completed. Not "most": every one.
+//
+// The consumers do not behave: they abandon, defer, renew, let locks expire on purpose, and settle
+// with the wrong token. Locks are short and the reaper is running, so expiry races the handler —
+// which is the exact window where a real system double-delivers.
+func TestConcurrentConsumersNeverShareAMessage(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		const (
+			messages      = 400
+			consumers     = 8
+			drainConsumer = -1
+		)
+		ctx := context.Background()
+		e, err := Open(ctx, Options{DB: dsn})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+
+		// A legacy short lease with the reaper live: expiry genuinely races the handler. New
+		// configurations reject this value, but existing databases retain it across upgrades,
+		// so their exclusivity guarantee remains part of the compatibility surface.
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 100})
+		if _, err := e.db.exec(ctx, `UPDATE queues SET lock_duration_ms=300 WHERE name='q'`); err != nil {
+			t.Fatal(err)
+		}
+
+		for i := 0; i < messages; i++ {
+			if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte(fmt.Sprintf("m%d", i))}); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		x := newExclusivity()
+		var completed int64
+		deadline := time.Now().Add(20 * time.Second)
+
+		var wg sync.WaitGroup
+		for c := 0; c < consumers; c++ {
+			wg.Add(1)
+			go func(consumer int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(int64(consumer) + 1))
+				for atomic.LoadInt64(&completed) < messages && time.Now().Before(deadline) {
+					msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1 + rng.Intn(4), WaitMs: 50})
+					if err != nil {
+						t.Errorf("consumer %d: receive: %v", consumer, err)
+						return
+					}
+					for _, m := range msgs {
+						x.claim(m.SeqNumber, consumer, m.LockToken, m.LockedUntilMs, time.Now().UnixMilli())
+					}
+					for _, m := range msgs {
+						switch rng.Intn(10) {
+						case 0, 1:
+							// Give it back. Somebody else must be able to take it — but only after
+							// we have let go.
+							x.settled(m.SeqNumber, m.LockToken, false)
+							if err := e.Abandon(ctx, "q", m.SeqNumber, m.LockToken, 0); err != nil &&
+								!errors.Is(err, ErrLockLost) {
+								t.Errorf("consumer %d: abandon: %v", consumer, err)
+							}
+						case 2:
+							// OVERRUN the lease and then try to settle. Expiry itself fences the
+							// holder, even if the reaper has not reclaimed the row yet.
+							time.Sleep(time.Duration(400+rng.Intn(200)) * time.Millisecond)
+							err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken)
+							x.settled(m.SeqNumber, m.LockToken, false)
+							if !errors.Is(err, ErrLockLost) {
+								t.Errorf("consumer %d: late complete: %v, want ErrLockLost", consumer, err)
+								return
+							}
+						case 3:
+							// Renew, then complete: the lease must hold across the renewal.
+							// The request's start gives a conservative lease bound. Adding the
+							// duration after a slow response could invent lease time never granted.
+							started := time.Now().UnixMilli()
+							if err := e.Renew(ctx, "q", m.SeqNumber, m.LockToken); err == nil {
+								x.renewed(m.SeqNumber, m.LockToken, started+300)
+							} else if !errors.Is(err, ErrLockLost) {
+								t.Errorf("consumer %d: renew: %v", consumer, err)
+							}
+							fallthrough
+						default:
+							err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken)
+							x.settled(m.SeqNumber, m.LockToken, err == nil)
+							if err == nil {
+								atomic.AddInt64(&completed, 1)
+							} else if !errors.Is(err, ErrLockLost) {
+								t.Errorf("consumer %d: complete: %v", consumer, err)
+							}
+						}
+					}
+				}
+			}(c)
+		}
+		wg.Wait()
+
+		x.report(t) // invariants 1 and 2
+		if x.completedCount() != messages {
+			// The randomized phase may stop with a valid short lease still in flight.
+			// Give the reaper and one well-behaved consumer a bounded convergence window
+			// before deciding that a message is lost or permanently stuck.
+			drainDeadline := time.Now().Add(5 * time.Second)
+			for x.completedCount() < messages && time.Now().Before(drainDeadline) {
+				msgs, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1, WaitMs: 50})
+				if err != nil {
+					t.Fatalf("drain receive: %v", err)
+				}
+				if len(msgs) == 0 {
+					continue
+				}
+				m := msgs[0]
+				x.claim(m.SeqNumber, drainConsumer, m.LockToken, m.LockedUntilMs, time.Now().UnixMilli())
+				err = e.Complete(ctx, "q", m.SeqNumber, m.LockToken)
+				x.settled(m.SeqNumber, m.LockToken, err == nil)
+				if err == nil {
+					atomic.AddInt64(&completed, 1)
+				} else if !errors.Is(err, ErrLockLost) {
+					t.Fatalf("drain complete: %v", err)
+				}
+			}
+			x.report(t) // the convergence consumer obeys the same exclusivity oracle
+		}
+
+		// Invariant 3: nothing was lost. Every message sent came out the other side.
+		if got := x.completedCount(); got != messages {
+			var stuck []int64
+			for seq := int64(1); seq <= messages; seq++ {
+				if !x.done[seq] {
+					stuck = append(stuck, seq)
+					if len(stuck) == 10 {
+						break
+					}
+				}
+			}
+			m, _ := e.Stats(context.Background(), "q")
+			t.Fatalf("DRAIN TIMEOUT: %d of %d messages were completed after the convergence window.\n"+
+				"  still in the queue: active=%d locked=%d dead=%d deferred=%d\n"+
+				"  not completed (first few): %v\n"+
+				"  every sent message must remain recoverable and converge to completion.",
+				got, messages, m.Active, m.Locked, m.DeadLettered, m.Deferred, stuck)
+		}
+	})
+}
+
+// TestConcurrentSettlementPicksExactlyOneWinner is the exclusivity invariant reduced to its sharpest
+// form: two consumers, one message, a lock that has just expired. Both of them try to settle it.
+//
+// Exactly the new, still-live holder may win. The fake clock is held still while both calls race:
+// if both leases expired, refusing both would be correct and would say nothing about exclusivity.
+//
+// It runs many rounds because this is a race: a single round proves nothing.
+func TestConcurrentSettlementPicksExactlyOneWinner(t *testing.T) {
+	eachLocalStore(t, func(t *testing.T, dsn string) {
+		ctx := context.Background()
+		var now atomic.Int64
+		now.Store(1_700_000_000_000)
+		e, err := Open(ctx, Options{DB: dsn, Now: now.Load, DisableBackground: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		mustQueue(t, e, "q", QueueConfig{LockDurationMs: 1_000, MaxDeliveryCount: 100})
+
+		const rounds = 60
+		for r := 0; r < rounds; r++ {
+			if _, err := e.SendOne(ctx, "q", OutMessage{Body: []byte("x")}); err != nil {
+				t.Fatal(err)
+			}
+			first, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+			if err != nil || len(first) != 1 {
+				t.Fatalf("round %d: first receive: %v (%d)", r, err, len(first))
+			}
+			a := first[0]
+
+			// Let the lease lapse and hand the message to a second consumer. Now TWO tokens exist
+			// for one message: A's, which is stale, and B's, which is live.
+			now.Store(a.LockedUntilMs)
+			e.RunMaintenanceOnce(ctx)
+			second, err := e.Receive(ctx, "q", ReceiveOptions{MaxMessages: 1})
+			if err != nil || len(second) != 1 {
+				t.Fatalf("round %d: the reaper did not release the expired lock: %v (%d)", r, err, len(second))
+			}
+			b := second[0]
+			if b.SeqNumber != a.SeqNumber {
+				t.Fatalf("round %d: expected the same message back, got %d and %d", r, a.SeqNumber, b.SeqNumber)
+			}
+			if a.LockToken == b.LockToken {
+				t.Fatalf("round %d: the redelivery reused the lock token — the fence is not a fence", r)
+			}
+
+			// Both consumers finish at the same instant and both try to acknowledge.
+			var wins int64
+			var staleWon int64
+			var wg sync.WaitGroup
+			for _, m := range []*Message{a, b} {
+				wg.Add(1)
+				go func(m *Message, stale bool) {
+					defer wg.Done()
+					err := e.Complete(ctx, "q", m.SeqNumber, m.LockToken)
+					switch {
+					case err == nil:
+						atomic.AddInt64(&wins, 1)
+						if stale {
+							atomic.AddInt64(&staleWon, 1)
+						}
+					case errors.Is(err, ErrLockLost): // the honest answer for the stale holder
+					default:
+						t.Errorf("round %d: unexpected error: %v", r, err)
+					}
+				}(m, m.LockToken == a.LockToken)
+			}
+			wg.Wait()
+
+			if wins != 1 {
+				t.Fatalf("round %d: %d of 2 racing consumers were told their Complete succeeded.\n"+
+					"  exactly one may win. Telling both they succeeded means the message was\n"+
+					"  processed twice and both acknowledgements were accepted.", r, wins)
+			}
+			// And "exactly one" is not enough on its own: the winner must be the RIGHT one. A queue
+			// that lets the STALE holder settle has no fence at all — it merely has a race, and the
+			// live holder (which is the one actually processing the message) is told it lost a lock
+			// it still held. Counting winners alone cannot see this; asking WHO won can.
+			if staleWon != 0 {
+				t.Fatalf("round %d: the settle was accepted from the holder of the EXPIRED lock.\n"+
+					"  the message had already been reassigned, and its new owner — the one actually\n"+
+					"  processing it — was told ErrLockLost. lock_token is not fencing anything.", r)
+			}
+			// And it really is gone.
+			left, err := e.Peek(ctx, "q", PeekOptions{Max: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(left) != 0 {
+				t.Fatalf("round %d: the message survived a successful Complete (%d left)", r, len(left))
+			}
+		}
+	})
 }

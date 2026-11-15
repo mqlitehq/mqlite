@@ -3,6 +3,8 @@ package mqlite
 import (
 	"errors"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -65,5 +67,68 @@ func TestParseDSNErrorKeepsCauseWithoutCredentials(t *testing.T) {
 				t.Fatal("connection string error lost its safe parse cause")
 			}
 		})
+	}
+}
+
+// TestNoStrayLegacyPort guards the 6754 migration (MQLITE-84): the previous default broker
+// port must not reappear as a casual default anywhere in the tracked source or docs. The
+// only places allowed to name it are deliberate upgrade/compat documents below.
+// Any new occurrence fails loudly so the old port can't quietly creep back as a default.
+//
+// The needle is assembled at runtime so this guard never matches itself.
+func TestNoStrayLegacyPort(t *testing.T) {
+	needle := "80" + "80"
+
+	allow := map[string]bool{
+		filepath.FromSlash("CHANGELOG.md"): true, // documents the changed default + compat mapping
+		// The deploy guide must say which port the image you can actually PULL listens on:
+		// until v0.3.0 is tagged that is 0.2.x, and it is still the old port. Telling people to
+		// publish 6754 for an image that binds the legacy port is how you get a broker that
+		// silently answers nothing (review round-3 §3.1). This is migration documentation, the
+		// case this guard explicitly allows for — not a default creeping back.
+		filepath.FromSlash("docs/deployment.md"): true,
+		// The operations runbook explicitly rehearses the old-to-new port/schema cutover.
+		filepath.FromSlash("docs/operations.md"): true,
+	}
+	skipDir := map[string]bool{
+		".git": true, "node_modules": true, "bin": true, "testdata": true,
+		"out": true, "web": true, // server/web is a vendored, minified console dist
+	}
+	textExt := map[string]bool{
+		".go": true, ".md": true, ".yml": true, ".yaml": true, ".toml": true,
+		".sh": true, ".py": true, ".txt": true, ".example": true, ".mjs": true,
+	}
+
+	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if skipDir[info.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel := strings.TrimPrefix(filepath.ToSlash(path), "./")
+		if allow[filepath.FromSlash(rel)] {
+			return nil
+		}
+		if info.Name() != "Dockerfile" && !textExt[filepath.Ext(info.Name())] {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, ln := range strings.Split(string(b), "\n") {
+			if strings.Contains(ln, needle) {
+				t.Errorf("%s:%d uses the legacy default port (switch to 6754, or allowlist in "+
+					"dsn_test.go if it is deliberate migration docs): %s", rel, i+1, strings.TrimSpace(ln))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
 	}
 }
