@@ -1,6 +1,8 @@
 # Conformance — correct mqlite behavior (TCK)
 
-This specification follows `main` for release target v0.4.3. For an installed
+This specification covers released v0.4.3 behavior and follows `main` for later
+documentation corrections. Use the [v0.4.3 conformance specification](https://github.com/mqlitehq/mqlite/blob/v0.4.3/docs/conformance.md)
+for the exact release snapshot. For an installed
 v0.4.2 release, use the [conformance specification at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/conformance.md);
 see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 

@@ -1,6 +1,8 @@
 # Examples
 
-These examples follow `main` for release target v0.4.3. For an installed
+These examples cover released v0.4.3 behavior and follow `main` for later
+documentation corrections. Use the [v0.4.3 examples](https://github.com/mqlitehq/mqlite/blob/v0.4.3/docs/examples.md)
+for the exact release snapshot. For an installed
 v0.4.2 release, use the [examples at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/examples.md);
 see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 

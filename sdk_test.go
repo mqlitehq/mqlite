@@ -1781,8 +1781,8 @@ func TestReleaseDocsPinLatestDatedRelease(t *testing.T) {
 // from Markdown. Review both files together before updating these hashes (MQLITE-110).
 func TestConceptsCompanionReview(t *testing.T) {
 	want := map[string]string{
-		"concepts.md":   "7c836de85d036a90e1bb8d4a63e942ad8bf2d19ad9b69d32416658223bbcb1b9",
-		"concepts.html": "fcdb1281472ddaebc99a5efe6446257317300d35f8bf0f82e40fc223bf9a944d",
+		"concepts.md":   "917a0e6567c6290819646fcaed1bf0bf51279af0539f46e64cf51f569bd87a1d",
+		"concepts.html": "94db149127870ac1134e6eaa6aab3b458bd382eb6a357a9c78d564f26dd9b4ea",
 	}
 	for name, digest := range want {
 		t.Run(name, func(t *testing.T) {

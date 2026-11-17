@@ -14,8 +14,9 @@ explicitly `linux/amd64`.
 An ARM host uses Docker's emulation; this does not benchmark native ARM performance.
 
 Use the matching release checkout so the broker, dashboard and rules come from the
-same source. This example targets v0.4.3 with schema token 7. Confirm the tag
-and assets on [Releases](https://github.com/mqlitehq/mqlite/releases) before use.
+same source. This example uses released v0.4.3 with schema token 7; its
+[release page](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3) provides
+the archives, checksums and qualification limits.
 
 Stop the v0.3.2 starter before launching this stack because both versions publish
 the same loopback ports. From its old checkout, run `docker compose down` in
