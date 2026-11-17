@@ -12,7 +12,12 @@ upgrade notes before replacing a broker.
 
 ## Unreleased
 
-## v0.4.3 — 2026-11-11
+## v0.4.3 — 2026-11-17
+
+Published with maintainer-approved bounded qualification. The planned 24/48-hour
+acceptance and eight spaced Turso windows were not completed; the
+[release notes](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3) record the
+completed checks and their limits.
 
 - Preserve embedded NUL bytes in remote message metadata and dead-letter text
   results.
@@ -140,8 +145,8 @@ upgrade notes before replacing a broker.
 ### Distinguish main documentation from v0.4.2 (MQLITE-149)
 
 - Mark the README, HTTP reference, and operations runbook as following `main`,
-  with unreleased lease, shutdown, and managed Receiver behavior. Link the
-  v0.4.2 documentation for operators using the published binary, and clarify
+  with the lease, shutdown, and managed Receiver behavior released in v0.4.3.
+  Link the v0.4.2 documentation for operators using that older binary, and clarify
   that broker shutdown does not implement application consumer draining.
 
 ### Make preserving live leases the safe startup default (MQLITE-137 follow-up)

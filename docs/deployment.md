@@ -48,10 +48,10 @@ and error reference: [api-reference.md](api-reference.md).
 ## Docker / GHCR
 
 > **Version and upgrade compatibility.**
-> This source targets **v0.4.3**, with default port **6754** and
-> schema token **7**. Verify its tag and assets on
-> [Releases](https://github.com/mqlitehq/mqlite/releases) before using the exact
-> v0.4.3 binary or image in these examples. v0.3.3 is withdrawn, unsupported, and retracted by
+> The published release is **v0.4.3**, with default port **6754** and
+> schema token **7**. Its [release page](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3)
+> contains the platform archives, checksums and qualification limits. The examples
+> below use that exact version. v0.3.3 is withdrawn, unsupported, and retracted by
 > v0.4.0 and later; its public assets and exact image remain available for
 > forensic or compatibility inspection and must not be deployed.
 >
@@ -71,10 +71,10 @@ remain `manage` operations. Browser root requests that explicitly prefer HTML
 enter the enabled console, while curl and JSON clients retain the discovery
 response. The wire contract is unchanged and no database rebuild is required.
 
-The target image is multi-arch (amd64 + arm64); confirm publication before running:
+The published image is multi-arch (amd64 + arm64). To run that version:
 
 ```bash
-# v0.4.3 release target, default port 6754
+# Published v0.4.3, default port 6754
 docker run -d --name mqlite -p 6754:6754 \
   -v mqlite-data:/data \
   -e MQLITE_DB=file:/data/mq.db \
@@ -104,7 +104,7 @@ app            = "your-mqlite"
 primary_region = "sin"            # pick a region near you
 
 [build]
-  image = "ghcr.io/mqlitehq/mqlite:0.4.3"   # exact release-target image
+  image = "ghcr.io/mqlitehq/mqlite:0.4.3"   # exact published version
 
 [env]
   MQLITE_DB = "file:/data/mq.db"            # SQLite on the persistent volume
@@ -252,6 +252,46 @@ replace it, stop the old owner, confirm its process has exited, and only then st
 the replacement. Rolling overlap against the same database is unsupported. The
 remote connection pool is safe only within one MQLite process; it does not provide
 cross-process ownership.
+
+## Verify the published release
+
+Use a supported current Go toolchain to install the exact published broker and
+MCP commands together:
+
+```sh
+go install github.com/mqlitehq/mqlite/cmd/mqlite@v0.4.3 github.com/mqlitehq/mqlite/cmd/mqlite-mcp@v0.4.3
+mqlite version
+go list -m -json github.com/mqlitehq/mqlite@v0.4.3
+```
+
+Use the installed binaries from `GOBIN`, or `$(go env GOPATH)/bin` when `GOBIN`
+is unset. `mqlite version` must report `0.4.3`. MCP clients check
+`initialize.serverInfo.version`; `mqlite-mcp` has no `--version` flag.
+The Go 1.21 source floor is independent of the supported toolchain used to build
+production binaries.
+
+For prebuilt binaries, download the OS/architecture archive and `checksums.txt`
+from the [v0.4.3 release](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3).
+Verify the archive's SHA256 against its matching named entry before extracting
+and running the binary. The standalone client uses its own
+[v0.1.2 release](https://github.com/mqlitehq/mqlite-go/releases/tag/v0.1.2) and
+`SHA256SUMS`; it is a separate module and executable.
+
+The published dual-platform image index is pinned by this digest:
+
+```sh
+docker pull ghcr.io/mqlitehq/mqlite:0.4.3@sha256:5b142d101a41406c587729a8c235a35ff45f817e95f3c569544a11d4d0963cdc
+docker run --rm ghcr.io/mqlitehq/mqlite:0.4.3@sha256:5b142d101a41406c587729a8c235a35ff45f817e95f3c569544a11d4d0963cdc version
+```
+
+The image command must report `0.4.3`. Record the digest with the deployment;
+a mutable `latest` tag is not a fixed deployment identity.
+
+The release notes disclose the maintainer-approved bounded qualification:
+complete regression/CI and integration, a 60-minute local workload and a
+30-minute direct-engine Turso workload. The planned 24/48-hour acceptance and
+eight spaced Turso windows were not completed. Installation and health checks
+do not replace sustained-load qualification for an application's workload.
 
 ## Verify any deploy
 

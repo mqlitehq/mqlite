@@ -1,13 +1,16 @@
 # Production operations
 
-This runbook follows `main` for release target v0.4.3 (port 6754, schema token 7).
+This runbook documents released v0.4.3 behavior (port 6754, schema token 7) and
+follows `main` for later documentation corrections. Use the
+[v0.4.3 runbook](https://github.com/mqlitehq/mqlite/blob/v0.4.3/docs/operations.md)
+for the exact release snapshot.
 Use the [v0.4.2 runbook](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/operations.md)
 when operating that binary. In particular, lease-preserving startup and local
 maintenance, coordinated broker shutdown, and the revised managed Receiver
-behavior below are included in the v0.4.3 release target; see [CHANGELOG.md](../CHANGELOG.md).
+behavior below are included in v0.4.3; see [CHANGELOG.md](../CHANGELOG.md).
 v0.3.3 is withdrawn and
 unsupported; its public assets and exact image remain available for forensic or
-compatibility inspection and must not be deployed. v0.4.2 retains v0.4.0's
+compatibility inspection and must not be deployed. v0.4.3 retains v0.4.0's
 retraction of v0.3.3. Upgrading from v0.3.2 or another schema-5 release
 requires a fresh database as described below.
 Runtime-managed access keys require v0.3.1; v0.3.0 supports configured tokens only.
@@ -216,7 +219,7 @@ shutdown behavior does not make overlapping brokers safe.
 
 ## Consumer stops and host interruptions
 
-These boundaries describe release target v0.4.3 and both Go clients' managed
+These boundaries describe released v0.4.3 and both Go clients' managed
 `Receiver.Run`. The SDK does not install process signal handlers. The host
 application decides how SIGINT/SIGTERM, stdin EOF, and platform grace periods
 affect its contexts; `Consumer.Shutdown` and a stop-admission-then-drain API are

@@ -6,7 +6,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/mqlitehq/mqlite@v0.4.3.svg)](https://pkg.go.dev/github.com/mqlitehq/mqlite@v0.4.3)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mqlitehq/mqlite)](https://goreportcard.com/report/github.com/mqlitehq/mqlite)
 [![codecov](https://codecov.io/gh/mqlitehq/mqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/mqlitehq/mqlite)
-[![Release target: v0.4.3](https://img.shields.io/badge/release_target-v0.4.3-blue)](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3)
+[![Release: v0.4.3](https://img.shields.io/badge/release-v0.4.3-green)](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3)
 [![Go](https://img.shields.io/github/go-mod/go-version/mqlitehq/mqlite)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -18,14 +18,17 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > Start in-process (with same-DB transactional enqueue), and upgrade to a
 > network broker with one line when you outgrow it.
 
-> **Release target:** this source prepares v0.4.3. Confirm the tag and assets on
-> [Releases](https://github.com/mqlitehq/mqlite/releases) before installing. Production
-> examples target v0.4.3 or `ghcr.io/mqlitehq/mqlite:0.4.3`. v0.3.3 is withdrawn
+> **Current release:** [v0.4.3](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3)
+> is published with binary archives, checksums and a multi-architecture container
+> image. Production examples use v0.4.3 or `ghcr.io/mqlitehq/mqlite:0.4.3`. v0.3.3 is withdrawn
 > and unsupported; its
 > public assets remain available only for forensic or compatibility inspection
 > and must not be deployed. v0.4.0 and later carry its retraction directive.
 
-> **Documentation scope:** this README follows `main` for release target v0.4.3.
+> **Documentation scope:** this README documents released v0.4.3 behavior and
+> follows `main` for later documentation corrections. Use the
+> [tagged documentation](https://github.com/mqlitehq/mqlite/tree/v0.4.3/docs)
+> for the exact release snapshot.
 > Changes are listed in [CHANGELOG.md](CHANGELOG.md). Lease-preserving
 > startup, cross-invocation local CLI settlement, coordinated broker shutdown,
 > the broker time header, and the revised managed Receiver retry and renewal
@@ -37,6 +40,12 @@ ordering, topics — in a single pure-Go binary (no CGO).
 > interrupted deliveries can consume delivery attempts.
 > See the [consumer stop and interruption boundaries](docs/operations.md#consumer-stops-and-host-interruptions)
 > before wiring process signals to `Run` cancellation.
+
+> **Release qualification:** v0.4.3 uses maintainer-approved bounded verification.
+> The planned 24/48-hour acceptance and eight spaced Turso windows were not
+> completed. See the [release notes](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3)
+> for the verified scope, and [verify an installation](docs/deployment.md#verify-the-published-release)
+> before deploying it.
 
 ## Goal
 
@@ -595,12 +604,19 @@ throughput, memory, and disk methodology and numbers:
 
 ## Status
 
-This source targets **v0.4.3** (port 6754, schema token 7). Confirm its tag and
-assets on [Releases](https://github.com/mqlitehq/mqlite/releases) before installation.
+The current published release is **v0.4.3** (port 6754, schema token 7).
+Its [release page](https://github.com/mqlitehq/mqlite/releases/tag/v0.4.3)
+contains the platform archives and checksums.
 The production image example is `ghcr.io/mqlitehq/mqlite:0.4.3`. v0.3.3 is
 withdrawn and unsupported; its public
 assets and exact image remain available for forensic or compatibility inspection
 and must not be deployed. v0.4.0 and later carry its retraction directive.
+
+v0.4.3 preserves schema token 7 and needs no database rebuild when upgrading from
+v0.4.1 or v0.4.2. It preserves live leases on ordinary reopen and requires
+`WithBrokerMode` before programmatic `Serve`; the CLI selects that mode itself.
+Review the [upgrade and rollback procedure](docs/operations.md#upgrade-and-rollback)
+for consumer shutdown, receive-attempt expiry and downgrade requirements.
 
 v0.4.2 is a schema-compatible patch over v0.4.1. Broker-wide `listen` keys can
 provision or update subscriptions and test filters; complete inventory and both

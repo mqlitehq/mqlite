@@ -1,6 +1,8 @@
 # Turso / libSQL: concurrency & embedded replicas (MQLITE-4)
 
-This guide follows `main` for release target v0.4.3. For an installed
+This guide covers released v0.4.3 behavior and follows `main` for later
+documentation corrections. Use the [v0.4.3 Turso guide](https://github.com/mqlitehq/mqlite/blob/v0.4.3/docs/turso.md)
+for the exact release snapshot. For an installed
 v0.4.2 release, use the [Turso guide at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/turso.md);
 see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 

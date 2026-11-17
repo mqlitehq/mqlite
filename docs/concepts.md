@@ -1,6 +1,8 @@
 # Core concepts & subscription filters
 
-This document follows `main` for release target v0.4.3. For an installed
+This document covers released v0.4.3 behavior and follows `main` for later
+documentation corrections. Use the [v0.4.3 concepts](https://github.com/mqlitehq/mqlite/blob/v0.4.3/docs/concepts.md)
+for the exact release snapshot. For an installed
 v0.4.2 release, use the [concepts at that tag](https://github.com/mqlitehq/mqlite/blob/v0.4.2/docs/concepts.md);
 see [CHANGELOG.md](../CHANGELOG.md) for version-specific behavior changes.
 
