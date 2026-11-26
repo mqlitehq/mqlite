@@ -7,7 +7,7 @@ retract v0.3.3 // Withdrawn: unstable queue Generation API; use v0.4.0 or later.
 require (
 	github.com/antlr4-go/antlr/v4 v4.13.0
 	github.com/charmbracelet/log v1.0.0
-	github.com/expr-lang/expr v1.17.8
+	github.com/expr-lang/expr v1.18.1
 	github.com/tursodatabase/libsql-client-go v0.0.0-20251219100830-236aa1ff8acc
 	golang.org/x/sys v0.30.0
 	modernc.org/sqlite v1.36.1
